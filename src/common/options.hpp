@@ -18,6 +18,10 @@ namespace cross {
 
 enum class EmitKind { Link, Assembly, Object, LlvmTextDebug, Preprocess };
 
+enum class OptimizationGoal { Debug, Speed, Size, MinimumSize };
+enum class CodeModel { Small, Kernel, Medium, Large };
+enum class FpContractMode { Off, On, Fast };
+
 enum class OptionValueKind { Boolean, Unsigned, Enumeration, Text };
 enum class OptionCategory { Optimization, CodeGeneration, Semantic, Target };
 enum class OptionImplementation { Implemented, Partial };
@@ -73,10 +77,10 @@ struct CompilerOptions {
     std::vector<std::string> macro_definitions;
     std::vector<std::string> macro_undefinitions;
 
-    // Cached hot-path values populated from resolved_options. The registry is
-    // authoritative; these fields keep lowering code compact while it is
-    // migrated to direct typed queries.
-    std::string optimize_for{"debug"};
+    // Typed hot-path values populated from resolved_options. The registry and
+    // its origin metadata remain authoritative; these fields keep lowering
+    // independent from command/model spellings.
+    OptimizationGoal optimize_for{OptimizationGoal::Debug};
     unsigned optimization_effort{};
     unsigned function_alignment{};
     unsigned loop_alignment{};
@@ -89,9 +93,9 @@ struct CompilerOptions {
     bool direct_external_data{};
     bool unwind_tables{true};
     bool asynchronous_unwind_tables{true};
-    std::string code_model{"small"};
+    CodeModel code_model{CodeModel::Small};
     bool fast_math{};
-    std::string fp_contract{"off"};
+    FpContractMode fp_contract{FpContractMode::Off};
     bool finite_math_only{};
     bool signed_zeros{true};
     bool evaluate_calls{true};

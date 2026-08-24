@@ -144,6 +144,7 @@ public:
     [[nodiscard]] const AbiEntry* find_abi(
         std::string_view architecture, std::string_view name,
         std::string_view triple) const;
+    [[nodiscard]] const AbiEntry* find_abi(AbiId id) const;
     [[nodiscard]] std::string_view default_abi(
         std::string_view architecture, std::string_view triple) const;
     [[nodiscard]] const ManglingEntry* find_mangling(

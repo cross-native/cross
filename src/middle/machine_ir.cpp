@@ -248,6 +248,10 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
     if (function.symbol.empty()) {
         ok = fail(diagnostics, function.location, "machine function has an empty linkage symbol");
     }
+    if (!function.abi.valid()) {
+        ok = fail(diagnostics, function.location,
+                  "machine function has no resolved ABI identity");
+    }
 
     std::vector<BlockId> block_ids;
     block_ids.reserve(function.blocks.size());
@@ -344,6 +348,10 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
              !spill_homes.insert(slot.spill_for->value).second)) {
             ok = fail(diagnostics, slot.location,
                       "machine virtual-register spill home is invalid or duplicated");
+        }
+        if (slot.hard_register && !slot.hard_register->valid()) {
+            ok = fail(diagnostics, slot.location,
+                      "machine hard-register slot has an invalid target view");
         }
         const bool assigned_spill =
             slot.spill_for &&

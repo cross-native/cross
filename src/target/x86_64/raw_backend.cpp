@@ -4,6 +4,7 @@
 
 #include "target/assembly_format.hpp"
 
+#include "target/x86_64/features.hpp"
 #include "target/x86_64/manual_endpoint.hpp"
 
 #include <algorithm>
@@ -1900,9 +1901,9 @@ private:
                  alignment > 1; alignment >>= 1U) {
                 ++alignment_power;
             }
-        } else if (options_.optimize_for == "minimum-size") {
+        } else if (options_.optimize_for == OptimizationGoal::MinimumSize) {
             alignment_power = 2;
-        } else if (options_.optimize_for == "size") {
+        } else if (options_.optimize_for == OptimizationGoal::Size) {
             alignment_power = 3;
         } else if (options_.tune == "skylake" ||
                    options_.tune == "skylake-avx512" ||

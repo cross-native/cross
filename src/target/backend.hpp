@@ -3,6 +3,7 @@
 #pragma once
 
 #include "middle/hir.hpp"
+#include "middle/machine_ir.hpp"
 #include "middle/mir.hpp"
 #include "middle/raw_mir.hpp"
 
@@ -51,8 +52,30 @@ public:
         const Subtarget& subtarget, const CompilerOptions& options,
         Diagnostics& diagnostics) const = 0;
 
-    [[nodiscard]] virtual std::string emit_managed_assembly(
+    // This nonvirtual entry point runs the common native machine pipeline:
+    // target selection, structural and target verification, standalone
+    // auditing, then target assembly emission.
+    [[nodiscard]] std::string emit_managed_assembly(
         mir::ManagedModule& managed_module, hir::Module& hir_module,
+        const Subtarget& subtarget, const CompilerOptions& options,
+        Diagnostics& diagnostics) const;
+
+    [[nodiscard]] virtual machine::Module lower_machine(
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module, const Subtarget& subtarget,
+        const CompilerOptions& options,
+        Diagnostics& diagnostics) const = 0;
+
+    [[nodiscard]] virtual bool verify_machine(
+        const machine::Module&, const Subtarget&, const CompilerOptions&,
+        Diagnostics&) const {
+        return true;
+    }
+
+    [[nodiscard]] virtual std::string emit_machine_assembly(
+        machine::Module& machine_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
         Diagnostics& diagnostics) const = 0;
 };

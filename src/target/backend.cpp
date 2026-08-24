@@ -2,10 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "target/backend.hpp"
 
+#include "backend/native/machine_pipeline.hpp"
 #include "target/target.hpp"
 #include "target/x86_64/backend.hpp"
 
 namespace cross {
+
+std::string TargetBackend::emit_managed_assembly(
+    mir::ManagedModule& managed_module, hir::Module& hir_module,
+    const Subtarget& subtarget, const CompilerOptions& options,
+    Diagnostics& diagnostics) const {
+    return native::run_machine_pipeline(
+        *this, managed_module, hir_module, subtarget, options, diagnostics);
+}
 
 const std::vector<const TargetBackend*>& all_target_backends() {
     static const std::vector<const TargetBackend*> backends{

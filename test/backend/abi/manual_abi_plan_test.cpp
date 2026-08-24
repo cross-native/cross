@@ -31,7 +31,10 @@ hir::Function function(std::uint32_t id, hir::TypeId result,
     hir::Function item;
     item.id = {id};
     item.result_type = result;
-    item.abi = abi;
+    if (const auto* model =
+            find_abi(x86_64_target(), abi, {})) {
+        item.abi = model->id;
+    }
     return item;
 }
 

@@ -6,6 +6,7 @@
 #include "common/options.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
+#include "target/x86_64/features.hpp"
 
 #include <algorithm>
 #include <array>
@@ -435,7 +436,9 @@ public:
             const Subtarget& subtarget, const CompilerOptions& options,
             Diagnostics& diagnostics)
         : module_(module), target_(target), subtarget_(subtarget),
-          options_(options), diagnostics_(diagnostics) {}
+          diagnostics_(diagnostics) {
+        (void)options;
+    }
 
     ManualAbiPlans run() {
         std::vector<ManualAbiPlan> entries;
@@ -451,12 +454,12 @@ private:
         ManualAbiPlan plan;
         plan.function = function.id;
         plan.manual = true;
-        plan.abi_info =
-            find_abi(target_, function.abi, options_.target);
+        plan.abi_info = find_abi(target_, function.abi);
         if (!plan.abi_info) {
             diagnostics_.error(
                 function.location,
-                "unsupported x86-64 manual ABI '" + function.abi + "'");
+                "unsupported x86-64 manual ABI id " +
+                    std::to_string(function.abi.value));
             plan.valid = false;
             return plan;
         }
@@ -923,9 +926,9 @@ private:
         switch (feature) {
         case RegisterFeature::base: return true;
         case RegisterFeature::avx:
-            return subtarget_.has_feature("avx");
+            return subtarget_.has_feature(Feature::Avx);
         case RegisterFeature::avx512f:
-            return subtarget_.has_feature("avx512f");
+            return subtarget_.has_feature(Feature::Avx512f);
         }
         return false;
     }
@@ -1349,7 +1352,6 @@ private:
     const hir::Module& module_;
     const TargetInfo& target_;
     const Subtarget& subtarget_;
-    const CompilerOptions& options_;
     Diagnostics& diagnostics_;
 };
 

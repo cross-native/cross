@@ -136,14 +136,11 @@ private:
 
     std::string abi_prefix(const hir::Function& function) const {
         const auto* target = target_for_triple(options_.target);
-        const auto* abi = target
-                              ? find_abi(*target, function.abi,
-                                         options_.target)
-                              : nullptr;
+        const auto* abi = target ? find_abi(*target, function.abi) : nullptr;
         if (!target || !abi) {
             diagnostics_.error(function.location,
-                               "unsupported target ABI '" + function.abi +
-                                   "'");
+                               "unsupported target ABI id " +
+                                   std::to_string(function.abi.value));
             return {};
         }
         if (abi->canonical_name == target->default_abi(options_.target)) {

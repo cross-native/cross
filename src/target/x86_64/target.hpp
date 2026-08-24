@@ -3,6 +3,7 @@
 #pragma once
 
 #include "target/target.hpp"
+#include "target/x86_64/features.hpp"
 
 namespace cross {
 

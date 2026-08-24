@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "target/x86_64/backend.hpp"
 
-#include "backend/native/standalone_audit.hpp"
 #include "middle/machine_ir.hpp"
 #include "target/backend.hpp"
 #include "target/subtarget.hpp"
 #include "target/x86_64/dynamic_abi_plan.hpp"
+#include "target/x86_64/machine_description.hpp"
 #include "target/x86_64/manual_abi_plan.hpp"
+#include "target/x86_64/manual_endpoint.hpp"
 #include "target/x86_64/native_backend.hpp"
 #include "target/x86_64/raw_backend.hpp"
 
@@ -29,7 +30,7 @@ public:
                 "platform contract");
             return false;
         }
-        if (options.code_model == "kernel" &&
+        if (options.code_model == CodeModel::Kernel &&
             options.position_independent) {
             diagnostics.command_error(
                 "x86-64 '-mcmodel=kernel' is incompatible with -fpic/-fpie");
@@ -111,8 +112,9 @@ public:
         return diagnostics.errors() == 0;
     }
 
-    std::string emit_managed_assembly(
-        mir::ManagedModule& managed_module, hir::Module& hir_module,
+    machine::Module lower_machine(
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
         Diagnostics& diagnostics) const override {
         const auto& target = subtarget.target();
@@ -123,17 +125,69 @@ public:
             managed_module, hir_module, manual_plans, options, diagnostics);
         if (diagnostics.errors() != 0) return {};
 
-        auto machine_module = lower_managed_machine(
+        return x86_64::lower_managed_machine(
             managed_module, hir_module, manual_plans, dynamic_plans,
             subtarget, options, diagnostics);
-        if (diagnostics.errors() != 0 ||
-            !machine::verify(machine_module, diagnostics)) {
-            return {};
+    }
+
+    bool verify_machine(
+        const machine::Module& module, const Subtarget&,
+        const CompilerOptions&, Diagnostics& diagnostics) const override {
+        bool valid = true;
+        for (const auto& function : module.functions) {
+            for (const auto& slot : function.stack_slots) {
+                if (!slot.hard_register ||
+                    slot.hard_register->value < register_views().size()) {
+                    continue;
+                }
+                diagnostics.error(
+                    slot.location,
+                    "x86-64 Machine IR contains an unknown hard-register "
+                    "view " + std::to_string(slot.hard_register->value));
+                valid = false;
+            }
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.kind ==
+                            machine::InstructionKind::Target &&
+                        !describe_opcode(instruction.opcode)) {
+                        diagnostics.error(
+                            instruction.location,
+                            "x86-64 Machine IR contains an unknown target "
+                            "opcode " +
+                                std::to_string(instruction.opcode.value));
+                        valid = false;
+                    }
+                    if (instruction.condition_predicate.empty() ||
+                        describe_opcode(instruction.condition_predicate)) {
+                        continue;
+                    }
+                    diagnostics.error(
+                        instruction.location,
+                        "x86-64 Machine IR contains an unknown condition "
+                        "opcode " +
+                            std::to_string(
+                                instruction.condition_predicate.value));
+                    valid = false;
+                }
+            }
         }
-        if (!native::audit_standalone(
-                machine_module, hir_module, diagnostics)) {
-            return {};
-        }
+        return valid;
+    }
+
+    std::string emit_machine_assembly(
+        machine::Module& machine_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module,
+        const Subtarget& subtarget, const CompilerOptions& options,
+        Diagnostics& diagnostics) const override {
+        const auto manual_plans = build_manual_abi_plans(
+            hir_module, subtarget.target(), subtarget, options, diagnostics);
+        if (diagnostics.errors() != 0) return {};
+        const auto dynamic_plans = build_dynamic_abi_plans(
+            managed_module, hir_module, manual_plans, options,
+            diagnostics);
+        if (diagnostics.errors() != 0) return {};
         return emit_managed_machine_assembly(
             machine_module, hir_module, manual_plans, dynamic_plans,
             subtarget, options, diagnostics);

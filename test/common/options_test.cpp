@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "common/options.hpp"
 #include "model/model.hpp"
+#include "target/subtarget.hpp"
+#include "target/x86_64/target.hpp"
 
 #include <iostream>
 #include <optional>
@@ -118,7 +120,8 @@ int main() {
     ok = expect(fast_then_granular && fast_then_granular->fast_math &&
                     !fast_then_granular->finite_math_only &&
                     fast_then_granular->signed_zeros &&
-                    fast_then_granular->fp_contract == "fast",
+                    fast_then_granular->fp_contract ==
+                        cross::FpContractMode::Fast,
                 "granular floating controls did not override fast-math") &&
          ok;
 
@@ -128,7 +131,8 @@ int main() {
     ok = expect(granular_then_fast && granular_then_fast->fast_math &&
                     granular_then_fast->finite_math_only &&
                     !granular_then_fast->signed_zeros &&
-                    granular_then_fast->fp_contract == "fast",
+                    granular_then_fast->fp_contract ==
+                        cross::FpContractMode::Fast,
                 "fast-math did not expand at its command-line position") &&
          ok;
 
@@ -137,14 +141,16 @@ int main() {
     ok = expect(strict_again && !strict_again->fast_math &&
                     !strict_again->finite_math_only &&
                     strict_again->signed_zeros &&
-                    strict_again->fp_contract == "off",
+                    strict_again->fp_contract ==
+                        cross::FpContractMode::Off,
                 "negative fast-math did not restore granular defaults") &&
          ok;
 
     const auto explicit_contract = parse(
         {"cc", "-ffast-math", "-ffp-contract=off"});
     ok = expect(explicit_contract && explicit_contract->fast_math &&
-                    explicit_contract->fp_contract == "off",
+                    explicit_contract->fp_contract ==
+                        cross::FpContractMode::Off,
                 "explicit contraction policy did not override fast-math") &&
          ok;
 
@@ -177,6 +183,42 @@ int main() {
                     cross::resolved_bool(*full_vector, "m.avx512f") &&
                     cross::resolved_bool(*full_vector, "m.avx512bw"),
                 "target feature prerequisites were not expanded") &&
+         ok;
+
+    const auto& x86_target = cross::x86_64_target();
+    const auto* feature_table = cross::subtarget_table_for(x86_target);
+    bool feature_ids_match = feature_table &&
+        feature_table->features.size() == static_cast<std::size_t>(
+            cross::x86_64::Feature::Count);
+    if (feature_ids_match) {
+        for (std::size_t index = 0; index < feature_table->features.size();
+             ++index) {
+            if (feature_table->features[index].name !=
+                cross::x86_64::feature_name(
+                    static_cast<cross::x86_64::Feature>(index))) {
+                feature_ids_match = false;
+                break;
+            }
+        }
+    }
+    ok = expect(feature_ids_match,
+                "typed x86 feature IDs diverged from the target table") &&
+         ok;
+
+    std::ostringstream subtarget_errors;
+    cross::Diagnostics subtarget_diagnostics(subtarget_errors);
+    const auto selected = full_vector
+        ? cross::resolve_subtarget(
+              x86_target, *full_vector, subtarget_diagnostics)
+        : std::nullopt;
+    ok = expect(selected &&
+                    selected->has_feature(cross::x86_64::Feature::Avx) &&
+                    selected->has_feature(cross::x86_64::Feature::Avx2) &&
+                    selected->has_feature(
+                        cross::x86_64::Feature::Avx512bw) &&
+                    selected->feature_name(
+                        cross::x86_64::Feature::Avx2) == "avx2",
+                "typed target-feature queries did not match text resolution") &&
          ok;
 
     const auto architecture_level = parse({"cc", "-march=x86-64-v4"});

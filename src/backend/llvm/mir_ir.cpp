@@ -45,7 +45,7 @@ std::string hexadecimal(std::uint64_t value, unsigned width) {
 std::string floating_flags(const CompilerOptions& options) {
     std::string result;
     if (options.fast_math) result += "reassoc arcp afn ";
-    if (options.fp_contract == "fast") result += "contract ";
+    if (options.fp_contract == FpContractMode::Fast) result += "contract ";
     if (options.finite_math_only) result += "nnan ninf ";
     if (!options.signed_zeros) result += "nsz ";
     return result;
@@ -455,12 +455,12 @@ private:
 
     std::string abi_name(const hir::Function& function) {
         const auto* target = target_for_triple(options_.target);
-        const auto* abi = target
-            ? find_abi(*target, function.abi, options_.target) : nullptr;
+        const auto* abi = target ? find_abi(*target, function.abi) : nullptr;
         if (!target || !abi) {
             diagnostics_.error(
                 function.location,
-                "managed MIR has an unavailable ABI '" + function.abi + "'");
+                "managed MIR has unavailable ABI id " +
+                    std::to_string(function.abi.value));
             return {};
         }
         return abi->canonical_name == target->default_abi(options_.target)
@@ -704,19 +704,17 @@ private:
 
     void emit_variadic_state(const mir::ManagedValue& value) {
         const auto* target = target_for_triple(options_.target);
-        const auto* abi = target
-            ? find_abi(*target, entity_.abi, options_.target)
-            : nullptr;
+        const auto* abi = target ? find_abi(*target, entity_.abi) : nullptr;
         if (!abi) {
             diagnostics_.error(value.location,
                                "variadic state has no LLVM-debug ABI model");
             return;
         }
-        const auto state = std::find_if(
-            abi->variadic_states.begin(), abi->variadic_states.end(),
-            [&](const AbiVariadicState& candidate) {
-                return candidate.canonical_name == value.variadic_state;
-            });
+        const auto* state = value.variadic_state.valid() &&
+                                    value.variadic_state.value <
+                                        abi->variadic_states.size()
+            ? &abi->variadic_states[value.variadic_state.value]
+            : nullptr;
         std::vector<AbiValue> arguments;
         arguments.reserve(entity_.parameters.size());
         for (const auto& parameter : entity_.parameters) {
@@ -729,7 +727,7 @@ private:
         const auto features = enabled_abi_features(options_);
         const auto classified = classify_variadic_signature(
             *abi, arguments, results, entity_.parameters.size(), features);
-        if (state == abi->variadic_states.end() || !classified) {
+        if (!state || !classified) {
             diagnostics_.error(value.location,
                                "variadic state cannot classify its fixed prefix");
             return;
@@ -1302,7 +1300,7 @@ private:
             if (entity_.variadic && !entity_.variadic_bindings.empty()) {
                 const auto* target = target_for_triple(options_.target);
                 const auto* abi = target
-                    ? find_abi(*target, entity_.abi, options_.target)
+                    ? find_abi(*target, entity_.abi)
                     : nullptr;
                 if (!abi || abi->variadic_va_list_bytes == 0) {
                     diagnostics_.error(

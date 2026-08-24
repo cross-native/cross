@@ -98,7 +98,7 @@ struct ManagedValue {
     std::uint64_t integer{};
     std::uint64_t integer_high{};
     std::uint32_t parameter_index{};
-    std::string variadic_state;
+    AbiStateId variadic_state;
     std::optional<SlotId> slot;
     std::optional<hir::FunctionId> callee;
     std::optional<hir::LabelId> label;

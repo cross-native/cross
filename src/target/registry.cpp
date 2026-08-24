@@ -37,6 +37,11 @@ const AbiEntry* find_abi(const TargetInfo& target, std::string_view name,
     return model_registry().find_abi(target.architecture, name, triple);
 }
 
+const AbiEntry* find_abi(const TargetInfo& target, AbiId id) {
+    const auto* abi = model_registry().find_abi(id);
+    return abi && abi->architecture == target.architecture ? abi : nullptr;
+}
+
 const RegisterEntry* find_register(const TargetInfo& target, std::string_view name) {
     for (const auto& entry : target.registers) {
         if (entry.name == name) return &entry;

@@ -74,6 +74,8 @@ add_library(cross_middle
     src/middle/hir.cpp
     src/middle/machine_ir.cpp
     src/middle/mir.cpp
+    src/middle/mir_analysis.cpp
+    src/middle/mir_pass.cpp
 )
 target_link_libraries(cross_middle PUBLIC cross_frontend cross_targets)
 cross_component(cross_middle)
@@ -87,10 +89,13 @@ cross_component(cross_raw_backend)
 add_library(cross_native_backend
     src/backend/native/assembler.cpp
     src/backend/native/data_emitter.cpp
+    src/backend/native/machine_pass.cpp
+    src/backend/native/machine_pipeline.cpp
     src/backend/native/standalone_audit.cpp
     src/target/backend.cpp
     src/target/x86_64/backend.cpp
     src/target/x86_64/dynamic_abi_plan.cpp
+    src/target/x86_64/machine_description.cpp
     src/target/x86_64/manual_abi_plan.cpp
     src/target/x86_64/native_backend.cpp
 )
@@ -138,6 +143,14 @@ if(BUILD_TESTING)
     target_link_libraries(cross_mir_verifier_test PRIVATE cross_middle)
     cross_component(cross_mir_verifier_test)
 
+    add_executable(cross_mir_analysis_test test/middle/mir_analysis_test.cpp)
+    target_link_libraries(cross_mir_analysis_test PRIVATE cross_middle)
+    cross_component(cross_mir_analysis_test)
+
+    add_executable(cross_machine_ir_test test/middle/machine_ir_test.cpp)
+    target_link_libraries(cross_machine_ir_test PRIVATE cross_middle)
+    cross_component(cross_machine_ir_test)
+
     add_executable(cross_abi_rules_test test/model/abi_rules_test.cpp)
     target_link_libraries(cross_abi_rules_test PRIVATE cross_native_backend)
     cross_component(cross_abi_rules_test)
@@ -148,6 +161,10 @@ if(BUILD_TESTING)
 
     add_test(NAME cross_help COMMAND $<TARGET_FILE:cross_cc> --help)
     add_test(NAME cross_options COMMAND $<TARGET_FILE:cross_options_test>)
+    add_test(NAME cross_mir_analysis
+             COMMAND $<TARGET_FILE:cross_mir_analysis_test>)
+    add_test(NAME cross_machine_ir
+             COMMAND $<TARGET_FILE:cross_machine_ir_test>)
     add_test(NAME cross_version COMMAND $<TARGET_FILE:cross_cc> --version)
     add_test(NAME cross_targets COMMAND $<TARGET_FILE:cross_cc> --print-targets)
     add_test(NAME cross_abis COMMAND $<TARGET_FILE:cross_cc> --print-abis)

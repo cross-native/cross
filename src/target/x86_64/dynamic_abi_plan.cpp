@@ -450,8 +450,7 @@ DynamicAbiPlans build_dynamic_abi_plans(
         if (build_plan(hir_module, *body, function, plan)) {
             if (!options.ipa_ra) {
                 if (const auto* fallback =
-                        model_registry().find_abi(
-                            "x86-64", function.abi, {})) {
+                        model_registry().find_abi(function.abi)) {
                     plan.clobbers = fallback->call_clobbers;
                 }
             }
@@ -508,8 +507,8 @@ DynamicAbiPlans build_dynamic_abi_plans(
                             }
                         }
                     }
-                } else if (const auto* abi = model_registry().find_abi(
-                               "x86-64", callee.abi, {})) {
+                } else if (const auto* abi =
+                               model_registry().find_abi(callee.abi)) {
                     changed |= append_unique(
                         plan.clobbers, abi->call_clobbers);
                 }

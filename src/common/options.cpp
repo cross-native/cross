@@ -569,8 +569,15 @@ bool resolve_registered_options(
     }
     if (diagnostics.errors() != 0) return false;
 
-    options.optimize_for =
-        std::string(resolved_text(options, "f.optimize-for", "debug"));
+    const auto optimize_for =
+        resolved_text(options, "f.optimize-for", "debug");
+    options.optimize_for = optimize_for == "speed"
+        ? OptimizationGoal::Speed
+        : optimize_for == "size"
+              ? OptimizationGoal::Size
+              : optimize_for == "minimum-size"
+                    ? OptimizationGoal::MinimumSize
+                    : OptimizationGoal::Debug;
     options.optimization_effort = static_cast<unsigned>(
         resolved_unsigned(options, "f.optimization-effort"));
     options.function_alignment = static_cast<unsigned>(
@@ -621,11 +628,20 @@ bool resolve_registered_options(
         resolved_bool(options, "f.unwind-tables", true);
     options.asynchronous_unwind_tables =
         resolved_bool(options, "f.asynchronous-unwind-tables", true);
-    options.code_model =
-        std::string(resolved_text(options, "m.cmodel", "small"));
+    const auto code_model = resolved_text(options, "m.cmodel", "small");
+    options.code_model = code_model == "kernel"
+        ? CodeModel::Kernel
+        : code_model == "medium"
+              ? CodeModel::Medium
+              : code_model == "large" ? CodeModel::Large
+                                        : CodeModel::Small;
     options.fast_math = resolved_bool(options, "f.fast-math");
-    options.fp_contract =
-        std::string(resolved_text(options, "f.fp-contract", "off"));
+    const auto fp_contract =
+        resolved_text(options, "f.fp-contract", "off");
+    options.fp_contract = fp_contract == "fast"
+        ? FpContractMode::Fast
+        : fp_contract == "on" ? FpContractMode::On
+                               : FpContractMode::Off;
     options.finite_math_only =
         resolved_bool(options, "f.finite-math-only");
     options.signed_zeros = resolved_bool(options, "f.signed-zeros", true);

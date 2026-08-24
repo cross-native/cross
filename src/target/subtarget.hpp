@@ -4,9 +4,12 @@
 
 #include "target/target.hpp"
 
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace cross {
@@ -14,6 +17,30 @@ struct CompilerOptions;
 class Diagnostics;
 
 enum class ObjectFormat { Elf, Coff, MachO, Unsupported };
+
+// Feature identities are dense and local to one target description, like
+// machine opcodes.  Names remain part of the command/model boundary, while
+// optimization and instruction-selection queries use this compact value.
+struct TargetFeatureId {
+    static constexpr std::uint16_t invalid_value =
+        std::numeric_limits<std::uint16_t>::max();
+
+    std::uint16_t value{invalid_value};
+
+    constexpr TargetFeatureId() = default;
+    constexpr explicit TargetFeatureId(std::uint16_t raw) : value(raw) {}
+
+    template <typename TargetFeature>
+        requires std::is_enum_v<TargetFeature>
+    constexpr TargetFeatureId(TargetFeature feature)
+        : value(static_cast<std::uint16_t>(feature)) {}
+
+    [[nodiscard]] constexpr bool valid() const {
+        return value != invalid_value;
+    }
+    friend constexpr bool operator==(TargetFeatureId,
+                                     TargetFeatureId) = default;
+};
 
 // These tables belong to a target implementation, not the driver.  Adding an
 // architecture therefore only requires registering its TargetInfo and a
@@ -48,7 +75,21 @@ public:
     [[nodiscard]] const AbiEntry& abi_info() const { return *abi_; }
     [[nodiscard]] std::string_view cpu() const { return cpu_; }
     [[nodiscard]] std::string_view tune() const { return tune_; }
+    [[nodiscard]] bool has_feature(TargetFeatureId feature) const;
+
+    template <typename TargetFeature>
+        requires std::is_enum_v<TargetFeature>
+    [[nodiscard]] bool has_feature(TargetFeature feature) const {
+        return has_feature(TargetFeatureId{feature});
+    }
+
+    // Text lookup is retained for source/model supplied requirements. Hot
+    // target code should resolve once and use TargetFeatureId instead.
     [[nodiscard]] bool has_feature(std::string_view name) const;
+    [[nodiscard]] std::optional<TargetFeatureId> feature_id(
+        std::string_view name) const;
+    [[nodiscard]] std::string_view feature_name(
+        TargetFeatureId feature) const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;
     }
@@ -59,10 +100,12 @@ private:
                                                        const SubtargetTable&, Diagnostics&);
     const TargetInfo* target_{};
     const AbiEntry* abi_{};
+    const SubtargetTable* table_{};
     ObjectFormat object_format_{ObjectFormat::Unsupported};
     std::string cpu_;
     std::string tune_;
     std::vector<std::string> enabled_features_;
+    std::vector<std::uint64_t> enabled_feature_words_;
 };
 
 // Built-in table selected for a compiled-in target.  It is intentionally

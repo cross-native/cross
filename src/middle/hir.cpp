@@ -723,7 +723,7 @@ private:
                 find_abi(target_, selected, options_.target);
             if (selected_abi) {
                 const auto* abi = selected_abi;
-                function.abi = std::string(abi->canonical_name);
+                function.abi = abi->id;
                 if (!abi_text.empty() && !abi->function_selectable) {
                     diagnostics_.error(
                         representative->location,
@@ -731,7 +731,6 @@ private:
                             "' is not function-selectable");
                 }
             } else {
-                function.abi = selected;
                 diagnostics_.error(
                     representative->location,
                     "unknown ABI model '" + selected + "' for target '" +
@@ -774,7 +773,7 @@ private:
                 if (!selected_abi || !selected_abi->variadic_supported) {
                     diagnostics_.error(
                         representative->location,
-                        "ABI model '" + function.abi +
+                        "ABI model '" + selected +
                             "' does not define variadic lowering");
                 }
                 if (variadic_attributes > 1) {
@@ -836,7 +835,7 @@ private:
                         }
                         function.variadic_bindings.push_back(
                             {attribute->location, std::string(name),
-                             intern_type(type), *decoded});
+                             intern_type(type), state->id});
                     }
                 }
             } else if (variadic_attributes != 0) {

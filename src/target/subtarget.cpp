@@ -34,9 +34,38 @@ const SubtargetCpu* find_cpu(const SubtargetTable& table, std::string_view name)
 
 } // namespace
 
+bool Subtarget::has_feature(TargetFeatureId feature) const {
+    if (!feature.valid() || !table_ || feature.value >= table_->features.size()) {
+        return false;
+    }
+    const auto word = static_cast<std::size_t>(feature.value) / 64U;
+    const auto bit = static_cast<unsigned>(feature.value) % 64U;
+    return word < enabled_feature_words_.size() &&
+           (enabled_feature_words_[word] & (std::uint64_t{1} << bit)) != 0;
+}
+
+std::optional<TargetFeatureId> Subtarget::feature_id(
+    std::string_view name) const {
+    if (!table_) return std::nullopt;
+    for (std::size_t index = 0; index < table_->features.size(); ++index) {
+        if (table_->features[index].name == name) {
+            if (index >= TargetFeatureId::invalid_value) return std::nullopt;
+            return TargetFeatureId{static_cast<std::uint16_t>(index)};
+        }
+    }
+    return std::nullopt;
+}
+
+std::string_view Subtarget::feature_name(TargetFeatureId feature) const {
+    if (!feature.valid() || !table_ || feature.value >= table_->features.size()) {
+        return {};
+    }
+    return table_->features[feature.value].name;
+}
+
 bool Subtarget::has_feature(std::string_view name) const {
-    return std::find(enabled_features_.begin(), enabled_features_.end(), name) !=
-           enabled_features_.end();
+    const auto feature = feature_id(name);
+    return feature && has_feature(*feature);
 }
 
 const SubtargetTable* subtarget_table_for(const TargetInfo& target) {
@@ -428,11 +457,19 @@ std::optional<Subtarget> resolve_subtarget(const TargetInfo& target,
     Subtarget result;
     result.target_ = &target;
     result.abi_ = abi;
+    result.table_ = &table;
     result.object_format_ = format;
     result.cpu_ = std::string(cpu->name);
     result.tune_ = std::string(tune->name);
-    for (const auto& feature : table.features) {
-        if (states[std::string(feature.name)]) result.enabled_features_.emplace_back(feature.name);
+    result.enabled_feature_words_.assign((table.features.size() + 63U) / 64U,
+                                         0);
+    for (std::size_t index = 0; index < table.features.size(); ++index) {
+        const auto& feature = table.features[index];
+        if (states[std::string(feature.name)]) {
+            result.enabled_features_.emplace_back(feature.name);
+            result.enabled_feature_words_[index / 64U] |=
+                std::uint64_t{1} << (index % 64U);
+        }
     }
     return result;
 }

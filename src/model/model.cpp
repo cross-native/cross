@@ -2399,7 +2399,36 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
         }
     }
 
-    for (auto& entry : document->abis) abis_.push_back(std::move(entry));
+    const auto abi_capacity = static_cast<std::size_t>(AbiId::invalid_value);
+    if (abis_.size() > abi_capacity ||
+        document->abis.size() > abi_capacity - abis_.size()) {
+        if (diagnostics) {
+            diagnostics->command_error(
+                origin + ": ABI model count exceeds the typed registry limit");
+        }
+        return false;
+    }
+    for (const auto& entry : document->abis) {
+        if (entry.variadic_states.size() >
+            static_cast<std::size_t>(AbiStateId::invalid_value)) {
+            if (diagnostics) {
+                diagnostics->command_error(
+                    origin + ": ABI model '" + entry.canonical_name +
+                    "' has too many variadic-state entries");
+            }
+            return false;
+        }
+    }
+
+    for (auto& entry : document->abis) {
+        entry.id = {static_cast<std::uint32_t>(abis_.size())};
+        for (std::size_t index = 0; index < entry.variadic_states.size();
+             ++index) {
+            entry.variadic_states[index].id = {
+                static_cast<std::uint16_t>(index)};
+        }
+        abis_.push_back(std::move(entry));
+    }
     for (auto& entry : document->manglings) {
         manglings_.push_back(std::move(entry));
     }
@@ -2475,6 +2504,11 @@ const AbiEntry* ModelRegistry::find_abi(
         }
     }
     return nullptr;
+}
+
+const AbiEntry* ModelRegistry::find_abi(AbiId id) const {
+    return id.valid() && id.value < abis_.size() ? &abis_[id.value]
+                                                 : nullptr;
 }
 
 const ManglingEntry* ModelRegistry::find_mangling(

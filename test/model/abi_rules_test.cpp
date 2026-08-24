@@ -82,6 +82,20 @@ bool validate_shipped_abis() {
     const auto* microsoft =
         model_registry().find_abi("x86-64", "ms_abi", {});
     if (!cross_abi || !sysv || !microsoft) return false;
+    if (!cross_abi->id.valid() || !sysv->id.valid() ||
+        !microsoft->id.valid() ||
+        model_registry().find_abi(cross_abi->id) != cross_abi ||
+        model_registry().find_abi(sysv->id) != sysv ||
+        model_registry().find_abi(microsoft->id) != microsoft) {
+        return false;
+    }
+    for (std::size_t index = 0; index < sysv->variadic_states.size();
+         ++index) {
+        if (!sysv->variadic_states[index].id.valid() ||
+            sysv->variadic_states[index].id.value != index) {
+            return false;
+        }
+    }
 
     const auto i64 = scalar(ScalarMode::integer(64));
     const auto f64 = scalar(ScalarMode::floating(64));

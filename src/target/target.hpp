@@ -5,6 +5,8 @@
 #include "common/options.hpp"
 
 #include <optional>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,6 +15,27 @@
 namespace cross {
 
 struct SubtargetTable;
+
+struct AbiId {
+    static constexpr std::uint32_t invalid_value =
+        std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t value{invalid_value};
+
+    [[nodiscard]] constexpr bool valid() const { return value != invalid_value; }
+    [[nodiscard]] constexpr bool empty() const { return !valid(); }
+    friend constexpr bool operator==(AbiId, AbiId) = default;
+};
+
+// Variadic state IDs are dense only within their owning ABI model.
+struct AbiStateId {
+    static constexpr std::uint16_t invalid_value =
+        std::numeric_limits<std::uint16_t>::max();
+    std::uint16_t value{invalid_value};
+
+    [[nodiscard]] constexpr bool valid() const { return value != invalid_value; }
+    [[nodiscard]] constexpr bool empty() const { return !valid(); }
+    friend constexpr bool operator==(AbiStateId, AbiStateId) = default;
+};
 
 enum class AbiValueKind {
     Any,
@@ -63,6 +86,7 @@ enum class AbiVariadicStateKind {
 };
 
 struct AbiVariadicState {
+    AbiStateId id;
     std::string canonical_name;
     std::string type;
     AbiVariadicStateKind kind{AbiVariadicStateKind::CursorOffset};
@@ -121,6 +145,7 @@ struct AbiRule {
 };
 
 struct AbiEntry {
+    AbiId id;
     std::string canonical_name;
     std::vector<std::string> aliases;
     std::string architecture;
@@ -326,6 +351,7 @@ const std::vector<const TargetInfo*>& all_targets();
 const TargetInfo* target_for_triple(std::string_view triple);
 const AbiEntry* find_abi(const TargetInfo& target, std::string_view name,
                          std::string_view triple);
+const AbiEntry* find_abi(const TargetInfo& target, AbiId id);
 const RegisterEntry* find_register(const TargetInfo& target, std::string_view name);
 const PatchValueMaterializerEntry* find_patch_value_materializer(
     const TargetInfo& target, std::string_view type_name);

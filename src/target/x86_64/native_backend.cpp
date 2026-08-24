@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "target/x86_64/native_backend.hpp"
+#include "backend/native/machine_pass.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
+#include "target/x86_64/features.hpp"
+#include "target/x86_64/machine_description.hpp"
 
 #include "model/model.hpp"
 
@@ -24,8 +27,49 @@
 namespace cross::x86_64 {
 namespace {
 
-const AbiEntry* abi_model(std::string_view abi) {
-    return model_registry().find_abi("x86-64", abi, {});
+enum class LoweringPass : std::uint16_t {
+    HoistParameterCaptures,
+    PropagateCopiesInitial,
+    FoldSplatConstants,
+    FoldVectorQwordMultiplyImmediates,
+    HoistVectorQwordMultiplyHighHalves,
+    FoldVectorShiftImmediates,
+    RecognizeVectorByteSwaps,
+    HoistVectorByteSwapMasks,
+    FuseVectorReductions,
+    RecognizeScalarRotatesEarly,
+    SelectBinaryImmediates,
+    CombineMachineImmediates,
+    EliminateRedundantExpressions,
+    EliminateRedundantLoadsEarly,
+    FuseScalarDivisionResults,
+    RecognizeScalarRotatesLate,
+    PropagateCopiesLate,
+    FuseCompareSelects,
+    FuseVectorSignSelects,
+    FuseCompareBranches,
+    FormDenseJumpTables,
+    ThreadForwardingBlocksEarly,
+    FoldIndexedAddresses,
+    EliminateRedundantLoadsLate,
+    FoldScalarMemoryOperands,
+    FoldFloatMemoryOperands,
+    FoldVectorMemoryOperands,
+    EliminateDeadValues,
+    ScheduleBlockLayout,
+    ScheduleAcrossBlocks,
+    ThreadForwardingBlocksLate,
+    ScheduleBlocks,
+    SelectRematerialization,
+    AllocateRegisters,
+    PreserveCallerContract,
+    CreateWidePhiTemporary,
+    FinalizeFrame,
+};
+
+const AbiEntry* abi_model(AbiId abi) {
+    const auto* model = model_registry().find_abi(abi);
+    return model && model->architecture == "x86-64" ? model : nullptr;
 }
 
 const RegisterView* canonical_storage_view(
@@ -40,6 +84,28 @@ const RegisterView* canonical_storage_view(
                     view.bits == 128 && view.name.starts_with("xmm"));
         });
     return found == views.end() ? nullptr : &*found;
+}
+
+const RegisterView* machine_register_view(
+    machine::TargetRegisterViewId id) {
+    const auto views = register_views();
+    return id.valid() && id.value < views.size() ? &views[id.value] : nullptr;
+}
+
+std::optional<machine::TargetRegisterViewId> machine_register_view_id(
+    const RegisterView* sought) {
+    if (!sought) return std::nullopt;
+    const auto views = register_views();
+    for (std::size_t index = 0; index < views.size(); ++index) {
+        if (&views[index] == sought) {
+            if (index >= machine::TargetRegisterViewId::invalid_value) {
+                return std::nullopt;
+            }
+            return machine::TargetRegisterViewId{
+                static_cast<std::uint16_t>(index)};
+        }
+    }
+    return std::nullopt;
 }
 
 const AbiRegisterBank* abi_bank(const AbiEntry& abi,
@@ -69,7 +135,7 @@ std::size_t variadic_save_area_size(const AbiEntry& abi) {
     return variadic_save_bank_offset(abi, {});
 }
 
-ReturnAssignment automatic_return(std::string_view abi,
+ReturnAssignment automatic_return(AbiId abi,
                                   ScalarMode mode,
                                   AbiFeatureSet features = {}) {
     const auto* model = abi_model(abi);
@@ -314,96 +380,128 @@ machine::Operand block_operand(machine::BlockId block) {
     return machine::BlockOperand{block};
 }
 
-std::string binary_opcode(mir::BinaryOperation operation) {
+machine::TargetOpcodeId binary_opcode(mir::BinaryOperation operation) {
     using mir::BinaryOperation;
     switch (operation) {
-    case BinaryOperation::Add: return "x86.add";
-    case BinaryOperation::Subtract: return "x86.sub";
-    case BinaryOperation::Multiply: return "x86.mul";
-    case BinaryOperation::SignedDivide: return "x86.sdiv";
-    case BinaryOperation::UnsignedDivide: return "x86.udiv";
-    case BinaryOperation::SignedRemainder: return "x86.srem";
-    case BinaryOperation::UnsignedRemainder: return "x86.urem";
-    case BinaryOperation::BitAnd: return "x86.and";
-    case BinaryOperation::BitOr: return "x86.or";
-    case BinaryOperation::BitXor: return "x86.xor";
-    case BinaryOperation::ShiftLeft: return "x86.shl";
-    case BinaryOperation::ShiftRightArithmetic: return "x86.shr.s";
-    case BinaryOperation::ShiftRightLogical: return "x86.shr.u";
-    case BinaryOperation::Equal: return "x86.cmp.eq";
-    case BinaryOperation::NotEqual: return "x86.cmp.ne";
-    case BinaryOperation::SignedLess: return "x86.cmp.slt";
-    case BinaryOperation::SignedLessEqual: return "x86.cmp.sle";
-    case BinaryOperation::SignedGreater: return "x86.cmp.sgt";
-    case BinaryOperation::SignedGreaterEqual: return "x86.cmp.sge";
-    case BinaryOperation::UnsignedLess: return "x86.cmp.ult";
-    case BinaryOperation::UnsignedLessEqual: return "x86.cmp.ule";
-    case BinaryOperation::UnsignedGreater: return "x86.cmp.ugt";
-    case BinaryOperation::UnsignedGreaterEqual: return "x86.cmp.uge";
+    case BinaryOperation::Add: return Opcode::Add;
+    case BinaryOperation::Subtract: return Opcode::Sub;
+    case BinaryOperation::Multiply: return Opcode::Mul;
+    case BinaryOperation::SignedDivide: return Opcode::Sdiv;
+    case BinaryOperation::UnsignedDivide: return Opcode::Udiv;
+    case BinaryOperation::SignedRemainder: return Opcode::Srem;
+    case BinaryOperation::UnsignedRemainder: return Opcode::Urem;
+    case BinaryOperation::BitAnd: return Opcode::And;
+    case BinaryOperation::BitOr: return Opcode::Or;
+    case BinaryOperation::BitXor: return Opcode::Xor;
+    case BinaryOperation::ShiftLeft: return Opcode::Shl;
+    case BinaryOperation::ShiftRightArithmetic: return Opcode::ShrS;
+    case BinaryOperation::ShiftRightLogical: return Opcode::ShrU;
+    case BinaryOperation::Equal: return Opcode::CmpEq;
+    case BinaryOperation::NotEqual: return Opcode::CmpNe;
+    case BinaryOperation::SignedLess: return Opcode::CmpSlt;
+    case BinaryOperation::SignedLessEqual: return Opcode::CmpSle;
+    case BinaryOperation::SignedGreater: return Opcode::CmpSgt;
+    case BinaryOperation::SignedGreaterEqual: return Opcode::CmpSge;
+    case BinaryOperation::UnsignedLess: return Opcode::CmpUlt;
+    case BinaryOperation::UnsignedLessEqual: return Opcode::CmpUle;
+    case BinaryOperation::UnsignedGreater: return Opcode::CmpUgt;
+    case BinaryOperation::UnsignedGreaterEqual: return Opcode::CmpUge;
     }
-    return "x86.invalid";
+    return Opcode::Invalid;
 }
 
-std::string unary_opcode(mir::UnaryOperation operation) {
+machine::TargetOpcodeId unary_opcode(mir::UnaryOperation operation) {
     switch (operation) {
-    case mir::UnaryOperation::Negate: return "x86.neg";
-    case mir::UnaryOperation::BitNot: return "x86.not";
-    case mir::UnaryOperation::IsZero: return "x86.iszero";
+    case mir::UnaryOperation::Negate: return Opcode::Neg;
+    case mir::UnaryOperation::BitNot: return Opcode::Not;
+    case mir::UnaryOperation::IsZero: return Opcode::Iszero;
     }
-    return "x86.invalid";
+    return Opcode::Invalid;
 }
 
-std::string cast_opcode(mir::CastOperation operation) {
+machine::TargetOpcodeId cast_opcode(mir::CastOperation operation) {
     switch (operation) {
-    case mir::CastOperation::SignExtend: return "x86.sext";
-    case mir::CastOperation::ZeroExtend: return "x86.zext";
-    case mir::CastOperation::Truncate: return "x86.trunc";
-    case mir::CastOperation::Reinterpret: return "x86.reinterpret";
-    case mir::CastOperation::FloatExtend: return "x86.fextend";
-    case mir::CastOperation::FloatTruncate: return "x86.ftruncate";
-    case mir::CastOperation::SignedIntegerToFloat: return "x86.sitofp";
-    case mir::CastOperation::UnsignedIntegerToFloat: return "x86.uitofp";
-    case mir::CastOperation::FloatToSignedInteger: return "x86.fptosi";
-    case mir::CastOperation::FloatToUnsignedInteger: return "x86.fptoui";
+    case mir::CastOperation::SignExtend: return Opcode::Sext;
+    case mir::CastOperation::ZeroExtend: return Opcode::Zext;
+    case mir::CastOperation::Truncate: return Opcode::Trunc;
+    case mir::CastOperation::Reinterpret: return Opcode::Reinterpret;
+    case mir::CastOperation::FloatExtend: return Opcode::Fextend;
+    case mir::CastOperation::FloatTruncate: return Opcode::Ftruncate;
+    case mir::CastOperation::SignedIntegerToFloat: return Opcode::Sitofp;
+    case mir::CastOperation::UnsignedIntegerToFloat: return Opcode::Uitofp;
+    case mir::CastOperation::FloatToSignedInteger: return Opcode::Fptosi;
+    case mir::CastOperation::FloatToUnsignedInteger: return Opcode::Fptoui;
     }
-    return "x86.invalid";
+    return Opcode::Invalid;
 }
 
-std::string atomic_opcode(mir::AtomicOperation operation) {
+machine::TargetOpcodeId atomic_opcode(mir::AtomicOperation operation) {
     switch (operation) {
-    case mir::AtomicOperation::Load: return "x86.atomic.load";
-    case mir::AtomicOperation::Store: return "x86.atomic.store";
-    case mir::AtomicOperation::Exchange: return "x86.atomic.exchange";
+    case mir::AtomicOperation::Load: return Opcode::AtomicLoad;
+    case mir::AtomicOperation::Store: return Opcode::AtomicStore;
+    case mir::AtomicOperation::Exchange: return Opcode::AtomicExchange;
     case mir::AtomicOperation::CompareExchange:
-        return "x86.atomic.compare_exchange";
-    case mir::AtomicOperation::FetchAdd: return "x86.atomic.fetch.add";
-    case mir::AtomicOperation::FetchSub: return "x86.atomic.fetch.sub";
-    case mir::AtomicOperation::FetchAnd: return "x86.atomic.fetch.and";
-    case mir::AtomicOperation::FetchXor: return "x86.atomic.fetch.xor";
-    case mir::AtomicOperation::FetchOr: return "x86.atomic.fetch.or";
+        return Opcode::AtomicCompareExchange;
+    case mir::AtomicOperation::FetchAdd: return Opcode::AtomicFetchAdd;
+    case mir::AtomicOperation::FetchSub: return Opcode::AtomicFetchSub;
+    case mir::AtomicOperation::FetchAnd: return Opcode::AtomicFetchAnd;
+    case mir::AtomicOperation::FetchXor: return Opcode::AtomicFetchXor;
+    case mir::AtomicOperation::FetchOr: return Opcode::AtomicFetchOr;
     case mir::AtomicOperation::FetchUpdate:
-        return "x86.atomic.fetch.update";
-    case mir::AtomicOperation::ThreadFence: return "x86.atomic.thread_fence";
-    case mir::AtomicOperation::SignalFence: return "x86.atomic.signal_fence";
+        return Opcode::AtomicFetchUpdate;
+    case mir::AtomicOperation::ThreadFence: return Opcode::AtomicThreadFence;
+    case mir::AtomicOperation::SignalFence: return Opcode::AtomicSignalFence;
     }
-    return "x86.atomic.invalid";
+    return Opcode::AtomicInvalid;
 }
 
-std::string floating_binary_opcode(mir::BinaryOperation operation) {
+machine::TargetOpcodeId floating_binary_opcode(
+    mir::BinaryOperation operation) {
     using mir::BinaryOperation;
     switch (operation) {
-    case BinaryOperation::Add: return "x86.fadd";
-    case BinaryOperation::Subtract: return "x86.fsub";
-    case BinaryOperation::Multiply: return "x86.fmul";
-    case BinaryOperation::SignedDivide: return "x86.fdiv";
-    case BinaryOperation::Equal: return "x86.fcmp.eq";
-    case BinaryOperation::NotEqual: return "x86.fcmp.ne";
-    case BinaryOperation::SignedLess: return "x86.fcmp.lt";
-    case BinaryOperation::SignedLessEqual: return "x86.fcmp.le";
-    case BinaryOperation::SignedGreater: return "x86.fcmp.gt";
-    case BinaryOperation::SignedGreaterEqual: return "x86.fcmp.ge";
-    default: return "x86.invalid";
+    case BinaryOperation::Add: return Opcode::Fadd;
+    case BinaryOperation::Subtract: return Opcode::Fsub;
+    case BinaryOperation::Multiply: return Opcode::Fmul;
+    case BinaryOperation::SignedDivide: return Opcode::Fdiv;
+    case BinaryOperation::Equal: return Opcode::FcmpEq;
+    case BinaryOperation::NotEqual: return Opcode::FcmpNe;
+    case BinaryOperation::SignedLess: return Opcode::FcmpLt;
+    case BinaryOperation::SignedLessEqual: return Opcode::FcmpLe;
+    case BinaryOperation::SignedGreater: return Opcode::FcmpGt;
+    case BinaryOperation::SignedGreaterEqual: return Opcode::FcmpGe;
+    default: return Opcode::Invalid;
     }
+}
+
+machine::TargetOpcodeId vector_binary_opcode(
+    mir::BinaryOperation operation) {
+    using mir::BinaryOperation;
+    switch (operation) {
+    case BinaryOperation::Add: return Opcode::Vadd;
+    case BinaryOperation::Subtract: return Opcode::Vsub;
+    case BinaryOperation::Multiply: return Opcode::Vmul;
+    case BinaryOperation::SignedDivide: return Opcode::Vsdiv;
+    case BinaryOperation::UnsignedDivide: return Opcode::Vudiv;
+    case BinaryOperation::SignedRemainder: return Opcode::Vsrem;
+    case BinaryOperation::UnsignedRemainder: return Opcode::Vurem;
+    case BinaryOperation::BitAnd: return Opcode::Vand;
+    case BinaryOperation::BitOr: return Opcode::Vor;
+    case BinaryOperation::BitXor: return Opcode::Vxor;
+    case BinaryOperation::ShiftLeft: return Opcode::Vshl;
+    case BinaryOperation::ShiftRightArithmetic: return Opcode::VshrS;
+    case BinaryOperation::ShiftRightLogical: return Opcode::VshrU;
+    case BinaryOperation::Equal: return Opcode::VcmpEq;
+    case BinaryOperation::NotEqual: return Opcode::VcmpNe;
+    case BinaryOperation::SignedLess: return Opcode::VcmpSlt;
+    case BinaryOperation::SignedLessEqual: return Opcode::VcmpSle;
+    case BinaryOperation::SignedGreater: return Opcode::VcmpSgt;
+    case BinaryOperation::SignedGreaterEqual: return Opcode::VcmpSge;
+    case BinaryOperation::UnsignedLess: return Opcode::VcmpUlt;
+    case BinaryOperation::UnsignedLessEqual: return Opcode::VcmpUle;
+    case BinaryOperation::UnsignedGreater: return Opcode::VcmpUgt;
+    case BinaryOperation::UnsignedGreaterEqual: return Opcode::VcmpUge;
+    }
+    return Opcode::Invalid;
 }
 
 struct ParameterStoragePlan {
@@ -486,11 +584,11 @@ private:
             current_.virtual_registers.at(value_registers_[value.value]->value));
     }
 
-    machine::Instruction target_instruction(std::string opcode,
+    machine::Instruction target_instruction(machine::TargetOpcodeId opcode,
                                             SourceLocation location) {
         machine::Instruction result;
         result.kind = machine::InstructionKind::Target;
-        result.opcode = std::move(opcode);
+        result.opcode = opcode;
         result.location = location;
         return result;
     }
@@ -548,9 +646,8 @@ private:
     void preserve_stronger_caller_contract() {
         std::unordered_set<std::uint16_t> explicitly_preserved;
         for (const auto& slot : current_.stack_slots) {
-            if (!slot.physical_location) continue;
-            if (const auto* view =
-                    find_register_view(*slot.physical_location)) {
+            if (!slot.hard_register) continue;
+            if (const auto* view = machine_register_view(*slot.hard_register)) {
                 explicitly_preserved.insert(view->storage_id);
             }
         }
@@ -576,10 +673,10 @@ private:
                     const bool feature_available = view &&
                         (view->required_feature == RegisterFeature::base ||
                          (view->required_feature == RegisterFeature::avx &&
-                          subtarget_.has_feature("avx")) ||
+                          subtarget_.has_feature(Feature::Avx)) ||
                          (view->required_feature ==
                               RegisterFeature::avx512f &&
-                          subtarget_.has_feature("avx512f")));
+                          subtarget_.has_feature(Feature::Avx512f)));
                     if (!feature_available ||
                         (view->register_class != RegisterClass::integer &&
                          view->register_class != RegisterClass::simd) ||
@@ -640,7 +737,17 @@ private:
             }
             target.location = slot.location;
             target.name = slot.name;
-            target.physical_location = slot.physical_location;
+            if (slot.physical_location) {
+                const auto* view =
+                    find_register_view(*slot.physical_location);
+                target.hard_register = machine_register_view_id(view);
+                if (view && !target.hard_register) {
+                    diagnostics_.error(
+                        slot.location,
+                        "x86-64 register-view table exceeds the Machine IR "
+                        "identity limit");
+                }
+            }
             current_.stack_slots.push_back(std::move(target));
         }
         std::unordered_set<std::string> hard_storage;
@@ -899,11 +1006,11 @@ private:
         if (value.kind == ValueKind::Parameter) {
             auto instruction =
                 target_instruction(is_aggregate(hir_, value.type)
-                                       ? "x86.aggregate.parameter"
+                                       ? Opcode::AggregateParameter
                                    : is_vector(hir_, value.type)
-                                       ? "x86.vparameter"
+                                       ? Opcode::Vparameter
                                    : is_floating(hir_, value.type)
-                                       ? "x86.fparameter" : "x86.parameter",
+                                       ? Opcode::Fparameter : Opcode::Parameter,
                                    value.location);
             instruction.operands.push_back(
                 immediate_operand(value.parameter_index, 0, machine::i32));
@@ -911,7 +1018,7 @@ private:
             return instruction;
         }
         if (value.kind == ValueKind::ConstantInteger) {
-            auto instruction = target_instruction("x86.constant", value.location);
+            auto instruction = target_instruction(Opcode::Constant, value.location);
             instruction.operands.push_back(immediate_operand(
                 value.integer, value.integer_high, reg(value.id).mode));
             instruction.defs.push_back(reg(value.id));
@@ -930,7 +1037,7 @@ private:
             return instruction;
         }
         if (value.kind == ValueKind::ConstantFloating) {
-            auto instruction = target_instruction("x86.fconstant", value.location);
+            auto instruction = target_instruction(Opcode::Fconstant, value.location);
             instruction.operands.push_back(immediate_operand(
                 value.integer, value.integer_high, reg(value.id).mode));
             instruction.defs.push_back(reg(value.id));
@@ -945,14 +1052,14 @@ private:
         }
         if (value.kind == ValueKind::VariadicState) {
             auto instruction = target_instruction(
-                "x86.variadic.state", value.location);
+                Opcode::VariadicState, value.location);
             instruction.variadic_state = value.variadic_state;
             instruction.defs.push_back(reg(value.id));
             return instruction;
         }
         if (value.kind == ValueKind::LabelAddress) {
             auto instruction =
-                target_instruction("x86.label.address", value.location);
+                target_instruction(Opcode::LabelAddress, value.location);
             const auto found = std::find_if(
                 source_->labels.begin(), source_->labels.end(),
                 [&](const mir::ManagedLabel& binding) {
@@ -970,7 +1077,7 @@ private:
         }
         if (value.kind == ValueKind::SlotAddress) {
             auto instruction =
-                target_instruction("x86.stack.address", value.location);
+                target_instruction(Opcode::StackAddress, value.location);
             instruction.operands.push_back(
                 stack_operand({value.slot->value}, machine::i64));
             instruction.defs.push_back(reg(value.id));
@@ -978,7 +1085,7 @@ private:
         }
         if (value.kind == ValueKind::GlobalAddress) {
             auto instruction =
-                target_instruction("x86.global.address", value.location);
+                target_instruction(Opcode::GlobalAddress, value.location);
             instruction.operands.push_back(machine::SymbolOperand{
                 hir_.object(*value.object).link_symbol, 0, false,
                 value.object});
@@ -987,7 +1094,7 @@ private:
         }
         if (value.kind == ValueKind::IndexedAddress) {
             auto instruction =
-                target_instruction("x86.indexed.address", value.location);
+                target_instruction(Opcode::IndexedAddress, value.location);
             for (const auto operand : value.operands) {
                 const auto source = reg(operand);
                 instruction.operands.push_back(register_operand(source));
@@ -1005,14 +1112,14 @@ private:
         }
         if (value.kind == ValueKind::DynamicStackSave) {
             auto instruction =
-                target_instruction("x86.stack.save", value.location);
+                target_instruction(Opcode::StackSave, value.location);
             instruction.defs.push_back(reg(value.id));
             instruction.has_side_effects = true;
             return instruction;
         }
         if (value.kind == ValueKind::DynamicAlloca) {
             auto instruction =
-                target_instruction("x86.stack.allocate", value.location);
+                target_instruction(Opcode::StackAllocate, value.location);
             const auto bound = reg(value.operands.front());
             instruction.operands.push_back(register_operand(bound));
             instruction.operands.push_back(immediate_operand(
@@ -1028,7 +1135,7 @@ private:
         }
         if (value.kind == ValueKind::DynamicStackRestore) {
             auto instruction =
-                target_instruction("x86.stack.restore", value.location);
+                target_instruction(Opcode::StackRestore, value.location);
             const auto mark = reg(value.operands.front());
             instruction.operands.push_back(register_operand(mark));
             instruction.uses.push_back(mark);
@@ -1037,9 +1144,9 @@ private:
         }
         if (value.kind == ValueKind::Phi) {
             auto instruction = target_instruction(is_vector(hir_, value.type)
-                                                       ? "x86.vphi"
+                                                       ? Opcode::Vphi
                                                    : is_floating(hir_, value.type)
-                                                       ? "x86.fphi" : "x86.phi",
+                                                       ? Opcode::Fphi : Opcode::Phi,
                                                    value.location);
             for (const auto& incoming : value.incoming) {
                 instruction.operands.push_back(
@@ -1054,7 +1161,7 @@ private:
             value.kind == ValueKind::LifetimeEnd) {
             auto instruction = target_instruction(
                 value.kind == ValueKind::LifetimeStart
-                    ? "x86.lifetime.start" : "x86.lifetime.end",
+                    ? Opcode::LifetimeStart : Opcode::LifetimeEnd,
                 value.location);
             instruction.operands.push_back(stack_operand(
                 {value.slot->value}, machine::i8));
@@ -1066,13 +1173,13 @@ private:
                 source_->slots[value.slot->value];
             auto instruction = target_instruction(
                 slot.physical_location
-                    ? "x86.fixed.load"
+                    ? Opcode::FixedLoad
                     : is_aggregate(hir_, value.type)
-                          ? "x86.aggregate.load"
+                          ? Opcode::AggregateLoad
                     : is_vector(hir_, value.type)
-                          ? "x86.vload"
+                          ? Opcode::Vload
                     : is_floating(hir_, value.type)
-                          ? "x86.fload" : "x86.load",
+                          ? Opcode::Fload : Opcode::Load,
                 value.location);
             instruction.operands.push_back(
                 stack_operand({value.slot->value}, reg(value.id).mode));
@@ -1086,17 +1193,17 @@ private:
                 source_->slots[value.slot->value];
             auto instruction = target_instruction(
                 slot.physical_location
-                    ? "x86.fixed.store"
+                    ? Opcode::FixedStore
                     : is_aggregate(
                           hir_, source_->values[
                                     value.operands.front().value].type)
-                          ? "x86.aggregate.store"
+                          ? Opcode::AggregateStore
                     : is_vector(
                           hir_, source_->values[
                                     value.operands.front().value].type)
-                          ? "x86.vstore"
+                          ? Opcode::Vstore
                     : floating_value(value.operands.front())
-                          ? "x86.fstore" : "x86.store",
+                          ? Opcode::Fstore : Opcode::Store,
                 value.location);
             const auto source = reg(value.operands.front());
             instruction.operands.push_back(
@@ -1109,9 +1216,9 @@ private:
         }
         if (value.kind == ValueKind::PointerLoad) {
             auto instruction = target_instruction(
-                is_aggregate(hir_, value.type) ? "x86.aggregate.pointer.load" :
-                is_vector(hir_, value.type) ? "x86.vpointer.load" :
-                is_floating(hir_, value.type) ? "x86.fpointer.load" : "x86.pointer.load",
+                is_aggregate(hir_, value.type) ? Opcode::AggregatePointerLoad :
+                is_vector(hir_, value.type) ? Opcode::VpointerLoad :
+                is_floating(hir_, value.type) ? Opcode::FpointerLoad : Opcode::PointerLoad,
                 value.location);
             const auto address = reg(value.operands.front());
             instruction.operands.push_back(register_operand(address));
@@ -1126,11 +1233,11 @@ private:
             const auto source = reg(value.operands[1]);
             auto instruction = target_instruction(
                 is_aggregate(hir_, source_->values[value.operands[1].value].type)
-                    ? "x86.aggregate.pointer.store"
+                    ? Opcode::AggregatePointerStore
                 : is_vector(hir_, source_->values[value.operands[1].value].type)
-                    ? "x86.vpointer.store"
-                : floating_value(value.operands[1]) ? "x86.fpointer.store"
-                                                   : "x86.pointer.store",
+                    ? Opcode::VpointerStore
+                : floating_value(value.operands[1]) ? Opcode::FpointerStore
+                                                   : Opcode::PointerStore,
                 value.location);
             instruction.operands.push_back(register_operand(address));
             instruction.operands.push_back(register_operand(source));
@@ -1142,9 +1249,9 @@ private:
         if (value.kind == ValueKind::IndexedLoad) {
             auto instruction =
                 target_instruction(is_vector(hir_, value.type)
-                                       ? "x86.vindexed.load"
+                                       ? Opcode::VindexedLoad
                                    : is_floating(hir_, value.type)
-                                       ? "x86.findexed.load" : "x86.indexed.load",
+                                       ? Opcode::FindexedLoad : Opcode::IndexedLoad,
                                    value.location);
             for (const auto operand : value.operands) {
                 const auto source = reg(operand);
@@ -1166,11 +1273,11 @@ private:
         if (value.kind == ValueKind::GlobalLoad) {
             auto instruction =
                 target_instruction(is_aggregate(hir_, value.type)
-                                       ? "x86.aggregate.global.load"
+                                       ? Opcode::AggregateGlobalLoad
                                    : is_vector(hir_, value.type)
-                                       ? "x86.vglobal.load"
+                                       ? Opcode::VglobalLoad
                                    : is_floating(hir_, value.type)
-                                       ? "x86.fglobal.load" : "x86.global.load",
+                                       ? Opcode::FglobalLoad : Opcode::GlobalLoad,
                                    value.location);
             instruction.operands.push_back(machine::SymbolOperand{
                 hir_.object(*value.object).link_symbol, 0, false,
@@ -1185,13 +1292,13 @@ private:
                 target_instruction(is_aggregate(
                                        hir_, source_->values[
                                                  value.operands.front().value].type)
-                                       ? "x86.aggregate.global.store"
+                                       ? Opcode::AggregateGlobalStore
                                    : is_vector(
                                        hir_, source_->values[
                                                  value.operands.front().value].type)
-                                       ? "x86.vglobal.store"
+                                       ? Opcode::VglobalStore
                                    : floating_value(value.operands.front())
-                                       ? "x86.fglobal.store" : "x86.global.store",
+                                       ? Opcode::FglobalStore : Opcode::GlobalStore,
                                    value.location);
             const auto source = reg(value.operands.front());
             instruction.operands.push_back(machine::SymbolOperand{
@@ -1296,7 +1403,7 @@ private:
             return instruction;
         }
         if (value.kind == ValueKind::PatchValue) {
-            auto instruction = target_instruction("x86.patch", value.location);
+            auto instruction = target_instruction(Opcode::Patch, value.location);
             const auto target = reg(value.id);
             instruction.operands.push_back(immediate_operand(
                 value.integer, value.integer_high, target.mode));
@@ -1310,8 +1417,8 @@ private:
         if (value.kind == ValueKind::Intrinsic) {
             auto instruction = target_instruction(
                 value.intrinsic == mir::IntrinsicOperation::Expect
-                    ? "x86.expect"
-                    : "x86.intrinsic.noop",
+                    ? Opcode::Expect
+                    : Opcode::IntrinsicNoop,
                 value.location);
             if (value.intrinsic == mir::IntrinsicOperation::Expect) {
                 const auto source = reg(value.operands.front());
@@ -1331,12 +1438,12 @@ private:
             auto instruction = target_instruction(
                 is_vector(hir_, source_type)
                     ? (value.unary == mir::UnaryOperation::Negate
-                           ? "x86.vneg"
+                           ? Opcode::Vneg
                        : value.unary == mir::UnaryOperation::BitNot
-                           ? "x86.vnot" : "x86.viszero")
+                           ? Opcode::Vnot : Opcode::Viszero)
                 : floating_value(value.operands.front())
-                    ? (value.unary == mir::UnaryOperation::Negate ? "x86.fneg"
-                                                                    : "x86.fiszero")
+                    ? (value.unary == mir::UnaryOperation::Negate ? Opcode::Fneg
+                                                                    : Opcode::Fiszero)
                     : unary_opcode(value.unary), value.location);
             const auto source = reg(value.operands.front());
             instruction.operands.push_back(register_operand(source));
@@ -1358,9 +1465,9 @@ private:
             auto instruction = target_instruction(
                 (is_vector(hir_, value.type) ||
                  is_vector(hir_, source_type))
-                    ? "x86.vcast"
+                    ? Opcode::Vcast
                 : representation_only_floating_cast
-                    ? "x86.freinterpret"
+                    ? Opcode::Freinterpret
                 : cast_opcode(value.cast),
                 value.location);
             const auto source = reg(value.operands.front());
@@ -1378,7 +1485,7 @@ private:
         if (value.kind == ValueKind::Select) {
             const bool vector = is_vector(hir_, value.type);
             auto instruction = target_instruction(
-                vector ? "x86.vselect" : "x86.select", value.location);
+                vector ? Opcode::Vselect : Opcode::Select, value.location);
             for (const auto operand : value.operands) {
                 const auto source = reg(operand);
                 instruction.operands.push_back(
@@ -1387,7 +1494,7 @@ private:
             }
             if (vector) {
                 instruction.operands.push_back(vector_metadata(value.type));
-                if (!subtarget_.has_feature("avx")) {
+                if (!subtarget_.has_feature(Feature::Avx)) {
                     for (const auto name : {"xmm3", "xmm4"}) {
                         if (const auto* scratch = find_register_view(name)) {
                             instruction.clobbers.push_back(
@@ -1410,7 +1517,7 @@ private:
                 source_splat_use_counts_[value.operands.front().value] == 1 &&
                 source_non_splat_use_counts_[value.operands.front().value] == 0;
             auto instruction = target_instruction(
-                immediate ? "x86.vsplat.constant" : "x86.vsplat",
+                immediate ? Opcode::VsplatConstant : Opcode::Vsplat,
                 value.location);
             if (immediate) {
                 instruction.operands.push_back(immediate_operand(
@@ -1426,7 +1533,7 @@ private:
             return instruction;
         }
         if (value.kind == ValueKind::ExtractElement) {
-            auto instruction = target_instruction("x86.vextract", value.location);
+            auto instruction = target_instruction(Opcode::Vextract, value.location);
             const auto vector = reg(value.operands[0]);
             instruction.operands.push_back(register_operand(vector));
             instruction.uses.push_back(vector);
@@ -1448,7 +1555,7 @@ private:
             return instruction;
         }
         if (value.kind == ValueKind::InsertElement) {
-            auto instruction = target_instruction("x86.vinsert", value.location);
+            auto instruction = target_instruction(Opcode::Vinsert, value.location);
             const auto vector = reg(value.operands[0]);
             instruction.operands.push_back(register_operand(vector));
             instruction.uses.push_back(vector);
@@ -1475,7 +1582,7 @@ private:
             const auto source_type =
                 source_->values[value.operands.front().value].type;
             auto instruction = target_instruction(
-                "x86.v" + binary_opcode(value.binary).substr(4),
+                vector_binary_opcode(value.binary),
                 value.location);
             for (const auto operand : value.operands) {
                 const auto source = reg(operand);
@@ -1583,10 +1690,10 @@ private:
     static bool parameter_instruction(
         const machine::Instruction& instruction) {
         return instruction.kind == machine::InstructionKind::Target &&
-               (instruction.opcode == "x86.parameter" ||
-                instruction.opcode == "x86.fparameter" ||
-                instruction.opcode == "x86.vparameter" ||
-                instruction.opcode == "x86.aggregate.parameter");
+               (instruction.opcode == Opcode::Parameter ||
+                instruction.opcode == Opcode::Fparameter ||
+                instruction.opcode == Opcode::Vparameter ||
+                instruction.opcode == Opcode::AggregateParameter);
     }
 
     void hoist_parameter_captures() {
@@ -1663,7 +1770,7 @@ private:
                     continue;
                 }
                 bool representation_vector_cast = false;
-                if (instruction.opcode == "x86.vcast") {
+                if (instruction.opcode == Opcode::Vcast) {
                     std::vector<const machine::ImmediateOperand*> shapes;
                     for (const auto& operand : instruction.operands) {
                         if (const auto* shape =
@@ -1678,9 +1785,9 @@ private:
                         shapes[0]->high == shapes[1]->high &&
                         shapes[0]->is_signed == shapes[1]->is_signed;
                 }
-                const bool copy = instruction.opcode == "x86.expect" ||
-                                  instruction.opcode == "x86.reinterpret" ||
-                                  instruction.opcode == "x86.freinterpret" ||
+                const bool copy = instruction.opcode == Opcode::Expect ||
+                                  instruction.opcode == Opcode::Reinterpret ||
+                                  instruction.opcode == Opcode::Freinterpret ||
                                   representation_vector_cast;
                 if (!copy) continue;
                 const auto target = instruction.defs.front();
@@ -1719,10 +1826,10 @@ private:
                                machine::RegisterKind::Virtual &&
                            removed.contains(
                                instruction.defs.front().id) &&
-                           (instruction.opcode == "x86.expect" ||
-                            instruction.opcode == "x86.reinterpret" ||
-                            instruction.opcode == "x86.freinterpret" ||
-                            instruction.opcode == "x86.vcast");
+                           (instruction.opcode == Opcode::Expect ||
+                            instruction.opcode == Opcode::Reinterpret ||
+                            instruction.opcode == Opcode::Freinterpret ||
+                            instruction.opcode == Opcode::Vcast);
                 });
         }
     }
@@ -1740,8 +1847,8 @@ private:
                         ++uses[use.id];
                     }
                 }
-                if ((instruction.opcode != "x86.constant" &&
-                     instruction.opcode != "x86.fconstant") ||
+                if ((instruction.opcode != Opcode::Constant &&
+                     instruction.opcode != Opcode::Fconstant) ||
                     instruction.defs.size() != 1 ||
                     instruction.defs.front().kind !=
                         machine::RegisterKind::Virtual ||
@@ -1757,7 +1864,7 @@ private:
         }
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.vsplat" ||
+                if (instruction.opcode != Opcode::Vsplat ||
                     instruction.uses.size() != 1 ||
                     instruction.uses.front().kind !=
                         machine::RegisterKind::Virtual ||
@@ -1769,7 +1876,7 @@ private:
                     uses[source.id] != 1) {
                     continue;
                 }
-                instruction.opcode = "x86.vsplat.constant";
+                instruction.opcode = Opcode::VsplatConstant;
                 instruction.operands.front() = *constants[source.id];
                 instruction.uses.clear();
                 if (uses[source.id] != 0) --uses[source.id];
@@ -1779,8 +1886,8 @@ private:
             std::erase_if(
                 block.instructions,
                 [&](const machine::Instruction& instruction) {
-                    if ((instruction.opcode != "x86.constant" &&
-                         instruction.opcode != "x86.fconstant") ||
+                    if ((instruction.opcode != Opcode::Constant &&
+                         instruction.opcode != Opcode::Fconstant) ||
                         instruction.defs.size() != 1 ||
                         instruction.defs.front().kind !=
                             machine::RegisterKind::Virtual) {
@@ -1817,11 +1924,11 @@ private:
                 return std::nullopt;
             }
             const machine::ImmediateOperand* immediate = nullptr;
-            if (definition->opcode == "x86.vsplat.constant" &&
+            if (definition->opcode == Opcode::VsplatConstant &&
                 !definition->operands.empty()) {
                 immediate = std::get_if<machine::ImmediateOperand>(
                     &definition->operands.front());
-            } else if (definition->opcode == "x86.vsplat" &&
+            } else if (definition->opcode == Opcode::Vsplat &&
                        definition->uses.size() == 1) {
                 const auto scalar = definition->uses.front();
                 const auto* scalar_definition =
@@ -1830,7 +1937,7 @@ private:
                         ? definitions[scalar.id]
                         : nullptr;
                 if (scalar_definition &&
-                    scalar_definition->opcode == "x86.constant" &&
+                    scalar_definition->opcode == Opcode::Constant &&
                     !scalar_definition->operands.empty()) {
                     immediate = std::get_if<machine::ImmediateOperand>(
                         &scalar_definition->operands.front());
@@ -1849,7 +1956,7 @@ private:
         };
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.vmul" ||
+                if (instruction.opcode != Opcode::Vmul ||
                     instruction.uses.size() != 2 ||
                     instruction.operands.empty()) {
                     continue;
@@ -1874,7 +1981,7 @@ private:
                 }
                 if (!scale || !simple_scale(*scale)) continue;
                 const auto metadata = instruction.operands.back();
-                instruction.opcode = "x86.vmul.imm";
+                instruction.opcode = Opcode::VmulImm;
                 instruction.uses = {source};
                 instruction.operands = {
                     register_operand(source),
@@ -1886,9 +1993,9 @@ private:
 
     void hoist_vector_qword_multiply_high_halves() {
         if (options_.optimization_effort < 3 ||
-            options_.optimize_for != "speed" ||
-            !subtarget_.has_feature("avx2") ||
-            subtarget_.has_feature("avx512dq") ||
+            options_.optimize_for != OptimizationGoal::Speed ||
+            !subtarget_.has_feature(Feature::Avx2) ||
+            subtarget_.has_feature(Feature::Avx512dq) ||
             current_.entry.value >= current_.blocks.size()) {
             return;
         }
@@ -1913,11 +2020,11 @@ private:
             const auto* definition = definitions[value.id];
             if (!definition) return std::nullopt;
             const machine::ImmediateOperand* immediate{};
-            if (definition->opcode == "x86.vsplat.constant" &&
+            if (definition->opcode == Opcode::VsplatConstant &&
                 !definition->operands.empty()) {
                 immediate = std::get_if<machine::ImmediateOperand>(
                     &definition->operands.front());
-            } else if (definition->opcode == "x86.vsplat" &&
+            } else if (definition->opcode == Opcode::Vsplat &&
                        definition->uses.size() == 1) {
                 const auto scalar = definition->uses.front();
                 const auto* scalar_definition =
@@ -1926,7 +2033,7 @@ private:
                         ? definitions[scalar.id]
                         : nullptr;
                 if (scalar_definition &&
-                    scalar_definition->opcode == "x86.constant" &&
+                    scalar_definition->opcode == Opcode::Constant &&
                     !scalar_definition->operands.empty()) {
                     immediate = std::get_if<machine::ImmediateOperand>(
                         &scalar_definition->operands.front());
@@ -1940,7 +2047,7 @@ private:
         std::unordered_map<std::uint32_t, std::uint64_t> high_halves;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.vmul" ||
+                if (instruction.opcode != Opcode::Vmul ||
                     instruction.uses.size() != 2 ||
                     instruction.operands.empty()) {
                     continue;
@@ -1995,7 +2102,7 @@ private:
                 machine::Register::virtual_register(id, mode);
             cached_high.emplace(constant_id, high);
             auto materialize = target_instruction(
-                "x86.vsplat.constant", definition->location);
+                Opcode::VsplatConstant, definition->location);
             materialize.defs.push_back(high);
             materialize.operands.push_back(immediate_operand(
                 high_halves.at(constant_id), 0, machine::i64));
@@ -2006,7 +2113,7 @@ private:
 
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.vmul" ||
+                if (instruction.opcode != Opcode::Vmul ||
                     instruction.uses.size() != 2 ||
                     instruction.operands.empty()) {
                     continue;
@@ -2026,9 +2133,9 @@ private:
         const auto position = std::find_if(
             entry.instructions.begin(), entry.instructions.end(),
             [](const machine::Instruction& instruction) {
-                return instruction.opcode != "x86.phi" &&
-                       instruction.opcode != "x86.fphi" &&
-                       instruction.opcode != "x86.vphi";
+                return instruction.opcode != Opcode::Phi &&
+                       instruction.opcode != Opcode::Fphi &&
+                       instruction.opcode != Opcode::Vphi;
             });
         entry.instructions.insert(
             position,
@@ -2059,11 +2166,11 @@ private:
             const auto* definition = definitions[value.id];
             if (!definition) return std::nullopt;
             const machine::ImmediateOperand* immediate{};
-            if (definition->opcode == "x86.vsplat.constant" &&
+            if (definition->opcode == Opcode::VsplatConstant &&
                 !definition->operands.empty()) {
                 immediate = std::get_if<machine::ImmediateOperand>(
                     &definition->operands.front());
-            } else if (definition->opcode == "x86.vsplat" &&
+            } else if (definition->opcode == Opcode::Vsplat &&
                        definition->uses.size() == 1) {
                 const auto scalar = definition->uses.front();
                 const auto* scalar_definition =
@@ -2072,7 +2179,7 @@ private:
                         ? definitions[scalar.id]
                         : nullptr;
                 if (scalar_definition &&
-                    scalar_definition->opcode == "x86.constant" &&
+                    scalar_definition->opcode == Opcode::Constant &&
                     !scalar_definition->operands.empty()) {
                     immediate = std::get_if<machine::ImmediateOperand>(
                         &scalar_definition->operands.front());
@@ -2086,9 +2193,9 @@ private:
         };
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                const bool shift = instruction.opcode == "x86.vshl" ||
-                    instruction.opcode == "x86.vshr.s" ||
-                    instruction.opcode == "x86.vshr.u";
+                const bool shift = instruction.opcode == Opcode::Vshl ||
+                    instruction.opcode == Opcode::VshrS ||
+                    instruction.opcode == Opcode::VshrU;
                 if (!shift || instruction.uses.size() != 2 ||
                     instruction.operands.empty()) {
                     continue;
@@ -2106,8 +2213,8 @@ private:
 
     void recognize_vector_byte_swaps() {
         if (options_.optimization_effort < 2 ||
-            options_.code_model == "medium" ||
-            options_.code_model == "large") {
+            options_.code_model == CodeModel::Medium ||
+            options_.code_model == CodeModel::Large) {
             return;
         }
         std::vector<const machine::Instruction*> definitions(
@@ -2133,14 +2240,14 @@ private:
             const auto* splat = definition(value);
             if (!splat) return std::nullopt;
             const machine::ImmediateOperand* immediate{};
-            if (splat->opcode == "x86.vsplat.constant" &&
+            if (splat->opcode == Opcode::VsplatConstant &&
                 !splat->operands.empty()) {
                 immediate = std::get_if<machine::ImmediateOperand>(
                     &splat->operands.front());
-            } else if (splat->opcode == "x86.vsplat" &&
+            } else if (splat->opcode == Opcode::Vsplat &&
                        splat->uses.size() == 1) {
                 const auto* scalar = definition(splat->uses.front());
-                if (scalar && scalar->opcode == "x86.constant" &&
+                if (scalar && scalar->opcode == Opcode::Constant &&
                     !scalar->operands.empty()) {
                     immediate = std::get_if<machine::ImmediateOperand>(
                         &scalar->operands.front());
@@ -2150,7 +2257,7 @@ private:
             return immediate->value;
         };
         const auto shifted_mask = [&](machine::Register result,
-                                      std::string_view shift_opcode,
+                                      machine::TargetOpcodeId shift_opcode,
                                       std::uint64_t mask)
             -> std::optional<machine::Register> {
             const auto* shift = definition(result);
@@ -2164,7 +2271,7 @@ private:
                 return std::nullopt;
             }
             const auto* bit_and = definition(shift->uses.front());
-            if (!bit_and || bit_and->opcode != "x86.vand" ||
+            if (!bit_and || bit_and->opcode != Opcode::Vand ||
                 bit_and->uses.size() != 2) {
                 return std::nullopt;
             }
@@ -2180,7 +2287,7 @@ private:
         };
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.vor" ||
+                if (instruction.opcode != Opcode::Vor ||
                     instruction.uses.size() != 2 ||
                     instruction.defs.size() != 1 ||
                     instruction.operands.empty()) {
@@ -2195,20 +2302,20 @@ private:
                 }
                 const auto bits = instruction.defs.front().mode.bits;
                 if ((bits <= 128 &&
-                     !subtarget_.has_feature("ssse3")) ||
+                     !subtarget_.has_feature(Feature::Ssse3)) ||
                     (bits > 128 && bits <= 256 &&
-                     !subtarget_.has_feature("avx2")) ||
+                     !subtarget_.has_feature(Feature::Avx2)) ||
                     (bits > 256 &&
-                     !subtarget_.has_feature("avx512bw"))) {
+                     !subtarget_.has_feature(Feature::Avx512bw))) {
                     continue;
                 }
                 const auto match = [&](machine::Register left,
                                        machine::Register right)
                     -> std::optional<machine::Register> {
                     const auto low = shifted_mask(
-                        left, "x86.vshl", UINT64_C(0x00ff00ff00ff00ff));
+                        left, Opcode::Vshl, UINT64_C(0x00ff00ff00ff00ff));
                     const auto high = shifted_mask(
-                        right, "x86.vshr.u", UINT64_C(0xff00ff00ff00ff00));
+                        right, Opcode::VshrU, UINT64_C(0xff00ff00ff00ff00));
                     return low && high && *low == *high ? low : std::nullopt;
                 };
                 auto source = match(
@@ -2219,7 +2326,7 @@ private:
                 }
                 if (!source) continue;
                 const auto metadata = instruction.operands.back();
-                instruction.opcode = "x86.vbswap16";
+                instruction.opcode = Opcode::Vbswap16;
                 instruction.uses = {*source};
                 instruction.operands = {
                     register_operand(*source), metadata};
@@ -2229,14 +2336,14 @@ private:
 
     void hoist_vector_byte_swap_masks() {
         if (options_.optimization_effort < 3 ||
-            options_.optimize_for != "speed" ||
+            options_.optimize_for != OptimizationGoal::Speed ||
             current_.entry.value >= current_.blocks.size()) {
             return;
         }
         std::unordered_map<unsigned, unsigned> counts;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.opcode == "x86.vbswap16" &&
+                if (instruction.opcode == Opcode::Vbswap16 &&
                     instruction.defs.size() == 1) {
                     ++counts[instruction.defs.front().mode.bits];
                 }
@@ -2250,7 +2357,7 @@ private:
                     return std::any_of(
                         block.instructions.begin(), block.instructions.end(),
                         [&](const machine::Instruction& instruction) {
-                            return instruction.opcode == "x86.vbswap16" &&
+                            return instruction.opcode == Opcode::Vbswap16 &&
                                    instruction.defs.size() == 1 &&
                                    instruction.defs.front().mode.bits == bits;
                         });
@@ -2259,7 +2366,7 @@ private:
             const auto instruction_found = std::find_if(
                 found->instructions.begin(), found->instructions.end(),
                 [&](const machine::Instruction& instruction) {
-                    return instruction.opcode == "x86.vbswap16" &&
+                    return instruction.opcode == Opcode::Vbswap16 &&
                            instruction.defs.size() == 1 &&
                            instruction.defs.front().mode.bits == bits;
                 });
@@ -2285,7 +2392,7 @@ private:
             const auto mask = machine::Register::virtual_register(id, mode);
             for (auto& block : current_.blocks) {
                 for (auto& instruction : block.instructions) {
-                    if (instruction.opcode != "x86.vbswap16" ||
+                    if (instruction.opcode != Opcode::Vbswap16 ||
                         instruction.defs.size() != 1 ||
                         instruction.defs.front().mode.bits != bits) {
                         continue;
@@ -2297,15 +2404,15 @@ private:
                 }
             }
             auto materialize = target_instruction(
-                "x86.vbswap16.mask", instruction_found->location);
+                Opcode::Vbswap16Mask, instruction_found->location);
             materialize.defs.push_back(mask);
             auto& entry = current_.blocks[current_.entry.value];
             const auto position = std::find_if(
                 entry.instructions.begin(), entry.instructions.end(),
                 [](const machine::Instruction& instruction) {
-                    return instruction.opcode != "x86.phi" &&
-                           instruction.opcode != "x86.fphi" &&
-                           instruction.opcode != "x86.vphi";
+                    return instruction.opcode != Opcode::Phi &&
+                           instruction.opcode != Opcode::Fphi &&
+                           instruction.opcode != Opcode::Vphi;
                 });
             entry.instructions.insert(position, std::move(materialize));
         }
@@ -2315,8 +2422,8 @@ private:
         if (!options_.tree_dce) return;
         const auto count = current_.virtual_registers.size();
         const unsigned native_vector_bits =
-            subtarget_.has_feature("avx512f") ? 512U :
-            subtarget_.has_feature("avx2") ? 256U : 128U;
+            subtarget_.has_feature(Feature::Avx512f) ? 512U :
+            subtarget_.has_feature(Feature::Avx2) ? 256U : 128U;
         bool changed = true;
         while (changed) {
             changed = false;
@@ -2392,7 +2499,7 @@ private:
         // inner loop.  Leave it unassigned and recreate it at each real use.
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.vsplat.constant" ||
+                if (instruction.opcode != Opcode::VsplatConstant ||
                     instruction.defs.size() != 1 ||
                     instruction.defs.front().kind !=
                         machine::RegisterKind::Virtual ||
@@ -2422,8 +2529,8 @@ private:
         // Medium and large data models cannot assume the pool is within a
         // signed 32-bit displacement, so retain their addressable fallback.
         if (options_.optimization_effort < 2 ||
-            options_.code_model == "medium" ||
-            options_.code_model == "large" ||
+            options_.code_model == CodeModel::Medium ||
+            options_.code_model == CodeModel::Large ||
             manual_plans_.find(current_.source)) {
             return;
         }
@@ -2441,9 +2548,9 @@ private:
                 }
                 const bool storage_boundary =
                     instruction.kind == machine::InstructionKind::Call ||
-                    instruction.opcode == "x86.phi" ||
-                    instruction.opcode == "x86.fphi" ||
-                    instruction.opcode == "x86.vphi";
+                    instruction.opcode == Opcode::Phi ||
+                    instruction.opcode == Opcode::Fphi ||
+                    instruction.opcode == Opcode::Vphi;
                 if (storage_boundary) {
                     for (const auto& use : instruction.uses) {
                         if (use.kind == machine::RegisterKind::Virtual &&
@@ -2453,8 +2560,8 @@ private:
                     }
                 }
                 const bool x87_conversion =
-                    (instruction.opcode == "x86.fextend" ||
-                     instruction.opcode == "x86.ftruncate") &&
+                    (instruction.opcode == Opcode::Fextend ||
+                     instruction.opcode == Opcode::Ftruncate) &&
                     (std::any_of(
                          instruction.uses.begin(), instruction.uses.end(),
                          [](const machine::Register& value) {
@@ -2476,7 +2583,7 @@ private:
         }
         for (auto& block : current_.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.fconstant" ||
+                if (instruction.opcode != Opcode::Fconstant ||
                     instruction.defs.size() != 1 ||
                     instruction.defs.front().kind !=
                         machine::RegisterKind::Virtual ||
@@ -2517,8 +2624,8 @@ private:
                         ++use_counts[use.id];
                     }
                 }
-                if ((instruction.opcode == "x86.constant" ||
-                     instruction.opcode == "x86.fconstant") &&
+                if ((instruction.opcode == Opcode::Constant ||
+                     instruction.opcode == Opcode::Fconstant) &&
                     instruction.defs.size() == 1 &&
                     instruction.defs.front().kind ==
                         machine::RegisterKind::Virtual &&
@@ -2546,7 +2653,7 @@ private:
                 const auto dead_lane_constant = [&](std::size_t position) {
                     if (position >= block.instructions.size()) return false;
                     const auto& instruction = block.instructions[position];
-                    return instruction.opcode == "x86.constant" &&
+                    return instruction.opcode == Opcode::Constant &&
                            instruction.defs.size() == 1 &&
                            instruction.defs.front().kind ==
                                machine::RegisterKind::Virtual &&
@@ -2584,19 +2691,19 @@ private:
                     (floating ||
                      first_extract.uses.front().mode.bits <= 128 ||
                      (first_extract.uses.front().mode.bits <= 256 &&
-                      subtarget_.has_feature("avx2")) ||
+                      subtarget_.has_feature(Feature::Avx2)) ||
                      (first_extract.uses.front().mode.bits == 512 &&
-                      subtarget_.has_feature("avx512f") &&
+                      subtarget_.has_feature(Feature::Avx512f) &&
                       (element_bits >= 32 ||
-                       subtarget_.has_feature("avx512bw")))) &&
+                       subtarget_.has_feature(Feature::Avx512bw)))) &&
                     (element_bits == 8 || element_bits == 16 ||
                      element_bits == 32 || element_bits == 64) &&
                     (!floating || element_bits == 64 ||
                      (options_.fast_math &&
-                      subtarget_.has_feature("avx"))) &&
+                      subtarget_.has_feature(Feature::Avx))) &&
                     (!floating || !options_.fast_math ||
                      first_extract.uses.front().mode.bits <= 256);
-                if (first_extract.opcode != "x86.vextract" ||
+                if (first_extract.opcode != Opcode::Vextract ||
                     !supported_shape || !first_lane ||
                     first_lane->high != 0 || first_lane->value != 0 ||
                     first_extract.uses.size() != 1 ||
@@ -2613,22 +2720,22 @@ private:
                 const bool lane_one_follows =
                     lane_one_position < block.instructions.size() &&
                     block.instructions[lane_one_position].opcode ==
-                        "x86.vextract";
+                        Opcode::Vextract;
                 const auto first_operation_position = lane_one_follows
                     ? lane_one_position + 1U : first_position + 1U;
-                std::string_view reduction_operation;
+                machine::TargetOpcodeId reduction_operation;
                 if (floating) {
-                    reduction_operation = "x86.fadd";
+                    reduction_operation = Opcode::Fadd;
                 } else if (first_operation_position <
                            block.instructions.size()) {
-                    const auto candidate = std::string_view(
-                        block.instructions[first_operation_position].opcode);
-                    if (candidate == "x86.add" || candidate == "x86.xor" ||
-                        candidate == "x86.and" || candidate == "x86.or") {
+                    const auto candidate =
+                        block.instructions[first_operation_position].opcode;
+                    if (candidate == Opcode::Add || candidate == Opcode::Xor ||
+                        candidate == Opcode::And || candidate == Opcode::Or) {
                         reduction_operation = candidate;
                     }
                 }
-                bool matches = !reduction_operation.empty() &&
+                bool matches = reduction_operation.valid() &&
                                vector.kind == machine::RegisterKind::Virtual &&
                                vector.id < count &&
                                vector.mode.bits == lanes * element_bits &&
@@ -2668,7 +2775,7 @@ private:
                         ? std::get_if<machine::ImmediateOperand>(
                               &extract.operands[2])
                         : nullptr;
-                    matches = extract.opcode == "x86.vextract" &&
+                    matches = extract.opcode == Opcode::Vextract &&
                               extract.uses.size() == 1 &&
                               extract.uses.front() == vector &&
                               extract.defs.size() == 1 && lane_operand &&
@@ -2701,18 +2808,18 @@ private:
                     continue;
                 }
 
-                std::string reduction_opcode;
+                machine::TargetOpcodeId reduction_opcode;
                 if (floating && !options_.fast_math) {
-                    reduction_opcode = "x86.vreduce.add.ordered";
-                } else if (reduction_operation == "x86.fadd" ||
-                           reduction_operation == "x86.add") {
-                    reduction_opcode = "x86.vreduce.add";
-                } else if (reduction_operation == "x86.xor") {
-                    reduction_opcode = "x86.vreduce.xor";
-                } else if (reduction_operation == "x86.and") {
-                    reduction_opcode = "x86.vreduce.and";
+                    reduction_opcode = Opcode::VreduceAddOrdered;
+                } else if (reduction_operation == Opcode::Fadd ||
+                           reduction_operation == Opcode::Add) {
+                    reduction_opcode = Opcode::VreduceAdd;
+                } else if (reduction_operation == Opcode::Xor) {
+                    reduction_opcode = Opcode::VreduceXor;
+                } else if (reduction_operation == Opcode::And) {
+                    reduction_opcode = Opcode::VreduceAnd;
                 } else {
-                    reduction_opcode = "x86.vreduce.or";
+                    reduction_opcode = Opcode::VreduceOr;
                 }
                 machine::Instruction reduction = target_instruction(
                     reduction_opcode, first_extract.location);
@@ -2747,39 +2854,37 @@ private:
         }
     }
 
-    static bool immediate_binary_opcode(std::string_view opcode) {
-        return opcode == "x86.add" || opcode == "x86.sub" ||
-               opcode == "x86.mul" || opcode == "x86.and" ||
-               opcode == "x86.or" || opcode == "x86.xor" ||
-               opcode == "x86.shl" || opcode == "x86.shr.s" ||
-               opcode == "x86.shr.u" || opcode == "x86.rotl" ||
-               opcode == "x86.rotr" || opcode.starts_with("x86.cmp.");
+    static bool immediate_binary_opcode(
+        machine::TargetOpcodeId opcode) {
+        return opcode == Opcode::Add || opcode == Opcode::Sub ||
+               opcode == Opcode::Mul || opcode == Opcode::And ||
+               opcode == Opcode::Or || opcode == Opcode::Xor ||
+               opcode == Opcode::Shl || opcode == Opcode::ShrS ||
+               opcode == Opcode::ShrU || opcode == Opcode::Rotl ||
+               opcode == Opcode::Rotr ||
+               has_property(opcode, OpcodeProperty::Comparison);
     }
 
-    static std::string_view binary_base_opcode(std::string_view opcode) {
-        for (const auto suffix : {std::string_view{".imm"},
-                                  std::string_view{".mem"}}) {
-            if (opcode.ends_with(suffix)) {
-                opcode.remove_suffix(suffix.size());
-                break;
-            }
-        }
-        return opcode;
+    static machine::TargetOpcodeId binary_base_opcode(
+        machine::TargetOpcodeId opcode) {
+        return x86_64::base_opcode(opcode);
     }
 
-    static bool immediate_commutative_opcode(std::string_view opcode) {
-        return opcode == "x86.add" || opcode == "x86.mul" ||
-               opcode == "x86.and" || opcode == "x86.or" ||
-               opcode == "x86.xor";
+    static bool immediate_commutative_opcode(
+        machine::TargetOpcodeId opcode) {
+        return opcode == Opcode::Add || opcode == Opcode::Mul ||
+               opcode == Opcode::And || opcode == Opcode::Or ||
+               opcode == Opcode::Xor;
     }
 
     static bool encodable_binary_immediate(
-        std::string_view opcode, const machine::ImmediateOperand& immediate,
+        machine::TargetOpcodeId opcode,
+        const machine::ImmediateOperand& immediate,
         unsigned bits) {
         if (immediate.high != 0 || bits > 64) return false;
-        if (opcode == "x86.shl" || opcode == "x86.shr.s" ||
-            opcode == "x86.shr.u" || opcode == "x86.rotl" ||
-            opcode == "x86.rotr" || bits <= 32) {
+        if (opcode == Opcode::Shl || opcode == Opcode::ShrS ||
+            opcode == Opcode::ShrU || opcode == Opcode::Rotl ||
+            opcode == Opcode::Rotr || bits <= 32) {
             return true;
         }
         const auto signed_value =
@@ -2795,7 +2900,7 @@ private:
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.opcode == "x86.constant" &&
+                if (instruction.opcode == Opcode::Constant &&
                     instruction.defs.size() == 1 &&
                     instruction.defs.front().kind ==
                         machine::RegisterKind::Virtual &&
@@ -2845,24 +2950,25 @@ private:
                 // tests.  Besides selecting the shorter TEST/Jcc form later,
                 // canonicalizing here removes an otherwise unencodable i64
                 // literal and its long-lived register.
-                std::optional<std::string> sign_comparison;
+                std::optional<machine::TargetOpcodeId> sign_comparison;
                 if (immediate.high == 0 && bits >= 1 && bits <= 64 &&
-                    instruction.opcode.starts_with("x86.cmp.")) {
+                    has_property(instruction.opcode,
+                                 OpcodeProperty::Comparison)) {
                     const auto sign_bit = std::uint64_t{1} << (bits - 1U);
                     const auto mask = bits == 64
                         ? std::numeric_limits<std::uint64_t>::max()
                         : (std::uint64_t{1} << bits) - 1U;
                     const auto literal = immediate.value & mask;
-                    if ((instruction.opcode == "x86.cmp.ult" &&
+                    if ((instruction.opcode == Opcode::CmpUlt &&
                          literal == sign_bit) ||
-                        (instruction.opcode == "x86.cmp.ule" &&
+                        (instruction.opcode == Opcode::CmpUle &&
                          literal == sign_bit - 1U)) {
-                        sign_comparison = "x86.cmp.sge.imm";
-                    } else if ((instruction.opcode == "x86.cmp.uge" &&
+                        sign_comparison = Opcode::CmpSgeImm;
+                    } else if ((instruction.opcode == Opcode::CmpUge &&
                                 literal == sign_bit) ||
-                               (instruction.opcode == "x86.cmp.ugt" &&
+                               (instruction.opcode == Opcode::CmpUgt &&
                                 literal == sign_bit - 1U)) {
-                        sign_comparison = "x86.cmp.slt.imm";
+                        sign_comparison = Opcode::CmpSltImm;
                     }
                 }
                 if (sign_comparison) {
@@ -2877,7 +2983,7 @@ private:
                         instruction.opcode, immediate, bits)) {
                     continue;
                 }
-                instruction.opcode += ".imm";
+                instruction.opcode = immediate_opcode(instruction.opcode);
                 instruction.operands[1] = immediate;
                 instruction.uses.pop_back();
                 if (uses[constant.id] != 0) --uses[constant.id];
@@ -2887,8 +2993,8 @@ private:
             std::erase_if(
                 block.instructions,
                 [&](const machine::Instruction& instruction) {
-                    return (instruction.opcode == "x86.constant" ||
-                            instruction.opcode == "x86.fconstant") &&
+                    return (instruction.opcode == Opcode::Constant ||
+                            instruction.opcode == Opcode::Fconstant) &&
                            instruction.defs.size() == 1 &&
                            instruction.defs.front().kind ==
                                machine::RegisterKind::Virtual &&
@@ -2921,9 +3027,10 @@ private:
                 for (std::size_t index = 0;
                      index < block.instructions.size(); ++index) {
                     auto& instruction = block.instructions[index];
-                    const auto additive = [](std::string_view opcode) {
-                        return opcode == "x86.add.imm" ||
-                               opcode == "x86.sub.imm";
+                    const auto additive = [](
+                        machine::TargetOpcodeId opcode) {
+                        return opcode == Opcode::AddImm ||
+                               opcode == Opcode::SubImm;
                     };
                     if (additive(instruction.opcode) &&
                         instruction.uses.size() == 1 &&
@@ -2959,7 +3066,7 @@ private:
                                     const auto delta = [&](
                                         const machine::Instruction& item,
                                         std::uint64_t immediate) {
-                                        return item.opcode == "x86.sub.imm"
+                                        return item.opcode == Opcode::SubImm
                                             ? (std::uint64_t{0} - immediate) &
                                                   mask
                                             : immediate & mask;
@@ -2987,7 +3094,7 @@ private:
                                         immediate.high = 0;
                                         if (combined == 0) {
                                             instruction.opcode =
-                                                "x86.reinterpret";
+                                                Opcode::Reinterpret;
                                             instruction.operands.resize(1);
                                         } else if (negative != 0 &&
                                                    negative < combined &&
@@ -2995,13 +3102,13 @@ private:
                                                        std::numeric_limits<
                                                            std::uint32_t>::max()) {
                                             instruction.opcode =
-                                                "x86.sub.imm";
+                                                Opcode::SubImm;
                                             immediate.value = negative;
                                             instruction.operands[1] =
                                                 immediate;
                                         } else {
                                             instruction.opcode =
-                                                "x86.add.imm";
+                                                Opcode::AddImm;
                                             instruction.operands[1] =
                                                 immediate;
                                         }
@@ -3039,14 +3146,14 @@ private:
     void eliminate_redundant_machine_expressions() {
         if (!options_.tree_fre) return;
         const auto eligible = [](const machine::Instruction& instruction) {
-            return (instruction.opcode == "x86.add.imm" ||
-                    instruction.opcode == "x86.sub.imm" ||
-                    instruction.opcode == "x86.and.imm" ||
-                    instruction.opcode == "x86.or.imm" ||
-                    instruction.opcode == "x86.xor.imm" ||
-                    instruction.opcode == "x86.shl.imm" ||
-                    instruction.opcode == "x86.shr.s.imm" ||
-                    instruction.opcode == "x86.shr.u.imm") &&
+            return (instruction.opcode == Opcode::AddImm ||
+                    instruction.opcode == Opcode::SubImm ||
+                    instruction.opcode == Opcode::AndImm ||
+                    instruction.opcode == Opcode::OrImm ||
+                    instruction.opcode == Opcode::XorImm ||
+                    instruction.opcode == Opcode::ShlImm ||
+                    instruction.opcode == Opcode::ShrSImm ||
+                    instruction.opcode == Opcode::ShrUImm) &&
                 instruction.kind == machine::InstructionKind::Target &&
                 instruction.uses.size() == 1 &&
                 instruction.defs.size() == 1 &&
@@ -3137,17 +3244,17 @@ private:
                 return false;
             }
             const auto& opcode = instruction.opcode;
-            return opcode == "x86.load" || opcode == "x86.fload" ||
-                opcode == "x86.vload" ||
-                opcode == "x86.pointer.load" ||
-                opcode == "x86.fpointer.load" ||
-                opcode == "x86.vpointer.load" ||
-                opcode == "x86.indexed.load" ||
-                opcode == "x86.findexed.load" ||
-                opcode == "x86.vindexed.load" ||
-                opcode == "x86.global.load" ||
-                opcode == "x86.fglobal.load" ||
-                opcode == "x86.vglobal.load";
+            return opcode == Opcode::Load || opcode == Opcode::Fload ||
+                opcode == Opcode::Vload ||
+                opcode == Opcode::PointerLoad ||
+                opcode == Opcode::FpointerLoad ||
+                opcode == Opcode::VpointerLoad ||
+                opcode == Opcode::IndexedLoad ||
+                opcode == Opcode::FindexedLoad ||
+                opcode == Opcode::VindexedLoad ||
+                opcode == Opcode::GlobalLoad ||
+                opcode == Opcode::FglobalLoad ||
+                opcode == Opcode::VglobalLoad;
         };
         const auto same_operand = [](const machine::Operand& left,
                                      const machine::Operand& right) {
@@ -3253,14 +3360,14 @@ private:
 
     void fuse_scalar_division_results() {
         if (!options_.peephole2) return;
-        const auto quotient_kind = [](std::string_view opcode) {
-            return opcode == "x86.sdiv" || opcode == "x86.udiv";
+        const auto quotient_kind = [](machine::TargetOpcodeId opcode) {
+            return opcode == Opcode::Sdiv || opcode == Opcode::Udiv;
         };
-        const auto remainder_kind = [](std::string_view opcode) {
-            return opcode == "x86.srem" || opcode == "x86.urem";
+        const auto remainder_kind = [](machine::TargetOpcodeId opcode) {
+            return opcode == Opcode::Srem || opcode == Opcode::Urem;
         };
-        const auto signed_kind = [](std::string_view opcode) {
-            return opcode == "x86.sdiv" || opcode == "x86.srem";
+        const auto signed_kind = [](machine::TargetOpcodeId opcode) {
+            return opcode == Opcode::Sdiv || opcode == Opcode::Srem;
         };
         for (auto& block : current_.blocks) {
             std::unordered_set<std::size_t> removed;
@@ -3291,7 +3398,7 @@ private:
                     }
                     machine::Instruction combined = target_instruction(
                         signed_kind(candidate.opcode)
-                            ? "x86.sdivrem" : "x86.udivrem",
+                            ? Opcode::Sdivrem : Opcode::Udivrem,
                         candidate.location);
                     combined.operands = candidate.operands;
                     combined.uses = candidate.uses;
@@ -3325,7 +3432,7 @@ private:
             count);
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.opcode != "x86.constant" ||
+                if (instruction.opcode != Opcode::Constant ||
                     instruction.defs.size() != 1 ||
                     instruction.operands.size() != 1) {
                     continue;
@@ -3372,7 +3479,7 @@ private:
                                         unsigned bits)
                 -> const machine::Instruction* {
                 const auto* subtract = definition(candidate);
-                if (!subtract || subtract->opcode != "x86.sub" ||
+                if (!subtract || subtract->opcode != Opcode::Sub ||
                     subtract->uses.size() != 2 ||
                     subtract->uses[1] != direct ||
                     subtract->uses[0].kind !=
@@ -3388,7 +3495,7 @@ private:
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
                 auto& combine = block.instructions[index];
-                if (combine.opcode != "x86.or" ||
+                if (combine.opcode != Opcode::Or ||
                     combine.uses.size() != 2 || combine.defs.size() != 1) {
                     continue;
                 }
@@ -3405,17 +3512,17 @@ private:
                 }
                 const machine::Instruction* direct_shift = nullptr;
                 const machine::Instruction* complement_shift = nullptr;
-                std::string_view opcode;
-                if (first->opcode == "x86.shl" &&
-                    second->opcode == "x86.shr.u") {
+                machine::TargetOpcodeId opcode;
+                if (first->opcode == Opcode::Shl &&
+                    second->opcode == Opcode::ShrU) {
                     direct_shift = first;
                     complement_shift = second;
-                    opcode = "x86.rotl";
-                } else if (first->opcode == "x86.shr.u" &&
-                           second->opcode == "x86.shl") {
+                    opcode = Opcode::Rotl;
+                } else if (first->opcode == Opcode::ShrU &&
+                           second->opcode == Opcode::Shl) {
                     direct_shift = first;
                     complement_shift = second;
-                    opcode = "x86.rotr";
+                    opcode = Opcode::Rotr;
                 } else {
                     continue;
                 }
@@ -3449,7 +3556,7 @@ private:
                         continue;
                     }
                 }
-                combine.opcode = std::string(opcode);
+                combine.opcode = opcode;
                 combine.uses = {
                     direct_shift->uses[0], direct_shift->uses[1]};
                 combine.operands = {
@@ -3489,7 +3596,7 @@ private:
             std::erase_if(
                 block.instructions,
                 [&](const machine::Instruction& instruction) {
-                    return instruction.opcode == "x86.constant" &&
+                    return instruction.opcode == Opcode::Constant &&
                            instruction.defs.size() == 1 &&
                            instruction.defs.front().kind ==
                                machine::RegisterKind::Virtual &&
@@ -3538,14 +3645,18 @@ private:
                 continue;
             }
             const auto base = binary_base_opcode(definition->opcode);
-            const bool comparison = base.starts_with("x86.cmp.");
-            const bool iszero = definition->opcode == "x86.iszero";
+            const bool comparison =
+                has_property(base, OpcodeProperty::Comparison) &&
+                !has_property(base, OpcodeProperty::Floating) &&
+                !has_property(base, OpcodeProperty::Vector);
+            const bool iszero = definition->opcode == Opcode::Iszero;
             if (!comparison && !iszero) continue;
 
             const auto truth = terminator.operands[1];
             const auto falsity = terminator.operands[2];
-            if ((base == "x86.cmp.eq" || base == "x86.cmp.ne") &&
-                definition->opcode.ends_with(".imm") &&
+            if ((base == Opcode::CmpEq || base == Opcode::CmpNe) &&
+                has_property(definition->opcode,
+                             OpcodeProperty::Immediate) &&
                 definition->uses.size() == 1 &&
                 definition->operands.size() >= 2) {
                 const auto* zero = std::get_if<machine::ImmediateOperand>(
@@ -3561,14 +3672,14 @@ private:
                     masked.kind == machine::RegisterKind::Virtual &&
                     uses[masked.id] == 1 &&
                     mask_definition != definition &&
-                    mask_definition->opcode == "x86.and.imm" &&
+                    mask_definition->opcode == Opcode::AndImm &&
                     mask_definition->uses.size() == 1 &&
                     mask_definition->operands.size() >= 2 &&
                     !mask_definition->patch &&
                     !mask_definition->has_side_effects) {
                     terminator.condition_predicate =
-                        base == "x86.cmp.eq" ? "x86.test.eq.imm"
-                                             : "x86.test.ne.imm";
+                        base == Opcode::CmpEq ? Opcode::TestEqImm
+                                             : Opcode::TestNeImm;
                     terminator.uses = mask_definition->uses;
                     terminator.operands = {
                         mask_definition->operands.front(), truth, falsity,
@@ -3579,7 +3690,8 @@ private:
                 }
             }
             terminator.condition_predicate = iszero
-                ? std::string("x86.cmp.eq.imm") : definition->opcode;
+                ? machine::TargetOpcodeId{Opcode::CmpEqImm}
+                : definition->opcode;
             terminator.uses = definition->uses;
             terminator.operands.clear();
             terminator.operands.push_back(definition->operands.front());
@@ -3601,7 +3713,7 @@ private:
 
     void form_dense_jump_tables() {
         if (options_.optimization_effort < 2 ||
-            options_.code_model != "small") {
+            options_.code_model != CodeModel::Small) {
             return;
         }
         const auto* table_base = find_register_view("rbx");
@@ -3629,7 +3741,7 @@ private:
                 const auto& terminator = owner.instructions.back();
                 if (terminator.kind !=
                         machine::InstructionKind::ConditionalBranch ||
-                    terminator.condition_predicate != "x86.cmp.eq.imm" ||
+                    terminator.condition_predicate != Opcode::CmpEqImm ||
                     terminator.uses.size() != 1 ||
                     terminator.operands.size() < 4) {
                     return std::nullopt;
@@ -3656,8 +3768,8 @@ private:
                 [](const machine::Instruction& instruction) {
                     return instruction.kind ==
                                machine::InstructionKind::Target &&
-                        (instruction.opcode == "x86.lifetime.start" ||
-                         instruction.opcode == "x86.lifetime.end");
+                        (instruction.opcode == Opcode::LifetimeStart ||
+                         instruction.opcode == Opcode::LifetimeEnd);
                 });
         };
         const auto has_phi = [&](machine::BlockId id) {
@@ -3665,9 +3777,9 @@ private:
                 current_.blocks[id.value].instructions.begin(),
                 current_.blocks[id.value].instructions.end(),
                 [](const machine::Instruction& instruction) {
-                    return instruction.opcode == "x86.phi" ||
-                        instruction.opcode == "x86.fphi" ||
-                        instruction.opcode == "x86.vphi";
+                    return instruction.opcode == Opcode::Phi ||
+                        instruction.opcode == Opcode::Fphi ||
+                        instruction.opcode == Opcode::Vphi;
                 });
         };
 
@@ -3730,7 +3842,7 @@ private:
                 });
             bool exhaustive_mask = false;
             if (selector_definition != root.instructions.end() - 1 &&
-                selector_definition->opcode == "x86.and.imm" &&
+                selector_definition->opcode == Opcode::AndImm &&
                 !selector_definition->operands.empty()) {
                 if (const auto* mask =
                         std::get_if<machine::ImmediateOperand>(
@@ -3835,7 +3947,7 @@ private:
                  selection_index < block.instructions.size();) {
                 auto selection = block.instructions.begin() +
                     static_cast<std::ptrdiff_t>(selection_index);
-                if (selection->opcode != "x86.select" ||
+                if (selection->opcode != Opcode::Select ||
                     !selection->condition_predicate.empty() ||
                     selection->uses.size() != 3 ||
                     selection->uses.front().kind !=
@@ -3860,8 +3972,11 @@ private:
                     continue;
                 }
                 const auto base = binary_base_opcode(definition->opcode);
-                const bool comparison = base.starts_with("x86.cmp.");
-                const bool iszero = definition->opcode == "x86.iszero";
+                const bool comparison =
+                    has_property(base, OpcodeProperty::Comparison) &&
+                    !has_property(base, OpcodeProperty::Floating) &&
+                    !has_property(base, OpcodeProperty::Vector);
+                const bool iszero = definition->opcode == Opcode::Iszero;
                 if (!comparison && !iszero) {
                     ++selection_index;
                     continue;
@@ -3871,8 +3986,9 @@ private:
                 const auto falsity = selection->uses[2];
                 const auto truth_operand = selection->operands[1];
                 const auto falsity_operand = selection->operands[2];
-                if ((base == "x86.cmp.eq" || base == "x86.cmp.ne") &&
-                    definition->opcode.ends_with(".imm") &&
+                if ((base == Opcode::CmpEq || base == Opcode::CmpNe) &&
+                    has_property(definition->opcode,
+                                 OpcodeProperty::Immediate) &&
                     definition->uses.size() == 1 &&
                     definition->operands.size() >= 2) {
                     const auto* zero =
@@ -3889,15 +4005,15 @@ private:
                         masked.kind == machine::RegisterKind::Virtual &&
                         uses[masked.id] == 1 &&
                         mask_definition != definition &&
-                        mask_definition->opcode == "x86.and.imm" &&
+                        mask_definition->opcode == Opcode::AndImm &&
                         mask_definition->uses.size() == 1 &&
                         mask_definition->operands.size() >= 2 &&
                         !mask_definition->patch &&
                         !mask_definition->has_side_effects) {
                         selection->condition_predicate =
-                            base == "x86.cmp.eq"
-                                ? "x86.test.eq.imm"
-                                : "x86.test.ne.imm";
+                            base == Opcode::CmpEq
+                                ? Opcode::TestEqImm
+                                : Opcode::TestNeImm;
                         selection->uses = mask_definition->uses;
                         selection->uses.push_back(truth);
                         selection->uses.push_back(falsity);
@@ -3912,7 +4028,7 @@ private:
                     }
                 }
                 selection->condition_predicate = iszero
-                    ? std::string("x86.cmp.eq.imm")
+                    ? machine::TargetOpcodeId{Opcode::CmpEqImm}
                     : definition->opcode;
                 selection->uses = definition->uses;
                 selection->uses.push_back(truth);
@@ -3934,7 +4050,7 @@ private:
     }
 
     void fuse_vector_sign_selects() {
-        if (!options_.if_conversion || !subtarget_.has_feature("avx")) {
+        if (!options_.if_conversion || !subtarget_.has_feature(Feature::Avx)) {
             return;
         }
         const auto count = current_.virtual_registers.size();
@@ -3973,14 +4089,14 @@ private:
             const auto* splat = definition(reg);
             if (!splat) return std::nullopt;
             const machine::ImmediateOperand* immediate = nullptr;
-            if (splat->opcode == "x86.vsplat.constant" &&
+            if (splat->opcode == Opcode::VsplatConstant &&
                 !splat->operands.empty()) {
                 immediate = std::get_if<machine::ImmediateOperand>(
                     &splat->operands.front());
-            } else if (splat->opcode == "x86.vsplat" &&
+            } else if (splat->opcode == Opcode::Vsplat &&
                        splat->uses.size() == 1) {
                 const auto* scalar = definition(splat->uses.front());
-                if (scalar && scalar->opcode == "x86.constant" &&
+                if (scalar && scalar->opcode == Opcode::Constant &&
                     !scalar->operands.empty()) {
                     immediate = std::get_if<machine::ImmediateOperand>(
                         &scalar->operands.front());
@@ -3993,7 +4109,7 @@ private:
         std::unordered_set<std::uint32_t> removed_definitions;
         for (auto& block : current_.blocks) {
             for (auto& select : block.instructions) {
-                if (select.opcode != "x86.vselect" ||
+                if (select.opcode != Opcode::Vselect ||
                     select.uses.size() != 3 ||
                     select.uses.front().kind !=
                         machine::RegisterKind::Virtual ||
@@ -4022,20 +4138,20 @@ private:
                 const auto rhs = vector_constant(compare->uses[1]);
                 bool true_when_sign{};
                 bool matched{};
-                if ((compare->opcode == "x86.vcmp.ult" ||
-                     compare->opcode == "x86.vcmp.uge") &&
+                if ((compare->opcode == Opcode::VcmpUlt ||
+                     compare->opcode == Opcode::VcmpUge) &&
                     rhs && *rhs == (1ULL << (shape->value - 1U))) {
-                    true_when_sign = compare->opcode == "x86.vcmp.uge";
+                    true_when_sign = compare->opcode == Opcode::VcmpUge;
                     matched = true;
-                } else if ((compare->opcode == "x86.vcmp.slt" ||
-                            compare->opcode == "x86.vcmp.sge") &&
+                } else if ((compare->opcode == Opcode::VcmpSlt ||
+                            compare->opcode == Opcode::VcmpSge) &&
                            rhs && *rhs == 0) {
-                    true_when_sign = compare->opcode == "x86.vcmp.slt";
+                    true_when_sign = compare->opcode == Opcode::VcmpSlt;
                     matched = true;
                 }
                 if (!matched) continue;
 
-                select.opcode = "x86.vselect.sign";
+                select.opcode = Opcode::VselectSign;
                 select.uses.front() = compare->uses.front();
                 if (!select.operands.empty()) {
                     select.operands.front() =
@@ -4075,8 +4191,8 @@ private:
             std::erase_if(
                 block.instructions,
                 [&](const machine::Instruction& instruction) {
-                    return (instruction.opcode == "x86.vsplat" ||
-                            instruction.opcode == "x86.vsplat.constant") &&
+                    return (instruction.opcode == Opcode::Vsplat ||
+                            instruction.opcode == Opcode::VsplatConstant) &&
                            instruction.defs.size() == 1 &&
                            instruction.defs.front().kind ==
                                machine::RegisterKind::Virtual &&
@@ -4112,9 +4228,9 @@ private:
             for (auto& forwarding : current_.blocks) {
                 const auto phi_instruction =
                     [](const machine::Instruction& instruction) {
-                        return instruction.opcode == "x86.phi" ||
-                            instruction.opcode == "x86.fphi" ||
-                            instruction.opcode == "x86.vphi";
+                        return instruction.opcode == Opcode::Phi ||
+                            instruction.opcode == Opcode::Fphi ||
+                            instruction.opcode == Opcode::Vphi;
                     };
                 const bool forwardable_prefix =
                     !forwarding.instructions.empty() &&
@@ -4125,9 +4241,9 @@ private:
                             return instruction.kind ==
                                        machine::InstructionKind::Target &&
                                    (instruction.opcode ==
-                                        "x86.lifetime.start" ||
+                                        Opcode::LifetimeStart ||
                                     instruction.opcode ==
-                                        "x86.lifetime.end" ||
+                                        Opcode::LifetimeEnd ||
                                     phi_instruction(instruction));
                         });
                 if (forwarding.id == current_.entry ||
@@ -4281,9 +4397,9 @@ private:
                     old_predecessors.begin(), old_predecessors.end());
 
                 for (auto& phi : target.instructions) {
-                    if (phi.opcode != "x86.phi" &&
-                        phi.opcode != "x86.fphi" &&
-                        phi.opcode != "x86.vphi") {
+                    if (phi.opcode != Opcode::Phi &&
+                        phi.opcode != Opcode::Fphi &&
+                        phi.opcode != Opcode::Vphi) {
                         continue;
                     }
                     for (std::size_t index = 0;
@@ -4368,26 +4484,26 @@ private:
                 }
             }
         }
-        const auto folded_opcode = [](std::string_view opcode) {
-            if (opcode == "x86.pointer.load") {
-                return std::string("x86.indexed.load");
+        const auto folded_opcode = [](machine::TargetOpcodeId opcode) {
+            if (opcode == Opcode::PointerLoad) {
+                return machine::TargetOpcodeId{Opcode::IndexedLoad};
             }
-            if (opcode == "x86.fpointer.load") {
-                return std::string("x86.findexed.load");
+            if (opcode == Opcode::FpointerLoad) {
+                return machine::TargetOpcodeId{Opcode::FindexedLoad};
             }
-            if (opcode == "x86.vpointer.load") {
-                return std::string("x86.vindexed.load");
+            if (opcode == Opcode::VpointerLoad) {
+                return machine::TargetOpcodeId{Opcode::VindexedLoad};
             }
-            if (opcode == "x86.vpointer.store") {
-                return std::string("x86.vindexed.store");
+            if (opcode == Opcode::VpointerStore) {
+                return machine::TargetOpcodeId{Opcode::VindexedStore};
             }
-            if (opcode == "x86.fpointer.store") {
-                return std::string("x86.findexed.store");
+            if (opcode == Opcode::FpointerStore) {
+                return machine::TargetOpcodeId{Opcode::FindexedStore};
             }
-            if (opcode == "x86.pointer.store") {
-                return std::string("x86.indexed.store");
+            if (opcode == Opcode::PointerStore) {
+                return machine::TargetOpcodeId{Opcode::IndexedStore};
             }
-            return std::string{};
+            return machine::TargetOpcodeId{};
         };
         for (auto& block : current_.blocks) {
             std::unordered_map<std::uint32_t, std::size_t> addresses;
@@ -4401,7 +4517,7 @@ private:
                         definitions[definition.id] = index;
                     }
                 }
-                if (instruction.opcode == "x86.indexed.address" &&
+                if (instruction.opcode == Opcode::IndexedAddress &&
                     instruction.defs.size() == 1 &&
                     instruction.defs.front().kind ==
                         machine::RegisterKind::Virtual) {
@@ -4414,9 +4530,9 @@ private:
                 auto& consumer = block.instructions[index];
                 const auto opcode = folded_opcode(consumer.opcode);
                 const bool store =
-                    consumer.opcode == "x86.pointer.store" ||
-                    consumer.opcode == "x86.fpointer.store" ||
-                    consumer.opcode == "x86.vpointer.store";
+                    consumer.opcode == Opcode::PointerStore ||
+                    consumer.opcode == Opcode::FpointerStore ||
+                    consumer.opcode == Opcode::VpointerStore;
                 if (opcode.empty() || consumer.uses.empty() ||
                     (!store && consumer.defs.size() != 1) ||
                     (store && (!consumer.defs.empty() ||
@@ -4444,7 +4560,7 @@ private:
                     ? consumer.uses[1].mode
                     : consumer.defs.front().mode;
                 const bool vector_store =
-                    consumer.opcode == "x86.vpointer.store";
+                    consumer.opcode == Opcode::VpointerStore;
                 if (!scale || (!vector_store && scale->value !=
                     mode_bytes(transported_mode))) {
                     continue;
@@ -4469,13 +4585,13 @@ private:
                  index < block.instructions.size(); ++index) {
                 auto& consumer = block.instructions[index];
                 const bool indexed_load =
-                    consumer.opcode == "x86.indexed.load" ||
-                    consumer.opcode == "x86.findexed.load" ||
-                    consumer.opcode == "x86.vindexed.load";
+                    consumer.opcode == Opcode::IndexedLoad ||
+                    consumer.opcode == Opcode::FindexedLoad ||
+                    consumer.opcode == Opcode::VindexedLoad;
                 const bool indexed_store =
-                    consumer.opcode == "x86.indexed.store" ||
-                    consumer.opcode == "x86.findexed.store" ||
-                    consumer.opcode == "x86.vindexed.store";
+                    consumer.opcode == Opcode::IndexedStore ||
+                    consumer.opcode == Opcode::FindexedStore ||
+                    consumer.opcode == Opcode::VindexedStore;
                 if ((!indexed_load && !indexed_store) ||
                     (indexed_load &&
                      (consumer.defs.size() != 1 ||
@@ -4497,8 +4613,8 @@ private:
                     continue;
                 }
                 const auto& additive = block.instructions[found->second];
-                if ((additive.opcode != "x86.add.imm" &&
-                     additive.opcode != "x86.sub.imm") ||
+                if ((additive.opcode != Opcode::AddImm &&
+                     additive.opcode != Opcode::SubImm) ||
                     additive.uses.size() != 1 ||
                     additive.operands.size() < 2) {
                     continue;
@@ -4532,7 +4648,7 @@ private:
                 const auto elements =
                     static_cast<std::int64_t>(immediate->value);
                 const auto signed_elements =
-                    additive.opcode == "x86.sub.imm" ? -elements : elements;
+                    additive.opcode == Opcode::SubImm ? -elements : elements;
                 if (signed_elements >
                         std::numeric_limits<std::int32_t>::max() /
                             static_cast<std::int64_t>(scale->value) ||
@@ -4600,7 +4716,7 @@ private:
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
                 auto& consumer = block.instructions[index];
-                if (consumer.opcode != "x86.vadd" ||
+                if (consumer.opcode != Opcode::Vadd ||
                     consumer.defs.size() != 1 ||
                     consumer.uses.size() != 2 ||
                     consumer.operands.size() < 3) {
@@ -4620,7 +4736,7 @@ private:
                         continue;
                     }
                     const auto& load = block.instructions[found->second];
-                    if (load.opcode != "x86.vindexed.load" ||
+                    if (load.opcode != Opcode::VindexedLoad ||
                         load.defs.size() != 1 || load.uses.size() != 2 ||
                         load.operands.size() < 3 ||
                         load.operands.size() > 4 || load.patch ||
@@ -4720,9 +4836,9 @@ private:
                 auto& consumer = block.instructions[index];
                 const auto base = binary_base_opcode(consumer.opcode);
                 const bool commutative =
-                    base == "x86.add" || base == "x86.mul" ||
-                    base == "x86.and" || base == "x86.or" ||
-                    base == "x86.xor";
+                    base == Opcode::Add || base == Opcode::Mul ||
+                    base == Opcode::And || base == Opcode::Or ||
+                    base == Opcode::Xor;
                 if (!commutative || consumer.opcode != base ||
                     consumer.defs.size() != 1 ||
                     consumer.uses.size() != 2 ||
@@ -4744,7 +4860,7 @@ private:
                         continue;
                     }
                     const auto& load = block.instructions[found->second];
-                    if (load.opcode != "x86.indexed.load" ||
+                    if (load.opcode != Opcode::IndexedLoad ||
                         load.defs.size() != 1 || load.uses.size() != 2 ||
                         load.operands.size() < 2 ||
                         load.operands.size() > 4 || load.patch ||
@@ -4778,7 +4894,7 @@ private:
                     if (crosses_write) continue;
 
                     const auto other = consumer.uses[1 - memory_index];
-                    consumer.opcode += ".mem";
+                    consumer.opcode = memory_opcode(consumer.opcode);
                     consumer.uses = {other, load.uses[0], load.uses[1]};
                     consumer.operands = {
                         machine::RegisterOperand{other}, load.operands[0],
@@ -4837,10 +4953,10 @@ private:
                  index < block.instructions.size(); ++index) {
                 auto& consumer = block.instructions[index];
                 const bool commutative =
-                    consumer.opcode == "x86.fadd" ||
-                    consumer.opcode == "x86.fmul";
-                const bool ordered = consumer.opcode == "x86.fsub" ||
-                    consumer.opcode == "x86.fdiv";
+                    consumer.opcode == Opcode::Fadd ||
+                    consumer.opcode == Opcode::Fmul;
+                const bool ordered = consumer.opcode == Opcode::Fsub ||
+                    consumer.opcode == Opcode::Fdiv;
                 if ((!commutative && !ordered) ||
                     consumer.defs.size() != 1 ||
                     consumer.uses.size() != 2 ||
@@ -4863,7 +4979,7 @@ private:
                         continue;
                     }
                     const auto& load = block.instructions[found->second];
-                    if (load.opcode != "x86.findexed.load" ||
+                    if (load.opcode != Opcode::FindexedLoad ||
                         load.defs.size() != 1 || load.uses.size() != 2 ||
                         load.operands.size() < 2 ||
                         load.operands.size() > 4 || load.patch ||
@@ -4897,7 +5013,7 @@ private:
                         });
                     if (crosses_write) continue;
                     const auto other = consumer.uses[1 - memory_index];
-                    consumer.opcode += ".mem";
+                    consumer.opcode = memory_opcode(consumer.opcode);
                     consumer.uses = {other, load.uses[0], load.uses[1]};
                     consumer.operands = {
                         machine::RegisterOperand{other}, load.operands[0],
@@ -4935,15 +5051,15 @@ private:
             instruction.has_side_effects || instruction.patch) {
             return true;
         }
-        if (instruction.opcode == "x86.phi" ||
-            instruction.opcode == "x86.fphi" ||
-            instruction.opcode.starts_with("x86.f") ||
-            instruction.opcode == "x86.sdiv" ||
-            instruction.opcode == "x86.udiv" ||
-            instruction.opcode == "x86.srem" ||
-            instruction.opcode == "x86.urem" ||
-            instruction.opcode == "x86.sdivrem" ||
-            instruction.opcode == "x86.udivrem") {
+        if (instruction.opcode == Opcode::Phi ||
+            instruction.opcode == Opcode::Fphi ||
+            has_property(instruction.opcode, OpcodeProperty::Floating) ||
+            instruction.opcode == Opcode::Sdiv ||
+            instruction.opcode == Opcode::Udiv ||
+            instruction.opcode == Opcode::Srem ||
+            instruction.opcode == Opcode::Urem ||
+            instruction.opcode == Opcode::Sdivrem ||
+            instruction.opcode == Opcode::Udivrem) {
             return true;
         }
         return false;
@@ -4957,7 +5073,7 @@ private:
         std::unordered_map<std::uint32_t, std::uint32_t>
             backedge_phi_sources;
         if (options_.optimization_effort >= 3 &&
-            options_.optimize_for == "speed") {
+            options_.optimize_for == OptimizationGoal::Speed) {
             const auto reaches_owner = [&](machine::BlockId start) {
                 std::vector<machine::BlockId> pending{start};
                 std::unordered_set<std::uint32_t> visited;
@@ -4978,9 +5094,9 @@ private:
                 if (!reaches_owner(successor)) continue;
                 for (const auto& phi :
                      current_.blocks.at(successor.value).instructions) {
-                    if ((phi.opcode != "x86.phi" &&
-                         phi.opcode != "x86.fphi" &&
-                         phi.opcode != "x86.vphi") ||
+                    if ((phi.opcode != Opcode::Phi &&
+                         phi.opcode != Opcode::Fphi &&
+                         phi.opcode != Opcode::Vphi) ||
                         phi.defs.size() != 1 ||
                         phi.defs.front().kind !=
                             machine::RegisterKind::Virtual) {
@@ -5068,11 +5184,11 @@ private:
             // a useful dependency-ordering estimate on every supported
             // x86-64 tuning profile.
             if (value.may_load) return 4U;
-            if (value.opcode == "x86.mul") return 3U;
-            if (value.opcode == "x86.label.address" ||
-                value.opcode == "x86.stack.address" ||
-                value.opcode == "x86.global.address" ||
-                value.opcode == "x86.indexed.address") return 2U;
+            if (value.opcode == Opcode::Mul) return 3U;
+            if (value.opcode == Opcode::LabelAddress ||
+                value.opcode == Opcode::StackAddress ||
+                value.opcode == Opcode::GlobalAddress ||
+                value.opcode == Opcode::IndexedAddress) return 2U;
             return 1U;
         };
         std::vector<unsigned> critical_height(count);
@@ -5094,7 +5210,7 @@ private:
         // a flag-preserving LEA chain and hide the flags-to-CMOV latency.
         std::vector<bool> prefer_early(count);
         if (options_.optimization_effort >= 3 &&
-            options_.optimize_for == "speed") {
+            options_.optimize_for == OptimizationGoal::Speed) {
             // A definition carried from this block into a phi on a genuine
             // backedge is next-iteration setup.  Once its current-iteration
             // uses have completed, start it ahead of an independent latency
@@ -5115,8 +5231,9 @@ private:
             }
             for (std::size_t index = 0; index < count; ++index) {
                 const auto& selection = instructions[begin + index];
-                if (selection.opcode != "x86.select" ||
-                    !selection.condition_predicate.starts_with("x86.test.") ||
+                if (selection.opcode != Opcode::Select ||
+                    !has_property(selection.condition_predicate,
+                                  OpcodeProperty::Test) ||
                     selection.uses.size() < 3) {
                     continue;
                 }
@@ -5151,8 +5268,8 @@ private:
         std::vector<std::size_t> order;
         order.reserve(count);
         const bool compact_schedule =
-            options_.optimize_for == "size" ||
-            options_.optimize_for == "minimum-size";
+            options_.optimize_for == OptimizationGoal::Size ||
+            options_.optimize_for == OptimizationGoal::MinimumSize;
         while (order.size() != count) {
             std::optional<std::size_t> best;
             int best_score = std::numeric_limits<int>::min();
@@ -5171,19 +5288,19 @@ private:
                 const auto candidate_base =
                     binary_base_opcode(candidate.opcode);
                 const bool destructive_update =
-                    candidate.opcode == "x86.neg" ||
-                    candidate.opcode == "x86.not" ||
-                    candidate_base == "x86.add" ||
-                    candidate_base == "x86.sub" ||
-                    candidate_base == "x86.mul" ||
-                    candidate_base == "x86.and" ||
-                    candidate_base == "x86.or" ||
-                    candidate_base == "x86.xor" ||
-                    candidate_base == "x86.shl" ||
-                    candidate_base == "x86.shr.s" ||
-                    candidate_base == "x86.shr.u" ||
-                    candidate_base == "x86.rotl" ||
-                    candidate_base == "x86.rotr";
+                    candidate.opcode == Opcode::Neg ||
+                    candidate.opcode == Opcode::Not ||
+                    candidate_base == Opcode::Add ||
+                    candidate_base == Opcode::Sub ||
+                    candidate_base == Opcode::Mul ||
+                    candidate_base == Opcode::And ||
+                    candidate_base == Opcode::Or ||
+                    candidate_base == Opcode::Xor ||
+                    candidate_base == Opcode::Shl ||
+                    candidate_base == Opcode::ShrS ||
+                    candidate_base == Opcode::ShrU ||
+                    candidate_base == Opcode::Rotl ||
+                    candidate_base == Opcode::Rotr;
                 if (compact_schedule && destructive_update &&
                     !candidate.defs.empty() && !candidate.uses.empty()) {
                     const auto source = candidate.uses.front();
@@ -5206,10 +5323,10 @@ private:
                         score += compact_schedule ? 16 : 4;
                     }
                 }
-                if (candidate.opcode == "x86.constant" ||
-                    candidate.opcode == "x86.label.address" ||
-                    candidate.opcode == "x86.stack.address" ||
-                    candidate.opcode == "x86.global.address") {
+                if (candidate.opcode == Opcode::Constant ||
+                    candidate.opcode == Opcode::LabelAddress ||
+                    candidate.opcode == Opcode::StackAddress ||
+                    candidate.opcode == Opcode::GlobalAddress) {
                     score -= 2;
                 }
                 if (!best || score > best_score ||
@@ -5546,20 +5663,21 @@ private:
         }
         const auto& opcode = instruction.opcode;
         const auto base = binary_base_opcode(opcode);
-        return opcode == "x86.constant" || opcode == "x86.expect" ||
-               opcode == "x86.intrinsic.noop" || base == "x86.add" ||
-               base == "x86.sub" || base == "x86.mul" ||
-               base == "x86.and" || base == "x86.or" ||
-               base == "x86.xor" || base == "x86.shl" ||
-               base == "x86.shr.s" || base == "x86.shr.u" ||
-               opcode == "x86.neg" || opcode == "x86.not" ||
-               opcode == "x86.iszero" || base.starts_with("x86.cmp.") ||
-               opcode == "x86.sext" || opcode == "x86.zext" ||
-               opcode == "x86.trunc" || opcode == "x86.reinterpret" ||
-               opcode == "x86.label.address" ||
-               opcode == "x86.stack.address" ||
-               opcode == "x86.global.address" ||
-               opcode == "x86.indexed.address";
+        return opcode == Opcode::Constant || opcode == Opcode::Expect ||
+               opcode == Opcode::IntrinsicNoop || base == Opcode::Add ||
+               base == Opcode::Sub || base == Opcode::Mul ||
+               base == Opcode::And || base == Opcode::Or ||
+               base == Opcode::Xor || base == Opcode::Shl ||
+               base == Opcode::ShrS || base == Opcode::ShrU ||
+               opcode == Opcode::Neg || opcode == Opcode::Not ||
+               opcode == Opcode::Iszero ||
+               has_property(base, OpcodeProperty::Comparison) ||
+               opcode == Opcode::Sext || opcode == Opcode::Zext ||
+               opcode == Opcode::Trunc || opcode == Opcode::Reinterpret ||
+               opcode == Opcode::LabelAddress ||
+               opcode == Opcode::StackAddress ||
+               opcode == Opcode::GlobalAddress ||
+               opcode == Opcode::IndexedAddress;
     }
 
     void schedule_across_blocks() {
@@ -5596,7 +5714,7 @@ private:
                 predecessor.successors.front() == successor.id;
             const bool speculate =
                 !linear && options_.optimization_effort >= 3 &&
-                options_.optimize_for == "speed" &&
+                options_.optimize_for == OptimizationGoal::Speed &&
                 kind == machine::InstructionKind::ConditionalBranch &&
                 std::find(predecessor.successors.begin(),
                           predecessor.successors.end(), successor.id) !=
@@ -5610,8 +5728,8 @@ private:
                 // Lifetime markers emit no code and carry no SSA register.
                 // Leave them on their original edge, but permit independent
                 // arithmetic after them to join the preceding trace region.
-                if (candidate.opcode == "x86.lifetime.start" ||
-                    candidate.opcode == "x86.lifetime.end") {
+                if (candidate.opcode == Opcode::LifetimeStart ||
+                    candidate.opcode == Opcode::LifetimeEnd) {
                     continue;
                 }
                 if (scheduling_barrier(candidate) ||
@@ -5649,7 +5767,7 @@ private:
             std::any_of(current_.stack_slots.begin(),
                         current_.stack_slots.end(),
                         [](const machine::StackSlot& slot) {
-                            return slot.physical_location.has_value();
+                            return slot.hard_register.has_value();
                         })) {
             return;
         }
@@ -5657,8 +5775,8 @@ private:
         if (count == 0) return;
         std::vector<bool> eligible(count, false);
         const unsigned native_vector_bits =
-            subtarget_.has_feature("avx512f") ? 512U :
-            subtarget_.has_feature("avx2") ? 256U : 128U;
+            subtarget_.has_feature(Feature::Avx512f) ? 512U :
+            subtarget_.has_feature(Feature::Avx2) ? 256U : 128U;
         const auto vector_preference = resolved_text(
             options_, "m.prefer-vector-width", "none");
         const unsigned allocatable_vector_bits =
@@ -5699,34 +5817,38 @@ private:
                                 instruction.defs.end(),
                                 vector_register_operand);
                 bool vector_register_safe =
-                    instruction.opcode == "x86.vphi" ||
-                    instruction.opcode == "x86.vsplat" ||
-                    instruction.opcode == "x86.vsplat.constant" ||
-                    instruction.opcode == "x86.vindexed.load" ||
-                    instruction.opcode == "x86.vindexed.store" ||
-                    instruction.opcode == "x86.vload" ||
-                    instruction.opcode == "x86.vstore" ||
-                    instruction.opcode == "x86.vpointer.load" ||
-                    instruction.opcode == "x86.vpointer.store" ||
-                    instruction.opcode == "x86.vglobal.load" ||
-                    instruction.opcode == "x86.vglobal.store" ||
-                    instruction.opcode == "x86.vadd" ||
-                    instruction.opcode == "x86.vsub" ||
-                    instruction.opcode == "x86.vand" ||
-                    instruction.opcode == "x86.vor" ||
-                    instruction.opcode == "x86.vxor" ||
-                    instruction.opcode == "x86.vbswap16" ||
-                    instruction.opcode == "x86.vbswap16.mask" ||
-                    instruction.opcode == "x86.vselect" ||
-                    instruction.opcode == "x86.vselect.sign";
-                if (subtarget_.has_feature("avx2") &&
-                    (instruction.opcode == "x86.vshl" ||
-                     instruction.opcode == "x86.vshr.s" ||
-                     instruction.opcode == "x86.vshr.u" ||
-                     instruction.opcode.starts_with("x86.vcmp."))) {
+                    instruction.opcode == Opcode::Vphi ||
+                    instruction.opcode == Opcode::Vsplat ||
+                    instruction.opcode == Opcode::VsplatConstant ||
+                    instruction.opcode == Opcode::VindexedLoad ||
+                    instruction.opcode == Opcode::VindexedStore ||
+                    instruction.opcode == Opcode::Vload ||
+                    instruction.opcode == Opcode::Vstore ||
+                    instruction.opcode == Opcode::VpointerLoad ||
+                    instruction.opcode == Opcode::VpointerStore ||
+                    instruction.opcode == Opcode::VglobalLoad ||
+                    instruction.opcode == Opcode::VglobalStore ||
+                    instruction.opcode == Opcode::Vadd ||
+                    instruction.opcode == Opcode::Vsub ||
+                    instruction.opcode == Opcode::Vand ||
+                    instruction.opcode == Opcode::Vor ||
+                    instruction.opcode == Opcode::Vxor ||
+                    instruction.opcode == Opcode::Vbswap16 ||
+                    instruction.opcode == Opcode::Vbswap16Mask ||
+                    instruction.opcode == Opcode::Vselect ||
+                    instruction.opcode == Opcode::VselectSign;
+                if (subtarget_.has_feature(Feature::Avx2) &&
+                    (instruction.opcode == Opcode::Vshl ||
+                     instruction.opcode == Opcode::VshrS ||
+                     instruction.opcode == Opcode::VshrU ||
+                     (has_property(instruction.opcode,
+                                   OpcodeProperty::Comparison) &&
+                      has_property(instruction.opcode,
+                                   OpcodeProperty::Vector)))) {
                     vector_register_safe = true;
                 }
-                if (instruction.opcode.starts_with("x86.vreduce.")) {
+                if (has_property(instruction.opcode,
+                                 OpcodeProperty::Reduction)) {
                     vector_register_safe = true;
                 }
                 const machine::ImmediateOperand* vector_shape = nullptr;
@@ -5740,24 +5862,24 @@ private:
                 }
                 const bool floating_vector = vector_shape &&
                     (vector_shape->high & (1ULL << 32U)) != 0;
-                if (instruction.opcode == "x86.vmul" ||
-                    instruction.opcode == "x86.vmul.imm") {
+                if (instruction.opcode == Opcode::Vmul ||
+                    instruction.opcode == Opcode::VmulImm) {
                     vector_register_safe = floating_vector ||
                         (vector_shape && vector_shape->value == 16) ||
                         (vector_shape && vector_shape->value == 32 &&
-                         subtarget_.has_feature("sse4.1")) ||
+                         subtarget_.has_feature(Feature::Sse41)) ||
                         (vector_shape && vector_shape->value == 64 &&
-                         (subtarget_.has_feature("avx2") ||
-                          subtarget_.has_feature("avx512dq")));
-                } else if (instruction.opcode == "x86.vsdiv") {
+                         (subtarget_.has_feature(Feature::Avx2) ||
+                          subtarget_.has_feature(Feature::Avx512dq)));
+                } else if (instruction.opcode == Opcode::Vsdiv) {
                     vector_register_safe = floating_vector;
                 }
-                if (instruction.opcode == "x86.vextract") {
+                if (instruction.opcode == Opcode::Vextract) {
                     vector_register_safe =
                         instruction.operands.size() >= 2 &&
                         std::holds_alternative<machine::ImmediateOperand>(
                             instruction.operands[1]);
-                } else if (instruction.opcode == "x86.vinsert") {
+                } else if (instruction.opcode == Opcode::Vinsert) {
                     vector_register_safe =
                         instruction.operands.size() >= 2 &&
                         std::holds_alternative<machine::ImmediateOperand>(
@@ -5767,8 +5889,8 @@ private:
                         vector_shape &&
                         ((floating_vector && vector_shape->value == 64) ||
                          (floating_vector && vector_shape->value == 32 &&
-                          subtarget_.has_feature("sse4.1")));
-                } else if (instruction.opcode == "x86.vcast") {
+                          subtarget_.has_feature(Feature::Sse41)));
+                } else if (instruction.opcode == Opcode::Vcast) {
                     std::vector<const machine::ImmediateOperand*> shapes;
                     for (const auto& operand : instruction.operands) {
                         if (const auto* shape =
@@ -5800,12 +5922,12 @@ private:
                 // color that chunked instructions cannot independently update.
                 if (has_zmm_value && vector_shape &&
                     vector_shape->value < 32 &&
-                    !subtarget_.has_feature("avx512bw") &&
-                    (instruction.opcode == "x86.vsplat" ||
-                     instruction.opcode == "x86.vsplat.constant" ||
-                     instruction.opcode == "x86.vadd" ||
-                     instruction.opcode == "x86.vsub" ||
-                     instruction.opcode == "x86.vmul")) {
+                    !subtarget_.has_feature(Feature::Avx512bw) &&
+                    (instruction.opcode == Opcode::Vsplat ||
+                     instruction.opcode == Opcode::VsplatConstant ||
+                     instruction.opcode == Opcode::Vadd ||
+                     instruction.opcode == Opcode::Vsub ||
+                     instruction.opcode == Opcode::Vmul)) {
                     vector_register_safe = false;
                 }
                 if (has_vector_register && !vector_register_safe) {
@@ -5817,10 +5939,10 @@ private:
                     }
                 }
                 const bool parameter =
-                    instruction.opcode == "x86.parameter" ||
-                    instruction.opcode == "x86.fparameter" ||
-                    instruction.opcode == "x86.vparameter" ||
-                    instruction.opcode == "x86.aggregate.parameter";
+                    instruction.opcode == Opcode::Parameter ||
+                    instruction.opcode == Opcode::Fparameter ||
+                    instruction.opcode == Opcode::Vparameter ||
+                    instruction.opcode == Opcode::AggregateParameter;
                 if (parameter) {
                     const auto parameter_index =
                         !instruction.operands.empty()
@@ -5894,8 +6016,8 @@ private:
                     }
                 }
                 const bool extended_float_cast =
-                    (instruction.opcode == "x86.fextend" ||
-                     instruction.opcode == "x86.ftruncate") &&
+                    (instruction.opcode == Opcode::Fextend ||
+                     instruction.opcode == Opcode::Ftruncate) &&
                     std::any_of(
                         instruction.uses.begin(), instruction.uses.end(),
                         [](const machine::Register& reg) {
@@ -5920,9 +6042,9 @@ private:
             std::uint32_t, std::unordered_set<std::uint32_t>>> phi_edge_uses(
                 current_.blocks.size());
         const auto is_phi = [](const machine::Instruction& instruction) {
-            return instruction.opcode == "x86.phi" ||
-                   instruction.opcode == "x86.fphi" ||
-                   instruction.opcode == "x86.vphi";
+            return instruction.opcode == Opcode::Phi ||
+                   instruction.opcode == Opcode::Fphi ||
+                   instruction.opcode == Opcode::Vphi;
         };
         for (const auto& block : current_.blocks) {
             auto& block_uses = uses[block.id.value];
@@ -6048,18 +6170,22 @@ private:
                                         });
                                 });
                         }
-                        if (instruction.opcode.starts_with("x86.atomic.") ||
-                            instruction.opcode.starts_with("x86.stack.") ||
-                            instruction.opcode.starts_with("x86.aggregate.") ||
-                            instruction.opcode.starts_with("x86.variadic.")) {
+                        if (has_property(instruction.opcode,
+                                         OpcodeProperty::Atomic) ||
+                            has_property(instruction.opcode,
+                                         OpcodeProperty::Stack) ||
+                            has_property(instruction.opcode,
+                                         OpcodeProperty::Aggregate) ||
+                            has_property(instruction.opcode,
+                                         OpcodeProperty::Variadic)) {
                             return false;
                         }
                         const auto base =
                             binary_base_opcode(instruction.opcode);
-                        if (base == "x86.sdiv" || base == "x86.udiv" ||
-                            base == "x86.srem" || base == "x86.urem" ||
-                            base == "x86.sdivrem" ||
-                            base == "x86.udivrem") {
+                        if (base == Opcode::Sdiv || base == Opcode::Udiv ||
+                            base == Opcode::Srem || base == Opcode::Urem ||
+                            base == Opcode::Sdivrem ||
+                            base == Opcode::Udivrem) {
                             return false;
                         }
                         return std::none_of(
@@ -6108,39 +6234,39 @@ private:
                     }
                     return false;
                 };
-                if ((opcode == "x86.fparameter" ||
-                     opcode == "x86.fconstant" ||
-                     opcode == "x86.fphi" ||
-                     opcode == "x86.findexed.load" ||
-                     opcode == "x86.findexed.store" ||
-                     opcode == "x86.indexed.store" ||
-                     base == "x86.fadd" || base == "x86.fsub" ||
-                     base == "x86.fmul" || base == "x86.fdiv") &&
+                if ((opcode == Opcode::Fparameter ||
+                     opcode == Opcode::Fconstant ||
+                     opcode == Opcode::Fphi ||
+                     opcode == Opcode::FindexedLoad ||
+                     opcode == Opcode::FindexedStore ||
+                     opcode == Opcode::IndexedStore ||
+                     base == Opcode::Fadd || base == Opcode::Fsub ||
+                     base == Opcode::Fmul || base == Opcode::Fdiv) &&
                     scalar_simd()) {
                     // Ordinary f32/f64 paths use SIMD and, when needed,
                     // RAX/RCX. R10/R11 are only implicit in the wide-float
                     // and indirect-memory paths excluded here.
                     return true;
                 }
-                if (opcode == "x86.vphi" || opcode == "x86.vsplat" ||
-                    opcode == "x86.vsplat.constant" ||
-                    opcode == "x86.vindexed.load" ||
-                    opcode == "x86.vindexed.store" ||
-                    opcode == "x86.vpointer.load" ||
-                    opcode == "x86.vpointer.store" ||
-                    opcode == "x86.vload" || opcode == "x86.vstore" ||
-                    opcode.starts_with("x86.vreduce.") ||
-                    opcode == "x86.vextract") {
+                if (opcode == Opcode::Vphi || opcode == Opcode::Vsplat ||
+                    opcode == Opcode::VsplatConstant ||
+                    opcode == Opcode::VindexedLoad ||
+                    opcode == Opcode::VindexedStore ||
+                    opcode == Opcode::VpointerLoad ||
+                    opcode == Opcode::VpointerStore ||
+                    opcode == Opcode::Vload || opcode == Opcode::Vstore ||
+                    has_property(opcode, OpcodeProperty::Reduction) ||
+                    opcode == Opcode::Vextract) {
                     return true;
                 }
-                if (opcode == "x86.vadd" || opcode == "x86.vsub" ||
-                    opcode == "x86.vmul" || opcode == "x86.vdiv" ||
-                    opcode == "x86.vsdiv") {
+                if (opcode == Opcode::Vadd || opcode == Opcode::Vsub ||
+                    opcode == Opcode::Vmul || opcode == Opcode::Vdiv ||
+                    opcode == Opcode::Vsdiv) {
                     // Packed floating arithmetic never enters the scalar
                     // integer fallback that reserves R10/R11.
                     if (floating_vector()) return true;
-                    if (opcode == "x86.vmul" &&
-                        subtarget_.has_feature("avx2")) {
+                    if (opcode == Opcode::Vmul &&
+                        subtarget_.has_feature(Feature::Avx2)) {
                         for (auto operand = instruction.operands.rbegin();
                              operand != instruction.operands.rend();
                              ++operand) {
@@ -6153,35 +6279,35 @@ private:
                     }
                     return false;
                 }
-                if (opcode == "x86.parameter" ||
-                    opcode == "x86.constant" ||
-                    opcode == "x86.patch" ||
-                    opcode == "x86.expect" ||
-                    opcode == "x86.select" ||
-                    opcode == "x86.intrinsic.noop" ||
-                    opcode == "x86.phi" ||
-                    opcode == "x86.lifetime.start" ||
-                    opcode == "x86.lifetime.end" ||
-                    opcode == "x86.load" || opcode == "x86.store" ||
-                    opcode == "x86.indexed.load" ||
-                    opcode == "x86.label.address" ||
-                    opcode == "x86.stack.address" ||
-                    opcode == "x86.global.address" ||
-                    opcode == "x86.indexed.address" ||
-                    opcode == "x86.neg" || opcode == "x86.not" ||
-                    opcode == "x86.iszero" || opcode == "x86.sext" ||
-                    opcode == "x86.zext" || opcode == "x86.trunc" ||
-                    opcode == "x86.reinterpret" || base == "x86.add" ||
-                    base == "x86.sub" || base == "x86.mul" ||
-                    base == "x86.and" || base == "x86.or" ||
-                    base == "x86.xor" || base == "x86.shl" ||
-                    base == "x86.shr.s" || base == "x86.shr.u" ||
-                    base == "x86.rotl" || base == "x86.rotr" ||
-                    opcode == "x86.sdiv" || opcode == "x86.udiv" ||
-                    opcode == "x86.srem" || opcode == "x86.urem" ||
-                    opcode == "x86.sdivrem" ||
-                    opcode == "x86.udivrem" ||
-                    base.starts_with("x86.cmp.")) {
+                if (opcode == Opcode::Parameter ||
+                    opcode == Opcode::Constant ||
+                    opcode == Opcode::Patch ||
+                    opcode == Opcode::Expect ||
+                    opcode == Opcode::Select ||
+                    opcode == Opcode::IntrinsicNoop ||
+                    opcode == Opcode::Phi ||
+                    opcode == Opcode::LifetimeStart ||
+                    opcode == Opcode::LifetimeEnd ||
+                    opcode == Opcode::Load || opcode == Opcode::Store ||
+                    opcode == Opcode::IndexedLoad ||
+                    opcode == Opcode::LabelAddress ||
+                    opcode == Opcode::StackAddress ||
+                    opcode == Opcode::GlobalAddress ||
+                    opcode == Opcode::IndexedAddress ||
+                    opcode == Opcode::Neg || opcode == Opcode::Not ||
+                    opcode == Opcode::Iszero || opcode == Opcode::Sext ||
+                    opcode == Opcode::Zext || opcode == Opcode::Trunc ||
+                    opcode == Opcode::Reinterpret || base == Opcode::Add ||
+                    base == Opcode::Sub || base == Opcode::Mul ||
+                    base == Opcode::And || base == Opcode::Or ||
+                    base == Opcode::Xor || base == Opcode::Shl ||
+                    base == Opcode::ShrS || base == Opcode::ShrU ||
+                    base == Opcode::Rotl || base == Opcode::Rotr ||
+                    opcode == Opcode::Sdiv || opcode == Opcode::Udiv ||
+                    opcode == Opcode::Srem || opcode == Opcode::Urem ||
+                    opcode == Opcode::Sdivrem ||
+                    opcode == Opcode::Udivrem ||
+                    has_property(base, OpcodeProperty::Comparison)) {
                     return std::none_of(
                         instruction.defs.begin(), instruction.defs.end(),
                         [](const auto& reg) { return reg.mode.bits > 64; }) &&
@@ -6259,16 +6385,17 @@ private:
                         }
                     }
                 }
-                if (instruction.opcode.ends_with(".mem") &&
+                if (has_property(instruction.opcode,
+                                 OpcodeProperty::Memory) &&
                     instruction.defs.size() == 1 &&
                     instruction.uses.size() >= 3) {
                     const auto target = instruction.defs.front();
                     const auto base =
                         binary_base_opcode(instruction.opcode);
                     const bool load_first_capable =
-                        base == "x86.add" || base == "x86.mul" ||
-                        base == "x86.and" || base == "x86.or" ||
-                        base == "x86.xor";
+                        base == Opcode::Add || base == Opcode::Mul ||
+                        base == Opcode::And || base == Opcode::Or ||
+                        base == Opcode::Xor;
                     // Scalar folded-memory arithmetic is emitted by first
                     // placing uses[0] in the two-address destination, unless
                     // allocation coalesces the result with an address input.
@@ -6294,7 +6421,7 @@ private:
                         interference[address.id].insert(target.id);
                     }
                 }
-                if (instruction.opcode == "x86.vcast" &&
+                if (instruction.opcode == Opcode::Vcast &&
                     !instruction.defs.empty() &&
                     !instruction.uses.empty()) {
                     const auto target = instruction.defs.front();
@@ -6310,7 +6437,7 @@ private:
                         interference[source.id].insert(target.id);
                     }
                 }
-                if (instruction.opcode == "x86.vreduce.add.ordered" &&
+                if (instruction.opcode == Opcode::VreduceAddOrdered &&
                     instruction.defs.size() == 1 &&
                     !instruction.uses.empty()) {
                     const auto target = instruction.defs.front();
@@ -6338,10 +6465,10 @@ private:
                         }
                     }
                 }
-                if ((instruction.opcode == "x86.vreduce.add" ||
-                     instruction.opcode == "x86.vreduce.xor" ||
-                     instruction.opcode == "x86.vreduce.and" ||
-                     instruction.opcode == "x86.vreduce.or") &&
+                if ((instruction.opcode == Opcode::VreduceAdd ||
+                     instruction.opcode == Opcode::VreduceXor ||
+                     instruction.opcode == Opcode::VreduceAnd ||
+                     instruction.opcode == Opcode::VreduceOr) &&
                     instruction.defs.size() == 1 &&
                     instruction.uses.size() == 2) {
                     const auto target = instruction.defs.front();
@@ -6355,7 +6482,7 @@ private:
                         interference[initial.id].insert(target.id);
                     }
                 }
-                if (instruction.opcode == "x86.select" &&
+                if (instruction.opcode == Opcode::Select &&
                     instruction.defs.size() == 1 &&
                     instruction.uses.size() >= 3) {
                     const auto target = instruction.defs.front();
@@ -6372,7 +6499,7 @@ private:
                         }
                     }
                 }
-                if (instruction.opcode == "x86.vsplat" &&
+                if (instruction.opcode == Opcode::Vsplat &&
                     instruction.defs.size() == 1 &&
                     instruction.uses.size() == 1) {
                     const auto target = instruction.defs.front();
@@ -6395,7 +6522,7 @@ private:
                 }
                 const bool edge_copy = options_.cprop_registers &&
                     (is_phi(instruction) ||
-                     instruction.opcode == "x86.expect");
+                     instruction.opcode == Opcode::Expect);
                 if (options_.cprop_registers && is_phi(instruction) &&
                     instruction.defs.size() == 1) {
                     const auto target = instruction.defs.front();
@@ -6427,37 +6554,37 @@ private:
                 }
                 const auto base = binary_base_opcode(instruction.opcode);
                 const bool destructive_candidate =
-                    instruction.opcode == "x86.neg" ||
-                    instruction.opcode == "x86.not" ||
-                    instruction.opcode == "x86.sext" ||
-                    instruction.opcode == "x86.zext" ||
-                    instruction.opcode == "x86.trunc" ||
-                    instruction.opcode == "x86.reinterpret" ||
-                    base == "x86.add" || base == "x86.sub" ||
-                    base == "x86.mul" || base == "x86.and" ||
-                    base == "x86.or" || base == "x86.xor" ||
-                    base == "x86.shl" || base == "x86.shr.s" ||
-                    base == "x86.shr.u" || base == "x86.rotl" ||
-                    base == "x86.rotr" ||
-                    instruction.opcode == "x86.fneg" ||
-                    instruction.opcode == "x86.fadd" ||
-                    instruction.opcode == "x86.fsub" ||
-                    instruction.opcode == "x86.fmul" ||
-                    instruction.opcode == "x86.fdiv" ||
-                    instruction.opcode == "x86.vinsert";
+                    instruction.opcode == Opcode::Neg ||
+                    instruction.opcode == Opcode::Not ||
+                    instruction.opcode == Opcode::Sext ||
+                    instruction.opcode == Opcode::Zext ||
+                    instruction.opcode == Opcode::Trunc ||
+                    instruction.opcode == Opcode::Reinterpret ||
+                    base == Opcode::Add || base == Opcode::Sub ||
+                    base == Opcode::Mul || base == Opcode::And ||
+                    base == Opcode::Or || base == Opcode::Xor ||
+                    base == Opcode::Shl || base == Opcode::ShrS ||
+                    base == Opcode::ShrU || base == Opcode::Rotl ||
+                    base == Opcode::Rotr ||
+                    instruction.opcode == Opcode::Fneg ||
+                    instruction.opcode == Opcode::Fadd ||
+                    instruction.opcode == Opcode::Fsub ||
+                    instruction.opcode == Opcode::Fmul ||
+                    instruction.opcode == Opcode::Fdiv ||
+                    instruction.opcode == Opcode::Vinsert;
                 // A two-address noncommutative form cannot overwrite its
                 // right operand before consuming it.  Model that destructive
                 // constraint explicitly instead of letting the emitter fall
                 // back to RAX/XMM0, where it could clobber another allocated
                 // live range.
                 const bool destructive_right_must_differ =
-                    base == "x86.sub" ||
-                    ((!subtarget_.has_feature("bmi2")) &&
-                     (base == "x86.shl" || base == "x86.shr.s" ||
-                      base == "x86.shr.u")) ||
-                    ((!subtarget_.has_feature("avx")) &&
-                     (instruction.opcode == "x86.fsub" ||
-                      instruction.opcode == "x86.fdiv"));
+                    base == Opcode::Sub ||
+                    ((!subtarget_.has_feature(Feature::Bmi2)) &&
+                     (base == Opcode::Shl || base == Opcode::ShrS ||
+                      base == Opcode::ShrU)) ||
+                    ((!subtarget_.has_feature(Feature::Avx)) &&
+                     (instruction.opcode == Opcode::Fsub ||
+                      instruction.opcode == Opcode::Fdiv));
                 if (destructive_right_must_differ &&
                     instruction.defs.size() == 1 &&
                     instruction.uses.size() >= 2) {
@@ -6478,9 +6605,9 @@ private:
                 }
                 const auto target = instruction.defs.front();
                 const bool commutative_candidate =
-                    base == "x86.add" || base == "x86.mul" ||
-                    base == "x86.and" || base == "x86.or" ||
-                    base == "x86.xor";
+                    base == Opcode::Add || base == Opcode::Mul ||
+                    base == Opcode::And || base == Opcode::Or ||
+                    base == Opcode::Xor;
                 const auto source_count = edge_copy
                     ? instruction.uses.size()
                     : commutative_candidate
@@ -6508,7 +6635,7 @@ private:
                  item != block.instructions.rend(); ++item) {
                 const bool phi = is_phi(*item);
                 std::optional<std::uint32_t> splat_source;
-                if (item->opcode == "x86.vsplat" &&
+                if (item->opcode == Opcode::Vsplat &&
                     item->defs.size() == 1 && item->uses.size() == 1) {
                     const auto target = item->defs.front();
                     const auto source = item->uses.front();
@@ -6537,12 +6664,12 @@ private:
                     live.erase(definition.id);
                 }
                 const bool scalar_division =
-                    item->opcode == "x86.sdiv" ||
-                    item->opcode == "x86.udiv" ||
-                    item->opcode == "x86.srem" ||
-                    item->opcode == "x86.urem" ||
-                    item->opcode == "x86.sdivrem" ||
-                    item->opcode == "x86.udivrem";
+                    item->opcode == Opcode::Sdiv ||
+                    item->opcode == Opcode::Udiv ||
+                    item->opcode == Opcode::Srem ||
+                    item->opcode == Opcode::Urem ||
+                    item->opcode == Opcode::Sdivrem ||
+                    item->opcode == Opcode::Udivrem;
                 if (scalar_division && rax && rcx && rdx) {
                     // DIV/IDIV consume RDX:RAX. An allocated divisor is used
                     // directly, so RCX remains available to values spanning
@@ -6579,8 +6706,8 @@ private:
                     }
                 }
                 const bool scalar_rotate =
-                    item->opcode == "x86.rotl" ||
-                    item->opcode == "x86.rotr";
+                    item->opcode == Opcode::Rotl ||
+                    item->opcode == Opcode::Rotr;
                 if (scalar_rotate && rcx) {
                     // Variable rotates use CL. The count may already reside
                     // there, but neither the destructive result nor a value
@@ -6743,8 +6870,8 @@ private:
             for (const auto& block : current_.blocks) {
                 for (const auto& instruction : block.instructions) {
                     if (rcx &&
-                        (instruction.opcode == "x86.rotl" ||
-                         instruction.opcode == "x86.rotr") &&
+                        (instruction.opcode == Opcode::Rotl ||
+                         instruction.opcode == Opcode::Rotr) &&
                         instruction.uses.size() >= 2) {
                         const auto count_value = instruction.uses[1];
                         if (count_value.kind ==
@@ -6865,8 +6992,8 @@ private:
                             }
                         }
                     }
-                    if (instruction.opcode != "x86.sdivrem" &&
-                        instruction.opcode != "x86.udivrem") {
+                    if (instruction.opcode != Opcode::Sdivrem &&
+                        instruction.opcode != Opcode::Udivrem) {
                         continue;
                     }
                     if (!instruction.defs.empty() &&
@@ -6958,9 +7085,9 @@ private:
             direct_result_endpoint_reserved = std::any_of(
                 current_.stack_slots.begin(), current_.stack_slots.end(),
                 [&](const machine::StackSlot& slot) {
-                    if (!slot.physical_location) return false;
+                    if (!slot.hard_register) return false;
                     const auto* view =
-                        find_register_view(*slot.physical_location);
+                        machine_register_view(*slot.hard_register);
                     return view && shares_register_storage(
                                        *view, *direct_result_view);
                 });
@@ -6974,9 +7101,9 @@ private:
                             machine::InstructionKind::Return ||
                         terminator.uses.size() != 1 ||
                         producer.kind != machine::InstructionKind::Target ||
-                        producer.opcode == "x86.phi" ||
-                        producer.opcode == "x86.fphi" ||
-                        producer.opcode == "x86.vphi" ||
+                        producer.opcode == Opcode::Phi ||
+                        producer.opcode == Opcode::Fphi ||
+                        producer.opcode == Opcode::Vphi ||
                         producer.defs.size() != 1) {
                         continue;
                     }
@@ -7049,9 +7176,9 @@ private:
                 return std::any_of(
                     block.instructions.begin(), block.instructions.end(),
                     [](const machine::Instruction& instruction) {
-                        return instruction.opcode == "x86.stack.save" ||
-                               instruction.opcode == "x86.stack.allocate" ||
-                               instruction.opcode == "x86.stack.restore";
+                        return instruction.opcode == Opcode::StackSave ||
+                               instruction.opcode == Opcode::StackAllocate ||
+                               instruction.opcode == Opcode::StackRestore;
                     });
             });
         const bool over_aligned_fixed_frame = std::any_of(
@@ -7062,9 +7189,9 @@ private:
         if (dynamic_stack_frame && over_aligned_fixed_frame) {
             std::unordered_set<std::uint16_t> unavailable;
             for (const auto& slot : current_.stack_slots) {
-                if (!slot.physical_location) continue;
+                if (!slot.hard_register) continue;
                 if (const auto* view =
-                        find_register_view(*slot.physical_location)) {
+                        machine_register_view(*slot.hard_register)) {
                     unavailable.insert(view->storage_id);
                 }
             }
@@ -7133,8 +7260,8 @@ private:
                         machine::VirtualRegisterClass::Vector);
         };
         const bool emitter_may_form_fma =
-            options_.fp_contract == "fast" &&
-            subtarget_.has_feature("fma");
+            options_.fp_contract == FpContractMode::Fast &&
+            subtarget_.has_feature(Feature::Fma);
         const auto rematerialized = [&](machine::Register value)
             -> const machine::ImmediateOperand* {
             if (value.kind != machine::RegisterKind::Virtual ||
@@ -7152,7 +7279,7 @@ private:
         // operands; zero or two-literal arithmetic would need XMM2 itself and
         // therefore fails this proof.
         const bool literal_xmm2_safe =
-            subtarget_.has_feature("avx2") && !emitter_may_form_fma &&
+            subtarget_.has_feature(Feature::Avx2) && !emitter_may_form_fma &&
             std::none_of(
                 current_.virtual_register_classes.begin(),
                 current_.virtual_register_classes.end(),
@@ -7169,13 +7296,14 @@ private:
                                 machine::InstructionKind::Call) {
                                 return false;
                             }
-                            if (instruction.opcode.starts_with("x86.v")) {
+                            if (has_property(instruction.opcode,
+                                             OpcodeProperty::Vector)) {
                                 return false;
                             }
-                            if (instruction.opcode != "x86.fadd" &&
-                                instruction.opcode != "x86.fsub" &&
-                                instruction.opcode != "x86.fmul" &&
-                                instruction.opcode != "x86.fdiv") {
+                            if (instruction.opcode != Opcode::Fadd &&
+                                instruction.opcode != Opcode::Fsub &&
+                                instruction.opcode != Opcode::Fmul &&
+                                instruction.opcode != Opcode::Fdiv) {
                                 return true;
                             }
                             if (instruction.uses.size() != 2) return false;
@@ -7184,8 +7312,8 @@ private:
                             const auto* right =
                                 rematerialized(instruction.uses[1]);
                             const bool commutative =
-                                instruction.opcode == "x86.fadd" ||
-                                instruction.opcode == "x86.fmul";
+                                instruction.opcode == Opcode::Fadd ||
+                                instruction.opcode == Opcode::Fmul;
                             if (commutative) {
                                 if (left && right) return false;
                                 const auto* literal = left ? left : right;
@@ -7195,7 +7323,7 @@ private:
                         });
                 });
         const bool extra_simd_colors_safe =
-            subtarget_.has_feature("avx2") &&
+            subtarget_.has_feature(Feature::Avx2) &&
             std::all_of(
                 entity.parameters.begin(), entity.parameters.end(),
                 [&](const hir::Parameter& parameter) {
@@ -7211,10 +7339,10 @@ private:
                         [&](const machine::Instruction& instruction) {
                             if (instruction.kind ==
                                     machine::InstructionKind::Call ||
-                                instruction.opcode.starts_with(
-                                    "x86.aggregate.") ||
-                                instruction.opcode.starts_with(
-                                    "x86.atomic.")) {
+                                has_property(instruction.opcode,
+                                             OpcodeProperty::Aggregate) ||
+                                has_property(instruction.opcode,
+                                             OpcodeProperty::Atomic)) {
                                 return false;
                             }
                             if (instruction.kind !=
@@ -7231,13 +7359,13 @@ private:
                                     is_simd_register);
                             if (!has_simd) return true;
                             if (emitter_may_form_fma &&
-                                (instruction.opcode == "x86.fadd" ||
-                                 instruction.opcode == "x86.fmul" ||
-                                 instruction.opcode == "x86.vadd" ||
-                                 instruction.opcode == "x86.vmul")) {
+                                (instruction.opcode == Opcode::Fadd ||
+                                 instruction.opcode == Opcode::Fmul ||
+                                 instruction.opcode == Opcode::Vadd ||
+                                 instruction.opcode == Opcode::Vmul)) {
                                 return false;
                             }
-                            if (instruction.opcode == "x86.vmul") {
+                            if (instruction.opcode == Opcode::Vmul) {
                                 const auto* shape = instruction.operands.empty()
                                     ? nullptr
                                     : std::get_if<machine::ImmediateOperand>(
@@ -7247,48 +7375,48 @@ private:
                                     return false;
                                 }
                             }
-                            if (instruction.opcode == "x86.vextract") {
+                            if (instruction.opcode == Opcode::Vextract) {
                                 return instruction.operands.size() >= 2 &&
                                     std::holds_alternative<
                                         machine::ImmediateOperand>(
                                             instruction.operands[1]);
                             }
-                            if (instruction.opcode.starts_with(
-                                    "x86.vreduce.")) {
+                            if (has_property(instruction.opcode,
+                                             OpcodeProperty::Reduction)) {
                                 return true;
                             }
                             const auto base = binary_base_opcode(
                                 instruction.opcode);
-                            return instruction.opcode == "x86.fparameter" ||
-                                   instruction.opcode == "x86.fconstant" ||
-                                   instruction.opcode == "x86.fphi" ||
-                                   instruction.opcode == "x86.findexed.load" ||
-                                   base == "x86.fadd" ||
-                                   base == "x86.fsub" ||
-                                   base == "x86.fmul" ||
-                                   base == "x86.fdiv" ||
-                                   instruction.opcode == "x86.vphi" ||
-                                   instruction.opcode == "x86.vsplat" ||
+                            return instruction.opcode == Opcode::Fparameter ||
+                                   instruction.opcode == Opcode::Fconstant ||
+                                   instruction.opcode == Opcode::Fphi ||
+                                   instruction.opcode == Opcode::FindexedLoad ||
+                                   base == Opcode::Fadd ||
+                                   base == Opcode::Fsub ||
+                                   base == Opcode::Fmul ||
+                                   base == Opcode::Fdiv ||
+                                   instruction.opcode == Opcode::Vphi ||
+                                   instruction.opcode == Opcode::Vsplat ||
                                    instruction.opcode ==
-                                       "x86.vsplat.constant" ||
-                                   instruction.opcode == "x86.vadd" ||
-                                   instruction.opcode == "x86.vsub" ||
-                                   instruction.opcode == "x86.vand" ||
-                                   instruction.opcode == "x86.vor" ||
-                                   instruction.opcode == "x86.vxor" ||
-                                   instruction.opcode == "x86.vbswap16" ||
-                                   instruction.opcode == "x86.vmul" ||
-                                   instruction.opcode == "x86.vmul.imm" ||
-                                   instruction.opcode == "x86.vsdiv" ||
-                                   instruction.opcode == "x86.vselect" ||
+                                       Opcode::VsplatConstant ||
+                                   instruction.opcode == Opcode::Vadd ||
+                                   instruction.opcode == Opcode::Vsub ||
+                                   instruction.opcode == Opcode::Vand ||
+                                   instruction.opcode == Opcode::Vor ||
+                                   instruction.opcode == Opcode::Vxor ||
+                                   instruction.opcode == Opcode::Vbswap16 ||
+                                   instruction.opcode == Opcode::Vmul ||
+                                   instruction.opcode == Opcode::VmulImm ||
+                                   instruction.opcode == Opcode::Vsdiv ||
+                                   instruction.opcode == Opcode::Vselect ||
                                    instruction.opcode ==
-                                       "x86.vselect.sign" ||
+                                       Opcode::VselectSign ||
                                    instruction.opcode ==
-                                       "x86.vindexed.load" ||
+                                       Opcode::VindexedLoad ||
                                    instruction.opcode ==
-                                       "x86.vindexed.store" ||
-                                   instruction.opcode == "x86.vload" ||
-                                   instruction.opcode == "x86.vstore";
+                                       Opcode::VindexedStore ||
+                                   instruction.opcode == Opcode::Vload ||
+                                   instruction.opcode == Opcode::Vstore;
                         });
                 });
         const auto collect_colors =
@@ -7381,61 +7509,62 @@ private:
                             }
                             const auto base =
                                 binary_base_opcode(instruction.opcode);
-                            if (instruction.opcode == "x86.parameter" ||
-                                instruction.opcode == "x86.constant" ||
-                                instruction.opcode == "x86.fconstant" ||
-                                instruction.opcode == "x86.fphi" ||
-                                instruction.opcode == "x86.findexed.load" ||
-                                base == "x86.fadd" ||
-                                base == "x86.fsub" ||
-                                base == "x86.fmul" ||
-                                base == "x86.fdiv" ||
-                                instruction.opcode == "x86.expect" ||
-                                instruction.opcode == "x86.select" ||
-                                instruction.opcode == "x86.intrinsic.noop" ||
-                                instruction.opcode == "x86.phi" ||
-                                instruction.opcode == "x86.lifetime.start" ||
-                                instruction.opcode == "x86.lifetime.end" ||
-                                instruction.opcode == "x86.indexed.load" ||
-                                instruction.opcode == "x86.indexed.store" ||
-                                instruction.opcode == "x86.findexed.store" ||
-                                base == "x86.add" || base == "x86.sub" ||
-                                base == "x86.mul" || base == "x86.and" ||
-                                base == "x86.or" || base == "x86.xor" ||
-                                base == "x86.shl" || base == "x86.shr.s" ||
-                                base == "x86.shr.u" ||
-                                base == "x86.rotl" ||
-                                base == "x86.rotr" ||
-                                instruction.opcode == "x86.sdiv" ||
-                                instruction.opcode == "x86.udiv" ||
-                                instruction.opcode == "x86.srem" ||
-                                instruction.opcode == "x86.urem" ||
-                                instruction.opcode == "x86.sdivrem" ||
-                                instruction.opcode == "x86.udivrem" ||
-                                base.starts_with("x86.cmp.") ||
-                                instruction.opcode == "x86.vphi" ||
-                                instruction.opcode == "x86.vsplat" ||
-                                instruction.opcode == "x86.vadd" ||
-                                instruction.opcode == "x86.vsub" ||
-                                instruction.opcode == "x86.vmul" ||
-                                instruction.opcode == "x86.vmul.imm" ||
-                                instruction.opcode == "x86.vsdiv" ||
-                                instruction.opcode == "x86.vindexed.load" ||
-                                instruction.opcode == "x86.vindexed.store" ||
-                                instruction.opcode == "x86.vload" ||
-                                instruction.opcode == "x86.vstore" ||
-                                instruction.opcode.starts_with(
-                                    "x86.vreduce.") ||
-                                instruction.opcode == "x86.vextract") {
+                            if (instruction.opcode == Opcode::Parameter ||
+                                instruction.opcode == Opcode::Constant ||
+                                instruction.opcode == Opcode::Fconstant ||
+                                instruction.opcode == Opcode::Fphi ||
+                                instruction.opcode == Opcode::FindexedLoad ||
+                                base == Opcode::Fadd ||
+                                base == Opcode::Fsub ||
+                                base == Opcode::Fmul ||
+                                base == Opcode::Fdiv ||
+                                instruction.opcode == Opcode::Expect ||
+                                instruction.opcode == Opcode::Select ||
+                                instruction.opcode == Opcode::IntrinsicNoop ||
+                                instruction.opcode == Opcode::Phi ||
+                                instruction.opcode == Opcode::LifetimeStart ||
+                                instruction.opcode == Opcode::LifetimeEnd ||
+                                instruction.opcode == Opcode::IndexedLoad ||
+                                instruction.opcode == Opcode::IndexedStore ||
+                                instruction.opcode == Opcode::FindexedStore ||
+                                base == Opcode::Add || base == Opcode::Sub ||
+                                base == Opcode::Mul || base == Opcode::And ||
+                                base == Opcode::Or || base == Opcode::Xor ||
+                                base == Opcode::Shl || base == Opcode::ShrS ||
+                                base == Opcode::ShrU ||
+                                base == Opcode::Rotl ||
+                                base == Opcode::Rotr ||
+                                instruction.opcode == Opcode::Sdiv ||
+                                instruction.opcode == Opcode::Udiv ||
+                                instruction.opcode == Opcode::Srem ||
+                                instruction.opcode == Opcode::Urem ||
+                                instruction.opcode == Opcode::Sdivrem ||
+                                instruction.opcode == Opcode::Udivrem ||
+                                has_property(base,
+                                             OpcodeProperty::Comparison) ||
+                                instruction.opcode == Opcode::Vphi ||
+                                instruction.opcode == Opcode::Vsplat ||
+                                instruction.opcode == Opcode::Vadd ||
+                                instruction.opcode == Opcode::Vsub ||
+                                instruction.opcode == Opcode::Vmul ||
+                                instruction.opcode == Opcode::VmulImm ||
+                                instruction.opcode == Opcode::Vsdiv ||
+                                instruction.opcode == Opcode::VindexedLoad ||
+                                instruction.opcode == Opcode::VindexedStore ||
+                                instruction.opcode == Opcode::Vload ||
+                                instruction.opcode == Opcode::Vstore ||
+                                has_property(instruction.opcode,
+                                             OpcodeProperty::Reduction) ||
+                                instruction.opcode == Opcode::Vextract) {
                                 return true;
                             }
-                            if (instruction.opcode == "x86.vxor") {
+                            if (instruction.opcode == Opcode::Vxor) {
                                 return instruction.uses.size() == 2 &&
                                        instruction.uses[0] ==
                                            instruction.uses[1];
                             }
                             if (instruction.opcode ==
-                                    "x86.vsplat.constant" &&
+                                    Opcode::VsplatConstant &&
                                 instruction.operands.size() >= 2) {
                                 const auto* shape =
                                     std::get_if<machine::ImmediateOperand>(
@@ -7452,13 +7581,13 @@ private:
             (direct_result_view->storage_name == "rax" ||
              direct_result_view->storage_name == "rcx");
         const bool extra_integer_colors_safe =
-            (subtarget_.has_feature("bmi2") ||
+            (subtarget_.has_feature(Feature::Bmi2) ||
              dynamic_integer_endpoint_safe) &&
             integer_opcode_set_safe;
         if (extra_integer_colors_safe) {
             const auto extra = collect_colors({"rax", "rcx"}, true);
-            if (options_.optimize_for == "size" ||
-                options_.optimize_for == "minimum-size") {
+            if (options_.optimize_for == OptimizationGoal::Size ||
+                options_.optimize_for == OptimizationGoal::MinimumSize) {
                 // Legacy registers avoid the extra REX bits carried by
                 // R8-R11. Prefer them when byte count is the objective.
                 integer_colors.insert(integer_colors.begin(),
@@ -7555,8 +7684,8 @@ private:
             }
         }
         auto preserved_integer_colors =
-            options_.optimize_for == "size" ||
-                    options_.optimize_for == "minimum-size"
+            options_.optimize_for == OptimizationGoal::Size ||
+                    options_.optimize_for == OptimizationGoal::MinimumSize
                 ? collect_colors(
                       {"rbx", "rsi", "rdi", "rbp", "r12", "r13",
                        "r14", "r15"},
@@ -7992,9 +8121,9 @@ private:
                 for (const auto predecessor : block.predecessors) {
                     std::vector<std::pair<std::string, std::string>> copies;
                     for (const auto& instruction : block.instructions) {
-                        if ((instruction.opcode != "x86.phi" &&
-                             instruction.opcode != "x86.fphi" &&
-                             instruction.opcode != "x86.vphi") ||
+                        if ((instruction.opcode != Opcode::Phi &&
+                             instruction.opcode != Opcode::Fphi &&
+                             instruction.opcode != Opcode::Vphi) ||
                             instruction.defs.empty()) {
                             continue;
                         }
@@ -8323,9 +8452,9 @@ private:
                 return std::any_of(
                     block.instructions.begin(), block.instructions.end(),
                     [](const machine::Instruction& instruction) {
-                        return instruction.opcode == "x86.stack.save" ||
-                               instruction.opcode == "x86.stack.allocate" ||
-                               instruction.opcode == "x86.stack.restore";
+                        return instruction.opcode == Opcode::StackSave ||
+                               instruction.opcode == Opcode::StackAllocate ||
+                               instruction.opcode == Opcode::StackRestore;
                     });
             });
         const bool dynamic_call_probe =
@@ -8349,7 +8478,7 @@ private:
             add_dynamic_save_slot("$dynamic.call.r10");
             add_dynamic_save_slot("$dynamic.call.r11");
         }
-        if (has_call && options_.code_model == "large") {
+        if (has_call && options_.code_model == CodeModel::Large) {
             add_dynamic_save_slot("$large.call.target");
         }
         const bool dynamic_realign =
@@ -8483,9 +8612,9 @@ private:
             for (const auto predecessor : block.predecessors) {
                 std::vector<Copy> copies;
                 for (const auto& instruction : block.instructions) {
-                    if ((instruction.opcode != "x86.phi" &&
-                         instruction.opcode != "x86.fphi" &&
-                         instruction.opcode != "x86.vphi") ||
+                    if ((instruction.opcode != Opcode::Phi &&
+                         instruction.opcode != Opcode::Fphi &&
+                         instruction.opcode != Opcode::Vphi) ||
                         instruction.defs.empty()) {
                         continue;
                     }
@@ -8506,7 +8635,7 @@ private:
                             location_key(target)) {
                             copies.push_back({
                                 source->value, target,
-                                instruction.opcode == "x86.vphi" ||
+                                instruction.opcode == Opcode::Vphi ||
                                     target.mode.bits > 64,
                                 false});
                         }
@@ -8614,58 +8743,132 @@ private:
         create_registers(source);
         create_stack_slots(source);
         lower_blocks(source);
-        hoist_parameter_captures();
-        propagate_machine_copies();
-        fold_splat_constants();
-        fold_vector_qword_multiply_immediates();
-        hoist_vector_qword_multiply_high_halves();
-        fold_vector_shift_immediates();
-        recognize_vector_byte_swaps();
-        hoist_vector_byte_swap_masks();
-        fuse_vector_reductions();
-        // Recognize literal rotates before scalar immediates consume the two
-        // shift-count registers.  The later invocation still handles
-        // variable complementary counts after the remaining combinations.
-        recognize_scalar_rotates();
-        select_binary_immediates();
-        combine_machine_immediates();
-        eliminate_redundant_machine_expressions();
-        eliminate_redundant_machine_loads();
-        fuse_scalar_division_results();
-        recognize_scalar_rotates();
-        propagate_machine_copies();
-        fuse_compare_selects();
-        fuse_vector_sign_selects();
-        fuse_compare_branches();
-        form_dense_jump_tables();
-        thread_forwarding_blocks();
-        fold_indexed_memory_addresses();
-        // Address folding exposes equivalent pointer/indexed load forms that
-        // were expressed through distinct temporary addresses initially.
-        eliminate_redundant_machine_loads();
-        fold_scalar_memory_operands();
-        fold_float_memory_operands();
-        fold_vector_memory_operands();
-        // Address/immediate and memory folding can consume the final use of
-        // setup values (notably vector splats). Remove those values before
-        // liveness and coloring so dead setup never creates a spill or a
-        // callee-saved register obligation.
-        eliminate_dead_machine_values();
-        schedule_block_layout();
-        schedule_across_blocks();
-        // Cross-block scheduling can consume the last real operation from a
-        // linear block. Thread the newly exposed jump-only edge as well.
-        thread_forwarding_blocks();
-        schedule_blocks();
-        select_rematerialization();
-        allocate_registers();
-        preserve_stronger_caller_contract();
-        create_wide_phi_temporary_if_needed();
         for (const auto& label : source.labels) {
             current_.labels.push_back(
                 {label.label, {label.block.value}});
         }
-        finalize_frame();
+
+        native::MachineFunctionPassManager passes;
+        using PassMethod = void (MachineLowerer::*)();
+        const auto add = [&](LoweringPass id, native::MachineStage stage,
+                             std::string_view name, PassMethod method) {
+            passes.add(
+                {{id}, stage, name},
+                [this, method](machine::Function&) {
+                    (this->*method)();
+                    return true;
+                });
+        };
+        using Stage = native::MachineStage;
+        add(LoweringPass::HoistParameterCaptures, Stage::Legalization,
+            "hoist-parameter-captures",
+            &MachineLowerer::hoist_parameter_captures);
+        add(LoweringPass::PropagateCopiesInitial, Stage::Canonicalization,
+            "propagate-copies", &MachineLowerer::propagate_machine_copies);
+        add(LoweringPass::FoldSplatConstants, Stage::InstructionCombining,
+            "fold-splat-constants", &MachineLowerer::fold_splat_constants);
+        add(LoweringPass::FoldVectorQwordMultiplyImmediates,
+            Stage::InstructionCombining, "fold-vector-multiply-immediates",
+            &MachineLowerer::fold_vector_qword_multiply_immediates);
+        add(LoweringPass::HoistVectorQwordMultiplyHighHalves,
+            Stage::InstructionCombining, "hoist-vector-multiply-halves",
+            &MachineLowerer::hoist_vector_qword_multiply_high_halves);
+        add(LoweringPass::FoldVectorShiftImmediates,
+            Stage::InstructionCombining, "fold-vector-shift-immediates",
+            &MachineLowerer::fold_vector_shift_immediates);
+        add(LoweringPass::RecognizeVectorByteSwaps,
+            Stage::InstructionCombining, "recognize-vector-byte-swaps",
+            &MachineLowerer::recognize_vector_byte_swaps);
+        add(LoweringPass::HoistVectorByteSwapMasks,
+            Stage::InstructionCombining, "hoist-vector-byte-swap-masks",
+            &MachineLowerer::hoist_vector_byte_swap_masks);
+        add(LoweringPass::FuseVectorReductions, Stage::InstructionCombining,
+            "fuse-vector-reductions",
+            &MachineLowerer::fuse_vector_reductions);
+        // Recognize literal rotates before scalar immediates consume the two
+        // shift-count registers. The later pass handles variable complements.
+        add(LoweringPass::RecognizeScalarRotatesEarly,
+            Stage::InstructionCombining, "recognize-scalar-rotates-early",
+            &MachineLowerer::recognize_scalar_rotates);
+        add(LoweringPass::SelectBinaryImmediates, Stage::Legalization,
+            "select-binary-immediates",
+            &MachineLowerer::select_binary_immediates);
+        add(LoweringPass::CombineMachineImmediates,
+            Stage::InstructionCombining, "combine-machine-immediates",
+            &MachineLowerer::combine_machine_immediates);
+        add(LoweringPass::EliminateRedundantExpressions,
+            Stage::Canonicalization, "eliminate-redundant-expressions",
+            &MachineLowerer::eliminate_redundant_machine_expressions);
+        add(LoweringPass::EliminateRedundantLoadsEarly,
+            Stage::Canonicalization, "eliminate-redundant-loads-early",
+            &MachineLowerer::eliminate_redundant_machine_loads);
+        add(LoweringPass::FuseScalarDivisionResults,
+            Stage::InstructionCombining, "fuse-scalar-division-results",
+            &MachineLowerer::fuse_scalar_division_results);
+        add(LoweringPass::RecognizeScalarRotatesLate,
+            Stage::InstructionCombining, "recognize-scalar-rotates-late",
+            &MachineLowerer::recognize_scalar_rotates);
+        add(LoweringPass::PropagateCopiesLate, Stage::Canonicalization,
+            "propagate-copies-late",
+            &MachineLowerer::propagate_machine_copies);
+        add(LoweringPass::FuseCompareSelects, Stage::InstructionCombining,
+            "fuse-compare-selects", &MachineLowerer::fuse_compare_selects);
+        add(LoweringPass::FuseVectorSignSelects,
+            Stage::InstructionCombining, "fuse-vector-sign-selects",
+            &MachineLowerer::fuse_vector_sign_selects);
+        add(LoweringPass::FuseCompareBranches, Stage::InstructionCombining,
+            "fuse-compare-branches",
+            &MachineLowerer::fuse_compare_branches);
+        add(LoweringPass::FormDenseJumpTables, Stage::ControlFlow,
+            "form-dense-jump-tables", &MachineLowerer::form_dense_jump_tables);
+        add(LoweringPass::ThreadForwardingBlocksEarly, Stage::ControlFlow,
+            "thread-forwarding-blocks-early",
+            &MachineLowerer::thread_forwarding_blocks);
+        add(LoweringPass::FoldIndexedAddresses, Stage::InstructionCombining,
+            "fold-indexed-addresses",
+            &MachineLowerer::fold_indexed_memory_addresses);
+        // Address folding exposes equivalent pointer/indexed load forms.
+        add(LoweringPass::EliminateRedundantLoadsLate,
+            Stage::Canonicalization, "eliminate-redundant-loads-late",
+            &MachineLowerer::eliminate_redundant_machine_loads);
+        add(LoweringPass::FoldScalarMemoryOperands,
+            Stage::InstructionCombining, "fold-scalar-memory-operands",
+            &MachineLowerer::fold_scalar_memory_operands);
+        add(LoweringPass::FoldFloatMemoryOperands,
+            Stage::InstructionCombining, "fold-float-memory-operands",
+            &MachineLowerer::fold_float_memory_operands);
+        add(LoweringPass::FoldVectorMemoryOperands,
+            Stage::InstructionCombining, "fold-vector-memory-operands",
+            &MachineLowerer::fold_vector_memory_operands);
+        // Remove dead setup before liveness so it cannot create spills or
+        // callee-saved obligations.
+        add(LoweringPass::EliminateDeadValues, Stage::Canonicalization,
+            "eliminate-dead-machine-values",
+            &MachineLowerer::eliminate_dead_machine_values);
+        add(LoweringPass::ScheduleBlockLayout, Stage::Scheduling,
+            "schedule-block-layout", &MachineLowerer::schedule_block_layout);
+        add(LoweringPass::ScheduleAcrossBlocks, Stage::Scheduling,
+            "schedule-across-blocks", &MachineLowerer::schedule_across_blocks);
+        // Scheduling can expose a newly empty forwarding block.
+        add(LoweringPass::ThreadForwardingBlocksLate, Stage::ControlFlow,
+            "thread-forwarding-blocks-late",
+            &MachineLowerer::thread_forwarding_blocks);
+        add(LoweringPass::ScheduleBlocks, Stage::Scheduling,
+            "schedule-blocks", &MachineLowerer::schedule_blocks);
+        add(LoweringPass::SelectRematerialization,
+            Stage::RegisterAllocation, "select-rematerialization",
+            &MachineLowerer::select_rematerialization);
+        add(LoweringPass::AllocateRegisters, Stage::RegisterAllocation,
+            "allocate-registers", &MachineLowerer::allocate_registers);
+        add(LoweringPass::PreserveCallerContract,
+            Stage::RegisterAllocation, "preserve-caller-contract",
+            &MachineLowerer::preserve_stronger_caller_contract);
+        add(LoweringPass::CreateWidePhiTemporary,
+            Stage::RegisterAllocation, "create-wide-phi-temporary",
+            &MachineLowerer::create_wide_phi_temporary_if_needed);
+        add(LoweringPass::FinalizeFrame, Stage::FrameFinalization,
+            "finalize-frame", &MachineLowerer::finalize_frame);
+        (void)passes.run(current_);
         result_.functions.push_back(std::move(current_));
     }
 
@@ -8870,7 +9073,7 @@ AutomaticAbiValue automatic_value(const hir::Module& module,
 AutomaticAbiSignature classify_scalar_signature(
     const std::vector<AutomaticAbiValue>& values,
     std::optional<AutomaticAbiValue> result,
-    std::string_view abi_name,
+    AbiId abi_name,
     std::optional<std::size_t> fixed_argument_count = std::nullopt,
     AbiFeatureSet features = {}) {
     AutomaticAbiSignature emitted;
@@ -9130,9 +9333,9 @@ private:
             }
             for (const auto& block : function.blocks) {
                 for (const auto& instruction : block.instructions) {
-                    if ((options_.optimize_for == "size" ||
-                         options_.optimize_for == "minimum-size") &&
-                        instruction.opcode == "x86.fconstant" &&
+                    if ((options_.optimize_for == OptimizationGoal::Size ||
+                         options_.optimize_for == OptimizationGoal::MinimumSize) &&
+                        instruction.opcode == Opcode::Fconstant &&
                         !instruction.operands.empty()) {
                         if (const auto* immediate =
                                 std::get_if<machine::ImmediateOperand>(
@@ -9140,7 +9343,7 @@ private:
                             add(*immediate);
                         }
                     }
-                    if (instruction.opcode != "x86.vsplat.constant" ||
+                    if (instruction.opcode != Opcode::VsplatConstant ||
                         instruction.operands.size() < 2) {
                         continue;
                     }
@@ -9174,7 +9377,7 @@ private:
         for (const auto& function : module_.functions) {
             for (const auto& block : function.blocks) {
                 for (const auto& instruction : block.instructions) {
-                    if (instruction.opcode != "x86.vbswap16" ||
+                    if (instruction.opcode != Opcode::Vbswap16 ||
                         instruction.defs.empty()) {
                         continue;
                     }
@@ -9342,19 +9545,19 @@ private:
     }
 
     bool absolute_data_model() const {
-        return options_.code_model == "medium" ||
-               options_.code_model == "large";
+        return options_.code_model == CodeModel::Medium ||
+               options_.code_model == CodeModel::Large;
     }
 
     bool elf_large_pic_model() const {
         return options_.position_independent &&
-               options_.code_model == "large" &&
+               options_.code_model == CodeModel::Large &&
                format_ == ObjectFormat::Elf;
     }
 
     bool macho_large_pic_model() const {
         return options_.position_independent &&
-               options_.code_model == "large" &&
+               options_.code_model == CodeModel::Large &&
                format_ == ObjectFormat::MachO;
     }
 
@@ -9788,9 +9991,9 @@ private:
     bool has_dynamic_stack(const machine::Function& function) const {
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.opcode == "x86.stack.save" ||
-                    instruction.opcode == "x86.stack.allocate" ||
-                    instruction.opcode == "x86.stack.restore") {
+                if (instruction.opcode == Opcode::StackSave ||
+                    instruction.opcode == Opcode::StackAllocate ||
+                    instruction.opcode == Opcode::StackRestore) {
                     return true;
                 }
             }
@@ -10125,9 +10328,8 @@ private:
         std::vector<const RegisterView*> result;
         std::unordered_set<std::uint16_t> seen;
         for (const auto& slot : function.stack_slots) {
-            if (!slot.physical_location) continue;
-            const auto* view =
-                find_register_view(*slot.physical_location);
+            if (!slot.hard_register) continue;
+            const auto* view = machine_register_view(*slot.hard_register);
             if (view && seen.insert(view->storage_id).second) {
                 result.push_back(view);
             }
@@ -10445,7 +10647,7 @@ private:
             if (immediate->value == 0) {
                 const auto opcode = source.mode.bits == 32 ? "xorps"
                                                             : "xorpd";
-                if (subtarget_.has_feature("avx")) {
+                if (subtarget_.has_feature(Feature::Avx)) {
                     instruction(std::string("v") + opcode,
                                 "%" + std::string(xmm) + ", %" +
                                     std::string(xmm) + ", %" +
@@ -10560,10 +10762,10 @@ private:
     }
 
     unsigned memory_vector_width(machine::Register value) const {
-        if (value.mode.bits >= 512 && subtarget_.has_feature("avx512f")) {
+        if (value.mode.bits >= 512 && subtarget_.has_feature(Feature::Avx512f)) {
             return 512;
         }
-        if (value.mode.bits >= 256 && subtarget_.has_feature("avx")) {
+        if (value.mode.bits >= 256 && subtarget_.has_feature(Feature::Avx)) {
             return 256;
         }
         return 128;
@@ -10571,7 +10773,7 @@ private:
 
     std::string vector_move_opcode(unsigned width) const {
         if (width == 512) return "vmovdqu64";
-        if (width == 256 || subtarget_.has_feature("avx")) return "vmovdqu";
+        if (width == 256 || subtarget_.has_feature(Feature::Avx)) return "vmovdqu";
         return "movdqu";
     }
 
@@ -10589,7 +10791,7 @@ private:
             instruction("vpxord", "%" + std::string(reg_name) + ", %" +
                                       std::string(reg_name) + ", %" +
                                       std::string(reg_name));
-        } else if (subtarget_.has_feature("avx")) {
+        } else if (subtarget_.has_feature(Feature::Avx)) {
             instruction("vxorps", "%" + std::string(reg_name) + ", %" +
                                       std::string(reg_name) + ", %" +
                                       std::string(reg_name));
@@ -10699,40 +10901,48 @@ private:
                                     shape.element_bits));
     }
 
-    std::string vector_compare_condition(std::string_view opcode) const {
-        if (opcode.ends_with("cmp.eq")) return "e";
-        if (opcode.ends_with("cmp.ne")) return "ne";
-        if (opcode.ends_with("cmp.slt")) return "l";
-        if (opcode.ends_with("cmp.sle")) return "le";
-        if (opcode.ends_with("cmp.sgt")) return "g";
-        if (opcode.ends_with("cmp.sge")) return "ge";
-        if (opcode.ends_with("cmp.ult")) return "b";
-        if (opcode.ends_with("cmp.ule")) return "be";
-        if (opcode.ends_with("cmp.ugt")) return "a";
-        if (opcode.ends_with("cmp.uge")) return "ae";
+    std::string vector_compare_condition(
+        machine::TargetOpcodeId opcode) const {
+        switch (decode_opcode(opcode)) {
+        case Opcode::VcmpEq: return "e";
+        case Opcode::VcmpNe: return "ne";
+        case Opcode::VcmpSlt: return "l";
+        case Opcode::VcmpSle: return "le";
+        case Opcode::VcmpSgt: return "g";
+        case Opcode::VcmpSge: return "ge";
+        case Opcode::VcmpUlt: return "b";
+        case Opcode::VcmpUle: return "be";
+        case Opcode::VcmpUgt: return "a";
+        case Opcode::VcmpUge: return "ae";
+        default: break;
+        }
         return {};
     }
 
     std::optional<unsigned> vector_compare_predicate(
-        std::string_view opcode) const {
-        if (opcode.ends_with("cmp.eq")) return 0;
-        if (opcode.ends_with("cmp.ne")) return 4;
-        if (opcode.ends_with("cmp.slt") ||
-            opcode.ends_with("cmp.ult")) return 1;
-        if (opcode.ends_with("cmp.sle") ||
-            opcode.ends_with("cmp.ule")) return 2;
-        if (opcode.ends_with("cmp.sgt") ||
-            opcode.ends_with("cmp.ugt")) return 6;
-        if (opcode.ends_with("cmp.sge") ||
-            opcode.ends_with("cmp.uge")) return 5;
+        machine::TargetOpcodeId opcode) const {
+        switch (decode_opcode(opcode)) {
+        case Opcode::VcmpEq: return 0;
+        case Opcode::VcmpNe: return 4;
+        case Opcode::VcmpSlt:
+        case Opcode::VcmpUlt: return 1;
+        case Opcode::VcmpSle:
+        case Opcode::VcmpUle: return 2;
+        case Opcode::VcmpSgt:
+        case Opcode::VcmpUgt: return 6;
+        case Opcode::VcmpSge:
+        case Opcode::VcmpUge: return 5;
+        default: break;
+        }
         return std::nullopt;
     }
 
-    bool unsigned_vector_comparison(std::string_view opcode) const {
-        return opcode.ends_with("cmp.ult") ||
-               opcode.ends_with("cmp.ule") ||
-               opcode.ends_with("cmp.ugt") ||
-               opcode.ends_with("cmp.uge");
+    bool unsigned_vector_comparison(
+        machine::TargetOpcodeId opcode) const {
+        return opcode == Opcode::VcmpUlt ||
+               opcode == Opcode::VcmpUle ||
+               opcode == Opcode::VcmpUgt ||
+               opcode == Opcode::VcmpUge;
     }
 
     std::string packed_lane_suffix(unsigned element_bits) const {
@@ -10741,51 +10951,52 @@ private:
                element_bits == 32 ? "d" : "q";
     }
 
-    bool integer_packed_operation_supported(std::string_view opcode,
+    bool integer_packed_operation_supported(
+                                             machine::TargetOpcodeId opcode,
                                              unsigned element_bits,
                                              unsigned width,
                                              bool immediate_shift = false) const {
-        const bool add_sub = opcode == "x86.vadd" ||
-                             opcode == "x86.vsub";
-        const bool bitwise = opcode == "x86.vand" ||
-                             opcode == "x86.vor" ||
-                             opcode == "x86.vxor";
-        const bool multiply = opcode == "x86.vmul" ||
-                              opcode == "x86.vmul.imm";
-        const bool shift = opcode == "x86.vshl" ||
-                           opcode == "x86.vshr.s" ||
-                           opcode == "x86.vshr.u";
+        const bool add_sub = opcode == Opcode::Vadd ||
+                             opcode == Opcode::Vsub;
+        const bool bitwise = opcode == Opcode::Vand ||
+                             opcode == Opcode::Vor ||
+                             opcode == Opcode::Vxor;
+        const bool multiply = opcode == Opcode::Vmul ||
+                              opcode == Opcode::VmulImm;
+        const bool shift = opcode == Opcode::Vshl ||
+                           opcode == Opcode::VshrS ||
+                           opcode == Opcode::VshrU;
         const bool comparison = vector_compare_predicate(opcode).has_value();
         if (!add_sub && !bitwise && !multiply && !shift && !comparison) {
             return false;
         }
         if (width == 512) {
-            if (!subtarget_.has_feature("avx512f")) return false;
+            if (!subtarget_.has_feature(Feature::Avx512f)) return false;
             if (comparison) {
                 return element_bits >= 32 ||
-                       subtarget_.has_feature("avx512bw");
+                       subtarget_.has_feature(Feature::Avx512bw);
             }
             if (shift) {
                 return element_bits >= 32 ||
                        (element_bits == 16 &&
-                        subtarget_.has_feature("avx512bw"));
+                        subtarget_.has_feature(Feature::Avx512bw));
             }
             if (bitwise) return true;
             if (element_bits == 8 || element_bits == 16) {
-                return subtarget_.has_feature("avx512bw") &&
+                return subtarget_.has_feature(Feature::Avx512bw) &&
                        (add_sub || (multiply && element_bits == 16));
             }
             return add_sub ||
                    (multiply && element_bits == 32) ||
                    (multiply && element_bits == 64 &&
-                    subtarget_.has_feature("avx512dq"));
+                    subtarget_.has_feature(Feature::Avx512dq));
         }
         if (width == 256) {
             const bool packed_shift = shift &&
                 ((immediate_shift && element_bits == 16) ||
                  element_bits == 32 ||
-                  (element_bits == 64 && opcode != "x86.vshr.s"));
-            return subtarget_.has_feature("avx2") &&
+                  (element_bits == 64 && opcode != Opcode::VshrS));
+            return subtarget_.has_feature(Feature::Avx2) &&
                    (add_sub || bitwise || comparison || packed_shift ||
                    (multiply && (element_bits == 16 ||
                                   element_bits == 32 ||
@@ -10793,23 +11004,23 @@ private:
         }
         if (comparison) {
             return element_bits <= 32 ||
-                   subtarget_.has_feature("avx2");
+                   subtarget_.has_feature(Feature::Avx2);
         }
         if (shift) {
             if (immediate_shift) {
                 return element_bits == 16 || element_bits == 32 ||
-                       (element_bits == 64 && opcode != "x86.vshr.s");
+                       (element_bits == 64 && opcode != Opcode::VshrS);
             }
-            return subtarget_.has_feature("avx2") &&
+            return subtarget_.has_feature(Feature::Avx2) &&
                    (element_bits == 32 ||
-                    (element_bits == 64 && opcode != "x86.vshr.s"));
+                    (element_bits == 64 && opcode != Opcode::VshrS));
         }
         return add_sub || bitwise ||
                (multiply && element_bits == 16) ||
                (multiply && element_bits == 32 &&
-                subtarget_.has_feature("avx2")) ||
+                subtarget_.has_feature(Feature::Avx2)) ||
                (multiply && element_bits == 64 &&
-                subtarget_.has_feature("avx2"));
+                subtarget_.has_feature(Feature::Avx2));
     }
 
     unsigned preferred_vector_width() const {
@@ -10826,9 +11037,9 @@ private:
             value.defs.front().mode.bits);
         const auto preferred = preferred_vector_width();
         const bool immediate_shift =
-            (value.opcode == "x86.vshl" ||
-             value.opcode == "x86.vshr.s" ||
-             value.opcode == "x86.vshr.u") &&
+            (value.opcode == Opcode::Vshl ||
+             value.opcode == Opcode::VshrS ||
+             value.opcode == Opcode::VshrU) &&
             value.uses.size() == 1 && value.operands.size() >= 3 &&
             std::holds_alternative<machine::ImmediateOperand>(
                 value.operands[1]);
@@ -10855,20 +11066,20 @@ private:
             value.defs.front().mode.bits);
         const auto preferred = preferred_vector_width();
         if (preferred >= 512 && total >= 512 &&
-            subtarget_.has_feature("avx512f")) {
+            subtarget_.has_feature(Feature::Avx512f)) {
             return 512;
         }
         if (preferred >= 256 && total >= 256 &&
-            subtarget_.has_feature("avx")) return 256;
+            subtarget_.has_feature(Feature::Avx)) return 256;
         return 128;
     }
 
     void plan_fused_multiply_adds(const machine::Function& function) {
         fused_adds_.clear();
         fused_multiplications_.clear();
-        if (options_.fp_contract != "fast" ||
+        if (options_.fp_contract != FpContractMode::Fast ||
             options_.optimization_effort == 0 ||
-            !subtarget_.has_feature("fma")) {
+            !subtarget_.has_feature(Feature::Fma)) {
             return;
         }
         std::vector<unsigned> uses(function.virtual_registers.size());
@@ -10886,9 +11097,9 @@ private:
             std::unordered_map<std::uint32_t,
                                const machine::Instruction*> definitions;
             for (const auto& value : block.instructions) {
-                const bool scalar_add = value.opcode == "x86.fadd" &&
+                const bool scalar_add = value.opcode == Opcode::Fadd &&
                     !value.defs.empty() && value.defs.front().mode.bits <= 64;
-                const bool vector_add = value.opcode == "x86.vadd" &&
+                const bool vector_add = value.opcode == Opcode::Vadd &&
                     vector_shape(value).floating;
                 if ((scalar_add || vector_add) && value.uses.size() == 2) {
                     for (const auto use : value.uses) {
@@ -10899,9 +11110,9 @@ private:
                         const auto found = definitions.find(use.id);
                         if (found == definitions.end()) continue;
                         const auto* multiply = found->second;
-                        if ((scalar_add && multiply->opcode != "x86.fmul") ||
+                        if ((scalar_add && multiply->opcode != Opcode::Fmul) ||
                             (vector_add &&
-                             (multiply->opcode != "x86.vmul" ||
+                             (multiply->opcode != Opcode::Vmul ||
                               !vector_shape(*multiply).floating))) {
                             continue;
                         }
@@ -10945,7 +11156,7 @@ private:
                                const machine::Instruction*> definitions;
             for (const auto& second : block.instructions) {
                 const machine::Instruction* first{};
-                if (second.opcode == "x86.add.imm" &&
+                if (second.opcode == Opcode::AddImm &&
                     second.uses.size() == 1 &&
                     second.uses.front().kind ==
                         machine::RegisterKind::Virtual) {
@@ -10954,10 +11165,10 @@ private:
                     if (found != definitions.end()) first = found->second;
                 }
                 const bool register_add = first &&
-                    first->opcode == "x86.add" &&
+                    first->opcode == Opcode::Add &&
                     first->uses.size() == 2;
                 const bool scaled_immediate = first &&
-                    first->opcode == "x86.mul.imm" &&
+                    first->opcode == Opcode::MulImm &&
                     first->uses.size() == 1 &&
                     first->operands.size() >= 2;
                 if ((!register_add && !scaled_immediate) ||
@@ -11060,7 +11271,7 @@ private:
         const auto prefix = displacement == 0
             ? std::string{}
             : std::to_string(displacement);
-        if (first.opcode == "x86.mul.imm") {
+        if (first.opcode == Opcode::MulImm) {
             const auto& factor =
                 std::get<machine::ImmediateOperand>(first.operands[1]);
             instruction(
@@ -11088,7 +11299,7 @@ private:
         const auto multiplied = multiply.defs.front();
         const auto addend = add.uses[0] == multiplied ? add.uses[1]
                                                      : add.uses[0];
-        if (add.opcode == "x86.fadd") {
+        if (add.opcode == Opcode::Fadd) {
             load_float(function, multiply.uses[0], "xmm0");
             load_float(function, addend, "xmm1");
             load_float(function, multiply.uses[1], "xmm2");
@@ -11120,7 +11331,8 @@ private:
         if (value.uses.size() != 2 || value.defs.size() != 1) {
             diagnostics_.error(
                 value.location,
-                "unselected integer vector operation '" + value.opcode +
+                "unselected integer vector operation '" +
+                    std::string(opcode_name(value.opcode)) +
                     "' has invalid fallback operands");
             return;
         }
@@ -11128,22 +11340,22 @@ private:
         const auto right = value.uses[1];
         const auto target = value.defs.front();
         const auto condition = vector_compare_condition(value.opcode);
-        const bool divide = value.opcode == "x86.vsdiv" ||
-                            value.opcode == "x86.vudiv" ||
-                            value.opcode == "x86.vsrem" ||
-                            value.opcode == "x86.vurem";
-        const bool signed_divide = value.opcode == "x86.vsdiv" ||
-                                   value.opcode == "x86.vsrem";
+        const bool divide = value.opcode == Opcode::Vsdiv ||
+                            value.opcode == Opcode::Vudiv ||
+                            value.opcode == Opcode::Vsrem ||
+                            value.opcode == Opcode::Vurem;
+        const bool signed_divide = value.opcode == Opcode::Vsdiv ||
+                                   value.opcode == Opcode::Vsrem;
         for (unsigned lane = 0; lane < shape.lanes; ++lane) {
             const bool signed_left = divide ? signed_divide
                                             : shape.signed_integer;
             load_lane(function, left, lane, shape, "rax", signed_left);
-            if (value.opcode == "x86.vshl" ||
-                value.opcode == "x86.vshr.s" ||
-                value.opcode == "x86.vshr.u") {
+            if (value.opcode == Opcode::Vshl ||
+                value.opcode == Opcode::VshrS ||
+                value.opcode == Opcode::VshrU) {
                 load_lane(function, right, lane, shape, "rcx", false);
-                instruction(value.opcode == "x86.vshl" ? "shlq" :
-                                value.opcode == "x86.vshr.s" ? "sarq" :
+                instruction(value.opcode == Opcode::Vshl ? "shlq" :
+                                value.opcode == Opcode::VshrS ? "sarq" :
                                                                "shrq",
                             "%cl, %rax");
             } else if (divide) {
@@ -11152,13 +11364,16 @@ private:
                 if (signed_divide) instruction("cqto");
                 else instruction("xorq", "%rdx, %rdx");
                 instruction(signed_divide ? "idivq" : "divq", "%r10");
-                if (value.opcode == "x86.vsrem" ||
-                    value.opcode == "x86.vurem") {
+                if (value.opcode == Opcode::Vsrem ||
+                    value.opcode == Opcode::Vurem) {
                     instruction("movq", "%rdx, %rax");
                 }
             } else {
                 const bool signed_compare =
-                    value.opcode.find("cmp.s") != std::string::npos;
+                    value.opcode == Opcode::VcmpSlt ||
+                    value.opcode == Opcode::VcmpSle ||
+                    value.opcode == Opcode::VcmpSgt ||
+                    value.opcode == Opcode::VcmpSge;
                 load_lane(function, right, lane, shape, "r10",
                           condition.empty() ? shape.signed_integer
                                             : signed_compare);
@@ -11167,22 +11382,23 @@ private:
                     instruction("set" + condition, "%al");
                     instruction("movzbq", "%al, %rax");
                     instruction("negq", "%rax");
-                } else if (value.opcode == "x86.vadd") {
+                } else if (value.opcode == Opcode::Vadd) {
                     instruction("addq", "%r10, %rax");
-                } else if (value.opcode == "x86.vsub") {
+                } else if (value.opcode == Opcode::Vsub) {
                     instruction("subq", "%r10, %rax");
-                } else if (value.opcode == "x86.vmul") {
+                } else if (value.opcode == Opcode::Vmul) {
                     instruction("imulq", "%r10, %rax");
-                } else if (value.opcode == "x86.vand") {
+                } else if (value.opcode == Opcode::Vand) {
                     instruction("andq", "%r10, %rax");
-                } else if (value.opcode == "x86.vor") {
+                } else if (value.opcode == Opcode::Vor) {
                     instruction("orq", "%r10, %rax");
-                } else if (value.opcode == "x86.vxor") {
+                } else if (value.opcode == Opcode::Vxor) {
                     instruction("xorq", "%r10, %rax");
                 } else {
                     diagnostics_.error(value.location,
                                        "unselected integer vector operation '" +
-                                           value.opcode + "'");
+                                           std::string(opcode_name(
+                                               value.opcode)) + "'");
                     return;
                 }
             }
@@ -11192,7 +11408,7 @@ private:
 
     void emit_vector_compare_sign_bias(unsigned width,
                                        unsigned element_bits) {
-        const bool vex = width == 256 || subtarget_.has_feature("avx2");
+        const bool vex = width == 256 || subtarget_.has_feature(Feature::Avx2);
         const auto scratch = width == 512 ? "zmm2" :
                              width == 256 ? "ymm2" : "xmm2";
         if (!vex) {
@@ -11249,17 +11465,17 @@ private:
         }
         const bool unsigned_compare =
             unsigned_vector_comparison(value.opcode);
-        const bool equal = value.opcode.ends_with("cmp.eq") ||
-                           value.opcode.ends_with("cmp.ne");
-        const bool invert = value.opcode.ends_with("cmp.ne") ||
-                            value.opcode.ends_with("cmp.sle") ||
-                            value.opcode.ends_with("cmp.ule") ||
-                            value.opcode.ends_with("cmp.sge") ||
-                            value.opcode.ends_with("cmp.uge");
-        const bool swap = value.opcode.ends_with("cmp.slt") ||
-                          value.opcode.ends_with("cmp.ult") ||
-                          value.opcode.ends_with("cmp.sge") ||
-                          value.opcode.ends_with("cmp.uge");
+        const bool equal = value.opcode == Opcode::VcmpEq ||
+                           value.opcode == Opcode::VcmpNe;
+        const bool invert = value.opcode == Opcode::VcmpNe ||
+                            value.opcode == Opcode::VcmpSle ||
+                            value.opcode == Opcode::VcmpUle ||
+                            value.opcode == Opcode::VcmpSge ||
+                            value.opcode == Opcode::VcmpUge;
+        const bool swap = value.opcode == Opcode::VcmpSlt ||
+                          value.opcode == Opcode::VcmpUlt ||
+                          value.opcode == Opcode::VcmpSge ||
+                          value.opcode == Opcode::VcmpUge;
         const auto left_register = vector_register(
             value.uses[0], 0, width);
         const auto right_register = vector_register(
@@ -11282,7 +11498,7 @@ private:
             }
 
             const bool vex = width == 256 ||
-                             subtarget_.has_feature("avx2");
+                             subtarget_.has_feature(Feature::Avx2);
             const auto prefix = width == 256 ? std::string("ymm")
                                              : std::string("xmm");
             if (vex) {
@@ -11351,7 +11567,7 @@ private:
         const auto target = value.defs.front();
         if (is_rematerialized_zero_vector(function, target)) return;
         const auto destination = vector_register(target, 0);
-        const auto* constant = value.opcode == "x86.vsplat.constant" &&
+        const auto* constant = value.opcode == Opcode::VsplatConstant &&
                                        !value.operands.empty()
             ? std::get_if<machine::ImmediateOperand>(&value.operands.front())
             : nullptr;
@@ -11366,13 +11582,13 @@ private:
         unsigned broadcast_width{};
         const auto preferred = preferred_vector_width();
         if (preferred >= 512 && target.mode.bits >= 512 &&
-            subtarget_.has_feature("avx512f") &&
+            subtarget_.has_feature(Feature::Avx512f) &&
             (shape.floating || shape.element_bits >= 32 ||
-             subtarget_.has_feature("avx512bw"))) {
+             subtarget_.has_feature(Feature::Avx512bw))) {
             broadcast_width = 512;
         } else if (preferred >= 256 && target.mode.bits >= 256 &&
-                   (shape.floating ? subtarget_.has_feature("avx")
-                                   : subtarget_.has_feature("avx2"))) {
+                   (shape.floating ? subtarget_.has_feature(Feature::Avx)
+                                   : subtarget_.has_feature(Feature::Avx2))) {
             broadcast_width = 256;
         }
         if (constant && constant->value == 0 && constant->high == 0) {
@@ -11380,7 +11596,7 @@ private:
             for (unsigned chunk = 0;
                  chunk < vector_chunks(target, width); ++chunk) {
                 const auto zero = vector_register(target, 0, width);
-                if (width == 128 && !subtarget_.has_feature("avx")) {
+                if (width == 128 && !subtarget_.has_feature(Feature::Avx)) {
                     instruction(shape.floating
                                     ? (shape.element_bits == 64 ? "xorpd"
                                                                 : "xorps")
@@ -11399,7 +11615,7 @@ private:
         }
         const auto materialize_constant = [&](std::string_view xmm) {
             if (!constant) return;
-            const auto move = subtarget_.has_feature("avx") ? "vmov" : "mov";
+            const auto move = subtarget_.has_feature(Feature::Avx) ? "vmov" : "mov";
             if (shape.element_bits == 64) {
                 instruction("movabsq",
                             "$" + std::to_string(constant->value) +
@@ -11501,7 +11717,7 @@ private:
                 materialize_constant(destination);
             } else {
                 load(function, source, "rax");
-                const auto move = subtarget_.has_feature("avx")
+                const auto move = subtarget_.has_feature(Feature::Avx)
                     ? (shape.element_bits == 64 ? "vmovq" : "vmovd")
                     : (shape.element_bits == 64 ? "movq" : "movd");
                 instruction(move,
@@ -11590,7 +11806,7 @@ private:
                 const auto destination = assigned
                     ? std::string(assigned->name)
                     : std::string("xmm0");
-                if (subtarget_.has_feature("avx")) {
+                if (subtarget_.has_feature(Feature::Avx)) {
                     if (shape.element_bits == 32) {
                         instruction("vpermilps",
                                     "$" + std::to_string(
@@ -11630,7 +11846,7 @@ private:
                 ? std::string(assigned->storage_name)
                 : std::string("rax");
             auto extraction_register = quarter_register;
-            const bool vex = subtarget_.has_feature("avx");
+            const bool vex = subtarget_.has_feature(Feature::Avx);
             if (lane_in_quarter != 0) {
                 if (extraction_register != "xmm2") {
                     instruction(vex ? "vmovdqa" : "movdqa",
@@ -11699,7 +11915,7 @@ private:
         const auto target_integer = assigned_integer_register(function, target);
 
         if (shape.floating &&
-            value.opcode == "x86.vreduce.add.ordered") {
+            value.opcode == Opcode::VreduceAddOrdered) {
             const auto accumulator = target_simd
                 ? std::string(target_simd->name)
                 : std::string("xmm0");
@@ -11736,7 +11952,7 @@ private:
                      local < lanes_per_quarter && lane < shape.lanes;
                     ++local, ++lane) {
                     if (local == 0) {
-                        if (subtarget_.has_feature("avx")) {
+                        if (subtarget_.has_feature(Feature::Avx)) {
                             instruction(
                                 shape.element_bits == 32 ? "vaddss"
                                                          : "vaddsd",
@@ -11748,7 +11964,7 @@ private:
                                 "%" + part + ", %" + accumulator);
                         }
                     } else {
-                        if (subtarget_.has_feature("avx")) {
+                        if (subtarget_.has_feature(Feature::Avx)) {
                             instruction(
                                 shape.element_bits == 32 ? "vshufps"
                                                          : "vunpckhpd",
@@ -11780,26 +11996,26 @@ private:
 
         if (!shape.floating) {
             const auto packed_operation = [&](bool vex) {
-                if (value.opcode == "x86.vreduce.add") {
+                if (value.opcode == Opcode::VreduceAdd) {
                     return std::string(vex ? "vpadd" : "padd") +
                         packed_lane_suffix(shape.element_bits);
                 }
-                if (value.opcode == "x86.vreduce.xor") {
+                if (value.opcode == Opcode::VreduceXor) {
                     return std::string(vex ? "vpxor" : "pxor");
                 }
-                if (value.opcode == "x86.vreduce.and") {
+                if (value.opcode == Opcode::VreduceAnd) {
                     return std::string(vex ? "vpand" : "pand");
                 }
-                if (value.opcode == "x86.vreduce.or") {
+                if (value.opcode == Opcode::VreduceOr) {
                     return std::string(vex ? "vpor" : "por");
                 }
                 return std::string{};
             };
             const auto scalar_operation = [&]() -> std::string_view {
-                if (value.opcode == "x86.vreduce.add") return "add";
-                if (value.opcode == "x86.vreduce.xor") return "xor";
-                if (value.opcode == "x86.vreduce.and") return "and";
-                if (value.opcode == "x86.vreduce.or") return "or";
+                if (value.opcode == Opcode::VreduceAdd) return "add";
+                if (value.opcode == Opcode::VreduceXor) return "xor";
+                if (value.opcode == Opcode::VreduceAnd) return "and";
+                if (value.opcode == Opcode::VreduceOr) return "or";
                 return {};
             }();
             if (scalar_operation.empty()) {
@@ -11814,7 +12030,7 @@ private:
             // instruction while YMM upper halves are dirty creates an
             // AVX-to-SSE transition on affected implementations, and this
             // reduction commonly sits inside an outer loop.
-            const auto vex = subtarget_.has_feature("avx");
+            const auto vex = subtarget_.has_feature(Feature::Avx);
             if (width == 512) {
                 instruction("vextracti64x4", "$1, %" + source + ", %ymm2");
                 const auto low_ymm = std::string("ymm") +
@@ -11905,11 +12121,11 @@ private:
             instruction(shape.element_bits == 32 ? "vaddps" : "vaddpd",
                         "%xmm2, %" + low + ", %xmm2");
         } else if (low != "xmm2") {
-            instruction(subtarget_.has_feature("avx") ? "vmovaps" : "movaps",
+            instruction(subtarget_.has_feature(Feature::Avx) ? "vmovaps" : "movaps",
                         "%" + low + ", %xmm2");
         }
         if (shape.element_bits == 64) {
-            if (subtarget_.has_feature("avx")) {
+            if (subtarget_.has_feature(Feature::Avx)) {
                 instruction("vunpckhpd", "%xmm2, %xmm2, %" + accumulator);
                 instruction("vaddsd", "%xmm2, %" + accumulator +
                                           ", %" + accumulator);
@@ -11929,7 +12145,7 @@ private:
         }
         if (has_initial) {
             load_float(function, value.uses.front(), "xmm2");
-            if (subtarget_.has_feature("avx")) {
+            if (subtarget_.has_feature(Feature::Avx)) {
                 instruction(shape.element_bits == 32 ? "vaddss" : "vaddsd",
                             "%xmm2, %" + accumulator + ", %" + accumulator);
             } else {
@@ -11955,7 +12171,7 @@ private:
             target.mode.bits == 128 && shape.floating &&
             (shape.element_bits == 64 ||
              (shape.element_bits == 32 &&
-              subtarget_.has_feature("sse4.1")))) {
+              subtarget_.has_feature(Feature::Sse41)))) {
             const auto lane = static_cast<unsigned>(constant_index->value);
             const auto destination = vector_register(target, 0);
             std::string element_register;
@@ -12028,28 +12244,28 @@ private:
         const auto preferred = preferred_vector_width();
         unsigned width = 128;
         if (preferred >= 512 && total >= 512) {
-            if (shape.floating && value.opcode == "x86.vneg" &&
-                subtarget_.has_feature("avx512f")) {
+            if (shape.floating && value.opcode == Opcode::Vneg &&
+                subtarget_.has_feature(Feature::Avx512f)) {
                 width = 512;
-            } else if (!shape.floating && value.opcode == "x86.vnot" &&
-                       subtarget_.has_feature("avx512f")) {
+            } else if (!shape.floating && value.opcode == Opcode::Vnot &&
+                       subtarget_.has_feature(Feature::Avx512f)) {
                 // VPTERNLOGD can invert every bit without materializing an
                 // all-ones ZMM value or using an AVX-512 mask result.
                 width = 512;
-            } else if (!shape.floating && value.opcode == "x86.vneg" &&
-                       subtarget_.has_feature("avx512f") &&
+            } else if (!shape.floating && value.opcode == Opcode::Vneg &&
+                       subtarget_.has_feature(Feature::Avx512f) &&
                        (shape.element_bits >= 32 ||
-                        subtarget_.has_feature("avx512bw"))) {
+                        subtarget_.has_feature(Feature::Avx512bw))) {
                 width = 512;
             }
         }
         if (width == 128 && preferred >= 256 && total >= 256) {
-            if ((shape.floating && subtarget_.has_feature("avx")) ||
-                (!shape.floating && subtarget_.has_feature("avx2"))) {
+            if ((shape.floating && subtarget_.has_feature(Feature::Avx)) ||
+                (!shape.floating && subtarget_.has_feature(Feature::Avx2))) {
                 width = 256;
             }
         }
-        if (value.opcode == "x86.viszero" && !shape.floating &&
+        if (value.opcode == Opcode::Viszero && !shape.floating &&
             shape.element_bits == 64 && width == 128) {
             for (unsigned lane = 0; lane < shape.lanes; ++lane) {
                 load_lane(function, source, lane, shape, "rax", false);
@@ -12064,18 +12280,18 @@ private:
         if (width != 128) {
             const auto source_register = vector_register(source, 0, width);
             const auto scratch_register = vector_register(source, 1, width);
-            if (value.opcode == "x86.vnot") {
+            if (value.opcode == Opcode::Vnot) {
                 if (width != 512) {
                     instruction("vpcmpeqd", "%" + scratch_register + ", %" +
                                                  scratch_register + ", %" +
                                                  scratch_register);
                 }
-            } else if (value.opcode == "x86.viszero") {
+            } else if (value.opcode == Opcode::Viszero) {
                 instruction(shape.floating ? "vxorps" : "vpxor",
                             "%" + scratch_register + ", %" +
                                 scratch_register + ", %" +
                                 scratch_register);
-            } else if (value.opcode == "x86.vneg") {
+            } else if (value.opcode == Opcode::Vneg) {
                 if (shape.floating) {
                     if (shape.element_bits == 32) {
                         instruction("movl", "$0x80000000, %eax");
@@ -12098,13 +12314,14 @@ private:
             } else {
                 diagnostics_.error(value.location,
                                    "unselected vector unary operation '" +
-                                       value.opcode + "'");
+                                       std::string(opcode_name(
+                                           value.opcode)) + "'");
                 return;
             }
             for (unsigned chunk = 0;
                  chunk < vector_chunks(source, width); ++chunk) {
                 load_vector(function, source, 0, chunk, width);
-                if (value.opcode == "x86.vnot") {
+                if (value.opcode == Opcode::Vnot) {
                     if (width == 512) {
                         instruction("vpternlogd",
                                     "$0x55, %" + source_register + ", %" +
@@ -12116,7 +12333,7 @@ private:
                                         source_register + ", %" +
                                         source_register);
                     }
-                } else if (value.opcode == "x86.viszero") {
+                } else if (value.opcode == Opcode::Viszero) {
                     if (shape.floating) {
                         instruction(shape.element_bits == 32 ? "vcmpps"
                                                               : "vcmppd",
@@ -12155,10 +12372,10 @@ private:
         }
         for (unsigned chunk = 0; chunk < vector_chunks(source); ++chunk) {
             load_vector(function, source, 0, chunk);
-            if (value.opcode == "x86.vnot") {
+            if (value.opcode == Opcode::Vnot) {
                 instruction("pcmpeqd", "%xmm1, %xmm1");
                 instruction("pxor", "%xmm1, %xmm0");
-            } else if (value.opcode == "x86.viszero") {
+            } else if (value.opcode == Opcode::Viszero) {
                 instruction("pxor", "%xmm1, %xmm1");
                 if (shape.floating) {
                     instruction(shape.element_bits == 32 ? "cmpps" : "cmppd",
@@ -12169,7 +12386,7 @@ private:
                                         shape.element_bits == 32 ? "pcmpeqd" : nullptr;
                     instruction(opcode, "%xmm1, %xmm0");
                 }
-            } else if (value.opcode == "x86.vneg") {
+            } else if (value.opcode == Opcode::Vneg) {
                 if (shape.floating) {
                     instruction("pcmpeqd", "%xmm1, %xmm1");
                     instruction(shape.element_bits == 32 ? "pslld" : "psllq",
@@ -12188,7 +12405,8 @@ private:
             } else {
                 diagnostics_.error(value.location,
                                    "unselected vector unary operation '" +
-                                       value.opcode + "'");
+                                       std::string(opcode_name(
+                                           value.opcode)) + "'");
                 return;
             }
             store_vector(function, target, 0, chunk);
@@ -12198,7 +12416,7 @@ private:
     void emit_vector_qword_multiply(
         const machine::Function& function,
         const machine::Instruction& value, unsigned width) {
-        const bool immediate_scale = value.opcode == "x86.vmul.imm";
+        const bool immediate_scale = value.opcode == Opcode::VmulImm;
         const bool cached_high =
             !immediate_scale && value.uses.size() == 3;
         if ((immediate_scale ? value.uses.size() != 1
@@ -12232,15 +12450,15 @@ private:
             const auto* definition = find_definition(source);
             if (!definition) return std::nullopt;
             const machine::ImmediateOperand* immediate = nullptr;
-            if (definition->opcode == "x86.vsplat.constant" &&
+            if (definition->opcode == Opcode::VsplatConstant &&
                 !definition->operands.empty()) {
                 immediate = std::get_if<machine::ImmediateOperand>(
                     &definition->operands.front());
-            } else if (definition->opcode == "x86.vsplat" &&
+            } else if (definition->opcode == Opcode::Vsplat &&
                        definition->uses.size() == 1) {
                 const auto* scalar =
                     find_definition(definition->uses.front());
-                if (scalar && scalar->opcode == "x86.constant" &&
+                if (scalar && scalar->opcode == Opcode::Constant &&
                     !scalar->operands.empty()) {
                     immediate = std::get_if<machine::ImmediateOperand>(
                         &scalar->operands.front());
@@ -12276,7 +12494,7 @@ private:
                     std::has_single_bit(constant + 1U));
         };
         if (scale && simple_scale(*scale)) {
-            const bool vex = width != 128 || subtarget_.has_feature("avx");
+            const bool vex = width != 128 || subtarget_.has_feature(Feature::Avx);
             for (unsigned chunk = 0;
                  chunk < vector_chunks(target, width); ++chunk) {
                 load_vector(function, scaled_source, 0, chunk, width);
@@ -12336,8 +12554,8 @@ private:
             }
             return;
         }
-        const bool direct = subtarget_.has_feature("avx512dq") &&
-            (width == 512 || subtarget_.has_feature("avx512vl"));
+        const bool direct = subtarget_.has_feature(Feature::Avx512dq) &&
+            (width == 512 || subtarget_.has_feature(Feature::Avx512vl));
         for (unsigned chunk = 0;
              chunk < vector_chunks(target, width); ++chunk) {
             load_vector(function, value.uses[0], 0, chunk, width);
@@ -12483,7 +12701,7 @@ private:
 
     void emit_vector_binary(const machine::Function& function,
                             const machine::Instruction& value) {
-        if (value.opcode == "x86.vbswap16.mask") {
+        if (value.opcode == Opcode::Vbswap16Mask) {
             if (value.defs.size() != 1) {
                 diagnostics_.error(value.location,
                                    "invalid packed byte-swap mask result");
@@ -12509,20 +12727,20 @@ private:
                                "fixed-vector operation metadata does not match its result");
             return;
         }
-        if (value.opcode == "x86.vbswap16") {
+        if (value.opcode == Opcode::Vbswap16) {
             const auto total = static_cast<unsigned>(
                 value.defs.front().mode.bits);
             const auto preferred = preferred_vector_width();
             const unsigned width =
                 preferred >= 512 && total >= 512 &&
-                        subtarget_.has_feature("avx512bw")
+                        subtarget_.has_feature(Feature::Avx512bw)
                     ? 512U
                     : preferred >= 256 && total >= 256 &&
-                              subtarget_.has_feature("avx2")
+                              subtarget_.has_feature(Feature::Avx2)
                     ? 256U
                     : 128U;
             const bool vex = width != 128 ||
-                             subtarget_.has_feature("avx");
+                             subtarget_.has_feature(Feature::Avx);
             const auto source = vector_register(
                 value.uses.front(), 0, width);
             auto destination = vector_register(
@@ -12583,23 +12801,23 @@ private:
                 emit_vector_integer_compare(function, value, shape, width);
                 return;
             }
-            if ((value.opcode == "x86.vmul" ||
-                 value.opcode == "x86.vmul.imm") &&
+            if ((value.opcode == Opcode::Vmul ||
+                 value.opcode == Opcode::VmulImm) &&
                 shape.element_bits == 64) {
                 emit_vector_qword_multiply(function, value, width);
                 return;
             }
-            const bool shift = value.opcode == "x86.vshl" ||
-                value.opcode == "x86.vshr.s" ||
-                value.opcode == "x86.vshr.u";
+            const bool shift = value.opcode == Opcode::Vshl ||
+                value.opcode == Opcode::VshrS ||
+                value.opcode == Opcode::VshrU;
             const auto* immediate_shift = shift && value.uses.size() == 1 &&
                                                    value.operands.size() >= 3
                 ? std::get_if<machine::ImmediateOperand>(
                       &value.operands[1])
                 : nullptr;
             if (immediate_shift && immediate_shift->high == 0) {
-                const auto root = value.opcode == "x86.vshl" ? "psll" :
-                                  value.opcode == "x86.vshr.s" ? "psra"
+                const auto root = value.opcode == Opcode::Vshl ? "psll" :
+                                  value.opcode == Opcode::VshrS ? "psra"
                                                                 : "psrl";
                 const auto opcode = std::string("v") + root +
                     packed_lane_suffix(shape.element_bits);
@@ -12624,31 +12842,31 @@ private:
                 return;
             }
             std::string opcode;
-            if (value.opcode == "x86.vadd") {
+            if (value.opcode == Opcode::Vadd) {
                 opcode = shape.element_bits == 8 ? "paddb" :
                          shape.element_bits == 16 ? "paddw" :
                          shape.element_bits == 32 ? "paddd" : "paddq";
-            } else if (value.opcode == "x86.vsub") {
+            } else if (value.opcode == Opcode::Vsub) {
                 opcode = shape.element_bits == 8 ? "psubb" :
                          shape.element_bits == 16 ? "psubw" :
                          shape.element_bits == 32 ? "psubd" : "psubq";
-            } else if (value.opcode == "x86.vand") {
+            } else if (value.opcode == Opcode::Vand) {
                 opcode = width == 512 ? "pandd" : "pand";
-            } else if (value.opcode == "x86.vor") {
+            } else if (value.opcode == Opcode::Vor) {
                 opcode = width == 512 ? "pord" : "por";
-            } else if (value.opcode == "x86.vxor") {
+            } else if (value.opcode == Opcode::Vxor) {
                 opcode = width == 512 ? "pxord" : "pxor";
-            } else if (value.opcode == "x86.vmul") {
+            } else if (value.opcode == Opcode::Vmul) {
                 opcode = shape.element_bits == 16 ? "pmullw" : "pmulld";
-            } else if (value.opcode == "x86.vshl") {
+            } else if (value.opcode == Opcode::Vshl) {
                 opcode = "psllv" + packed_lane_suffix(shape.element_bits);
-            } else if (value.opcode == "x86.vshr.s") {
+            } else if (value.opcode == Opcode::VshrS) {
                 opcode = "psrav" + packed_lane_suffix(shape.element_bits);
-            } else if (value.opcode == "x86.vshr.u") {
+            } else if (value.opcode == Opcode::VshrU) {
                 opcode = "psrlv" + packed_lane_suffix(shape.element_bits);
             }
             const bool vex = width != 128 ||
-                             subtarget_.has_feature("avx2");
+                             subtarget_.has_feature(Feature::Avx2);
             const auto left_register = vector_register(
                 value.uses[0], 0, width);
             const auto right_register = indexed_memory
@@ -12668,11 +12886,11 @@ private:
             auto lhs_register = left_register;
             auto rhs_register = right_register;
             const bool commutative =
-                value.opcode == "x86.vadd" ||
-                value.opcode == "x86.vmul" ||
-                value.opcode == "x86.vand" ||
-                value.opcode == "x86.vor" ||
-                value.opcode == "x86.vxor";
+                value.opcode == Opcode::Vadd ||
+                value.opcode == Opcode::Vmul ||
+                value.opcode == Opcode::Vand ||
+                value.opcode == Opcode::Vor ||
+                value.opcode == Opcode::Vxor;
             for (unsigned chunk = 0;
                  chunk < vector_chunks(value.defs.front(), width); ++chunk) {
                 load_vector(function, value.uses[0], 0, chunk, width);
@@ -12754,12 +12972,12 @@ private:
         }
 
         const auto suffix = shape.element_bits == 32 ? "ps" : "pd";
-        const bool arithmetic = value.opcode == "x86.vadd" ||
-                                value.opcode == "x86.vsub" ||
-                                value.opcode == "x86.vmul" ||
-                                value.opcode == "x86.vsdiv";
+        const bool arithmetic = value.opcode == Opcode::Vadd ||
+                                value.opcode == Opcode::Vsub ||
+                                value.opcode == Opcode::Vmul ||
+                                value.opcode == Opcode::Vsdiv;
         const auto width = floating_operation_width(value, !arithmetic);
-        const bool vex = width != 128 || subtarget_.has_feature("avx");
+        const bool vex = width != 128 || subtarget_.has_feature(Feature::Avx);
         const auto left_register = vector_register(value.uses[0], 0, width);
         const auto right_register = vector_register(value.uses[1], 1, width);
         auto result_register = left_register;
@@ -12768,9 +12986,9 @@ private:
             load_vector(function, value.uses[0], 0, chunk, width);
             load_vector(function, value.uses[1], 1, chunk, width);
             if (arithmetic) {
-                const auto root = value.opcode == "x86.vadd" ? "add" :
-                                  value.opcode == "x86.vsub" ? "sub" :
-                                  value.opcode == "x86.vmul" ? "mul" : "div";
+                const auto root = value.opcode == Opcode::Vadd ? "add" :
+                                  value.opcode == Opcode::Vsub ? "sub" :
+                                  value.opcode == Opcode::Vmul ? "mul" : "div";
                 auto lhs_register = left_register;
                 auto rhs_register = right_register;
                 auto destination = vector_register(
@@ -12785,8 +13003,8 @@ private:
                                     lhs_register + ", %" + destination);
                 } else {
                     const bool commutative =
-                        value.opcode == "x86.vadd" ||
-                        value.opcode == "x86.vmul";
+                        value.opcode == Opcode::Vadd ||
+                        value.opcode == Opcode::Vmul;
                     if (destination == rhs_register &&
                         destination != lhs_register) {
                         if (commutative) {
@@ -12807,19 +13025,19 @@ private:
             } else {
                 unsigned predicate{};
                 bool swap{};
-                if (value.opcode.ends_with("cmp.eq")) predicate = 0;
-                else if (value.opcode.ends_with("cmp.ne")) predicate = 4;
-                else if (value.opcode.ends_with("cmp.slt")) predicate = 1;
-                else if (value.opcode.ends_with("cmp.sle")) predicate = 2;
-                else if (value.opcode.ends_with("cmp.sgt")) {
+                if (value.opcode == Opcode::VcmpEq) predicate = 0;
+                else if (value.opcode == Opcode::VcmpNe) predicate = 4;
+                else if (value.opcode == Opcode::VcmpSlt) predicate = 1;
+                else if (value.opcode == Opcode::VcmpSle) predicate = 2;
+                else if (value.opcode == Opcode::VcmpSgt) {
                     predicate = 1; swap = true;
-                } else if (value.opcode.ends_with("cmp.sge")) {
+                } else if (value.opcode == Opcode::VcmpSge) {
                     predicate = 2; swap = true;
                 } else {
                     diagnostics_.error(
                         value.location,
                         "unselected floating vector comparison '" +
-                            value.opcode + "'");
+                            std::string(opcode_name(value.opcode)) + "'");
                     return;
                 }
                 if (width == 512 && swap) {
@@ -13009,12 +13227,12 @@ private:
         const auto& slot =
             std::get<machine::StackSlotOperand>(value.operands.front());
         const auto offset = slot_offset(function, slot.slot) + slot.offset;
-        const auto transported = value.opcode == "x86.vload"
+        const auto transported = value.opcode == Opcode::Vload
             ? value.defs.front() : value.uses.front();
         const auto width = memory_vector_width(transported);
         const auto chunks = static_cast<unsigned>(slot.mode.bits) / width;
         const auto scratch = vector_register(transported, 0, width);
-        if (value.opcode == "x86.vload") {
+        if (value.opcode == Opcode::Vload) {
             for (unsigned chunk = 0; chunk < chunks; ++chunk) {
                 instruction(vector_move_opcode(width),
                             memory(offset + static_cast<std::int32_t>(
@@ -13036,7 +13254,7 @@ private:
     void emit_vector_pointer_access(const machine::Function& function,
                                     const machine::Instruction& value) {
         load(function, value.uses.front(), "rax");
-        if (value.opcode == "x86.vpointer.load") {
+        if (value.opcode == Opcode::VpointerLoad) {
             const auto target = value.defs.front();
             const auto width = memory_vector_width(target);
             const auto scratch = vector_register(target, 0, width);
@@ -13186,7 +13404,7 @@ private:
             return;
         }
         materialize_symbol_address(symbol, "rax");
-        if (value.opcode == "x86.vglobal.load") {
+        if (value.opcode == Opcode::VglobalLoad) {
             const auto target = value.defs.front();
             const auto width = memory_vector_width(target);
             const auto scratch = vector_register(target, 0, width);
@@ -13295,7 +13513,7 @@ private:
             if (immediate.value == 0) {
                 const auto opcode = target.mode.bits == 32 ? "xorps"
                                                             : "xorpd";
-                if (subtarget_.has_feature("avx")) {
+                if (subtarget_.has_feature(Feature::Avx)) {
                     instruction(std::string("v") + opcode,
                                 "%" + destination + ", %" + destination +
                                     ", %" + destination);
@@ -13338,8 +13556,8 @@ private:
                 ? std::string(assigned->name) : std::string("xmm0");
             if (immediate.value == 0) {
                 instruction("xorps", "%" + destination + ", %" + destination);
-            } else if ((options_.optimize_for == "size" ||
-                        options_.optimize_for == "minimum-size") &&
+            } else if ((options_.optimize_for == OptimizationGoal::Size ||
+                        options_.optimize_for == OptimizationGoal::MinimumSize) &&
                        float_literal_memory(immediate)) {
                 instruction("movss", *float_literal_memory(immediate) +
                                          ", %" + destination);
@@ -13355,8 +13573,8 @@ private:
                 ? std::string(assigned->name) : std::string("xmm0");
             if (immediate.value == 0) {
                 instruction("xorpd", "%" + destination + ", %" + destination);
-            } else if ((options_.optimize_for == "size" ||
-                        options_.optimize_for == "minimum-size") &&
+            } else if ((options_.optimize_for == OptimizationGoal::Size ||
+                        options_.optimize_for == OptimizationGoal::MinimumSize) &&
                        float_literal_memory(immediate)) {
                 instruction("movsd", *float_literal_memory(immediate) +
                                          ", %" + destination);
@@ -13372,7 +13590,7 @@ private:
     void emit_float_load_store(const machine::Function& function,
                                const machine::Instruction& value) {
         const auto& slot = std::get<machine::StackSlotOperand>(value.operands.front());
-        if (value.opcode == "x86.fload") {
+        if (value.opcode == Opcode::Fload) {
             if (value.defs.front().mode.bits == 80) {
                 load_x87_slot(function, slot);
                 store_x87(function, value.defs.front());
@@ -13595,7 +13813,7 @@ private:
 
         load(function, value.uses[0], "rax", "rdx");
         load(function, value.uses[1], "r10", "r11");
-        if (value.opcode == "x86.fsub") instruction("btcq", "$63, %r11");
+        if (value.opcode == Opcode::Fsub) instruction("btcq", "$63, %r11");
         instruction("movq", "%rax, " + f128_scratch(function, 0));
         instruction("movq", "%rdx, " + f128_scratch(function, 8));
         instruction("movq", "%r10, " + f128_scratch(function, 16));
@@ -14160,8 +14378,8 @@ private:
         instruction("jne", unordered);
         output_ << ordered << ":\n";
 
-        if (value.opcode == "x86.fcmp.eq" ||
-            value.opcode == "x86.fcmp.ne") {
+        if (value.opcode == Opcode::FcmpEq ||
+            value.opcode == Opcode::FcmpNe) {
             // IEEE equality folds the two signed-zero encodings together.
             instruction("movq", "%rdx, %rcx");
             instruction("btrq", "$63, %rcx");
@@ -14171,15 +14389,15 @@ private:
             instruction("btrq", "$63, %r8");
             instruction("orq", "%r10, %r8");
             instruction("jne", nonzero);
-            instruction(value.opcode == "x86.fcmp.eq" ? "movb" : "xorb",
-                        value.opcode == "x86.fcmp.eq"
+            instruction(value.opcode == Opcode::FcmpEq ? "movb" : "xorb",
+                        value.opcode == Opcode::FcmpEq
                             ? "$1, %al" : "%al, %al");
             instruction("jmp", done);
             output_ << nonzero << ":\n";
             instruction("xorq", "%r10, %rax");
             instruction("xorq", "%r11, %rdx");
             instruction("orq", "%rdx, %rax");
-            instruction(value.opcode == "x86.fcmp.eq" ? "sete" : "setne",
+            instruction(value.opcode == Opcode::FcmpEq ? "sete" : "setne",
                         "%al");
             instruction("jmp", done);
         } else {
@@ -14192,11 +14410,11 @@ private:
             instruction("btrq", "$63, %r8");
             instruction("orq", "%r10, %r8");
             instruction("jne", nonzero);
-            instruction((value.opcode == "x86.fcmp.le" ||
-                         value.opcode == "x86.fcmp.ge")
+            instruction((value.opcode == Opcode::FcmpLe ||
+                         value.opcode == Opcode::FcmpGe)
                             ? "movb" : "xorb",
-                        (value.opcode == "x86.fcmp.le" ||
-                         value.opcode == "x86.fcmp.ge")
+                        (value.opcode == Opcode::FcmpLe ||
+                         value.opcode == Opcode::FcmpGe)
                             ? "$1, %al" : "%al, %al");
             instruction("jmp", done);
             output_ << nonzero << ":\n";
@@ -14227,15 +14445,15 @@ private:
             instruction("cmpq", "%r10, %rax");
             output_ << set_result << ":\n";
             const auto condition =
-                value.opcode == "x86.fcmp.lt" ? "setb" :
-                value.opcode == "x86.fcmp.le" ? "setbe" :
-                value.opcode == "x86.fcmp.gt" ? "seta" : "setae";
+                value.opcode == Opcode::FcmpLt ? "setb" :
+                value.opcode == Opcode::FcmpLe ? "setbe" :
+                value.opcode == Opcode::FcmpGt ? "seta" : "setae";
             instruction(condition, "%al");
             instruction("jmp", done);
         }
         output_ << unordered << ":\n";
-        instruction(value.opcode == "x86.fcmp.ne" ? "movb" : "xorb",
-                    value.opcode == "x86.fcmp.ne"
+        instruction(value.opcode == Opcode::FcmpNe ? "movb" : "xorb",
+                    value.opcode == Opcode::FcmpNe
                         ? "$1, %al" : "%al, %al");
         output_ << done << ":\n";
         store(function, target, "rax");
@@ -14248,10 +14466,9 @@ private:
                 value.operands.front());
         const auto& slot =
             function.stack_slots.at(operand.slot.value);
-        const auto* view =
-            slot.physical_location
-                ? find_register_view(*slot.physical_location)
-                : nullptr;
+        const auto* view = slot.hard_register
+            ? machine_register_view(*slot.hard_register)
+            : nullptr;
         if (!view) {
             diagnostics_.error(
                 value.location,
@@ -14259,28 +14476,28 @@ private:
             return;
         }
         if (view->register_class == RegisterClass::simd) {
-            const auto bits = value.opcode == "x86.fixed.load"
+            const auto bits = value.opcode == Opcode::FixedLoad
                                   ? value.defs.front().mode.bits
                                   : value.uses.front().mode.bits;
             const auto xmm = simd_register(*view, bits);
             if (bits > 128) {
                 const auto opcode = bits == 256 ? "vmovdqu" : "vmovdqu64";
                 const auto home = vreg_offset(
-                    function, value.opcode == "x86.fixed.load"
+                    function, value.opcode == Opcode::FixedLoad
                                   ? value.defs.front()
                                   : value.uses.front());
                 instruction(opcode,
-                            value.opcode == "x86.fixed.load"
+                            value.opcode == Opcode::FixedLoad
                                 ? "%" + xmm + ", " + memory(home)
                                 : memory(home) + ", %" + xmm);
                 return;
             }
-            if (value.opcode == "x86.fixed.load") {
+            if (value.opcode == Opcode::FixedLoad) {
                 store_float(function, value.defs.front(), xmm);
             } else {
                 load_float(function, value.uses.front(), xmm);
             }
-        } else if (value.opcode == "x86.fixed.load") {
+        } else if (value.opcode == Opcode::FixedLoad) {
             store(function, value.defs.front(),
                   view->storage_name);
         } else {
@@ -14291,7 +14508,7 @@ private:
 
     void emit_float_binary(const machine::Function& function,
                            const machine::Instruction& value) {
-        if (value.opcode.ends_with(".mem")) {
+        if (has_property(value.opcode, OpcodeProperty::Memory)) {
             if (value.uses.size() != 3 || value.defs.size() != 1 ||
                 value.operands.size() < 5) {
                 diagnostics_.error(
@@ -14299,12 +14516,11 @@ private:
                     "malformed x86 scalar floating memory operation");
                 return;
             }
-            auto base_opcode = std::string_view(value.opcode);
-            base_opcode.remove_suffix(std::string_view(".mem").size());
-            const auto opcode = base_opcode == "x86.fadd" ? "add" :
-                                base_opcode == "x86.fsub" ? "sub" :
-                                base_opcode == "x86.fmul" ? "mul" :
-                                base_opcode == "x86.fdiv" ? "div" : "";
+            const auto scalar_opcode = x86_64::base_opcode(value.opcode);
+            const auto opcode = scalar_opcode == Opcode::Fadd ? "add" :
+                                scalar_opcode == Opcode::Fsub ? "sub" :
+                                scalar_opcode == Opcode::Fmul ? "mul" :
+                                scalar_opcode == Opcode::Fdiv ? "div" : "";
             if (std::string_view(opcode).empty()) {
                 diagnostics_.error(
                     value.location,
@@ -14352,7 +14568,7 @@ private:
                 ? std::string(assigned_target->name)
                 : std::string("xmm0");
             const auto suffix = float_suffix(lhs);
-            if (subtarget_.has_feature("avx")) {
+            if (subtarget_.has_feature(Feature::Avx)) {
                 instruction(std::string("v") + opcode + suffix,
                             memory_operand + ", %" + lhs_register +
                                 ", %" + destination);
@@ -14372,20 +14588,21 @@ private:
         const auto right = value.uses[1];
         const auto target = value.defs.front();
         if (left.mode.bits == 128 &&
-            value.opcode.starts_with("x86.fcmp.")) {
+            has_property(value.opcode, OpcodeProperty::Comparison) &&
+            has_property(value.opcode, OpcodeProperty::Floating)) {
             emit_float_compare128(function, value);
             return;
         }
         if (left.mode.bits == 128) {
-            if (value.opcode == "x86.fadd" || value.opcode == "x86.fsub") {
+            if (value.opcode == Opcode::Fadd || value.opcode == Opcode::Fsub) {
                 emit_f128_add_subtract(function, value);
                 return;
             }
-            if (value.opcode == "x86.fmul") {
+            if (value.opcode == Opcode::Fmul) {
                 emit_f128_multiply(function, value);
                 return;
             }
-            if (value.opcode == "x86.fdiv") {
+            if (value.opcode == Opcode::Fdiv) {
                 emit_f128_divide(function, value);
                 return;
             }
@@ -14398,14 +14615,14 @@ private:
         if (left.mode.bits == 80) {
             load_x87(function, left);
             load_x87(function, right);
-            if (value.opcode == "x86.fadd" ||
-                value.opcode == "x86.fsub" ||
-                value.opcode == "x86.fmul" ||
-                value.opcode == "x86.fdiv") {
+            if (value.opcode == Opcode::Fadd ||
+                value.opcode == Opcode::Fsub ||
+                value.opcode == Opcode::Fmul ||
+                value.opcode == Opcode::Fdiv) {
                 const auto opcode =
-                    value.opcode == "x86.fadd" ? "faddp" :
-                    value.opcode == "x86.fsub" ? "fsubrp" :
-                    value.opcode == "x86.fmul" ? "fmulp" : "fdivrp";
+                    value.opcode == Opcode::Fadd ? "faddp" :
+                    value.opcode == Opcode::Fsub ? "fsubrp" :
+                    value.opcode == Opcode::Fmul ? "fmulp" : "fdivrp";
                 instruction(opcode, "%st, %st(1)");
                 store_x87(function, target);
                 return;
@@ -14418,25 +14635,25 @@ private:
             instruction("fucomip", "%st(1), %st");
             instruction("fstp", "%st(0)");
             std::string condition;
-            if (value.opcode == "x86.fcmp.eq") condition = "e";
-            else if (value.opcode == "x86.fcmp.ne") condition = "ne";
-            else if (value.opcode == "x86.fcmp.lt") condition = "b";
-            else if (value.opcode == "x86.fcmp.le") condition = "be";
-            else if (value.opcode == "x86.fcmp.gt") condition = "a";
-            else if (value.opcode == "x86.fcmp.ge") condition = "ae";
+            if (value.opcode == Opcode::FcmpEq) condition = "e";
+            else if (value.opcode == Opcode::FcmpNe) condition = "ne";
+            else if (value.opcode == Opcode::FcmpLt) condition = "b";
+            else if (value.opcode == Opcode::FcmpLe) condition = "be";
+            else if (value.opcode == Opcode::FcmpGt) condition = "a";
+            else if (value.opcode == Opcode::FcmpGe) condition = "ae";
             else {
                 diagnostics_.error(
                     value.location,
                     "unselected x87 floating operation '" +
-                        value.opcode + "'");
+                        std::string(opcode_name(value.opcode)) + "'");
                 return;
             }
             instruction("set" + condition, "%al");
-            if (value.opcode == "x86.fcmp.ne") {
+            if (value.opcode == Opcode::FcmpNe) {
                 instruction("setp", "%dl");
                 instruction("orb", "%dl, %al");
-            } else if (value.opcode != "x86.fcmp.gt" &&
-                       value.opcode != "x86.fcmp.ge") {
+            } else if (value.opcode != Opcode::FcmpGt &&
+                       value.opcode != Opcode::FcmpGe) {
                 instruction("setnp", "%dl");
                 instruction("andb", "%dl, %al");
             }
@@ -14444,15 +14661,15 @@ private:
             return;
         }
         const auto suffix = float_suffix(left);
-        if (value.opcode == "x86.fadd" || value.opcode == "x86.fsub" ||
-            value.opcode == "x86.fmul" || value.opcode == "x86.fdiv") {
-            const auto opcode = value.opcode == "x86.fadd" ? "add" :
-                                value.opcode == "x86.fsub" ? "sub" :
-                                value.opcode == "x86.fmul" ? "mul" : "div";
+        if (value.opcode == Opcode::Fadd || value.opcode == Opcode::Fsub ||
+            value.opcode == Opcode::Fmul || value.opcode == Opcode::Fdiv) {
+            const auto opcode = value.opcode == Opcode::Fadd ? "add" :
+                                value.opcode == Opcode::Fsub ? "sub" :
+                                value.opcode == Opcode::Fmul ? "mul" : "div";
             auto lhs = left;
             auto rhs = right;
-            const bool commutative = value.opcode == "x86.fadd" ||
-                                     value.opcode == "x86.fmul";
+            const bool commutative = value.opcode == Opcode::Fadd ||
+                                     value.opcode == Opcode::Fmul;
             if (commutative &&
                 rematerialized_immediate(function, lhs) &&
                 !rematerialized_immediate(function, rhs)) {
@@ -14463,7 +14680,7 @@ private:
             auto destination = assigned_target
                 ? std::string(assigned_target->name)
                 : std::string("xmm0");
-            if (!subtarget_.has_feature("avx") && assigned_target &&
+            if (!subtarget_.has_feature(Feature::Avx) && assigned_target &&
                 same_physical_assignment(function, target, rhs) &&
                 !same_physical_assignment(function, target, lhs)) {
                 if (commutative) std::swap(lhs, rhs);
@@ -14507,7 +14724,7 @@ private:
             const auto right_operand = right_memory
                 ? *right_memory
                 : "%" + right_register;
-            if (subtarget_.has_feature("avx")) {
+            if (subtarget_.has_feature(Feature::Avx)) {
                 instruction(std::string("v") + opcode + suffix,
                             right_operand + ", %" + left_register +
                                 ", %" + destination);
@@ -14534,19 +14751,21 @@ private:
         const auto left_register = source_register(left, "xmm0");
         const auto right_register = right == left
             ? left_register : source_register(right, "xmm1");
-        instruction((subtarget_.has_feature("avx") ? "vucomi" : "ucomi") +
+        instruction((subtarget_.has_feature(Feature::Avx) ? "vucomi" : "ucomi") +
                         suffix,
                     "%" + right_register + ", %" + left_register);
         std::string condition;
-        if (value.opcode == "x86.fcmp.eq") condition = "e";
-        else if (value.opcode == "x86.fcmp.ne") condition = "ne";
-        else if (value.opcode == "x86.fcmp.lt") condition = "b";
-        else if (value.opcode == "x86.fcmp.le") condition = "be";
-        else if (value.opcode == "x86.fcmp.gt") condition = "a";
-        else if (value.opcode == "x86.fcmp.ge") condition = "ae";
+        if (value.opcode == Opcode::FcmpEq) condition = "e";
+        else if (value.opcode == Opcode::FcmpNe) condition = "ne";
+        else if (value.opcode == Opcode::FcmpLt) condition = "b";
+        else if (value.opcode == Opcode::FcmpLe) condition = "be";
+        else if (value.opcode == Opcode::FcmpGt) condition = "a";
+        else if (value.opcode == Opcode::FcmpGe) condition = "ae";
         else {
-            diagnostics_.error(value.location, "unselected x86 floating operation '" +
-                                             value.opcode + "'");
+            diagnostics_.error(
+                value.location,
+                "unselected x86 floating operation '" +
+                    std::string(opcode_name(value.opcode)) + "'");
             return;
         }
         const auto* assigned_target =
@@ -14555,10 +14774,10 @@ private:
             ? std::string(assigned_target->storage_name)
             : std::string("rax");
         instruction("set" + condition, register_name(destination, 8));
-        if (value.opcode == "x86.fcmp.ne") {
+        if (value.opcode == Opcode::FcmpNe) {
             instruction("setp", "%dl");
             instruction("orb", "%dl, " + register_name(destination, 8));
-        } else if (value.opcode != "x86.fcmp.gt" && value.opcode != "x86.fcmp.ge") {
+        } else if (value.opcode != Opcode::FcmpGt && value.opcode != Opcode::FcmpGe) {
             instruction("setnp", "%dl");
             instruction("andb", "%dl, " + register_name(destination, 8));
         }
@@ -14571,7 +14790,7 @@ private:
         const auto target = value.defs.front();
         if (source.mode.bits == 128) {
             load(function, source, "rax", "rdx");
-            if (value.opcode == "x86.fneg") {
+            if (value.opcode == Opcode::Fneg) {
                 instruction("btcq", "$63, %rdx");
                 store(function, target, "rax", "rdx");
             } else {
@@ -14584,7 +14803,7 @@ private:
         }
         if (source.mode.bits == 80) {
             load_x87(function, source);
-            if (value.opcode == "x86.fneg") {
+            if (value.opcode == Opcode::Fneg) {
                 instruction("fchs");
                 store_x87(function, target);
                 return;
@@ -14604,7 +14823,7 @@ private:
         const auto source_register = assigned_source
             ? std::string(assigned_source->name) : std::string("xmm0");
         if (!assigned_source) load_float(function, source, source_register);
-        if (value.opcode == "x86.fneg") {
+        if (value.opcode == Opcode::Fneg) {
             const auto* assigned_target =
                 assigned_simd_register(function, target);
             const auto destination = assigned_target
@@ -14612,7 +14831,7 @@ private:
             if (source.mode.bits == 32) {
                 instruction("movl", "$2147483648, %eax");
                 instruction("movd", "%eax, %xmm1");
-                if (subtarget_.has_feature("avx")) {
+                if (subtarget_.has_feature(Feature::Avx)) {
                     instruction("vxorps", "%xmm1, %" + source_register +
                                                 ", %" + destination);
                 } else {
@@ -14625,7 +14844,7 @@ private:
             } else {
                 instruction("movabsq", "$-9223372036854775808, %rax");
                 instruction("movq", "%rax, %xmm1");
-                if (subtarget_.has_feature("avx")) {
+                if (subtarget_.has_feature(Feature::Avx)) {
                     instruction("vxorpd", "%xmm1, %" + source_register +
                                                 ", %" + destination);
                 } else {
@@ -14640,12 +14859,12 @@ private:
             return;
         }
         const auto zero_opcode = source.mode.bits == 32 ? "xorps" : "xorpd";
-        instruction(subtarget_.has_feature("avx")
+        instruction(subtarget_.has_feature(Feature::Avx)
                         ? std::string("v") + zero_opcode
                         : std::string(zero_opcode),
-                    subtarget_.has_feature("avx")
+                    subtarget_.has_feature(Feature::Avx)
                         ? "%xmm1, %xmm1, %xmm1" : "%xmm1, %xmm1");
-        instruction((subtarget_.has_feature("avx") ? "vucomi" : "ucomi") +
+        instruction((subtarget_.has_feature(Feature::Avx) ? "vucomi" : "ucomi") +
                         suffix,
                     "%xmm1, %" + source_register);
         const auto* assigned_target =
@@ -15106,11 +15325,11 @@ private:
         }
         load_float(function, source, "xmm0");
         const auto opcode =
-            value.opcode == "x86.fextend" ? "cvtss2sd" : "cvtsd2ss";
-        instruction(subtarget_.has_feature("avx")
+            value.opcode == Opcode::Fextend ? "cvtss2sd" : "cvtsd2ss";
+        instruction(subtarget_.has_feature(Feature::Avx)
                         ? std::string("v") + opcode
                         : std::string(opcode),
-                    subtarget_.has_feature("avx")
+                    subtarget_.has_feature(Feature::Avx)
                         ? "%xmm0, %xmm0, %xmm0" : "%xmm0, %xmm0");
         store_float(function, target, "xmm0");
     }
@@ -15161,7 +15380,7 @@ private:
                                  const machine::Instruction& value,
                                  machine::Register output) {
         const auto source = value.uses.front();
-        const bool signed_integer = value.opcode == "x86.sitofp";
+        const bool signed_integer = value.opcode == Opcode::Sitofp;
         const auto magnitude = private_label(function, "i128.tof128.magnitude");
         const auto low_half = private_label(function, "i128.tof128.lowhalf");
         const auto align_small = private_label(function, "i128.tof128.alignsmall");
@@ -15278,7 +15497,7 @@ private:
         instruction("movl", "$63, %ecx");
         instruction("subl", "%edx, %ecx");
         instruction("shrq", "%cl, %rax");
-        if (value.opcode == "x86.fptosi") {
+        if (value.opcode == Opcode::Fptosi) {
             instruction("testw", "$32768, %r10w");
             const auto positive = private_label(function, "f80.toint.positive");
             instruction("jz", positive);
@@ -15329,7 +15548,7 @@ private:
         output_ << zero << ":\n";
         instruction("xorq", "%rax, %rax");
         output_ << signed_result << ":\n";
-        if (value.opcode == "x86.fptosi") {
+        if (value.opcode == Opcode::Fptosi) {
             instruction("testq", "%r10, %r10");
             const auto positive = private_label(function, "f128.toint.positive");
             instruction("jns", positive);
@@ -15388,7 +15607,7 @@ private:
         instruction("xorq", "%rax, %rax");
         instruction("xorq", "%rdx, %rdx");
         output_ << apply_sign << ":\n";
-        if (value.opcode == "x86.fptosi") {
+        if (value.opcode == Opcode::Fptosi) {
             instruction("testq", "%r10, %r10");
             instruction("jns", positive);
             instruction("notq", "%rax");
@@ -15413,7 +15632,7 @@ private:
                 "x86-64 native integer-to-floating conversion has an unsupported type");
             return;
         }
-        const bool signed_integer = value.opcode == "x86.sitofp";
+        const bool signed_integer = value.opcode == Opcode::Sitofp;
         if (source.mode.bits == 128) {
             if (target.mode.bits == 128) {
                 emit_integer128_to_f128(function, value, target);
@@ -15470,7 +15689,7 @@ private:
                 "x86-64 native floating-to-integer conversion has an unsupported type");
             return;
         }
-        const bool signed_integer = value.opcode == "x86.fptosi";
+        const bool signed_integer = value.opcode == Opcode::Fptosi;
         if (target.mode.bits == 128) {
             auto f128_source = source;
             if (source.mode.bits != 128) {
@@ -15610,7 +15829,7 @@ private:
 
     void emit_dynamic_stack(const machine::Function& function,
                             const machine::Instruction& value) {
-        if (value.opcode == "x86.stack.save") {
+        if (value.opcode == Opcode::StackSave) {
             const auto* assigned =
                 assigned_integer_register(function, value.defs.front());
             const auto destination = assigned
@@ -15619,7 +15838,7 @@ private:
             store(function, value.defs.front(), destination);
             return;
         }
-        if (value.opcode == "x86.stack.restore") {
+        if (value.opcode == Opcode::StackRestore) {
             load(function, value.uses.front(), "rax");
             instruction("movq", "%rax, %rsp");
             return;
@@ -15749,8 +15968,8 @@ private:
     void emit_atomic(const machine::Function& function,
                      const machine::Instruction& value) {
         const auto metadata = atomic_metadata(value);
-        if (value.opcode == "x86.atomic.signal_fence") return;
-        if (value.opcode == "x86.atomic.thread_fence") {
+        if (value.opcode == Opcode::AtomicSignalFence) return;
+        if (value.opcode == Opcode::AtomicThreadFence) {
             if (metadata.order == mir::MemoryOrder::SeqCst) {
                 instruction("mfence");
             }
@@ -15768,14 +15987,14 @@ private:
         const auto memory_operand = std::string("0(%r11)");
         load(function, value.uses[0], "r11");
 
-        if (value.opcode == "x86.atomic.load") {
+        if (value.opcode == Opcode::AtomicLoad) {
             instruction("mov" + mnemonic,
                         memory_operand + ", " +
                             register_name("rax", metadata.bits));
             store_atomic_bits(function, value.defs.front(), "rax");
             return;
         }
-        if (value.opcode == "x86.atomic.store") {
+        if (value.opcode == Opcode::AtomicStore) {
             load_atomic_bits(function, value.uses[1], "rax");
             if (metadata.order == mir::MemoryOrder::SeqCst) {
                 instruction("xchg" + mnemonic,
@@ -15788,7 +16007,7 @@ private:
             }
             return;
         }
-        if (value.opcode == "x86.atomic.exchange") {
+        if (value.opcode == Opcode::AtomicExchange) {
             load_atomic_bits(function, value.uses[1], "rax");
             instruction("xchg" + mnemonic,
                         register_name("rax", metadata.bits) + ", " +
@@ -15796,10 +16015,10 @@ private:
             store_atomic_bits(function, value.defs.front(), "rax");
             return;
         }
-        if (value.opcode == "x86.atomic.fetch.add" ||
-            value.opcode == "x86.atomic.fetch.sub") {
+        if (value.opcode == Opcode::AtomicFetchAdd ||
+            value.opcode == Opcode::AtomicFetchSub) {
             load_atomic_bits(function, value.uses[1], "rax");
-            if (value.opcode == "x86.atomic.fetch.sub") {
+            if (value.opcode == Opcode::AtomicFetchSub) {
                 instruction("neg" + mnemonic,
                             register_name("rax", metadata.bits));
             }
@@ -15809,9 +16028,9 @@ private:
             store_atomic_bits(function, value.defs.front(), "rax");
             return;
         }
-        if (value.opcode == "x86.atomic.fetch.and" ||
-            value.opcode == "x86.atomic.fetch.xor" ||
-            value.opcode == "x86.atomic.fetch.or") {
+        if (value.opcode == Opcode::AtomicFetchAnd ||
+            value.opcode == Opcode::AtomicFetchXor ||
+            value.opcode == Opcode::AtomicFetchOr) {
             load_atomic_bits(function, value.uses[1], "r10");
             instruction("mov" + mnemonic,
                         memory_operand + ", " +
@@ -15822,8 +16041,8 @@ private:
                         register_name("rax", metadata.bits) + ", " +
                             register_name("rdx", metadata.bits));
             const auto operation =
-                value.opcode == "x86.atomic.fetch.and" ? "and" :
-                value.opcode == "x86.atomic.fetch.xor" ? "xor" : "or";
+                value.opcode == Opcode::AtomicFetchAnd ? "and" :
+                value.opcode == Opcode::AtomicFetchXor ? "xor" : "or";
             instruction(std::string(operation) + mnemonic,
                         register_name("r10", metadata.bits) + ", " +
                             register_name("rdx", metadata.bits));
@@ -15834,7 +16053,7 @@ private:
             store_atomic_bits(function, value.defs.front(), "rax");
             return;
         }
-        if (value.opcode == "x86.atomic.fetch.update") {
+        if (value.opcode == Opcode::AtomicFetchUpdate) {
             load_atomic_bits(function, value.uses[1], "r10");
             instruction("mov" + mnemonic,
                         memory_operand + ", " +
@@ -15958,7 +16177,7 @@ private:
             store_atomic_bits(function, value.defs.front(), "rax");
             return;
         }
-        if (value.opcode == "x86.atomic.compare_exchange") {
+        if (value.opcode == Opcode::AtomicCompareExchange) {
             load(function, value.uses[1], "r10");
             load_atomic_bits(function, value.uses[2], "rdx");
             instruction("mov" + mnemonic,
@@ -15980,9 +16199,10 @@ private:
             store(function, value.defs.front(), "rax");
             return;
         }
-        diagnostics_.error(value.location,
-                           "unselected x86-64 atomic operation '" +
-                               value.opcode + "'");
+        diagnostics_.error(
+            value.location,
+            "unselected x86-64 atomic operation '" +
+                std::string(opcode_name(value.opcode)) + "'");
     }
 
     std::string simd_register(const RegisterView& view,
@@ -16372,14 +16592,12 @@ private:
                                "variadic state has no ABI model or destination");
             return;
         }
-        const auto& name = value.variadic_state;
-        const auto state = std::find_if(
-            abi->variadic_states.begin(), abi->variadic_states.end(),
-            [&](const AbiVariadicState& candidate) {
-                return candidate.canonical_name == name;
-            });
+        const auto* state = value.variadic_state.value <
+                                    abi->variadic_states.size()
+            ? &abi->variadic_states[value.variadic_state.value]
+            : nullptr;
         const auto fixed = variadic_fixed_signature(entity);
-        if (state == abi->variadic_states.end() || !fixed.valid) {
+        if (!state || !fixed.valid) {
             diagnostics_.error(value.location,
                                "variadic state cannot classify the fixed prefix");
             return;
@@ -16746,14 +16964,14 @@ private:
         const auto source = value.uses.front();
         const auto target = value.defs.front();
         load(function, source, "rax", "rdx");
-        if (value.opcode == "x86.neg") {
+        if (value.opcode == Opcode::Neg) {
             instruction("negq", "%rax");
             instruction("adcq", "$0, %rdx");
             instruction("negq", "%rdx");
-        } else if (value.opcode == "x86.not") {
+        } else if (value.opcode == Opcode::Not) {
             instruction("notq", "%rax");
             instruction("notq", "%rdx");
-        } else if (value.opcode == "x86.iszero") {
+        } else if (value.opcode == Opcode::Iszero) {
             instruction("orq", "%rdx, %rax");
             instruction("sete", "%al");
             store(function, target, "rax");
@@ -16774,10 +16992,10 @@ private:
         const auto destination = assigned
             ? std::string(assigned->storage_name) : std::string("rax");
         load(function, source, destination);
-        if (value.opcode == "x86.neg") {
+        if (value.opcode == Opcode::Neg) {
             instruction("neg" + std::string(1, suffix(source.mode.bits)),
                         register_name(destination, source.mode.bits));
-        } else if (value.opcode == "x86.not") {
+        } else if (value.opcode == Opcode::Not) {
             instruction("not" + std::string(1, suffix(source.mode.bits)),
                         register_name(destination, source.mode.bits));
         } else {
@@ -16797,7 +17015,7 @@ private:
         // banks. Treat it as an exact bit transfer rather than routing the
         // SIMD value through integer load/store helpers, which would require
         // a spill home even when both values have physical assignments.
-        if (value.opcode == "x86.reinterpret" &&
+        if (value.opcode == Opcode::Reinterpret &&
             source.mode.bits <= 64 && target.mode.bits <= 64 &&
             floating_register(function, source) !=
                 floating_register(function, target)) {
@@ -16808,8 +17026,8 @@ private:
         const auto source_bits = source.mode.bits;
         const auto target_bits = target.mode.bits;
         if (source_bits <= 64 && target_bits <= 64 &&
-            (value.opcode == "x86.trunc" ||
-             value.opcode == "x86.reinterpret" ||
+            (value.opcode == Opcode::Trunc ||
+             value.opcode == Opcode::Reinterpret ||
              source_bits == target_bits)) {
             const auto* assigned_target =
                 assigned_integer_register(function, target);
@@ -16828,7 +17046,7 @@ private:
             ? std::string(assigned_target->storage_name)
             : std::string("rax");
         load(function, source, destination, "rdx");
-        if (value.opcode == "x86.sext" && target_bits > source_bits) {
+        if (value.opcode == Opcode::Sext && target_bits > source_bits) {
             if (source_bits == 8) {
                 instruction(target_bits <= 32 ? "movsbl" : "movsbq",
                             register_name(destination, 8) + ", " +
@@ -16849,7 +17067,7 @@ private:
                 store(function, target, "rax", "rdx");
                 return;
             }
-        } else if (value.opcode == "x86.zext" &&
+        } else if (value.opcode == Opcode::Zext &&
                    target_bits > source_bits) {
             if (source_bits == 8) {
                 instruction("movzbl",
@@ -16880,17 +17098,17 @@ private:
         store(function, target, destination);
     }
 
-    std::string condition_code(std::string_view opcode) const {
-        if (opcode == "x86.cmp.eq") return "e";
-        if (opcode == "x86.cmp.ne") return "ne";
-        if (opcode == "x86.cmp.slt") return "l";
-        if (opcode == "x86.cmp.sle") return "le";
-        if (opcode == "x86.cmp.sgt") return "g";
-        if (opcode == "x86.cmp.sge") return "ge";
-        if (opcode == "x86.cmp.ult") return "b";
-        if (opcode == "x86.cmp.ule") return "be";
-        if (opcode == "x86.cmp.ugt") return "a";
-        if (opcode == "x86.cmp.uge") return "ae";
+    std::string condition_code(machine::TargetOpcodeId opcode) const {
+        if (opcode == Opcode::CmpEq) return "e";
+        if (opcode == Opcode::CmpNe) return "ne";
+        if (opcode == Opcode::CmpSlt) return "l";
+        if (opcode == Opcode::CmpSle) return "le";
+        if (opcode == Opcode::CmpSgt) return "g";
+        if (opcode == Opcode::CmpSge) return "ge";
+        if (opcode == Opcode::CmpUlt) return "b";
+        if (opcode == Opcode::CmpUle) return "be";
+        if (opcode == Opcode::CmpUgt) return "a";
+        if (opcode == Opcode::CmpUge) return "ae";
         return {};
     }
 
@@ -16915,34 +17133,41 @@ private:
                          machine::Register target) {
         load(function, left, "rax", "rdx");
         load(function, right, "r10", "r11");
-        if (value.opcode == "x86.cmp.eq" ||
-            value.opcode == "x86.cmp.ne") {
+        if (value.opcode == Opcode::CmpEq ||
+            value.opcode == Opcode::CmpNe) {
             instruction("xorq", "%r10, %rax");
             instruction("xorq", "%r11, %rdx");
             instruction("orq", "%rdx, %rax");
-            instruction(value.opcode == "x86.cmp.eq" ? "sete" : "setne",
+            instruction(value.opcode == Opcode::CmpEq ? "sete" : "setne",
                         "%al");
             store(function, target, "rax");
             return;
         }
-        const bool signed_compare =
-            value.opcode.find(".s") != std::string::npos;
+        const bool signed_compare = value.opcode == Opcode::CmpSlt ||
+                                    value.opcode == Opcode::CmpSle ||
+                                    value.opcode == Opcode::CmpSgt ||
+                                    value.opcode == Opcode::CmpSge;
         const auto high_different = private_label(function, "cmp128.high");
         const auto done = private_label(function, "cmp128.done");
         instruction("cmpq", "%r11, %rdx");
         instruction("jne", high_different);
         instruction("cmpq", "%r10, %rax");
-        const std::string low_code =
-            value.opcode.ends_with("lt") ? "b" :
-            value.opcode.ends_with("le") ? "be" :
-            value.opcode.ends_with("gt") ? "a" : "ae";
+        const bool less = value.opcode == Opcode::CmpSlt ||
+                          value.opcode == Opcode::CmpUlt;
+        const bool less_equal = value.opcode == Opcode::CmpSle ||
+                                value.opcode == Opcode::CmpUle;
+        const bool greater = value.opcode == Opcode::CmpSgt ||
+                             value.opcode == Opcode::CmpUgt;
+        const std::string low_code = less ? "b" :
+                                     less_equal ? "be" :
+                                     greater ? "a" : "ae";
         instruction("set" + low_code, "%al");
         instruction("jmp", done);
         output_ << high_different << ":\n";
         std::string high_code;
-        if (value.opcode.ends_with("lt")) high_code = signed_compare ? "l" : "b";
-        else if (value.opcode.ends_with("le")) high_code = signed_compare ? "l" : "b";
-        else if (value.opcode.ends_with("gt")) high_code = signed_compare ? "g" : "a";
+        if (less) high_code = signed_compare ? "l" : "b";
+        else if (less_equal) high_code = signed_compare ? "l" : "b";
+        else if (greater) high_code = signed_compare ? "g" : "a";
         else high_code = signed_compare ? "g" : "a";
         instruction("set" + high_code, "%al");
         output_ << done << ":\n";
@@ -16960,25 +17185,25 @@ private:
         const auto done = private_label(function, "shift128.done");
         instruction("testb", "$64, %cl");
         instruction("jne", large);
-        if (value.opcode == "x86.shl") {
+        if (value.opcode == Opcode::Shl) {
             instruction("shldq", "%cl, %rax, %rdx");
             instruction("shlq", "%cl, %rax");
         } else {
             instruction("shrdq", "%cl, %rdx, %rax");
-            instruction(value.opcode == "x86.shr.s" ? "sarq" : "shrq",
+            instruction(value.opcode == Opcode::ShrS ? "sarq" : "shrq",
                         "%cl, %rdx");
         }
         instruction("jmp", done);
         output_ << large << ":\n";
-        if (value.opcode == "x86.shl") {
+        if (value.opcode == Opcode::Shl) {
             instruction("movq", "%rax, %rdx");
             instruction("shlq", "%cl, %rdx");
             instruction("xorq", "%rax, %rax");
         } else {
             instruction("movq", "%rdx, %rax");
-            instruction(value.opcode == "x86.shr.s" ? "sarq" : "shrq",
+            instruction(value.opcode == Opcode::ShrS ? "sarq" : "shrq",
                         "%cl, %rax");
-            if (value.opcode == "x86.shr.s") {
+            if (value.opcode == Opcode::ShrS) {
                 instruction("sarq", "$63, %rdx");
             } else {
                 instruction("xorq", "%rdx, %rdx");
@@ -16998,7 +17223,7 @@ private:
         load(function, left, "r8", "r9");
         load(function, right, "r10", "r11");
         const bool signed_operation =
-            value.opcode == "x86.sdiv" || value.opcode == "x86.srem";
+            value.opcode == Opcode::Sdiv || value.opcode == Opcode::Srem;
         if (signed_operation) {
             const auto left_positive = private_label(function, "div128.lpos");
             const auto right_positive = private_label(function, "div128.rpos");
@@ -17044,7 +17269,7 @@ private:
         instruction("decl", "%ecx");
         instruction("jne", loop);
         if (signed_operation) {
-            if (value.opcode == "x86.sdiv") {
+            if (value.opcode == Opcode::Sdiv) {
                 const auto quotient_positive =
                     private_label(function, "div128.qpos");
                 instruction("movq",
@@ -17071,8 +17296,8 @@ private:
                 output_ << remainder_positive << ":\n";
             }
         }
-        if (value.opcode != "x86.udiv" &&
-            value.opcode != "x86.sdiv") {
+        if (value.opcode != Opcode::Udiv &&
+            value.opcode != Opcode::Sdiv) {
             store(function, target, "rax", "rdx");
         }
     }
@@ -17086,36 +17311,36 @@ private:
             emit_compare128(function, value, left, right, target);
             return;
         }
-        if (value.opcode == "x86.shl" ||
-            value.opcode == "x86.shr.s" ||
-            value.opcode == "x86.shr.u") {
+        if (value.opcode == Opcode::Shl ||
+            value.opcode == Opcode::ShrS ||
+            value.opcode == Opcode::ShrU) {
             emit_shift128(function, value, left, right, target);
             return;
         }
-        if (value.opcode == "x86.sdiv" ||
-            value.opcode == "x86.udiv" ||
-            value.opcode == "x86.srem" ||
-            value.opcode == "x86.urem") {
+        if (value.opcode == Opcode::Sdiv ||
+            value.opcode == Opcode::Udiv ||
+            value.opcode == Opcode::Srem ||
+            value.opcode == Opcode::Urem) {
             emit_divide128(function, value, left, right, target);
             return;
         }
         load(function, left, "rax", "rdx");
         load(function, right, "r10", "r11");
-        if (value.opcode == "x86.add") {
+        if (value.opcode == Opcode::Add) {
             instruction("addq", "%r10, %rax");
             instruction("adcq", "%r11, %rdx");
-        } else if (value.opcode == "x86.sub") {
+        } else if (value.opcode == Opcode::Sub) {
             instruction("subq", "%r10, %rax");
             instruction("sbbq", "%r11, %rdx");
-        } else if (value.opcode == "x86.and" ||
-                   value.opcode == "x86.or" ||
-                   value.opcode == "x86.xor") {
+        } else if (value.opcode == Opcode::And ||
+                   value.opcode == Opcode::Or ||
+                   value.opcode == Opcode::Xor) {
             const auto opcode =
-                value.opcode == "x86.and" ? "andq" :
-                value.opcode == "x86.or" ? "orq" : "xorq";
+                value.opcode == Opcode::And ? "andq" :
+                value.opcode == Opcode::Or ? "orq" : "xorq";
             instruction(opcode, "%r10, %rax");
             instruction(opcode, "%r11, %rdx");
-        } else if (value.opcode == "x86.mul") {
+        } else if (value.opcode == Opcode::Mul) {
             // Low 128 bits of (a1:a0)*(b1:b0).
             instruction("movq", "%rax, %r9");
             instruction("movq", "%rdx, %r8");
@@ -17125,9 +17350,10 @@ private:
             instruction("addq", "%r9, %rdx");
             instruction("addq", "%r8, %rdx");
         } else {
-            diagnostics_.error(value.location,
-                               "unselected 128-bit x86 machine operation '" +
-                                   value.opcode + "'");
+            diagnostics_.error(
+                value.location,
+                "unselected 128-bit x86 machine operation '" +
+                    std::string(opcode_name(value.opcode)) + "'");
             return;
         }
         store(function, target, "rax", "rdx");
@@ -17147,8 +17373,7 @@ private:
         const auto bits = source.mode.bits;
         const auto& immediate =
             std::get<machine::ImmediateOperand>(value.operands[1]);
-        const auto base = value.opcode.substr(
-            0, value.opcode.size() - std::string_view(".imm").size());
+        const auto base = x86_64::base_opcode(value.opcode);
         const auto signed_value =
             static_cast<std::int64_t>(immediate.value);
         const auto immediate_text = bits == 64
@@ -17179,7 +17404,7 @@ private:
         const auto destination = assigned_target
             ? std::string(assigned_target->storage_name)
             : std::string("rax");
-        if (options_.peephole2 && base == "x86.mul" &&
+        if (options_.peephole2 && base == Opcode::Mul &&
             bits >= 32 && immediate.high == 0) {
             const auto factor = immediate.value &
                 (bits == 64
@@ -17249,10 +17474,10 @@ private:
             }
         }
         if (options_.peephole2 && bits >= 32 &&
-            (base == "x86.add" || base == "x86.sub")) {
+            (base == Opcode::Add || base == Opcode::Sub)) {
             const auto* assigned_source =
                 assigned_integer_register(function, source);
-            const auto displacement = base == "x86.add"
+            const auto displacement = base == Opcode::Add
                 ? signed_value : -signed_value;
             if (assigned_source && assigned_target &&
                 assigned_source->storage_id !=
@@ -17271,42 +17496,43 @@ private:
         }
         load(function, source, destination);
         std::string opcode;
-        if (base == "x86.add") opcode = "add";
-        else if (base == "x86.sub") opcode = "sub";
-        else if (base == "x86.mul") opcode = "imul";
-        else if (base == "x86.and") opcode = "and";
-        else if (base == "x86.or") opcode = "or";
-        else if (base == "x86.xor") opcode = "xor";
-        else if (base == "x86.shl") opcode = "shl";
-        else if (base == "x86.shr.s") opcode = "sar";
-        else if (base == "x86.shr.u") opcode = "shr";
-        else if (base == "x86.rotl") opcode = "rol";
-        else if (base == "x86.rotr") opcode = "ror";
+        if (base == Opcode::Add) opcode = "add";
+        else if (base == Opcode::Sub) opcode = "sub";
+        else if (base == Opcode::Mul) opcode = "imul";
+        else if (base == Opcode::And) opcode = "and";
+        else if (base == Opcode::Or) opcode = "or";
+        else if (base == Opcode::Xor) opcode = "xor";
+        else if (base == Opcode::Shl) opcode = "shl";
+        else if (base == Opcode::ShrS) opcode = "sar";
+        else if (base == Opcode::ShrU) opcode = "shr";
+        else if (base == Opcode::Rotl) opcode = "rol";
+        else if (base == Opcode::Rotr) opcode = "ror";
         if (opcode.empty()) {
-            diagnostics_.error(value.location,
-                               "unselected x86 immediate operation '" +
-                                   value.opcode + "'");
+            diagnostics_.error(
+                value.location,
+                "unselected x86 immediate operation '" +
+                    std::string(opcode_name(value.opcode)) + "'");
             return;
         }
         const auto encoded_immediate =
-            base == "x86.shl" || base == "x86.shr.s" ||
-                    base == "x86.shr.u" || base == "x86.rotl" ||
-                    base == "x86.rotr"
+            base == Opcode::Shl || base == Opcode::ShrS ||
+                    base == Opcode::ShrU || base == Opcode::Rotl ||
+                    base == Opcode::Rotr
                 ? std::to_string(immediate.value % bits)
                 : immediate_text;
         if (options_.peephole2 &&
-            (options_.optimize_for == "size" ||
-             options_.optimize_for == "minimum-size") &&
-            (base == "x86.add" || base == "x86.sub") &&
+            (options_.optimize_for == OptimizationGoal::Size ||
+             options_.optimize_for == OptimizationGoal::MinimumSize) &&
+            (base == Opcode::Add || base == Opcode::Sub) &&
             immediate.value == 1 && immediate.high == 0) {
-            instruction((base == "x86.add" ? "inc" : "dec") +
+            instruction((base == Opcode::Add ? "inc" : "dec") +
                             std::string(1, suffix(bits)),
                         register_name(destination, bits));
             store(function, target, destination);
             return;
         }
         const auto encoded_bits =
-            base == "x86.and" && bits == 64 && immediate.high == 0 &&
+            base == Opcode::And && bits == 64 && immediate.high == 0 &&
                     immediate.value <=
                         std::numeric_limits<std::uint32_t>::max()
                 ? 32U : bits;
@@ -17328,18 +17554,18 @@ private:
             value.has_side_effects || value.may_store) {
             return false;
         }
-        if (value.opcode == "x86.phi" || value.opcode == "x86.fphi" ||
-            value.opcode == "x86.vphi" ||
-            value.opcode == "x86.lifetime.start" ||
-            value.opcode == "x86.lifetime.end" ||
-            value.opcode == "x86.expect" ||
-            value.opcode == "x86.indexed.address" ||
-            value.opcode == "x86.stack.address" ||
-            value.opcode == "x86.global.address" ||
-            value.opcode == "x86.label.address") {
+        if (value.opcode == Opcode::Phi || value.opcode == Opcode::Fphi ||
+            value.opcode == Opcode::Vphi ||
+            value.opcode == Opcode::LifetimeStart ||
+            value.opcode == Opcode::LifetimeEnd ||
+            value.opcode == Opcode::Expect ||
+            value.opcode == Opcode::IndexedAddress ||
+            value.opcode == Opcode::StackAddress ||
+            value.opcode == Opcode::GlobalAddress ||
+            value.opcode == Opcode::LabelAddress) {
             return true;
         }
-        if (options_.peephole2 && value.opcode == "x86.mul.imm" &&
+        if (options_.peephole2 && value.opcode == Opcode::MulImm &&
             value.defs.size() == 1 &&
             value.operands.size() >= 2) {
             const auto* immediate = std::get_if<machine::ImmediateOperand>(
@@ -17356,7 +17582,7 @@ private:
             return factor == 1 || factor == 3 || factor == 5 ||
                 factor == 9;
         }
-        if (options_.peephole2 && value.opcode == "x86.add" &&
+        if (options_.peephole2 && value.opcode == Opcode::Add &&
             value.uses.size() == 2 &&
             value.defs.size() == 1 &&
             (value.defs.front().mode.bits == 32 ||
@@ -17377,8 +17603,8 @@ private:
     bool emit_early_masked_select_test(
         const machine::Function& function,
         const machine::Instruction& value) {
-        if ((value.condition_predicate != "x86.test.eq.imm" &&
-             value.condition_predicate != "x86.test.ne.imm") ||
+        if ((value.condition_predicate != Opcode::TestEqImm &&
+             value.condition_predicate != Opcode::TestNeImm) ||
             value.uses.size() < 3 || value.operands.size() < 2) {
             return false;
         }
@@ -17416,17 +17642,17 @@ private:
                                "vector select shape does not match result");
             return;
         }
-        const bool avx = subtarget_.has_feature("avx");
+        const bool avx = subtarget_.has_feature(Feature::Avx);
         const bool byte_blend = shape.element_bits < 32;
         unsigned width = 128;
         if (target.mode.bits >= 256 && preferred_vector_width() >= 256 &&
-            avx && (!byte_blend || subtarget_.has_feature("avx2"))) {
+            avx && (!byte_blend || subtarget_.has_feature(Feature::Avx2))) {
             width = 256;
         }
         const auto mask = vector_register(value.uses[0], 0, width);
         const auto truth = vector_register(value.uses[1], 1, width);
         const auto falsity = vector_register(value.uses[2], 2, width);
-        const bool sign_mask = value.opcode == "x86.vselect.sign";
+        const bool sign_mask = value.opcode == Opcode::VselectSign;
         bool true_when_sign = true;
         if (sign_mask && value.operands.size() >= 2) {
             if (const auto* polarity =
@@ -17445,7 +17671,7 @@ private:
             load_vector(function, value.uses[0], 0, chunk, width);
             load_vector(function, value.uses[1], 1, chunk, width);
             load_vector(function, value.uses[2], 2, chunk, width);
-            if (avx && (!byte_blend || subtarget_.has_feature("avx2"))) {
+            if (avx && (!byte_blend || subtarget_.has_feature(Feature::Avx2))) {
                 const auto opcode = shape.element_bits == 64 ? "vblendvpd" :
                                     shape.element_bits == 32 ? "vblendvps"
                                                              : "vpblendvb";
@@ -17514,16 +17740,13 @@ private:
                     ", " + register_name(condition_register,
                                           condition.mode.bits));
         } else {
-            auto base = std::string_view(value.condition_predicate);
-            constexpr std::string_view immediate_suffix = ".imm";
-            if (base.ends_with(immediate_suffix)) {
-                base.remove_suffix(immediate_suffix.size());
-            }
+            const auto base =
+                x86_64::base_opcode(value.condition_predicate);
             const auto left = value.uses.front();
             const bool test_predicate =
-                base == "x86.test.eq" || base == "x86.test.ne";
+                base == Opcode::TestEq || base == Opcode::TestNe;
             truth_code = test_predicate
-                ? (base == "x86.test.eq" ? "e" : "ne")
+                ? (base == Opcode::TestEq ? "e" : "ne")
                 : condition_code(base);
             falsity_code = inverse_condition_code(truth_code);
             if (truth_code.empty() || falsity_code.empty() ||
@@ -17542,7 +17765,8 @@ private:
             std::string right_operand;
             unsigned comparison_bits = left.mode.bits;
             bool signed_zero_test = false;
-            if (value.condition_predicate.ends_with(immediate_suffix)) {
+            if (has_property(value.condition_predicate,
+                             OpcodeProperty::Immediate)) {
                 if (value.operands.size() < 2 ||
                     !std::holds_alternative<machine::ImmediateOperand>(
                         value.operands[1])) {
@@ -17559,8 +17783,8 @@ private:
                 } else {
                     signed_zero_test = immediate.value == 0 &&
                         immediate.high == 0 &&
-                        (base == "x86.cmp.slt" ||
-                         base == "x86.cmp.sge");
+                        (base == Opcode::CmpSlt ||
+                         base == Opcode::CmpSge);
                 }
                 right_operand = "$" +
                     (left.mode.bits == 64
@@ -17654,20 +17878,19 @@ private:
 
     void emit_binary(const machine::Function& function,
                      const machine::Instruction& value) {
-        if (value.opcode.ends_with(".imm")) {
+        if (has_property(value.opcode, OpcodeProperty::Immediate)) {
             emit_binary_immediate(function, value);
             return;
         }
-        if (value.opcode.ends_with(".mem")) {
+        if (has_property(value.opcode, OpcodeProperty::Memory)) {
             const auto lhs = value.uses.front();
             const auto target = value.defs.front();
             const auto bits = lhs.mode.bits;
-            const auto base = std::string_view(value.opcode).substr(
-                0, value.opcode.size() - std::string_view(".mem").size());
-            const auto opcode = base == "x86.add" ? "add" :
-                                base == "x86.mul" ? "imul" :
-                                base == "x86.and" ? "and" :
-                                base == "x86.or" ? "or" : "xor";
+            const auto base = x86_64::base_opcode(value.opcode);
+            const auto opcode = base == Opcode::Add ? "add" :
+                                base == Opcode::Mul ? "imul" :
+                                base == Opcode::And ? "and" :
+                                base == Opcode::Or ? "or" : "xor";
             const auto address_base =
                 std::get<machine::RegisterOperand>(value.operands[1]).value;
             const auto address_index =
@@ -17761,8 +17984,8 @@ private:
             store(function, target, destination);
             return;
         }
-        if (value.opcode == "x86.sdivrem" ||
-            value.opcode == "x86.udivrem") {
+        if (value.opcode == Opcode::Sdivrem ||
+            value.opcode == Opcode::Udivrem) {
             if (bits < 32 || value.defs.size() != 2) {
                 diagnostics_.error(
                     value.location,
@@ -17786,7 +18009,7 @@ private:
                 ? register_name(assigned_divisor->storage_name, bits)
                 : spilled_divisor ? memory(vreg_offset(function, right))
                                   : register_name("rcx", bits);
-            if (value.opcode == "x86.sdivrem") {
+            if (value.opcode == Opcode::Sdivrem) {
                 instruction(bits == 32 ? "cltd" : "cqto");
                 instruction("idiv" + std::string(1, suffix(bits)),
                             divisor);
@@ -17801,10 +18024,10 @@ private:
             store(function, value.defs[1], "rdx");
             return;
         }
-        if (value.opcode == "x86.sdiv" ||
-            value.opcode == "x86.udiv" ||
-            value.opcode == "x86.srem" ||
-            value.opcode == "x86.urem") {
+        if (value.opcode == Opcode::Sdiv ||
+            value.opcode == Opcode::Udiv ||
+            value.opcode == Opcode::Srem ||
+            value.opcode == Opcode::Urem) {
             if (bits < 32) {
                 diagnostics_.error(value.location,
                                    "x86 integer division was not promoted to "
@@ -17828,8 +18051,8 @@ private:
                 ? register_name(assigned_divisor->storage_name, bits)
                 : spilled_divisor ? memory(vreg_offset(function, right))
                                   : register_name("rcx", bits);
-            if (value.opcode == "x86.sdiv" ||
-                value.opcode == "x86.srem") {
+            if (value.opcode == Opcode::Sdiv ||
+                value.opcode == Opcode::Srem) {
                 instruction(bits == 32 ? "cltd" : "cqto");
                 instruction("idiv" + std::string(1, suffix(bits)),
                             divisor);
@@ -17841,13 +18064,13 @@ private:
                             divisor);
             }
             store(function, target,
-                  value.opcode == "x86.srem" ||
-                          value.opcode == "x86.urem"
+                  value.opcode == Opcode::Srem ||
+                          value.opcode == Opcode::Urem
                       ? "rdx" : "rax");
             return;
         }
-        if (value.opcode == "x86.rotl" ||
-            value.opcode == "x86.rotr") {
+        if (value.opcode == Opcode::Rotl ||
+            value.opcode == Opcode::Rotr) {
             load(function, right, "rcx");
             const auto* assigned_target =
                 assigned_integer_register(function, target);
@@ -17856,19 +18079,19 @@ private:
                 : std::string("rax");
             load(function, left, destination);
             instruction(
-                (value.opcode == "x86.rotl" ? "rol" : "ror") +
+                (value.opcode == Opcode::Rotl ? "rol" : "ror") +
                     std::string(1, suffix(bits)),
                 "%cl, " + register_name(destination, bits));
             store(function, target, destination);
             return;
         }
-        if (value.opcode == "x86.shl" ||
-            value.opcode == "x86.shr.s" ||
-            value.opcode == "x86.shr.u") {
+        if (value.opcode == Opcode::Shl ||
+            value.opcode == Opcode::ShrS ||
+            value.opcode == Opcode::ShrU) {
             const auto opcode =
-                value.opcode == "x86.shl" ? "shl" :
-                value.opcode == "x86.shr.s" ? "sar" : "shr";
-            if (bits >= 32 && subtarget_.has_feature("bmi2")) {
+                value.opcode == Opcode::Shl ? "shl" :
+                value.opcode == Opcode::ShrS ? "sar" : "shr";
+            if (bits >= 32 && subtarget_.has_feature(Feature::Bmi2)) {
                 const auto left_register = source_register(left, "rax");
                 const auto right_register = source_register(right, "rcx");
                 const auto* assigned_target =
@@ -17897,31 +18120,32 @@ private:
             return;
         }
         std::string opcode;
-        if (value.opcode == "x86.add") opcode = "add";
-        else if (value.opcode == "x86.sub") opcode = "sub";
-        else if (value.opcode == "x86.mul") opcode = "imul";
-        else if (value.opcode == "x86.and") opcode = "and";
-        else if (value.opcode == "x86.or") opcode = "or";
-        else if (value.opcode == "x86.xor") opcode = "xor";
+        if (value.opcode == Opcode::Add) opcode = "add";
+        else if (value.opcode == Opcode::Sub) opcode = "sub";
+        else if (value.opcode == Opcode::Mul) opcode = "imul";
+        else if (value.opcode == Opcode::And) opcode = "and";
+        else if (value.opcode == Opcode::Or) opcode = "or";
+        else if (value.opcode == Opcode::Xor) opcode = "xor";
         if (opcode.empty()) {
-            diagnostics_.error(value.location,
-                               "unselected x86 machine operation '" +
-                                   value.opcode + "'");
+            diagnostics_.error(
+                value.location,
+                "unselected x86 machine operation '" +
+                    std::string(opcode_name(value.opcode)) + "'");
             return;
         }
         auto lhs = left;
         auto rhs = right;
-        const bool commutative = value.opcode == "x86.add" ||
-                                 value.opcode == "x86.mul" ||
-                                 value.opcode == "x86.and" ||
-                                 value.opcode == "x86.or" ||
-                                 value.opcode == "x86.xor";
+        const bool commutative = value.opcode == Opcode::Add ||
+                                 value.opcode == Opcode::Mul ||
+                                 value.opcode == Opcode::And ||
+                                 value.opcode == Opcode::Or ||
+                                 value.opcode == Opcode::Xor;
         const auto* assigned_target =
             assigned_integer_register(function, target);
         auto destination = assigned_target
             ? std::string(assigned_target->storage_name)
             : std::string("rax");
-        if (options_.peephole2 && value.opcode == "x86.add" &&
+        if (options_.peephole2 && value.opcode == Opcode::Add &&
             (bits == 32 || bits == 64) && assigned_target) {
             const auto* assigned_left =
                 assigned_integer_register(function, left);
@@ -17961,7 +18185,7 @@ private:
                          const machine::Instruction& value) {
         const auto& slot =
             std::get<machine::StackSlotOperand>(value.operands.front());
-        if (value.opcode == "x86.load") {
+        if (value.opcode == Opcode::Load) {
             load_slot(function, slot, "rax", "rdx");
             store(function, value.defs.front(), "rax", "rdx");
         } else {
@@ -17976,7 +18200,7 @@ private:
         const auto& slot =
             std::get<machine::StackSlotOperand>(value.operands.front());
         const auto slot_address = slot_offset(function, slot.slot) + slot.offset;
-        if (value.opcode == "x86.aggregate.load") {
+        if (value.opcode == Opcode::AggregateLoad) {
             const auto target = value.defs.front();
             copy_frame_storage(slot_address, vreg_offset(function, target),
                                mode_bytes(target.mode));
@@ -17993,7 +18217,7 @@ private:
         const auto address =
             std::get<machine::RegisterOperand>(value.operands[0]).value;
         load(function, address, "r10");
-        if (value.opcode == "x86.aggregate.pointer.load") {
+        if (value.opcode == Opcode::AggregatePointerLoad) {
             const auto target = value.defs.front();
             copy_pointer_to_frame("r10", vreg_offset(function, target),
                                   mode_bytes(target.mode));
@@ -18027,7 +18251,7 @@ private:
             return base + (offset == 0 ? std::string{} : "+" +
                        std::to_string(offset)) + "(%rip)";
         };
-        if (value.opcode == "x86.aggregate.global.load") {
+        if (value.opcode == Opcode::AggregateGlobalLoad) {
             const auto target = value.defs.front();
             copy_fixed_storage(
                 mode_bytes(target.mode), global_address,
@@ -18187,7 +18411,7 @@ private:
                              const machine::Instruction& value) {
         const auto address = std::get<machine::RegisterOperand>(value.operands[0]).value;
         load(function, address, "rax");
-        if (value.opcode == "x86.pointer.load") {
+        if (value.opcode == Opcode::PointerLoad) {
             const auto target = value.defs.front();
             if (target.mode.bits == 128) {
                 instruction("movq", "0(%rax), %rdx");
@@ -18230,7 +18454,7 @@ private:
                                    const machine::Instruction& value) {
         const auto address = std::get<machine::RegisterOperand>(value.operands[0]).value;
         load(function, address, "rax");
-        if (value.opcode == "x86.fpointer.load") {
+        if (value.opcode == Opcode::FpointerLoad) {
             const auto target = value.defs.front();
             if (target.mode.bits == 80) {
                 instruction("fldt", "0(%rax)");
@@ -18409,7 +18633,7 @@ private:
                            "+" + std::to_string(offset)) + "(%rip)";
         };
         const auto address = address_at(0);
-        if (value.opcode == "x86.global.load") {
+        if (value.opcode == Opcode::GlobalLoad) {
             const auto target = value.defs.front();
             if (target.mode.bits == 128) {
                 instruction("movq", address + ", %rax");
@@ -18444,7 +18668,7 @@ private:
             return;
         }
         const auto address = global_memory(symbol);
-        if (value.opcode == "x86.fglobal.load") {
+        if (value.opcode == Opcode::FglobalLoad) {
             const auto target = value.defs.front();
             if (target.mode.bits == 80) {
                 instruction("fldt", address);
@@ -18487,17 +18711,17 @@ private:
         }
         if (is_floating(hir_, type)) {
             return mode.bits == 128
-                       ? (subtarget_.has_feature("avx") ? "vmovdqu"
+                       ? (subtarget_.has_feature(Feature::Avx) ? "vmovdqu"
                                                         : "movdqu")
                    : mode.bits == 32
-                       ? (subtarget_.has_feature("avx") ? "vmovss"
+                       ? (subtarget_.has_feature(Feature::Avx) ? "vmovss"
                                                         : "movss")
-                       : (subtarget_.has_feature("avx") ? "vmovsd"
+                       : (subtarget_.has_feature(Feature::Avx) ? "vmovsd"
                                                         : "movsd");
         }
         return mode.bits == 32
-                   ? (subtarget_.has_feature("avx") ? "vmovd" : "movd")
-                   : (subtarget_.has_feature("avx") ? "vmovq" : "movq");
+                   ? (subtarget_.has_feature(Feature::Avx) ? "vmovd" : "movd")
+                   : (subtarget_.has_feature(Feature::Avx) ? "vmovq" : "movq");
     }
 
     std::string simd_scratch_register(hir::TypeId type) const {
@@ -18793,7 +19017,7 @@ private:
                              const hir::Function& callee,
                              const machine::SymbolOperand& symbol,
                              SourceLocation location) {
-        if (options_.code_model != "large") return true;
+        if (options_.code_model != CodeModel::Large) return true;
         const auto slot = named_slot_offset(function, "$large.call.target");
         if (!slot) {
             diagnostics_.error(
@@ -18834,7 +19058,7 @@ private:
                             SourceLocation location) {
         if (uses_wide_vectors_) instruction("vzeroupper");
         const auto call_symbol = assembly_symbol(symbol.name);
-        if (options_.code_model == "large") {
+        if (options_.code_model == CodeModel::Large) {
             const auto slot = named_slot_offset(function, "$large.call.target");
             if (!slot) {
                 diagnostics_.error(
@@ -19643,7 +19867,7 @@ private:
         const machine::Instruction& call,
         const machine::Instruction& result) const {
         if (options_.optimization_effort == 0 ||
-            options_.code_model == "large" || dynamic_stack_ ||
+            options_.code_model == CodeModel::Large || dynamic_stack_ ||
             function.frame.outgoing_argument_size != 0 ||
             call.kind != machine::InstructionKind::Call ||
             result.kind != machine::InstructionKind::Return ||
@@ -19860,9 +20084,9 @@ private:
         const auto& destination = block(function, successor);
         for (const auto& value : destination.instructions) {
             if (value.kind != machine::InstructionKind::Target ||
-                (value.opcode != "x86.phi" &&
-                 value.opcode != "x86.fphi" &&
-                 value.opcode != "x86.vphi")) {
+                (value.opcode != Opcode::Phi &&
+                 value.opcode != Opcode::Fphi &&
+                 value.opcode != Opcode::Vphi)) {
                 continue;
             }
             for (std::size_t index = 0;
@@ -19898,8 +20122,8 @@ private:
         std::vector<Copy> copies;
         for (const auto& value : destination.instructions) {
             if (value.kind != machine::InstructionKind::Target ||
-                (value.opcode != "x86.phi" && value.opcode != "x86.fphi" &&
-                 value.opcode != "x86.vphi")) {
+                (value.opcode != Opcode::Phi && value.opcode != Opcode::Fphi &&
+                 value.opcode != Opcode::Vphi)) {
                 continue;
             }
             for (std::size_t index = 0;
@@ -19916,8 +20140,8 @@ private:
                     break;
                 }
                 copies.push_back({source, value.defs.front(),
-                                  value.opcode == "x86.fphi",
-                                  value.opcode == "x86.vphi", false});
+                                  value.opcode == Opcode::Fphi,
+                                  value.opcode == Opcode::Vphi, false});
                 break;
             }
         }
@@ -20672,14 +20896,15 @@ private:
                 std::get<machine::BlockOperand>(value.operands[2]).target;
             std::string truth_code = "ne";
             std::string falsity_code = "e";
-            if (value.condition_predicate.starts_with("x86.test.")) {
+            if (has_property(value.condition_predicate,
+                             OpcodeProperty::Test)) {
                 if (value.uses.size() != 1 || value.operands.size() < 4) {
                     diagnostics_.error(
                         value.location,
                         "malformed fused x86 masked-test branch");
                     return;
                 }
-                truth_code = value.condition_predicate == "x86.test.eq.imm"
+                truth_code = value.condition_predicate == Opcode::TestEqImm
                     ? "e" : "ne";
                 falsity_code = truth_code == "e" ? "ne" : "e";
                 const auto source = value.uses.front();
@@ -20698,12 +20923,10 @@ private:
                     "$" + std::to_string(
                         static_cast<std::int64_t>(mask.value)) + ", " +
                         register_name(source_register, test_bits));
-            } else if (value.condition_predicate.starts_with("x86.cmp.")) {
-                auto base = std::string_view(value.condition_predicate);
-                constexpr std::string_view immediate_suffix = ".imm";
-                if (base.ends_with(immediate_suffix)) {
-                    base.remove_suffix(immediate_suffix.size());
-                }
+            } else if (has_property(value.condition_predicate,
+                                    OpcodeProperty::Comparison)) {
+                const auto base =
+                    x86_64::base_opcode(value.condition_predicate);
                 truth_code = condition_code(base);
                 falsity_code = inverse_condition_code(truth_code);
                 if (truth_code.empty() || falsity_code.empty() ||
@@ -20723,14 +20946,15 @@ private:
                 if (!assigned_left) load(function, left, left_register);
                 std::string right_operand;
                 bool signed_zero_test = false;
-                if (value.condition_predicate.ends_with(".imm")) {
+                if (has_property(value.condition_predicate,
+                                 OpcodeProperty::Immediate)) {
                     const auto& immediate =
                         std::get<machine::ImmediateOperand>(
                             value.operands.back());
                     signed_zero_test = immediate.value == 0 &&
                         immediate.high == 0 &&
-                        (base == "x86.cmp.slt" ||
-                         base == "x86.cmp.sge");
+                        (base == Opcode::CmpSlt ||
+                         base == Opcode::CmpSge);
                     right_operand = "$" +
                         (bits == 64
                              ? std::to_string(static_cast<std::int64_t>(
@@ -20935,93 +21159,93 @@ private:
                    address_add != fused_integer_adds_.end()) {
             emit_fused_integer_address_add(
                 function, value, *address_add->second);
-        } else if (value.opcode == "x86.parameter" ||
-                   value.opcode == "x86.aggregate.parameter") {
+        } else if (value.opcode == Opcode::Parameter ||
+                   value.opcode == Opcode::AggregateParameter) {
             emit_parameter(function, value);
-        } else if (value.opcode == "x86.vparameter") {
+        } else if (value.opcode == Opcode::Vparameter) {
             emit_parameter(function, value);
-        } else if (value.opcode == "x86.label.address") {
+        } else if (value.opcode == Opcode::LabelAddress) {
             emit_label_address(function, value);
-        } else if (value.opcode == "x86.stack.address") {
+        } else if (value.opcode == Opcode::StackAddress) {
             emit_stack_address(function, value);
-        } else if (value.opcode == "x86.global.address") {
+        } else if (value.opcode == Opcode::GlobalAddress) {
             emit_global_address(function, value);
-        } else if (value.opcode == "x86.indexed.address") {
+        } else if (value.opcode == Opcode::IndexedAddress) {
             emit_indexed_address(function, value);
-        } else if (value.opcode == "x86.stack.save" ||
-                   value.opcode == "x86.stack.allocate" ||
-                   value.opcode == "x86.stack.restore") {
+        } else if (value.opcode == Opcode::StackSave ||
+                   value.opcode == Opcode::StackAllocate ||
+                   value.opcode == Opcode::StackRestore) {
             emit_dynamic_stack(function, value);
-        } else if (value.opcode == "x86.fparameter") {
+        } else if (value.opcode == Opcode::Fparameter) {
             emit_parameter(function, value);
-        } else if (value.opcode == "x86.constant") {
+        } else if (value.opcode == Opcode::Constant) {
             emit_constant(function, value);
-        } else if (value.opcode == "x86.fconstant") {
+        } else if (value.opcode == Opcode::Fconstant) {
             emit_float_constant(function, value);
-        } else if (value.opcode == "x86.variadic.state") {
+        } else if (value.opcode == Opcode::VariadicState) {
             emit_variadic_state(function, value);
-        } else if (value.opcode == "x86.phi" ||
-                   value.opcode == "x86.fphi" ||
-                   value.opcode == "x86.vphi" ||
-                   value.opcode == "x86.lifetime.start" ||
-                   value.opcode == "x86.lifetime.end") {
+        } else if (value.opcode == Opcode::Phi ||
+                   value.opcode == Opcode::Fphi ||
+                   value.opcode == Opcode::Vphi ||
+                   value.opcode == Opcode::LifetimeStart ||
+                   value.opcode == Opcode::LifetimeEnd) {
             return;
-        } else if (value.opcode == "x86.load" ||
-                   value.opcode == "x86.store") {
+        } else if (value.opcode == Opcode::Load ||
+                   value.opcode == Opcode::Store) {
             emit_load_store(function, value);
-        } else if (value.opcode == "x86.aggregate.load" ||
-                   value.opcode == "x86.aggregate.store") {
+        } else if (value.opcode == Opcode::AggregateLoad ||
+                   value.opcode == Opcode::AggregateStore) {
             emit_aggregate_load_store(function, value);
-        } else if (value.opcode == "x86.fload" ||
-                   value.opcode == "x86.fstore") {
+        } else if (value.opcode == Opcode::Fload ||
+                   value.opcode == Opcode::Fstore) {
             emit_float_load_store(function, value);
-        } else if (value.opcode == "x86.vload" ||
-                   value.opcode == "x86.vstore") {
+        } else if (value.opcode == Opcode::Vload ||
+                   value.opcode == Opcode::Vstore) {
             emit_vector_load_store(function, value);
-        } else if (value.opcode == "x86.fixed.load" ||
-                   value.opcode == "x86.fixed.store") {
+        } else if (value.opcode == Opcode::FixedLoad ||
+                   value.opcode == Opcode::FixedStore) {
             emit_fixed_load_store(function, value);
-        } else if (value.opcode == "x86.pointer.load" ||
-                   value.opcode == "x86.pointer.store") {
+        } else if (value.opcode == Opcode::PointerLoad ||
+                   value.opcode == Opcode::PointerStore) {
             emit_pointer_access(function, value);
-        } else if (value.opcode == "x86.aggregate.pointer.load" ||
-                   value.opcode == "x86.aggregate.pointer.store") {
+        } else if (value.opcode == Opcode::AggregatePointerLoad ||
+                   value.opcode == Opcode::AggregatePointerStore) {
             emit_aggregate_pointer_access(function, value);
-        } else if (value.opcode == "x86.fpointer.load" ||
-                   value.opcode == "x86.fpointer.store") {
+        } else if (value.opcode == Opcode::FpointerLoad ||
+                   value.opcode == Opcode::FpointerStore) {
             emit_float_pointer_access(function, value);
-        } else if (value.opcode == "x86.vpointer.load" ||
-                   value.opcode == "x86.vpointer.store") {
+        } else if (value.opcode == Opcode::VpointerLoad ||
+                   value.opcode == Opcode::VpointerStore) {
             emit_vector_pointer_access(function, value);
-        } else if (value.opcode == "x86.indexed.load") {
+        } else if (value.opcode == Opcode::IndexedLoad) {
             emit_indexed_load(function, value);
-        } else if (value.opcode == "x86.indexed.store") {
+        } else if (value.opcode == Opcode::IndexedStore) {
             emit_indexed_store(function, value);
-        } else if (value.opcode == "x86.findexed.load") {
+        } else if (value.opcode == Opcode::FindexedLoad) {
             emit_float_indexed_load(function, value);
-        } else if (value.opcode == "x86.findexed.store") {
+        } else if (value.opcode == Opcode::FindexedStore) {
             emit_float_indexed_store(function, value);
-        } else if (value.opcode == "x86.vindexed.load") {
+        } else if (value.opcode == Opcode::VindexedLoad) {
             emit_vector_indexed_load(function, value);
-        } else if (value.opcode == "x86.vindexed.store") {
+        } else if (value.opcode == Opcode::VindexedStore) {
             emit_vector_indexed_store(function, value);
-        } else if (value.opcode == "x86.global.load" ||
-                   value.opcode == "x86.global.store") {
+        } else if (value.opcode == Opcode::GlobalLoad ||
+                   value.opcode == Opcode::GlobalStore) {
             emit_global_access(function, value);
-        } else if (value.opcode == "x86.aggregate.global.load" ||
-                   value.opcode == "x86.aggregate.global.store") {
+        } else if (value.opcode == Opcode::AggregateGlobalLoad ||
+                   value.opcode == Opcode::AggregateGlobalStore) {
             emit_aggregate_global_access(function, value);
-        } else if (value.opcode == "x86.fglobal.load" ||
-                   value.opcode == "x86.fglobal.store") {
+        } else if (value.opcode == Opcode::FglobalLoad ||
+                   value.opcode == Opcode::FglobalStore) {
             emit_float_global_access(function, value);
-        } else if (value.opcode == "x86.vglobal.load" ||
-                   value.opcode == "x86.vglobal.store") {
+        } else if (value.opcode == Opcode::VglobalLoad ||
+                   value.opcode == Opcode::VglobalStore) {
             emit_vector_global_access(function, value);
-        } else if (value.opcode.starts_with("x86.atomic.")) {
+        } else if (has_property(value.opcode, OpcodeProperty::Atomic)) {
             emit_atomic(function, value);
-        } else if (value.opcode == "x86.patch") {
+        } else if (value.opcode == Opcode::Patch) {
             emit_patch(function, value);
-        } else if (value.opcode == "x86.expect") {
+        } else if (value.opcode == Opcode::Expect) {
             if (same_physical_assignment(
                     function, value.uses.front(), value.defs.front())) {
                 return;
@@ -21042,29 +21266,29 @@ private:
             }
             load(function, value.uses.front(), "rax");
             store(function, value.defs.front(), "rax");
-        } else if (value.opcode == "x86.intrinsic.noop") {
+        } else if (value.opcode == Opcode::IntrinsicNoop) {
             return;
-        } else if (value.opcode == "x86.vselect" ||
-                   value.opcode == "x86.vselect.sign") {
+        } else if (value.opcode == Opcode::Vselect ||
+                   value.opcode == Opcode::VselectSign) {
             emit_vector_select(function, value);
-        } else if (value.opcode == "x86.select") {
+        } else if (value.opcode == Opcode::Select) {
             emit_select(function, value);
-        } else if (value.opcode == "x86.neg" ||
-                   value.opcode == "x86.not" ||
-                   value.opcode == "x86.iszero") {
+        } else if (value.opcode == Opcode::Neg ||
+                   value.opcode == Opcode::Not ||
+                   value.opcode == Opcode::Iszero) {
             emit_unary(function, value);
-        } else if (value.opcode == "x86.fneg" ||
-                   value.opcode == "x86.fiszero") {
+        } else if (value.opcode == Opcode::Fneg ||
+                   value.opcode == Opcode::Fiszero) {
             emit_float_unary(function, value);
-        } else if (value.opcode == "x86.sext" ||
-                   value.opcode == "x86.zext" ||
-                   value.opcode == "x86.trunc" ||
-                   value.opcode == "x86.reinterpret") {
+        } else if (value.opcode == Opcode::Sext ||
+                   value.opcode == Opcode::Zext ||
+                   value.opcode == Opcode::Trunc ||
+                   value.opcode == Opcode::Reinterpret) {
             emit_cast(function, value);
-        } else if (value.opcode == "x86.fextend" ||
-                   value.opcode == "x86.ftruncate" ||
-                   value.opcode == "x86.freinterpret") {
-            if (value.opcode == "x86.freinterpret") {
+        } else if (value.opcode == Opcode::Fextend ||
+                   value.opcode == Opcode::Ftruncate ||
+                   value.opcode == Opcode::Freinterpret) {
+            if (value.opcode == Opcode::Freinterpret) {
                 if (same_physical_assignment(
                         function, value.uses.front(), value.defs.front())) {
                     return;
@@ -21074,30 +21298,30 @@ private:
                 return;
             }
             emit_float_cast(function, value);
-        } else if (value.opcode == "x86.sitofp" ||
-                   value.opcode == "x86.uitofp") {
+        } else if (value.opcode == Opcode::Sitofp ||
+                   value.opcode == Opcode::Uitofp) {
             emit_integer_to_float(function, value);
-        } else if (value.opcode == "x86.fptosi" ||
-                   value.opcode == "x86.fptoui") {
+        } else if (value.opcode == Opcode::Fptosi ||
+                   value.opcode == Opcode::Fptoui) {
             emit_float_to_integer(function, value);
-        } else if (value.opcode == "x86.vsplat" ||
-                   value.opcode == "x86.vsplat.constant") {
+        } else if (value.opcode == Opcode::Vsplat ||
+                   value.opcode == Opcode::VsplatConstant) {
             emit_vector_splat(function, value);
-        } else if (value.opcode == "x86.vextract") {
+        } else if (value.opcode == Opcode::Vextract) {
             emit_vector_extract(function, value);
-        } else if (value.opcode.starts_with("x86.vreduce.")) {
+        } else if (has_property(value.opcode, OpcodeProperty::Reduction)) {
             emit_vector_reduction(function, value);
-        } else if (value.opcode == "x86.vinsert") {
+        } else if (value.opcode == Opcode::Vinsert) {
             emit_vector_insert(function, value);
-        } else if (value.opcode == "x86.vcast") {
+        } else if (value.opcode == Opcode::Vcast) {
             emit_vector_cast(function, value);
-        } else if (value.opcode == "x86.vneg" ||
-                   value.opcode == "x86.vnot" ||
-                   value.opcode == "x86.viszero") {
+        } else if (value.opcode == Opcode::Vneg ||
+                   value.opcode == Opcode::Vnot ||
+                   value.opcode == Opcode::Viszero) {
             emit_vector_unary(function, value);
-        } else if (value.opcode.starts_with("x86.v")) {
+        } else if (has_property(value.opcode, OpcodeProperty::Vector)) {
             emit_vector_binary(function, value);
-        } else if (value.opcode.starts_with("x86.f")) {
+        } else if (has_property(value.opcode, OpcodeProperty::Floating)) {
             emit_float_binary(function, value);
         } else {
             emit_binary(function, value);
@@ -21123,15 +21347,15 @@ private:
         std::vector<const machine::Instruction*> early_test_before(
             value.instructions.size());
         if (options_.optimization_effort >= 3 &&
-            options_.optimize_for == "speed") {
+            options_.optimize_for == OptimizationGoal::Speed) {
             for (std::size_t index = 0;
                  index < value.instructions.size(); ++index) {
                 const auto& selection = value.instructions[index];
                 if ((selection.condition_predicate !=
-                         "x86.test.eq.imm" &&
+                         Opcode::TestEqImm &&
                      selection.condition_predicate !=
-                         "x86.test.ne.imm") ||
-                    selection.opcode != "x86.select" ||
+                         Opcode::TestNeImm) ||
+                    selection.opcode != Opcode::Select ||
                     selection.uses.empty()) {
                     continue;
                 }
@@ -21181,7 +21405,7 @@ private:
             }
             current_operation_ = instruction_value.opcode.empty()
                 ? std::string("machine control")
-                : instruction_value.opcode;
+                : std::string(opcode_name(instruction_value.opcode));
             if (instruction_value.kind ==
                     machine::InstructionKind::Call &&
                 index + 1U < value.instructions.size() &&
@@ -21327,9 +21551,9 @@ private:
                  alignment > 1; alignment >>= 1U) {
                 ++alignment_power;
             }
-        } else if (options_.optimize_for == "minimum-size") {
+        } else if (options_.optimize_for == OptimizationGoal::MinimumSize) {
             alignment_power = 0;
-        } else if (options_.optimize_for == "size") {
+        } else if (options_.optimize_for == OptimizationGoal::Size) {
             alignment_power = 3;
         } else if (options_.tune == "skylake" ||
                    options_.tune == "skylake-avx512" ||

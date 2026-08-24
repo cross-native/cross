@@ -90,7 +90,7 @@ struct VariadicBinding {
     SourceLocation location;
     std::string name;
     TypeId type;
-    std::string state;
+    AbiStateId state;
 };
 
 enum class BodyOwnership { None, ManagedAst, ManagedMir, RawMir };
@@ -106,7 +106,7 @@ struct Function {
     TypeId result_type;
     std::vector<Parameter> parameters;
     std::optional<std::string> result_location;
-    std::string abi;
+    AbiId abi;
     AbiContract abi_contract{AbiContract::Registered};
     bool abi_explicit{};
     std::optional<std::string> section;

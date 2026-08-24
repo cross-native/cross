@@ -11,8 +11,10 @@
 #include "middle/mir.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -33,9 +35,65 @@ struct PhysicalRegisterId {
     friend bool operator==(PhysicalRegisterId, PhysicalRegisterId) = default;
 };
 
+// Exact target register views are distinct from physical storage: on x86,
+// for example, `ah` and `al` share one register but name different bit ranges.
+// Machine IR keeps the target-local dense identity without retaining source
+// spelling or imposing one architecture's alias model on another.
+struct TargetRegisterViewId {
+    static constexpr std::uint16_t invalid_value =
+        std::numeric_limits<std::uint16_t>::max();
+    std::uint16_t value{invalid_value};
+
+    [[nodiscard]] constexpr bool valid() const { return value != invalid_value; }
+    friend constexpr bool operator==(TargetRegisterViewId,
+                                     TargetRegisterViewId) = default;
+};
+
 struct StackSlotId {
     std::uint32_t value{};
     friend bool operator==(StackSlotId, StackSlotId) = default;
+};
+
+// Target opcodes are dense, target-local identities.  Machine IR never owns
+// their textual spelling: the active target's machine description maps an ID
+// to diagnostics, instruction properties, scheduling data, and assembly
+// lowering.  Value zero is reserved for "no opcode" so generic instructions
+// cannot accidentally masquerade as selected target instructions.
+struct TargetOpcodeId {
+    std::uint32_t value{};
+
+    constexpr TargetOpcodeId() = default;
+    constexpr TargetOpcodeId(std::uint32_t raw) : value(raw) {}
+
+    template <typename TargetOpcode>
+        requires std::is_enum_v<TargetOpcode>
+    constexpr TargetOpcodeId(TargetOpcode opcode)
+        : value(static_cast<std::uint32_t>(opcode)) {}
+
+    template <typename TargetOpcode>
+        requires std::is_enum_v<TargetOpcode>
+    constexpr TargetOpcodeId& operator=(TargetOpcode opcode) {
+        value = static_cast<std::uint32_t>(opcode);
+        return *this;
+    }
+
+    [[nodiscard]] constexpr bool valid() const { return value != 0; }
+    [[nodiscard]] constexpr bool empty() const { return !valid(); }
+    friend constexpr bool operator==(TargetOpcodeId, TargetOpcodeId) = default;
+
+    template <typename TargetOpcode>
+        requires std::is_enum_v<TargetOpcode>
+    friend constexpr bool operator==(TargetOpcodeId left,
+                                     TargetOpcode right) {
+        return left.value == static_cast<std::uint32_t>(right);
+    }
+
+    template <typename TargetOpcode>
+        requires std::is_enum_v<TargetOpcode>
+    friend constexpr bool operator==(TargetOpcode left,
+                                     TargetOpcodeId right) {
+        return right == left;
+    }
 };
 
 // Integer modes name values by their representation width, not a host type.
@@ -117,7 +175,7 @@ struct StackSlot {
     std::optional<std::int32_t> frame_offset;
     SourceLocation location;
     std::string name;
-    std::optional<std::string> physical_location;
+    std::optional<TargetRegisterViewId> hard_register;
     // A target may keep an explicit fallback home for a virtual register and
     // elide it after physical assignment. Elision is represented explicitly
     // so finalized-frame verification never mistakes a missing offset for a
@@ -174,7 +232,7 @@ enum class InstructionKind {
 // otherwise interpreted solely by its target lowering/emitter.
 struct Instruction {
     InstructionKind kind{InstructionKind::Target};
-    std::string opcode;
+    TargetOpcodeId opcode;
     SourceLocation location;
     std::vector<Operand> operands;
     std::vector<Register> defs;
@@ -185,10 +243,10 @@ struct Instruction {
     // around the call; preserved allocations need no emitted move.
     std::vector<Register> live_across_call;
     // Targets may fold a comparison into a conditional operation and retain
-    // its selected predicate here. The spelling and interpretation are
-    // target-owned; generic Machine IR treats it as target metadata on a
-    // target instruction or conditional branch.
-    std::string condition_predicate;
+    // its selected comparison/test opcode here.  The identity and
+    // interpretation are target-owned; generic Machine IR only verifies that
+    // non-target instructions use it where the contract permits.
+    TargetOpcodeId condition_predicate;
     std::optional<PatchSite> patch;
     // Direct calls retain canonical identity independently from symbol
     // spelling so IPA and target ABI planning never reverse-map assembler
@@ -198,9 +256,9 @@ struct Instruction {
     // selection.  Width/register class alone cannot distinguish every
     // variadic floating, vector, pointer, and by-reference boundary value.
     std::vector<hir::TypeId> call_argument_types;
-    // Internal name of model-provided incoming variadic state.  This is not a
-    // linker symbol and therefore never appears in the operand stream.
-    std::string variadic_state;
+    // Dense identity of model-provided incoming variadic state. It is local
+    // to the function's ABI model and never appears in the operand stream.
+    AbiStateId variadic_state;
     bool may_load{};
     bool may_store{};
     bool has_side_effects{};
@@ -221,7 +279,7 @@ struct Function {
     std::optional<mir::BlockId> source_entry;
     SourceLocation location;
     std::string symbol;
-    std::string abi;
+    AbiId abi;
     BlockId entry;
     std::vector<IntegerMode> virtual_registers;
     std::vector<VirtualRegisterClass> virtual_register_classes;

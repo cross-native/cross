@@ -5,6 +5,8 @@
 #include "common/floating_bits.hpp"
 #include "common/uint128.hpp"
 #include "middle/data_ir.hpp"
+#include "middle/mir_analysis.hpp"
+#include "middle/mir_pass.hpp"
 #include "target/subtarget.hpp"
 #include <algorithm>
 #include <bit>
@@ -13,6 +15,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -738,9 +741,9 @@ bool contains_goto(const Statement& statement) {
 }
 
 bool eligible_function(const hir::Module& module, const hir::Function& function,
-                       const TargetInfo& target, const CompilerOptions& options) {
+                       const TargetInfo& target) {
     if (!function.definition || function.naked) return false;
-    const auto* abi = find_abi(target, function.abi, options.target);
+    const auto* abi = find_abi(target, function.abi);
     if (!abi || !abi->function_selectable ||
         (function.variadic && !abi->variadic_supported)) return false;
     const auto supported_type = [&](hir::TypeId type) {
@@ -789,13 +792,14 @@ public:
     ManagedLowerer(hir::Module& module, const Subtarget& subtarget,
                    const CompilerOptions& options, Diagnostics& diagnostics)
         : hir_(module), subtarget_(subtarget), target_(subtarget.target()),
-          options_(options),
-          diagnostics_(diagnostics) {}
+          diagnostics_(diagnostics) {
+        (void)options;
+    }
 
     ManagedModule run() {
         for (auto& function : hir_.functions) {
             if (function.ownership != hir::BodyOwnership::ManagedAst ||
-                !eligible_function(hir_, function, target_, options_)) continue;
+                !eligible_function(hir_, function, target_)) continue;
             auto lowered = lower_function(function);
             if (!lowered) continue;
             result_.definitions.insert(function.id.value);
@@ -908,6 +912,12 @@ private:
         for (std::uint32_t index = 0;
              index < function.variadic_bindings.size(); ++index) {
             const auto& state = function.variadic_bindings[index];
+            const auto* abi = find_abi(target_, function.abi);
+            const auto* state_model =
+                abi && state.state.valid() &&
+                        state.state.value < abi->variadic_states.size()
+                    ? &abi->variadic_states[state.state.value]
+                    : nullptr;
             const auto value = add_value(
                 ValueKind::VariadicState, state.type, state.location);
             current_.values[value.value].variadic_state = state.state;
@@ -915,7 +925,10 @@ private:
                 static_cast<std::uint32_t>(current_.slots.size())};
             current_.slots.push_back(
                 {slot, state.location, state.type,
-                 "$variadic." + state.state, std::nullopt, false,
+                 "$variadic." +
+                     (state_model ? state_model->canonical_name
+                                  : std::to_string(state.state.value)),
+                 std::nullopt, false,
                  address_taken_names_.contains(state.name), false});
             const LocalBinding binding{slot, state.type, std::nullopt};
             if (!scopes_.back().bindings.emplace(
@@ -1232,7 +1245,7 @@ private:
         if (!call_type(function.result_type, true)) {
             return false;
         }
-        const auto* abi = find_abi(target_, function.abi, options_.target);
+        const auto* abi = find_abi(target_, function.abi);
         if (!abi || !abi->function_selectable ||
             (function.variadic && !abi->variadic_supported)) return false;
         for (const auto& parameter : function.parameters) {
@@ -4345,7 +4358,6 @@ private:
     hir::Module& hir_;
     const Subtarget& subtarget_;
     const TargetInfo& target_;
-    const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ManagedModule result_;
     ManagedFunction current_;
@@ -5880,9 +5892,9 @@ void inline_managed_calls(ManagedModule& module,
         const auto ordinary_limit =
             static_cast<std::size_t>(options.inline_unit_limit);
         const std::size_t expansion_multiplier =
-            options.optimize_for == "speed"
+            options.optimize_for == OptimizationGoal::Speed
                 ? 8U
-                : options.optimize_for == "size"
+                : options.optimize_for == OptimizationGoal::Size
                       ? 4U
                       : 2U;
         const auto expansion_limit =
@@ -7642,8 +7654,8 @@ bool if_convert_one_diamond(ManagedFunction& function,
     if (!pure_arm(truth) || !pure_arm(falsity)) return false;
 
     const auto profitable = [&](unsigned cost) {
-        unsigned limit = options.optimize_for == "minimum-size" ? 3U
-            : options.optimize_for == "size" ? 5U
+        unsigned limit = options.optimize_for == OptimizationGoal::MinimumSize ? 3U
+            : options.optimize_for == OptimizationGoal::Size ? 5U
             : options.optimization_effort >= 3 ? 12U : 6U;
         // A low-bit test of loaded data commonly has little branch
         // predictability. Once allocation and if-conversion are enabled,
@@ -7881,108 +7893,6 @@ bool if_convert_diamonds(ManagedFunction& function,
     }
 }
 
-std::vector<std::vector<bool>> mir_dominators(
-    const ManagedFunction& function) {
-    const auto reachable = mir_reachable_blocks(function);
-    const auto count = function.blocks.size();
-    std::vector<std::vector<bool>> result(
-        count, std::vector<bool>(count));
-    for (std::size_t block = 0; block < count; ++block) {
-        if (!reachable[block]) continue;
-        for (std::size_t candidate = 0; candidate < count; ++candidate) {
-            result[block][candidate] = reachable[candidate];
-        }
-    }
-    std::fill(result[function.entry.value].begin(),
-              result[function.entry.value].end(), false);
-    result[function.entry.value][function.entry.value] = true;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (const auto& block : function.blocks) {
-            if (!reachable[block.id.value] ||
-                block.id == function.entry) {
-                continue;
-            }
-            std::vector<bool> next(count, true);
-            bool has_predecessor = false;
-            for (const auto predecessor : block.predecessors) {
-                if (!reachable[predecessor.value]) continue;
-                has_predecessor = true;
-                for (std::size_t bit = 0; bit < count; ++bit) {
-                    next[bit] = next[bit] &&
-                                result[predecessor.value][bit];
-                }
-            }
-            if (!has_predecessor) std::fill(next.begin(), next.end(), false);
-            next[block.id.value] = true;
-            if (next != result[block.id.value]) {
-                result[block.id.value] = std::move(next);
-                changed = true;
-            }
-        }
-    }
-    return result;
-}
-
-struct NaturalLoop {
-    BlockId header;
-    BlockId preheader;
-    std::unordered_set<std::uint32_t> blocks;
-};
-
-std::vector<NaturalLoop> natural_loops(
-    const ManagedFunction& function) {
-    const auto dominators = mir_dominators(function);
-    std::vector<NaturalLoop> loops;
-    for (const auto& tail : function.blocks) {
-        for (const auto header : tail.terminator.successors) {
-            if (tail.id.value >= dominators.size() ||
-                header.value >= dominators[tail.id.value].size() ||
-                !dominators[tail.id.value][header.value]) {
-                continue;
-            }
-            std::unordered_set<std::uint32_t> members{
-                header.value, tail.id.value};
-            std::vector<BlockId> pending;
-            if (tail.id != header) pending.push_back(tail.id);
-            while (!pending.empty()) {
-                const auto item = pending.back();
-                pending.pop_back();
-                for (const auto predecessor :
-                     function.blocks[item.value].predecessors) {
-                    if (members.insert(predecessor.value).second &&
-                        predecessor != header) {
-                        pending.push_back(predecessor);
-                    }
-                }
-            }
-            std::vector<BlockId> outside;
-            for (const auto predecessor :
-                 function.blocks[header.value].predecessors) {
-                if (!members.contains(predecessor.value)) {
-                    outside.push_back(predecessor);
-                }
-            }
-            if (outside.size() != 1) continue;
-            const auto preheader = outside.front();
-            const auto& terminator =
-                function.blocks[preheader.value].terminator;
-            if (terminator.kind != TerminatorKind::Branch ||
-                terminator.successors.size() != 1 ||
-                terminator.successors.front() != header) {
-                continue;
-            }
-            loops.push_back({header, preheader, std::move(members)});
-        }
-    }
-    std::sort(loops.begin(), loops.end(),
-              [](const NaturalLoop& left, const NaturalLoop& right) {
-                  return left.blocks.size() < right.blocks.size();
-              });
-    return loops;
-}
-
 bool safely_loop_invariant(const ManagedValue& value,
                            const ManagedFunction& function,
                            const hir::Module& hir_module) {
@@ -8060,7 +7970,8 @@ bool supports_loop_invariant(const ManagedValue& value,
 }
 
 void move_loop_invariants(ManagedFunction& function,
-                          const hir::Module& hir_module) {
+                          const hir::Module& hir_module,
+                          std::span<const CanonicalLoop> loops) {
     if (function.blocks.size() < 2) return;
     std::vector<std::optional<BlockId>> definition_block(
         function.values.size());
@@ -8069,7 +7980,7 @@ void move_loop_invariants(ManagedFunction& function,
             definition_block[value.value] = block.id;
         }
     }
-    for (const auto& loop : natural_loops(function)) {
+    for (const auto& loop : loops) {
         std::unordered_set<std::uint32_t> invariant;
         std::vector<ValueId> moved;
         bool changed = true;
@@ -8158,7 +8069,7 @@ struct VectorLoopStore {
 };
 
 struct ReductionLoopPattern {
-    NaturalLoop loop;
+    CanonicalLoop loop;
     BlockId body;
     BlockId exit;
     ValueId index;
@@ -8199,6 +8110,7 @@ std::vector<std::optional<BlockId>> value_definition_blocks(
 
 void coalesce_equivalent_inductions(ManagedFunction& function,
                                     const hir::Module& hir_module,
+                                    std::span<const CanonicalLoop> loops,
                                     bool compact = true,
                                     bool derive_scaled = false) {
     struct Recurrence {
@@ -8210,7 +8122,7 @@ void coalesce_equivalent_inductions(ManagedFunction& function,
     };
     std::unordered_set<std::uint32_t> removed;
     const auto definition_blocks = value_definition_blocks(function);
-    for (const auto& loop : natural_loops(function)) {
+    for (const auto& loop : loops) {
         auto& header = function.blocks[loop.header.value];
         if (header.predecessors.size() != 2) continue;
         const auto backedge = header.predecessors[0] == loop.preheader
@@ -8471,7 +8383,7 @@ void coalesce_equivalent_inductions(ManagedFunction& function,
 }
 
 struct UnrollLoopPattern {
-    NaturalLoop loop;
+    CanonicalLoop loop;
     BlockId body;
     BlockId backedge;
     BlockId exit;
@@ -8485,7 +8397,7 @@ struct UnrollLoopPattern {
 
 std::optional<UnrollLoopPattern> find_unrollable_loop(
     const ManagedFunction& function, const hir::Module& hir_module,
-    const NaturalLoop& loop) {
+    const CanonicalLoop& loop) {
     if (loop.blocks.size() < 2 ||
         std::any_of(function.labels.begin(), function.labels.end(),
                     [&](const ManagedLabel& label) {
@@ -9001,12 +8913,12 @@ bool unroll_loop(ManagedFunction& function,
 
 void unroll_loops(ManagedFunction& function,
                   const hir::Module& hir_module,
-                  const CompilerOptions& options) {
-    if (options.optimize_for != "speed" ||
+                  const CompilerOptions& options,
+                  std::span<const CanonicalLoop> loops) {
+    if (options.optimize_for != OptimizationGoal::Speed ||
         options.optimization_effort < 2) {
         return;
     }
-    const auto loops = natural_loops(function);
     for (const auto& loop : loops) {
         const auto pattern =
             find_unrollable_loop(function, hir_module, loop);
@@ -9066,7 +8978,8 @@ void unroll_loops(ManagedFunction& function,
 // because reassociation could introduce overflow into a source execution that
 // did not previously overflow.
 void rebalance_unrolled_unsigned_add_recurrences(
-    ManagedFunction& function, const hir::Module& hir_module) {
+    ManagedFunction& function, const hir::Module& hir_module,
+    const UseLists& use_lists) {
     struct Candidate {
         ValueId phi;
         std::size_t incoming_index{};
@@ -9075,30 +8988,6 @@ void rebalance_unrolled_unsigned_add_recurrences(
         SourceLocation location;
         std::vector<ValueId> terms;
     };
-
-    const auto definitions = value_definition_blocks(function);
-    std::vector<unsigned> uses(function.values.size());
-    for (const auto& value : function.values) {
-        for (const auto operand : value.operands) {
-            if (operand.value < uses.size()) ++uses[operand.value];
-        }
-        for (const auto& argument : value.call_arguments) {
-            if (argument.value && argument.value->value < uses.size()) {
-                ++uses[argument.value->value];
-            }
-        }
-        for (const auto& incoming : value.incoming) {
-            if (incoming.value.value < uses.size()) {
-                ++uses[incoming.value.value];
-            }
-        }
-    }
-    for (const auto& block : function.blocks) {
-        if (block.terminator.value &&
-            block.terminator.value->value < uses.size()) {
-            ++uses[block.terminator.value->value];
-        }
-    }
 
     std::vector<Candidate> candidates;
     for (const auto& block : function.blocks) {
@@ -9111,10 +9000,10 @@ void rebalance_unrolled_unsigned_add_recurrences(
             for (std::size_t incoming_index = 0;
                  incoming_index < phi.incoming.size(); ++incoming_index) {
                 const auto& incoming = phi.incoming[incoming_index];
-                if (incoming.value.value >= definitions.size() ||
-                    !definitions[incoming.value.value] ||
-                    *definitions[incoming.value.value] !=
-                        incoming.predecessor) {
+                const auto incoming_definition =
+                    use_lists.definition_block(incoming.value);
+                if (!incoming_definition ||
+                    *incoming_definition != incoming.predecessor) {
                     continue;
                 }
                 // Store-heavy unrolled loops already keep the stored value,
@@ -9149,10 +9038,10 @@ void rebalance_unrolled_unsigned_add_recurrences(
                         return;
                     }
                     const auto& value = function.values[id.value];
+                    const auto definition = use_lists.definition_block(id);
                     const bool local_single_use =
-                        id.value < definitions.size() && definitions[id.value] &&
-                        *definitions[id.value] == incoming.predecessor &&
-                        id.value < uses.size() && uses[id.value] == 1;
+                        definition && *definition == incoming.predecessor &&
+                        use_lists.uses(id).size() == 1;
                     if (local_single_use && value.kind == ValueKind::Binary &&
                         value.binary == BinaryOperation::Add &&
                         value.type == phi.type && value.operands.size() == 2 &&
@@ -9229,7 +9118,7 @@ bool scalar_vector_element(const hir::Module& hir_module,
 
 std::optional<ReductionLoopPattern> find_reduction_loop(
     const ManagedFunction& function, const hir::Module& hir_module,
-    const NaturalLoop& loop) {
+    const CanonicalLoop& loop) {
     if (loop.blocks.size() < 2 || loop.blocks.size() > 3 ||
         std::any_of(function.labels.begin(), function.labels.end(),
                     [&](const ManagedLabel& label) {
@@ -11000,7 +10889,7 @@ bool vectorize_slp_group(
 void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
                    const Subtarget& subtarget,
                    const CompilerOptions& options) {
-    if (options.optimize_for != "speed") return;
+    if (options.optimize_for != OptimizationGoal::Speed) return;
     // Prefer the smallest native packed width for isolated trees: wider
     // groups increase packing latency and register pressure without the
     // amortization available to a counted loop.
@@ -11082,9 +10971,9 @@ void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
 void vectorize_reduction_loops(ManagedFunction& function,
                                hir::Module& hir_module,
                                const Subtarget& subtarget,
-                               const CompilerOptions& options) {
-    if (options.optimize_for != "speed") return;
-    const auto loops = natural_loops(function);
+                               const CompilerOptions& options,
+                               std::span<const CanonicalLoop> loops) {
+    if (options.optimize_for != OptimizationGoal::Speed) return;
     const auto definitions = value_definition_blocks(function);
     for (const auto& loop : loops) {
         auto pattern =
@@ -11178,20 +11067,152 @@ void vectorize_reduction_loops(ManagedFunction& function,
     }
 }
 
+bool fold_integer_constants(ManagedFunction& function,
+                            const hir::Module& hir_module) {
+    bool changed = false;
+    for (auto& value : function.values) {
+        if (value.kind == ValueKind::Unary && value.operands.size() == 1) {
+            const auto& operand = function.values[value.operands[0].value];
+            if (operand.kind != ValueKind::ConstantInteger) continue;
+            const auto bits = type_bits(hir_module, value.type);
+            const UInt128 input{operand.integer, operand.integer_high};
+            UInt128 folded;
+            if (value.unary == UnaryOperation::Negate) {
+                folded = mask_to(negate(input), bits);
+            } else if (value.unary == UnaryOperation::BitNot) {
+                folded = mask_to(bit_not(input), bits);
+            } else {
+                folded = input == UInt128{} ? UInt128{1} : UInt128{};
+            }
+            value.integer = folded.low;
+            value.integer_high = folded.high;
+            value.kind = ValueKind::ConstantInteger;
+            value.operands.clear();
+            changed = true;
+        } else if (value.kind == ValueKind::Cast &&
+                   value.operands.size() == 1) {
+            const auto& operand = function.values[value.operands[0].value];
+            if (operand.kind != ValueKind::ConstantInteger) continue;
+            const auto source_bits = type_bits(hir_module, operand.type);
+            const auto target_bits = type_bits(hir_module, value.type);
+            if (source_bits == 0 || target_bits == 0) continue;
+            auto folded = mask_to(
+                UInt128{operand.integer, operand.integer_high}, source_bits);
+            if (value.cast == CastOperation::SignExtend &&
+                bit(folded, source_bits - 1U)) {
+                folded = bit_or(
+                    folded,
+                    bit_not(mask_to(bit_not(UInt128{}), source_bits)));
+            } else if (value.cast != CastOperation::ZeroExtend &&
+                       value.cast != CastOperation::Truncate &&
+                       value.cast != CastOperation::Reinterpret &&
+                       value.cast != CastOperation::SignExtend) {
+                continue;
+            }
+            folded = mask_to(folded, target_bits);
+            value.integer = folded.low;
+            value.integer_high = folded.high;
+            value.kind = ValueKind::ConstantInteger;
+            value.operands.clear();
+            changed = true;
+        } else if (value.kind == ValueKind::Binary &&
+                   value.operands.size() == 2) {
+            const auto& left = function.values[value.operands[0].value];
+            const auto& right = function.values[value.operands[1].value];
+            if (left.kind != ValueKind::ConstantInteger ||
+                right.kind != ValueKind::ConstantInteger) {
+                continue;
+            }
+            const auto bits = comparison(value.binary)
+                ? type_bits(hir_module, left.type)
+                : type_bits(hir_module, value.type);
+            const UInt128 left_value{left.integer, left.integer_high};
+            const UInt128 right_value{right.integer, right.integer_high};
+            UInt128 folded;
+            switch (value.binary) {
+            case BinaryOperation::Add:
+                folded = mask_to(add(left_value, right_value), bits);
+                break;
+            case BinaryOperation::Subtract:
+                folded = mask_to(subtract(left_value, right_value), bits);
+                break;
+            case BinaryOperation::Multiply:
+                folded = mask_to(multiply(left_value, right_value), bits);
+                break;
+            case BinaryOperation::BitAnd:
+                folded = bit_and(left_value, right_value);
+                break;
+            case BinaryOperation::BitOr:
+                folded = bit_or(left_value, right_value);
+                break;
+            case BinaryOperation::BitXor:
+                folded = bit_xor(left_value, right_value);
+                break;
+            case BinaryOperation::ShiftLeft:
+                folded = mask_to(
+                    shift_left(left_value,
+                               static_cast<unsigned>(right_value.low % bits)),
+                    bits);
+                break;
+            case BinaryOperation::ShiftRightLogical:
+                folded = shift_right(
+                    left_value,
+                    static_cast<unsigned>(right_value.low % bits));
+                break;
+            case BinaryOperation::Equal:
+                folded = left_value == right_value ? 1 : 0;
+                break;
+            case BinaryOperation::NotEqual:
+                folded = left_value == right_value ? 0 : 1;
+                break;
+            case BinaryOperation::UnsignedLess:
+                folded = left_value < right_value ? 1 : 0;
+                break;
+            case BinaryOperation::UnsignedLessEqual:
+                folded = right_value < left_value ? 0 : 1;
+                break;
+            case BinaryOperation::UnsignedGreater:
+                folded = right_value < left_value ? 1 : 0;
+                break;
+            case BinaryOperation::UnsignedGreaterEqual:
+                folded = left_value < right_value ? 0 : 1;
+                break;
+            default: continue;
+            }
+            value.integer = folded.low;
+            value.integer_high = folded.high;
+            value.kind = ValueKind::ConstantInteger;
+            value.operands.clear();
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 } // namespace
 
 void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
               Diagnostics& diagnostics) {
     inline_managed_calls(module, hir_module, options, diagnostics);
+
     // Scalar cells are a source-language ownership device, not a mandate for
     // machine stack traffic. Promote eligible cells before the remaining SSA
     // passes so loops, the allocator, and target selection see their values.
     if (options.tree_copy_prop) {
-        for (auto& function : module.functions) {
-            promote_scalar_slots(function, hir_module);
-        }
+        FunctionPassManager promotion;
+        promotion.add(
+            PassId::PromoteScalarSlots,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                promote_scalar_slots(function, hir_module);
+                return PassResult::changed_values();
+            });
+        (void)promotion.run(module);
     }
+
+    // This is the one module pass in the early scalar pipeline: it reaches a
+    // fixed point over the call graph and therefore intentionally brackets
+    // the per-function pass managers.
     if (options.ipa_pure_const) {
         const auto removable =
             infer_removable_functions(module, hir_module);
@@ -11199,223 +11220,226 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             eliminate_dead_removable_calls(function, removable);
         }
     }
+
+    FunctionPassManager pipeline;
     if (options.tree_dse) {
-        for (auto& function : module.functions) {
-            eliminate_dead_stores(function);
-        }
+        pipeline.add(
+            PassId::DeadStoreElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_dead_stores(function);
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_copy_prop) {
-        for (auto& function : module.functions) {
-            propagate_trivial_copies(function);
-        }
+        pipeline.add(
+            PassId::CopyPropagation,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                propagate_trivial_copies(function);
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_ccp) {
         const auto rounds = std::max(1U, options.optimization_effort);
         for (unsigned round = 0; round < rounds; ++round) {
-            for (auto& function : module.functions) {
-                for (auto& value : function.values) {
-            if (value.kind == ValueKind::Unary && value.operands.size() == 1) {
-                const auto& operand = function.values[value.operands[0].value];
-                if (operand.kind != ValueKind::ConstantInteger) continue;
-                const auto bits = type_bits(hir_module, value.type);
-                const UInt128 input{operand.integer, operand.integer_high};
-                UInt128 folded;
-                if (value.unary == UnaryOperation::Negate) folded = mask_to(negate(input), bits);
-                else if (value.unary == UnaryOperation::BitNot) {
-                    folded = mask_to(bit_not(input), bits);
-                } else {
-                    folded = input == UInt128{} ? UInt128{1} : UInt128{};
-                }
-                value.integer = folded.low;
-                value.integer_high = folded.high;
-                value.kind = ValueKind::ConstantInteger;
-                value.operands.clear();
-            } else if (value.kind == ValueKind::Cast &&
-                       value.operands.size() == 1) {
-                const auto& operand =
-                    function.values[value.operands[0].value];
-                if (operand.kind != ValueKind::ConstantInteger) continue;
-                const auto source_bits =
-                    type_bits(hir_module, operand.type);
-                const auto target_bits =
-                    type_bits(hir_module, value.type);
-                if (source_bits == 0 || target_bits == 0) continue;
-                auto folded = mask_to(
-                    UInt128{operand.integer, operand.integer_high},
-                    source_bits);
-                if (value.cast == CastOperation::SignExtend &&
-                    bit(folded, source_bits - 1U)) {
-                    folded = bit_or(
-                        folded,
-                        bit_not(mask_to(bit_not(UInt128{}), source_bits)));
-                } else if (value.cast != CastOperation::ZeroExtend &&
-                           value.cast != CastOperation::Truncate &&
-                           value.cast != CastOperation::Reinterpret &&
-                           value.cast != CastOperation::SignExtend) {
-                    continue;
-                }
-                folded = mask_to(folded, target_bits);
-                value.integer = folded.low;
-                value.integer_high = folded.high;
-                value.kind = ValueKind::ConstantInteger;
-                value.operands.clear();
-            } else if (value.kind == ValueKind::Binary && value.operands.size() == 2) {
-                const auto& left = function.values[value.operands[0].value];
-                const auto& right = function.values[value.operands[1].value];
-                if (left.kind != ValueKind::ConstantInteger ||
-                    right.kind != ValueKind::ConstantInteger) continue;
-                const auto bits = comparison(value.binary)
-                                      ? type_bits(hir_module, left.type)
-                                      : type_bits(hir_module, value.type);
-                const UInt128 left_value{left.integer, left.integer_high};
-                const UInt128 right_value{right.integer, right.integer_high};
-                UInt128 folded;
-                switch (value.binary) {
-                case BinaryOperation::Add: folded = mask_to(add(left_value, right_value), bits); break;
-                case BinaryOperation::Subtract: folded = mask_to(subtract(left_value, right_value), bits); break;
-                case BinaryOperation::Multiply: folded = mask_to(multiply(left_value, right_value), bits); break;
-                case BinaryOperation::BitAnd: folded = bit_and(left_value, right_value); break;
-                case BinaryOperation::BitOr: folded = bit_or(left_value, right_value); break;
-                case BinaryOperation::BitXor: folded = bit_xor(left_value, right_value); break;
-                case BinaryOperation::ShiftLeft:
-                    folded = mask_to(shift_left(left_value,
-                                               static_cast<unsigned>(right_value.low % bits)),
-                                     bits);
-                    break;
-                case BinaryOperation::ShiftRightLogical:
-                    folded = shift_right(left_value,
-                                         static_cast<unsigned>(right_value.low % bits));
-                    break;
-                case BinaryOperation::Equal: folded = left_value == right_value ? 1 : 0; break;
-                case BinaryOperation::NotEqual: folded = left_value == right_value ? 0 : 1; break;
-                case BinaryOperation::UnsignedLess: folded = left_value < right_value ? 1 : 0; break;
-                case BinaryOperation::UnsignedLessEqual:
-                    folded = right_value < left_value ? 0 : 1;
-                    break;
-                case BinaryOperation::UnsignedGreater: folded = right_value < left_value ? 1 : 0; break;
-                case BinaryOperation::UnsignedGreaterEqual:
-                    folded = left_value < right_value ? 0 : 1;
-                    break;
-                default: continue;
-                }
-                value.integer = folded.low;
-                value.integer_high = folded.high;
-                value.kind = ValueKind::ConstantInteger;
-                value.operands.clear();
-            }
-                }
-            }
+            pipeline.add(
+                PassId::ConstantFolding,
+                [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                    return fold_integer_constants(function, hir_module)
+                        ? PassResult::changed_values()
+                        : PassResult::unchanged();
+                });
         }
-        for (auto& function : module.functions) {
-            simplify_integer_operations(function, hir_module);
-        }
-        for (auto& function : module.functions) {
-            if (fold_constant_branches(function) &&
-                options.tree_copy_prop) {
-                propagate_trivial_copies(function);
-            }
-        }
+        pipeline.add(
+            PassId::IntegerSimplification,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                simplify_integer_operations(function, hir_module);
+                return PassResult::changed_values();
+            });
+        pipeline.add(
+            PassId::BranchFolding,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                const bool changed = fold_constant_branches(function);
+                if (changed && options.tree_copy_prop) {
+                    propagate_trivial_copies(function);
+                }
+                return changed ? PassResult::changed_cfg()
+                               : PassResult::unchanged();
+            });
     }
     if (options.tree_ccp && options.optimization_effort >= 2) {
-        for (auto& function : module.functions) {
-            if (thread_boolean_phi_branches(function) &&
-                options.tree_copy_prop) {
-                propagate_trivial_copies(function);
-            }
-        }
+        pipeline.add(
+            PassId::BranchThreading,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                const bool changed = thread_boolean_phi_branches(function);
+                if (changed && options.tree_copy_prop) {
+                    propagate_trivial_copies(function);
+                }
+                return changed ? PassResult::changed_cfg()
+                               : PassResult::unchanged();
+            });
     }
     if (options.if_conversion) {
-        for (auto& function : module.functions) {
-            if (if_convert_diamonds(function, hir_module, options) &&
-                options.tree_copy_prop) {
-                propagate_trivial_copies(function);
-            }
-            factor_common_select_addends(function);
-        }
+        pipeline.add(
+            PassId::IfConversion,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                const bool changed =
+                    if_convert_diamonds(function, hir_module, options);
+                if (changed && options.tree_copy_prop) {
+                    propagate_trivial_copies(function);
+                }
+                return changed ? PassResult::changed_cfg()
+                               : PassResult::unchanged();
+            });
+        pipeline.add(
+            PassId::SelectFactoring,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                factor_common_select_addends(function);
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_fre) {
-        for (auto& function : module.functions) {
-            eliminate_fully_redundant_expressions(function);
-        }
+        pipeline.add(
+            PassId::RedundantExpressionElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_fully_redundant_expressions(function);
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_copy_prop && options.optimization_effort >= 2) {
-        for (auto& function : module.functions) {
-            coalesce_equivalent_inductions(
-                function, hir_module, true,
-                options.optimize_for == "size" ||
-                options.optimize_for == "minimum-size");
-        }
+        pipeline.add(
+            PassId::InductionCoalescing,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                coalesce_equivalent_inductions(
+                    function, hir_module,
+                    analyses.loops().canonical_loops(), true,
+                    options.optimize_for == OptimizationGoal::Size ||
+                        options.optimize_for ==
+                            OptimizationGoal::MinimumSize);
+                return PassResult::changed_values();
+            });
     }
     if (options.move_loop_invariants) {
-        for (auto& function : module.functions) {
-            move_loop_invariants(function, hir_module);
-        }
+        pipeline.add(
+            PassId::LoopInvariantMotion,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                move_loop_invariants(
+                    function, hir_module,
+                    analyses.loops().canonical_loops());
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_loop_vectorize) {
-        for (auto& function : module.functions) {
-            vectorize_reduction_loops(
-                function, hir_module, subtarget, options);
-        }
+        pipeline.add(
+            PassId::ReductionVectorization,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                vectorize_reduction_loops(
+                    function, hir_module, subtarget, options,
+                    analyses.loops().canonical_loops());
+                return PassResult::changed_cfg();
+            });
     }
     // Preserve vectorizable reductions before expanding scalar bodies. The
     // unroller then handles dependency-heavy scalar loops and vector cleanup
     // tails without hiding the canonical reduction shape from vectorization.
     if (options.unroll_loops) {
-        for (auto& function : module.functions) {
-            unroll_loops(function, hir_module, options);
-            rebalance_unrolled_unsigned_add_recurrences(function,
-                                                        hir_module);
-        }
+        pipeline.add(
+            PassId::LoopUnrolling,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                unroll_loops(function, hir_module, options,
+                             analyses.loops().canonical_loops());
+                return PassResult::changed_cfg();
+            });
+        pipeline.add(
+            PassId::RecurrenceRebalancing,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                rebalance_unrolled_unsigned_add_recurrences(function,
+                    hir_module, analyses.uses());
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_slp_vectorize) {
-        for (auto& function : module.functions) {
-            vectorize_slp(function, hir_module, subtarget, options);
-        }
+        pipeline.add(
+            PassId::SlpVectorization,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                vectorize_slp(function, hir_module, subtarget, options);
+                return PassResult::changed_values();
+            });
     }
     if (options.move_loop_invariants) {
-        for (auto& function : module.functions) {
-            move_loop_invariants(function, hir_module);
-        }
+        pipeline.add(
+            PassId::LoopInvariantMotion,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                move_loop_invariants(
+                    function, hir_module,
+                    analyses.loops().canonical_loops());
+                return PassResult::changed_values();
+            });
     }
     // LICM can place equivalent constants and derived expressions from
     // distinct branch arms in one preheader. Run local value numbering again
     // there so size-oriented code does not reserve and save separate
     // registers for identical loop-invariant bounds.
     if (options.tree_fre) {
-        for (auto& function : module.functions) {
-            eliminate_fully_redundant_expressions(function);
-        }
+        pipeline.add(
+            PassId::RedundantExpressionElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_fully_redundant_expressions(function);
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_ccp) {
-        for (auto& function : module.functions) {
-            simplify_integer_operations(function, hir_module);
-            if (options.tree_copy_prop) {
-                propagate_trivial_copies(function);
-            }
-        }
+        pipeline.add(
+            PassId::IntegerSimplification,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                simplify_integer_operations(function, hir_module);
+                if (options.tree_copy_prop) {
+                    propagate_trivial_copies(function);
+                }
+                return PassResult::changed_values();
+            });
     }
     // Simplification and loop transforms can expose equivalent recurrences
     // after the first induction pass. Canonicalize them while SSA IDs are
     // still sparse; final DCE performs the safe global compaction.
     if (options.tree_copy_prop && options.optimization_effort >= 2) {
-        for (auto& function : module.functions) {
-            coalesce_equivalent_inductions(
-                function, hir_module, false,
-                options.optimize_for == "size" ||
-                options.optimize_for == "minimum-size");
-        }
+        pipeline.add(
+            PassId::InductionCoalescing,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                coalesce_equivalent_inductions(
+                    function, hir_module,
+                    analyses.loops().canonical_loops(), false,
+                    options.optimize_for == OptimizationGoal::Size ||
+                        options.optimize_for ==
+                            OptimizationGoal::MinimumSize);
+                return PassResult::changed_values();
+            });
     }
     if (options.fast_math || options.finite_math_only ||
         !options.signed_zeros) {
-        for (auto& function : module.functions) {
-            simplify_floating_math(function, hir_module, options);
-        }
+        pipeline.add(
+            PassId::FloatingSimplification,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                simplify_floating_math(function, hir_module, options);
+                return PassResult::changed_values();
+            });
     }
     if (options.tree_dce) {
-        for (auto& function : module.functions) {
-            eliminate_dead_values(function);
-        }
+        pipeline.add(
+            PassId::DeadCodeElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_dead_values(function);
+                return PassResult::changed_values();
+            });
     }
+
+    (void)pipeline.run(module);
 }
 
 bool specialize_surviving_calls(ManagedModule& module,
