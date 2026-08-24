@@ -35,7 +35,16 @@ For a quick validation:
 python trunk/benchmark/x86_64/run.py --levels O2 --target-ms 1 --samples 1 --compile-runs 1
 ```
 
-Results are written below `build/benchmark/x86_64/`:
+By default, results are grouped by source revision and run configuration:
+
+```text
+build/benchmark/x86_64/
+  <short-commit>-<commit-subject>[-dirty]/
+    <timestamp>-<levels>-<target-ms>-<samples>-<compile-runs>/
+```
+
+`--run-name NAME` replaces the timestamp/configuration leaf with a readable
+name. `--output PATH` still selects an exact directory. Each run contains:
 
 - `report.md`: Cross-relative aggregate summary;
 - `measurements.csv`: per-kernel steady-state timings;
@@ -50,3 +59,7 @@ whenever a kernel changes. For publishable measurements, close background
 programs, pin CPU frequency/affinity externally where the host permits it, run
 several complete benchmark invocations, and report dispersion as well as the
 median.
+
+Metadata also records the full Git commit and dirty state, exact invocation,
+Cross compiler SHA-256, and source-corpus SHA-256. Use these identities rather
+than directory names alone when retaining or comparing benchmark evidence.

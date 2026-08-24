@@ -183,3 +183,47 @@ def test_concise_version_keeps_cross_identity_before_license() -> None:
         "License GPLv3+: GNU GPL version 3 or later",
     ]
     assert benchmark.concise_version(lines) == lines[0]
+
+
+def test_slugify_produces_bounded_filesystem_component() -> None:
+    """Commit subjects and run names must have stable portable spellings."""
+
+    assert benchmark.slugify("Refactor: typed IR / staged pipelines") == (
+        "refactor-typed-ir-staged-pipelines"
+    )
+    assert benchmark.slugify("***", limit=8) == "unnamed"
+    assert benchmark.slugify("ABCDEFGHIJK", limit=8) == "abcdefgh"
+
+
+def test_default_output_directory_is_commit_addressed() -> None:
+    """Default runs should be grouped by revision rather than mixed together."""
+
+    source_dir = Path("/workspace/trunk/benchmark/x86_64")
+    revision = benchmark.SourceRevision(
+        commit="0123456789abcdef",
+        short_commit="01234567",
+        subject="typed pipeline",
+        dirty=False,
+        directory_name="01234567-typed-pipeline",
+    )
+    output = benchmark.default_output_directory(
+        source_dir,
+        revision,
+        (benchmark.LEVELS["O3"], benchmark.LEVELS["Oz"]),
+        20,
+        7,
+        3,
+        stamp="20260824-220000",
+    )
+    assert output.as_posix().endswith(
+        "build/benchmark/x86_64/01234567-typed-pipeline/"
+        "20260824-220000-O3-Oz-20ms-7samples-3compiles"
+    )
+
+
+def test_output_and_run_name_are_mutually_exclusive() -> None:
+    """Two competing output-layout controls should fail before tool lookup."""
+
+    arguments = benchmark.parse_arguments(("--output", "out", "--run-name", "quick"))
+    with pytest.raises(benchmark.BenchmarkError, match="mutually exclusive"):
+        benchmark.configuration_from_arguments(arguments)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import math
@@ -41,6 +42,17 @@ class OptimizationLevel:
 
 
 @dataclass(frozen=True)
+class SourceRevision:
+    """Git identity used to group and reproduce benchmark runs."""
+
+    commit: str
+    short_commit: str
+    subject: str
+    dirty: bool
+    directory_name: str
+
+
+@dataclass(frozen=True)
 class Tools:
     """Resolved compiler and object-inspection executables."""
 
@@ -70,6 +82,7 @@ class Configuration:
     samples: int
     compile_runs: int
     max_relative_mad: float
+    source_revision: SourceRevision
 
 
 @dataclass(frozen=True)
@@ -1017,6 +1030,9 @@ def markdown_report(
         "# x86-64 compiler comparison",
         "",
         f"Host: `{platform.platform()}`  ",
+        f"Source: `{config.source_revision.short_commit}` "
+        f"({config.source_revision.subject})"
+        f"{' [dirty]' if config.source_revision.dirty else ''}  ",
         f"Target: `{config.target}` / `{config.architecture}`  ",
         f"Samples: median of {config.samples}, calibrated to at least "
         f"{config.target_ms} ms per sample. Each logical sample averages a "
@@ -1215,6 +1231,120 @@ def concise_version(lines: Sequence[str]) -> str:
     return first
 
 
+def slugify(value: str, *, limit: int = 56) -> str:
+    """Return one stable, readable filesystem component."""
+
+    slug = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+    return (slug or "unnamed")[:limit].rstrip("-")
+
+
+def git_text(repository: Path, *arguments: str) -> str | None:
+    """Read one Git value without making Git a benchmark prerequisite."""
+
+    git = shutil.which("git")
+    if git is None:
+        return None
+    process = subprocess.run(
+        (git, "-C", str(repository), *arguments),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if process.returncode != 0:
+        return None
+    return process.stdout.strip()
+
+
+def discover_source_revision(repository: Path) -> SourceRevision:
+    """Resolve the source revision used by a benchmark invocation."""
+
+    commit = git_text(repository, "rev-parse", "HEAD")
+    if not commit:
+        return SourceRevision(
+            commit="unknown",
+            short_commit="unknown",
+            subject="source",
+            dirty=False,
+            directory_name="unknown-source",
+        )
+    short_commit = git_text(repository, "rev-parse", "--short=8", "HEAD")
+    subject = git_text(repository, "log", "-1", "--format=%s")
+    status = git_text(repository, "status", "--porcelain=v1")
+    dirty = bool(status)
+    short_commit = short_commit or commit[:8]
+    subject = subject or "commit"
+    directory_name = f"{short_commit}-{slugify(subject)}"
+    if dirty:
+        directory_name += "-dirty"
+    return SourceRevision(
+        commit=commit,
+        short_commit=short_commit,
+        subject=subject,
+        dirty=dirty,
+        directory_name=directory_name,
+    )
+
+
+def default_output_directory(
+    source_dir: Path,
+    revision: SourceRevision,
+    levels: Sequence[OptimizationLevel],
+    target_ms: int,
+    samples: int,
+    compile_runs: int,
+    *,
+    stamp: str | None = None,
+    run_name: str | None = None,
+) -> Path:
+    """Build a commit-addressed output path for one benchmark run."""
+
+    profile = "-".join(level.name for level in levels)
+    if run_name:
+        leaf = slugify(run_name)
+    else:
+        stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
+        leaf = (
+            f"{stamp}-{profile}-{target_ms}ms-"
+            f"{samples}samples-{compile_runs}compiles"
+        )
+    return (
+        source_dir.parents[2]
+        / "build"
+        / "benchmark"
+        / "x86_64"
+        / revision.directory_name
+        / leaf
+    )
+
+
+def sha256_file(path: Path) -> str:
+    """Hash one compiler or benchmark input without loading it all at once."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def benchmark_corpus_sha256(source_dir: Path) -> str:
+    """Hash every source template that defines generated benchmark work."""
+
+    inputs = [
+        source_dir / "runner.cpp.in",
+        *sorted((source_dir / "kernels").glob("*.in")),
+    ]
+    digest = hashlib.sha256()
+    for path in inputs:
+        relative = path.relative_to(source_dir).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "little"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha256_file(path)))
+    return digest.hexdigest()
+
+
 def default_cross_cc(source_dir: Path) -> str:
     """Return the repository's conventional built compiler path."""
 
@@ -1239,7 +1369,11 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=source_dir.parents[2] / "build" / "benchmark" / "x86_64",
+        help="exact output directory (default: a commit-addressed run directory)",
+    )
+    parser.add_argument(
+        "--run-name",
+        help="readable run-directory name below the current commit",
     )
     parser.add_argument(
         "--levels",
@@ -1262,6 +1396,8 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
 def configuration_from_arguments(arguments: argparse.Namespace) -> Configuration:
     """Resolve and validate the host-dependent benchmark configuration."""
 
+    if arguments.output is not None and arguments.run_name is not None:
+        raise BenchmarkError("--output and --run-name are mutually exclusive")
     if arguments.target_ms <= 0:
         raise BenchmarkError("--target-ms must be positive")
     if arguments.samples <= 0 or arguments.samples % 2 == 0:
@@ -1273,6 +1409,21 @@ def configuration_from_arguments(arguments: argparse.Namespace) -> Configuration
     ):
         raise BenchmarkError("--max-relative-mad must be between zero and one")
     source_dir = Path(__file__).resolve().parent
+    levels = parse_levels(arguments.levels)
+    revision = discover_source_revision(source_dir.parents[1])
+    output_dir = (
+        arguments.output.resolve()
+        if arguments.output is not None
+        else default_output_directory(
+            source_dir,
+            revision,
+            levels,
+            arguments.target_ms,
+            arguments.samples,
+            arguments.compile_runs,
+            run_name=arguments.run_name,
+        )
+    )
     windows = sys.platform == "win32"
     tools = Tools(
         cross_cc=resolve_tool(arguments.cross_cc, "Cross compiler"),
@@ -1287,9 +1438,9 @@ def configuration_from_arguments(arguments: argparse.Namespace) -> Configuration
     )
     return Configuration(
         source_dir=source_dir,
-        output_dir=arguments.output.resolve(),
+        output_dir=output_dir,
         tools=tools,
-        levels=parse_levels(arguments.levels),
+        levels=levels,
         target="x86_64-w64-windows-gnu" if windows else "x86_64-unknown-linux-gnu",
         abi="ms_abi" if windows else "sysv_abi",
         architecture=arguments.architecture,
@@ -1297,6 +1448,7 @@ def configuration_from_arguments(arguments: argparse.Namespace) -> Configuration
         samples=arguments.samples,
         compile_runs=arguments.compile_runs,
         max_relative_mad=arguments.max_relative_mad,
+        source_revision=revision,
     )
 
 
@@ -1311,6 +1463,11 @@ async def async_main(argv: Sequence[str]) -> int:
         json.dumps(
             {
                 "host": platform.platform(),
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "source_revision": asdict(config.source_revision),
+                "invocation": [sys.executable, str(Path(__file__).resolve()), *argv],
+                "cross_compiler_sha256": sha256_file(config.tools.cross_cc),
+                "benchmark_corpus_sha256": benchmark_corpus_sha256(config.source_dir),
                 "target": config.target,
                 "architecture": config.architecture,
                 "levels": [level.name for level in config.levels],
