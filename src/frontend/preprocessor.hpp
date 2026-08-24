@@ -1,0 +1,55 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "common/diagnostic.hpp"
+#include "common/options.hpp"
+#include "common/source.hpp"
+
+#include <filesystem>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace cross {
+
+class Preprocessor {
+public:
+    Preprocessor(SourceManager& sources, Diagnostics& diagnostics,
+                 const CompilerOptions& options);
+    std::string process(const std::filesystem::path& input);
+
+private:
+    struct Macro {
+        std::string replacement;
+        std::vector<std::string> parameters;
+        bool function_like{};
+        bool variadic{};
+    };
+
+    std::string expand_includes(const std::filesystem::path& path,
+                                std::vector<std::filesystem::path>& stack);
+    std::string expand_macros(std::string_view source, const SourceFile* file);
+    std::filesystem::path find_include(const std::filesystem::path& including,
+                                       std::string_view name, bool quoted) const;
+    void install_predefined_macros();
+    void define_command_line_macros();
+    std::string expand_text(std::string_view text,
+                            std::unordered_set<std::string>& disabled,
+                            unsigned depth) const;
+    std::string substitute(const Macro& macro, const std::vector<std::string>& arguments,
+                           std::unordered_set<std::string>& disabled,
+                           unsigned depth) const;
+    std::string evaluate_query(std::string_view name,
+                               const std::vector<std::string>& arguments) const;
+
+    SourceManager& sources_;
+    Diagnostics& diagnostics_;
+    const CompilerOptions& options_;
+    std::unordered_map<std::string, Macro> macros_;
+    std::unordered_set<std::string> pragma_once_files_;
+    std::unordered_set<std::string> already_included_;
+};
+
+} // namespace cross

@@ -1,0 +1,82 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+[[abi("@ABI@"), link_name("@PREFIX@mix"), noinline]]
+global u64 benchmark_mix(in u64 state, in uptr iterations) {
+    u64 result = state;
+    uptr index = 0;
+    u64 step = 0u64;
+    while (index < iterations) {
+        result = result ^ (result >> 12);
+        result = result ^ (result << 25);
+        result = result ^ (result >> 27);
+        result = result * 2685821657736338717u64 + step;
+        index = index + 1;
+        step = step + 1u64;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@divide"), noinline]]
+global u64 benchmark_divide(in u64 state, in uptr iterations) {
+    u64 result = state;
+    u64 sequence = state;
+    u64 divisor = 3u64;
+    u64 step = 1u64;
+    uptr index = 0;
+    while (index < iterations) {
+        u64 quotient = result / divisor;
+        u64 remainder = result % divisor;
+        result = (quotient ^ (remainder * 11400714819323198485u64)) + sequence;
+        sequence = sequence * 6364136223846793005u64 + step;
+        divisor = (sequence & 1023u64) + 1u64;
+        step = step + 1u64;
+        index = index + 1;
+    }
+    return result ^ sequence;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@rotate"), noinline]]
+global u64 benchmark_rotate(in u64 state, in uptr iterations) {
+    u64 result = state;
+    u64 step = 0u64;
+    uptr index = 0;
+    while (index < iterations) {
+        u64 shift = (step & 31u64) + 1u64;
+        result = (result << shift) | (result >> (64u64 - shift));
+        result = (result ^ (11400714819323198485u64 + step)) *
+                 6364136223846793005u64;
+        step = step + 1u64;
+        index = index + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@narrow"), noinline]]
+global u64 benchmark_narrow(in u64 state, in uptr iterations) {
+    u32 result = state;
+    u32 step = 1u32;
+    uptr index = 0;
+    while (index < iterations) {
+        result = (result * 1664525u32 + 1013904223u32) ^ (result >> 13);
+        result = result + step;
+        step = step + 17u32;
+        index = index + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@bitswap"), noinline]]
+global u64 benchmark_bitswap(in u64 state, in uptr iterations) {
+    u64 result = state;
+    u64 step = 11400714819323198485u64;
+    uptr index = 0;
+    while (index < iterations) {
+        u64 low = (result & 71777214294589695u64) << 8;
+        u64 high = (result & 18374966859414961920u64) >> 8;
+        result = (low | high) ^ step;
+        step = step + 6364136223846793005u64;
+        index = index + 1;
+    }
+    return result;
+}

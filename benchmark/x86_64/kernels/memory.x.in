@@ -1,0 +1,132 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+[[abi("@ABI@"), link_name("@PREFIX@reduce"), noinline]]
+global u64 benchmark_reduce(in const u64 *data, in uptr count,
+                            in uptr rounds) {
+    u64 result = 0u64;
+    uptr round = 0;
+    u64 round_value = 0u64;
+    while (round < rounds) {
+        u64 sum = 0u64;
+        uptr index = 0;
+        while (index < count) {
+            sum = sum + data[index];
+            index = index + 1;
+        }
+        result = result + (sum ^ round_value);
+        round = round + 1;
+        round_value = round_value + 1u64;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@xor_reduce"), noinline]]
+global u64 benchmark_xor_reduce(in const u64 *data, in uptr count,
+                                in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 1u64;
+    uptr round = 0;
+    while (round < rounds) {
+        u64 sum = round_value;
+        uptr index = 0;
+        while (index < count) {
+            sum = sum + (data[index] ^
+                         (index * 11400714819323198485u64));
+            index = index + 1;
+        }
+        result = result ^ sum;
+        round_value = round_value + 6364136223846793005u64;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@transform"), noinline]]
+global u64 benchmark_transform(in const u64 *source, in u64 *destination,
+                               in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 0u64;
+    uptr round = 0;
+    while (round < rounds) {
+        u64 salt = round_value;
+        uptr index = 0;
+        while (index < count) {
+            u64 value = (source[index] + salt) ^ 11400714819323198485u64;
+            value = value * 6364136223846793005u64;
+            destination[index] = value;
+            result = result + value;
+            salt = salt + 1442695040888963407u64;
+            index = index + 1;
+        }
+        round_value = round_value + 7046029254386353131u64;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@blend"), noinline]]
+global u64 benchmark_blend(in const u64 *source, in u64 *destination,
+                           in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 0u64;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            u64 value = source[index];
+            u64 mixed = ((value & 71777214294589695u64) << 8) |
+                        ((value & 18374966859414961920u64) >> 8);
+            mixed = mixed + round_value;
+            destination[index] = mixed;
+            result = result ^ (mixed + index);
+            index = index + 1;
+        }
+        round_value = round_value + 7046029254386353131u64;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@scan"), noinline]]
+global u64 benchmark_scan(in const u64 *source, in u64 *destination,
+                          in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 1u64;
+    uptr round = 0;
+    while (round < rounds) {
+        u64 carry = round_value;
+        uptr index = 0;
+        while (index < count) {
+            carry = carry + source[index];
+            destination[index] = carry;
+            result = result ^ (carry + index);
+            index = index + 1;
+        }
+        round_value = round_value + 17u64;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@prefix_xor"), noinline]]
+global u64 benchmark_prefix_xor(in const u64 *source, in u64 *destination,
+                                in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 11400714819323198485u64;
+    uptr round = 0;
+    while (round < rounds) {
+        u64 carry = round_value;
+        uptr index = 0;
+        while (index < count) {
+            carry = (carry << 7) | (carry >> 57);
+            carry = carry ^ source[index];
+            destination[index] = carry;
+            result = result + (carry ^ index);
+            index = index + 1;
+        }
+        round_value = round_value + 6364136223846793005u64;
+        round = round + 1;
+    }
+    return result;
+}

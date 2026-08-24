@@ -1,0 +1,90 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+BENCH_NOINLINE double @PREFIX@polynomial(const double *data, size_t count,
+                                         size_t rounds) {
+    double result = 0.0;
+    for (size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (size_t index = 0; index < count; ++index) {
+            const double value = data[index];
+            const double term =
+                ((value * 0.5 + 1.25) * value - 0.75) * value + 0.125;
+            sum += term;
+        }
+        result += sum;
+    }
+    return result;
+}
+
+BENCH_NOINLINE double @PREFIX@dot(const double *left, const double *right,
+                                  size_t count, size_t rounds) {
+    double result = 0.0;
+    for (size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (size_t index = 0; index < count; ++index)
+            sum += left[index] * right[index];
+        result += sum;
+    }
+    return result;
+}
+
+BENCH_NOINLINE double @PREFIX@recurrence(const double *data, size_t count,
+                                         size_t rounds) {
+    double result = 0.125;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index)
+            result = (result * 0.999999 + data[index]) * 0.5;
+    }
+    return result;
+}
+
+BENCH_NOINLINE double @PREFIX@axpy(const double *left, const double *right,
+                                   size_t count, size_t rounds) {
+    double result = 0.0;
+    for (size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (size_t index = 0; index < count; ++index)
+            sum = sum + left[index] * 0.75 + right[index] * 1.25;
+        result += sum;
+    }
+    return result;
+}
+
+BENCH_NOINLINE double @PREFIX@quotient(const double *left,
+                                       const double *right,
+                                       size_t count, size_t rounds) {
+    double result = 0.0;
+    for (size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (size_t index = 0; index < count; ++index) {
+            const double denominator = right[index] * right[index] + 1.25;
+            sum += left[index] / denominator;
+        }
+        result += sum;
+    }
+    return result;
+}
+
+BENCH_NOINLINE double @PREFIX@iir(const double *data, size_t count,
+                                  size_t rounds) {
+    double first = 0.125;
+    double second = -0.25;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const double next = data[index] + first * 0.625 - second * 0.125;
+            second = first;
+            first = next;
+        }
+    }
+    return first + second;
+}

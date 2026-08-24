@@ -1,0 +1,52 @@
+# x86-64 code-generation comparison
+
+This corpus compares four paths over equivalent standalone kernels:
+
+- `cross`: Cross HIR/MIR/Machine IR and the in-tree x86-64 backend;
+- `llc`: Cross LLVM serialization, LLVM `opt`, then `llc`;
+- `gcc`: equivalent freestanding C compiled by GCC; and
+- `clang`: equivalent freestanding C compiled by Clang.
+
+The runner measures generated-code time, executable text bytes, and complete
+front-end-to-object compilation latency at `O0`, `Og`, `O1`, `O2`, `O3`, `Os`,
+and `Oz`. Every kernel object must have no undefined symbols. GCC and Clang are
+given `-ffreestanding -fno-builtin`; floating contraction is disabled for all
+paths. Each variant is linked into the same process and checked against one
+reference result before timing.
+
+The runtime corpus separates integer, bitwise, call, reduction,
+streaming-write, memory-dependency, indirect-access, pointer-chasing,
+branching, selection, search, floating-throughput, and floating-dependency
+use cases. Each category has multiple kernels. Scores first take a geometric
+mean within each category and then weight categories equally; the robust speed
+gate also has to survive removing any one category. Code size is built as six
+separate scalar, call, linear-memory, indirect-memory, control, and floating
+units and is checked again after removing any one unit.
+
+Run from the repository root after building `build/cc`:
+
+```text
+python trunk/benchmark/x86_64/run.py
+```
+
+For a quick validation:
+
+```text
+python trunk/benchmark/x86_64/run.py --levels O2 --target-ms 1 --samples 1 --compile-runs 1
+```
+
+Results are written below `build/benchmark/x86_64/`:
+
+- `report.md`: Cross-relative aggregate summary;
+- `measurements.csv`: per-kernel steady-state timings;
+- `build.csv`: compile latency and text size;
+- `metadata.json`: host, target, and toolchain identities; and
+- `*.disasm`: generated object disassembly for diagnosis.
+
+The `llc` path measures the former LLVM-style production pipeline, including
+Cross serialization and LLVM optimization. It does not isolate LLVM's target
+backend from Cross's middle end. GCC/Clang source equivalence should be reviewed
+whenever a kernel changes. For publishable measurements, close background
+programs, pin CPU frequency/affinity externally where the host permits it, run
+several complete benchmark invocations, and report dispersion as well as the
+median.

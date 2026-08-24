@@ -1,0 +1,203 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "common/source.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace cross {
+
+enum class BuiltinType {
+    Void, Bool, I8, U8, I16, U16, I32, U32, I64, U64, I128, U128, Iptr, Uptr,
+    F32, F64, F80, F128, Fptr, Label,
+};
+
+struct Type;
+using TypePtr = std::shared_ptr<Type>;
+
+struct Type {
+    enum class Kind { Builtin, Pointer, Generic, Vector, Array, Record } kind{Kind::Builtin};
+    BuiltinType builtin{BuiltinType::Void};
+    TypePtr pointee;
+    TypePtr element;
+    std::uint32_t lanes{};
+    bool scalable{};
+    std::string generic_name;
+    std::string nominal_name;
+    bool is_union{};
+    bool is_const{};
+    bool is_volatile{};
+    bool is_atomic{};
+};
+
+TypePtr builtin_type(BuiltinType kind, bool is_const = false,
+                     bool is_volatile = false, bool is_atomic = false);
+TypePtr pointer_type(TypePtr pointee, bool is_const = false,
+                     bool is_volatile = false, bool is_atomic = false);
+TypePtr generic_type(std::string name, bool is_const = false,
+                     bool is_volatile = false, bool is_atomic = false);
+TypePtr vector_type(TypePtr element, std::uint32_t lanes, bool scalable = false,
+                    bool is_const = false, bool is_volatile = false,
+                    bool is_atomic = false);
+TypePtr array_type(TypePtr element, std::uint32_t elements,
+                   bool is_const = false, bool is_volatile = false);
+TypePtr record_type(std::string name, bool is_union = false,
+                    bool is_const = false, bool is_volatile = false);
+TypePtr enum_type(std::string name, BuiltinType underlying,
+                  bool is_const = false, bool is_volatile = false,
+                  bool is_atomic = false);
+std::string type_name(const TypePtr& type);
+// Stable structural spelling supplied to model DSLs. Qualifiers and pointers
+// are prefix-coded (K, V, P), so recipes can rewrite leaf type names without
+// compiler-owned mangling decisions.
+std::string canonical_type_name(const TypePtr& type);
+bool same_type(const TypePtr& left, const TypePtr& right);
+bool is_integer(const TypePtr& type);
+bool is_floating(const TypePtr& type);
+bool is_scalar(const TypePtr& type);
+bool is_vector(const TypePtr& type);
+bool is_nominal(const TypePtr& type);
+unsigned type_bits(const TypePtr& type);
+
+enum class Linkage { Group, Static, Global };
+enum class ParameterMode { In, Out, InOut };
+
+struct Attribute {
+    std::string name;
+    std::vector<std::string> arguments;
+    SourceLocation location;
+};
+
+struct Expr {
+    struct GenericArgument {
+        TypePtr type;
+        std::unique_ptr<Expr> value;
+    };
+
+    enum class Kind {
+        Integer, Floating, String, Character, Name, Unary, Binary, Assign,
+        Conditional, Call, Parenthesized,
+    } kind{Kind::Integer};
+    SourceLocation location;
+    std::string text;
+    std::unique_ptr<Expr> left;
+    std::unique_ptr<Expr> right;
+    std::unique_ptr<Expr> third;
+    std::vector<std::unique_ptr<Expr>> arguments;
+    std::vector<GenericArgument> generic_arguments;
+};
+
+struct VariableDecl {
+    SourceLocation location;
+    std::string name;
+    TypePtr type;
+    // Present only when the outermost array bound is evaluated at block
+    // entry. A zero lane count on `type` marks that dynamic outer bound.
+    std::unique_ptr<Expr> dynamic_array_bound;
+    std::unique_ptr<Expr> initializer;
+    bool storage_register{};
+    bool storage_stack{};
+    std::optional<std::string> location_name;
+};
+
+struct Statement {
+    enum class Kind {
+        Compound, Declaration, Expression, Return, If, While, DoWhile, For,
+        Break, Continue, Label, Goto, Empty,
+    } kind{Kind::Empty};
+    SourceLocation location;
+    std::vector<std::unique_ptr<Statement>> statements;
+    std::unique_ptr<VariableDecl> declaration;
+    std::unique_ptr<Expr> expression;
+    std::unique_ptr<Expr> condition;
+    std::unique_ptr<Expr> increment;
+    std::unique_ptr<Statement> first;
+    std::unique_ptr<Statement> second;
+    std::string label_name;
+};
+
+struct ParameterDecl {
+    SourceLocation location;
+    std::string name;
+    TypePtr type;
+    ParameterMode mode{ParameterMode::InOut};
+    bool explicit_mode{};
+    std::optional<std::string> location_name;
+};
+
+struct FunctionDecl {
+    struct GenericParameter {
+        std::string name;
+        TypePtr value_type;
+    };
+
+    SourceLocation location;
+    std::string name;
+    std::string source_namespace;
+    std::string source_unit;
+    std::vector<std::string> imports;
+    TypePtr return_type;
+    std::vector<ParameterDecl> parameters;
+    std::vector<Attribute> attributes;
+    std::vector<GenericParameter> generic_parameters;
+    std::optional<std::string> result_location;
+    std::unique_ptr<Statement> body;
+    Linkage linkage{Linkage::Group};
+    bool variadic{};
+    bool inline_hint{};
+
+    [[nodiscard]] bool definition() const { return body != nullptr; }
+    [[nodiscard]] const Attribute* attribute(std::string_view name) const;
+};
+
+struct ObjectDecl {
+    SourceLocation location;
+    std::string name;
+    std::string source_unit;
+    TypePtr type;
+    std::vector<Attribute> attributes;
+    std::unique_ptr<Expr> initializer;
+    Linkage linkage{Linkage::Group};
+};
+
+struct EnumDecl {
+    SourceLocation location;
+    std::string name;
+    BuiltinType underlying{BuiltinType::I32};
+    std::vector<Attribute> attributes;
+};
+
+struct RecordMemberDecl {
+    SourceLocation location;
+    std::string name;
+    TypePtr type;
+    std::vector<Attribute> attributes;
+};
+
+struct RecordDecl {
+    SourceLocation location;
+    std::string name;
+    bool is_union{};
+    bool complete{};
+    std::vector<Attribute> attributes;
+    std::vector<RecordMemberDecl> members;
+};
+
+struct Program {
+    std::vector<RecordDecl> records;
+    std::vector<EnumDecl> enumerations;
+    std::vector<std::unique_ptr<FunctionDecl>> functions;
+    std::vector<std::unique_ptr<ObjectDecl>> objects;
+};
+
+std::string encode_link_name(std::string_view qualified_name, bool label = false,
+                             std::string_view mangling_name = "default");
+std::optional<std::string> decode_string_literal(std::string_view text);
+
+} // namespace cross

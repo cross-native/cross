@@ -1,0 +1,76 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+BENCH_NOINLINE uint64_t @PREFIX@gather(const uint64_t *data,
+                                       const uint64_t *indices,
+                                       size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const size_t slot = indices[index] & (count - 1U);
+            result = (result ^ data[slot]) + round_value;
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@gather_pair(const uint64_t *data,
+                                            const uint64_t *indices,
+                                            size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const size_t first = indices[index] & (count - 1U);
+            const size_t second = (first + 17U) & (count - 1U);
+            result += (data[first] * UINT64_C(3)) ^ data[second];
+            result += round_value;
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@pointer_chase(const uint64_t *data,
+                                              const uint64_t *indices,
+                                              size_t count, size_t rounds) {
+    uint64_t result = 0;
+    size_t slot = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            slot = indices[slot] & (count - 1U);
+            result ^= data[slot] + index;
+        }
+        slot = (slot + round + 1U) & (count - 1U);
+    }
+    return result ^ slot;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@pointer_chase_pair(
+    const uint64_t *data, const uint64_t *indices, size_t count,
+    size_t rounds) {
+    uint64_t result = 0;
+    size_t first = 0;
+    size_t second = count >> 1;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            first = indices[first] & (count - 1U);
+            second = indices[second] & (count - 1U);
+            result += data[first] ^ data[second];
+        }
+        first = (first + round + 1U) & (count - 1U);
+        second = (second + round + 17U) & (count - 1U);
+    }
+    return result ^ first ^ second;
+}

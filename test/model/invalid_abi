@@ -1,0 +1,25 @@
+abi "invalid_test_abi" {
+    architecture = "x86-64";
+    address_bits = 64;
+    argument_register_failure = "stack";
+    result_register_failure = "error";
+    stack_layout = "packed";
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 8;
+    stack_order = ["arguments"];
+
+    bank "integer" {
+        class = "integer";
+        register_bits = 64;
+        arguments = ["rdi"];
+        results = ["rax"];
+    }
+
+    rule "broken-bank-reference" {
+        match = ["integer"];
+        action = "direct";
+        bank = "missing";
+    }
+}

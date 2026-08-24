@@ -1,0 +1,886 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <string_view>
+#include <vector>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#elif defined(__linux__)
+#include <sched.h>
+#endif
+
+using ScalarFunction = std::uint64_t (*)(std::uint64_t, std::size_t);
+using MemoryFunction = std::uint64_t (*)(const std::uint64_t *, std::size_t,
+                                         std::size_t);
+using TransformFunction = std::uint64_t (*)(const std::uint64_t *,
+                                            std::uint64_t *, std::size_t,
+                                            std::size_t);
+using GatherFunction = std::uint64_t (*)(const std::uint64_t *,
+                                         const std::uint64_t *, std::size_t,
+                                         std::size_t);
+using SearchFunction = std::uint64_t (*)(const std::uint64_t *, std::size_t,
+                                         std::uint64_t, std::size_t);
+using FloatingFunction = double (*)(const double *, std::size_t, std::size_t);
+using FloatingPairFunction = double (*)(const double *, const double *,
+                                        std::size_t, std::size_t);
+
+extern "C" {
+@DECLARATIONS@
+}
+
+struct Variant {
+    std::string_view compiler;
+    std::string_view level;
+@FUNCTION_ARRAYS@
+};
+
+static constexpr Variant variants[] = {
+@VARIANTS@
+};
+
+static volatile std::uint64_t integer_sink;
+static volatile double floating_sink;
+
+void stabilize_benchmark_thread() {
+#if defined(_WIN32)
+    DWORD_PTR process_mask = 0;
+    DWORD_PTR system_mask = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask,
+                               &system_mask) == 0 || process_mask == 0) {
+        return;
+    }
+    auto selected = process_mask & (~process_mask + 1U);
+    const auto remaining = process_mask & ~selected;
+    if (remaining != 0) selected = remaining & (~remaining + 1U);
+    (void)SetThreadAffinityMask(GetCurrentThread(), selected);
+    (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#elif defined(__linux__)
+    cpu_set_t available;
+    CPU_ZERO(&available);
+    if (sched_getaffinity(0, sizeof(available), &available) != 0) return;
+    int first = -1;
+    int second = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &available)) continue;
+        if (first < 0) first = cpu;
+        else { second = cpu; break; }
+    }
+    const auto selected = second >= 0 ? second : first;
+    if (selected < 0) return;
+    cpu_set_t pinned;
+    CPU_ZERO(&pinned);
+    CPU_SET(selected, &pinned);
+    (void)sched_setaffinity(0, sizeof(pinned), &pinned);
+#endif
+}
+
+struct TimingSummary {
+    double median_ns;
+    double mad_ns;
+};
+
+template <class Invocation>
+std::uint64_t measure(Invocation invoke) {
+    const auto begin = std::chrono::steady_clock::now();
+    invoke();
+    const auto end = std::chrono::steady_clock::now();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
+            .count());
+}
+
+template <class Invocation>
+std::size_t calibrate(Invocation invoke, std::uint64_t target_ns) {
+    const bool has_o3 = std::any_of(std::begin(variants), std::end(variants),
+                                    [](const Variant &variant) {
+                                        return variant.level == "O3";
+                                    });
+    std::size_t work = 1;
+    while (true) {
+        auto fastest = std::numeric_limits<std::uint64_t>::max();
+        for (const auto &variant : variants) {
+            if (has_o3 && variant.level != "O3") continue;
+            const auto elapsed = measure([&] { invoke(variant, work); });
+            fastest = std::min(fastest, elapsed);
+        }
+        if (fastest >= target_ns) return work;
+        const auto denominator = std::max<std::uint64_t>(fastest, 1);
+        const auto estimated = static_cast<std::size_t>(
+            std::min<std::uint64_t>(target_ns / denominator + 1, 64));
+        const auto growth = std::max<std::size_t>(estimated, 2);
+        if (work > std::numeric_limits<std::size_t>::max() / growth)
+            return work;
+        work *= growth;
+    }
+}
+
+template <class Invocation>
+std::vector<TimingSummary> interleaved_summaries(Invocation invoke,
+                                                 std::size_t work,
+                                                 unsigned samples) {
+    constexpr auto count = std::size(variants);
+    std::vector<std::vector<std::uint64_t>> timings(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        timings[index].reserve(samples);
+        invoke(variants[index], work);
+    }
+    for (unsigned sample = 0; sample < samples; ++sample) {
+        const auto start = (static_cast<std::size_t>(sample) * 5U) % count;
+        std::array<std::uint64_t, count> paired{};
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            const bool reverse = ((sample + pass) & 1U) != 0;
+            for (std::size_t visit = 0; visit < count; ++visit) {
+                const auto index = reverse
+                    ? (start + count - 1U - visit) % count
+                    : (start + visit) % count;
+                paired[index] +=
+                    measure([&] { invoke(variants[index], work); });
+            }
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            // Each sample brackets every candidate with the opposite order,
+            // cancelling first-order frequency and temperature drift.
+            timings[index].push_back(paired[index] / 2U);
+        }
+    }
+    std::vector<TimingSummary> result(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        auto &values = timings[index];
+        std::sort(values.begin(), values.end());
+        const auto median = values[values.size() / 2];
+        std::vector<std::uint64_t> deviations;
+        deviations.reserve(values.size());
+        for (const auto value : values) {
+            deviations.push_back(value > median ? value - median
+                                                : median - value);
+        }
+        std::sort(deviations.begin(), deviations.end());
+        result[index] = {
+            static_cast<double>(median),
+            static_cast<double>(deviations[deviations.size() / 2]),
+        };
+    }
+    return result;
+}
+
+std::uint64_t reference_mix(std::uint64_t state, std::size_t iterations) {
+    std::uint64_t step = 0;
+    for (std::size_t index = 0; index < iterations; ++index) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state = state * UINT64_C(2685821657736338717) + step++;
+    }
+    return state;
+}
+
+std::uint64_t reference_divide(std::uint64_t state, std::size_t iterations) {
+    std::uint64_t result = state;
+    std::uint64_t sequence = state;
+    std::uint64_t divisor = 3;
+    std::uint64_t step = 1;
+    for (std::size_t index = 0; index < iterations; ++index) {
+        const auto quotient = result / divisor;
+        const auto remainder = result % divisor;
+        result = (quotient ^
+                  (remainder * UINT64_C(11400714819323198485))) + sequence;
+        sequence = sequence * UINT64_C(6364136223846793005) + step++;
+        divisor = (sequence & UINT64_C(1023)) + UINT64_C(1);
+    }
+    return result ^ sequence;
+}
+
+std::uint64_t reference_rotate(std::uint64_t state, std::size_t iterations) {
+    std::uint64_t result = state;
+    std::uint64_t step = 0;
+    for (std::size_t index = 0; index < iterations; ++index) {
+        const auto shift = (step & UINT64_C(31)) + UINT64_C(1);
+        result = (result << shift) | (result >> (UINT64_C(64) - shift));
+        result = (result ^ (UINT64_C(11400714819323198485) + step++)) *
+                 UINT64_C(6364136223846793005);
+    }
+    return result;
+}
+
+std::uint64_t reference_narrow(std::uint64_t state, std::size_t iterations) {
+    std::uint32_t result = static_cast<std::uint32_t>(state);
+    std::uint32_t step = 1;
+    for (std::size_t index = 0; index < iterations; ++index) {
+        result = (result * UINT32_C(1664525) + UINT32_C(1013904223)) ^
+                 (result >> 13);
+        result += step;
+        step += UINT32_C(17);
+    }
+    return result;
+}
+
+std::uint64_t reference_bitswap(std::uint64_t state,
+                                std::size_t iterations) {
+    std::uint64_t result = state;
+    std::uint64_t step = UINT64_C(11400714819323198485);
+    for (std::size_t index = 0; index < iterations; ++index) {
+        const auto low = (result & UINT64_C(0x00ff00ff00ff00ff)) << 8;
+        const auto high = (result & UINT64_C(0xff00ff00ff00ff00)) >> 8;
+        result = (low | high) ^ step;
+        step += UINT64_C(6364136223846793005);
+    }
+    return result;
+}
+
+std::uint64_t reference_call_leaf_step(std::uint64_t value,
+                                       std::uint64_t step) {
+    return ((value ^ step) * UINT64_C(6364136223846793005)) +
+           UINT64_C(1442695040888963407);
+}
+
+std::uint64_t reference_call_leaf(std::uint64_t state,
+                                  std::size_t iterations) {
+    std::uint64_t result = state;
+    for (std::size_t index = 0; index < iterations; ++index)
+        result = reference_call_leaf_step(result, index);
+    return result;
+}
+
+std::uint64_t reference_call_chain_inner(std::uint64_t value,
+                                         std::uint64_t step) {
+    return (value + step) ^ (value >> 17);
+}
+
+std::uint64_t reference_call_chain_outer(std::uint64_t value,
+                                         std::uint64_t step) {
+    const auto first = reference_call_chain_inner(value, step);
+    return reference_call_chain_inner(first * UINT64_C(5) + UINT64_C(1),
+                                      step + UINT64_C(3));
+}
+
+std::uint64_t reference_call_chain(std::uint64_t state,
+                                   std::size_t iterations) {
+    std::uint64_t result = state;
+    for (std::size_t index = 0; index < iterations; ++index)
+        result = reference_call_chain_outer(result, index);
+    return result;
+}
+
+std::uint64_t reference_reduce(const std::uint64_t *data, std::size_t count,
+                               std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        std::uint64_t sum = 0;
+        for (std::size_t index = 0; index < count; ++index) sum += data[index];
+        result += sum ^ round_value++;
+    }
+    return result;
+}
+
+std::uint64_t reference_xor_reduce(const std::uint64_t *data,
+                                   std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 1;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        std::uint64_t sum = round_value;
+        for (std::size_t index = 0; index < count; ++index) {
+            sum += data[index] ^
+                   (index * UINT64_C(11400714819323198485));
+        }
+        result ^= sum;
+        round_value += UINT64_C(6364136223846793005);
+    }
+    return result;
+}
+
+std::uint64_t reference_transform(const std::uint64_t *source,
+                                  std::uint64_t *destination,
+                                  std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        std::uint64_t salt = round_value;
+        for (std::size_t index = 0; index < count; ++index) {
+            auto value = (source[index] + salt) ^
+                         UINT64_C(11400714819323198485);
+            value *= UINT64_C(6364136223846793005);
+            destination[index] = value;
+            result += value;
+            salt += UINT64_C(1442695040888963407);
+        }
+        round_value += UINT64_C(7046029254386353131);
+    }
+    return result;
+}
+
+std::uint64_t reference_blend(const std::uint64_t *source,
+                              std::uint64_t *destination,
+                              std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto value = source[index];
+            auto mixed =
+                ((value & UINT64_C(0x00ff00ff00ff00ff)) << 8) |
+                ((value & UINT64_C(0xff00ff00ff00ff00)) >> 8);
+            mixed += round_value;
+            destination[index] = mixed;
+            result ^= mixed + index;
+        }
+        round_value += UINT64_C(7046029254386353131);
+    }
+    return result;
+}
+
+std::uint64_t reference_gather(const std::uint64_t *data,
+                               const std::uint64_t *indices,
+                               std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto slot = indices[index] & (count - 1U);
+            result = (result ^ data[slot]) + round_value;
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_scan(const std::uint64_t *source,
+                             std::uint64_t *destination,
+                             std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 1;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        std::uint64_t carry = round_value;
+        for (std::size_t index = 0; index < count; ++index) {
+            carry += source[index];
+            destination[index] = carry;
+            result ^= carry + index;
+        }
+        round_value += UINT64_C(17);
+    }
+    return result;
+}
+
+std::uint64_t reference_prefix_xor(const std::uint64_t *source,
+                                   std::uint64_t *destination,
+                                   std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = UINT64_C(11400714819323198485);
+    for (std::size_t round = 0; round < rounds; ++round) {
+        auto carry = round_value;
+        for (std::size_t index = 0; index < count; ++index) {
+            carry = (carry << 7) | (carry >> 57);
+            carry ^= source[index];
+            destination[index] = carry;
+            result += carry ^ index;
+        }
+        round_value += UINT64_C(6364136223846793005);
+    }
+    return result;
+}
+
+std::uint64_t reference_gather_pair(const std::uint64_t *data,
+                                    const std::uint64_t *indices,
+                                    std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto first = indices[index] & (count - 1U);
+            const auto second = (first + 17U) & (count - 1U);
+            result += (data[first] * UINT64_C(3)) ^ data[second];
+            result += round_value;
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_pointer_chase(const std::uint64_t *data,
+                                      const std::uint64_t *indices,
+                                      std::size_t count,
+                                      std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::size_t slot = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            slot = indices[slot] & (count - 1U);
+            result ^= data[slot] + index;
+        }
+        slot = (slot + round + 1U) & (count - 1U);
+    }
+    return result ^ slot;
+}
+
+std::uint64_t reference_pointer_chase_pair(const std::uint64_t *data,
+                                           const std::uint64_t *indices,
+                                           std::size_t count,
+                                           std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::size_t first = 0;
+    std::size_t second = count >> 1;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            first = indices[first] & (count - 1U);
+            second = indices[second] & (count - 1U);
+            result += data[first] ^ data[second];
+        }
+        first = (first + round + 1U) & (count - 1U);
+        second = (second + round + 17U) & (count - 1U);
+    }
+    return result ^ first ^ second;
+}
+
+std::uint64_t reference_branch(const std::uint64_t *data, std::size_t count,
+                               std::size_t rounds) {
+    std::uint64_t result = UINT64_C(1469598103934665603);
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto value = data[index] + round_value;
+            if ((value & 1U) != 0U)
+                result += value * 3U + 1U;
+            else
+                result ^= value + UINT64_C(11400714819323198485);
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_classify(const std::uint64_t *data, std::size_t count,
+                                 std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto value = data[index] + round_value;
+            switch (value & UINT64_C(7)) {
+            case 0: result += value; break;
+            case 1: result ^= value << 1; break;
+            case 2: result += value * UINT64_C(3); break;
+            case 3: result ^= value >> 2; break;
+            case 4: result -= value; break;
+            case 5: result += value ^ UINT64_C(11400714819323198485); break;
+            case 6: result ^= value * UINT64_C(5); break;
+            default: result += value >> 3; break;
+            }
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_search(const std::uint64_t *data, std::size_t count,
+                               std::uint64_t seed, std::size_t rounds) {
+    std::uint64_t result = 0;
+    const std::uint64_t limit = count * UINT64_C(3);
+    std::uint64_t target = seed % limit;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        std::size_t low = 0;
+        std::size_t high = count;
+        while (low < high) {
+            const auto middle = low + ((high - low) >> 1);
+            if (data[middle] < target)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        result += low ^ target;
+        target += UINT64_C(97);
+        if (target >= limit) target -= limit;
+    }
+    return result;
+}
+
+std::uint64_t reference_select(const std::uint64_t *data, std::size_t count,
+                               std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto value = data[index] + round_value;
+            if (value < UINT64_C(0x8000000000000000))
+                result += value * UINT64_C(5);
+            else
+                result += value ^ UINT64_C(11400714819323198485);
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_clamp(const std::uint64_t *data, std::size_t count,
+                              std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            auto selected = data[index] + round_value;
+            if (selected < UINT64_C(0x4000000000000000))
+                selected = UINT64_C(0x4000000000000000);
+            if (selected > UINT64_C(0xbfffffffffffffff))
+                selected = UINT64_C(0xbfffffffffffffff);
+            result += selected ^ index;
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_linear_search(const std::uint64_t *data,
+                                      std::size_t count, std::uint64_t seed,
+                                      std::size_t rounds) {
+    std::uint64_t result = 0;
+    const std::uint64_t limit = count * UINT64_C(3);
+    std::uint64_t target = seed % limit;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        std::size_t index = 0;
+        while (index < count && data[index] < target) ++index;
+        result += index ^ target;
+        target += UINT64_C(97);
+        if (target >= limit) target -= limit;
+    }
+    return result;
+}
+
+double reference_polynomial(const double *data, std::size_t count,
+                            std::size_t rounds) {
+    double result = 0.0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const double value = data[index];
+            const double term =
+                ((value * 0.5 + 1.25) * value - 0.75) * value + 0.125;
+            sum += term;
+        }
+        result += sum;
+    }
+    return result;
+}
+
+double reference_dot(const double *left, const double *right,
+                     std::size_t count, std::size_t rounds) {
+    double result = 0.0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (std::size_t index = 0; index < count; ++index)
+            sum += left[index] * right[index];
+        result += sum;
+    }
+    return result;
+}
+
+double reference_recurrence(const double *data, std::size_t count,
+                            std::size_t rounds) {
+    double result = 0.125;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index)
+            result = (result * 0.999999 + data[index]) * 0.5;
+    }
+    return result;
+}
+
+double reference_axpy(const double *left, const double *right,
+                      std::size_t count, std::size_t rounds) {
+    double result = 0.0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (std::size_t index = 0; index < count; ++index)
+            sum = sum + left[index] * 0.75 + right[index] * 1.25;
+        result += sum;
+    }
+    return result;
+}
+
+double reference_quotient(const double *left, const double *right,
+                          std::size_t count, std::size_t rounds) {
+    double result = 0.0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        double sum = 0.0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const double denominator = right[index] * right[index] + 1.25;
+            sum += left[index] / denominator;
+        }
+        result += sum;
+    }
+    return result;
+}
+
+double reference_iir(const double *data, std::size_t count,
+                     std::size_t rounds) {
+    double first = 0.125;
+    double second = -0.25;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const double next = data[index] + first * 0.625 - second * 0.125;
+            second = first;
+            first = next;
+        }
+    }
+    return first + second;
+}
+
+template <class Function>
+struct KernelDescriptor {
+    std::string_view name;
+    std::string_view category;
+    Function reference;
+};
+
+static constexpr KernelDescriptor<ScalarFunction> scalar_kernels[] = {
+    {"mix", "integer", reference_mix},
+    {"divide", "integer", reference_divide},
+    {"narrow", "integer", reference_narrow},
+    {"rotate", "bitwise", reference_rotate},
+    {"bitswap", "bitwise", reference_bitswap},
+    {"call_leaf", "calls", reference_call_leaf},
+    {"call_chain", "calls", reference_call_chain},
+};
+
+static constexpr KernelDescriptor<MemoryFunction> memory_kernels[] = {
+    {"reduce", "reduction", reference_reduce},
+    {"xor_reduce", "reduction", reference_xor_reduce},
+    {"branch", "branching", reference_branch},
+    {"classify", "branching", reference_classify},
+    {"select", "selection", reference_select},
+    {"clamp", "selection", reference_clamp},
+};
+
+static constexpr KernelDescriptor<TransformFunction> transform_kernels[] = {
+    {"transform", "streaming", reference_transform},
+    {"blend", "streaming", reference_blend},
+    {"scan", "memory-dependency", reference_scan},
+    {"prefix_xor", "memory-dependency", reference_prefix_xor},
+};
+
+static constexpr KernelDescriptor<GatherFunction> gather_kernels[] = {
+    {"gather", "indirect", reference_gather},
+    {"gather_pair", "indirect", reference_gather_pair},
+    {"pointer_chase", "pointer-chasing", reference_pointer_chase},
+    {"pointer_chase_pair", "pointer-chasing",
+     reference_pointer_chase_pair},
+};
+
+static constexpr KernelDescriptor<SearchFunction> search_kernels[] = {
+    {"search", "search", reference_search},
+    {"linear_search", "search", reference_linear_search},
+};
+
+static constexpr KernelDescriptor<FloatingFunction> floating_kernels[] = {
+    {"polynomial", "fp-throughput", reference_polynomial},
+    {"recurrence", "fp-dependency", reference_recurrence},
+    {"iir", "fp-dependency", reference_iir},
+};
+
+static constexpr KernelDescriptor<FloatingPairFunction>
+    floating_pair_kernels[] = {
+        {"dot", "fp-throughput", reference_dot},
+        {"axpy", "fp-throughput", reference_axpy},
+        {"quotient", "fp-throughput", reference_quotient},
+    };
+
+[[noreturn]] void mismatch(const Variant &variant, std::string_view kernel) {
+    std::cerr << "result mismatch: " << variant.compiler << ',' << variant.level
+              << ',' << kernel << '\n';
+    std::exit(2);
+}
+
+void emit(std::string_view compiler, std::string_view level,
+          std::string_view category, std::string_view kernel,
+          std::size_t work, const TimingSummary &timing,
+          std::uint64_t checksum) {
+    std::cout << compiler << ',' << level << ',' << category << ',' << kernel
+              << ',' << work << ',' << std::fixed << std::setprecision(3)
+              << timing.median_ns << ',' << timing.mad_ns << ','
+              << (timing.median_ns / static_cast<double>(work)) << ",0x"
+              << std::hex << checksum << std::dec << '\n';
+}
+
+void consume(std::uint64_t value) { integer_sink = value; }
+void consume(double value) { floating_sink = value; }
+
+bool result_matches(std::uint64_t actual, std::uint64_t expected) {
+    return actual == expected;
+}
+
+bool result_matches(double actual, double expected) {
+    return std::bit_cast<std::uint64_t>(actual) ==
+           std::bit_cast<std::uint64_t>(expected);
+}
+
+std::uint64_t result_checksum(std::uint64_t value) { return value; }
+
+std::uint64_t result_checksum(double value) {
+    return std::bit_cast<std::uint64_t>(value);
+}
+
+template <class Invocation, class Reference, class Validation>
+void benchmark_kernel(std::string_view name, std::string_view category,
+                      std::size_t units_per_work, Invocation invoke,
+                      Reference reference, Validation validate,
+                      std::uint64_t target_ns, unsigned samples) {
+    const auto work = calibrate(
+        [&](const Variant &variant, std::size_t amount) {
+            consume(invoke(variant, amount));
+        },
+        target_ns);
+    const auto expected = reference(work);
+    for (const auto &variant : variants) {
+        const auto actual = invoke(variant, work);
+        if (!result_matches(actual, expected) || !validate())
+            mismatch(variant, name);
+    }
+    const auto timings = interleaved_summaries(
+        [&](const Variant &variant, std::size_t amount) {
+            consume(invoke(variant, amount));
+        },
+        work, samples);
+    for (std::size_t index = 0; index < std::size(variants); ++index) {
+        const auto &variant = variants[index];
+        emit(variant.compiler, variant.level, category, name,
+             work * units_per_work, timings[index], result_checksum(expected));
+    }
+}
+
+int main(int argc, char **argv) {
+    stabilize_benchmark_thread();
+    const auto target_ms = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 20;
+    const auto samples = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : 7;
+    if (target_ms == 0 || samples == 0 || (samples % 2) == 0) {
+        std::cerr << "target milliseconds and odd sample count must be positive\n";
+        return 2;
+    }
+    const auto target_ns = target_ms * UINT64_C(1000000);
+
+    constexpr std::size_t count = 4096;
+    std::vector<std::uint64_t> integers(count), indices(count), sorted(count);
+    std::vector<std::uint64_t> transformed(count), expected_transformed(count);
+    std::vector<double> floating(count), floating_right(count);
+    std::uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
+    for (std::size_t index = 0; index < count; ++index) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        integers[index] = state * UINT64_C(2685821657736338717);
+        indices[index] = (state >> 17) & (count - 1U);
+        sorted[index] = index * UINT64_C(3);
+        floating[index] = static_cast<double>(integers[index] & 0xffffU) /
+                          65536.0 - 0.5;
+        floating_right[index] =
+            static_cast<double>((integers[index] >> 16) & 0xffffU) /
+            32768.0 - 1.0;
+    }
+
+    std::cout << "compiler,level,category,kernel,work_units,median_ns,mad_ns,ns_per_unit,checksum\n";
+
+    for (std::size_t index = 0; index < std::size(scalar_kernels); ++index) {
+        const auto &kernel = scalar_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, 1,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.scalar[index](UINT64_C(0x123456789abcdef0), work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(UINT64_C(0x123456789abcdef0), work);
+            },
+            [] { return true; }, target_ns, samples);
+    }
+    for (std::size_t index = 0; index < std::size(memory_kernels); ++index) {
+        const auto &kernel = memory_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, count,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.memory[index](integers.data(), count, work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(integers.data(), count, work);
+            },
+            [] { return true; }, target_ns, samples);
+    }
+    for (std::size_t index = 0; index < std::size(transform_kernels); ++index) {
+        const auto &kernel = transform_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, count,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.transform[index](integers.data(), transformed.data(),
+                                                count, work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(integers.data(), expected_transformed.data(),
+                                        count, work);
+            },
+            [&] { return transformed == expected_transformed; }, target_ns,
+            samples);
+    }
+    for (std::size_t index = 0; index < std::size(gather_kernels); ++index) {
+        const auto &kernel = gather_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, count,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.gather[index](integers.data(), indices.data(),
+                                             count, work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(integers.data(), indices.data(), count,
+                                        work);
+            },
+            [] { return true; }, target_ns, samples);
+    }
+    for (std::size_t index = 0; index < std::size(search_kernels); ++index) {
+        const auto &kernel = search_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, 1,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.search[index](sorted.data(), count,
+                    UINT64_C(0x123456789abcdef0), work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(sorted.data(), count,
+                    UINT64_C(0x123456789abcdef0), work);
+            },
+            [] { return true; }, target_ns, samples);
+    }
+    for (std::size_t index = 0; index < std::size(floating_kernels); ++index) {
+        const auto &kernel = floating_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, count,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.floating[index](floating.data(), count, work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(floating.data(), count, work);
+            },
+            [] { return true; }, target_ns, samples);
+    }
+    for (std::size_t index = 0;
+         index < std::size(floating_pair_kernels); ++index) {
+        const auto &kernel = floating_pair_kernels[index];
+        benchmark_kernel(
+            kernel.name, kernel.category, count,
+            [&](const Variant &variant, std::size_t work) {
+                return variant.floating_pair[index](floating.data(),
+                    floating_right.data(), count, work);
+            },
+            [&](std::size_t work) {
+                return kernel.reference(floating.data(), floating_right.data(),
+                                        count, work);
+            },
+            [] { return true; }, target_ns, samples);
+    }
+    return 0;
+}

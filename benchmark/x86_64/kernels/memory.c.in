@@ -1,0 +1,115 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+BENCH_NOINLINE uint64_t @PREFIX@reduce(const uint64_t *data, size_t count,
+                                       size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        uint64_t sum = 0;
+        for (size_t index = 0; index < count; ++index) sum += data[index];
+        result += sum ^ round_value;
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@xor_reduce(const uint64_t *data,
+                                           size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 1;
+    for (size_t round = 0; round < rounds; ++round) {
+        uint64_t sum = round_value;
+        for (size_t index = 0; index < count; ++index) {
+            sum += data[index] ^
+                   (index * UINT64_C(11400714819323198485));
+        }
+        result ^= sum;
+        round_value += UINT64_C(6364136223846793005);
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@transform(const uint64_t *source,
+                                          uint64_t *destination,
+                                          size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        uint64_t salt = round_value;
+        for (size_t index = 0; index < count; ++index) {
+            uint64_t value = (source[index] + salt) ^
+                             UINT64_C(11400714819323198485);
+            value *= UINT64_C(6364136223846793005);
+            destination[index] = value;
+            result += value;
+            salt += UINT64_C(1442695040888963407);
+        }
+        round_value += UINT64_C(7046029254386353131);
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@blend(const uint64_t *source,
+                                      uint64_t *destination,
+                                      size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const uint64_t value = source[index];
+            uint64_t mixed =
+                ((value & UINT64_C(0x00ff00ff00ff00ff)) << 8) |
+                ((value & UINT64_C(0xff00ff00ff00ff00)) >> 8);
+            mixed += round_value;
+            destination[index] = mixed;
+            result ^= mixed + index;
+        }
+        round_value += UINT64_C(7046029254386353131);
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@scan(const uint64_t *source,
+                                     uint64_t *destination,
+                                     size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 1;
+    for (size_t round = 0; round < rounds; ++round) {
+        uint64_t carry = round_value;
+        for (size_t index = 0; index < count; ++index) {
+            carry += source[index];
+            destination[index] = carry;
+            result ^= carry + index;
+        }
+        round_value += UINT64_C(17);
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@prefix_xor(const uint64_t *source,
+                                           uint64_t *destination,
+                                           size_t count, size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = UINT64_C(11400714819323198485);
+    for (size_t round = 0; round < rounds; ++round) {
+        uint64_t carry = round_value;
+        for (size_t index = 0; index < count; ++index) {
+            carry = (carry << 7) | (carry >> 57);
+            carry ^= source[index];
+            destination[index] = carry;
+            result += carry ^ index;
+        }
+        round_value += UINT64_C(6364136223846793005);
+    }
+    return result;
+}

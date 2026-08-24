@@ -1,0 +1,80 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+BENCH_NOINLINE uint64_t @PREFIX@mix(uint64_t state, size_t iterations) {
+    uint64_t result = state;
+    uint64_t step = 0;
+    for (size_t index = 0; index < iterations; ++index) {
+        result ^= result >> 12;
+        result ^= result << 25;
+        result ^= result >> 27;
+        result = result * UINT64_C(2685821657736338717) + step;
+        ++step;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@divide(uint64_t state, size_t iterations) {
+    uint64_t result = state;
+    uint64_t sequence = state;
+    uint64_t divisor = 3;
+    uint64_t step = 1;
+    for (size_t index = 0; index < iterations; ++index) {
+        const uint64_t quotient = result / divisor;
+        const uint64_t remainder = result % divisor;
+        result = (quotient ^
+                  (remainder * UINT64_C(11400714819323198485))) + sequence;
+        sequence = sequence * UINT64_C(6364136223846793005) + step;
+        divisor = (sequence & UINT64_C(1023)) + UINT64_C(1);
+        ++step;
+    }
+    return result ^ sequence;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@rotate(uint64_t state, size_t iterations) {
+    uint64_t result = state;
+    uint64_t step = 0;
+    for (size_t index = 0; index < iterations; ++index) {
+        const uint64_t shift = (step & UINT64_C(31)) + UINT64_C(1);
+        result = (result << shift) | (result >> (UINT64_C(64) - shift));
+        result = (result ^ (UINT64_C(11400714819323198485) + step)) *
+                 UINT64_C(6364136223846793005);
+        ++step;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@narrow(uint64_t state, size_t iterations) {
+    uint32_t result = (uint32_t)state;
+    uint32_t step = UINT32_C(1);
+    for (size_t index = 0; index < iterations; ++index) {
+        result = (result * UINT32_C(1664525) + UINT32_C(1013904223)) ^
+                 (result >> 13);
+        result += step;
+        step += UINT32_C(17);
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@bitswap(uint64_t state, size_t iterations) {
+    uint64_t result = state;
+    uint64_t step = UINT64_C(11400714819323198485);
+    for (size_t index = 0; index < iterations; ++index) {
+        const uint64_t low =
+            (result & UINT64_C(0x00ff00ff00ff00ff)) << 8;
+        const uint64_t high =
+            (result & UINT64_C(0xff00ff00ff00ff00)) >> 8;
+        result = (low | high) ^ step;
+        step += UINT64_C(6364136223846793005);
+    }
+    return result;
+}

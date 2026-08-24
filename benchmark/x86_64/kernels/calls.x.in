@@ -1,0 +1,41 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+[[runtime_only, noinline]]
+static u64 call_leaf_step(in u64 value, in u64 step) {
+    return ((value ^ step) * 6364136223846793005u64) +
+           1442695040888963407u64;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@call_leaf"), noinline]]
+global u64 benchmark_call_leaf(in u64 state, in uptr iterations) {
+    u64 result = state;
+    uptr index = 0;
+    while (index < iterations) {
+        result = call_leaf_step(result, index);
+        index = index + 1;
+    }
+    return result;
+}
+
+[[runtime_only, noinline]]
+static u64 call_chain_inner(in u64 value, in u64 step) {
+    return (value + step) ^ (value >> 17);
+}
+
+[[runtime_only, noinline]]
+static u64 call_chain_outer(in u64 value, in u64 step) {
+    u64 first = call_chain_inner(value, step);
+    return call_chain_inner(first * 5u64 + 1u64, step + 3u64);
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@call_chain"), noinline]]
+global u64 benchmark_call_chain(in u64 state, in uptr iterations) {
+    u64 result = state;
+    uptr index = 0;
+    while (index < iterations) {
+        result = call_chain_outer(result, index);
+        index = index + 1;
+    }
+    return result;
+}

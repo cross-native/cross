@@ -1,0 +1,125 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+BENCH_NOINLINE uint64_t @PREFIX@branch(const uint64_t *data, size_t count,
+                                       size_t rounds) {
+    uint64_t result = UINT64_C(1469598103934665603);
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const uint64_t value = data[index] + round_value;
+            if ((value & UINT64_C(1)) != UINT64_C(0)) {
+                result += value * UINT64_C(3) + UINT64_C(1);
+            } else {
+                result ^= value + UINT64_C(11400714819323198485);
+            }
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@classify(const uint64_t *data, size_t count,
+                                         size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const uint64_t value = data[index] + round_value;
+            switch (value & UINT64_C(7)) {
+            case 0: result += value; break;
+            case 1: result ^= value << 1; break;
+            case 2: result += value * UINT64_C(3); break;
+            case 3: result ^= value >> 2; break;
+            case 4: result -= value; break;
+            case 5: result += value ^ UINT64_C(11400714819323198485); break;
+            case 6: result ^= value * UINT64_C(5); break;
+            default: result += value >> 3; break;
+            }
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@search(const uint64_t *data, size_t count,
+                                       uint64_t seed, size_t rounds) {
+    uint64_t result = 0;
+    const uint64_t limit = count * UINT64_C(3);
+    uint64_t target = seed % limit;
+    for (size_t round = 0; round < rounds; ++round) {
+        size_t low = 0;
+        size_t high = count;
+        while (low < high) {
+            const size_t middle = low + ((high - low) >> 1);
+            if (data[middle] < target)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        result += low ^ target;
+        target += UINT64_C(97);
+        if (target >= limit) target -= limit;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@select(const uint64_t *data, size_t count,
+                                       size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            const uint64_t value = data[index] + round_value;
+            if (value < UINT64_C(0x8000000000000000))
+                result += value * UINT64_C(5);
+            else
+                result += value ^ UINT64_C(11400714819323198485);
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@clamp(const uint64_t *data, size_t count,
+                                      size_t rounds) {
+    uint64_t result = 0;
+    uint64_t round_value = 0;
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t index = 0; index < count; ++index) {
+            uint64_t selected = data[index] + round_value;
+            if (selected < UINT64_C(0x4000000000000000))
+                selected = UINT64_C(0x4000000000000000);
+            if (selected > UINT64_C(0xbfffffffffffffff))
+                selected = UINT64_C(0xbfffffffffffffff);
+            result += selected ^ index;
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@linear_search(const uint64_t *data,
+                                              size_t count, uint64_t seed,
+                                              size_t rounds) {
+    uint64_t result = 0;
+    const uint64_t limit = count * UINT64_C(3);
+    uint64_t target = seed % limit;
+    for (size_t round = 0; round < rounds; ++round) {
+        size_t index = 0;
+        while (index < count && data[index] < target) ++index;
+        result += index ^ target;
+        target += UINT64_C(97);
+        if (target >= limit) target -= limit;
+    }
+    return result;
+}

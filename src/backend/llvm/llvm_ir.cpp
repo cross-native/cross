@@ -1,0 +1,425 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "backend/llvm/llvm_ir.hpp"
+
+#include "backend/llvm/mir_ir.hpp"
+
+#include "common/uint128.hpp"
+#include "target/target.hpp"
+
+#include <algorithm>
+#include <bit>
+#include <iomanip>
+#include <sstream>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
+
+namespace cross::debug {
+namespace {
+
+std::string llvm_string(std::string_view text) {
+    std::ostringstream out;
+    out << '"';
+    for (const char byte : text) {
+        const auto ch = static_cast<unsigned char>(byte);
+        if (ch >= 0x20 && ch <= 0x7e && ch != '"' && ch != '\\') {
+            out << static_cast<char>(ch);
+        } else {
+            constexpr char digits[] = "0123456789ABCDEF";
+            out << '\\' << digits[ch >> 4] << digits[ch & 15];
+        }
+    }
+    out << '"';
+    return out.str();
+}
+
+std::string symbol_name(std::string_view text) {
+    return "@" + llvm_string(text);
+}
+
+std::string sanitize_identifier(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+    for (const char ch : text) {
+        const bool valid = (ch >= 'A' && ch <= 'Z') ||
+                           (ch >= 'a' && ch <= 'z') ||
+                           (ch >= '0' && ch <= '9');
+        result.push_back(valid ? ch : '_');
+    }
+    return result;
+}
+
+std::string label_name(std::string_view source_name) {
+    return "cross.label." + sanitize_identifier(source_name);
+}
+
+std::string hexadecimal(std::uint64_t value, unsigned width) {
+    std::ostringstream out;
+    out << std::uppercase << std::hex << std::setfill('0')
+        << std::setw(static_cast<int>(width)) << value;
+    return out.str();
+}
+
+class ModuleEmitter {
+public:
+    ModuleEmitter(const CompilerOptions& options, Diagnostics& diagnostics,
+                  const codegen::ModuleView& module)
+        : options_(options), diagnostics_(diagnostics), hir_(module.hir()),
+          data_(module.data()), managed_(module.managed()),
+          raw_assembly_(module.raw_assembly()) {}
+
+    std::string run() {
+        std::ostringstream module;
+        module << "; Cross language 0.8\n"
+                  "source_filename = \"cross compilation group\"\n"
+               << "target triple = " << llvm_string(options_.target)
+               << "\n\n";
+        if (!raw_assembly_.module_assembly.empty()) {
+            module << "module asm "
+                   << llvm_string(raw_assembly_.module_assembly) << "\n\n";
+        }
+
+        emit_objects(module);
+        emit_declarations(module);
+        emit_definitions(module);
+        emit_retention(module);
+        emit_intrinsic_declarations(module);
+        return module.str();
+    }
+
+private:
+    std::string ir_type(hir::TypeId id) const {
+        const auto& type = hir_.type(id);
+        if (type.kind == hir::Type::Kind::Pointer) return "ptr";
+        if (type.kind == hir::Type::Kind::Vector && type.element) {
+            return type.scalable
+                       ? "<vscale x " + std::to_string(type.lanes) + " x " +
+                             ir_type(*type.element) + ">"
+                       : "<" + std::to_string(type.lanes) + " x " +
+                             ir_type(*type.element) + ">";
+        }
+        if (type.kind == hir::Type::Kind::Array && type.element) {
+            return "[" + std::to_string(type.lanes) + " x " +
+                   ir_type(*type.element) + "]";
+        }
+        if (type.kind == hir::Type::Kind::Record && type.record) {
+            return "[" + std::to_string(hir_.record(*type.record).size) +
+                   " x i8]";
+        }
+        switch (type.builtin) {
+        case BuiltinType::Void: return "void";
+        case BuiltinType::Bool:
+        case BuiltinType::I8:
+        case BuiltinType::U8: return "i8";
+        case BuiltinType::I16:
+        case BuiltinType::U16: return "i16";
+        case BuiltinType::I32:
+        case BuiltinType::U32: return "i32";
+        case BuiltinType::I64:
+        case BuiltinType::U64: return "i64";
+        case BuiltinType::Iptr:
+        case BuiltinType::Uptr:
+            return "i" + std::to_string(data_.address_bits);
+        case BuiltinType::I128:
+        case BuiltinType::U128: return "i128";
+        case BuiltinType::F32: return "float";
+        case BuiltinType::F64: return "double";
+        case BuiltinType::Fptr:
+            return data_.address_bits == 32 ? "float" : "double";
+        case BuiltinType::F80: return "x86_fp80";
+        case BuiltinType::F128: return "fp128";
+        case BuiltinType::Label: return "ptr";
+        }
+        return "void";
+    }
+
+    std::string abi_prefix(const hir::Function& function) const {
+        const auto* target = target_for_triple(options_.target);
+        const auto* abi = target
+                              ? find_abi(*target, function.abi,
+                                         options_.target)
+                              : nullptr;
+        if (!target || !abi) {
+            diagnostics_.error(function.location,
+                               "unsupported target ABI '" + function.abi +
+                                   "'");
+            return {};
+        }
+        if (abi->canonical_name == target->default_abi(options_.target)) {
+            return {};
+        }
+        return std::string(abi->llvm_calling_convention) + ' ';
+    }
+
+    void emit_declarations(std::ostringstream& module) const {
+        for (const auto& function : hir_.functions) {
+            const bool raw = raw_assembly_.owns(function.id);
+            if (function.definition && !raw) continue;
+            module << "declare ";
+            if (raw) module << "dso_local ";
+            module << abi_prefix(function) << ir_type(function.result_type)
+                   << ' ' << symbol_name(function.link_symbol) << '(';
+            for (std::size_t index = 0;
+                 index < function.parameters.size(); ++index) {
+                if (index != 0) module << ", ";
+                const auto& parameter = function.parameters[index];
+                const bool manual_cell =
+                    parameter.physical_location &&
+                    *parameter.physical_location != "auto";
+                module << (parameter.mode == ParameterMode::In &&
+                                   !manual_cell
+                               ? ir_type(parameter.type)
+                               : std::string("ptr"));
+            }
+            if (function.variadic) {
+                if (!function.parameters.empty()) module << ", ";
+                module << "...";
+            }
+            module << ")\n\n";
+        }
+    }
+
+    void emit_definitions(std::ostringstream& module) {
+        for (const auto& function : hir_.functions) {
+            if (!function.definition || raw_assembly_.owns(function.id)) {
+                continue;
+            }
+            const auto* managed = managed_.find(function.id);
+            if (!managed) {
+                diagnostics_.error(
+                    function.location,
+                    "LLVM debug serializer received a function without "
+                    "managed or raw MIR ownership");
+                continue;
+            }
+            module << emit_managed_mir_function(
+                hir_, *managed, options_, diagnostics_);
+        }
+    }
+
+    std::string floating_initializer(const data::Object& object) const {
+        const auto& type = hir_.type(object.type);
+        if (type.builtin == BuiltinType::F32 ||
+            (type.builtin == BuiltinType::Fptr && object.size == 4)) {
+            const auto value = std::bit_cast<float>(
+                static_cast<std::uint32_t>(object.bits.low));
+            return "0x" + hexadecimal(
+                              std::bit_cast<std::uint64_t>(
+                                  static_cast<double>(value)),
+                              16);
+        }
+        if (type.builtin == BuiltinType::F64 ||
+            (type.builtin == BuiltinType::Fptr && object.size == 8)) {
+            return "0x" + hexadecimal(object.bits.low, 16);
+        }
+        if (type.builtin == BuiltinType::F80) {
+            return "0xK" + hexadecimal(object.bits.high & 0xffffU, 4) +
+                   hexadecimal(object.bits.low, 16);
+        }
+        if (type.builtin == BuiltinType::F128) {
+            return "0xL" + hexadecimal(object.bits.high, 16) +
+                   hexadecimal(object.bits.low, 16);
+        }
+        return "zeroinitializer";
+    }
+
+    std::string address_initializer(const data::Object& object) {
+        if (!object.address) return "null";
+        const auto& address = *object.address;
+        std::string target;
+        if (address.kind == data::AddressKind::Object && address.object) {
+            target = symbol_name(hir_.object(*address.object).link_symbol);
+        } else if (address.kind == data::AddressKind::Function &&
+                   address.function) {
+            target = symbol_name(hir_.function(*address.function).link_symbol);
+        } else if (address.kind == data::AddressKind::Label &&
+                   address.function && address.label) {
+            if (raw_assembly_.owns(*address.function)) {
+                diagnostics_.error(
+                    object.location,
+                    "LLVM debug serialization cannot represent a raw-assembly "
+                    "local-label address");
+                return "null";
+            }
+            const auto& function = hir_.function(*address.function);
+            const auto& label = hir_.labels.at(address.label->value);
+            target = "blockaddress(" + symbol_name(function.link_symbol) +
+                     ", %" + label_name(label.source_name) + ')';
+        } else {
+            diagnostics_.error(object.location,
+                               "data IR address constant has no target");
+            return "null";
+        }
+        if (address.addend == 0) return target;
+        return "getelementptr (i8, ptr " + target + ", i" +
+               std::to_string(data_.address_bits) + ' ' +
+               std::to_string(address.addend) + ')';
+    }
+
+    std::string initializer(const data::Object& object) {
+        switch (object.initializer) {
+        case data::InitializerKind::Declaration: return {};
+        case data::InitializerKind::Zero: return "zeroinitializer";
+        case data::InitializerKind::Uninitialized: return "undef";
+        case data::InitializerKind::Integer: return to_decimal(object.bits);
+        case data::InitializerKind::Floating:
+            return floating_initializer(object);
+        case data::InitializerKind::Address:
+            return address_initializer(object);
+        }
+        return "zeroinitializer";
+    }
+
+    void emit_objects(std::ostringstream& module) {
+        bool emitted = false;
+        for (const auto& object : data_.objects) {
+            if (raw_assembly_.owns(object.source)) continue;
+            const auto& entity = hir_.object(object.source);
+            const auto symbol = symbol_name(entity.link_symbol);
+            const auto storage = object.read_only ? "constant " : "global ";
+            const auto tls = [&]() -> std::string {
+                if (!object.is_thread_local) return {};
+                const auto model = object.tls_model.empty()
+                    ? (entity.definition && entity.linkage != Linkage::Global
+                           ? std::string("local-exec")
+                           : std::string("initial-exec"))
+                    : object.tls_model;
+                return "thread_local(" +
+                       std::string(model == "local-exec" ? "localexec"
+                                                         : "initialexec") +
+                       ") ";
+            }();
+            if (object.initializer == data::InitializerKind::Declaration) {
+                module << symbol << " = external " << tls << storage
+                       << ir_type(object.type) << ", align "
+                       << object.alignment << '\n';
+                emitted = true;
+                continue;
+            }
+            module << symbol << " = "
+                   << (entity.linkage == Linkage::Global ? "" : "internal ")
+                   << tls << storage << ir_type(object.type) << ' '
+                   << initializer(object);
+            if (entity.section) {
+                module << ", section " << llvm_string(*entity.section);
+            } else if (object.initializer ==
+                       data::InitializerKind::Uninitialized) {
+                module << ", section \".noinit\"";
+            }
+            module << ", align " << object.alignment << '\n';
+            emitted = true;
+        }
+        if (emitted) module << '\n';
+    }
+
+    void emit_retention(std::ostringstream& module) const {
+        std::vector<std::string> compiler_symbols;
+        std::vector<std::string> linker_symbols;
+        std::unordered_set<std::string> compiler_seen;
+        std::unordered_set<std::string> linker_seen;
+        const auto append_unique = [](std::vector<std::string>& symbols,
+                                      std::unordered_set<std::string>& seen,
+                                      std::string symbol) {
+            if (seen.insert(symbol).second) {
+                symbols.push_back(std::move(symbol));
+            }
+        };
+        for (const auto& object : data_.objects) {
+            if (object.initializer == data::InitializerKind::Declaration ||
+                raw_assembly_.owns(object.source)) {
+                continue;
+            }
+            const auto symbol =
+                symbol_name(hir_.object(object.source).link_symbol);
+            if (object.retain) {
+                append_unique(linker_symbols, linker_seen, symbol);
+            } else if (object.used) {
+                append_unique(compiler_symbols, compiler_seen, symbol);
+            }
+        }
+        const auto emit = [&](std::string_view name,
+                              const std::vector<std::string>& symbols) {
+            if (symbols.empty()) return;
+            module << '@' << name << " = appending global [" << symbols.size()
+                   << " x ptr] [";
+            for (std::size_t index = 0; index < symbols.size(); ++index) {
+                if (index != 0) module << ", ";
+                module << "ptr " << symbols[index];
+            }
+            module << "], section \"llvm.metadata\"\n";
+        };
+        emit("llvm.compiler.used", compiler_symbols);
+        emit("llvm.used", linker_symbols);
+        if (!compiler_symbols.empty() || !linker_symbols.empty()) {
+            module << '\n';
+        }
+    }
+
+    void emit_intrinsic_declarations(std::ostringstream& module) const {
+        std::vector<std::string> expect_types;
+        bool trap = false;
+        bool va_start = false;
+        bool dynamic_stack = false;
+        for (const auto& function : managed_.functions) {
+            for (const auto& value : function.values) {
+                if (value.kind == mir::ValueKind::VariadicState) {
+                    va_start = true;
+                }
+                if (value.kind == mir::ValueKind::DynamicStackSave ||
+                    value.kind == mir::ValueKind::DynamicAlloca ||
+                    value.kind == mir::ValueKind::DynamicStackRestore) {
+                    dynamic_stack = true;
+                }
+                if (value.kind != mir::ValueKind::Intrinsic ||
+                    value.intrinsic != mir::IntrinsicOperation::Expect) {
+                    continue;
+                }
+                const auto type = ir_type(value.type);
+                if (std::find(expect_types.begin(), expect_types.end(), type) ==
+                    expect_types.end()) {
+                    expect_types.push_back(type);
+                }
+            }
+            trap = trap || std::any_of(
+                               function.blocks.begin(), function.blocks.end(),
+                               [](const mir::ManagedBlock& block) {
+                                   return block.terminator.kind ==
+                                          mir::TerminatorKind::Trap;
+                               });
+        }
+        std::sort(expect_types.begin(), expect_types.end());
+        for (const auto& type : expect_types) {
+            module << "declare " << type << " @llvm.expect." << type << '('
+                   << type << ", " << type << ")\n";
+        }
+        if (trap) module << "declare void @llvm.trap()\n";
+        if (va_start) module << "declare void @llvm.va_start(ptr)\n";
+        if (dynamic_stack) {
+            module << "declare ptr @llvm.stacksave.p0()\n"
+                      "declare void @llvm.stackrestore.p0(ptr)\n";
+        }
+        if (!expect_types.empty() || trap || va_start || dynamic_stack) {
+            module << '\n';
+        }
+    }
+
+    const CompilerOptions& options_;
+    Diagnostics& diagnostics_;
+    const hir::Module& hir_;
+    const data::Module& data_;
+    const mir::ManagedModule& managed_;
+    const mir::AssemblyBundle& raw_assembly_;
+};
+
+} // namespace
+
+LlvmTextSerializer::LlvmTextSerializer(const CompilerOptions& options,
+                                       Diagnostics& diagnostics)
+    : options_(options), diagnostics_(diagnostics) {}
+
+std::string LlvmTextSerializer::serialize(const codegen::ModuleView& module) {
+    return ModuleEmitter(options_, diagnostics_, module).run();
+}
+
+} // namespace cross::debug

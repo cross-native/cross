@@ -1,0 +1,27 @@
+// Generated from the shipped model source by CMake.
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "model/model.hpp"
+
+#include <array>
+
+namespace cross {
+namespace {
+
+constexpr std::string_view common_model =
+    R"cross_model(@CROSS_COMMON_MODEL@)cross_model";
+
+constexpr std::string_view x86_64_model =
+    R"cross_model(@CROSS_X86_64_MODEL@)cross_model";
+
+constexpr std::array sources{
+    ShippedModelSource{"shipped:common.xm", common_model},
+    ShippedModelSource{"shipped:x86_64.xm", x86_64_model},
+};
+
+} // namespace
+
+std::span<const ShippedModelSource> shipped_model_sources() {
+    return sources;
+}
+
+} // namespace cross

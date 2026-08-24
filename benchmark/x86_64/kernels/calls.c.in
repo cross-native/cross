@@ -1,0 +1,45 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+static BENCH_NOINLINE uint64_t call_leaf_step(uint64_t value,
+                                               uint64_t step) {
+    return ((value ^ step) * UINT64_C(6364136223846793005)) +
+           UINT64_C(1442695040888963407);
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@call_leaf(uint64_t state,
+                                          size_t iterations) {
+    uint64_t result = state;
+    for (size_t index = 0; index < iterations; ++index)
+        result = call_leaf_step(result, index);
+    return result;
+}
+
+static BENCH_NOINLINE uint64_t call_chain_inner(uint64_t value,
+                                                uint64_t step) {
+    return (value + step) ^ (value >> 17);
+}
+
+static BENCH_NOINLINE uint64_t call_chain_outer(uint64_t value,
+                                                uint64_t step) {
+    const uint64_t first = call_chain_inner(value, step);
+    return call_chain_inner(first * UINT64_C(5) + UINT64_C(1),
+                            step + UINT64_C(3));
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@call_chain(uint64_t state,
+                                           size_t iterations) {
+    uint64_t result = state;
+    for (size_t index = 0; index < iterations; ++index)
+        result = call_chain_outer(result, index);
+    return result;
+}

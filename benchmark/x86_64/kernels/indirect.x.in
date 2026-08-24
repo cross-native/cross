@@ -1,0 +1,85 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+[[abi("@ABI@"), link_name("@PREFIX@gather"), noinline]]
+global u64 benchmark_gather(in const u64 *data, in const u64 *indices,
+                            in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 0u64;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            uptr slot = indices[index] & (count - 1);
+            result = (result ^ data[slot]) + round_value;
+            index = index + 1;
+        }
+        round_value = round_value + 1u64;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@gather_pair"), noinline]]
+global u64 benchmark_gather_pair(in const u64 *data, in const u64 *indices,
+                                 in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    u64 round_value = 0u64;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            uptr first = indices[index] & (count - 1);
+            uptr second = (first + 17) & (count - 1);
+            result = result + ((data[first] * 3u64) ^ data[second]) +
+                     round_value;
+            index = index + 1;
+        }
+        round_value = round_value + 1u64;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@pointer_chase"), noinline]]
+global u64 benchmark_pointer_chase(in const u64 *data,
+                                   in const u64 *indices,
+                                   in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    uptr slot = 0;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            slot = indices[slot] & (count - 1);
+            result = result ^ (data[slot] + index);
+            index = index + 1;
+        }
+        slot = (slot + round + 1) & (count - 1);
+        round = round + 1;
+    }
+    return result ^ slot;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@pointer_chase_pair"), noinline]]
+global u64 benchmark_pointer_chase_pair(in const u64 *data,
+                                        in const u64 *indices,
+                                        in uptr count, in uptr rounds) {
+    u64 result = 0u64;
+    uptr first = 0;
+    uptr second = count >> 1;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            first = indices[first] & (count - 1);
+            second = indices[second] & (count - 1);
+            result = result + (data[first] ^ data[second]);
+            index = index + 1;
+        }
+        first = (first + round + 1) & (count - 1);
+        second = (second + round + 17) & (count - 1);
+        round = round + 1;
+    }
+    return result ^ first ^ second;
+}

@@ -1,0 +1,113 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+[[abi("@ABI@"), link_name("@PREFIX@polynomial"), noinline]]
+global f64 benchmark_polynomial(in const f64 *data, in uptr count,
+                               in uptr rounds) {
+    f64 result = 0.0f64;
+    uptr round = 0;
+    while (round < rounds) {
+        f64 sum = 0.0f64;
+        uptr index = 0;
+        while (index < count) {
+            f64 value = data[index];
+            f64 term = ((value * 0.5f64 + 1.25f64) * value - 0.75f64) *
+                       value + 0.125f64;
+            sum = sum + term;
+            index = index + 1;
+        }
+        result = result + sum;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@dot"), noinline]]
+global f64 benchmark_dot(in const f64 *left, in const f64 *right,
+                         in uptr count, in uptr rounds) {
+    f64 result = 0.0f64;
+    uptr round = 0;
+    while (round < rounds) {
+        f64 sum = 0.0f64;
+        uptr index = 0;
+        while (index < count) {
+            sum = sum + left[index] * right[index];
+            index = index + 1;
+        }
+        result = result + sum;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@recurrence"), noinline]]
+global f64 benchmark_recurrence(in const f64 *data, in uptr count,
+                                in uptr rounds) {
+    f64 result = 0.125f64;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            result = (result * 0.999999f64 + data[index]) * 0.5f64;
+            index = index + 1;
+        }
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@axpy"), noinline]]
+global f64 benchmark_axpy(in const f64 *left, in const f64 *right,
+                          in uptr count, in uptr rounds) {
+    f64 result = 0.0f64;
+    uptr round = 0;
+    while (round < rounds) {
+        f64 sum = 0.0f64;
+        uptr index = 0;
+        while (index < count) {
+            sum = sum + left[index] * 0.75f64 + right[index] * 1.25f64;
+            index = index + 1;
+        }
+        result = result + sum;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@quotient"), noinline]]
+global f64 benchmark_quotient(in const f64 *left, in const f64 *right,
+                              in uptr count, in uptr rounds) {
+    f64 result = 0.0f64;
+    uptr round = 0;
+    while (round < rounds) {
+        f64 sum = 0.0f64;
+        uptr index = 0;
+        while (index < count) {
+            f64 denominator = right[index] * right[index] + 1.25f64;
+            sum = sum + left[index] / denominator;
+            index = index + 1;
+        }
+        result = result + sum;
+        round = round + 1;
+    }
+    return result;
+}
+
+[[abi("@ABI@"), link_name("@PREFIX@iir"), noinline]]
+global f64 benchmark_iir(in const f64 *data, in uptr count,
+                         in uptr rounds) {
+    f64 first = 0.125f64;
+    f64 second = -0.25f64;
+    uptr round = 0;
+    while (round < rounds) {
+        uptr index = 0;
+        while (index < count) {
+            f64 next = data[index] + first * 0.625f64 - second * 0.125f64;
+            second = first;
+            first = next;
+            index = index + 1;
+        }
+        round = round + 1;
+    }
+    return first + second;
+}
