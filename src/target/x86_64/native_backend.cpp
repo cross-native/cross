@@ -57,12 +57,35 @@ enum class LoweringPass : std::uint16_t {
     ScheduleBlockLayout,
     ScheduleAcrossBlocks,
     ScheduleBlocks,
+    ClusterSharedCompareSelects,
     SelectRematerialization,
     AllocateRegisters,
     PreserveCallerContract,
     CreateWidePhiTemporary,
     FinalizeFrame,
 };
+
+bool same_fused_select_condition(const machine::Instruction& left,
+                                 const machine::Instruction& right) {
+    if (left.opcode != Opcode::Select || right.opcode != Opcode::Select ||
+        left.condition_predicate.empty() ||
+        left.condition_predicate != right.condition_predicate ||
+        left.uses.size() < 3 || right.uses.size() < 3 ||
+        left.operands.size() < 2 || right.operands.size() < 2) {
+        return false;
+    }
+    const auto left_use_end = left.uses.end() - 2;
+    const auto right_use_end = right.uses.end() - 2;
+    const auto left_operand_end = left.operands.end() - 2;
+    const auto right_operand_end = right.operands.end() - 2;
+    return std::distance(left.uses.begin(), left_use_end) ==
+               std::distance(right.uses.begin(), right_use_end) &&
+           std::equal(left.uses.begin(), left_use_end, right.uses.begin()) &&
+           std::distance(left.operands.begin(), left_operand_end) ==
+               std::distance(right.operands.begin(), right_operand_end) &&
+           std::equal(
+               left.operands.begin(), left_operand_end, right.operands.begin());
+}
 
 const AbiEntry* abi_model(AbiId abi) {
     const auto* model = model_registry().find_abi(abi);
@@ -3487,11 +3510,33 @@ private:
                     selection->uses.size() != 3 ||
                     selection->uses.front().kind !=
                         machine::RegisterKind::Virtual ||
-                    uses[selection->uses.front().id] != 1) {
+                    selection->uses.front().id >= uses.size()) {
                     ++selection_index;
                     continue;
                 }
                 const auto condition = selection->uses.front();
+                // A flags target can profitably duplicate a pure comparison
+                // into several conditional moves.  Compared with keeping a
+                // materialized boolean, this removes SETcc and every TEST of
+                // that byte while adding no instructions: N CMP/CMOV pairs
+                // replace CMP/SETcc plus N TEST/CMOV pairs.  Require every
+                // use to be a selectable consumer in this block so cloning
+                // never penalizes a remaining ordinary boolean use.
+                const auto selectable_uses =
+                    static_cast<unsigned>(std::count_if(
+                        block.instructions.begin(),
+                        block.instructions.end(),
+                        [&](const machine::Instruction& instruction) {
+                            return instruction.opcode == Opcode::Select &&
+                                   instruction.condition_predicate.empty() &&
+                                   instruction.uses.size() == 3 &&
+                                   instruction.uses.front() == condition;
+                        }));
+                if (selectable_uses == 0 ||
+                    uses[condition.id] != selectable_uses) {
+                    ++selection_index;
+                    continue;
+                }
                 const auto definition = std::find_if(
                     block.instructions.begin(), selection,
                     [&](const machine::Instruction& instruction) {
@@ -3502,7 +3547,9 @@ private:
                     definition->kind != machine::InstructionKind::Target ||
                     definition->uses.empty() ||
                     definition->uses.front().mode.bits > 64 ||
-                    definition->patch || definition->has_side_effects) {
+                    definition->operands.empty() || definition->patch ||
+                    definition->has_side_effects || definition->may_load ||
+                    definition->may_store) {
                     ++selection_index;
                     continue;
                 }
@@ -3521,7 +3568,8 @@ private:
                 const auto falsity = selection->uses[2];
                 const auto truth_operand = selection->operands[1];
                 const auto falsity_operand = selection->operands[2];
-                if ((base == Opcode::CmpEq || base == Opcode::CmpNe) &&
+                if (uses[condition.id] == 1 &&
+                    (base == Opcode::CmpEq || base == Opcode::CmpNe) &&
                     has_property(definition->opcode,
                                  OpcodeProperty::Immediate) &&
                     definition->uses.size() == 1 &&
@@ -3576,10 +3624,28 @@ private:
                 }
                 selection->operands.push_back(truth_operand);
                 selection->operands.push_back(falsity_operand);
-                block.instructions.erase(definition);
-                // Erasing an earlier definition shifts the select. Restart;
-                // each successful fusion strictly reduces this block.
-                selection_index = 0;
+                --uses[condition.id];
+                for (const auto use : definition->uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+                if (uses[condition.id] == 0) {
+                    for (const auto use : definition->uses) {
+                        if (use.kind == machine::RegisterKind::Virtual &&
+                            use.id < uses.size()) {
+                            --uses[use.id];
+                        }
+                    }
+                    block.instructions.erase(definition);
+                    // Erasing an earlier definition shifts the select.
+                    // Restart; each completed group strictly reduces this
+                    // block.
+                    selection_index = 0;
+                } else {
+                    ++selection_index;
+                }
             }
         }
     }
@@ -4645,6 +4711,84 @@ private:
                 }
                 schedule_region(block.instructions, begin, end, block.id);
                 begin = end;
+            }
+        }
+    }
+
+    void cluster_shared_compare_selects() {
+        if (!options_.if_conversion || options_.optimization_effort < 2 ||
+            options_.optimize_for != OptimizationGoal::Speed) {
+            return;
+        }
+        for (auto& block : current_.blocks) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (std::size_t later = 1; later < block.instructions.size();
+                     ++later) {
+                    const auto& last = block.instructions[later];
+                    if (last.opcode != Opcode::Select ||
+                        last.condition_predicate.empty()) {
+                        continue;
+                    }
+                    if (later < 2) continue;
+                    for (std::size_t earlier = later - 1; earlier-- > 0;) {
+                        const auto& first = block.instructions[earlier];
+                        if (!same_fused_select_condition(first, last) ||
+                            first.defs.size() != 1 ||
+                            first.defs.front().kind !=
+                                machine::RegisterKind::Virtual) {
+                            continue;
+                        }
+                        const auto result = first.defs.front();
+                        const bool safe = std::all_of(
+                            block.instructions.begin() +
+                                static_cast<std::ptrdiff_t>(earlier + 1),
+                            block.instructions.begin() +
+                                static_cast<std::ptrdiff_t>(later),
+                            [&](const machine::Instruction& instruction) {
+                                if (instruction.kind !=
+                                        machine::InstructionKind::Target ||
+                                    instruction.opcode == Opcode::Select ||
+                                    instruction.patch ||
+                                    instruction.has_side_effects ||
+                                    instruction.may_load ||
+                                    instruction.may_store ||
+                                    !instruction.clobbers.empty() ||
+                                    !instruction.live_across_call.empty()) {
+                                    return false;
+                                }
+                                const auto virtual_register =
+                                    [](machine::Register value) {
+                                        return value.kind ==
+                                               machine::RegisterKind::Virtual;
+                                    };
+                                return std::all_of(instruction.defs.begin(),
+                                                   instruction.defs.end(),
+                                                   virtual_register) &&
+                                       std::all_of(instruction.uses.begin(),
+                                                   instruction.uses.end(),
+                                                   virtual_register) &&
+                                       std::find(instruction.uses.begin(),
+                                                 instruction.uses.end(),
+                                                 result) ==
+                                           instruction.uses.end();
+                            });
+                        if (!safe) continue;
+
+                        auto selection = std::move(block.instructions[earlier]);
+                        block.instructions.erase(
+                            block.instructions.begin() +
+                            static_cast<std::ptrdiff_t>(earlier));
+                        block.instructions.insert(
+                            block.instructions.begin() +
+                                static_cast<std::ptrdiff_t>(later - 1),
+                            std::move(selection));
+                        changed = true;
+                        break;
+                    }
+                    if (changed) break;
+                }
             }
         }
     }
@@ -8106,6 +8250,9 @@ private:
             "schedule-across-blocks", &MachineLowerer::schedule_across_blocks);
         add(LoweringPass::ScheduleBlocks, Stage::Scheduling,
             "schedule-blocks", &MachineLowerer::schedule_blocks);
+        add(LoweringPass::ClusterSharedCompareSelects, Stage::Scheduling,
+            "cluster-shared-compare-selects",
+            &MachineLowerer::cluster_shared_compare_selects);
         add(LoweringPass::SelectRematerialization,
             Stage::RegisterAllocation, "select-rematerialization",
             &MachineLowerer::select_rematerialization);
@@ -17059,7 +17206,10 @@ private:
                 right_operand =
                     register_name(right_register, left.mode.bits);
             }
-            if (!test_predicate || !early_select_tests_.contains(&value)) {
+            const bool condition_ready =
+                shared_select_flags_.contains(&value) ||
+                (test_predicate && early_select_tests_.contains(&value));
+            if (!condition_ready) {
                 const auto left_operand =
                     register_name(left_register, comparison_bits);
                 instruction((test_predicate || signed_zero_test
@@ -20595,6 +20745,17 @@ private:
             }
         }
         early_select_tests_.clear();
+        shared_select_flags_.clear();
+        for (std::size_t index = 1; index < value.instructions.size();
+             ++index) {
+            if (same_fused_select_condition(value.instructions[index - 1],
+                                            value.instructions[index])) {
+                // MOV/MOVZX/CMOV and spill loads/stores emitted by the first
+                // select preserve EFLAGS, so an adjacent select with the
+                // same typed comparison can consume those flags directly.
+                shared_select_flags_.insert(&value.instructions[index]);
+            }
+        }
         std::vector<const machine::Instruction*> early_test_before(
             value.instructions.size());
         if (options_.optimization_effort >= 3 &&
@@ -21158,6 +21319,7 @@ private:
     std::unordered_set<const machine::Instruction*>
         fused_integer_add_outputs_;
     std::unordered_set<const machine::Instruction*> early_select_tests_;
+    std::unordered_set<const machine::Instruction*> shared_select_flags_;
     std::unordered_set<std::uint32_t> loop_headers_;
 };
 

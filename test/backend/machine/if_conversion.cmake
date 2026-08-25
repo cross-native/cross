@@ -80,6 +80,8 @@ foreach(symbol ifconv_compare ifconv_return ifconv_small)
 endforeach()
 extract_function("${selected_assembly}" ifconv_expensive selected_expensive)
 extract_function("${selected_assembly}" ifconv_sign_boundary selected_sign)
+extract_function("${selected_assembly}" ifconv_shared_condition
+                 selected_shared)
 if(NOT selected_sign MATCHES "testq" OR
    NOT selected_sign MATCHES "cmov(l|ge)q" OR
    selected_sign MATCHES "-9223372036854775808")
@@ -139,4 +141,18 @@ if(selected_ifconv_compare MATCHES "[\t ]set[a-z]+[\t ]" OR
     message(FATAL_ERROR
         "comparison select retained a redundant setcc\n"
         "${selected_ifconv_compare}\n${selected_ifconv_return}")
+endif()
+string(REGEX MATCHALL "[\t ]cmp[a-z]*[\t ]" shared_compares
+       "${selected_shared}")
+string(REGEX MATCHALL "[\t ]cmov[a-z]*[\t ]" shared_moves
+       "${selected_shared}")
+list(LENGTH shared_compares shared_compare_count)
+list(LENGTH shared_moves shared_move_count)
+if(NOT shared_compare_count EQUAL 1 OR NOT shared_move_count EQUAL 2 OR
+   selected_shared MATCHES "[\t ]set[a-z]+[\t ]" OR
+   selected_shared MATCHES "[\t ]test[a-z]*[\t ]" OR
+   selected_shared MATCHES "[\t ]j[a-z]+[\t ]")
+    message(FATAL_ERROR
+        "shared comparison did not feed two adjacent CMOVs\n"
+        "${selected_shared}")
 endif()

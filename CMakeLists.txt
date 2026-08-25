@@ -585,7 +585,7 @@ if(BUILD_TESTING)
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-if-conversion
                 -DENTRY=if_conversion_entry
-                -DEXPECTED=12
+                -DEXPECTED=14
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_runtime_native_loop_unrolling

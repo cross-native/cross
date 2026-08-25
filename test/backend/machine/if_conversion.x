@@ -47,6 +47,18 @@ global u64 ifconv_sign_boundary(in u64 value, in u64 truth,
     return value < 9223372036854775808u64 ? truth : falsity;
 }
 
+[[runtime_only, noinline, link_name("ifconv_shared_condition")]]
+global u64 ifconv_shared_condition(in u64 left, in u64 right,
+                                   in u64 first_truth,
+                                   in u64 first_falsity,
+                                   in u64 second_truth,
+                                   in u64 second_falsity) {
+    bool choose = left < right;
+    u64 first = choose ? first_truth : first_falsity;
+    u64 second = choose ? second_truth : second_falsity;
+    return first ^ second;
+}
+
 global i32 if_conversion_entry() {
     u64 odd = 5;
     u64 even = 4;
@@ -61,5 +73,7 @@ global i32 if_conversion_entry() {
            (ifconv_masked_load(&odd, 7) == 23) +
            (ifconv_masked_load(&even, 7) == 10) +
            (ifconv_sign_boundary(7, 11, 13) == 11) +
-           (ifconv_sign_boundary(9223372036854775808u64, 11, 13) == 13);
+           (ifconv_sign_boundary(9223372036854775808u64, 11, 13) == 13) +
+           (ifconv_shared_condition(1, 2, 10, 20, 5, 7) == 15) +
+           (ifconv_shared_condition(2, 1, 10, 20, 5, 7) == 19);
 }
