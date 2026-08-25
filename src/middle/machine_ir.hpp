@@ -136,13 +136,19 @@ struct Register {
     friend constexpr bool operator==(Register, Register) = default;
 };
 
-struct RegisterOperand { Register value; };
+struct RegisterOperand {
+    Register value;
+    friend bool operator==(const RegisterOperand&,
+                           const RegisterOperand&) = default;
+};
 
 struct ImmediateOperand {
     std::uint64_t value{};
     std::uint64_t high{};
     IntegerMode mode{};
     bool is_signed{};
+    friend bool operator==(const ImmediateOperand&,
+                           const ImmediateOperand&) = default;
 };
 
 // The target chooses the relocation spelling and code model.  The symbol name
@@ -152,14 +158,22 @@ struct SymbolOperand {
     std::int64_t addend{};
     bool is_function{};
     std::optional<hir::ObjectId> object;
+    friend bool operator==(const SymbolOperand&,
+                           const SymbolOperand&) = default;
 };
 
-struct BlockOperand { BlockId target; };
+struct BlockOperand {
+    BlockId target;
+    friend bool operator==(const BlockOperand&,
+                           const BlockOperand&) = default;
+};
 
 struct StackSlotOperand {
     StackSlotId slot;
     std::int32_t offset{};
     IntegerMode mode{};
+    friend bool operator==(const StackSlotOperand&,
+                           const StackSlotOperand&) = default;
 };
 
 using Operand = std::variant<RegisterOperand, ImmediateOperand, SymbolOperand,

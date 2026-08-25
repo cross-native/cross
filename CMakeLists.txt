@@ -94,6 +94,7 @@ add_library(cross_native_backend
     src/backend/native/data_emitter.cpp
     src/backend/native/machine_pass.cpp
     src/backend/native/machine_pipeline.cpp
+    src/backend/native/machine_transform.cpp
     src/backend/native/standalone_audit.cpp
     src/target/backend.cpp
     src/target/x86_64/backend.cpp
@@ -171,6 +172,12 @@ if(BUILD_TESTING)
     target_link_libraries(cross_machine_ir_test PRIVATE cross_middle)
     cross_component(cross_machine_ir_test)
 
+    add_executable(cross_machine_transform_test
+        test/backend/native/machine_transform_test.cpp)
+    target_link_libraries(cross_machine_transform_test
+        PRIVATE cross_native_backend)
+    cross_component(cross_machine_transform_test)
+
     add_executable(cross_abi_rules_test test/model/abi_rules_test.cpp)
     target_link_libraries(cross_abi_rules_test PRIVATE cross_native_backend)
     cross_component(cross_abi_rules_test)
@@ -185,6 +192,8 @@ if(BUILD_TESTING)
              COMMAND $<TARGET_FILE:cross_mir_analysis_test>)
     add_test(NAME cross_machine_ir
              COMMAND $<TARGET_FILE:cross_machine_ir_test>)
+    add_test(NAME cross_machine_transform
+             COMMAND $<TARGET_FILE:cross_machine_transform_test>)
     add_test(NAME cross_version COMMAND $<TARGET_FILE:cross_cc> --version)
     add_test(NAME cross_targets COMMAND $<TARGET_FILE:cross_cc> --print-targets)
     add_test(NAME cross_abis COMMAND $<TARGET_FILE:cross_cc> --print-abis)

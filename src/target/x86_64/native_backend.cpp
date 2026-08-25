@@ -3,6 +3,7 @@
 
 #include "target/x86_64/native_backend.hpp"
 #include "backend/native/machine_pass.hpp"
+#include "backend/native/machine_transform.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
 #include "target/x86_64/features.hpp"
@@ -1749,89 +1750,26 @@ private:
 
     void propagate_machine_copies() {
         if (!options_.cprop_registers) return;
-        std::unordered_map<std::uint32_t, machine::Register> replacements;
-        std::unordered_set<std::uint32_t> removed;
-        const auto resolve = [&](machine::Register value) {
-            std::unordered_set<std::uint32_t> seen;
-            while (value.kind == machine::RegisterKind::Virtual &&
-                   seen.insert(value.id).second) {
-                const auto found = replacements.find(value.id);
-                if (found == replacements.end()) break;
-                value = found->second;
+        const auto is_copy = [](const machine::Instruction& instruction) {
+            if (instruction.opcode == Opcode::Expect ||
+                instruction.opcode == Opcode::Reinterpret ||
+                instruction.opcode == Opcode::Freinterpret) {
+                return true;
             }
-            return value;
+            if (instruction.opcode != Opcode::Vcast) return false;
+            std::vector<const machine::ImmediateOperand*> shapes;
+            for (const auto& operand : instruction.operands) {
+                if (const auto* shape =
+                        std::get_if<machine::ImmediateOperand>(&operand)) {
+                    shapes.push_back(shape);
+                }
+            }
+            return shapes.size() == 2 &&
+                   shapes[0]->value == shapes[1]->value &&
+                   shapes[0]->high == shapes[1]->high &&
+                   shapes[0]->is_signed == shapes[1]->is_signed;
         };
-        for (const auto& block : current_.blocks) {
-            for (const auto& instruction : block.instructions) {
-                if (instruction.kind != machine::InstructionKind::Target ||
-                    instruction.defs.size() != 1 ||
-                    instruction.uses.size() != 1 ||
-                    instruction.patch || instruction.has_side_effects) {
-                    continue;
-                }
-                bool representation_vector_cast = false;
-                if (instruction.opcode == Opcode::Vcast) {
-                    std::vector<const machine::ImmediateOperand*> shapes;
-                    for (const auto& operand : instruction.operands) {
-                        if (const auto* shape =
-                                std::get_if<machine::ImmediateOperand>(
-                                    &operand)) {
-                            shapes.push_back(shape);
-                        }
-                    }
-                    representation_vector_cast =
-                        shapes.size() == 2 &&
-                        shapes[0]->value == shapes[1]->value &&
-                        shapes[0]->high == shapes[1]->high &&
-                        shapes[0]->is_signed == shapes[1]->is_signed;
-                }
-                const bool copy = instruction.opcode == Opcode::Expect ||
-                                  instruction.opcode == Opcode::Reinterpret ||
-                                  instruction.opcode == Opcode::Freinterpret ||
-                                  representation_vector_cast;
-                if (!copy) continue;
-                const auto target = instruction.defs.front();
-                const auto source = resolve(instruction.uses.front());
-                if (target.kind != machine::RegisterKind::Virtual ||
-                    source.kind != machine::RegisterKind::Virtual ||
-                    target.mode != source.mode ||
-                    target.id >= current_.virtual_register_classes.size() ||
-                    source.id >= current_.virtual_register_classes.size() ||
-                    current_.virtual_register_classes[target.id] !=
-                        current_.virtual_register_classes[source.id]) {
-                    continue;
-                }
-                replacements[target.id] = source;
-                removed.insert(target.id);
-            }
-        }
-        if (removed.empty()) return;
-        for (auto& block : current_.blocks) {
-            for (auto& instruction : block.instructions) {
-                for (auto& use : instruction.uses) use = resolve(use);
-                for (auto& operand : instruction.operands) {
-                    if (auto* reg =
-                            std::get_if<machine::RegisterOperand>(&operand)) {
-                        reg->value = resolve(reg->value);
-                    }
-                }
-            }
-            std::erase_if(
-                block.instructions,
-                [&](const machine::Instruction& instruction) {
-                    return instruction.kind ==
-                               machine::InstructionKind::Target &&
-                           instruction.defs.size() == 1 &&
-                           instruction.defs.front().kind ==
-                               machine::RegisterKind::Virtual &&
-                           removed.contains(
-                               instruction.defs.front().id) &&
-                           (instruction.opcode == Opcode::Expect ||
-                            instruction.opcode == Opcode::Reinterpret ||
-                            instruction.opcode == Opcode::Freinterpret ||
-                            instruction.opcode == Opcode::Vcast);
-                });
-        }
+        (void)native::propagate_virtual_register_copies(current_, is_copy);
     }
 
     void fold_splat_constants() {
@@ -2420,75 +2358,29 @@ private:
 
     void eliminate_dead_machine_values() {
         if (!options_.tree_dce) return;
-        const auto count = current_.virtual_registers.size();
         const unsigned native_vector_bits =
             subtarget_.has_feature(Feature::Avx512f) ? 512U :
             subtarget_.has_feature(Feature::Avx2) ? 256U : 128U;
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            std::vector<unsigned> uses(count);
-            for (const auto& block : current_.blocks) {
-                for (const auto& instruction : block.instructions) {
-                    for (const auto& use : instruction.uses) {
-                        if (use.kind == machine::RegisterKind::Virtual &&
-                            use.id < count) {
-                            ++uses[use.id];
-                        }
-                    }
+        // Values wider than an allocatable register still use implicit
+        // chunked homes in the x86 emitter. Keep that target limitation out
+        // of the common liveness algorithm as an explicit policy predicate.
+        const auto implicitly_observable =
+            [&](const machine::Register& definition) {
+                if (definition.kind != machine::RegisterKind::Virtual ||
+                    definition.id >=
+                        current_.virtual_register_classes.size()) {
+                    return false;
                 }
-            }
-            for (auto& block : current_.blocks) {
-                const auto before = block.instructions.size();
-                std::erase_if(
-                    block.instructions,
-                    [&](const machine::Instruction& instruction) {
-                        if (instruction.kind !=
-                                machine::InstructionKind::Target ||
-                            instruction.may_load || instruction.may_store ||
-                            instruction.has_side_effects || instruction.patch ||
-                            instruction.defs.empty()) {
-                            return false;
-                        }
-                        // Values that the allocator cannot keep in a physical
-                        // register are materialized through their stack homes.
-                        // Some wide-vector instructions update those homes in
-                        // chunks, so the emitter has storage dependencies that
-                        // are intentionally not represented as SSA uses.  Keep
-                        // such definitions until wide values have an explicit
-                        // chunked machine representation.
-                        for (const auto definition : instruction.defs) {
-                            if (definition.kind !=
-                                    machine::RegisterKind::Virtual ||
-                                definition.id >=
-                                    current_.virtual_register_classes.size()) {
-                                continue;
-                            }
-                            const auto value_class =
-                                current_.virtual_register_classes[
-                                    definition.id];
-                            if (value_class ==
-                                    machine::VirtualRegisterClass::Memory ||
-                                (value_class ==
-                                     machine::VirtualRegisterClass::Vector &&
-                                 definition.mode.bits >
-                                     native_vector_bits)) {
-                                return false;
-                            }
-                        }
-                        return std::all_of(
-                            instruction.defs.begin(),
-                            instruction.defs.end(),
-                            [&](machine::Register definition) {
-                                return definition.kind ==
-                                           machine::RegisterKind::Virtual &&
-                                       definition.id < uses.size() &&
-                                       uses[definition.id] == 0;
-                            });
-                    });
-                changed = changed || block.instructions.size() != before;
-            }
-        }
+                const auto value_class =
+                    current_.virtual_register_classes[definition.id];
+                return value_class ==
+                           machine::VirtualRegisterClass::Memory ||
+                       (value_class ==
+                            machine::VirtualRegisterClass::Vector &&
+                        definition.mode.bits > native_vector_bits);
+            };
+        (void)native::eliminate_dead_definitions(
+            current_, implicitly_observable);
     }
 
     void select_rematerialization() {
@@ -3146,103 +3038,26 @@ private:
     void eliminate_redundant_machine_expressions() {
         if (!options_.tree_fre) return;
         const auto eligible = [](const machine::Instruction& instruction) {
-            return (instruction.opcode == Opcode::AddImm ||
-                    instruction.opcode == Opcode::SubImm ||
-                    instruction.opcode == Opcode::AndImm ||
-                    instruction.opcode == Opcode::OrImm ||
-                    instruction.opcode == Opcode::XorImm ||
-                    instruction.opcode == Opcode::ShlImm ||
-                    instruction.opcode == Opcode::ShrSImm ||
-                    instruction.opcode == Opcode::ShrUImm) &&
-                instruction.kind == machine::InstructionKind::Target &&
-                instruction.uses.size() == 1 &&
-                instruction.defs.size() == 1 &&
-                instruction.operands.size() >= 2 && !instruction.patch &&
-                !instruction.has_side_effects && !instruction.may_load &&
-                !instruction.may_store;
+            const auto opcode = instruction.opcode;
+            return instruction.uses.size() == 1 &&
+                   instruction.operands.size() >= 2 &&
+                   std::holds_alternative<machine::ImmediateOperand>(
+                       instruction.operands[1]) &&
+                   (opcode == Opcode::AddImm ||
+                    opcode == Opcode::SubImm ||
+                    opcode == Opcode::AndImm ||
+                    opcode == Opcode::OrImm ||
+                    opcode == Opcode::XorImm ||
+                    opcode == Opcode::ShlImm ||
+                    opcode == Opcode::ShrSImm ||
+                    opcode == Opcode::ShrUImm);
         };
-        const auto same_immediate = [](const machine::ImmediateOperand& left,
-                                       const machine::ImmediateOperand& right) {
-            return left.value == right.value && left.high == right.high &&
-                left.mode == right.mode &&
-                left.is_signed == right.is_signed;
-        };
-        std::unordered_map<std::uint32_t, machine::Register> replacements;
-        std::unordered_set<std::uint32_t> removed;
-        for (const auto& block : current_.blocks) {
-            std::vector<const machine::Instruction*> available;
-            for (const auto& instruction : block.instructions) {
-                if (!eligible(instruction)) continue;
-                const auto* immediate =
-                    std::get_if<machine::ImmediateOperand>(
-                        &instruction.operands[1]);
-                if (!immediate) continue;
-                const auto duplicate = std::find_if(
-                    available.begin(), available.end(),
-                    [&](const machine::Instruction* candidate) {
-                        const auto* prior =
-                            std::get_if<machine::ImmediateOperand>(
-                                &candidate->operands[1]);
-                        return prior &&
-                            candidate->opcode == instruction.opcode &&
-                            candidate->uses.front() ==
-                                instruction.uses.front() &&
-                            candidate->defs.front().mode ==
-                                instruction.defs.front().mode &&
-                            same_immediate(*prior, *immediate);
-                    });
-                if (duplicate != available.end()) {
-                    replacements[instruction.defs.front().id] =
-                        (*duplicate)->defs.front();
-                    removed.insert(instruction.defs.front().id);
-                } else {
-                    available.push_back(&instruction);
-                }
-            }
-        }
-        if (removed.empty()) return;
-        const auto resolve = [&](machine::Register value) {
-            std::unordered_set<std::uint32_t> seen;
-            while (value.kind == machine::RegisterKind::Virtual &&
-                   seen.insert(value.id).second) {
-                const auto found = replacements.find(value.id);
-                if (found == replacements.end()) break;
-                value = found->second;
-            }
-            return value;
-        };
-        for (auto& block : current_.blocks) {
-            for (auto& instruction : block.instructions) {
-                for (auto& use : instruction.uses) use = resolve(use);
-                for (auto& operand : instruction.operands) {
-                    if (auto* reg =
-                            std::get_if<machine::RegisterOperand>(&operand)) {
-                        reg->value = resolve(reg->value);
-                    }
-                }
-            }
-            std::erase_if(
-                block.instructions,
-                [&](const machine::Instruction& instruction) {
-                    return eligible(instruction) &&
-                        instruction.defs.front().kind ==
-                            machine::RegisterKind::Virtual &&
-                        removed.contains(instruction.defs.front().id);
-                });
-        }
+        (void)native::eliminate_redundant_expressions(current_, eligible);
     }
 
     void eliminate_redundant_machine_loads() {
         if (!options_.tree_fre) return;
         const auto eligible = [](const machine::Instruction& instruction) {
-            if (instruction.kind != machine::InstructionKind::Target ||
-                !instruction.may_load || instruction.may_store ||
-                instruction.has_side_effects || instruction.patch ||
-                instruction.defs.size() != 1 ||
-                instruction.defs.front().kind !=
-                    machine::RegisterKind::Virtual) {
-                return false;
-            }
             const auto& opcode = instruction.opcode;
             return opcode == Opcode::Load || opcode == Opcode::Fload ||
                 opcode == Opcode::Vload ||
@@ -3256,106 +3071,7 @@ private:
                 opcode == Opcode::FglobalLoad ||
                 opcode == Opcode::VglobalLoad;
         };
-        const auto same_operand = [](const machine::Operand& left,
-                                     const machine::Operand& right) {
-            if (left.index() != right.index()) return false;
-            if (const auto* value =
-                    std::get_if<machine::RegisterOperand>(&left)) {
-                return value->value ==
-                    std::get<machine::RegisterOperand>(right).value;
-            }
-            if (const auto* value =
-                    std::get_if<machine::ImmediateOperand>(&left)) {
-                const auto& other =
-                    std::get<machine::ImmediateOperand>(right);
-                return value->value == other.value &&
-                    value->high == other.high &&
-                    value->mode == other.mode &&
-                    value->is_signed == other.is_signed;
-            }
-            if (const auto* value =
-                    std::get_if<machine::SymbolOperand>(&left)) {
-                const auto& other =
-                    std::get<machine::SymbolOperand>(right);
-                return value->name == other.name &&
-                    value->addend == other.addend &&
-                    value->is_function == other.is_function &&
-                    value->object == other.object;
-            }
-            if (const auto* value =
-                    std::get_if<machine::BlockOperand>(&left)) {
-                return value->target ==
-                    std::get<machine::BlockOperand>(right).target;
-            }
-            const auto& value = std::get<machine::StackSlotOperand>(left);
-            const auto& other =
-                std::get<machine::StackSlotOperand>(right);
-            return value.slot == other.slot && value.offset == other.offset &&
-                value.mode == other.mode;
-        };
-        const auto same_load = [&](const machine::Instruction& left,
-                                   const machine::Instruction& right) {
-            return left.opcode == right.opcode &&
-                left.defs.front().mode == right.defs.front().mode &&
-                left.uses == right.uses &&
-                left.operands.size() == right.operands.size() &&
-                std::equal(left.operands.begin(), left.operands.end(),
-                           right.operands.begin(), same_operand);
-        };
-
-        std::unordered_map<std::uint32_t, machine::Register> replacements;
-        std::unordered_set<std::uint32_t> removed;
-        for (const auto& block : current_.blocks) {
-            std::vector<const machine::Instruction*> available;
-            for (const auto& instruction : block.instructions) {
-                if (instruction.kind != machine::InstructionKind::Target ||
-                    instruction.may_store || instruction.has_side_effects ||
-                    instruction.patch) {
-                    available.clear();
-                }
-                if (!eligible(instruction)) continue;
-                const auto duplicate = std::find_if(
-                    available.begin(), available.end(),
-                    [&](const machine::Instruction* candidate) {
-                        return same_load(*candidate, instruction);
-                    });
-                if (duplicate == available.end()) {
-                    available.push_back(&instruction);
-                    continue;
-                }
-                replacements[instruction.defs.front().id] =
-                    (*duplicate)->defs.front();
-                removed.insert(instruction.defs.front().id);
-            }
-        }
-        if (removed.empty()) return;
-        const auto resolve = [&](machine::Register value) {
-            std::unordered_set<std::uint32_t> seen;
-            while (value.kind == machine::RegisterKind::Virtual &&
-                   seen.insert(value.id).second) {
-                const auto found = replacements.find(value.id);
-                if (found == replacements.end()) break;
-                value = found->second;
-            }
-            return value;
-        };
-        for (auto& block : current_.blocks) {
-            for (auto& instruction : block.instructions) {
-                for (auto& use : instruction.uses) use = resolve(use);
-                for (auto& operand : instruction.operands) {
-                    if (auto* reg =
-                            std::get_if<machine::RegisterOperand>(&operand)) {
-                        reg->value = resolve(reg->value);
-                    }
-                }
-            }
-            std::erase_if(
-                block.instructions,
-                [&](const machine::Instruction& instruction) {
-                    return eligible(instruction) &&
-                        removed.contains(instruction.defs.front().id);
-                });
-        }
+        (void)native::eliminate_redundant_loads(current_, eligible);
     }
 
     void fuse_scalar_division_results() {
