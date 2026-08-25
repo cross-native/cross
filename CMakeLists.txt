@@ -78,6 +78,7 @@ add_library(cross_middle
     src/middle/mir.cpp
     src/middle/mir_analysis.cpp
     src/middle/mir_pass.cpp
+    src/middle/mir_transform.cpp
 )
 target_link_libraries(cross_middle PUBLIC cross_frontend cross_targets)
 cross_component(cross_middle)

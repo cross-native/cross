@@ -7,6 +7,7 @@
 #include "middle/data_ir.hpp"
 #include "middle/mir_analysis.hpp"
 #include "middle/mir_pass.hpp"
+#include "middle/mir_transform.hpp"
 #include "target/subtarget.hpp"
 #include <algorithm>
 #include <bit>
@@ -6924,6 +6925,8 @@ void simplify_integer_operations(ManagedFunction& function,
         case BinaryOperation::ShiftLeft:
         case BinaryOperation::ShiftRightArithmetic:
         case BinaryOperation::ShiftRightLogical:
+        case BinaryOperation::RotateLeft:
+        case BinaryOperation::RotateRight:
             if (constant_integer(right, {})) replacement = left_id;
             break;
         case BinaryOperation::NotEqual:
@@ -7473,7 +7476,9 @@ unsigned if_conversion_cost(const ManagedValue& value,
         if (value.binary == BinaryOperation::Multiply) return 3U;
         if (value.binary == BinaryOperation::ShiftLeft ||
             value.binary == BinaryOperation::ShiftRightArithmetic ||
-            value.binary == BinaryOperation::ShiftRightLogical) {
+            value.binary == BinaryOperation::ShiftRightLogical ||
+            value.binary == BinaryOperation::RotateLeft ||
+            value.binary == BinaryOperation::RotateRight) {
             return 2U;
         }
         return 1U;
@@ -11159,6 +11164,28 @@ bool fold_integer_constants(ManagedFunction& function,
                     left_value,
                     static_cast<unsigned>(right_value.low % bits));
                 break;
+            case BinaryOperation::RotateLeft: {
+                const auto amount =
+                    static_cast<unsigned>(right_value.low % bits);
+                folded = amount == 0
+                    ? mask_to(left_value, bits)
+                    : mask_to(
+                          bit_or(shift_left(left_value, amount),
+                                 shift_right(left_value, bits - amount)),
+                          bits);
+                break;
+            }
+            case BinaryOperation::RotateRight: {
+                const auto amount =
+                    static_cast<unsigned>(right_value.low % bits);
+                folded = amount == 0
+                    ? mask_to(left_value, bits)
+                    : mask_to(
+                          bit_or(shift_right(left_value, amount),
+                                 shift_left(left_value, bits - amount)),
+                          bits);
+                break;
+            }
             case BinaryOperation::Equal:
                 folded = left_value == right_value ? 1 : 0;
                 break;
@@ -11190,6 +11217,10 @@ bool fold_integer_constants(ManagedFunction& function,
 }
 
 } // namespace
+
+void prune_unreachable_blocks(ManagedFunction& function) {
+    eliminate_unreachable_blocks(function);
+}
 
 void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
@@ -11295,6 +11326,18 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             [](ManagedFunction& function, FunctionAnalysisManager&) {
                 factor_common_select_addends(function);
                 return PassResult::changed_values();
+            });
+    }
+    // Preserve complete diamonds until if-conversion has had the opportunity
+    // to form semantic selects. Forwarding one empty arm first would turn a
+    // diamond into a triangle and hide the target-independent conversion.
+    if (options.optimization_effort != 0) {
+        pipeline.add(
+            PassId::ForwardingBlockElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                return eliminate_forwarding_blocks(function)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
             });
     }
     if (options.tree_fre) {
@@ -11404,6 +11447,19 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
+    // Keep shift/or forms visible to loop and SLP vectorization. Scalar
+    // survivors become target-independent rotates only after those passes,
+    // and -fpeephole2 remains independent from -ftree-ccp.
+    if (options.peephole2) {
+        pipeline.add(
+            PassId::BitwiseCanonicalization,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager&) {
+                return canonicalize_bitwise_operations(function, hir_module)
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
+    }
     // Simplification and loop transforms can expose equivalent recurrences
     // after the first induction pass. Canonicalize them while SSA IDs are
     // still sparse; final DCE performs the safe global compaction.
@@ -11428,6 +11484,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 simplify_floating_math(function, hir_module, options);
                 return PassResult::changed_values();
+            });
+    }
+    if (options.optimization_effort != 0) {
+        pipeline.add(
+            PassId::ForwardingBlockElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                return eliminate_forwarding_blocks(function)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
             });
     }
     if (options.tree_dce) {

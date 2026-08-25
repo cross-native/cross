@@ -148,6 +148,8 @@ bool has_precise_straight_line_scalar_clobbers(
             case mir::BinaryOperation::ShiftLeft:
             case mir::BinaryOperation::ShiftRightArithmetic:
             case mir::BinaryOperation::ShiftRightLogical:
+            case mir::BinaryOperation::RotateLeft:
+            case mir::BinaryOperation::RotateRight:
             case mir::BinaryOperation::Equal:
             case mir::BinaryOperation::NotEqual:
             case mir::BinaryOperation::SignedLess:

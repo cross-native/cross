@@ -36,6 +36,10 @@ foreach(mode gimple rtl)
     if(NOT text MATCHES "cross_gimple_signed_v")
         message(FATAL_ERROR "signed vector operation domain was not emitted")
     endif()
+    if(NOT text MATCHES "cross_gimple_rotl_[0-9]+" OR
+       NOT text MATCHES "gimple_bridge_rotate")
+        message(FATAL_ERROR "MIR rotate helper was not emitted")
+    endif()
     execute_process(
         COMMAND "${GCC}" -c -O3 -fgimple -march=x86-64-v3
                 -ffreestanding -fno-builtin -fno-stack-protector

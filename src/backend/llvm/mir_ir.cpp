@@ -129,6 +129,8 @@ std::string binary_name(mir::BinaryOperation operation) {
     case BinaryOperation::ShiftLeft: return "shl";
     case BinaryOperation::ShiftRightArithmetic: return "ashr";
     case BinaryOperation::ShiftRightLogical: return "lshr";
+    case BinaryOperation::RotateLeft: return "fshl";
+    case BinaryOperation::RotateRight: return "fshr";
     case BinaryOperation::Equal: return "eq";
     case BinaryOperation::NotEqual: return "ne";
     case BinaryOperation::SignedLess: return "slt";
@@ -1214,6 +1216,18 @@ private:
         const auto right = value.operands[1];
         const auto operand_type_id = function_.values[left.value].type;
         const auto operand_type = ir_type(hir_, operand_type_id);
+        if (value.binary == mir::BinaryOperation::RotateLeft ||
+            value.binary == mir::BinaryOperation::RotateRight) {
+            const auto intrinsic =
+                value.binary == mir::BinaryOperation::RotateLeft
+                    ? "llvm.fshl." : "llvm.fshr.";
+            out_ << "  " << result << " = call " << operand_type << " @"
+                 << intrinsic << operand_type << '(' << operand_type << ' '
+                 << reference(left) << ", " << operand_type << ' '
+                 << reference(left) << ", " << operand_type << ' '
+                 << reference(right) << ")\n";
+            return;
+        }
         if (comparison(value.binary)) {
             const auto predicate = "%mir.p" + std::to_string(value.id.value);
             if (is_floating(hir_, operand_type_id)) {

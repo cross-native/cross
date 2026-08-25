@@ -26,6 +26,10 @@ global i32 mir_wide_rank(in u32 unsigned_value, in i64 signed_value) {
     return signed_value < unsigned_value;
 }
 
+global u64 mir_rotate(in u64 value, in u64 count) {
+    return (value << count) | (value >> (64u64 - count));
+}
+
 global i32 mir_effect_loop(in i32 limit) {
     i32 total = 0;
     for (i32 index = 0; index < limit; ++index) {

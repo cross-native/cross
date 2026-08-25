@@ -59,6 +59,42 @@ if(assembly MATCHES "(__divti3|__udivti3|memcpy|memset)")
 endif()
 
 execute_process(
+    COMMAND "${CC}" "-mabi=${HOST_ABI}" -S -O2 -fno-peephole2
+            "${SOURCE}" -o "${OUTPUT}.no-peephole.s"
+    RESULT_VARIABLE no_peephole_status
+    OUTPUT_VARIABLE no_peephole_stdout
+    ERROR_VARIABLE no_peephole_stderr
+)
+if(NOT no_peephole_status EQUAL 0)
+    message(FATAL_ERROR
+        "native no-peephole assembly emission failed\n"
+        "${no_peephole_stdout}\n${no_peephole_stderr}")
+endif()
+file(READ "${OUTPUT}.no-peephole.s" no_peephole_assembly)
+if(no_peephole_assembly MATCHES "[\t ]rolq[\t ]")
+    message(FATAL_ERROR
+        "-fno-peephole2 did not disable MIR rotate recognition")
+endif()
+
+execute_process(
+    COMMAND "${CC}" "-mabi=${HOST_ABI}" -S -O2 -fno-tree-ccp
+            "${SOURCE}" -o "${OUTPUT}.no-tree-ccp.s"
+    RESULT_VARIABLE no_tree_ccp_status
+    OUTPUT_VARIABLE no_tree_ccp_stdout
+    ERROR_VARIABLE no_tree_ccp_stderr
+)
+if(NOT no_tree_ccp_status EQUAL 0)
+    message(FATAL_ERROR
+        "native no-tree-ccp assembly emission failed\n"
+        "${no_tree_ccp_stdout}\n${no_tree_ccp_stderr}")
+endif()
+file(READ "${OUTPUT}.no-tree-ccp.s" no_tree_ccp_assembly)
+if(NOT no_tree_ccp_assembly MATCHES "[\t ]rolq[\t ]")
+    message(FATAL_ERROR
+        "-fpeephole2 was incorrectly coupled to -ftree-ccp")
+endif()
+
+execute_process(
     COMMAND "${CC}" "-mabi=${HOST_ABI}" -c -O2
             "${SOURCE}" -o "${OUTPUT}.o"
     RESULT_VARIABLE object_status

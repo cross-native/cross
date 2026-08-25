@@ -98,6 +98,8 @@ std::string binary_operator(mir::BinaryOperation operation) {
     case BinaryOperation::ShiftLeft: return "<<";
     case BinaryOperation::ShiftRightArithmetic:
     case BinaryOperation::ShiftRightLogical: return ">>";
+    case BinaryOperation::RotateLeft:
+    case BinaryOperation::RotateRight: return "|";
     case BinaryOperation::Equal: return "==";
     case BinaryOperation::NotEqual: return "!=";
     case BinaryOperation::SignedLess:
@@ -1090,6 +1092,15 @@ private:
             const auto left = value.operands.at(0);
             const auto right = value.operands.at(1);
             const auto operand_type = function_.values.at(left.value).type;
+            if (value.binary == mir::BinaryOperation::RotateLeft ||
+                value.binary == mir::BinaryOperation::RotateRight) {
+                out_ << "  " << reference(value.id) << " = cross_gimple_"
+                     << (value.binary == mir::BinaryOperation::RotateLeft
+                             ? "rotl_" : "rotr_")
+                     << operand_type.value << " (" << reference(left)
+                     << ", " << reference(right) << ");\n";
+                return;
+            }
             const auto& integer_temporary =
                 integer_temporaries_.at(value.id.value);
             if (integer_temporary) {
@@ -1286,6 +1297,7 @@ public:
         out << "/* Cross language 0.8: experimental GCC __GIMPLE bridge.\n"
                "   Compile this file with GCC -fgimple. */\n\n";
         types_.emit(out);
+        emit_rotate_helpers(out);
         emit_floating_division_helpers(out);
         emit_function_declarations(out);
         emit_object_declarations(out);
@@ -1314,6 +1326,65 @@ public:
     }
 
 private:
+    void emit_rotate_helpers(std::ostringstream& out) const {
+        struct UsedType {
+            hir::TypeId type;
+            bool left{};
+            bool right{};
+        };
+        std::vector<UsedType> used;
+        for (const auto& function : managed_.functions) {
+            for (const auto& value : function.values) {
+                if (value.kind != mir::ValueKind::Binary ||
+                    (value.binary != mir::BinaryOperation::RotateLeft &&
+                     value.binary != mir::BinaryOperation::RotateRight) ||
+                    value.operands.empty()) {
+                    continue;
+                }
+                const auto type =
+                    function.values.at(value.operands.front().value).type;
+                auto found = std::find_if(
+                    used.begin(), used.end(), [&](const UsedType& candidate) {
+                        return candidate.type == type;
+                    });
+                if (found == used.end()) {
+                    used.push_back({type});
+                    found = used.end() - 1;
+                }
+                if (value.binary == mir::BinaryOperation::RotateLeft) {
+                    found->left = true;
+                } else {
+                    found->right = true;
+                }
+            }
+        }
+        std::sort(used.begin(), used.end(),
+                  [](const UsedType& left, const UsedType& right) {
+                      return left.type.value < right.type.value;
+                  });
+        for (const auto& entry : used) {
+            const auto type = types_.name(entry.type);
+            const auto domain = types_.integer_domain_name(
+                entry.type, IntegerDomain::Unsigned);
+            const auto bits = types_.bits(entry.type);
+            const auto emit = [&](std::string_view name, bool left) {
+                out << "static __attribute__((always_inline, artificial)) "
+                       "inline "
+                    << type << " cross_gimple_" << name << '_'
+                    << entry.type.value << '(' << type << " value, " << type
+                    << " amount) { " << domain << " bits_value = ("
+                    << domain << ") value; " << domain << " count = ("
+                    << domain << ") amount & " << (bits - 1U) << "; return ("
+                    << type << ") ((bits_value " << (left ? "<<" : ">>")
+                    << " count) | (bits_value " << (left ? ">>" : "<<")
+                    << " ((0 - count) & " << (bits - 1U) << "))); }\n";
+            };
+            if (entry.left) emit("rotl", true);
+            if (entry.right) emit("rotr", false);
+        }
+        if (!used.empty()) out << '\n';
+    }
+
     void emit_floating_division_helpers(std::ostringstream& out) const {
         std::vector<hir::TypeId> types;
         for (const auto& function : managed_.functions) {

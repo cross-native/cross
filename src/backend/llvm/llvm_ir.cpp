@@ -355,6 +355,8 @@ private:
 
     void emit_intrinsic_declarations(std::ostringstream& module) const {
         std::vector<std::string> expect_types;
+        std::vector<std::string> rotate_left_types;
+        std::vector<std::string> rotate_right_types;
         bool trap = false;
         bool va_start = false;
         bool dynamic_stack = false;
@@ -367,6 +369,18 @@ private:
                     value.kind == mir::ValueKind::DynamicAlloca ||
                     value.kind == mir::ValueKind::DynamicStackRestore) {
                     dynamic_stack = true;
+                }
+                if (value.kind == mir::ValueKind::Binary &&
+                    (value.binary == mir::BinaryOperation::RotateLeft ||
+                     value.binary == mir::BinaryOperation::RotateRight)) {
+                    auto& types =
+                        value.binary == mir::BinaryOperation::RotateLeft
+                            ? rotate_left_types : rotate_right_types;
+                    const auto type = ir_type(value.type);
+                    if (std::find(types.begin(), types.end(), type) ==
+                        types.end()) {
+                        types.push_back(type);
+                    }
                 }
                 if (value.kind != mir::ValueKind::Intrinsic ||
                     value.intrinsic != mir::IntrinsicOperation::Expect) {
@@ -386,9 +400,19 @@ private:
                                });
         }
         std::sort(expect_types.begin(), expect_types.end());
+        std::sort(rotate_left_types.begin(), rotate_left_types.end());
+        std::sort(rotate_right_types.begin(), rotate_right_types.end());
         for (const auto& type : expect_types) {
             module << "declare " << type << " @llvm.expect." << type << '('
                    << type << ", " << type << ")\n";
+        }
+        for (const auto& type : rotate_left_types) {
+            module << "declare " << type << " @llvm.fshl." << type << '('
+                   << type << ", " << type << ", " << type << ")\n";
+        }
+        for (const auto& type : rotate_right_types) {
+            module << "declare " << type << " @llvm.fshr." << type << '('
+                   << type << ", " << type << ", " << type << ")\n";
         }
         if (trap) module << "declare void @llvm.trap()\n";
         if (va_start) module << "declare void @llvm.va_start(ptr)\n";
@@ -396,7 +420,9 @@ private:
             module << "declare ptr @llvm.stacksave.p0()\n"
                       "declare void @llvm.stackrestore.p0(ptr)\n";
         }
-        if (!expect_types.empty() || trap || va_start || dynamic_stack) {
+        if (!expect_types.empty() || !rotate_left_types.empty() ||
+            !rotate_right_types.empty() || trap || va_start ||
+            dynamic_stack) {
             module << '\n';
         }
     }

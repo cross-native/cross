@@ -13,6 +13,7 @@
 extern CROSS_MS_ABI uint64_t gimple_bridge_sum(const uint64_t *, size_t);
 extern CROSS_MS_ABI double gimple_bridge_divide(double, double);
 extern CROSS_MS_ABI uint64_t gimple_bridge_select(const uint64_t *, size_t);
+extern CROSS_MS_ABI uint64_t gimple_bridge_rotate(uint64_t, uint64_t);
 
 static uint64_t reference_select(const uint64_t *values, size_t count) {
     uint64_t total = 0;
@@ -40,5 +41,11 @@ int main(void) {
         reference_select(values, count)) {
         return 3;
     }
+    const uint64_t rotate_value = UINT64_C(0x0123456789abcdef);
+    const unsigned rotate_count = 13;
+    const uint64_t rotated =
+        (rotate_value << rotate_count) |
+        (rotate_value >> (64 - rotate_count));
+    if (gimple_bridge_rotate(rotate_value, rotate_count) != rotated) return 4;
     return 0;
 }

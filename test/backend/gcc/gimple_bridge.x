@@ -32,3 +32,8 @@ global u64 gimple_bridge_select(in const u64 *values, in uptr count) {
     }
     return total;
 }
+
+[[abi("ms_abi"), link_name("gimple_bridge_rotate"), noinline]]
+global u64 gimple_bridge_rotate(in u64 value, in u64 count) {
+    return (value << count) | (value >> (64u64 - count));
+}

@@ -37,19 +37,16 @@ enum class LoweringPass : std::uint16_t {
     RecognizeVectorByteSwaps,
     HoistVectorByteSwapMasks,
     FuseVectorReductions,
-    RecognizeScalarRotatesEarly,
     SelectBinaryImmediates,
     CombineMachineImmediates,
     EliminateRedundantExpressions,
     EliminateRedundantLoadsEarly,
     FuseScalarDivisionResults,
-    RecognizeScalarRotatesLate,
     PropagateCopiesLate,
     FuseCompareSelects,
     FuseVectorSignSelects,
     FuseCompareBranches,
     FormDenseJumpTables,
-    ThreadForwardingBlocksEarly,
     FoldIndexedAddresses,
     EliminateRedundantLoadsLate,
     FoldScalarMemoryOperands,
@@ -58,7 +55,6 @@ enum class LoweringPass : std::uint16_t {
     EliminateDeadValues,
     ScheduleBlockLayout,
     ScheduleAcrossBlocks,
-    ThreadForwardingBlocksLate,
     ScheduleBlocks,
     SelectRematerialization,
     AllocateRegisters,
@@ -396,6 +392,8 @@ machine::TargetOpcodeId binary_opcode(mir::BinaryOperation operation) {
     case BinaryOperation::ShiftLeft: return Opcode::Shl;
     case BinaryOperation::ShiftRightArithmetic: return Opcode::ShrS;
     case BinaryOperation::ShiftRightLogical: return Opcode::ShrU;
+    case BinaryOperation::RotateLeft: return Opcode::Rotl;
+    case BinaryOperation::RotateRight: return Opcode::Rotr;
     case BinaryOperation::Equal: return Opcode::CmpEq;
     case BinaryOperation::NotEqual: return Opcode::CmpNe;
     case BinaryOperation::SignedLess: return Opcode::CmpSlt;
@@ -490,6 +488,8 @@ machine::TargetOpcodeId vector_binary_opcode(
     case BinaryOperation::ShiftLeft: return Opcode::Vshl;
     case BinaryOperation::ShiftRightArithmetic: return Opcode::VshrS;
     case BinaryOperation::ShiftRightLogical: return Opcode::VshrU;
+    case BinaryOperation::RotateLeft:
+    case BinaryOperation::RotateRight: return Opcode::Invalid;
     case BinaryOperation::Equal: return Opcode::VcmpEq;
     case BinaryOperation::NotEqual: return Opcode::VcmpNe;
     case BinaryOperation::SignedLess: return Opcode::VcmpSlt;
@@ -3425,187 +3425,6 @@ private:
         }
     }
 
-    void recognize_scalar_rotates() {
-        if (!options_.peephole2) return;
-        const auto count = current_.virtual_registers.size();
-        std::vector<std::optional<machine::ImmediateOperand>> constants(
-            count);
-        for (const auto& block : current_.blocks) {
-            for (const auto& instruction : block.instructions) {
-                if (instruction.opcode != Opcode::Constant ||
-                    instruction.defs.size() != 1 ||
-                    instruction.operands.size() != 1) {
-                    continue;
-                }
-                if (const auto* immediate =
-                        std::get_if<machine::ImmediateOperand>(
-                            &instruction.operands.front())) {
-                    constants[instruction.defs.front().id] = *immediate;
-                }
-            }
-        }
-        for (auto& block : current_.blocks) {
-            std::vector<std::optional<std::size_t>> definitions(count);
-            std::vector<unsigned> uses(count);
-            for (std::size_t index = 0;
-                 index < block.instructions.size(); ++index) {
-                const auto& instruction = block.instructions[index];
-                for (const auto reg : instruction.defs) {
-                    if (reg.kind == machine::RegisterKind::Virtual &&
-                        reg.id < count) {
-                        definitions[reg.id] = index;
-                    }
-                }
-                for (const auto reg : instruction.uses) {
-                    if (reg.kind == machine::RegisterKind::Virtual &&
-                        reg.id < count) {
-                        ++uses[reg.id];
-                    }
-                }
-            }
-            std::unordered_set<std::size_t> removed;
-            const auto definition = [&](machine::Register reg)
-                -> const machine::Instruction* {
-                if (reg.kind != machine::RegisterKind::Virtual ||
-                    reg.id >= definitions.size() ||
-                    !definitions[reg.id] ||
-                    removed.contains(*definitions[reg.id])) {
-                    return nullptr;
-                }
-                return &block.instructions[*definitions[reg.id]];
-            };
-            const auto complement = [&](machine::Register direct,
-                                        machine::Register candidate,
-                                        unsigned bits)
-                -> const machine::Instruction* {
-                const auto* subtract = definition(candidate);
-                if (!subtract || subtract->opcode != Opcode::Sub ||
-                    subtract->uses.size() != 2 ||
-                    subtract->uses[1] != direct ||
-                    subtract->uses[0].kind !=
-                        machine::RegisterKind::Virtual ||
-                    subtract->uses[0].id >= constants.size() ||
-                    !constants[subtract->uses[0].id] ||
-                    constants[subtract->uses[0].id]->high != 0 ||
-                    constants[subtract->uses[0].id]->value != bits) {
-                    return nullptr;
-                }
-                return subtract;
-            };
-            for (std::size_t index = 0;
-                 index < block.instructions.size(); ++index) {
-                auto& combine = block.instructions[index];
-                if (combine.opcode != Opcode::Or ||
-                    combine.uses.size() != 2 || combine.defs.size() != 1) {
-                    continue;
-                }
-                const auto* first = definition(combine.uses[0]);
-                const auto* second = definition(combine.uses[1]);
-                if (!first || !second || first->uses.size() != 2 ||
-                    second->uses.size() != 2 ||
-                    first->uses[0] != second->uses[0] ||
-                    first->uses[0].mode.bits < 32 ||
-                    first->uses[0].mode.bits > 64 ||
-                    uses[combine.uses[0].id] != 1 ||
-                    uses[combine.uses[1].id] != 1) {
-                    continue;
-                }
-                const machine::Instruction* direct_shift = nullptr;
-                const machine::Instruction* complement_shift = nullptr;
-                machine::TargetOpcodeId opcode;
-                if (first->opcode == Opcode::Shl &&
-                    second->opcode == Opcode::ShrU) {
-                    direct_shift = first;
-                    complement_shift = second;
-                    opcode = Opcode::Rotl;
-                } else if (first->opcode == Opcode::ShrU &&
-                           second->opcode == Opcode::Shl) {
-                    direct_shift = first;
-                    complement_shift = second;
-                    opcode = Opcode::Rotr;
-                } else {
-                    continue;
-                }
-                const auto shift_constant =
-                    [&](machine::Register reg)
-                    -> std::optional<std::uint64_t> {
-                        if (reg.kind != machine::RegisterKind::Virtual ||
-                            reg.id >= constants.size() ||
-                            !constants[reg.id] ||
-                            constants[reg.id]->high != 0) {
-                            return std::nullopt;
-                        }
-                        return constants[reg.id]->value;
-                    };
-                const auto direct_amount =
-                    shift_constant(direct_shift->uses[1]);
-                const auto complement_amount =
-                    shift_constant(complement_shift->uses[1]);
-                const auto bits = direct_shift->uses[0].mode.bits;
-                const bool constant_complement =
-                    direct_amount && complement_amount &&
-                    *direct_amount < bits && *complement_amount <= bits &&
-                    *direct_amount + *complement_amount == bits;
-                const machine::Instruction* subtract = nullptr;
-                if (!constant_complement) {
-                    subtract = complement(
-                        direct_shift->uses[1],
-                        complement_shift->uses[1], bits);
-                    if (!subtract || subtract->defs.size() != 1 ||
-                        uses[subtract->defs.front().id] != 1) {
-                        continue;
-                    }
-                }
-                combine.opcode = opcode;
-                combine.uses = {
-                    direct_shift->uses[0], direct_shift->uses[1]};
-                combine.operands = {
-                    machine::RegisterOperand{combine.uses[0]},
-                    machine::RegisterOperand{combine.uses[1]}};
-                removed.insert(*definitions[first->defs.front().id]);
-                removed.insert(*definitions[second->defs.front().id]);
-                if (subtract) {
-                    removed.insert(
-                        *definitions[subtract->defs.front().id]);
-                }
-            }
-            if (removed.empty()) continue;
-            std::vector<machine::Instruction> compact;
-            compact.reserve(block.instructions.size() - removed.size());
-            for (std::size_t index = 0;
-                 index < block.instructions.size(); ++index) {
-                if (!removed.contains(index)) {
-                    compact.push_back(
-                        std::move(block.instructions[index]));
-                }
-            }
-            block.instructions = std::move(compact);
-        }
-        std::vector<unsigned> remaining_uses(count);
-        for (const auto& block : current_.blocks) {
-            for (const auto& instruction : block.instructions) {
-                for (const auto reg : instruction.uses) {
-                    if (reg.kind == machine::RegisterKind::Virtual &&
-                        reg.id < count) {
-                        ++remaining_uses[reg.id];
-                    }
-                }
-            }
-        }
-        for (auto& block : current_.blocks) {
-            std::erase_if(
-                block.instructions,
-                [&](const machine::Instruction& instruction) {
-                    return instruction.opcode == Opcode::Constant &&
-                           instruction.defs.size() == 1 &&
-                           instruction.defs.front().kind ==
-                               machine::RegisterKind::Virtual &&
-                           remaining_uses[
-                               instruction.defs.front().id] == 0;
-                });
-        }
-    }
-
     void fuse_compare_branches() {
         if (options_.optimization_effort == 0) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
@@ -4199,275 +4018,6 @@ private:
                            instruction.defs.front().id < uses.size() &&
                            uses[instruction.defs.front().id] == 0;
                 });
-        }
-    }
-
-    void thread_forwarding_blocks() {
-        if (options_.optimization_effort == 0) return;
-        const auto addressable = [&](machine::BlockId block) {
-            return source_ && std::any_of(
-                source_->labels.begin(), source_->labels.end(),
-                [&](const mir::ManagedLabel& label) {
-                    return label.block.value == block.value;
-                });
-        };
-        const auto replace_target = [](machine::Instruction& terminator,
-                                       machine::BlockId from,
-                                       machine::BlockId to) {
-            for (auto& operand : terminator.operands) {
-                if (auto* block = std::get_if<machine::BlockOperand>(&operand);
-                    block && block->target == from) {
-                    block->target = to;
-                }
-            }
-        };
-
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (auto& forwarding : current_.blocks) {
-                const auto phi_instruction =
-                    [](const machine::Instruction& instruction) {
-                        return instruction.opcode == Opcode::Phi ||
-                            instruction.opcode == Opcode::Fphi ||
-                            instruction.opcode == Opcode::Vphi;
-                    };
-                const bool forwardable_prefix =
-                    !forwarding.instructions.empty() &&
-                    std::all_of(
-                        forwarding.instructions.begin(),
-                        forwarding.instructions.end() - 1,
-                        [&](const machine::Instruction& instruction) {
-                            return instruction.kind ==
-                                       machine::InstructionKind::Target &&
-                                   (instruction.opcode ==
-                                        Opcode::LifetimeStart ||
-                                    instruction.opcode ==
-                                        Opcode::LifetimeEnd ||
-                                    phi_instruction(instruction));
-                        });
-                if (forwarding.id == current_.entry ||
-                    addressable(forwarding.id) ||
-                    !forwardable_prefix ||
-                    forwarding.instructions.back().kind !=
-                        machine::InstructionKind::Branch ||
-                    forwarding.successors.size() != 1 ||
-                    forwarding.predecessors.empty()) {
-                    continue;
-                }
-                const auto destination = forwarding.successors.front();
-                if (destination == forwarding.id ||
-                    destination.value >= current_.blocks.size()) {
-                    continue;
-                }
-                auto& target = current_.blocks[destination.value];
-                // A predecessor already reaching the target would give a phi
-                // two indistinguishable edges after threading. Leave that
-                // uncommon shape intact until Machine IR models edge IDs.
-                if (std::any_of(
-                        forwarding.predecessors.begin(),
-                        forwarding.predecessors.end(),
-                        [&](machine::BlockId predecessor) {
-                            return std::find(target.predecessors.begin(),
-                                             target.predecessors.end(),
-                                             predecessor) !=
-                                   target.predecessors.end();
-                        })) {
-                    continue;
-                }
-
-                // A phi-only forwarding block is the SSA form naturally
-                // produced by a source-level if/else ladder.  Translate each
-                // destination phi through it before bypassing the block.  A
-                // definition with any other use is deliberately left alone:
-                // it still needs the forwarding block to dominate that use.
-                std::unordered_map<
-                    std::uint32_t,
-                    std::unordered_map<std::uint32_t, machine::Operand>>
-                    translated_phi_inputs;
-                std::unordered_map<std::uint32_t, unsigned>
-                    permitted_phi_uses;
-                bool translatable = true;
-                for (const auto& instruction : forwarding.instructions) {
-                    if (!phi_instruction(instruction)) continue;
-                    if (instruction.defs.size() != 1 ||
-                        instruction.defs.front().kind !=
-                            machine::RegisterKind::Virtual) {
-                        translatable = false;
-                        break;
-                    }
-                    auto& inputs = translated_phi_inputs[
-                        instruction.defs.front().id];
-                    for (std::size_t index = 0;
-                         index + 1 < instruction.operands.size();
-                         index += 2) {
-                        const auto* predecessor =
-                            std::get_if<machine::BlockOperand>(
-                                &instruction.operands[index]);
-                        if (!predecessor ||
-                            !inputs.emplace(predecessor->target.value,
-                                            instruction.operands[index + 1])
-                                 .second) {
-                            translatable = false;
-                            break;
-                        }
-                    }
-                    if (!translatable ||
-                        inputs.size() != forwarding.predecessors.size() ||
-                        std::any_of(
-                            forwarding.predecessors.begin(),
-                            forwarding.predecessors.end(),
-                            [&](machine::BlockId predecessor) {
-                                return !inputs.contains(predecessor.value);
-                            })) {
-                        translatable = false;
-                        break;
-                    }
-                }
-                if (!translatable) continue;
-                for (const auto& phi : target.instructions) {
-                    if (!phi_instruction(phi)) continue;
-                    for (std::size_t index = 0;
-                         index + 1 < phi.operands.size(); index += 2) {
-                        const auto* incoming =
-                            std::get_if<machine::BlockOperand>(
-                                &phi.operands[index]);
-                        const auto* source =
-                            std::get_if<machine::RegisterOperand>(
-                                &phi.operands[index + 1]);
-                        if (incoming && source &&
-                            incoming->target == forwarding.id &&
-                            source->value.kind ==
-                                machine::RegisterKind::Virtual &&
-                            translated_phi_inputs.contains(
-                                source->value.id)) {
-                            ++permitted_phi_uses[source->value.id];
-                        }
-                    }
-                }
-                for (const auto& [definition, inputs] :
-                     translated_phi_inputs) {
-                    unsigned uses = 0;
-                    for (const auto& block : current_.blocks) {
-                        for (const auto& instruction : block.instructions) {
-                            uses += static_cast<unsigned>(std::count_if(
-                                instruction.uses.begin(),
-                                instruction.uses.end(),
-                                [&](machine::Register use) {
-                                    return use.kind ==
-                                            machine::RegisterKind::Virtual &&
-                                        use.id == definition;
-                                }));
-                        }
-                    }
-                    if (uses != permitted_phi_uses[definition]) {
-                        translatable = false;
-                        break;
-                    }
-                }
-                if (!translatable) continue;
-
-                const auto old_predecessors = forwarding.predecessors;
-                for (const auto predecessor : old_predecessors) {
-                    if (predecessor.value >= current_.blocks.size()) continue;
-                    auto& owner = current_.blocks[predecessor.value];
-                    for (auto& successor : owner.successors) {
-                        if (successor == forwarding.id) {
-                            successor = destination;
-                        }
-                    }
-                    if (!owner.instructions.empty()) {
-                        replace_target(owner.instructions.back(),
-                                       forwarding.id, destination);
-                    }
-                }
-
-                const auto predecessor_position = std::find(
-                    target.predecessors.begin(), target.predecessors.end(),
-                    forwarding.id);
-                if (predecessor_position == target.predecessors.end()) {
-                    continue;
-                }
-                const auto offset = static_cast<std::size_t>(
-                    predecessor_position - target.predecessors.begin());
-                target.predecessors.erase(predecessor_position);
-                target.predecessors.insert(
-                    target.predecessors.begin() +
-                        static_cast<std::ptrdiff_t>(offset),
-                    old_predecessors.begin(), old_predecessors.end());
-
-                for (auto& phi : target.instructions) {
-                    if (phi.opcode != Opcode::Phi &&
-                        phi.opcode != Opcode::Fphi &&
-                        phi.opcode != Opcode::Vphi) {
-                        continue;
-                    }
-                    for (std::size_t index = 0;
-                         index + 1 < phi.operands.size(); index += 2) {
-                        const auto* incoming_block =
-                            std::get_if<machine::BlockOperand>(
-                                &phi.operands[index]);
-                        if (!incoming_block ||
-                            incoming_block->target != forwarding.id) {
-                            continue;
-                        }
-                        const auto incoming_value = phi.operands[index + 1];
-                        phi.operands.erase(phi.operands.begin() +
-                                              static_cast<std::ptrdiff_t>(index),
-                                          phi.operands.begin() +
-                                              static_cast<std::ptrdiff_t>(index + 2));
-                        std::vector<machine::Operand> replacements;
-                        replacements.reserve(old_predecessors.size() * 2);
-                        for (const auto predecessor : old_predecessors) {
-                            replacements.push_back(
-                                machine::BlockOperand{predecessor});
-                            const auto* incoming_register =
-                                std::get_if<machine::RegisterOperand>(
-                                    &incoming_value);
-                            if (incoming_register &&
-                                incoming_register->value.kind ==
-                                    machine::RegisterKind::Virtual) {
-                                const auto translated =
-                                    translated_phi_inputs.find(
-                                        incoming_register->value.id);
-                                if (translated !=
-                                    translated_phi_inputs.end()) {
-                                    replacements.push_back(
-                                        translated->second.at(
-                                            predecessor.value));
-                                    continue;
-                                }
-                            }
-                            replacements.push_back(incoming_value);
-                        }
-                        phi.operands.insert(
-                            phi.operands.begin() +
-                                static_cast<std::ptrdiff_t>(index),
-                            replacements.begin(), replacements.end());
-                        phi.uses.clear();
-                        for (std::size_t incoming = 1;
-                             incoming < phi.operands.size(); incoming += 2) {
-                            if (const auto* reg =
-                                    std::get_if<machine::RegisterOperand>(
-                                        &phi.operands[incoming])) {
-                                phi.uses.push_back(reg->value);
-                            }
-                        }
-                        break;
-                    }
-                }
-
-                forwarding.predecessors.clear();
-                forwarding.successors.clear();
-                forwarding.instructions.clear();
-                machine::Instruction unreachable;
-                unreachable.kind = machine::InstructionKind::Unreachable;
-                unreachable.location = forwarding.location;
-                unreachable.has_side_effects = true;
-                forwarding.instructions.push_back(std::move(unreachable));
-                changed = true;
-                break;
-            }
         }
     }
 
@@ -8785,11 +8335,6 @@ private:
         add(LoweringPass::FuseVectorReductions, Stage::InstructionCombining,
             "fuse-vector-reductions",
             &MachineLowerer::fuse_vector_reductions);
-        // Recognize literal rotates before scalar immediates consume the two
-        // shift-count registers. The later pass handles variable complements.
-        add(LoweringPass::RecognizeScalarRotatesEarly,
-            Stage::InstructionCombining, "recognize-scalar-rotates-early",
-            &MachineLowerer::recognize_scalar_rotates);
         add(LoweringPass::SelectBinaryImmediates, Stage::Legalization,
             "select-binary-immediates",
             &MachineLowerer::select_binary_immediates);
@@ -8805,9 +8350,6 @@ private:
         add(LoweringPass::FuseScalarDivisionResults,
             Stage::InstructionCombining, "fuse-scalar-division-results",
             &MachineLowerer::fuse_scalar_division_results);
-        add(LoweringPass::RecognizeScalarRotatesLate,
-            Stage::InstructionCombining, "recognize-scalar-rotates-late",
-            &MachineLowerer::recognize_scalar_rotates);
         add(LoweringPass::PropagateCopiesLate, Stage::Canonicalization,
             "propagate-copies-late",
             &MachineLowerer::propagate_machine_copies);
@@ -8821,9 +8363,6 @@ private:
             &MachineLowerer::fuse_compare_branches);
         add(LoweringPass::FormDenseJumpTables, Stage::ControlFlow,
             "form-dense-jump-tables", &MachineLowerer::form_dense_jump_tables);
-        add(LoweringPass::ThreadForwardingBlocksEarly, Stage::ControlFlow,
-            "thread-forwarding-blocks-early",
-            &MachineLowerer::thread_forwarding_blocks);
         add(LoweringPass::FoldIndexedAddresses, Stage::InstructionCombining,
             "fold-indexed-addresses",
             &MachineLowerer::fold_indexed_memory_addresses);
@@ -8849,10 +8388,6 @@ private:
             "schedule-block-layout", &MachineLowerer::schedule_block_layout);
         add(LoweringPass::ScheduleAcrossBlocks, Stage::Scheduling,
             "schedule-across-blocks", &MachineLowerer::schedule_across_blocks);
-        // Scheduling can expose a newly empty forwarding block.
-        add(LoweringPass::ThreadForwardingBlocksLate, Stage::ControlFlow,
-            "thread-forwarding-blocks-late",
-            &MachineLowerer::thread_forwarding_blocks);
         add(LoweringPass::ScheduleBlocks, Stage::Scheduling,
             "schedule-blocks", &MachineLowerer::schedule_blocks);
         add(LoweringPass::SelectRematerialization,

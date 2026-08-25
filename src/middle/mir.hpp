@@ -61,6 +61,7 @@ enum class BinaryOperation {
     Add, Subtract, Multiply, SignedDivide, UnsignedDivide,
     SignedRemainder, UnsignedRemainder, BitAnd, BitOr, BitXor,
     ShiftLeft, ShiftRightArithmetic, ShiftRightLogical,
+    RotateLeft, RotateRight,
     Equal, NotEqual, SignedLess, SignedLessEqual, SignedGreater,
     SignedGreaterEqual, UnsignedLess, UnsignedLessEqual,
     UnsignedGreater, UnsignedGreaterEqual,
@@ -74,6 +75,8 @@ enum class CastOperation {
 struct PhiIncoming {
     BlockId predecessor;
     ValueId value;
+    friend bool operator==(const PhiIncoming&,
+                           const PhiIncoming&) = default;
 };
 
 struct CallArgument {

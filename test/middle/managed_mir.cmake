@@ -25,6 +25,7 @@ run_cc("${OUTPUT}.O2.o" -c -O2)
 run_cc("${OUTPUT}.linux.O2.o" -c -O2 -target x86_64-unknown-linux-gnu)
 
 file(READ "${OUTPUT}.O0.ll" ir)
+file(READ "${OUTPUT}.O2.ll" optimized_ir)
 
 function(function_body result symbol)
     string(REGEX MATCH "define[^\n]*@\"${symbol}\"\\([^}]*}" body "${ir}")
@@ -85,4 +86,11 @@ endif()
 if(NOT entry_ir MATCHES "call i32.*mir_choose" OR
    NOT entry_ir MATCHES "call i32.*mir_safe_div")
     message(FATAL_ERROR "managed MIR lost direct all-in calls")
+endif()
+if(NOT optimized_ir MATCHES
+       "call i64 @llvm[.]fshl[.]i64\\(i64 [^,]+, i64 [^,]+, i64 [^)]+\\)" OR
+   NOT optimized_ir MATCHES
+       "declare i64 @llvm[.]fshl[.]i64\\(i64, i64, i64\\)")
+    message(FATAL_ERROR
+        "MIR rotate did not serialize through LLVM's funnel shift intrinsic")
 endif()
