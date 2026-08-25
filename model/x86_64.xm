@@ -246,6 +246,7 @@ abi "cross" {
     address_bits = 64;
     aliases = ["cross_abi"];
     llvm_calling_convention = "";
+    gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
     argument_register_failure = "stack";
@@ -530,6 +531,7 @@ abi "sysv_abi" {
     address_bits = 64;
     aliases = ["linux"];
     llvm_calling_convention = "x86_64_sysvcc";
+    gcc_calling_attribute = "sysv_abi";
     compilation_selectable = true;
     function_selectable = true;
     argument_register_failure = "stack";
@@ -833,6 +835,7 @@ abi "ms_abi" {
     address_bits = 64;
     aliases = ["ms", "win64", "windows"];
     llvm_calling_convention = "win64cc";
+    gcc_calling_attribute = "ms_abi";
     compilation_selectable = true;
     function_selectable = true;
     argument_register_failure = "partial";

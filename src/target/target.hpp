@@ -151,6 +151,7 @@ struct AbiEntry {
     std::string architecture;
     unsigned address_bits{};
     std::string llvm_calling_convention;
+    std::string gcc_calling_attribute;
     bool compilation_selectable{true};
     bool function_selectable{true};
     std::vector<AbiRegisterBank> banks;

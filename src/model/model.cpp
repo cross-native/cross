@@ -1308,7 +1308,7 @@ private:
         if (!known_properties(
                 properties,
                 {"architecture", "address_bits", "aliases",
-                 "llvm_calling_convention",
+                 "llvm_calling_convention", "gcc_calling_attribute",
                  "compilation_selectable", "function_selectable",
                  "call_clobbers", "argument_register_failure",
                  "result_register_failure", "stack_layout",
@@ -1351,6 +1351,10 @@ private:
         if (const auto llvm =
                 text_property(properties, "llvm_calling_convention")) {
             result.llvm_calling_convention = *llvm;
+        }
+        if (const auto gcc =
+                text_property(properties, "gcc_calling_attribute")) {
+            result.gcc_calling_attribute = *gcc;
         }
         if (const auto value = list_property(properties, "aliases")) {
             result.aliases = *value;

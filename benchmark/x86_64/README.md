@@ -1,9 +1,13 @@
 # x86-64 code-generation comparison
 
-This corpus compares four paths over equivalent standalone kernels:
+This corpus compares six paths over equivalent standalone kernels:
 
 - `cross`: Cross HIR/MIR/Machine IR and the in-tree x86-64 backend;
 - `llc`: Cross LLVM serialization, LLVM `opt`, then `llc`;
+- `gcc-gimple`: optimized typed Cross MIR serialized as GCC `__GIMPLE (ssa)`,
+  followed by GCC's remaining GIMPLE and RTL passes;
+- `gcc-rtl`: the same serialization with `startwith("optimized")`, followed by
+  GCC expansion and RTL passes only;
 - `gcc`: equivalent freestanding C compiled by GCC; and
 - `clang`: equivalent freestanding C compiled by Clang.
 
@@ -49,16 +53,24 @@ name. `--output PATH` still selects an exact directory. Each run contains:
 - `report.md`: Cross-relative aggregate summary;
 - `measurements.csv`: per-kernel steady-state timings;
 - `build.csv`: compile latency and text size;
-- `metadata.json`: host, target, and toolchain identities; and
+- `metadata.json`: host, target, and toolchain identities;
+- `*.gimple.c`: exact experimental GCC bridge inputs; and
 - `*.disasm`: generated object disassembly for diagnosis.
 
 The `llc` path measures the former LLVM-style production pipeline, including
-Cross serialization and LLVM optimization. It does not isolate LLVM's target
-backend from Cross's middle end. GCC/Clang source equivalence should be reviewed
-whenever a kernel changes. For publishable measurements, close background
-programs, pin CPU frequency/affinity externally where the host permits it, run
-several complete benchmark invocations, and report dispersion as well as the
-median.
+Cross serialization and LLVM optimization. The two GCC bridge paths likewise
+retain Cross's middle end and isolate progressively more of GCC's optimizer.
+They use GCC's experimental, version-sensitive `-fgimple` interface; the
+runner probes for it before building. GCC/Clang source equivalence should be
+reviewed whenever a kernel changes. For publishable measurements, close
+background programs, pin CPU frequency/affinity externally where the host
+permits it, run several complete benchmark invocations, and report dispersion
+as well as the median.
+
+The bridge preserves model-mapped explicit C ABIs. A private dynamic Cross ABI
+has no GCC spelling, so bridge-only local calls use GCC's translation-unit
+convention; native Cross remains the only row that measures dynamic ABI
+planning.
 
 Metadata also records the full Git commit and dirty state, exact invocation,
 Cross compiler SHA-256, and source-corpus SHA-256. Use these identities rather

@@ -3,6 +3,8 @@ project(cross VERSION 0.1.0 LANGUAGES CXX)
 
 option(CROSS_ENABLE_LLVM_TEXT
        "Build the optional LLVM text debug/compatibility serializer" ON)
+option(CROSS_ENABLE_GCC_GIMPLE_TEXT
+       "Build the optional GCC GIMPLE debug/backend-validation serializer" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -113,6 +115,15 @@ if(CROSS_ENABLE_LLVM_TEXT)
     cross_component(cross_llvm_debug)
 endif()
 
+if(CROSS_ENABLE_GCC_GIMPLE_TEXT)
+    add_library(cross_gcc_gimple_debug
+        src/backend/gcc/gimple_ir.cpp
+    )
+    target_link_libraries(cross_gcc_gimple_debug PUBLIC cross_frontend
+        cross_targets cross_middle cross_raw_backend)
+    cross_component(cross_gcc_gimple_debug)
+endif()
+
 add_library(cross_driver
     src/driver/driver.cpp
 )
@@ -122,6 +133,14 @@ if(CROSS_ENABLE_LLVM_TEXT)
     target_compile_definitions(cross_driver PRIVATE CROSS_ENABLE_LLVM_TEXT=1)
 else()
     target_compile_definitions(cross_driver PRIVATE CROSS_ENABLE_LLVM_TEXT=0)
+endif()
+if(CROSS_ENABLE_GCC_GIMPLE_TEXT)
+    target_link_libraries(cross_driver PRIVATE cross_gcc_gimple_debug)
+    target_compile_definitions(cross_driver PRIVATE
+        CROSS_ENABLE_GCC_GIMPLE_TEXT=1)
+else()
+    target_compile_definitions(cross_driver PRIVATE
+        CROSS_ENABLE_GCC_GIMPLE_TEXT=0)
 endif()
 cross_component(cross_driver)
 
@@ -210,6 +229,19 @@ if(BUILD_TESTING)
         COMMAND $<TARGET_FILE:cross_cc> -c -O2 -ffunction-sections
                 "${CMAKE_SOURCE_DIR}/test/language/basic.x"
                 -o "${CMAKE_CURRENT_BINARY_DIR}/basic.o")
+    if(CROSS_ENABLE_GCC_GIMPLE_TEXT)
+        find_program(CROSS_TEST_GCC NAMES gcc)
+        if(CROSS_TEST_GCC)
+            add_test(NAME cross_gcc_gimple_bridge
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_bridge.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_bridge_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-bridge
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_bridge.cmake")
+        endif()
+    endif()
     add_test(NAME cross_namespace
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/language/namespace.x"

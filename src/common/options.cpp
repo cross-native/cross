@@ -731,6 +731,14 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
             options.emit = EmitKind::LlvmTextDebug;
             continue;
         }
+        if (argument == "-emit-gimple") {
+            options.emit = EmitKind::GimpleTextDebug;
+            continue;
+        }
+        if (argument == "-emit-gimple=rtl") {
+            options.emit = EmitKind::GimpleRtlTextDebug;
+            continue;
+        }
         if (argument == "--print-targets") { options.print_targets = true; continue; }
         if (argument == "--print-abis" || argument == "-mabi=help") { options.print_abis = true; continue; }
         if (argument == "--print-models") { options.print_models = true; continue; }
@@ -804,6 +812,8 @@ void print_cc_help() {
   -S                    emit target assembly
   -c                    emit object code
   -emit-llvm            serialize optional debug/compatibility LLVM IR
+  -emit-gimple          serialize GCC GIMPLE SSA for GIMPLE + RTL passes
+  -emit-gimple=rtl      serialize optimized GIMPLE SSA for GCC RTL passes
   -o FILE               write output to FILE
   -O0/-Og/-O1/-O2/-O3/-Os/-Oz
                         select a model-defined optimization preset

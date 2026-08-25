@@ -143,7 +143,22 @@ LEVELS: Mapping[str, OptimizationLevel] = {
     "Os": OptimizationLevel("Os", "Os", "O2"),
     "Oz": OptimizationLevel("Oz", "Oz", "O2"),
 }
-COMPILERS: tuple[str, ...] = ("cross", "llc", "gcc", "clang")
+COMPILERS: tuple[str, ...] = (
+    "cross",
+    "llc",
+    "gcc-gimple",
+    "gcc-rtl",
+    "gcc",
+    "clang",
+)
+PIPELINES: Mapping[str, str] = {
+    "cross": "Cross MIR -> native Machine IR -> x86-64",
+    "llc": "Cross MIR -> LLVM text -> LLVM opt -> llc",
+    "gcc-gimple": "Cross MIR -> GCC GIMPLE SSA -> GCC GIMPLE + RTL",
+    "gcc-rtl": "Cross MIR -> optimized GCC GIMPLE SSA -> GCC RTL",
+    "gcc": "equivalent freestanding C -> GCC GIMPLE + RTL",
+    "clang": "equivalent freestanding C -> LLVM -> Clang x86-64",
+}
 BUILD_UNITS: tuple[str, ...] = (
     "scalar",
     "calls",
@@ -492,7 +507,8 @@ def compiler_prefix(compiler: str, level: str) -> str:
 
     if compiler not in COMPILERS or level not in LEVELS:
         raise BenchmarkError(f"invalid compiler/level pair: {compiler}/{level}")
-    return f"{compiler}_{level}_"
+    identifier = re.sub(r"[^A-Za-z0-9_]", "_", compiler)
+    return f"{identifier}_{level}_"
 
 
 def runner_fragments(
@@ -667,6 +683,78 @@ async def build_llc(
     return BuildRecord("llc", level.name, category, object_path, compile_ms, *sizes)
 
 
+def gcc_common_flags(config: Configuration) -> tuple[str, ...]:
+    """Return runtime-free GCC flags shared by C and GIMPLE inputs."""
+
+    return (
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-fno-unwind-tables",
+        "-fno-asynchronous-unwind-tables",
+        "-fno-ident",
+        "-ffp-contract=off",
+        "-fno-lto",
+        f"-march={config.architecture}",
+    )
+
+
+async def build_gcc_bridge(
+    config: Configuration,
+    level: OptimizationLevel,
+    compiler: str,
+    category: str,
+) -> BuildRecord:
+    """Build typed Cross MIR through GCC's GIMPLE or RTL pipeline."""
+
+    if compiler not in {"gcc-gimple", "gcc-rtl"}:
+        raise BenchmarkError(f"unsupported GCC bridge: {compiler}")
+    prefix = compiler_prefix(compiler, level.name)
+    source = config.output_dir / f"{compiler}-{level.name}-{category}.x"
+    gimple_source = config.output_dir / f"{compiler}-{level.name}-{category}.gimple.c"
+    object_path = config.output_dir / f"{compiler}-{level.name}-{category}.o"
+    write_rendered(
+        config.source_dir / "kernels" / f"{category}.x.in",
+        source,
+        {"ABI": config.abi, "PREFIX": prefix},
+    )
+    emit = "-emit-gimple=rtl" if compiler == "gcc-rtl" else "-emit-gimple"
+
+    async def pipeline() -> None:
+        await run_checked(
+            (
+                config.tools.cross_cc,
+                emit,
+                level.flag,
+                "-target",
+                config.target,
+                f"-mabi={config.abi}",
+                f"-march={config.architecture}",
+                "-fno-unwind-tables",
+                "-fno-asynchronous-unwind-tables",
+                source,
+                "-o",
+                gimple_source,
+            )
+        )
+        await run_checked(
+            (
+                config.tools.gcc,
+                "-c",
+                level.flag,
+                "-fgimple",
+                *gcc_common_flags(config),
+                gimple_source,
+                "-o",
+                object_path,
+            )
+        )
+
+    compile_ms = await measure_pipeline(pipeline, config.compile_runs)
+    sizes = await inspect_object(config, object_path)
+    return BuildRecord(compiler, level.name, category, object_path, compile_ms, *sizes)
+
+
 async def build_c_compiler(
     config: Configuration,
     level: OptimizationLevel,
@@ -688,15 +776,7 @@ async def build_c_compiler(
     )
     common_flags = (
         "-std=c11",
-        "-ffreestanding",
-        "-fno-builtin",
-        "-fno-stack-protector",
-        "-fno-unwind-tables",
-        "-fno-asynchronous-unwind-tables",
-        "-fno-ident",
-        "-ffp-contract=off",
-        "-fno-lto",
-        f"-march={config.architecture}",
+        *gcc_common_flags(config),
     )
 
     async def pipeline() -> None:
@@ -726,6 +806,8 @@ async def build_all(config: Configuration) -> list[BuildRecord]:
         for unit in BUILD_UNITS:
             records.append(await build_cross_native(config, level, unit))
             records.append(await build_llc(config, level, unit))
+            records.append(await build_gcc_bridge(config, level, "gcc-gimple", unit))
+            records.append(await build_gcc_bridge(config, level, "gcc-rtl", unit))
             records.append(await build_c_compiler(config, level, "gcc", unit))
             records.append(await build_c_compiler(config, level, "clang", unit))
     return records
@@ -1161,11 +1243,15 @@ def markdown_report(
         (
             "",
             "The `llc` row is Cross LLVM serialization followed by LLVM `opt` "
-            "and `llc`; it represents the former production-style LLVM path, "
-            "not an LLVM-free backend-isolation experiment. GCC and Clang "
-            "compile equivalent freestanding C with built-ins disabled. All "
-            "four source-unit objects are rejected if they contain an undefined "
-            "symbol. The objective gates describe this deterministic corpus; "
+            "and `llc`. `gcc-gimple` consumes the same optimized typed Cross "
+            "MIR as GCC `__GIMPLE (ssa)` and runs GCC's remaining GIMPLE and "
+            'RTL passes. `gcc-rtl` uses `startwith("optimized")` to skip '
+            "GCC's optimization GIMPLE passes and enter expansion/RTL. GCC's "
+            "GIMPLE interface is experimental; emitted bridge sources are "
+            "retained with the report. GCC and Clang compile equivalent "
+            "freestanding C with built-ins disabled. Every object is rejected "
+            "if it contains an undefined symbol. The objective gates describe "
+            "this deterministic corpus; "
             "they are evidence against narrow overfitting, not a claim that "
             "one compiler wins every possible program or host.",
             "",
@@ -1215,6 +1301,14 @@ async def tool_versions(tools: Tools) -> dict[str, str]:
         lines = [line.strip() for line in version.stdout.splitlines() if line.strip()]
         result[name] = concise_version(lines)
     return result
+
+
+async def require_gimple_frontend(gcc: Path) -> None:
+    """Fail early when the selected GCC lacks its experimental GIMPLE parser."""
+
+    result = await run_checked((gcc, "-Q", "--help=c"))
+    if "-fgimple" not in f"{result.stdout}\n{result.stderr}":
+        raise BenchmarkError(f"selected GCC does not advertise -fgimple support: {gcc}")
 
 
 def concise_version(lines: Sequence[str]) -> str:
@@ -1459,6 +1553,7 @@ async def async_main(argv: Sequence[str]) -> int:
     config = configuration_from_arguments(arguments)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     versions = await tool_versions(config.tools)
+    await require_gimple_frontend(config.tools.gcc)
     (config.output_dir / "metadata.json").write_text(
         json.dumps(
             {
@@ -1471,6 +1566,8 @@ async def async_main(argv: Sequence[str]) -> int:
                 "target": config.target,
                 "architecture": config.architecture,
                 "levels": [level.name for level in config.levels],
+                "compilers": list(COMPILERS),
+                "pipelines": dict(PIPELINES),
                 "build_units": list(BUILD_UNITS),
                 "categories": list(CATEGORIES),
                 "kernels": [asdict(kernel) for kernel in KERNELS],

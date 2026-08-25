@@ -16,7 +16,15 @@
 
 namespace cross {
 
-enum class EmitKind { Link, Assembly, Object, LlvmTextDebug, Preprocess };
+enum class EmitKind {
+    Link,
+    Assembly,
+    Object,
+    LlvmTextDebug,
+    GimpleTextDebug,
+    GimpleRtlTextDebug,
+    Preprocess,
+};
 
 enum class OptimizationGoal { Debug, Speed, Size, MinimumSize };
 enum class CodeModel { Small, Kernel, Medium, Large };

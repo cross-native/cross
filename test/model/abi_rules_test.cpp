@@ -82,6 +82,11 @@ bool validate_shipped_abis() {
     const auto* microsoft =
         model_registry().find_abi("x86-64", "ms_abi", {});
     if (!cross_abi || !sysv || !microsoft) return false;
+    if (!cross_abi->gcc_calling_attribute.empty() ||
+        sysv->gcc_calling_attribute != "sysv_abi" ||
+        microsoft->gcc_calling_attribute != "ms_abi") {
+        return false;
+    }
     if (!cross_abi->id.valid() || !sysv->id.valid() ||
         !microsoft->id.valid() ||
         model_registry().find_abi(cross_abi->id) != cross_abi ||

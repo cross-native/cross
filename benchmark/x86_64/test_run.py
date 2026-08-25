@@ -185,6 +185,21 @@ def test_concise_version_keeps_cross_identity_before_license() -> None:
     assert benchmark.concise_version(lines) == lines[0]
 
 
+def test_compiler_prefix_makes_pipeline_labels_c_identifiers() -> None:
+    """Hyphenated backend-stage labels still need linkable C symbols."""
+
+    assert benchmark.compiler_prefix("gcc-gimple", "O3") == "gcc_gimple_O3_"
+    assert benchmark.compiler_prefix("gcc-rtl", "Oz") == "gcc_rtl_Oz_"
+
+
+def test_every_pipeline_has_a_description() -> None:
+    """Reports must preserve the exact compiler-stage meaning of every row."""
+
+    assert set(benchmark.PIPELINES) == set(benchmark.COMPILERS)
+    assert "GIMPLE" in benchmark.PIPELINES["gcc-gimple"]
+    assert "RTL" in benchmark.PIPELINES["gcc-rtl"]
+
+
 def test_slugify_produces_bounded_filesystem_component() -> None:
     """Commit subjects and run names must have stable portable spellings."""
 

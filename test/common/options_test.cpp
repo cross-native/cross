@@ -40,6 +40,15 @@ bool expect(bool condition, const char* message) {
 
 int main() {
     bool ok = true;
+    const auto gimple = parse({"cc", "-emit-gimple"});
+    const auto gimple_rtl = parse({"cc", "-emit-gimple=rtl"});
+    ok = expect(gimple &&
+                    gimple->emit == cross::EmitKind::GimpleTextDebug &&
+                    gimple_rtl &&
+                    gimple_rtl->emit == cross::EmitKind::GimpleRtlTextDebug,
+                "GIMPLE output modes did not parse") &&
+         ok;
+
     const auto o0 = parse({"cc", "-O0"});
     ok = expect(o0 && !o0->tree_ccp && !o0->tree_copy_prop &&
                     !o0->tree_dce && !o0->tree_dse && !o0->tree_fre &&

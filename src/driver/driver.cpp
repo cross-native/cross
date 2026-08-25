@@ -5,6 +5,9 @@
 #if CROSS_ENABLE_LLVM_TEXT
 #include "backend/llvm/llvm_ir.hpp"
 #endif
+#if CROSS_ENABLE_GCC_GIMPLE_TEXT
+#include "backend/gcc/gimple_ir.hpp"
+#endif
 #include "backend/native/assembler.hpp"
 #include "backend/native/data_emitter.hpp"
 #include "common/options.hpp"
@@ -310,6 +313,8 @@ std::filesystem::path default_output(const CompilerOptions& options) {
     case EmitKind::Assembly: output += ".s"; break;
     case EmitKind::Object: output += ".o"; break;
     case EmitKind::LlvmTextDebug: output += ".ll"; break;
+    case EmitKind::GimpleTextDebug:
+    case EmitKind::GimpleRtlTextDebug: output += ".gimple.c"; break;
     case EmitKind::Preprocess: output += ".i"; break;
     case EmitKind::Link: output += ".exe"; break;
     }
@@ -537,6 +542,25 @@ int cc_main(int argc, char** argv) {
         diagnostics.command_error(
             "LLVM text serialization is unavailable in this build; "
             "configure with -DCROSS_ENABLE_LLVM_TEXT=ON");
+#endif
+    } else if (options.emit == EmitKind::GimpleTextDebug ||
+               options.emit == EmitKind::GimpleRtlTextDebug) {
+#if CROSS_ENABLE_GCC_GIMPLE_TEXT
+        if (options.verbose) {
+            std::cerr << "cc: serializing GCC GIMPLE backend-validation input\n";
+        }
+        const auto start = options.emit == EmitKind::GimpleRtlTextDebug
+            ? debug::GimpleStart::Rtl
+            : debug::GimpleStart::Gimple;
+        debug::GimpleTextSerializer serializer(options, diagnostics, start);
+        const auto source = serializer.serialize(codegen_module);
+        if (diagnostics.errors() != 0) return 1;
+        std::string error;
+        if (!write_file(output, source, error)) diagnostics.command_error(error);
+#else
+        diagnostics.command_error(
+            "GCC GIMPLE serialization is unavailable in this build; "
+            "configure with -DCROSS_ENABLE_GCC_GIMPLE_TEXT=ON");
 #endif
     } else {
         if (options.verbose) {
