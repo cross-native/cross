@@ -27,6 +27,8 @@ std::string_view pass_name(PassId pass) {
     case PassId::InductionCoalescing: return "induction-coalescing";
     case PassId::LoopInvariantMotion: return "loop-invariant-motion";
     case PassId::ReductionVectorization: return "reduction-vectorization";
+    case PassId::EarlyExitVectorization:
+        return "early-exit-vectorization";
     case PassId::LoopUnrolling: return "loop-unrolling";
     case PassId::RecurrenceRebalancing: return "recurrence-rebalancing";
     case PassId::SlpVectorization: return "slp-vectorization";

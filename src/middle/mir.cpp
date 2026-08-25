@@ -11072,6 +11072,579 @@ void vectorize_reduction_loops(ManagedFunction& function,
     }
 }
 
+struct EarlyExitLoopPattern {
+    CanonicalLoop loop;
+    BlockId test;
+    BlockId latch;
+    BlockId exit;
+    ValueId index;
+    ValueId initial_index;
+    ValueId bound;
+    ValueId index_next;
+    ValueId base;
+    ValueId load;
+    ValueId compared_load;
+    ValueId invariant;
+    BinaryOperation continuation{BinaryOperation::UnsignedLess};
+    bool load_on_left{};
+};
+
+std::optional<BinaryOperation> negated_integer_comparison(
+    BinaryOperation operation) {
+    switch (operation) {
+    case BinaryOperation::Equal: return BinaryOperation::NotEqual;
+    case BinaryOperation::NotEqual: return BinaryOperation::Equal;
+    case BinaryOperation::SignedLess:
+        return BinaryOperation::SignedGreaterEqual;
+    case BinaryOperation::SignedLessEqual:
+        return BinaryOperation::SignedGreater;
+    case BinaryOperation::SignedGreater:
+        return BinaryOperation::SignedLessEqual;
+    case BinaryOperation::SignedGreaterEqual:
+        return BinaryOperation::SignedLess;
+    case BinaryOperation::UnsignedLess:
+        return BinaryOperation::UnsignedGreaterEqual;
+    case BinaryOperation::UnsignedLessEqual:
+        return BinaryOperation::UnsignedGreater;
+    case BinaryOperation::UnsignedGreater:
+        return BinaryOperation::UnsignedLessEqual;
+    case BinaryOperation::UnsignedGreaterEqual:
+        return BinaryOperation::UnsignedLess;
+    default: return std::nullopt;
+    }
+}
+
+std::optional<EarlyExitLoopPattern> find_early_exit_loop(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const CanonicalLoop& loop,
+    const std::vector<std::optional<BlockId>>& definitions,
+    const UseLists& uses) {
+    if (loop.blocks.size() != 3 ||
+        std::any_of(function.labels.begin(), function.labels.end(),
+                    [&](const ManagedLabel& label) {
+                        return loop.blocks.contains(label.block.value);
+                    })) {
+        return std::nullopt;
+    }
+    const auto& header = function.blocks[loop.header.value];
+    if (header.predecessors.size() != 2 ||
+        header.terminator.kind != TerminatorKind::ConditionalBranch ||
+        !header.terminator.value ||
+        header.terminator.successors.size() != 2) {
+        return std::nullopt;
+    }
+    const auto& range = function.values[header.terminator.value->value];
+    if (range.kind != ValueKind::Binary ||
+        range.binary != BinaryOperation::UnsignedLess ||
+        range.operands.size() != 2) {
+        return std::nullopt;
+    }
+    const auto bound_definition = definitions[range.operands[1].value];
+    if (bound_definition &&
+        loop.blocks.contains(bound_definition->value)) {
+        return std::nullopt;
+    }
+    const auto index_id = range.operands.front();
+    const auto& index = function.values[index_id.value];
+    if (index.kind != ValueKind::Phi || index.incoming.size() != 2 ||
+        !integer_type(hir_module, index.type)) {
+        return std::nullopt;
+    }
+    for (const auto id : header.values) {
+        if (id != index_id &&
+            function.values[id.value].kind == ValueKind::Phi) {
+            return std::nullopt;
+        }
+    }
+    const auto initial_index = phi_value_from(index, loop.preheader);
+    const auto backedge = std::find_if(
+        index.incoming.begin(), index.incoming.end(),
+        [&](const PhiIncoming& incoming) {
+            return incoming.predecessor != loop.preheader;
+        });
+    if (!initial_index || backedge == index.incoming.end() ||
+        !loop.blocks.contains(backedge->predecessor.value)) {
+        return std::nullopt;
+    }
+    const auto& initial = function.values[initial_index->value];
+    if (initial.kind != ValueKind::ConstantInteger || initial.integer != 0 ||
+        initial.integer_high != 0) {
+        return std::nullopt;
+    }
+
+    const auto test_id = header.terminator.successors.front();
+    const auto exit_id = header.terminator.successors.back();
+    const auto latch_id = backedge->predecessor;
+    if (!loop.blocks.contains(test_id.value) || test_id == loop.header ||
+        !loop.blocks.contains(latch_id.value) || latch_id == loop.header ||
+        latch_id == test_id || loop.blocks.contains(exit_id.value)) {
+        return std::nullopt;
+    }
+    const auto& test = function.blocks[test_id.value];
+    const auto& latch = function.blocks[latch_id.value];
+    if (test.predecessors.size() != 1 ||
+        test.predecessors.front() != loop.header ||
+        test.terminator.kind != TerminatorKind::ConditionalBranch ||
+        !test.terminator.value || test.terminator.successors.size() != 2 ||
+        test.terminator.successors.front() != latch_id ||
+        test.terminator.successors.back() != exit_id ||
+        latch.predecessors.size() != 1 ||
+        latch.predecessors.front() != test_id ||
+        latch.terminator.kind != TerminatorKind::Branch ||
+        latch.terminator.successors.size() != 1 ||
+        latch.terminator.successors.front() != loop.header) {
+        return std::nullopt;
+    }
+    const auto index_next = backedge->value;
+    const auto& next = function.values[index_next.value];
+    if (next.kind != ValueKind::Binary ||
+        next.binary != BinaryOperation::Add || next.operands.size() != 2) {
+        return std::nullopt;
+    }
+    std::optional<ValueId> step;
+    if (next.operands[0] == index_id) step = next.operands[1];
+    else if (next.operands[1] == index_id) step = next.operands[0];
+    if (!step) return std::nullopt;
+    const auto& step_value = function.values[step->value];
+    if (step_value.kind != ValueKind::ConstantInteger ||
+        step_value.integer != 1 || step_value.integer_high != 0) {
+        return std::nullopt;
+    }
+
+    const auto comparison_id = *test.terminator.value;
+    const auto& condition = function.values[comparison_id.value];
+    if (condition.kind != ValueKind::Binary ||
+        !negated_integer_comparison(condition.binary) ||
+        condition.operands.size() != 2) {
+        return std::nullopt;
+    }
+    std::optional<ValueId> load_id;
+    std::optional<ValueId> compared_load_id;
+    bool load_on_left = false;
+    for (unsigned operand = 0; operand < 2; ++operand) {
+        auto candidate = condition.operands[operand];
+        const auto compared = candidate;
+        const auto* candidate_value = &function.values[candidate.value];
+        while (candidate_value->kind == ValueKind::Cast &&
+               candidate_value->cast == CastOperation::Reinterpret &&
+               candidate_value->operands.size() == 1 &&
+               integer_type(hir_module, candidate_value->type) &&
+               integer_type(
+                   hir_module,
+                   function.values[candidate_value->operands.front().value]
+                       .type) &&
+               type_bits(hir_module, candidate_value->type) ==
+                   type_bits(
+                       hir_module,
+                       function.values[candidate_value->operands.front().value]
+                           .type)) {
+            candidate = candidate_value->operands.front();
+            candidate_value = &function.values[candidate.value];
+        }
+        const auto kind = candidate_value->kind;
+        if (kind != ValueKind::PointerLoad &&
+            kind != ValueKind::IndexedLoad) {
+            continue;
+        }
+        if (load_id) return std::nullopt;
+        load_id = candidate;
+        compared_load_id = compared;
+        load_on_left = operand == 0;
+    }
+    if (!load_id || !compared_load_id) return std::nullopt;
+    const auto invariant = condition.operands[load_on_left ? 1U : 0U];
+    const auto& load = function.values[load_id->value];
+    const auto compared_type =
+        function.values[compared_load_id->value].type;
+    const auto element_bits = type_bits(hir_module, compared_type);
+    if (!integer_type(hir_module, load.type) ||
+        !integer_type(hir_module, compared_type) ||
+        type_bits(hir_module, load.type) != element_bits ||
+        element_bits < 8 ||
+        element_bits > 64 || !std::has_single_bit(element_bits) ||
+        load.is_volatile_access || !load.effect_input ||
+        !load.effect_output ||
+        function.values[invariant.value].type != compared_type) {
+        return std::nullopt;
+    }
+    const auto invariant_definition = definitions[invariant.value];
+    if (invariant_definition &&
+        loop.blocks.contains(invariant_definition->value)) {
+        return std::nullopt;
+    }
+
+    std::optional<ValueId> base;
+    if (load.kind == ValueKind::IndexedLoad && load.operands.size() == 2 &&
+        load.operands[1] == index_id) {
+        base = load.operands[0];
+    } else if (load.kind == ValueKind::PointerLoad &&
+               load.operands.size() == 1) {
+        const auto address_id = load.operands.front();
+        const auto& address = function.values[address_id.value];
+        if (address.kind == ValueKind::IndexedAddress &&
+            address.operands.size() == 2 &&
+            address.operands[1] == index_id) {
+            base = address.operands[0];
+        }
+    }
+    if (!base) return std::nullopt;
+    const auto base_definition = definitions[base->value];
+    if (base_definition && loop.blocks.contains(base_definition->value)) {
+        return std::nullopt;
+    }
+
+    for (const auto id : test.values) {
+        const auto& value = function.values[id.value];
+        if (is_effectful_value(value) && id != *load_id) {
+            return std::nullopt;
+        }
+        if (std::any_of(uses.uses(id).begin(), uses.uses(id).end(),
+                        [&](const ValueUse& use) {
+                            return use.block != test_id;
+                        })) {
+            return std::nullopt;
+        }
+    }
+    for (const auto id : header.values) {
+        if (is_effectful_value(function.values[id.value])) {
+            return std::nullopt;
+        }
+    }
+    for (const auto id : latch.values) {
+        const auto& value = function.values[id.value];
+        if (is_effectful_value(value) ||
+            (id != index_next && value.kind != ValueKind::ConstantInteger)) {
+            return std::nullopt;
+        }
+    }
+    return EarlyExitLoopPattern{
+        loop, test_id, latch_id, exit_id, index_id, *initial_index,
+        range.operands[1], index_next, *base, *load_id,
+        *compared_load_id, invariant,
+        condition.binary, load_on_left};
+}
+
+bool vectorize_early_exit_loop(ManagedFunction& function,
+                               hir::Module& hir_module,
+                               const EarlyExitLoopPattern& pattern,
+                               unsigned vector_bits) {
+    if (pattern.loop.header.value >= function.blocks.size() ||
+        pattern.loop.preheader.value >= function.blocks.size()) {
+        return false;
+    }
+    const auto original_header_effect =
+        function.blocks[pattern.loop.header.value].effect;
+    if (original_header_effect.value >= function.effects.size() ||
+        std::none_of(
+            function.effects[original_header_effect.value].incoming.begin(),
+            function.effects[original_header_effect.value].incoming.end(),
+            [&](const EffectIncoming& incoming) {
+                return incoming.predecessor == pattern.loop.preheader;
+            })) {
+        return false;
+    }
+    const auto scalar_type =
+        function.values[pattern.compared_load.value].type;
+    const auto element_bits = type_bits(hir_module, scalar_type);
+    if (element_bits == 0 || vector_bits % element_bits != 0) return false;
+    const auto lanes = vector_bits / element_bits;
+    if (lanes < 2 || !std::has_single_bit(lanes)) return false;
+    const auto failure_operation =
+        negated_integer_comparison(pattern.continuation);
+    if (!failure_operation) return false;
+
+    const auto index_type = function.values[pattern.index.value].type;
+    const auto bool_type =
+        function.values[function.blocks[pattern.test.value]
+                            .terminator.value->value]
+            .type;
+    const auto mask_element = element_bits == 8
+        ? hir_module.builtin(BuiltinType::I8)
+        : element_bits == 16
+        ? hir_module.builtin(BuiltinType::I16)
+        : element_bits == 32
+        ? hir_module.builtin(BuiltinType::I32)
+        : hir_module.builtin(BuiltinType::I64);
+    if (!mask_element) return false;
+    const auto vector_type = hir_module.vector_of(scalar_type, lanes);
+    const auto mask_type = hir_module.vector_of(*mask_element, lanes);
+
+    const BlockId vector_header_id{
+        static_cast<std::uint32_t>(function.blocks.size())};
+    const BlockId vector_body_id{vector_header_id.value + 1U};
+    const BlockId vector_exit_id{vector_header_id.value + 2U};
+    ManagedBlock vector_header;
+    vector_header.id = vector_header_id;
+    vector_header.location = function.blocks[pattern.loop.header.value].location;
+    vector_header.predecessors = {pattern.loop.preheader, vector_body_id};
+    ManagedBlock vector_body;
+    vector_body.id = vector_body_id;
+    vector_body.location = function.blocks[pattern.test.value].location;
+    vector_body.predecessors = {vector_header_id};
+    ManagedBlock vector_exit;
+    vector_exit.id = vector_exit_id;
+    vector_exit.location = vector_header.location;
+    vector_exit.predecessors = {vector_header_id, vector_body_id};
+
+    const auto add_phi_effect = [&](SourceLocation location,
+                                    std::vector<EffectIncoming> incoming) {
+        const EffectId id{
+            static_cast<std::uint32_t>(function.effects.size())};
+        ManagedEffect effect;
+        effect.id = id;
+        effect.location = location;
+        effect.kind = EffectKind::Phi;
+        effect.incoming = std::move(incoming);
+        function.effects.push_back(std::move(effect));
+        return id;
+    };
+    const auto preheader_effect =
+        function.blocks[pattern.loop.preheader.value].terminator.effect;
+    const auto vector_header_effect = add_phi_effect(
+        vector_header.location,
+        {{pattern.loop.preheader, preheader_effect}});
+    const auto vector_body_effect = add_phi_effect(
+        vector_body.location, {{vector_header_id, vector_header_effect}});
+    const auto vector_exit_effect = add_phi_effect(
+        vector_exit.location, {{vector_header_id, vector_header_effect}});
+    vector_header.effect = vector_header_effect;
+    vector_body.effect = vector_body_effect;
+    vector_exit.effect = vector_exit_effect;
+
+    const auto append_value = [&](std::vector<ValueId>& destination,
+                                  ManagedValue value) {
+        const ValueId id{
+            static_cast<std::uint32_t>(function.values.size())};
+        value.id = id;
+        function.values.push_back(std::move(value));
+        destination.push_back(id);
+        return id;
+    };
+    auto& preheader_values =
+        function.blocks[pattern.loop.preheader.value].values;
+    const auto add_integer_constant = [&](hir::TypeId type,
+                                          std::uint64_t integer) {
+        ManagedValue value;
+        value.location = vector_header.location;
+        value.type = type;
+        value.kind = ValueKind::ConstantInteger;
+        value.integer = integer;
+        return append_value(preheader_values, std::move(value));
+    };
+    const auto lanes_constant = add_integer_constant(index_type, lanes);
+    const auto index_bits = type_bits(hir_module, index_type);
+    const auto limit_mask = mask_to(
+        bit_not(UInt128{lanes - 1U}), index_bits);
+    ManagedValue mask;
+    mask.location = vector_header.location;
+    mask.type = index_type;
+    mask.kind = ValueKind::ConstantInteger;
+    mask.integer = limit_mask.low;
+    mask.integer_high = limit_mask.high;
+    const auto mask_id = append_value(preheader_values, std::move(mask));
+    ManagedValue limit;
+    limit.location = vector_header.location;
+    limit.type = index_type;
+    limit.kind = ValueKind::Binary;
+    limit.binary = BinaryOperation::BitAnd;
+    limit.operands = {pattern.bound, mask_id};
+    const auto vector_limit =
+        append_value(preheader_values, std::move(limit));
+    ManagedValue invariant_splat;
+    invariant_splat.location =
+        function.values[pattern.invariant.value].location;
+    invariant_splat.type = vector_type;
+    invariant_splat.kind = ValueKind::Splat;
+    invariant_splat.operands = {pattern.invariant};
+    const auto vector_invariant =
+        append_value(preheader_values, std::move(invariant_splat));
+    std::vector<ValueId> lane_constants;
+    lane_constants.reserve(lanes);
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+        lane_constants.push_back(add_integer_constant(index_type, lane));
+    }
+
+    ManagedValue vector_index_phi;
+    vector_index_phi.location = vector_header.location;
+    vector_index_phi.type = index_type;
+    vector_index_phi.kind = ValueKind::Phi;
+    vector_index_phi.incoming = {
+        {pattern.loop.preheader, pattern.initial_index},
+        {vector_body_id, ValueId{}}};
+    const auto vector_index =
+        append_value(vector_header.values, std::move(vector_index_phi));
+    ManagedValue vector_range;
+    vector_range.location = vector_header.location;
+    vector_range.type = bool_type;
+    vector_range.kind = ValueKind::Binary;
+    vector_range.binary = BinaryOperation::UnsignedLess;
+    vector_range.operands = {vector_index, vector_limit};
+    const auto vector_range_id =
+        append_value(vector_header.values, std::move(vector_range));
+
+    EffectId current_effect = vector_body_effect;
+    ManagedValue vector_load;
+    vector_load.location = function.values[pattern.load.value].location;
+    vector_load.type = vector_type;
+    vector_load.kind = ValueKind::IndexedLoad;
+    vector_load.memory_alignment =
+        function.values[pattern.load.value].memory_alignment;
+    vector_load.operands = {pattern.base, vector_index};
+    vector_load.effect_input = current_effect;
+    const EffectId load_effect{
+        static_cast<std::uint32_t>(function.effects.size())};
+    vector_load.effect_output = load_effect;
+    const auto vector_load_id =
+        append_value(vector_body.values, std::move(vector_load));
+    ManagedEffect load_operation;
+    load_operation.id = load_effect;
+    load_operation.location =
+        function.values[vector_load_id.value].location;
+    load_operation.kind = EffectKind::Operation;
+    load_operation.input = current_effect;
+    load_operation.operation = vector_load_id;
+    function.effects.push_back(std::move(load_operation));
+    current_effect = load_effect;
+
+    ManagedValue failures;
+    failures.location =
+        function.values[function.blocks[pattern.test.value]
+                            .terminator.value->value]
+            .location;
+    failures.type = mask_type;
+    failures.kind = ValueKind::Binary;
+    failures.binary = *failure_operation;
+    failures.operands = pattern.load_on_left
+        ? std::vector<ValueId>{vector_load_id, vector_invariant}
+        : std::vector<ValueId>{vector_invariant, vector_load_id};
+    const auto failure_mask =
+        append_value(vector_body.values, std::move(failures));
+    ManagedValue first_extract;
+    first_extract.location = vector_body.location;
+    first_extract.type = *mask_element;
+    first_extract.kind = ValueKind::ExtractElement;
+    first_extract.operands = {failure_mask, lane_constants.front()};
+    auto reduced =
+        append_value(vector_body.values, std::move(first_extract));
+    for (unsigned lane = 1; lane < lanes; ++lane) {
+        ManagedValue extract;
+        extract.location = vector_body.location;
+        extract.type = *mask_element;
+        extract.kind = ValueKind::ExtractElement;
+        extract.operands = {failure_mask, lane_constants[lane]};
+        const auto element =
+            append_value(vector_body.values, std::move(extract));
+        ManagedValue combine;
+        combine.location = vector_body.location;
+        combine.type = *mask_element;
+        combine.kind = ValueKind::Binary;
+        combine.binary = BinaryOperation::BitOr;
+        combine.operands = {reduced, element};
+        reduced = append_value(vector_body.values, std::move(combine));
+    }
+    ManagedValue no_failure;
+    no_failure.location = vector_body.location;
+    no_failure.type = bool_type;
+    no_failure.kind = ValueKind::Unary;
+    no_failure.unary = UnaryOperation::IsZero;
+    no_failure.operands = {reduced};
+    const auto no_failure_id =
+        append_value(vector_body.values, std::move(no_failure));
+    ManagedValue vector_index_next;
+    vector_index_next.location =
+        function.values[pattern.index_next.value].location;
+    vector_index_next.type = index_type;
+    vector_index_next.kind = ValueKind::Binary;
+    vector_index_next.binary = BinaryOperation::Add;
+    vector_index_next.operands = {vector_index, lanes_constant};
+    const auto vector_index_next_id =
+        append_value(vector_body.values, std::move(vector_index_next));
+    function.values[vector_index.value].incoming[1].value =
+        vector_index_next_id;
+
+    vector_header.terminator.kind = TerminatorKind::ConditionalBranch;
+    vector_header.terminator.location = vector_header.location;
+    vector_header.terminator.value = vector_range_id;
+    vector_header.terminator.successors = {
+        vector_body_id, vector_exit_id};
+    vector_header.terminator.effect = vector_header_effect;
+    vector_body.terminator.kind = TerminatorKind::ConditionalBranch;
+    vector_body.terminator.location = vector_body.location;
+    vector_body.terminator.value = no_failure_id;
+    vector_body.terminator.successors = {
+        vector_header_id, vector_exit_id};
+    vector_body.terminator.effect = current_effect;
+    vector_exit.terminator.kind = TerminatorKind::Branch;
+    vector_exit.terminator.location = vector_exit.location;
+    vector_exit.terminator.successors = {pattern.loop.header};
+    vector_exit.terminator.effect = vector_exit_effect;
+    function.effects[vector_header_effect.value].incoming.push_back(
+        {vector_body_id, current_effect});
+    function.effects[vector_exit_effect.value].incoming.push_back(
+        {vector_body_id, current_effect});
+
+    auto& preheader = function.blocks[pattern.loop.preheader.value];
+    std::replace(preheader.terminator.successors.begin(),
+                 preheader.terminator.successors.end(),
+                 pattern.loop.header, vector_header_id);
+    auto& header = function.blocks[pattern.loop.header.value];
+    std::replace(header.predecessors.begin(), header.predecessors.end(),
+                 pattern.loop.preheader, vector_exit_id);
+    for (const auto id : header.values) {
+        auto& value = function.values[id.value];
+        if (value.kind != ValueKind::Phi) continue;
+        const auto incoming = std::find_if(
+            value.incoming.begin(), value.incoming.end(),
+            [&](const PhiIncoming& edge) {
+                return edge.predecessor == pattern.loop.preheader;
+            });
+        if (incoming == value.incoming.end()) continue;
+        incoming->predecessor = vector_exit_id;
+        if (id == pattern.index) incoming->value = vector_index;
+    }
+    auto& header_effect = function.effects[header.effect.value];
+    const auto incoming_effect = std::find_if(
+        header_effect.incoming.begin(), header_effect.incoming.end(),
+        [&](const EffectIncoming& edge) {
+            return edge.predecessor == pattern.loop.preheader;
+        });
+    incoming_effect->predecessor = vector_exit_id;
+    incoming_effect->effect = vector_exit_effect;
+
+    function.blocks.push_back(std::move(vector_header));
+    function.blocks.push_back(std::move(vector_body));
+    function.blocks.push_back(std::move(vector_exit));
+    return true;
+}
+
+bool vectorize_early_exit_loops(ManagedFunction& function,
+                                hir::Module& hir_module,
+                                const Subtarget& subtarget,
+                                const CompilerOptions& options,
+                                std::span<const CanonicalLoop> loops,
+                                const UseLists& uses) {
+    if (options.optimize_for != OptimizationGoal::Speed ||
+        options.optimization_effort < 3) {
+        return false;
+    }
+    bool changed = false;
+    const auto definitions = value_definition_blocks(function);
+    for (const auto& loop : loops) {
+        const auto pattern = find_early_exit_loop(
+            function, hir_module, loop, definitions, uses);
+        if (!pattern) continue;
+        const auto element_bits = type_bits(
+            hir_module, function.values[pattern->load.value].type);
+        const auto width = preferred_vector_bits(
+            subtarget, options, false, element_bits);
+        if (width != 0 && vectorize_early_exit_loop(
+                              function, hir_module, *pattern, width)) {
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 bool fold_integer_constants(ManagedFunction& function,
                             const hir::Module& hir_module) {
     bool changed = false;
@@ -11382,6 +11955,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     function, hir_module, subtarget, options,
                     analyses.loops().canonical_loops());
                 return PassResult::changed_cfg();
+            });
+        pipeline.add(
+            PassId::EarlyExitVectorization,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                const bool changed = vectorize_early_exit_loops(
+                    function, hir_module, subtarget, options,
+                    analyses.loops().canonical_loops(), analyses.uses());
+                return changed ? PassResult::changed_cfg()
+                               : PassResult::unchanged();
             });
     }
     // Preserve vectorizable reductions before expanding scalar bodies. The

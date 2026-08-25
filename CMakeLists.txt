@@ -775,6 +775,23 @@ if(BUILD_TESTING)
                 -DEXPECTED=16
                 "-DCC_FLAGS=-O2;-march=x86-64-v3"
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_x86_64_early_exit_vectorization
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/early_exit.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/early-exit-vectorization.s
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/vector/early_exit.cmake")
+    add_test(NAME cross_runtime_x86_64_early_exit_vectorization
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/early_exit.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-early-exit-vectorization
+                -DENTRY=early_exit_entry
+                -DEXPECTED=16
+                "-DCC_FLAGS=-O3;-march=x86-64-v3"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_wide_vectors
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/backend/native/vector/wide_runtime.x"

@@ -14,7 +14,7 @@ constexpr OpcodeProperty properties(std::string_view name) {
         name.starts_with("x86.vcmp.")) {
         result = result | OpcodeProperty::Comparison;
     }
-    if (name.starts_with("x86.test.")) {
+    if (name.starts_with("x86.test.") || name.starts_with("x86.vtest.")) {
         result = result | OpcodeProperty::Test;
     }
     if (name.starts_with("x86.f") && !name.starts_with("x86.fixed.")) {

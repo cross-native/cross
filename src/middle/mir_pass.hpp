@@ -26,6 +26,7 @@ enum class PassId : std::uint8_t {
     InductionCoalescing,
     LoopInvariantMotion,
     ReductionVectorization,
+    EarlyExitVectorization,
     LoopUnrolling,
     RecurrenceRebalancing,
     SlpVectorization,

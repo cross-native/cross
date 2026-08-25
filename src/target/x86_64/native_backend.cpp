@@ -47,6 +47,7 @@ enum class LoweringPass : std::uint16_t {
     FuseCompareSelects,
     FuseVectorSignSelects,
     FuseCompareBranches,
+    HoistVectorComparisonSignMasks,
     FormDenseJumpTables,
     FoldIndexedAddresses,
     EliminateRedundantLoadsLate,
@@ -3212,6 +3213,101 @@ private:
 
             const auto truth = terminator.operands[1];
             const auto falsity = terminator.operands[2];
+            if (iszero && definition->uses.size() == 1) {
+                const auto reduced = definition->uses.front();
+                const auto reduction_definition = std::find_if(
+                    block.instructions.begin(), definition,
+                    [&](const machine::Instruction& instruction) {
+                        return instruction.defs.size() == 1 &&
+                               instruction.defs.front() == reduced;
+                    });
+                const auto* initial = reduction_definition != definition &&
+                        !reduction_definition->operands.empty()
+                    ? std::get_if<machine::ImmediateOperand>(
+                          &reduction_definition->operands.front())
+                    : nullptr;
+                const auto* shape = reduction_definition != definition &&
+                        !reduction_definition->operands.empty()
+                    ? std::get_if<machine::ImmediateOperand>(
+                          &reduction_definition->operands.back())
+                    : nullptr;
+                if (reduced.kind == machine::RegisterKind::Virtual &&
+                    reduced.id < uses.size() && uses[reduced.id] == 1 &&
+                    reduction_definition != definition &&
+                    reduction_definition->opcode == Opcode::VreduceOr &&
+                    reduction_definition->uses.size() == 1 &&
+                    reduction_definition->uses.front().mode.bits <= 256 &&
+                    reduction_definition->operands.size() >= 3 && initial &&
+                    initial->value == 0 && initial->high == 0 && shape &&
+                    subtarget_.has_feature(Feature::Avx)) {
+                    const auto mask = reduction_definition->uses.front();
+                    const auto comparison_definition = std::find_if(
+                        block.instructions.begin(), reduction_definition,
+                        [&](const machine::Instruction& instruction) {
+                            return instruction.defs.size() == 1 &&
+                                   instruction.defs.front() == mask;
+                        });
+                    const bool fold_comparison =
+                        comparison_definition != reduction_definition &&
+                        comparison_definition->kind ==
+                            machine::InstructionKind::Target &&
+                        has_property(comparison_definition->opcode,
+                                     OpcodeProperty::Comparison) &&
+                        has_property(comparison_definition->opcode,
+                                     OpcodeProperty::Vector) &&
+                        !has_property(comparison_definition->opcode,
+                                      OpcodeProperty::Floating) &&
+                        comparison_definition->uses.size() == 2 &&
+                        comparison_definition->operands.size() >= 3 &&
+                        comparison_definition->defs.front().mode.bits ==
+                            mask.mode.bits &&
+                        !comparison_definition->patch &&
+                        !comparison_definition->may_load &&
+                        !comparison_definition->may_store &&
+                        !comparison_definition->has_side_effects;
+                    if (fold_comparison) {
+                        terminator.condition_predicate = Opcode::VcmpNone;
+                        terminator.uses = comparison_definition->uses;
+                        terminator.operands = {
+                            comparison_definition->operands[0], truth,
+                            falsity, comparison_definition->operands[1],
+                            machine::ImmediateOperand{
+                                comparison_definition->opcode.value, 0,
+                                machine::i32, false},
+                            comparison_definition->operands.back()};
+                        terminator.clobbers = comparison_definition->clobbers;
+                        // XMM0/XMM1 are explicit operand/result scratches in
+                        // the compare emitter and remain available to the
+                        // allocator.  XMM2 and RAX are implicit helpers for
+                        // sign bias/inversion and must be modeled here.
+                        for (const auto name :
+                             {"xmm0", "xmm1", "xmm2", "rax"}) {
+                            const auto* scratch = find_register_view(name);
+                            if (!scratch) continue;
+                            const auto mode = scratch->register_class ==
+                                                      RegisterClass::simd
+                                ? machine::i128
+                                : machine::i64;
+                            terminator.clobbers.push_back(
+                                machine::Register::physical_register(
+                                    {scratch->storage_id}, mode));
+                        }
+                    } else {
+                        terminator.condition_predicate = Opcode::VtestNone;
+                        terminator.uses = reduction_definition->uses;
+                        terminator.operands = {
+                            reduction_definition->operands[1], truth,
+                            falsity,
+                            reduction_definition->operands.back()};
+                    }
+                    block.instructions.erase(definition);
+                    block.instructions.erase(reduction_definition);
+                    if (fold_comparison) {
+                        block.instructions.erase(comparison_definition);
+                    }
+                    continue;
+                }
+            }
             if ((base == Opcode::CmpEq || base == Opcode::CmpNe) &&
                 has_property(definition->opcode,
                              OpcodeProperty::Immediate) &&
@@ -3267,6 +3363,305 @@ private:
             }
             block.instructions.erase(definition);
         }
+    }
+
+    void hoist_vector_comparison_sign_masks() {
+        if (options_.optimization_effort < 3 ||
+            options_.optimize_for != OptimizationGoal::Speed ||
+            !subtarget_.has_feature(Feature::Avx2) ||
+            current_.entry.value >= current_.blocks.size()) {
+            return;
+        }
+
+        const auto mask_key = [&](const machine::Instruction& instruction)
+            -> std::optional<std::uint64_t> {
+            if (instruction.kind !=
+                    machine::InstructionKind::ConditionalBranch ||
+                instruction.condition_predicate != Opcode::VcmpNone ||
+                instruction.uses.size() != 2 ||
+                instruction.operands.size() < 6 ||
+                (instruction.uses.front().mode.bits != 128 &&
+                 instruction.uses.front().mode.bits != 256)) {
+                return std::nullopt;
+            }
+            const auto* encoded =
+                std::get_if<machine::ImmediateOperand>(
+                    &instruction.operands[instruction.operands.size() - 2]);
+            const auto* shape =
+                std::get_if<machine::ImmediateOperand>(
+                    &instruction.operands.back());
+            if (!encoded || !shape || shape->high >> 32U != 0 ||
+                (shape->value != 8 && shape->value != 16 &&
+                 shape->value != 32 && shape->value != 64)) {
+                return std::nullopt;
+            }
+            const auto opcode = decode_opcode(
+                machine::TargetOpcodeId{
+                    static_cast<std::uint32_t>(encoded->value)});
+            if (opcode != Opcode::VcmpUlt && opcode != Opcode::VcmpUle &&
+                opcode != Opcode::VcmpUgt && opcode != Opcode::VcmpUge) {
+                return std::nullopt;
+            }
+            return (static_cast<std::uint64_t>(
+                        instruction.uses.front().mode.bits)
+                    << 32U) |
+                shape->value;
+        };
+
+        struct MaskRequest {
+            machine::Operand shape;
+            SourceLocation location;
+        };
+        std::unordered_map<std::uint64_t, MaskRequest> requests;
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                const auto key = mask_key(instruction);
+                if (key) {
+                    requests.try_emplace(
+                        *key,
+                        MaskRequest{instruction.operands.back(),
+                                    instruction.location});
+                }
+            }
+        }
+        if (requests.empty()) return;
+
+        const auto create_vector_temporary =
+            [&](machine::IntegerMode mode, SourceLocation location) {
+                const machine::VirtualRegisterId id{
+                    static_cast<std::uint32_t>(
+                        current_.virtual_registers.size())};
+                current_.virtual_registers.push_back(mode);
+                current_.virtual_register_assignments.push_back(
+                    std::nullopt);
+                current_.rematerialized_immediates.push_back(std::nullopt);
+                current_.virtual_register_classes.push_back(
+                    machine::VirtualRegisterClass::Vector);
+                machine::StackSlot spill;
+                spill.id = {static_cast<std::uint32_t>(
+                    current_.stack_slots.size())};
+                spill.kind = machine::StackSlotKind::Spill;
+                spill.size = mode_bytes(mode);
+                spill.alignment = mode_alignment(mode);
+                spill.location = location;
+                spill.name = "$v" + std::to_string(id.value);
+                spill.spill_for = id;
+                current_.stack_slots.push_back(std::move(spill));
+                return machine::Register::virtual_register(id, mode);
+            };
+
+        std::unordered_map<std::uint64_t, machine::Register> masks;
+        std::vector<machine::Instruction> materializers;
+        for (const auto& [key, request] : requests) {
+            const auto bits = static_cast<unsigned>(key >> 32U);
+            const machine::IntegerMode mode{
+                static_cast<std::uint16_t>(bits)};
+            const auto mask = create_vector_temporary(
+                mode, request.location);
+            masks.emplace(key, mask);
+            auto materialize = target_instruction(
+                Opcode::VsignMask, request.location);
+            materialize.defs.push_back(mask);
+            materialize.operands.push_back(request.shape);
+            const auto element_bits =
+                static_cast<unsigned>(key & 0xffffffffULL);
+            if (element_bits == 8) {
+                if (const auto* scratch = find_register_view("xmm2")) {
+                    materialize.clobbers.push_back(
+                        machine::Register::physical_register(
+                            {scratch->storage_id}, machine::i128));
+                }
+            }
+            materializers.push_back(std::move(materialize));
+        }
+
+        struct Definition {
+            std::size_t block{};
+            machine::TargetOpcodeId opcode;
+        };
+        std::unordered_map<std::uint32_t, Definition> definitions;
+        for (std::size_t block_index = 0;
+             block_index < current_.blocks.size(); ++block_index) {
+            for (const auto& instruction :
+                 current_.blocks[block_index].instructions) {
+                for (const auto definition : instruction.defs) {
+                    if (definition.kind ==
+                            machine::RegisterKind::Virtual) {
+                        definitions[definition.id] = {
+                            block_index, instruction.opcode};
+                    }
+                }
+            }
+        }
+
+        std::unordered_map<std::uint64_t, machine::Register> biased_values;
+        std::unordered_map<std::uint32_t,
+                           std::vector<machine::Instruction>>
+            biases_after_definition;
+        std::vector<machine::Instruction> entry_biases;
+        const auto signed_comparison = [](Opcode opcode) {
+            switch (opcode) {
+            case Opcode::VcmpUlt: return Opcode::VcmpSlt;
+            case Opcode::VcmpUle: return Opcode::VcmpSle;
+            case Opcode::VcmpUgt: return Opcode::VcmpSgt;
+            case Opcode::VcmpUge: return Opcode::VcmpSge;
+            default: return opcode;
+            }
+        };
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                const auto key = mask_key(instruction);
+                if (!key) continue;
+                const auto mask = masks.at(*key);
+                instruction.uses.push_back(mask);
+                instruction.operands.insert(
+                    instruction.operands.end() - 2,
+                    register_operand(mask));
+                const auto* xmm2 = find_register_view("xmm2");
+                const auto* rax = find_register_view("rax");
+                std::erase_if(
+                    instruction.clobbers,
+                    [&](const machine::Register& clobber) {
+                        return clobber.kind ==
+                                   machine::RegisterKind::Physical &&
+                            ((xmm2 && clobber.id == xmm2->storage_id) ||
+                             (rax && clobber.id == rax->storage_id));
+                    });
+
+                // On AVX2, unsigned packed comparisons are signed compares
+                // after XORing each lane's sign bit.  Make those biases
+                // explicit Machine IR values: an invariant splat can then be
+                // biased once, while the ordinary vector-memory fold turns
+                // the streamed load's bias into a memory-source VPXOR.
+                const auto left_definition =
+                    definitions.find(instruction.uses[0].id);
+                const auto right_definition =
+                    definitions.find(instruction.uses[1].id);
+                if (left_definition == definitions.end() ||
+                    right_definition == definitions.end()) {
+                    continue;
+                }
+                const auto is_splat = [](machine::TargetOpcodeId opcode) {
+                    return opcode == Opcode::Vsplat ||
+                           opcode == Opcode::VsplatConstant;
+                };
+                const auto is_indexed_load =
+                    [](machine::TargetOpcodeId opcode) {
+                        return opcode == Opcode::VindexedLoad;
+                    };
+                const bool left_splat =
+                    is_splat(left_definition->second.opcode);
+                const bool right_splat =
+                    is_splat(right_definition->second.opcode);
+                const bool canonical =
+                    (left_splat &&
+                     is_indexed_load(right_definition->second.opcode)) ||
+                    (right_splat &&
+                     is_indexed_load(left_definition->second.opcode));
+                if (!canonical) continue;
+
+                const auto shape = instruction.operands.back();
+                const auto bias_value =
+                    [&](machine::Register source,
+                        const Definition& definition,
+                        bool splat) {
+                        const auto bias_key =
+                            (static_cast<std::uint64_t>(mask.id) << 32U) |
+                            source.id;
+                        const auto found = biased_values.find(bias_key);
+                        if (found != biased_values.end()) {
+                            return found->second;
+                        }
+                        const auto result = create_vector_temporary(
+                            source.mode, instruction.location);
+                        auto bias = target_instruction(
+                            Opcode::Vxor, instruction.location);
+                        bias.defs.push_back(result);
+                        bias.uses = {source, mask};
+                        bias.operands = {
+                            register_operand(source),
+                            register_operand(mask), shape};
+                        biased_values.emplace(bias_key, result);
+                        if (splat &&
+                            definition.block == current_.entry.value) {
+                            entry_biases.push_back(std::move(bias));
+                        } else {
+                            biases_after_definition[source.id].push_back(
+                                std::move(bias));
+                        }
+                        return result;
+                    };
+                const auto original_opcode = decode_opcode(
+                    machine::TargetOpcodeId{
+                        static_cast<std::uint32_t>(
+                            std::get<machine::ImmediateOperand>(
+                                instruction.operands[
+                                    instruction.operands.size() - 2])
+                                .value)});
+                const auto biased_left = bias_value(
+                    instruction.uses[0], left_definition->second,
+                    left_splat);
+                const auto biased_right = bias_value(
+                    instruction.uses[1], right_definition->second,
+                    right_splat);
+                instruction.uses[0] = biased_left;
+                instruction.uses[1] = biased_right;
+                instruction.operands[0] = register_operand(biased_left);
+                instruction.operands[3] = register_operand(biased_right);
+                auto& encoded = std::get<machine::ImmediateOperand>(
+                    instruction.operands[
+                        instruction.operands.size() - 2]);
+                encoded.value = static_cast<std::uint64_t>(
+                    signed_comparison(original_opcode));
+                if (original_opcode == Opcode::VcmpUlt ||
+                    original_opcode == Opcode::VcmpUgt) {
+                    instruction.uses.erase(instruction.uses.begin() + 2);
+                    instruction.operands.erase(
+                        instruction.operands.end() - 3);
+                }
+            }
+        }
+
+        if (!biases_after_definition.empty()) {
+            for (auto& block : current_.blocks) {
+                std::vector<machine::Instruction> rewritten;
+                rewritten.reserve(block.instructions.size());
+                for (auto& instruction : block.instructions) {
+                    std::optional<std::uint32_t> definition;
+                    if (instruction.defs.size() == 1 &&
+                        instruction.defs.front().kind ==
+                            machine::RegisterKind::Virtual) {
+                        definition = instruction.defs.front().id;
+                    }
+                    rewritten.push_back(std::move(instruction));
+                    if (!definition) continue;
+                    const auto found =
+                        biases_after_definition.find(*definition);
+                    if (found == biases_after_definition.end()) continue;
+                    rewritten.insert(
+                        rewritten.end(),
+                        std::make_move_iterator(found->second.begin()),
+                        std::make_move_iterator(found->second.end()));
+                }
+                block.instructions = std::move(rewritten);
+            }
+        }
+
+        auto& entry = current_.blocks[current_.entry.value];
+        const auto position = entry.instructions.empty()
+            ? entry.instructions.end()
+            : std::prev(entry.instructions.end());
+        entry.instructions.insert(
+            position,
+            std::make_move_iterator(materializers.begin()),
+            std::make_move_iterator(materializers.end()));
+        const auto bias_position = entry.instructions.empty()
+            ? entry.instructions.end()
+            : std::prev(entry.instructions.end());
+        entry.instructions.insert(
+            bias_position,
+            std::make_move_iterator(entry_biases.begin()),
+            std::make_move_iterator(entry_biases.end()));
     }
 
     void form_dense_jump_tables() {
@@ -4048,7 +4443,8 @@ private:
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
                 auto& consumer = block.instructions[index];
-                if (consumer.opcode != Opcode::Vadd ||
+                if ((consumer.opcode != Opcode::Vadd &&
+                     consumer.opcode != Opcode::Vxor) ||
                     consumer.defs.size() != 1 ||
                     consumer.uses.size() != 2 ||
                     consumer.operands.size() < 3) {
@@ -4089,10 +4485,10 @@ private:
                             &consumer.operands.back());
                     const bool floating = metadata &&
                         (metadata->high & (1ULL << 32U)) != 0;
-                    // Start with exact integer addition, the hot reduction
-                    // form. Floating contraction/reassociation and the
-                    // noncommutative packed operations need separate legality
-                    // rules before their loads can become memory operands.
+                    // Exact integer addition and XOR are commutative and may
+                    // consume the indexed load directly. Floating
+                    // contraction/reassociation and noncommutative packed
+                    // operations need separate legality rules.
                     if (floating) continue;
                     const bool crosses_write = std::any_of(
                         block.instructions.begin() +
@@ -5245,8 +5641,15 @@ private:
                     instruction.opcode == Opcode::Vxor ||
                     instruction.opcode == Opcode::Vbswap16 ||
                     instruction.opcode == Opcode::Vbswap16Mask ||
+                    instruction.opcode == Opcode::VsignMask ||
                     instruction.opcode == Opcode::Vselect ||
                     instruction.opcode == Opcode::VselectSign;
+                if (instruction.kind ==
+                        machine::InstructionKind::ConditionalBranch &&
+                    (instruction.condition_predicate == Opcode::VtestNone ||
+                     instruction.condition_predicate == Opcode::VcmpNone)) {
+                    vector_register_safe = true;
+                }
                 if (subtarget_.has_feature(Feature::Avx2) &&
                     (instruction.opcode == Opcode::Vshl ||
                      instruction.opcode == Opcode::VshrS ||
@@ -5658,8 +6061,11 @@ private:
                     // and indirect-memory paths excluded here.
                     return true;
                 }
-                if (opcode == Opcode::Vphi || opcode == Opcode::Vsplat ||
+                if (opcode == Opcode::Vphi ||
+                    opcode == Opcode::VsignMask ||
+                    opcode == Opcode::Vsplat ||
                     opcode == Opcode::VsplatConstant ||
+                    opcode == Opcode::Vxor ||
                     opcode == Opcode::VindexedLoad ||
                     opcode == Opcode::VindexedStore ||
                     opcode == Opcode::VpointerLoad ||
@@ -6146,16 +6552,17 @@ private:
                     }
                 }
                 const bool uses_wide_integer_scratch =
-                    std::any_of(
-                        item->defs.begin(), item->defs.end(),
-                        [](const machine::Register& reg) {
-                            return reg.mode.bits > 64;
-                        }) ||
-                    std::any_of(
-                        item->uses.begin(), item->uses.end(),
-                        [](const machine::Register& reg) {
-                            return reg.mode.bits > 64;
-                        });
+                    !safe_without_extra_integer_scratch(*item) &&
+                    (std::any_of(
+                         item->defs.begin(), item->defs.end(),
+                         [](const machine::Register& reg) {
+                             return reg.mode.bits > 64;
+                         }) ||
+                     std::any_of(
+                         item->uses.begin(), item->uses.end(),
+                         [](const machine::Register& reg) {
+                             return reg.mode.bits > 64;
+                         }));
                 if (uses_wide_integer_scratch && r8 && r9) {
                     for (const auto id : live) {
                         forbidden[id].insert(r8->storage_id);
@@ -6806,6 +7213,7 @@ private:
                                    base == Opcode::Fmul ||
                                    base == Opcode::Fdiv ||
                                    instruction.opcode == Opcode::Vphi ||
+                                   instruction.opcode == Opcode::VsignMask ||
                                    instruction.opcode == Opcode::Vsplat ||
                                    instruction.opcode ==
                                        Opcode::VsplatConstant ||
@@ -6953,9 +7361,11 @@ private:
                                 has_property(base,
                                              OpcodeProperty::Comparison) ||
                                 instruction.opcode == Opcode::Vphi ||
+                                instruction.opcode == Opcode::VsignMask ||
                                 instruction.opcode == Opcode::Vsplat ||
                                 instruction.opcode == Opcode::Vadd ||
                                 instruction.opcode == Opcode::Vsub ||
+                                instruction.opcode == Opcode::Vxor ||
                                 instruction.opcode == Opcode::Vmul ||
                                 instruction.opcode == Opcode::VmulImm ||
                                 instruction.opcode == Opcode::Vsdiv ||
@@ -8221,6 +8631,10 @@ private:
         add(LoweringPass::FuseCompareBranches, Stage::InstructionCombining,
             "fuse-compare-branches",
             &MachineLowerer::fuse_compare_branches);
+        add(LoweringPass::HoistVectorComparisonSignMasks,
+            Stage::InstructionCombining,
+            "hoist-vector-comparison-sign-masks",
+            &MachineLowerer::hoist_vector_comparison_sign_masks);
         add(LoweringPass::FormDenseJumpTables, Stage::ControlFlow,
             "form-dense-jump-tables", &MachineLowerer::form_dense_jump_tables);
         add(LoweringPass::FoldIndexedAddresses, Stage::InstructionCombining,
@@ -10854,7 +11268,7 @@ private:
     void emit_vector_integer_compare(
         const machine::Function& function,
         const machine::Instruction& value, const VectorShape& shape,
-        unsigned width) {
+        unsigned width, bool test_none = false) {
         const auto predicate = vector_compare_predicate(value.opcode);
         if (!predicate) {
             diagnostics_.error(value.location,
@@ -10874,14 +11288,21 @@ private:
                           value.opcode == Opcode::VcmpUlt ||
                           value.opcode == Opcode::VcmpSge ||
                           value.opcode == Opcode::VcmpUge;
+        const bool supplied_test_mask =
+            test_none && value.uses.size() >= 3;
+        const bool test_all = supplied_test_mask && invert;
         const auto left_register = vector_register(
             value.uses[0], 0, width);
         const auto right_register = vector_register(
             value.uses[1], 1, width);
-        for (unsigned chunk = 0;
-             chunk < vector_chunks(value.defs.front(), width); ++chunk) {
+        const auto chunks = test_none
+            ? 1U : vector_chunks(value.defs.front(), width);
+        for (unsigned chunk = 0; chunk < chunks; ++chunk) {
             load_vector(function, value.uses[0], 0, chunk, width);
             load_vector(function, value.uses[1], 1, chunk, width);
+            if (supplied_test_mask) {
+                load_vector(function, value.uses[2], 2, chunk, width);
+            }
             if (width == 512) {
                 const auto root = unsigned_compare ? "vpcmpu" : "vpcmp";
                 instruction(std::string(root) +
@@ -10903,20 +11324,29 @@ private:
                 auto left_operand = left_register;
                 auto right_operand = right_register;
                 if (unsigned_compare && !equal) {
-                    emit_vector_compare_sign_bias(width, shape.element_bits);
+                    std::string bias = prefix + "2";
+                    if (supplied_test_mask) {
+                        bias = vector_register(
+                            value.uses[2], 2, width);
+                    } else {
+                        emit_vector_compare_sign_bias(
+                            width, shape.element_bits);
+                    }
                     left_operand = prefix + "0";
                     right_operand = prefix + "1";
-                    instruction("vpxor", "%" + prefix + "2, %" +
+                    instruction("vpxor", "%" + bias + ", %" +
                                             left_register + ", %" +
                                             left_operand);
-                    instruction("vpxor", "%" + prefix + "2, %" +
+                    instruction("vpxor", "%" + bias + ", %" +
                                             right_register + ", %" +
                                             right_operand);
                 }
-                auto destination = vector_is_assigned(
-                    function, value.defs.front(), width)
-                    ? vector_register(value.defs.front(), 2, width)
-                    : prefix + "0";
+                auto destination = test_none
+                    ? prefix + "0"
+                    : vector_is_assigned(
+                          function, value.defs.front(), width)
+                        ? vector_register(value.defs.front(), 2, width)
+                        : prefix + "0";
                 const auto compare =
                     std::string(equal ? "vpcmpeq" : "vpcmpgt") +
                     packed_lane_suffix(shape.element_bits);
@@ -10926,7 +11356,7 @@ private:
                                       right_operand + ", %" + destination
                                 : "%" + right_operand + ", %" +
                                       left_operand + ", %" + destination);
-                if (invert) {
+                if (invert && !test_all) {
                     instruction("vpcmpeqd", "%" + prefix + "2, %" +
                                                  prefix + "2, %" +
                                                  prefix + "2");
@@ -10934,8 +11364,16 @@ private:
                                             destination + ", %" +
                                             destination);
                 }
-                store_vector_from(function, value.defs.front(), destination,
-                                  chunk, width);
+                if (test_none) {
+                    const auto tested = test_all
+                        ? vector_register(value.uses[2], 2, width)
+                        : destination;
+                    instruction("vptest", "%" + tested + ", %" +
+                                             destination);
+                } else {
+                    store_vector_from(function, value.defs.front(),
+                                      destination, chunk, width);
+                }
                 continue;
             }
             if (unsigned_compare && !equal) {
@@ -10951,11 +11389,18 @@ private:
             } else {
                 instruction(compare, "%xmm1, %xmm0");
             }
-            if (invert) {
+            if (invert && !test_all) {
                 instruction("pcmpeqd", "%xmm2, %xmm2");
                 instruction("pxor", "%xmm2, %xmm0");
             }
-            store_vector(function, value.defs.front(), 0, chunk, width);
+            if (test_none) {
+                const auto tested = test_all
+                    ? vector_register(value.uses[2], 2, width)
+                    : std::string("xmm0");
+                instruction("vptest", "%" + tested + ", %xmm0");
+            } else {
+                store_vector(function, value.defs.front(), 0, chunk, width);
+            }
         }
     }
 
@@ -12099,6 +12544,47 @@ private:
 
     void emit_vector_binary(const machine::Function& function,
                             const machine::Instruction& value) {
+        if (value.opcode == Opcode::VsignMask) {
+            const auto shape = vector_shape(value);
+            if (value.defs.size() != 1 || value.operands.size() != 1 ||
+                shape.lanes * shape.element_bits !=
+                    value.defs.front().mode.bits ||
+                (shape.element_bits != 8 && shape.element_bits != 16 &&
+                 shape.element_bits != 32 && shape.element_bits != 64)) {
+                diagnostics_.error(
+                    value.location,
+                    "invalid packed sign-mask materialization");
+                return;
+            }
+            const auto target = value.defs.front();
+            const auto width = memory_vector_width(target);
+            const auto destination = vector_register(target, 0, width);
+            for (unsigned chunk = 0;
+                 chunk < vector_chunks(target, width); ++chunk) {
+                instruction("vpcmpeqd", "%" + destination + ", %" +
+                                             destination + ", %" +
+                                             destination);
+                if (shape.element_bits == 8) {
+                    instruction("vpsllw", "$15, %" + destination +
+                                               ", %" + destination);
+                    const auto scratch = width == 256 ? "ymm2" : "xmm2";
+                    instruction("vpsrlw", "$8, %" + destination + ", %" +
+                                              std::string(scratch));
+                    instruction("vpor", "%" + std::string(scratch) +
+                                            ", %" + destination + ", %" +
+                                            destination);
+                } else {
+                    const auto shift = shape.element_bits - 1U;
+                    instruction(
+                        "vpsll" + packed_lane_suffix(shape.element_bits),
+                        "$" + std::to_string(shift) + ", %" + destination +
+                            ", %" + destination);
+                }
+                store_vector_from(function, target, destination,
+                                  chunk, width);
+            }
+            return;
+        }
         if (value.opcode == Opcode::Vbswap16Mask) {
             if (value.defs.size() != 1) {
                 diagnostics_.error(value.location,
@@ -20297,7 +20783,78 @@ private:
                 std::get<machine::BlockOperand>(value.operands[2]).target;
             std::string truth_code = "ne";
             std::string falsity_code = "e";
-            if (has_property(value.condition_predicate,
+            if (value.condition_predicate == Opcode::VcmpNone) {
+                if ((value.uses.size() != 2 && value.uses.size() != 3) ||
+                    value.operands.size() < 6 ||
+                    value.uses[0].mode != value.uses[1].mode ||
+                    (value.uses.size() == 3 &&
+                     value.uses[0].mode != value.uses[2].mode) ||
+                    (value.uses.front().mode.bits != 128 &&
+                     value.uses.front().mode.bits != 256) ||
+                    !subtarget_.has_feature(Feature::Avx)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused x86 vector-comparison branch");
+                    return;
+                }
+                const auto* encoded =
+                    std::get_if<machine::ImmediateOperand>(
+                        &value.operands[value.operands.size() - 2]);
+                const auto comparison_opcode = encoded
+                    ? machine::TargetOpcodeId{
+                          static_cast<std::uint32_t>(encoded->value)}
+                    : machine::TargetOpcodeId{};
+                if (!encoded ||
+                    !has_property(comparison_opcode,
+                                  OpcodeProperty::Comparison) ||
+                    !has_property(comparison_opcode,
+                                  OpcodeProperty::Vector) ||
+                    has_property(comparison_opcode,
+                                 OpcodeProperty::Floating) ||
+                    !vector_compare_predicate(comparison_opcode)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused x86 vector-comparison predicate");
+                    return;
+                }
+                machine::Instruction comparison;
+                comparison.kind = machine::InstructionKind::Target;
+                comparison.opcode = comparison_opcode;
+                comparison.location = value.location;
+                comparison.operands = {
+                    value.operands[0], value.operands[3],
+                    value.operands.back()};
+                comparison.uses = value.uses;
+                const bool tests_all = value.uses.size() == 3 &&
+                    (comparison_opcode == Opcode::VcmpSle ||
+                     comparison_opcode == Opcode::VcmpSge ||
+                     comparison_opcode == Opcode::VcmpUle ||
+                     comparison_opcode == Opcode::VcmpUge);
+                truth_code = tests_all ? "b" : "e";
+                falsity_code = tests_all ? "ae" : "ne";
+                emit_vector_integer_compare(
+                    function, comparison, vector_shape(comparison),
+                    value.uses.front().mode.bits, true);
+            } else if (value.condition_predicate == Opcode::VtestNone) {
+                if (value.uses.size() != 1 || value.operands.size() < 4 ||
+                    (value.uses.front().mode.bits != 128 &&
+                     value.uses.front().mode.bits != 256) ||
+                    !subtarget_.has_feature(Feature::Avx)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused x86 vector-test branch");
+                    return;
+                }
+                truth_code = "e";
+                falsity_code = "ne";
+                const auto source = value.uses.front();
+                const auto width = source.mode.bits;
+                load_vector(function, source, 0, 0, width);
+                const auto source_register =
+                    vector_register(source, 0, width);
+                instruction("vptest", "%" + source_register + ", %" +
+                                         source_register);
+            } else if (has_property(value.condition_predicate,
                              OpcodeProperty::Test)) {
                 if (value.uses.size() != 1 || value.operands.size() < 4) {
                     diagnostics_.error(
