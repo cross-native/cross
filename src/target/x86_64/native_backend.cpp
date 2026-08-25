@@ -9095,6 +9095,12 @@ private:
         machine::BlockId successor;
     };
 
+    struct SpeculativeVectorAdvance {
+        const machine::Instruction* additive{};
+        machine::Register index;
+        std::uint32_t step{};
+    };
+
     unsigned byte_swap_literal_bytes_{};
 
     static bool same_immediate(const machine::ImmediateOperand& left,
@@ -11063,6 +11069,162 @@ private:
                 }
             }
         }
+    }
+
+    void plan_speculative_vector_advances(
+        const machine::Function& function) {
+        speculative_vector_advances_.clear();
+        speculative_vector_advance_adds_.clear();
+        if (!options_.peephole2 || options_.optimization_effort < 3 ||
+            options_.optimize_for != OptimizationGoal::Speed) {
+            return;
+        }
+
+        std::vector<unsigned> uses(function.virtual_registers.size());
+        for (const auto& block_value : function.blocks) {
+            for (const auto& instruction_value : block_value.instructions) {
+                for (const auto use : instruction_value.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+
+        std::unordered_map<std::uint32_t, std::size_t> layout_position;
+        for (std::size_t index = 0; index < function.layout.size(); ++index) {
+            layout_position.emplace(function.layout[index].value, index);
+        }
+
+        for (const auto& owner : function.blocks) {
+            if (owner.instructions.size() < 2) continue;
+            const auto& terminator = owner.instructions.back();
+            const auto& additive = owner.instructions[
+                owner.instructions.size() - 2U];
+            if (terminator.kind !=
+                    machine::InstructionKind::ConditionalBranch ||
+                (terminator.condition_predicate != Opcode::VcmpNone &&
+                 terminator.condition_predicate != Opcode::VtestNone) ||
+                terminator.operands.size() < 3 ||
+                additive.kind != machine::InstructionKind::Target ||
+                additive.opcode != Opcode::AddImm ||
+                additive.defs.size() != 1 || additive.uses.size() != 1 ||
+                additive.operands.size() < 2 || additive.patch ||
+                additive.may_load || additive.may_store ||
+                additive.has_side_effects || !additive.clobbers.empty() ||
+                fused_integer_add_outputs_.contains(&additive)) {
+                continue;
+            }
+
+            const auto* truth_operand = std::get_if<machine::BlockOperand>(
+                &terminator.operands[1]);
+            const auto* false_operand = std::get_if<machine::BlockOperand>(
+                &terminator.operands[2]);
+            const auto owner_position = layout_position.find(owner.id.value);
+            const auto truth_position = truth_operand
+                ? layout_position.find(truth_operand->target.value)
+                : layout_position.end();
+            if (!truth_operand || !false_operand ||
+                truth_operand->target == false_operand->target ||
+                owner_position == layout_position.end() ||
+                truth_position == layout_position.end() ||
+                truth_position->second > owner_position->second) {
+                continue;
+            }
+
+            const auto output = additive.defs.front();
+            const auto index = additive.uses.front();
+            const auto* input_operand = std::get_if<machine::RegisterOperand>(
+                &additive.operands[0]);
+            const auto* immediate = std::get_if<machine::ImmediateOperand>(
+                &additive.operands[1]);
+            if (output.kind != machine::RegisterKind::Virtual ||
+                output.id >= uses.size() || uses[output.id] != 1 ||
+                index.kind != machine::RegisterKind::Virtual ||
+                output.mode != index.mode ||
+                (index.mode.bits != 32 && index.mode.bits != 64) ||
+                !input_operand || input_operand->value != index ||
+                !immediate || immediate->high != 0 ||
+                immediate->value == 0 ||
+                immediate->value >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int32_t>::max()) ||
+                !assigned_integer_register(function, index)) {
+                continue;
+            }
+
+            bool found_advance = false;
+            bool found_other_copy = false;
+            const auto& continuation =
+                block(function, truth_operand->target);
+            for (const auto& phi : continuation.instructions) {
+                if (phi.kind != machine::InstructionKind::Target ||
+                    (phi.opcode != Opcode::Phi &&
+                     phi.opcode != Opcode::Fphi &&
+                     phi.opcode != Opcode::Vphi) ||
+                    phi.defs.size() != 1) {
+                    continue;
+                }
+                for (std::size_t operand_index = 0;
+                     operand_index + 1 < phi.operands.size();
+                     operand_index += 2) {
+                    const auto* incoming_block =
+                        std::get_if<machine::BlockOperand>(
+                            &phi.operands[operand_index]);
+                    if (!incoming_block || incoming_block->target != owner.id) {
+                        continue;
+                    }
+                    const auto* incoming_value =
+                        std::get_if<machine::RegisterOperand>(
+                            &phi.operands[operand_index + 1]);
+                    if (!incoming_value) {
+                        found_other_copy = true;
+                        break;
+                    }
+                    const auto source = incoming_value->value;
+                    const auto target = phi.defs.front();
+                    if (source == target || same_physical_assignment(
+                                                function, source, target)) {
+                        break;
+                    }
+                    if (!found_advance && phi.opcode == Opcode::Phi &&
+                        source == output && target == index) {
+                        found_advance = true;
+                    } else {
+                        found_other_copy = true;
+                    }
+                    break;
+                }
+            }
+            if (!found_advance || found_other_copy) continue;
+
+            speculative_vector_advances_.emplace(
+                &terminator,
+                SpeculativeVectorAdvance{
+                    &additive, index,
+                    static_cast<std::uint32_t>(immediate->value)});
+            speculative_vector_advance_adds_.insert(&additive);
+        }
+    }
+
+    void emit_speculative_vector_advance(
+        const machine::Function& function,
+        const SpeculativeVectorAdvance& advance,
+        bool restore) {
+        const auto* assigned =
+            assigned_integer_register(function, advance.index);
+        if (!assigned) {
+            diagnostics_.error(
+                advance.additive->location,
+                "speculative x86 vector advance lost its register assignment");
+            return;
+        }
+        const auto bits = advance.index.mode.bits;
+        instruction(
+            std::string(restore ? "sub" : "add") + suffix(bits),
+            "$" + std::to_string(advance.step) + ", " +
+                register_name(assigned->storage_name, bits));
     }
 
     void emit_fused_integer_address_add(
@@ -20781,6 +20943,11 @@ private:
                 std::get<machine::BlockOperand>(value.operands[1]).target;
             const auto falsity =
                 std::get<machine::BlockOperand>(value.operands[2]).target;
+            const auto advance_found =
+                speculative_vector_advances_.find(&value);
+            const auto* speculative_advance =
+                advance_found == speculative_vector_advances_.end()
+                    ? nullptr : &advance_found->second;
             std::string truth_code = "ne";
             std::string falsity_code = "e";
             if (value.condition_predicate == Opcode::VcmpNone) {
@@ -20832,6 +20999,10 @@ private:
                      comparison_opcode == Opcode::VcmpUge);
                 truth_code = tests_all ? "b" : "e";
                 falsity_code = tests_all ? "ae" : "ne";
+                if (speculative_advance) {
+                    emit_speculative_vector_advance(
+                        function, *speculative_advance, false);
+                }
                 emit_vector_integer_compare(
                     function, comparison, vector_shape(comparison),
                     value.uses.front().mode.bits, true);
@@ -20852,6 +21023,10 @@ private:
                 load_vector(function, source, 0, 0, width);
                 const auto source_register =
                     vector_register(source, 0, width);
+                if (speculative_advance) {
+                    emit_speculative_vector_advance(
+                        function, *speculative_advance, false);
+                }
                 instruction("vptest", "%" + source_register + ", %" +
                                          source_register);
             } else if (has_property(value.condition_predicate,
@@ -20963,6 +21138,17 @@ private:
                                           condition.mode.bits) +
                                 ", " + register_name(condition_register,
                                                       condition.mode.bits));
+            }
+            if (speculative_advance) {
+                instruction("j" + truth_code,
+                            block_label(function, truth));
+                emit_speculative_vector_advance(
+                    function, *speculative_advance, true);
+                emit_edge_copies(function, owner.id, falsity);
+                if (!next_block || falsity != *next_block) {
+                    instruction("jmp", block_label(function, falsity));
+                }
+                return;
             }
             const auto truth_copies =
                 edge_requires_copies(function, owner.id, truth);
@@ -21369,7 +21555,9 @@ private:
                     function, *early_test_before[index]);
             }
             if (fused_multiplications_.contains(&instruction_value) ||
-                fused_integer_add_outputs_.contains(&instruction_value)) {
+                fused_integer_add_outputs_.contains(&instruction_value) ||
+                speculative_vector_advance_adds_.contains(
+                    &instruction_value)) {
                 continue;
             }
             current_operation_ = instruction_value.opcode.empty()
@@ -21439,6 +21627,7 @@ private:
         red_zone_storage_ = 0;
         plan_fused_multiply_adds(function);
         plan_fused_integer_address_adds(function);
+        plan_speculative_vector_advances(function);
         loop_headers_.clear();
         if (options_.loop_alignment > 1) {
             std::unordered_map<std::uint32_t, std::size_t> layout_position;
@@ -21875,6 +22064,11 @@ private:
                        const machine::Instruction*> fused_integer_adds_;
     std::unordered_set<const machine::Instruction*>
         fused_integer_add_outputs_;
+    std::unordered_map<const machine::Instruction*,
+                       SpeculativeVectorAdvance>
+        speculative_vector_advances_;
+    std::unordered_set<const machine::Instruction*>
+        speculative_vector_advance_adds_;
     std::unordered_set<const machine::Instruction*> early_select_tests_;
     std::unordered_set<const machine::Instruction*> shared_select_flags_;
     std::unordered_set<std::uint32_t> loop_headers_;

@@ -50,6 +50,27 @@ if(NOT less_body MATCHES "vpxor[\t ]+\\(")
     message(FATAL_ERROR
         "early-exit loop did not fold its vector load into VPXOR\n${less_body}")
 endif()
+if(NOT less_body MATCHES
+   "addq[\t ]+\\$4,[^\n]*\n[\t ]+vpcmpgtq")
+    message(FATAL_ERROR
+        "early-exit loop did not advance its induction register before the "
+        "vector test\n${less_body}")
+endif()
+if(NOT less_body MATCHES
+   "vptest[^\n]*\n[\t ]+jb[\t ]+\\.Lcross\\.machine")
+    message(FATAL_ERROR
+        "early-exit loop did not use a direct conditional backedge\n"
+        "${less_body}")
+endif()
+if(NOT less_body MATCHES "subq[\t ]+\\$4,")
+    message(FATAL_ERROR
+        "early-exit loop did not restore its speculative advance on exit\n"
+        "${less_body}")
+endif()
+if(less_body MATCHES "leaq[\t ]+4\\(")
+    message(FATAL_ERROR
+        "early-exit loop retained a separate induction result\n${less_body}")
+endif()
 if(less_body MATCHES
    "vmovdqu[	 ]+[^\n]*%rsp|vmovdqu[	 ]+%ymm[0-9]+,[	 ]+[^\n]*%rsp")
     message(FATAL_ERROR
