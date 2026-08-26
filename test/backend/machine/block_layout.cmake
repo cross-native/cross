@@ -23,12 +23,14 @@ endif()
 file(STRINGS "${OUTPUT}.s" lines)
 file(READ "${OUTPUT}.s" assembly)
 string(REGEX MATCH
-    "dense_choice:[^#]*[.]size dense_choice"
+    "dense_choice:[^#]*[.]size dense_choice,"
     dense_body "${assembly}")
 string(REGEX MATCH
-    "[.]Lcross[.]machine[.][0-9]+[.]jump[.]table[.]0:[^#]*"
+    "[.]Lcross[.]machine[.][0-9]+[.]jump[.]table[.]0:"
     dense_table "${assembly}")
-string(REGEX MATCHALL "[.]long" dense_table_entries "${dense_table}")
+string(REGEX MATCHALL
+    "[.]long[^\r\n]*[.]jump[.]table[.]0"
+    dense_table_entries "${assembly}")
 list(LENGTH dense_table_entries dense_table_entry_count)
 if(dense_body STREQUAL "" OR dense_table STREQUAL "" OR
    NOT dense_table_entry_count EQUAL 8 OR
@@ -87,6 +89,29 @@ if(NOT o3_status EQUAL 0)
         "cross-block scheduling compilation failed\n${o3_stdout}\n${o3_stderr}")
 endif()
 file(READ "${OUTPUT}.O3.s" o3_assembly)
+string(REGEX MATCH
+    "dense_choice:[^#]*[.]size dense_choice,"
+    o3_dense_body "${o3_assembly}")
+string(REGEX MATCHALL "cmpq[\t ]+[$][0-6]"
+    o3_dense_compares "${o3_dense_body}")
+list(LENGTH o3_dense_compares o3_dense_compare_count)
+if(o3_dense_body STREQUAL "" OR
+   NOT o3_dense_compare_count EQUAL 7 OR
+   o3_dense_body MATCHES "jmp[q]?[\t ]+[*]%")
+    message(FATAL_ERROR
+        "O3 small dense choice did not select direct compare dispatch\n"
+        "${o3_dense_body}")
+endif()
+string(REGEX MATCH
+    "dense_choice_wide:[^#]*[.]size dense_choice_wide,"
+    o3_wide_dense_body "${o3_assembly}")
+if(o3_wide_dense_body STREQUAL "" OR
+   NOT o3_wide_dense_body MATCHES "jmp[q]?[\t ]+[*]%" OR
+   NOT o3_wide_dense_body MATCHES "cmpq[\t ]+[$]7")
+    message(FATAL_ERROR
+        "O3 nine-destination choice did not retain bounded table dispatch\n"
+        "${o3_wide_dense_body}")
+endif()
 string(REGEX MATCH
     "__cross_static_[^:]*scheduled_choice:[^#]*retq"
     scheduled_body "${o3_assembly}")

@@ -66,6 +66,14 @@ enum class LoweringPass : std::uint16_t {
     FinalizeFrame,
 };
 
+bool prefer_direct_dense_dispatch(const CompilerOptions& options,
+                                  std::size_t explicit_cases) {
+    constexpr std::size_t maximum_direct_destinations = 8;
+    return options.optimization_effort >= 3 &&
+        options.optimize_for == OptimizationGoal::Speed &&
+        explicit_cases + 1U <= maximum_direct_destinations;
+}
+
 bool same_fused_select_condition(const machine::Instruction& left,
                                  const machine::Instruction& right) {
     if (left.opcode != Opcode::Select || right.opcode != Opcode::Select ||
@@ -3840,16 +3848,20 @@ private:
             jump.kind = machine::InstructionKind::IndirectBranch;
             jump.location = root.instructions.back().location;
             jump.uses = {first->selector};
-            jump.clobbers = {
-                machine::Register::physical_register(
-                    machine::PhysicalRegisterId{table_base->storage_id},
-                    machine::i64)};
-            if (!destructive_offset) {
-                jump.clobbers.push_back(
+            const bool direct_dispatch =
+                prefer_direct_dense_dispatch(options_, cases.size());
+            if (!direct_dispatch) {
+                jump.clobbers = {
                     machine::Register::physical_register(
-                        machine::PhysicalRegisterId{
-                            table_offset->storage_id},
-                        machine::i64));
+                        machine::PhysicalRegisterId{table_base->storage_id},
+                        machine::i64)};
+                if (!destructive_offset) {
+                    jump.clobbers.push_back(
+                        machine::Register::physical_register(
+                            machine::PhysicalRegisterId{
+                                table_offset->storage_id},
+                            machine::i64));
+                }
             }
             jump.operands.push_back(
                 machine::RegisterOperand{first->selector});
@@ -3861,9 +3873,11 @@ private:
             }
             jump.operands.push_back(machine::BlockOperand{fallback});
             root.instructions.back() = std::move(jump);
-            add_preserved_storage(table_base->storage_id);
-            if (!destructive_offset) {
-                add_preserved_storage(table_offset->storage_id);
+            if (!direct_dispatch) {
+                add_preserved_storage(table_base->storage_id);
+                if (!destructive_offset) {
+                    add_preserved_storage(table_offset->storage_id);
+                }
             }
             root.successors = cases;
             root.successors.push_back(fallback);
@@ -21259,6 +21273,24 @@ private:
                 const auto fallback =
                     std::get<machine::BlockOperand>(
                         value.operands.back()).target;
+                if (prefer_direct_dense_dispatch(options_, count)) {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        const auto target =
+                            std::get<machine::BlockOperand>(
+                                value.operands[index + 2]).target;
+                        instruction(
+                            "cmp" + std::string(
+                                1, suffix(selector.mode.bits)),
+                            "$" + std::to_string(index) + ", " +
+                                register_name(selector_register,
+                                              selector.mode.bits));
+                        instruction("je", block_label(function, target));
+                    }
+                    if (!next_block || fallback != *next_block) {
+                        instruction("jmp", block_label(function, fallback));
+                    }
+                    return;
+                }
                 if (!exhaustive) {
                     instruction(
                         "cmp" + std::string(1, suffix(selector.mode.bits)),

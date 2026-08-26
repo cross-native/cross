@@ -45,6 +45,31 @@ global i32 dense_choice(in u64 source) {
     return result;
 }
 
+[[runtime_only, noinline, link_name("dense_choice_wide")]]
+global i32 dense_choice_wide(in u64 selector) {
+    i32 result;
+    if (selector == 0u64) {
+        result = 3;
+    } else if (selector == 1u64) {
+        result = 5;
+    } else if (selector == 2u64) {
+        result = 7;
+    } else if (selector == 3u64) {
+        result = 11;
+    } else if (selector == 4u64) {
+        result = 13;
+    } else if (selector == 5u64) {
+        result = 17;
+    } else if (selector == 6u64) {
+        result = 19;
+    } else if (selector == 7u64) {
+        result = 23;
+    } else {
+        result = 29;
+    }
+    return result;
+}
+
 [[runtime_only, noinline, link_name("nested_layout")]]
 global u64 nested_layout(in u64 extent) {
     u64 total = 0u64;
@@ -70,6 +95,10 @@ global i32 block_layout_entry() {
     }
     if (dense_choice(0) != 3 || dense_choice(3) != 11 ||
         dense_choice(6) != 19 || dense_choice(15) != 23) {
+        return 0;
+    }
+    if (dense_choice_wide(0) != 3 || dense_choice_wide(7) != 23 ||
+        dense_choice_wide(99) != 29) {
         return 0;
     }
     if (nested_layout(4u64) != 74u64) {

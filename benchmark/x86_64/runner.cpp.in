@@ -484,6 +484,56 @@ std::uint64_t reference_classify(const std::uint64_t *data, std::size_t count,
     return result;
 }
 
+std::uint64_t reference_classify4(const std::uint64_t *data,
+                                  std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto value = data[index] + round_value;
+            switch (value & UINT64_C(3)) {
+            case 0: result += value; break;
+            case 1: result ^= value << 1; break;
+            case 2: result += value * UINT64_C(3); break;
+            default: result ^= value >> 2; break;
+            }
+        }
+        ++round_value;
+    }
+    return result;
+}
+
+std::uint64_t reference_classify16(const std::uint64_t *data,
+                                   std::size_t count, std::size_t rounds) {
+    std::uint64_t result = 0;
+    std::uint64_t round_value = 0;
+    for (std::size_t round = 0; round < rounds; ++round) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto value = data[index] + round_value;
+            switch (value & UINT64_C(15)) {
+            case 0: result += value; break;
+            case 1: result ^= value << 1; break;
+            case 2: result += value * UINT64_C(3); break;
+            case 3: result ^= value >> 2; break;
+            case 4: result -= value; break;
+            case 5: result += value ^ UINT64_C(11400714819323198485); break;
+            case 6: result ^= value * UINT64_C(5); break;
+            case 7: result += value >> 3; break;
+            case 8: result ^= value + UINT64_C(13787848793156543929); break;
+            case 9: result += value * UINT64_C(7); break;
+            case 10: result -= value >> 5; break;
+            case 11: result ^= value << 3; break;
+            case 12: result += value * UINT64_C(9); break;
+            case 13: result ^= value >> 7; break;
+            case 14: result -= value * UINT64_C(11); break;
+            default: result += value ^ UINT64_C(10723151780598845931); break;
+            }
+        }
+        ++round_value;
+    }
+    return result;
+}
+
 std::uint64_t reference_search(const std::uint64_t *data, std::size_t count,
                                std::uint64_t seed, std::size_t rounds) {
     std::uint64_t result = 0;
@@ -656,7 +706,9 @@ static constexpr KernelDescriptor<MemoryFunction> memory_kernels[] = {
     {"reduce", "reduction", reference_reduce},
     {"xor_reduce", "reduction", reference_xor_reduce},
     {"branch", "branching", reference_branch},
+    {"classify4", "branching", reference_classify4},
     {"classify", "branching", reference_classify},
+    {"classify16", "branching", reference_classify16},
     {"select", "selection", reference_select},
     {"clamp", "selection", reference_clamp},
 };
