@@ -9,6 +9,7 @@ optimization "O0" {
     f.tree-dce = false;
     f.tree-dse = false;
     f.tree-fre = false;
+    f.tree-tail-merge = false;
     f.move-loop-invariants = false;
     f.unroll-loops = false;
     f.tree-loop-vectorize = false;
@@ -57,6 +58,7 @@ optimization "O2" {
     f.ipa-pure-const = true;
     f.private-abi = true;
     f.tree-fre = true;
+    f.tree-tail-merge = true;
     f.if-conversion = true;
     f.tree-loop-vectorize = true;
     f.tree-slp-vectorize = true;

@@ -20,6 +20,7 @@ std::string_view pass_name(PassId pass) {
     case PassId::BranchThreading: return "branch-threading";
     case PassId::ForwardingBlockElimination:
         return "forwarding-block-elimination";
+    case PassId::TailMerging: return "tail-merging";
     case PassId::IfConversion: return "if-conversion";
     case PassId::SelectFactoring: return "select-factoring";
     case PassId::RedundantExpressionElimination:

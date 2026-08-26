@@ -20,6 +20,7 @@ enum class PassId : std::uint8_t {
     BranchFolding,
     BranchThreading,
     ForwardingBlockElimination,
+    TailMerging,
     IfConversion,
     SelectFactoring,
     RedundantExpressionElimination,

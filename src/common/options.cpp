@@ -303,6 +303,9 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.tree-fre", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "local fully redundant expression elimination"},
+        {"f.tree-tail-merge", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "factor profitable common SSA tails before machine selection"},
         {"f.move-loop-invariants", {}, OptionValueKind::Boolean, false, {},
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
@@ -590,6 +593,8 @@ bool resolve_registered_options(
     options.tree_dce = resolved_bool(options, "f.tree-dce");
     options.tree_dse = resolved_bool(options, "f.tree-dse");
     options.tree_fre = resolved_bool(options, "f.tree-fre");
+    options.tree_tail_merge =
+        resolved_bool(options, "f.tree-tail-merge");
     options.move_loop_invariants =
         resolved_bool(options, "f.move-loop-invariants");
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");

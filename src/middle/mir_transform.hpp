@@ -13,6 +13,13 @@ namespace cross::mir {
 canonicalize_bitwise_operations(ManagedFunction& function,
                                 const hir::Module& hir_module);
 [[nodiscard]] bool eliminate_forwarding_blocks(ManagedFunction& function);
+[[nodiscard]] bool factor_common_phi_tails(
+    ManagedFunction& function, const hir::Module& hir_module);
+
+// Keep canonical dense value IDs after a transformation removes definitions.
+// The helper rewrites every value-bearing MIR edge, including effect owners,
+// parameter lists, phi inputs, and terminators.
+void compact_managed_values(ManagedFunction& function);
 
 // Shared identity-preserving cleanup used by CFG transforms after they make
 // one or more non-addressable blocks unreachable.

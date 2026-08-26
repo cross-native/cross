@@ -204,6 +204,101 @@ cross::mir::ManagedFunction forwarding_function() {
     return function;
 }
 
+cross::mir::ManagedFunction tail_factor_function() {
+    using namespace cross::mir;
+    ManagedFunction function;
+    function.source = {0};
+    function.result_type = {1};
+    function.entry = {0};
+    function.values.resize(9);
+    for (std::uint32_t index = 0; index < function.values.size(); ++index) {
+        function.values[index].id = {index};
+        function.values[index].type = {1};
+    }
+    function.values[0].kind = ValueKind::Parameter;
+    function.values[0].type = {0};
+    function.values[0].parameter_index = 0;
+    function.values[1].kind = ValueKind::ConstantInteger;
+    function.values[1].integer = 100;
+    function.values[2].kind = ValueKind::ConstantInteger;
+    function.values[2].integer = 1;
+    function.values[3].kind = ValueKind::Binary;
+    function.values[3].binary = BinaryOperation::Add;
+    function.values[3].operands = {{1}, {2}};
+    function.values[4].kind = ValueKind::ConstantInteger;
+    function.values[4].integer = 2;
+    function.values[5].kind = ValueKind::Binary;
+    function.values[5].binary = BinaryOperation::Add;
+    function.values[5].operands = {{1}, {4}};
+    function.values[6].kind = ValueKind::ConstantInteger;
+    function.values[6].integer = 3;
+    function.values[7].kind = ValueKind::Binary;
+    function.values[7].binary = BinaryOperation::Add;
+    function.values[7].operands = {{1}, {6}};
+    function.values[8].kind = ValueKind::Phi;
+    function.values[8].incoming = {
+        {{1}, {3}}, {{3}, {5}}, {{4}, {7}}};
+    function.parameters = {{0}};
+
+    ManagedBlock entry;
+    entry.id = {0};
+    entry.effect = {0};
+    entry.values = {{0}, {1}};
+    entry.terminator = {
+        TerminatorKind::ConditionalBranch, {}, ValueId{0},
+        {{1}, {2}}, {0}};
+    ManagedBlock first;
+    first.id = {1};
+    first.effect = {1};
+    first.predecessors = {{0}};
+    first.values = {{2}, {3}};
+    first.terminator = {
+        TerminatorKind::Branch, {}, std::nullopt, {{5}}, {1}};
+    ManagedBlock test;
+    test.id = {2};
+    test.effect = {2};
+    test.predecessors = {{0}};
+    test.terminator = {
+        TerminatorKind::ConditionalBranch, {}, ValueId{0},
+        {{3}, {4}}, {2}};
+    ManagedBlock second;
+    second.id = {3};
+    second.effect = {3};
+    second.predecessors = {{2}};
+    second.values = {{4}, {5}};
+    second.terminator = {
+        TerminatorKind::Branch, {}, std::nullopt, {{5}}, {3}};
+    ManagedBlock third;
+    third.id = {4};
+    third.effect = {4};
+    third.predecessors = {{2}};
+    third.values = {{6}, {7}};
+    third.terminator = {
+        TerminatorKind::Branch, {}, std::nullopt, {{5}}, {4}};
+    ManagedBlock join;
+    join.id = {5};
+    join.effect = {5};
+    join.predecessors = {{1}, {3}, {4}};
+    join.values = {{8}};
+    join.terminator = {
+        TerminatorKind::Return, {}, ValueId{8}, {}, {5}};
+    function.blocks = {entry, first, test, second, third, join};
+    function.effects = {
+        {EffectId{0}, {}, EffectKind::Entry, std::nullopt, std::nullopt, {}},
+        {EffectId{1}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{0}, {0}}}},
+        {EffectId{2}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{0}, {0}}}},
+        {EffectId{3}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{2}, {2}}}},
+        {EffectId{4}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{2}, {2}}}},
+        {EffectId{5}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{1}, {1}}, {{3}, {3}}, {{4}, {4}}}},
+    };
+    return function;
+}
+
 } // namespace
 
 int main() {
@@ -281,6 +376,8 @@ int main() {
     ok &= expect(pass_name(PassId::LoopInvariantMotion) ==
                      "loop-invariant-motion",
                  "typed pass IDs should retain diagnostic names");
+    ok &= expect(pass_name(PassId::TailMerging) == "tail-merging",
+                 "tail merging should retain a typed pass name");
 
     auto hir = transform_hir();
     auto rotate = rotate_function();
@@ -323,6 +420,50 @@ int main() {
     addressable.labels.push_back({{0}, {3}});
     ok &= expect(!eliminate_forwarding_blocks(addressable),
                  "address-taken forwarding block must remain observable");
+
+    auto unsafe_tails = tail_factor_function();
+    unsafe_tails.values[3].effect_input = EffectId{1};
+    ok &= expect(!factor_common_phi_tails(unsafe_tails, hir),
+                 "effectful or two-member tails must not be factored");
+
+    auto tails = tail_factor_function();
+    ok &= expect(factor_common_phi_tails(tails, hir),
+                 "three common integer phi tails should be factored");
+    const auto& shared = tails.blocks.back();
+    ok &= expect(tails.blocks.size() == 7 && shared.id == BlockId{6} &&
+                     shared.predecessors ==
+                         std::vector<BlockId>{{1}, {3}, {4}} &&
+                     shared.terminator.successors ==
+                         std::vector<BlockId>{{5}} &&
+                     tails.blocks[5].predecessors ==
+                         std::vector<BlockId>{{6}} &&
+                     shared.values.size() == 2,
+                 "factored tail should own the collapsed CFG edge");
+    if (shared.values.size() == 2) {
+        const auto& varying = tails.values[shared.values[0].value];
+        const auto& factored_result =
+            tails.values[shared.values[1].value];
+        ok &= expect(
+            varying.kind == ValueKind::Phi &&
+                varying.incoming ==
+                    std::vector<PhiIncoming>{{{1}, {2}}, {{3}, {3}},
+                                             {{4}, {4}}} &&
+                factored_result.kind == ValueKind::Binary &&
+                factored_result.binary == BinaryOperation::Add &&
+                factored_result.operands ==
+                    std::vector<ValueId>{{1}, shared.values[0]},
+            "factored tail should select only the varying operand");
+    }
+    ManagedModule factored;
+    factored.functions.push_back(tails);
+    factored.definitions.insert(0);
+    std::ostringstream factored_diagnostics_text;
+    cross::Diagnostics factored_diagnostics(factored_diagnostics_text);
+    ok &= expect(verify(factored, hir, factored_diagnostics),
+                 "factored tail should preserve MIR and effect SSA");
+    if (!factored_diagnostics_text.str().empty()) {
+        std::cerr << factored_diagnostics_text.str();
+    }
 
     return ok ? 0 : 1;
 }

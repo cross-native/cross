@@ -52,6 +52,7 @@ int main() {
     const auto o0 = parse({"cc", "-O0"});
     ok = expect(o0 && !o0->tree_ccp && !o0->tree_copy_prop &&
                     !o0->tree_dce && !o0->tree_dse && !o0->tree_fre &&
+                    !o0->tree_tail_merge &&
                     !o0->inline_functions && !o0->ipa_ra &&
                     !o0->ipa_pure_const &&
                     !o0->private_abi && !o0->ipa_cp_clone &&
@@ -72,6 +73,7 @@ int main() {
     const auto o2 = parse({"cc", "-O2"});
     ok = expect(o2 && o2->tree_ccp && o2->tree_copy_prop &&
                     o2->tree_dce && o2->tree_dse && o2->tree_fre &&
+                    o2->tree_tail_merge &&
                     o2->inline_functions && o2->ipa_ra &&
                     o2->ipa_pure_const &&
                     o2->private_abi && !o2->ipa_cp_clone &&
@@ -82,10 +84,12 @@ int main() {
 
     const auto o3_override = parse(
         {"cc", "-fno-inline", "-fno-tree-dce", "-O3",
-         "-fno-tree-dse", "-fno-ipa-ra", "-fno-ipa-pure-const"});
+         "-fno-tree-dse", "-fno-tree-tail-merge", "-fno-ipa-ra",
+         "-fno-ipa-pure-const"});
     ok = expect(o3_override && o3_override->tree_ccp &&
                     !o3_override->tree_dce &&
                     !o3_override->tree_dse &&
+                    !o3_override->tree_tail_merge &&
                     !o3_override->inline_functions &&
                     !o3_override->ipa_ra &&
                     !o3_override->ipa_pure_const &&

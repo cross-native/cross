@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace cross::mir {
@@ -161,6 +162,320 @@ bool canonicalize_bitwise_operations_impl(ManagedFunction& function,
         }
     }
     return changed;
+}
+
+bool commutative_tail_operation(BinaryOperation operation) {
+    return operation == BinaryOperation::Add ||
+        operation == BinaryOperation::Multiply ||
+        operation == BinaryOperation::BitAnd ||
+        operation == BinaryOperation::BitOr ||
+        operation == BinaryOperation::BitXor;
+}
+
+bool factorable_integer_tail(const ManagedValue& value,
+                             const hir::Module& hir_module) {
+    if (value.kind != ValueKind::Binary || value.operands.size() != 2 ||
+        scalar_integer_bits(hir_module, value.type) == 0 ||
+        value.effect_input || value.effect_output) {
+        return false;
+    }
+    const bool operation_supported =
+        value.binary == BinaryOperation::Add ||
+        value.binary == BinaryOperation::Subtract ||
+        value.binary == BinaryOperation::Multiply ||
+        value.binary == BinaryOperation::BitAnd ||
+        value.binary == BinaryOperation::BitOr ||
+        value.binary == BinaryOperation::BitXor;
+    return operation_supported;
+}
+
+struct PhiTailCandidate {
+    BlockId predecessor;
+    ValueId result;
+    ValueId operands[2];
+    BinaryOperation operation{BinaryOperation::Add};
+    hir::TypeId type;
+    SourceLocation location;
+};
+
+struct PhiTailMember {
+    BlockId predecessor;
+    ValueId result;
+    ValueId varying;
+};
+
+struct PhiTailPlan {
+    BlockId join;
+    ValueId join_phi;
+    BinaryOperation operation{BinaryOperation::Add};
+    hir::TypeId type;
+    ValueId common;
+    unsigned common_index{};
+    SourceLocation location;
+    std::vector<PhiTailMember> members;
+};
+
+std::optional<ValueId> varying_tail_operand(
+    const PhiTailCandidate& candidate, BinaryOperation operation,
+    hir::TypeId type, ValueId common, unsigned common_index) {
+    if (candidate.operation != operation || candidate.type != type) {
+        return std::nullopt;
+    }
+    if (candidate.operands[common_index] == common) {
+        return candidate.operands[1U - common_index];
+    }
+    if (commutative_tail_operation(operation) &&
+        candidate.operands[1U - common_index] == common) {
+        return candidate.operands[common_index];
+    }
+    return std::nullopt;
+}
+
+std::vector<PhiTailPlan> collect_phi_tail_plans(
+    const ManagedFunction& function, const hir::Module& hir_module) {
+    const UseLists uses(function);
+    std::vector<PhiTailPlan> plans;
+    for (const auto& join : function.blocks) {
+        std::vector<ValueId> phis;
+        for (const auto id : join.values) {
+            if (function.values[id.value].kind == ValueKind::Phi) {
+                phis.push_back(id);
+            }
+        }
+        // Factoring every other join phi would require one corresponding phi
+        // in each shared tail. Keep the initial profitability proof narrow.
+        if (phis.size() != 1 || join.predecessors.size() < 3) continue;
+        const auto phi_id = phis.front();
+        const auto& phi = function.values[phi_id.value];
+        std::vector<PhiTailCandidate> candidates;
+        for (const auto& incoming : phi.incoming) {
+            if (incoming.predecessor.value >= function.blocks.size() ||
+                incoming.value.value >= function.values.size()) {
+                continue;
+            }
+            const auto& predecessor =
+                function.blocks[incoming.predecessor.value];
+            const auto& value = function.values[incoming.value.value];
+            const auto& reverse_uses = uses.uses(incoming.value);
+            if (predecessor.terminator.kind != TerminatorKind::Branch ||
+                predecessor.terminator.successors.size() != 1 ||
+                predecessor.terminator.successors.front() != join.id ||
+                uses.definition_block(incoming.value) !=
+                    incoming.predecessor ||
+                reverse_uses.size() != 1 ||
+                reverse_uses.front().kind != UseKind::PhiIncoming ||
+                reverse_uses.front().block != incoming.predecessor ||
+                reverse_uses.front().user != phi_id ||
+                value.operands.size() != 2 ||
+                value.operands[0].value >= function.values.size() ||
+                value.operands[1].value >= function.values.size() ||
+                !factorable_integer_tail(value, hir_module) ||
+                function.values[value.operands[0].value].type != value.type ||
+                function.values[value.operands[1].value].type != value.type) {
+                continue;
+            }
+            candidates.push_back(
+                {incoming.predecessor, incoming.value,
+                 {value.operands[0], value.operands[1]}, value.binary,
+                 value.type, value.location});
+        }
+
+        std::unordered_set<std::uint32_t> selected;
+        while (true) {
+            std::optional<PhiTailPlan> best;
+            for (const auto& seed : candidates) {
+                if (selected.contains(seed.result.value)) continue;
+                for (unsigned common_index = 0; common_index < 2;
+                     ++common_index) {
+                    PhiTailPlan candidate;
+                    candidate.join = join.id;
+                    candidate.join_phi = phi_id;
+                    candidate.operation = seed.operation;
+                    candidate.type = seed.type;
+                    candidate.common = seed.operands[common_index];
+                    candidate.common_index =
+                        commutative_tail_operation(seed.operation)
+                        ? 0U : common_index;
+                    candidate.location = seed.location;
+                    for (const auto& member : candidates) {
+                        if (selected.contains(member.result.value)) continue;
+                        const auto varying = varying_tail_operand(
+                            member, seed.operation, seed.type,
+                            candidate.common, common_index);
+                        if (!varying) continue;
+                        candidate.members.push_back(
+                            {member.predecessor, member.result, *varying});
+                    }
+                    if (candidate.members.size() >= 3 &&
+                        (!best || candidate.members.size() >
+                                      best->members.size())) {
+                        best = std::move(candidate);
+                    }
+                }
+            }
+            if (!best) break;
+            for (const auto& member : best->members) {
+                selected.insert(member.result.value);
+            }
+            plans.push_back(std::move(*best));
+        }
+    }
+    return plans;
+}
+
+template <typename Item, typename Predecessor>
+std::vector<Item> collapse_tail_predecessors(
+    const std::vector<Item>& source,
+    const std::unordered_set<std::uint32_t>& collapsed,
+    Item replacement, Predecessor predecessor) {
+    std::vector<Item> result;
+    result.reserve(source.size());
+    bool inserted = false;
+    for (const auto& item : source) {
+        if (!collapsed.contains(predecessor(item).value)) {
+            result.push_back(item);
+        } else if (!inserted) {
+            result.push_back(replacement);
+            inserted = true;
+        }
+    }
+    return result;
+}
+
+bool apply_phi_tail_plan(ManagedFunction& function, const PhiTailPlan& plan,
+                         std::unordered_set<std::uint32_t>& removed) {
+    if (plan.join.value >= function.blocks.size() ||
+        plan.join_phi.value >= function.values.size() ||
+        plan.common.value >= function.values.size() ||
+        plan.common_index > 1 || plan.members.size() < 3) {
+        return false;
+    }
+
+    // Plans are collected before any rewrite. Validate the complete plan
+    // against the current function first so several disjoint groups may be
+    // applied to one join without a failed late check leaving partial SSA.
+    const auto& join = function.blocks[plan.join.value];
+    const auto& join_phi = function.values[plan.join_phi.value];
+    if (join.effect.value >= function.effects.size() ||
+        join_phi.kind != ValueKind::Phi || join_phi.type != plan.type ||
+        std::count(join.values.begin(), join.values.end(), plan.join_phi) !=
+            1) {
+        return false;
+    }
+    const auto& join_effect = function.effects[join.effect.value];
+    if (join_effect.kind != EffectKind::Phi) return false;
+
+    std::unordered_set<std::uint32_t> collapsed;
+    std::unordered_set<std::uint32_t> results;
+    for (const auto& member : plan.members) {
+        if (member.predecessor.value >= function.blocks.size() ||
+            member.result.value >= function.values.size() ||
+            member.varying.value >= function.values.size() ||
+            removed.contains(member.result.value) ||
+            !collapsed.insert(member.predecessor.value).second ||
+            !results.insert(member.result.value).second) {
+            return false;
+        }
+        const auto& predecessor =
+            function.blocks[member.predecessor.value];
+        if (predecessor.terminator.kind != TerminatorKind::Branch ||
+            predecessor.terminator.successors.size() != 1 ||
+            predecessor.terminator.successors.front() != plan.join ||
+            std::count(predecessor.values.begin(), predecessor.values.end(),
+                       member.result) != 1 ||
+            function.values[member.varying.value].type != plan.type ||
+            std::count(join.predecessors.begin(), join.predecessors.end(),
+                       member.predecessor) != 1 ||
+            std::count_if(
+                join_phi.incoming.begin(), join_phi.incoming.end(),
+                [&](const PhiIncoming& incoming) {
+                    return incoming.predecessor == member.predecessor &&
+                        incoming.value == member.result;
+                }) != 1 ||
+            std::count_if(
+                join_effect.incoming.begin(), join_effect.incoming.end(),
+                [&](const EffectIncoming& incoming) {
+                    return incoming.predecessor == member.predecessor &&
+                        incoming.effect == predecessor.terminator.effect;
+                }) != 1) {
+            return false;
+        }
+    }
+
+    const BlockId shared_id{
+        static_cast<std::uint32_t>(function.blocks.size())};
+    const EffectId shared_effect_id{
+        static_cast<std::uint32_t>(function.effects.size())};
+    const ValueId varying_id{
+        static_cast<std::uint32_t>(function.values.size())};
+
+    ManagedValue varying;
+    varying.id = varying_id;
+    varying.location = plan.location;
+    varying.type = plan.type;
+    varying.kind = ValueKind::Phi;
+    for (const auto& member : plan.members) {
+        varying.incoming.push_back({member.predecessor, member.varying});
+    }
+    function.values.push_back(std::move(varying));
+
+    const ValueId result_id{
+        static_cast<std::uint32_t>(function.values.size())};
+    ManagedValue result;
+    result.id = result_id;
+    result.location = plan.location;
+    result.type = plan.type;
+    result.kind = ValueKind::Binary;
+    result.binary = plan.operation;
+    result.operands = plan.common_index == 0
+        ? std::vector<ValueId>{plan.common, varying_id}
+        : std::vector<ValueId>{varying_id, plan.common};
+    function.values.push_back(std::move(result));
+
+    ManagedEffect shared_effect;
+    shared_effect.id = shared_effect_id;
+    shared_effect.location = plan.location;
+    shared_effect.kind = EffectKind::Phi;
+    for (const auto& member : plan.members) {
+        auto& predecessor = function.blocks[member.predecessor.value];
+        predecessor.terminator.successors.front() = shared_id;
+        shared_effect.incoming.push_back(
+            {member.predecessor, predecessor.terminator.effect});
+        removed.insert(member.result.value);
+    }
+
+    auto& mutable_join = function.blocks[plan.join.value];
+    mutable_join.predecessors = collapse_tail_predecessors(
+        mutable_join.predecessors, collapsed, shared_id,
+        [](BlockId predecessor) { return predecessor; });
+    auto& mutable_join_effect =
+        function.effects[mutable_join.effect.value];
+    mutable_join_effect.incoming = collapse_tail_predecessors(
+        mutable_join_effect.incoming, collapsed,
+        EffectIncoming{shared_id, shared_effect_id},
+        [](const EffectIncoming& incoming) {
+            return incoming.predecessor;
+        });
+    auto& mutable_join_phi = function.values[plan.join_phi.value];
+    mutable_join_phi.incoming = collapse_tail_predecessors(
+        mutable_join_phi.incoming, collapsed,
+        PhiIncoming{shared_id, result_id},
+        [](const PhiIncoming& incoming) { return incoming.predecessor; });
+
+    ManagedBlock shared;
+    shared.id = shared_id;
+    shared.location = plan.location;
+    shared.values = {varying_id, result_id};
+    for (const auto& member : plan.members) {
+        shared.predecessors.push_back(member.predecessor);
+    }
+    shared.effect = shared_effect_id;
+    shared.terminator = {
+        TerminatorKind::Branch, plan.location, std::nullopt,
+        {plan.join}, shared_effect_id};
+    function.effects.push_back(std::move(shared_effect));
+    function.blocks.push_back(std::move(shared));
+    return true;
 }
 
 bool eliminate_one_forwarding_block(ManagedFunction& function) {
@@ -367,6 +682,65 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
 bool canonicalize_bitwise_operations(ManagedFunction& function,
                                      const hir::Module& hir_module) {
     return canonicalize_bitwise_operations_impl(function, hir_module);
+}
+
+void compact_managed_values(ManagedFunction& function) {
+    std::vector<bool> used(function.values.size());
+    for (const auto& block : function.blocks) {
+        for (const auto value : block.values) used[value.value] = true;
+    }
+    std::vector<std::optional<ValueId>> remap(function.values.size());
+    std::vector<ManagedValue> values;
+    values.reserve(function.values.size());
+    for (std::size_t index = 0; index < function.values.size(); ++index) {
+        if (!used[index]) continue;
+        const ValueId id{static_cast<std::uint32_t>(values.size())};
+        remap[index] = id;
+        auto value = function.values[index];
+        value.id = id;
+        values.push_back(std::move(value));
+    }
+    const auto map = [&](ValueId id) {
+        return *remap[id.value];
+    };
+    for (auto& value : values) {
+        for (auto& operand : value.operands) operand = map(operand);
+        for (auto& argument : value.call_arguments) {
+            if (argument.value) argument.value = map(*argument.value);
+        }
+        for (auto& incoming : value.incoming) {
+            incoming.value = map(incoming.value);
+        }
+    }
+    for (auto& effect : function.effects) {
+        if (effect.operation) effect.operation = map(*effect.operation);
+    }
+    for (auto& block : function.blocks) {
+        for (auto& value : block.values) value = map(value);
+        if (block.terminator.value) {
+            block.terminator.value = map(*block.terminator.value);
+        }
+    }
+    for (auto& parameter : function.parameters) parameter = map(parameter);
+    function.values = std::move(values);
+}
+
+bool factor_common_phi_tails(ManagedFunction& function,
+                             const hir::Module& hir_module) {
+    const auto plans = collect_phi_tail_plans(function, hir_module);
+    std::unordered_set<std::uint32_t> removed;
+    bool changed = false;
+    for (const auto& plan : plans) {
+        changed = apply_phi_tail_plan(function, plan, removed) || changed;
+    }
+    if (!changed) return false;
+    for (auto& block : function.blocks) {
+        std::erase_if(block.values, [&](ValueId value) {
+            return removed.contains(value.value);
+        });
+    }
+    compact_managed_values(function);
+    return true;
 }
 
 bool eliminate_forwarding_blocks(ManagedFunction& function) {

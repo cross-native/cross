@@ -5842,47 +5842,6 @@ void compact_effects(ManagedFunction& function) {
     function.effects = std::move(effects);
 }
 
-void compact_values(ManagedFunction& function) {
-    std::vector<bool> used(function.values.size());
-    for (const auto& block : function.blocks) {
-        for (const auto value : block.values) used[value.value] = true;
-    }
-    std::vector<std::optional<ValueId>> remap(function.values.size());
-    std::vector<ManagedValue> values;
-    values.reserve(function.values.size());
-    for (std::size_t index = 0; index < function.values.size(); ++index) {
-        if (!used[index]) continue;
-        const ValueId id{static_cast<std::uint32_t>(values.size())};
-        remap[index] = id;
-        auto value = function.values[index];
-        value.id = id;
-        values.push_back(std::move(value));
-    }
-    const auto map = [&](ValueId id) {
-        return *remap[id.value];
-    };
-    for (auto& value : values) {
-        for (auto& operand : value.operands) operand = map(operand);
-        for (auto& argument : value.call_arguments) {
-            if (argument.value) argument.value = map(*argument.value);
-        }
-        for (auto& incoming : value.incoming) {
-            incoming.value = map(incoming.value);
-        }
-    }
-    for (auto& effect : function.effects) {
-        if (effect.operation) effect.operation = map(*effect.operation);
-    }
-    for (auto& block : function.blocks) {
-        for (auto& value : block.values) value = map(value);
-        if (block.terminator.value) {
-            block.terminator.value = map(*block.terminator.value);
-        }
-    }
-    for (auto& parameter : function.parameters) parameter = map(parameter);
-    function.values = std::move(values);
-}
-
 void inline_managed_calls(ManagedModule& module,
                           const hir::Module& hir_module,
                           const CompilerOptions& options,
@@ -5947,7 +5906,7 @@ void inline_managed_calls(ManagedModule& module,
         }
         if (changed) {
             compact_effects(caller);
-            compact_values(caller);
+            compact_managed_values(caller);
         }
     }
 
@@ -6006,7 +5965,7 @@ void eliminate_dead_values(ManagedFunction& function) {
         });
     }
     compact_effects(function);
-    compact_values(function);
+    compact_managed_values(function);
 }
 
 void remove_effectful_values(
@@ -6025,7 +5984,7 @@ void remove_effectful_values(
         });
     }
     compact_effects(function);
-    compact_values(function);
+    compact_managed_values(function);
 }
 
 bool optimizable_slot(const ManagedFunction& function, SlotId slot) {
@@ -6589,7 +6548,7 @@ void remove_replaced_values(
             return removed.contains(value.value);
         });
     }
-    compact_values(function);
+    compact_managed_values(function);
 }
 
 void propagate_phi_scc_copies(ManagedFunction& function) {
@@ -7163,7 +7122,7 @@ void eliminate_unreachable_blocks(ManagedFunction& function) {
     for (auto& label : function.labels) label.block = map(label.block);
     function.blocks = std::move(blocks);
     compact_effects(function);
-    compact_values(function);
+    compact_managed_values(function);
 }
 
 bool fold_constant_branches(ManagedFunction& function) {
@@ -12208,6 +12167,17 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             PassId::ForwardingBlockElimination,
             [](ManagedFunction& function, FunctionAnalysisManager&) {
                 return eliminate_forwarding_blocks(function)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
+            });
+    }
+    if (options.tree_tail_merge &&
+        (options.optimize_for == OptimizationGoal::Size ||
+         options.optimize_for == OptimizationGoal::MinimumSize)) {
+        pipeline.add(
+            PassId::TailMerging,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return factor_common_phi_tails(function, hir_module)
                     ? PassResult::changed_cfg()
                     : PassResult::unchanged();
             });

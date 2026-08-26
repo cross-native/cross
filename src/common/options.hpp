@@ -113,6 +113,7 @@ struct CompilerOptions {
     bool tree_dce{};
     bool tree_dse{};
     bool tree_fre{};
+    bool tree_tail_merge{};
     bool move_loop_invariants{};
     bool unroll_loops{};
     bool tree_loop_vectorize{};
