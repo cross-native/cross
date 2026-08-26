@@ -5,10 +5,20 @@ option(CROSS_ENABLE_LLVM_TEXT
        "Build the optional LLVM text debug/compatibility serializer" ON)
 option(CROSS_ENABLE_GCC_GIMPLE_TEXT
        "Build the optional GCC GIMPLE debug/backend-validation serializer" ON)
+option(CROSS_STATIC_TOOLS
+       "Link the cc and cpp tools without shared compiler runtimes" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+if(CROSS_STATIC_TOOLS AND MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY
+        "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+if(CROSS_STATIC_TOOLS AND MINGW AND
+   CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    find_program(CROSS_LLD_LINKER NAMES ld.lld)
+endif()
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../build")
 endif()
@@ -21,6 +31,29 @@ function(cross_component target)
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow
         )
+    endif()
+endfunction()
+
+function(cross_tool target)
+    if(NOT CROSS_STATIC_TOOLS OR MSVC)
+        return()
+    endif()
+    if(MINGW)
+        # A MinGW-built release must run without libgcc/libstdc++ DLLs or an
+        # installed MSYS2/MinGW environment. Windows system DLLs remain normal
+        # dynamic imports.
+        target_link_options(${target} PRIVATE
+            -static -static-libgcc -static-libstdc++
+        )
+        if(CROSS_LLD_LINKER)
+            # GNU ld warns about Clang/libstdc++ COMDATs in a fully static
+            # MinGW link. LLD understands both producers and emits a smaller,
+            # warning-free PE image.
+            target_link_options(${target} PRIVATE -fuse-ld=lld)
+        endif()
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Linux distributors may opt out when their sysroot omits static libc.
+        target_link_options(${target} PRIVATE -static)
     endif()
 endfunction()
 
@@ -149,10 +182,12 @@ cross_component(cross_driver)
 add_executable(cross_cc src/driver/cc_main.cpp)
 target_link_libraries(cross_cc PRIVATE cross_driver)
 set_target_properties(cross_cc PROPERTIES OUTPUT_NAME cc)
+cross_tool(cross_cc)
 
 add_executable(cross_cpp src/driver/cpp_main.cpp)
 target_link_libraries(cross_cpp PRIVATE cross_driver)
 set_target_properties(cross_cpp PROPERTIES OUTPUT_NAME cpp)
+cross_tool(cross_cpp)
 
 include(CTest)
 if(BUILD_TESTING)
