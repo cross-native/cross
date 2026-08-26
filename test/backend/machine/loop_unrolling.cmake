@@ -49,6 +49,7 @@ compile_assembly("-funroll-loops -fno-cprop-registers" no-cprop no_cprop_assembl
 compile_assembly("-funroll-loops -fno-peephole2" no-peephole no_peephole_assembly)
 extract_function("${scalar_assembly}" unroll_power scalar_power)
 extract_function("${unrolled_assembly}" unroll_power unrolled_power)
+extract_function("${unrolled_assembly}" unroll_rotate unrolled_rotate)
 extract_function("${unrolled_assembly}" unroll_sequence unrolled_sequence)
 extract_function("${unrolled_assembly}" unroll_read unrolled_read)
 extract_function("${unrolled_assembly}" unroll_add_read unrolled_add_read)
@@ -62,6 +63,13 @@ if(scalar_power MATCHES "addq[\t ]+[$]4" OR
     message(FATAL_ERROR
         "four-way unrolling or rounded scalar-tail guard is missing\n"
         "${unrolled_power}\n${unrolled_sequence}")
+endif()
+if(NOT unrolled_rotate MATCHES "addq[\t ]+[$]4" OR
+   NOT unrolled_rotate MATCHES "andl[\t ]+[$]28" OR
+   NOT unrolled_rotate MATCHES "[\t ]rolq[\t ]")
+    message(FATAL_ERROR
+        "masked variable rotate did not use a shared four-way induction "
+        "group\n${unrolled_rotate}")
 endif()
 string(REGEX MATCHALL "movq[\t ]+[^,\n]+,[\t ]*[^\n]*\\(%r9"
        unrolled_store_writes "${unrolled_store}")

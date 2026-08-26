@@ -596,7 +596,7 @@ if(BUILD_TESTING)
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-loop-unrolling
                 -DENTRY=loop_unrolling_entry
-                -DEXPECTED=29
+                -DEXPECTED=35
                 -DCC_FLAGS=-O3
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_runtime_native_slp_vectorization

@@ -115,8 +115,9 @@ if(o2_expect MATCHES
 endif()
 
 # On a target where RCX is an ordinary allocatable color, variable rotate
-# counts should be formed directly in RCX/CL.  A late move after the final
-# count addition serializes every unrolled lane immediately before ROL.
+# counts should be formed directly in RCX/CL. The shared first count remains
+# live to derive the second lane, but the remaining four-way group must not
+# introduce a late move after each count addition.
 execute_process(
     COMMAND "${CC}" -S -O3 -fno-eval-calls -march=x86-64-v3
             -target x86_64-unknown-linux-gnu -mabi=sysv_abi "${SOURCE}"
@@ -135,8 +136,8 @@ extract_function("${v3_assembly}" allocated_rotate v3_rotate)
 string(REGEX MATCHALL "rolq[\t ]+%cl" variable_rotates "${v3_rotate}")
 list(LENGTH variable_rotates variable_rotate_count)
 if(NOT variable_rotate_count EQUAL 5 OR
-   NOT v3_rotate MATCHES "andl[\t ]+[$]31,[\t ]+%ecx" OR
-   NOT v3_rotate MATCHES "leaq[\t ]+1\\([^\n]+\\),[\t ]+%rcx" OR
+   NOT v3_rotate MATCHES "andl[\t ]+[$]28" OR
+   NOT v3_rotate MATCHES "leaq[\t ]+3\\([^\n]+\\),[\t ]+%rcx" OR
    v3_rotate MATCHES
        "addq[\t ]+[$]1,[\t ]+%r(8|9|10|11|dx|si|di)[\r\n]+[\t ]*movq[^\n]+,[\t ]+%rcx")
     message(FATAL_ERROR

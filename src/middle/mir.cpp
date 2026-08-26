@@ -8400,6 +8400,78 @@ struct UnrollLoopPattern {
     std::vector<ValueId> header_values;
 };
 
+struct SharedMaskedInduction {
+    ValueId value;
+    ValueId source;
+    UInt128 reduced_mask;
+    hir::TypeId type;
+    SourceLocation location;
+};
+
+bool is_loop_index_view(const ManagedFunction& function,
+                        const hir::Module& hir_module,
+                        ValueId candidate, ValueId index) {
+    std::unordered_set<std::uint32_t> visited;
+    while (candidate != index) {
+        if (candidate.value >= function.values.size() ||
+            !visited.insert(candidate.value).second) {
+            return false;
+        }
+        const auto& value = function.values[candidate.value];
+        if (value.kind != ValueKind::Cast ||
+            value.cast != CastOperation::Reinterpret ||
+            value.operands.size() != 1 ||
+            type_bits(hir_module, value.type) !=
+                type_bits(hir_module,
+                          function.values[value.operands.front().value].type)) {
+            return false;
+        }
+        candidate = value.operands.front();
+    }
+    return true;
+}
+
+std::vector<SharedMaskedInduction> find_shared_masked_inductions(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const UnrollLoopPattern& pattern, unsigned factor) {
+    std::vector<SharedMaskedInduction> result;
+    if (factor < 2 || (factor & (factor - 1U)) != 0) return result;
+    const UInt128 low_bits{factor - 1U};
+    for (const auto id : pattern.body_values) {
+        const auto& value = function.values[id.value];
+        if (value.kind != ValueKind::Binary ||
+            value.binary != BinaryOperation::BitAnd ||
+            value.operands.size() != 2 ||
+            !integer_type(hir_module, value.type)) {
+            continue;
+        }
+        std::optional<ValueId> source;
+        const ManagedValue* mask{};
+        for (unsigned index = 0; index < 2; ++index) {
+            const auto source_id = value.operands[index];
+            const auto mask_id = value.operands[1U - index];
+            const auto& candidate_mask = function.values[mask_id.value];
+            if (is_loop_index_view(function, hir_module, source_id,
+                                   pattern.index) &&
+                candidate_mask.kind == ValueKind::ConstantInteger) {
+                source = source_id;
+                mask = &candidate_mask;
+                break;
+            }
+        }
+        if (!source || !mask) continue;
+        const auto bits = type_bits(hir_module, value.type);
+        const auto original_mask = mask_to(
+            UInt128{mask->integer, mask->integer_high}, bits);
+        if (bit_and(original_mask, low_bits) != low_bits) continue;
+        const auto reduced_mask = mask_to(
+            bit_and(original_mask, bit_not(low_bits)), bits);
+        result.push_back(
+            {id, *source, reduced_mask, value.type, value.location});
+    }
+    return result;
+}
+
 std::optional<UnrollLoopPattern> find_unrollable_loop(
     const ManagedFunction& function, const hir::Module& hir_module,
     const CanonicalLoop& loop) {
@@ -8608,6 +8680,8 @@ bool unroll_loop(ManagedFunction& function,
     const auto definitions = value_definition_blocks(function);
     const auto induction_update = *phi_value_from(
         function.values[pattern.index.value], pattern.backedge);
+    const auto shared_masked_patterns = find_shared_masked_inductions(
+        function, hir_module, pattern, factor);
 
     const BlockId header_id{
         static_cast<std::uint32_t>(function.blocks.size())};
@@ -8695,6 +8769,43 @@ bool unroll_loop(ManagedFunction& function,
         : 0;
     const auto mask_id =
         append_value(preheader_values, std::move(mask_value));
+
+    struct SharedMaskedState {
+        ValueId source;
+        hir::TypeId type;
+        SourceLocation location;
+        ValueId mask;
+        std::vector<ValueId> offsets;
+        std::optional<ValueId> base;
+    };
+    std::unordered_map<std::uint32_t, SharedMaskedState>
+        shared_masked_inductions;
+    for (const auto& pattern_value : shared_masked_patterns) {
+        ManagedValue shared_mask;
+        shared_mask.location = pattern_value.location;
+        shared_mask.type = pattern_value.type;
+        shared_mask.kind = ValueKind::ConstantInteger;
+        shared_mask.integer = pattern_value.reduced_mask.low;
+        shared_mask.integer_high = pattern_value.reduced_mask.high;
+        const auto shared_mask_id =
+            append_value(preheader_values, std::move(shared_mask));
+        std::vector<ValueId> offsets(factor);
+        for (unsigned offset = 1; offset < factor; ++offset) {
+            ManagedValue offset_value;
+            offset_value.location = pattern_value.location;
+            offset_value.type = pattern_value.type;
+            offset_value.kind = ValueKind::ConstantInteger;
+            offset_value.integer = offset;
+            offsets[offset] =
+                append_value(preheader_values, std::move(offset_value));
+        }
+        shared_masked_inductions.emplace(
+            pattern_value.value.value,
+            SharedMaskedState{pattern_value.source, pattern_value.type,
+                              pattern_value.location, shared_mask_id,
+                              std::move(offsets), std::nullopt});
+    }
+
     ManagedValue limit_value;
     limit_value.location = header.location;
     limit_value.type = index_type;
@@ -8819,6 +8930,30 @@ bool unroll_loop(ManagedFunction& function,
         std::optional<ValueId> next_index;
         for (const auto original : pattern.body_values) {
             if (invariant_values.contains(original.value)) continue;
+            if (const auto found =
+                    shared_masked_inductions.find(original.value);
+                found != shared_masked_inductions.end()) {
+                auto& shared = found->second;
+                ManagedValue derived;
+                derived.location = shared.location;
+                derived.type = shared.type;
+                derived.kind = ValueKind::Binary;
+                if (iteration_number == 0) {
+                    const auto source = resolve(shared.source, iteration);
+                    if (!source) return false;
+                    derived.binary = BinaryOperation::BitAnd;
+                    derived.operands = {*source, shared.mask};
+                } else {
+                    if (!shared.base) return false;
+                    derived.binary = BinaryOperation::Add;
+                    derived.operands = {
+                        *shared.base, shared.offsets[iteration_number]};
+                }
+                const auto id = append_body_value(std::move(derived));
+                if (iteration_number == 0) shared.base = id;
+                iteration.emplace(original.value, id);
+                continue;
+            }
             if (original == induction_update) {
                 // Express every cloned induction value relative to the
                 // loop-header phi rather than as a chain of +1 updates.
@@ -8961,10 +9096,9 @@ void unroll_loops(ManagedFunction& function,
             });
         const unsigned factor =
             body_cost <= 24 &&
-                    (contains_select || contains_ordered_store ||
-                     !reads_memory ||
-                     (options.optimization_effort >= 3 &&
-                      contains_floating_recurrence))
+                (contains_select || contains_ordered_store || !reads_memory ||
+                 (options.optimization_effort >= 3 &&
+                  contains_floating_recurrence))
                 ? 4U
                 : 2U;
         (void)unroll_loop(function, *pattern, hir_module, factor);

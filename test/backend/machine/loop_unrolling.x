@@ -12,6 +12,18 @@ global u64 unroll_power(in uptr count) {
     return result;
 }
 
+[[runtime_only, noinline, link_name("unroll_rotate")]]
+global u64 unroll_rotate(in uptr count) {
+    u64 result = 1;
+    uptr index = 0;
+    while (index < count) {
+        u64 shift = (index & 31u64) + 1u64;
+        result = (result << shift) | (result >> (64u64 - shift));
+        index = index + 1;
+    }
+    return result;
+}
+
 [[runtime_only, noinline, link_name("unroll_sequence")]]
 global u64 unroll_sequence(in uptr count) {
     u64 result = 2;
@@ -93,6 +105,12 @@ global i32 loop_unrolling_entry() {
            (unroll_power(4) == 162) +
            (unroll_power(5) == 486) +
            (unroll_power(9) == 39366) +
+           (unroll_rotate(0) == 1) +
+           (unroll_rotate(1) == 2) +
+           (unroll_rotate(7) == 268435456) +
+           (unroll_rotate(8) == 68719476736) +
+           (unroll_rotate(9) == 35184372088832) +
+           (unroll_rotate(16) == 256) +
            (unroll_sequence(0) == 2) +
            (unroll_sequence(1) == 6) +
            (unroll_sequence(3) == 59) +
