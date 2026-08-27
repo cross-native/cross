@@ -7,6 +7,8 @@ option(CROSS_ENABLE_GCC_GIMPLE_TEXT
        "Build the optional GCC GIMPLE debug/backend-validation serializer" ON)
 option(CROSS_STATIC_TOOLS
        "Link the cc and cpp tools without shared compiler runtimes" ON)
+set(CROSS_PPSSPP_HEADLESS "" CACHE FILEPATH
+    "Optional PPSSPPHeadless executable for Allegrex runtime tests")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -254,6 +256,16 @@ if(BUILD_TESTING)
                 -DF64_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/single_float_error.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-allegrex
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.cmake")
+    add_test(NAME cross_mips_allegrex_runtime
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
+                -DRUNTIME=${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.x
+                -DMODULE_INFO=${CMAKE_SOURCE_DIR}/test/target/mips/psp/module_info.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/psp/link.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-allegrex-runtime
+                -DPPSSPP=${CROSS_PPSSPP_HEADLESS}
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.cmake")
     add_test(NAME cross_mips_vr4300_runtime
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
