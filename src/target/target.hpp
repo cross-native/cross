@@ -126,6 +126,19 @@ struct AbiRule {
     unsigned unit_bits{};
     unsigned carrier_bits{};
     unsigned max_elements{~0U};
+    // Register cursors are counted in model-defined slots rather than bytes.
+    // Some ABIs align a value to an even slot and/or consume more slots than
+    // the number of physical endpoints used by the value (for example a
+    // double in the MIPS o32 paired-FPR convention).
+    unsigned cursor_alignment{1};
+    unsigned cursor_advance{};
+    // Zero means unlimited.  This makes leading-argument conventions model
+    // data without giving the common interpreter an architecture name.
+    unsigned argument_limit{};
+    // A rule can remain eligible only until another bank has classified a
+    // value.  This expresses stateful conventions such as "leading floating
+    // arguments use FPRs until a GPR argument is encountered".
+    std::vector<std::string> requires_unused_banks;
     unsigned stack_alignment{};
     unsigned stack_size{};
     // A flatten rule may merge recursively classified fields into fixed-size

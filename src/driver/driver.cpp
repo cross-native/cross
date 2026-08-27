@@ -582,9 +582,14 @@ int cc_main(int argc, char** argv) {
                 diagnostics.command_error(error);
             }
         } else {
+            const auto object_writer_cpu =
+                backend->object_writer_cpu(*subtarget);
+            const auto object_writer_features =
+                backend->object_writer_features(*subtarget);
             native::AssemblyRequest request{
-                assembly, options.target, options.cpu,
-                &options.target_features, subtarget->object_format(), output,
+                assembly, options.target,
+                object_writer_cpu,
+                &object_writer_features, subtarget->object_format(), output,
                 options.verbose,
                 options.save_temps};
             (void)native::assemble_object(request, diagnostics);

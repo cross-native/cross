@@ -67,11 +67,14 @@ cross_component(cross_common)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
-             "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm")
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
      CROSS_COMMON_MODEL)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
      CROSS_X86_64_MODEL)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm"
+     CROSS_MIPS_MODEL)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/model/shipped_models.cpp.in"
@@ -86,6 +89,7 @@ add_library(cross_targets
     src/target/assembly_format.cpp
     src/target/registry.cpp
     src/target/subtarget.cpp
+    src/target/mips/target.cpp
     src/target/x86_64/manual_endpoint.cpp
     src/target/x86_64/target.cpp
 )
@@ -130,6 +134,9 @@ add_library(cross_native_backend
     src/backend/native/machine_transform.cpp
     src/backend/native/standalone_audit.cpp
     src/target/backend.cpp
+    src/target/mips/backend.cpp
+    src/target/mips/machine_description.cpp
+    src/target/mips/native_backend.cpp
     src/target/x86_64/backend.cpp
     src/target/x86_64/dynamic_abi_plan.cpp
     src/target/x86_64/machine_description.cpp
@@ -232,6 +239,24 @@ if(BUILD_TESTING)
     add_test(NAME cross_version COMMAND $<TARGET_FILE:cross_cc> --version)
     add_test(NAME cross_targets COMMAND $<TARGET_FILE:cross_cc> --print-targets)
     add_test(NAME cross_abis COMMAND $<TARGET_FILE:cross_cc> --print-abis)
+    add_test(NAME cross_mips_vr4300_o32
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.x
+                -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-o32
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.cmake")
+    add_test(NAME cross_mips_vr4300_runtime
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.x
+                -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/runtime.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-runtime
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
     add_test(NAME cross_model_system
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

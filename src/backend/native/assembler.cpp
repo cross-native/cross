@@ -111,11 +111,21 @@ bool assemble_object(const AssemblyRequest& request, Diagnostics& diagnostics) {
 
     std::vector<std::string> command{"llvm-mc", "--filetype=obj",
                                      "--triple=" + std::string(request.target)};
-    // Feature and CPU names belong to the Cross target registry. They need
-    // not use LLVM spellings, and selection has already produced an exact
-    // assembly instruction stream. Forwarding them to the object writer
-    // would incorrectly couple custom compiler definitions to LLVM's option
-    // vocabulary without changing the chosen encoding.
+    // Cross feature/CPU names are never forwarded directly. A target backend
+    // may supply one exact writer-specific CPU spelling because some object
+    // formats (notably MIPS ELF) derive mandatory architecture flags from it
+    // even after source directives selected the same instruction encoding.
+    if (!request.cpu.empty()) {
+        command.push_back("--mcpu=" + std::string(request.cpu));
+    }
+    if (request.target_features && !request.target_features->empty()) {
+        std::string features;
+        for (const auto& feature : *request.target_features) {
+            if (!features.empty()) features += ',';
+            features += feature;
+        }
+        command.push_back("--mattr=" + features);
+    }
     command.push_back(input.string());
     command.emplace_back("-o");
     command.push_back(object.string());

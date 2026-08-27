@@ -22,6 +22,8 @@ struct AssemblyRequest {
     std::string_view assembly;
     std::string_view target;
     std::string_view cpu;
+    // Exact object-writer spellings supplied by the active target backend;
+    // never the user/model-facing Cross feature names.
     const std::vector<std::string>* target_features{};
     ObjectFormat object_format{ObjectFormat::Unsupported};
     std::filesystem::path output;

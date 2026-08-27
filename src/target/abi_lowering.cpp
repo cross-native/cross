@@ -6,6 +6,7 @@
 #include <array>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace cross {
@@ -29,6 +30,7 @@ struct LoweredValue {
 
 struct AllocationState {
     std::unordered_map<std::string, std::size_t> cursors;
+    std::unordered_map<std::string, std::size_t> bank_uses;
     std::size_t stack_cursor{};
     std::size_t high_water{};
 };
@@ -111,7 +113,9 @@ bool naturally_aligned(const AbiValue& value, unsigned depth = 0) {
 
 bool rule_matches(const AbiEntry& abi, const AbiRule& rule,
                   const AbiValue& value, RuleUse use,
-                  AbiFeatureSet features) {
+                  AbiFeatureSet features,
+                  const AllocationState* allocation = nullptr,
+                  std::size_t argument_index = 0) {
     const auto kind = model_kind(
         value.transport == ValueTransport::ByReference
             ? ScalarKind::Pointer
@@ -126,6 +130,22 @@ bool rule_matches(const AbiEntry& abi, const AbiRule& rule,
          !rule.variadic_arguments) ||
         (use == RuleUse::Result && !rule.results)) {
         return false;
+    }
+    if (use != RuleUse::Result) {
+        if (rule.argument_limit != 0 &&
+            argument_index >= rule.argument_limit) {
+            return false;
+        }
+        if (allocation && std::any_of(
+                rule.requires_unused_banks.begin(),
+                rule.requires_unused_banks.end(),
+                [&](const std::string& bank) {
+                    const auto found = allocation->bank_uses.find(bank);
+                    return found != allocation->bank_uses.end() &&
+                           found->second != 0;
+                })) {
+            return false;
+        }
     }
     if (std::find(rule.matches.begin(), rule.matches.end(), kind) ==
             rule.matches.end() &&
@@ -208,10 +228,13 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                                         const AbiValue& value,
                                         RuleUse use,
                                         AbiFeatureSet features,
+                                        const AllocationState* allocation = nullptr,
+                                        std::size_t argument_index = 0,
                                         unsigned depth = 0) {
     if (depth >= 64) return std::nullopt;
     for (const auto& candidate : abi.rules) {
-        if (!rule_matches(abi, candidate, value, use, features)) {
+        if (!rule_matches(abi, candidate, value, use, features,
+                          allocation, argument_index)) {
             continue;
         }
         const auto* rule = &candidate;
@@ -264,7 +287,7 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                 element_offset(value, index, running);
             auto child =
                 lower_value(abi, value.elements[index], use, features,
-                            depth + 1);
+                            allocation, argument_index, depth + 1);
             if (!child || child->force_stack || child->indirect) {
                 return std::nullopt;
             }
@@ -282,7 +305,7 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                  index < value.element_count; ++index) {
                 auto child =
                     lower_value(abi, element, use, features,
-                                depth + 1);
+                                allocation, argument_index, depth + 1);
                 if (!child || child->force_stack || child->indirect) {
                     return std::nullopt;
                 }
@@ -558,6 +581,55 @@ struct ResultWork {
     std::vector<PendingPiece> partial_stack;
 };
 
+using CursorMap = std::unordered_map<std::string, std::size_t>;
+
+bool prepare_rule_cursors(const LoweredValue& lowered, CursorMap& cursors,
+                          CursorMap& starts) {
+    const auto alignment = lowered.rule
+                               ? lowered.rule->cursor_alignment
+                               : 1U;
+    for (const auto& piece : lowered.pieces) {
+        if (!piece.bank || starts.contains(piece.bank->cursor)) continue;
+        std::size_t aligned{};
+        if (!checked_align(cursors[piece.bank->cursor], alignment,
+                           aligned)) {
+            return false;
+        }
+        cursors[piece.bank->cursor] = aligned;
+        starts.emplace(piece.bank->cursor, aligned);
+    }
+    return true;
+}
+
+bool finish_rule_cursors(const LoweredValue& lowered, CursorMap& cursors,
+                         const CursorMap& starts) {
+    if (!lowered.rule || lowered.rule->cursor_advance == 0) return true;
+    for (const auto& [name, start] : starts) {
+        const auto found = cursors.find(name);
+        if (found == cursors.end() || found->second < start) return false;
+        const auto used = found->second - start;
+        if (used > lowered.rule->cursor_advance ||
+            start > std::numeric_limits<std::size_t>::max() -
+                        lowered.rule->cursor_advance) {
+            return false;
+        }
+        found->second = start + lowered.rule->cursor_advance;
+    }
+    return true;
+}
+
+void record_rule_banks(const LoweredValue& lowered,
+                       AllocationState& state) {
+    std::unordered_set<std::string_view> seen;
+    for (const auto& piece : lowered.pieces) {
+        if (!piece.bank ||
+            !seen.insert(piece.bank->canonical_name).second) {
+            continue;
+        }
+        ++state.bank_uses[piece.bank->canonical_name];
+    }
+}
+
 SignatureClassificationResult signature_fail(
     SignatureLayout layout, ClassificationError error,
     std::size_t value, bool result) {
@@ -618,6 +690,13 @@ SignatureClassificationResult classify_signature_values(
         auto& work = result_work[index];
         auto& assignment = layout.results[index];
         if (!work.lowered.indirect) continue;
+        CursorMap starts;
+        if (!prepare_rule_cursors(
+                work.lowered, argument_registers.cursors, starts)) {
+            return signature_fail(
+                std::move(layout), ClassificationError::SizeOverflow,
+                index, true);
+        }
         for (const auto& request : work.lowered.pieces) {
             if (!request.bank) {
                 return signature_fail(
@@ -639,6 +718,13 @@ SignatureClassificationResult classify_signature_values(
                     request.bank->results.front();
             }
         }
+        if (!finish_rule_cursors(
+                work.lowered, argument_registers.cursors, starts)) {
+            return signature_fail(
+                std::move(layout), ClassificationError::InvalidScalarMode,
+                index, true);
+        }
+        record_rule_banks(work.lowered, argument_registers);
     }
 
     const bool reserve_argument_spills =
@@ -649,7 +735,8 @@ SignatureClassificationResult classify_signature_values(
             fixed_argument_count && index >= *fixed_argument_count
                 ? RuleUse::VariadicArgument
                 : RuleUse::FixedArgument;
-        auto lowered = lower_value(abi, value, use, features);
+        auto lowered = lower_value(
+            abi, value, use, features, &argument_registers, index);
         if (!lowered) {
             return signature_fail(
                 std::move(layout),
@@ -673,6 +760,13 @@ SignatureClassificationResult classify_signature_values(
         }
 
         const auto saved_cursors = argument_registers.cursors;
+        CursorMap starts;
+        if (!prepare_rule_cursors(
+                work.lowered, argument_registers.cursors, starts)) {
+            return signature_fail(
+                std::move(layout), ClassificationError::SizeOverflow,
+                index, false);
+        }
         bool exhausted = false;
         for (const auto& request : work.lowered.pieces) {
             if (!request.bank) {
@@ -691,6 +785,12 @@ SignatureClassificationResult classify_signature_values(
                 work.partial_stack.push_back({request, position});
             }
         }
+        if (!finish_rule_cursors(
+                work.lowered, argument_registers.cursors, starts)) {
+            return signature_fail(
+                std::move(layout), ClassificationError::InvalidScalarMode,
+                index, false);
+        }
         if (exhausted) {
             const auto failure =
                 failure_policy(abi, work.lowered, true);
@@ -708,6 +808,7 @@ SignatureClassificationResult classify_signature_values(
         } else {
             work.spill = reserve_argument_spills;
         }
+        record_rule_banks(work.lowered, argument_registers);
         layout.call.arguments.push_back(std::move(assignment));
         if (fixed_argument_count && index + 1 == *fixed_argument_count) {
             named_register_cursors = argument_registers.cursors;
@@ -724,6 +825,13 @@ SignatureClassificationResult classify_signature_values(
             continue;
         }
         const auto saved_cursors = result_cursors;
+        CursorMap starts;
+        if (!prepare_rule_cursors(
+                work.lowered, result_cursors, starts)) {
+            return signature_fail(
+                std::move(layout), ClassificationError::SizeOverflow,
+                index, true);
+        }
         bool exhausted = false;
         for (const auto& request : work.lowered.pieces) {
             if (!request.bank) {
@@ -740,6 +848,12 @@ SignatureClassificationResult classify_signature_values(
                 exhausted = true;
                 work.partial_stack.push_back({request, position});
             }
+        }
+        if (!finish_rule_cursors(
+                work.lowered, result_cursors, starts)) {
+            return signature_fail(
+                std::move(layout), ClassificationError::InvalidScalarMode,
+                index, true);
         }
         if (!exhausted) continue;
         const auto failure =

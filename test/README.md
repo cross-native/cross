@@ -12,6 +12,8 @@
 - `backend/abi/` covers automatic, manual, and optimized private call
   boundaries.
 - `backend/native/` covers native emission and standalone auditing.
+- `target/<architecture>/` covers architecture-specific profiles, assembly,
+  object metadata, diagnostics, and optional emulator execution.
 - `support/` contains runners shared by multiple test families.
 
 Fixtures live beside their CMake test driver whenever they are not shared.

@@ -3,6 +3,7 @@
 #include "target/target.hpp"
 
 #include "model/model.hpp"
+#include "target/mips/target.hpp"
 #include "target/x86_64/target.hpp"
 
 namespace cross {
@@ -20,6 +21,10 @@ std::string_view TargetInfo::default_abi(std::string_view triple) const {
 
 const std::vector<const TargetInfo*>& all_targets() {
     static const std::vector<const TargetInfo*> targets{
+        // Little-endian spellings begin with "mips" too, so keep the more
+        // specific variant first.
+        &mipsel_target(),
+        &mips_target(),
         &x86_64_target(),
     };
     return targets;

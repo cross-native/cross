@@ -28,6 +28,19 @@ public:
 
     [[nodiscard]] virtual std::string_view architecture() const = 0;
 
+    // Exact CPU spelling for the selected external object writer. This is
+    // target-owned because Cross CPU/model names need not match LLVM or
+    // binutils vocabulary. An empty value asks the writer to use its triple
+    // default; instruction selection has already happened before this hook.
+    [[nodiscard]] virtual std::string object_writer_cpu(
+        const Subtarget&) const {
+        return {};
+    }
+    [[nodiscard]] virtual std::vector<std::string> object_writer_features(
+        const Subtarget&) const {
+        return {};
+    }
+
     // Validate architecture-specific HIR contracts early enough that later
     // source/body diagnostics can still be accumulated in the same run.
     [[nodiscard]] virtual bool validate_hir(

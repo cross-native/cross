@@ -81,7 +81,9 @@ bool validate_shipped_abis() {
         model_registry().find_abi("x86-64", "sysv_abi", {});
     const auto* microsoft =
         model_registry().find_abi("x86-64", "ms_abi", {});
-    if (!cross_abi || !sysv || !microsoft) return false;
+    const auto* o32 =
+        model_registry().find_abi("mips", "o32", {});
+    if (!cross_abi || !sysv || !microsoft || !o32) return false;
     if (!cross_abi->gcc_calling_attribute.empty() ||
         sysv->gcc_calling_attribute != "sysv_abi" ||
         microsoft->gcc_calling_attribute != "ms_abi") {
@@ -109,6 +111,55 @@ bool validate_shipped_abis() {
     const auto ref_i128 =
         AbiValue{ScalarMode::integer(128),
                  ValueTransport::ByReference};
+
+    const auto o32_i32 = scalar(ScalarMode::integer(32));
+    const auto o32_f32 = scalar(ScalarMode::floating(32));
+    const std::array<std::string, 4> o32_hard{
+        "mips3", "hard-float", "fp32", "odd-spreg"};
+    const std::array<std::string, 2> o32_soft{"mips3", "soft-float"};
+
+    const auto o32_integer_pair = classify_call_arguments(
+        *o32, std::array{o32_i32, i64, o32_i32}, o32_hard);
+    if (!o32_integer_pair ||
+        !register_is(o32_integer_pair.layout.arguments[0], 0, "a0") ||
+        !register_is(o32_integer_pair.layout.arguments[1], 0, "a2") ||
+        !register_is(o32_integer_pair.layout.arguments[1], 1, "a3") ||
+        !stack_is(o32_integer_pair.layout.arguments[2], 0, 16)) {
+        return false;
+    }
+
+    const auto o32_leading_float = classify_call_arguments(
+        *o32, std::array{o32_f32, o32_f32, o32_i32}, o32_hard);
+    const auto o32_after_integer = classify_call_arguments(
+        *o32, std::array{o32_i32, o32_f32}, o32_hard);
+    const auto o32_aligned_float = classify_call_arguments(
+        *o32, std::array{o32_f32, f64, o32_i32}, o32_hard);
+    if (!o32_leading_float ||
+        !register_is(o32_leading_float.layout.arguments[0], 0, "f12") ||
+        !register_is(o32_leading_float.layout.arguments[1], 0, "f14") ||
+        !register_is(o32_leading_float.layout.arguments[2], 0, "a2") ||
+        !o32_after_integer ||
+        !register_is(o32_after_integer.layout.arguments[0], 0, "a0") ||
+        !register_is(o32_after_integer.layout.arguments[1], 0, "a1") ||
+        !o32_aligned_float ||
+        !register_is(o32_aligned_float.layout.arguments[0], 0, "f12") ||
+        !register_is(o32_aligned_float.layout.arguments[1], 0, "f14") ||
+        !stack_is(o32_aligned_float.layout.arguments[2], 0, 16)) {
+        return false;
+    }
+
+    const auto o32_i64_result = classify_return(*o32, i64, o32_hard);
+    const auto o32_f64_result = classify_return(*o32, f64, o32_hard);
+    const auto o32_soft_f64_result = classify_return(*o32, f64, o32_soft);
+    if (!o32_i64_result ||
+        !register_is(o32_i64_result, 0, "v0") ||
+        !register_is(o32_i64_result, 1, "v1") ||
+        !o32_f64_result || !register_is(o32_f64_result, 0, "f0") ||
+        !o32_soft_f64_result ||
+        !register_is(o32_soft_f64_result, 0, "v0") ||
+        !register_is(o32_soft_f64_result, 1, "v1")) {
+        return false;
+    }
 
     const std::array seven_i64{i64, i64, i64, i64, i64, i64, i64};
     const auto cross_registers =

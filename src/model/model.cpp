@@ -1541,6 +1541,8 @@ private:
                     block.properties,
                     {"match", "action", "bank", "min_bits", "max_bits",
                      "unit_bits", "carrier_bits", "max_elements",
+                     "cursor_alignment", "cursor_advance",
+                     "argument_limit", "requires_unused_banks",
                      "stack_alignment", "stack_size", "applies_to",
                      "register_failure", "requires_features",
                      "forbids_features", "merge_banks",
@@ -1597,6 +1599,22 @@ private:
                     unsigned_property(block.properties, "max_elements")) {
                 rule.max_elements = *value;
             }
+            if (const auto value = unsigned_property(
+                    block.properties, "cursor_alignment")) {
+                rule.cursor_alignment = *value;
+            }
+            if (const auto value = unsigned_property(
+                    block.properties, "cursor_advance")) {
+                rule.cursor_advance = *value;
+            }
+            if (const auto value = unsigned_property(
+                    block.properties, "argument_limit")) {
+                rule.argument_limit = *value;
+            }
+            if (const auto value = list_property(
+                    block.properties, "requires_unused_banks")) {
+                rule.requires_unused_banks = *value;
+            }
             if (const auto value =
                     unsigned_property(block.properties, "stack_alignment")) {
                 rule.stack_alignment = *value;
@@ -1627,6 +1645,12 @@ private:
                 (rule.stack_alignment & (rule.stack_alignment - 1U)) != 0) {
                 fail(block.line,
                      "ABI rule stack_alignment must be a power of two");
+                return std::nullopt;
+            }
+            if (rule.cursor_alignment == 0 ||
+                (rule.cursor_alignment & (rule.cursor_alignment - 1U)) != 0) {
+                fail(block.line,
+                     "ABI rule cursor_alignment must be a nonzero power of two");
                 return std::nullopt;
             }
             if (const auto applies =
@@ -2176,6 +2200,30 @@ bool validate_abi_model(const TargetInfo& target, const AbiEntry& abi,
                 rule.canonical_name +
                 "' has unit_bits wider than its register bank");
             return false;
+        }
+        if ((rule.cursor_alignment != 1 || rule.cursor_advance != 0) &&
+            !needs_bank) {
+            diagnostics.command_error(
+                "ABI model '" + abi.canonical_name + "' rule '" +
+                rule.canonical_name +
+                "' uses cursor policy without a register bank");
+            return false;
+        }
+        std::unordered_set<std::string_view> required_unused_names;
+        for (const auto& required : rule.requires_unused_banks) {
+            const auto known = std::find_if(
+                abi.banks.begin(), abi.banks.end(),
+                [&](const AbiRegisterBank& candidate) {
+                    return candidate.canonical_name == required;
+                });
+            if (required.empty() || known == abi.banks.end() ||
+                !required_unused_names.insert(required).second) {
+                diagnostics.command_error(
+                    "ABI model '" + abi.canonical_name + "' rule '" +
+                    rule.canonical_name +
+                    "' has an empty, duplicate, or unknown required-unused bank");
+                return false;
+            }
         }
         if (bank != abi.banks.end() &&
             rule.carrier_bits > bank->register_bits) {

@@ -13,9 +13,13 @@ constexpr std::string_view common_model =
 constexpr std::string_view x86_64_model =
     R"cross_model(@CROSS_X86_64_MODEL@)cross_model";
 
+constexpr std::string_view mips_model =
+    R"cross_model(@CROSS_MIPS_MODEL@)cross_model";
+
 constexpr std::array sources{
     ShippedModelSource{"shipped:common.xm", common_model},
     ShippedModelSource{"shipped:x86_64.xm", x86_64_model},
+    ShippedModelSource{"shipped:mips.xm", mips_model},
 };
 
 } // namespace

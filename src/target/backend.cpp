@@ -4,6 +4,7 @@
 
 #include "backend/native/machine_pipeline.hpp"
 #include "target/target.hpp"
+#include "target/mips/backend.hpp"
 #include "target/x86_64/backend.hpp"
 
 namespace cross {
@@ -18,6 +19,7 @@ std::string TargetBackend::emit_managed_assembly(
 
 const std::vector<const TargetBackend*>& all_target_backends() {
     static const std::vector<const TargetBackend*> backends{
+        &mips::backend(),
         &x86_64::backend(),
     };
     return backends;
