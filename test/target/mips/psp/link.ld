@@ -20,9 +20,9 @@ SECTIONS
     ASSERT(SIZEOF(.text.psp.stub) >= 8,
            "PSP import stub must contain two instructions")
     .text : { *(.text.boot) *(.text .text.*) } :text
-    ASSERT(. <= 0x08805000, "PSP test code overlaps module metadata")
+    ASSERT(. <= 0x08808000, "PSP test code overlaps module metadata")
 
-    . = 0x08805000;
+    . = 0x08808000;
     .rodata.sceModuleInfo : { *metadata.bin(.data) } :data
     ASSERT(SIZEOF(.rodata.sceModuleInfo) == 0x5c,
            "PSP module metadata layout changed")

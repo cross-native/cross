@@ -397,12 +397,10 @@ private:
                                    "managed value has no fixed MIPS machine mode");
                 continue;
             }
-            if (mode.bits == 64 && !is_floating(hir_, value.type) &&
-                !subtarget_.has_feature(Feature::Mips3)) {
-                diagnostics_.error(
-                    value.location,
-                    "64-bit scalar lowering in this MIPS backend requires MIPS III");
-            }
+            // MIPS I/II legalize 64-bit integers to a pair of 32-bit GPR
+            // words in the assembly emitter.  Keeping the SSA value intact
+            // here lets target-independent MIR optimizations reason about an
+            // ordinary i64/u64 value without inventing a public pair type.
             if (is_floating(hir_, value.type) &&
                 !subtarget_.has_feature(Feature::HardFloat)) {
                 diagnostics_.error(
@@ -1268,6 +1266,66 @@ private:
         return ActiveSignature{abi, classified.layout};
     }
 
+    static std::string parameter_home_name(std::string_view reg) {
+        return "$abi.in." + std::string(reg);
+    }
+
+    void prepare_parameter_homes(machine::Function& function) {
+        if (!active_signature_) return;
+        for (const auto& assignment :
+             active_signature_->layout.call.arguments) {
+            for (const auto& piece : assignment.pieces) {
+                if (piece.location.kind != LocationKind::Register) continue;
+                const auto name = parameter_home_name(piece.location.reg);
+                if (named_slot(function, name)) continue;
+                machine::StackSlot home;
+                home.id = {static_cast<std::uint32_t>(
+                    function.stack_slots.size())};
+                home.kind = machine::StackSlotKind::IncomingArgument;
+                home.size = std::max(
+                    4U, (static_cast<unsigned>(piece.carrier_bits) + 7U) /
+                            8U);
+                home.alignment = std::min(home.size, 8U);
+                home.location = function.location;
+                home.name = name;
+                function.stack_slots.push_back(std::move(home));
+            }
+        }
+    }
+
+    void emit_parameter_homes(const machine::Function& function) {
+        if (!active_signature_) return;
+        std::vector<std::string> saved;
+        for (const auto& assignment :
+             active_signature_->layout.call.arguments) {
+            for (const auto& piece : assignment.pieces) {
+                if (piece.location.kind != LocationKind::Register ||
+                    std::find(saved.begin(), saved.end(),
+                              piece.location.reg) != saved.end()) {
+                    continue;
+                }
+                const auto* home = named_slot(
+                    function, parameter_home_name(piece.location.reg));
+                if (!home || !home->frame_offset) {
+                    diagnostics_.error(
+                        function.location,
+                        "MIPS incoming argument register has no frame home");
+                    continue;
+                }
+                if (fpr(piece.location.reg)) {
+                    instruction(piece.carrier_bits <= 32 ? "swc1" : "sdc1",
+                                reg_name(piece.location.reg) + "," +
+                                    memory(*home->frame_offset));
+                } else {
+                    store_integer_memory(piece.location.reg,
+                                         memory(*home->frame_offset),
+                                         piece.carrier_bits);
+                }
+                saved.push_back(piece.location.reg);
+            }
+        }
+    }
+
     static unsigned effective_piece_offset(
         const ValuePiece& piece, unsigned value_bits, ByteOrder order) {
         if (order == ByteOrder::Little || piece.value_bits >= value_bits) {
@@ -1340,6 +1398,47 @@ private:
         instruction(opcode, reg_name(source) + "," + memory_operand);
     }
 
+    bool legalizes_to_pair(machine::Register value) const {
+        return value.mode.bits > 32 && value.mode.bits <= 64 &&
+               !subtarget_.has_feature(Feature::Mips3);
+    }
+
+    std::int64_t word_offset(std::int64_t base, bool high) const {
+        const bool little = subtarget_.target().data_layout.byte_order ==
+                            ByteOrder::Little;
+        return base + ((little ? high : !high) ? 4 : 0);
+    }
+
+    void load_pair_memory(std::string_view low, std::string_view high,
+                          std::int64_t offset,
+                          std::string_view base = "fp") {
+        instruction("lw", reg_name(low) + "," +
+                              memory(word_offset(offset, false), base));
+        instruction("lw", reg_name(high) + "," +
+                              memory(word_offset(offset, true), base));
+    }
+
+    void store_pair_memory(std::string_view low, std::string_view high,
+                           std::int64_t offset,
+                           std::string_view base = "fp") {
+        instruction("sw", reg_name(low) + "," +
+                              memory(word_offset(offset, false), base));
+        instruction("sw", reg_name(high) + "," +
+                              memory(word_offset(offset, true), base));
+    }
+
+    void load_vreg_pair(const machine::Function& function,
+                        machine::Register value, std::string_view low,
+                        std::string_view high, SourceLocation location) {
+        load_pair_memory(low, high, vreg_offset(function, value, location));
+    }
+
+    void store_vreg_pair(const machine::Function& function,
+                         machine::Register value, std::string_view low,
+                         std::string_view high, SourceLocation location) {
+        store_pair_memory(low, high, vreg_offset(function, value, location));
+    }
+
     void load_vreg(const machine::Function& function,
                    machine::Register value, std::string_view target,
                    SourceLocation location) {
@@ -1382,6 +1481,9 @@ private:
         if (floating) {
             load_fvreg(function, source, "f0", location);
             store_fvreg(function, target, "f0", location);
+        } else if (legalizes_to_pair(target)) {
+            load_vreg_pair(function, source, "t0", "t1", location);
+            store_vreg_pair(function, target, "t0", "t1", location);
         } else {
             load_vreg(function, source, "t0", location);
             store_vreg(function, target, "t0", location);
@@ -1448,23 +1550,38 @@ private:
         return memory(static_cast<std::int64_t>(offset));
     }
 
-    void load_abi_piece(const ValuePiece& piece, const AbiEntry& abi,
-                        std::string_view gpr) {
+    void load_abi_piece(const machine::Function& function,
+                        const ValuePiece& piece, const AbiEntry& abi,
+                        std::string_view gpr, bool parameter_entry) {
         if (piece.location.kind == LocationKind::Register) {
-            instruction("move", reg_name(gpr) + "," +
-                                    reg_name(piece.location.reg));
+            if (parameter_entry) {
+                const auto* home = named_slot(
+                    function, parameter_home_name(piece.location.reg));
+                if (!home || !home->frame_offset) {
+                    diagnostics_.error(
+                        function.location,
+                        "MIPS incoming argument register has no frame home");
+                    return;
+                }
+                load_integer_memory(gpr, memory(*home->frame_offset),
+                                    piece.carrier_bits, false);
+            } else {
+                instruction("move", reg_name(gpr) + "," +
+                                        reg_name(piece.location.reg));
+            }
         } else {
             load_integer_memory(
                 gpr, incoming_memory(piece, abi), piece.carrier_bits, false);
         }
     }
 
-    void assemble_incoming_integer(const std::vector<ValuePiece>& pieces,
+    void assemble_incoming_integer(const machine::Function& function,
+                                   const std::vector<ValuePiece>& pieces,
                                    const AbiEntry& abi, unsigned value_bits,
-                                   bool sign) {
+                                   bool sign, bool parameter_entry) {
         instruction("move", "$t0,$zero");
         for (const auto& piece : pieces) {
-            load_abi_piece(piece, abi, "t1");
+            load_abi_piece(function, piece, abi, "t1", parameter_entry);
             if (piece.value_bits < 32) {
                 const auto mask = (std::uint64_t{1} << piece.value_bits) - 1U;
                 instruction("andi", "$t1,$t1," + std::to_string(mask));
@@ -1482,6 +1599,36 @@ private:
             instruction(value_bits > 32 ? "or" : "or", "$t0,$t0,$t1");
         }
         normalize_integer("t0", value_bits, sign);
+    }
+
+    void assemble_incoming_pair(const machine::Function& function,
+                                const std::vector<ValuePiece>& pieces,
+                                const AbiEntry& abi, unsigned value_bits,
+                                bool parameter_entry) {
+        instruction("move", "$t0,$zero");
+        instruction("move", "$t1,$zero");
+        for (const auto& piece : pieces) {
+            load_abi_piece(function, piece, abi, "t2", parameter_entry);
+            if (piece.value_bits < 32) {
+                const auto mask = (std::uint64_t{1} << piece.value_bits) - 1U;
+                instruction("andi", "$t2,$t2," + std::to_string(mask));
+            }
+            const auto shift = effective_piece_offset(
+                piece, value_bits,
+                subtarget_.target().data_layout.byte_order);
+            auto destination = std::string_view{"t0"};
+            auto word_shift = shift;
+            if (shift >= 32) {
+                destination = "t1";
+                word_shift -= 32;
+            }
+            if (word_shift != 0) {
+                instruction("sll", "$t2,$t2," +
+                                       std::to_string(word_shift));
+            }
+            instruction("or", reg_name(destination) + "," +
+                                  reg_name(destination) + ",$t2");
+        }
     }
 
     void capture_parameter(const machine::Function& function,
@@ -1516,12 +1663,17 @@ private:
                                    "MIPS output parameter has no pointer home");
                 return;
             }
-            load_abi_piece(assignment.pieces.front(),
-                           *active_signature_->abi, "t0");
+            load_abi_piece(function, assignment.pieces.front(),
+                           *active_signature_->abi, "t0", true);
             instruction("sw", "$t0," + memory(*pointer->frame_offset));
             if (parameter.mode == ParameterMode::Out) {
-                instruction("move", "$t1,$zero");
-                store_vreg(function, target, "t1", value.location);
+                if (legalizes_to_pair(target)) {
+                    store_vreg_pair(function, target, "zero", "zero",
+                                    value.location);
+                } else {
+                    instruction("move", "$t1,$zero");
+                    store_vreg(function, target, "t1", value.location);
+                }
                 return;
             }
             if (is_floating(hir_, parameter.type)) {
@@ -1529,9 +1681,16 @@ private:
                             "$f0,0($t0)");
                 store_fvreg(function, target, "f0", value.location);
             } else {
-                load_integer_memory("t1", "0($t0)", target.mode.bits,
-                                    is_signed_integer(hir_, parameter.type));
-                store_vreg(function, target, "t1", value.location);
+                if (legalizes_to_pair(target)) {
+                    load_pair_memory("t1", "t2", 0, "t0");
+                    store_vreg_pair(function, target, "t1", "t2",
+                                    value.location);
+                } else {
+                    load_integer_memory(
+                        "t1", "0($t0)", target.mode.bits,
+                        is_signed_integer(hir_, parameter.type));
+                    store_vreg(function, target, "t1", value.location);
+                }
             }
             return;
         }
@@ -1540,16 +1699,33 @@ private:
             assignment.pieces.front().location.kind ==
                 LocationKind::Register &&
             fpr(assignment.pieces.front().location.reg)) {
-            store_fvreg(function, target,
-                        assignment.pieces.front().location.reg,
-                        value.location);
+            const auto& piece = assignment.pieces.front();
+            const auto* home = named_slot(
+                function, parameter_home_name(piece.location.reg));
+            if (!home || !home->frame_offset) {
+                diagnostics_.error(
+                    value.location,
+                    "MIPS floating argument register has no frame home");
+                return;
+            }
+            instruction(piece.carrier_bits <= 32 ? "lwc1" : "ldc1",
+                        "$f0," + memory(*home->frame_offset));
+            store_fvreg(function, target, "f0", value.location);
             return;
         }
-        assemble_incoming_integer(
-            assignment.pieces, *active_signature_->abi,
-            type_bits(hir_, parameter.type),
-            is_signed_integer(hir_, parameter.type));
-        if (is_floating(hir_, parameter.type)) {
+        const auto bits = type_bits(hir_, parameter.type);
+        if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
+            assemble_incoming_pair(function, assignment.pieces,
+                                   *active_signature_->abi, bits, true);
+            store_vreg_pair(function, target, "t0", "t1", value.location);
+        } else {
+            assemble_incoming_integer(
+                function, assignment.pieces, *active_signature_->abi, bits,
+                is_signed_integer(hir_, parameter.type), true);
+        }
+        if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
+            // The pair was written above, including floating bit transport.
+        } else if (is_floating(hir_, parameter.type)) {
             const auto offset = vreg_offset(function, target, value.location);
             store_integer_memory("t0", memory(offset), target.mode.bits);
         } else {
@@ -1582,10 +1758,16 @@ private:
                 instruction(bits == 32 ? "swc1" : "sdc1",
                             "$f0,0($t0)");
             } else {
-                load_integer_memory(
-                    "t1", memory(*local->frame_offset), bits,
-                    is_signed_integer(hir_, parameter.type));
-                store_integer_memory("t1", "0($t0)", bits);
+                if (bits > 32 &&
+                    !subtarget_.has_feature(Feature::Mips3)) {
+                    load_pair_memory("t1", "t2", *local->frame_offset);
+                    store_pair_memory("t1", "t2", 0, "t0");
+                } else {
+                    load_integer_memory(
+                        "t1", memory(*local->frame_offset), bits,
+                        is_signed_integer(hir_, parameter.type));
+                    store_integer_memory("t1", "0($t0)", bits);
+                }
             }
         }
     }
@@ -1594,18 +1776,33 @@ private:
                              machine::Register source,
                              const ValuePiece& piece, unsigned value_bits,
                              SourceLocation location) {
-        load_vreg(function, source, "t0", location);
         const auto shift = effective_piece_offset(
             piece, value_bits, subtarget_.target().data_layout.byte_order);
-        if (shift != 0) {
+        if (legalizes_to_pair(source)) {
+            // ABI endpoints may include every ordinary caller-saved GPR.
+            // Use the compiler-owned assembler temporary so placing one
+            // piece cannot destroy an argument/result placed earlier.
+            const auto offset = vreg_offset(function, source, location);
+            const bool high = shift >= 32;
+            instruction("lw", "$at," +
+                                  memory(word_offset(offset, high)));
+            const auto word_shift = shift - (high ? 32U : 0U);
+            if (word_shift != 0) {
+                instruction("srl", "$at,$at," +
+                                       std::to_string(word_shift));
+            }
+        } else {
+            load_vreg(function, source, "at", location);
+        }
+        if (!legalizes_to_pair(source) && shift != 0) {
             instruction(value_bits > 32 ? "dsrl" : "srl",
-                        "$t0,$t0," + std::to_string(shift));
+                        "$at,$at," + std::to_string(shift));
         }
         if (piece.location.kind == LocationKind::Register) {
-            instruction("move", reg_name(piece.location.reg) + ",$t0");
+            instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
             store_integer_memory(
-                "t0", memory(static_cast<std::int64_t>(
+                "at", memory(static_cast<std::int64_t>(
                                   piece.location.stack_offset),
                               "sp"),
                 piece.carrier_bits);
@@ -1618,11 +1815,11 @@ private:
                              SourceLocation location) {
         const auto offset = slot_offset(function, source.slot, location) +
                             source.offset;
-        instruction("addiu", "$t0,$fp," + std::to_string(offset));
+        instruction("addiu", "$at,$fp," + std::to_string(offset));
         if (piece.location.kind == LocationKind::Register) {
-            instruction("move", reg_name(piece.location.reg) + ",$t0");
+            instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
-            instruction("sw", "$t0," +
+            instruction("sw", "$at," +
                                   memory(static_cast<std::int64_t>(
                                              piece.location.stack_offset),
                                          "sp"));
@@ -1641,18 +1838,30 @@ private:
         // Soft-float and the o32 "integer seen" rule transport floating bits
         // through ordinary GPR pieces.
         const auto offset = vreg_offset(function, source, location);
-        load_integer_memory("t0", memory(offset), source.mode.bits, false);
         const auto shift = effective_piece_offset(
             piece, source.mode.bits,
             subtarget_.target().data_layout.byte_order);
-        if (shift != 0) {
-            instruction("dsrl", "$t0,$t0," + std::to_string(shift));
+        if (legalizes_to_pair(source)) {
+            const bool high = shift >= 32;
+            instruction("lw", "$at," +
+                                  memory(word_offset(offset, high)));
+            const auto word_shift = shift - (high ? 32U : 0U);
+            if (word_shift != 0) {
+                instruction("srl", "$at,$at," +
+                                       std::to_string(word_shift));
+            }
+        } else {
+            load_integer_memory("at", memory(offset), source.mode.bits,
+                                false);
+        }
+        if (!legalizes_to_pair(source) && shift != 0) {
+            instruction("dsrl", "$at,$at," + std::to_string(shift));
         }
         if (piece.location.kind == LocationKind::Register) {
-            instruction("move", reg_name(piece.location.reg) + ",$t0");
+            instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
             store_integer_memory(
-                "t0", memory(static_cast<std::int64_t>(
+                "at", memory(static_cast<std::int64_t>(
                                   piece.location.stack_offset),
                               "sp"),
                 piece.carrier_bits);
@@ -1682,11 +1891,19 @@ private:
                         call.location);
             return;
         }
-        assemble_incoming_integer(
-            assignment.pieces, *signature.abi,
-            type_bits(hir_, callee.result_type),
-            is_signed_integer(hir_, callee.result_type));
-        if (is_floating(hir_, callee.result_type)) {
+        const auto bits = type_bits(hir_, callee.result_type);
+        if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
+            assemble_incoming_pair(function, assignment.pieces,
+                                   *signature.abi, bits, false);
+            store_vreg_pair(function, target, "t0", "t1", call.location);
+        } else {
+            assemble_incoming_integer(
+                function, assignment.pieces, *signature.abi, bits,
+                is_signed_integer(hir_, callee.result_type), false);
+        }
+        if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
+            // Already stored as two ABI words.
+        } else if (is_floating(hir_, callee.result_type)) {
             store_integer_memory(
                 "t0", memory(vreg_offset(function, target, call.location)),
                 target.mode.bits);
@@ -1812,6 +2029,8 @@ private:
     // Instruction and control-flow emission are defined in the following
     // section; ABI transport is intentionally complete before target opcode
     // selection so o32 never depends on LLVM's calling-convention lowering.
+    void emit_integer_pair_binary(const machine::Function& function,
+                                  const machine::Instruction& value);
     void emit_integer_binary(const machine::Function& function,
                              const machine::Instruction& value);
     void emit_floating_binary(const machine::Function& function,
@@ -1846,6 +2065,262 @@ private:
     std::string epilogue_label_;
 };
 
+void AssemblyEmitter::emit_integer_pair_binary(
+    const machine::Function& function,
+    const machine::Instruction& value) {
+    if (value.uses.size() < 2 || value.defs.empty()) return;
+    const auto left = value.uses[0];
+    const auto right = value.uses[1];
+    const auto target = value.defs.front();
+    const auto opcode = decode_opcode(value.opcode);
+    load_vreg_pair(function, left, "t0", "t1", value.location);
+    if (legalizes_to_pair(right)) {
+        load_vreg_pair(function, right, "t2", "t3", value.location);
+    } else {
+        load_vreg(function, right, "t2", value.location);
+        instruction("move", "$t3,$zero");
+    }
+
+    const auto store_pair = [&] {
+        store_vreg_pair(function, target, "t4", "t5", value.location);
+    };
+    const auto store_boolean = [&] {
+        store_vreg(function, target, "t4", value.location);
+    };
+    const auto emit_less = [&](bool is_signed, bool reverse) {
+        const auto left_low = reverse ? "t2" : "t0";
+        const auto left_high = reverse ? "t3" : "t1";
+        const auto right_low = reverse ? "t0" : "t2";
+        const auto right_high = reverse ? "t1" : "t3";
+        instruction(is_signed ? "slt" : "sltu",
+                    "$t4," + reg_name(left_high) + "," +
+                        reg_name(right_high));
+        instruction("xor", "$t6," + reg_name(left_high) + "," +
+                               reg_name(right_high));
+        instruction("sltiu", "$t6,$t6,1");
+        instruction("sltu", "$t7," + reg_name(left_low) + "," +
+                                reg_name(right_low));
+        instruction("and", "$t7,$t7,$t6");
+        instruction("or", "$t4,$t4,$t7");
+    };
+
+    switch (opcode) {
+    case Opcode::Add:
+        instruction("addu", "$t4,$t0,$t2");
+        instruction("sltu", "$t6,$t4,$t0");
+        instruction("addu", "$t5,$t1,$t3");
+        instruction("addu", "$t5,$t5,$t6");
+        store_pair();
+        return;
+    case Opcode::Sub:
+        instruction("sltu", "$t6,$t0,$t2");
+        instruction("subu", "$t4,$t0,$t2");
+        instruction("subu", "$t5,$t1,$t3");
+        instruction("subu", "$t5,$t5,$t6");
+        store_pair();
+        return;
+    case Opcode::Mul:
+        instruction("multu", "$t0,$t2");
+        instruction("mflo", "$t4");
+        instruction("mfhi", "$t5");
+        instruction("multu", "$t0,$t3");
+        instruction("mflo", "$t6");
+        instruction("addu", "$t5,$t5,$t6");
+        instruction("multu", "$t1,$t2");
+        instruction("mflo", "$t6");
+        instruction("addu", "$t5,$t5,$t6");
+        store_pair();
+        return;
+    case Opcode::And:
+    case Opcode::Or:
+    case Opcode::Xor: {
+        const auto mnemonic = opcode == Opcode::And ? "and" :
+                              opcode == Opcode::Or ? "or" : "xor";
+        instruction(mnemonic, "$t4,$t0,$t2");
+        instruction(mnemonic, "$t5,$t1,$t3");
+        store_pair();
+        return;
+    }
+    case Opcode::CmpEq:
+    case Opcode::CmpNe:
+        instruction("xor", "$t4,$t0,$t2");
+        instruction("xor", "$t5,$t1,$t3");
+        instruction("or", "$t4,$t4,$t5");
+        instruction(opcode == Opcode::CmpEq ? "sltiu" : "sltu",
+                    opcode == Opcode::CmpEq ? "$t4,$t4,1"
+                                            : "$t4,$zero,$t4");
+        store_boolean();
+        return;
+    case Opcode::CmpSlt: emit_less(true, false); store_boolean(); return;
+    case Opcode::CmpUlt: emit_less(false, false); store_boolean(); return;
+    case Opcode::CmpSgt: emit_less(true, true); store_boolean(); return;
+    case Opcode::CmpUgt: emit_less(false, true); store_boolean(); return;
+    case Opcode::CmpSle:
+        emit_less(true, true);
+        instruction("xori", "$t4,$t4,1");
+        store_boolean();
+        return;
+    case Opcode::CmpUle:
+        emit_less(false, true);
+        instruction("xori", "$t4,$t4,1");
+        store_boolean();
+        return;
+    case Opcode::CmpSge:
+        emit_less(true, false);
+        instruction("xori", "$t4,$t4,1");
+        store_boolean();
+        return;
+    case Opcode::CmpUge:
+        emit_less(false, false);
+        instruction("xori", "$t4,$t4,1");
+        store_boolean();
+        return;
+    case Opcode::Shl:
+    case Opcode::ShrS:
+    case Opcode::ShrU:
+    case Opcode::Rotl:
+    case Opcode::Rotr: {
+        const auto loop = local_label(function);
+        const auto done = local_label(function);
+        instruction("andi", "$t2,$t2,63");
+        instruction("move", "$t4,$t0");
+        instruction("move", "$t5,$t1");
+        instruction("beq", "$t2,$zero," + done);
+        instruction("nop");
+        output_ << loop << ":\n";
+        if (opcode == Opcode::Shl || opcode == Opcode::Rotl) {
+            instruction("srl", "$t6,$t4,31");
+            if (opcode == Opcode::Rotl) {
+                instruction("srl", "$t7,$t5,31");
+            }
+            instruction("sll", "$t5,$t5,1");
+            instruction("or", "$t5,$t5,$t6");
+            instruction("sll", "$t4,$t4,1");
+            if (opcode == Opcode::Rotl) {
+                instruction("or", "$t4,$t4,$t7");
+            }
+        } else {
+            instruction("sll", "$t6,$t5,31");
+            if (opcode == Opcode::Rotr) {
+                instruction("andi", "$t7,$t4,1");
+            }
+            instruction("srl", "$t4,$t4,1");
+            instruction("or", "$t4,$t4,$t6");
+            instruction(opcode == Opcode::ShrS ? "sra" : "srl",
+                        "$t5,$t5,1");
+            if (opcode == Opcode::Rotr) {
+                instruction("sll", "$t7,$t7,31");
+                instruction("or", "$t5,$t5,$t7");
+            }
+        }
+        instruction("addiu", "$t2,$t2,-1");
+        instruction("bne", "$t2,$zero," + loop);
+        instruction("nop");
+        output_ << done << ":\n";
+        store_pair();
+        return;
+    }
+    case Opcode::Sdiv:
+    case Opcode::Srem:
+    case Opcode::Udiv:
+    case Opcode::Urem: {
+        const bool is_signed = opcode == Opcode::Sdiv ||
+                               opcode == Opcode::Srem;
+        const bool remainder = opcode == Opcode::Srem ||
+                               opcode == Opcode::Urem;
+        const auto left_ready = local_label(function);
+        const auto right_ready = local_label(function);
+        const auto loop = local_label(function);
+        const auto subtract = local_label(function);
+        const auto next = local_label(function);
+        const auto quotient_ready = local_label(function);
+        const auto remainder_ready = local_label(function);
+        if (is_signed) {
+            instruction("srl", "$a0,$t1,31");
+            instruction("srl", "$a1,$t3,31");
+            instruction("xor", "$a0,$a0,$a1");
+            instruction("srl", "$a1,$t1,31");
+            instruction("bgez", "$t1," + left_ready);
+            instruction("nop");
+            instruction("subu", "$t0,$zero,$t0");
+            instruction("sltu", "$t7,$zero,$t0");
+            instruction("subu", "$t1,$zero,$t1");
+            instruction("subu", "$t1,$t1,$t7");
+            output_ << left_ready << ":\n";
+            instruction("bgez", "$t3," + right_ready);
+            instruction("nop");
+            instruction("subu", "$t2,$zero,$t2");
+            instruction("sltu", "$t7,$zero,$t2");
+            instruction("subu", "$t3,$zero,$t3");
+            instruction("subu", "$t3,$t3,$t7");
+            output_ << right_ready << ":\n";
+        }
+        instruction("move", "$t4,$zero");
+        instruction("move", "$t5,$zero");
+        instruction("li", "$t6,64");
+        output_ << loop << ":\n";
+        instruction("srl", "$t7,$t1,31");
+        instruction("sll", "$t8,$t5,1");
+        instruction("srl", "$t9,$t4,31");
+        instruction("or", "$t5,$t8,$t9");
+        instruction("sll", "$t4,$t4,1");
+        instruction("or", "$t4,$t4,$t7");
+        // The dividend is kept as a low/high pair in t0/t1.  After its
+        // current top bit has entered the remainder, shift the quotient
+        // candidate left as one 64-bit value: t0's top bit crosses into t1.
+        instruction("srl", "$t7,$t0,31");
+        instruction("sll", "$t1,$t1,1");
+        instruction("or", "$t1,$t1,$t7");
+        instruction("sll", "$t0,$t0,1");
+        instruction("sltu", "$t7,$t5,$t3");
+        instruction("bne", "$t7,$zero," + next);
+        instruction("nop");
+        instruction("sltu", "$t7,$t3,$t5");
+        instruction("bne", "$t7,$zero," + subtract);
+        instruction("nop");
+        instruction("sltu", "$t7,$t4,$t2");
+        instruction("bne", "$t7,$zero," + next);
+        instruction("nop");
+        output_ << subtract << ":\n";
+        instruction("sltu", "$t7,$t4,$t2");
+        instruction("subu", "$t4,$t4,$t2");
+        instruction("subu", "$t5,$t5,$t3");
+        instruction("subu", "$t5,$t5,$t7");
+        instruction("ori", "$t0,$t0,1");
+        output_ << next << ":\n";
+        instruction("addiu", "$t6,$t6,-1");
+        instruction("bne", "$t6,$zero," + loop);
+        instruction("nop");
+        if (is_signed) {
+            instruction("beq", "$a0,$zero," + quotient_ready);
+            instruction("nop");
+            instruction("subu", "$t0,$zero,$t0");
+            instruction("sltu", "$t7,$zero,$t0");
+            instruction("subu", "$t1,$zero,$t1");
+            instruction("subu", "$t1,$t1,$t7");
+            output_ << quotient_ready << ":\n";
+            instruction("beq", "$a1,$zero," + remainder_ready);
+            instruction("nop");
+            instruction("subu", "$t4,$zero,$t4");
+            instruction("sltu", "$t7,$zero,$t4");
+            instruction("subu", "$t5,$zero,$t5");
+            instruction("subu", "$t5,$t5,$t7");
+            output_ << remainder_ready << ":\n";
+        }
+        if (!remainder) {
+            instruction("move", "$t4,$t0");
+            instruction("move", "$t5,$t1");
+        }
+        store_pair();
+        return;
+    }
+    default:
+        diagnostics_.error(value.location,
+                           "unknown MIPS pair-legalized integer operation");
+        return;
+    }
+}
+
 void AssemblyEmitter::emit_integer_binary(
     const machine::Function& function,
     const machine::Instruction& value) {
@@ -1854,6 +2329,10 @@ void AssemblyEmitter::emit_integer_binary(
     const auto right = value.uses[1];
     const auto target = value.defs.front();
     const bool wide = left.mode.bits > 32;
+    if (wide && !subtarget_.has_feature(Feature::Mips3)) {
+        emit_integer_pair_binary(function, value);
+        return;
+    }
     load_vreg(function, left, "t0", value.location);
     load_vreg(function, right, "t1", value.location);
     switch (decode_opcode(value.opcode)) {
@@ -2022,14 +2501,34 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
 
     if (opcode == Opcode::Sext || opcode == Opcode::Zext ||
         opcode == Opcode::Trunc || opcode == Opcode::Reinterpret) {
-        load_vreg(function, source, "t0", value.location);
         const bool sign = opcode == Opcode::Sext;
-        normalize_integer("t0", target.mode.bits, sign);
-        store_vreg(function, target, "t0", value.location);
+        if (legalizes_to_pair(source) && legalizes_to_pair(target)) {
+            copy_vreg(function, target, source, value.location);
+        } else if (legalizes_to_pair(source)) {
+            load_vreg_pair(function, source, "t0", "t1", value.location);
+            normalize_integer("t0", target.mode.bits, sign);
+            store_vreg(function, target, "t0", value.location);
+        } else if (legalizes_to_pair(target)) {
+            load_vreg(function, source, "t0", value.location);
+            normalize_integer("t0", source.mode.bits, sign);
+            if (sign) instruction("sra", "$t1,$t0,31");
+            else instruction("move", "$t1,$zero");
+            store_vreg_pair(function, target, "t0", "t1", value.location);
+        } else {
+            load_vreg(function, source, "t0", value.location);
+            normalize_integer("t0", target.mode.bits, sign);
+            store_vreg(function, target, "t0", value.location);
+        }
         return;
     }
     if (opcode == Opcode::Freinterpret) {
-        if (source_float && target_float) {
+        if (source.mode.bits > 32 && target.mode.bits > 32 &&
+            !subtarget_.has_feature(Feature::Mips3)) {
+            load_pair_memory(
+                "t0", "t1", vreg_offset(function, source, value.location));
+            store_pair_memory(
+                "t0", "t1", vreg_offset(function, target, value.location));
+        } else if (source_float && target_float) {
             copy_vreg(function, target, source, value.location);
         } else if (source_float) {
             load_fvreg(function, source, "f0", value.location);
@@ -2299,8 +2798,24 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             const auto field = end + "-" + std::to_string(bytes);
             instruction("lui", "$t0,%hi(" + field + ")");
             instruction("addiu", "$t0,$t0,%lo(" + field + ")");
-            load_integer_memory("t1", "0($t0)", target.mode.bits, false);
-            store_vreg(function, target, "t1", value.location);
+            if (legalizes_to_pair(target)) {
+                load_pair_memory("t1", "t2", 0, "t0");
+                store_vreg_pair(function, target, "t1", "t2",
+                                value.location);
+            } else {
+                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                                    false);
+                store_vreg(function, target, "t1", value.location);
+            }
+            return;
+        }
+        if (legalizes_to_pair(target)) {
+            const auto low = static_cast<std::uint32_t>(immediate.value);
+            const auto high = static_cast<std::uint32_t>(
+                immediate.value >> 32U);
+            instruction("li", "$t0," + std::to_string(low));
+            instruction("li", "$t1," + std::to_string(high));
+            store_vreg_pair(function, target, "t0", "t1", value.location);
             return;
         }
         instruction(target.mode.bits > 32 ? "dli" : "li",
@@ -2336,9 +2851,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         } else if (opcode == Opcode::GlobalLoadSigned ||
                    opcode == Opcode::GlobalLoadUnsigned) {
             const auto target = value.defs.front();
-            load_integer_memory("t1", "0($t0)", target.mode.bits,
-                                opcode == Opcode::GlobalLoadSigned);
-            store_vreg(function, target, "t1", value.location);
+            if (legalizes_to_pair(target)) {
+                load_pair_memory("t1", "t2", 0, "t0");
+                store_vreg_pair(function, target, "t1", "t2",
+                                value.location);
+            } else {
+                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                                    opcode == Opcode::GlobalLoadSigned);
+                store_vreg(function, target, "t1", value.location);
+            }
         } else if (opcode == Opcode::FglobalLoad) {
             const auto target = value.defs.front();
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -2351,8 +2872,14 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 instruction(source.mode.bits == 32 ? "swc1" : "sdc1",
                             "$f0,0($t0)");
             } else {
-                load_vreg(function, source, "t1", value.location);
-                store_integer_memory("t1", "0($t0)", source.mode.bits);
+                if (legalizes_to_pair(source)) {
+                    load_vreg_pair(function, source, "t1", "t2",
+                                   value.location);
+                    store_pair_memory("t1", "t2", 0, "t0");
+                } else {
+                    load_vreg(function, source, "t1", value.location);
+                    store_integer_memory("t1", "0($t0)", source.mode.bits);
+                }
             }
         }
         return;
@@ -2394,9 +2921,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                             slot.offset;
         if (opcode == Opcode::LoadSigned || opcode == Opcode::LoadUnsigned) {
             const auto target = value.defs.front();
-            load_integer_memory("t0", memory(offset), target.mode.bits,
-                                opcode == Opcode::LoadSigned);
-            store_vreg(function, target, "t0", value.location);
+            if (legalizes_to_pair(target)) {
+                load_pair_memory("t0", "t1", offset);
+                store_vreg_pair(function, target, "t0", "t1",
+                                value.location);
+            } else {
+                load_integer_memory("t0", memory(offset), target.mode.bits,
+                                    opcode == Opcode::LoadSigned);
+                store_vreg(function, target, "t0", value.location);
+            }
         } else if (opcode == Opcode::Fload) {
             const auto target = value.defs.front();
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -2409,8 +2942,14 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                         "$f0," + memory(offset));
         } else {
             const auto source = value.uses.front();
-            load_vreg(function, source, "t0", value.location);
-            store_integer_memory("t0", memory(offset), source.mode.bits);
+            if (legalizes_to_pair(source)) {
+                load_vreg_pair(function, source, "t0", "t1",
+                               value.location);
+                store_pair_memory("t0", "t1", offset);
+            } else {
+                load_vreg(function, source, "t0", value.location);
+                store_integer_memory("t0", memory(offset), source.mode.bits);
+            }
         }
         return;
     }
@@ -2422,9 +2961,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         if (opcode == Opcode::PointerLoadSigned ||
             opcode == Opcode::PointerLoadUnsigned) {
             const auto target = value.defs.front();
-            load_integer_memory("t1", "0($t0)", target.mode.bits,
-                                opcode == Opcode::PointerLoadSigned);
-            store_vreg(function, target, "t1", value.location);
+            if (legalizes_to_pair(target)) {
+                load_pair_memory("t1", "t2", 0, "t0");
+                store_vreg_pair(function, target, "t1", "t2",
+                                value.location);
+            } else {
+                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                                    opcode == Opcode::PointerLoadSigned);
+                store_vreg(function, target, "t1", value.location);
+            }
         } else if (opcode == Opcode::FpointerLoad) {
             const auto target = value.defs.front();
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -2437,8 +2982,14 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                         "$f0,0($t0)");
         } else {
             const auto source = value.uses[1];
-            load_vreg(function, source, "t1", value.location);
-            store_integer_memory("t1", "0($t0)", source.mode.bits);
+            if (legalizes_to_pair(source)) {
+                load_vreg_pair(function, source, "t1", "t2",
+                               value.location);
+                store_pair_memory("t1", "t2", 0, "t0");
+            } else {
+                load_vreg(function, source, "t1", value.location);
+                store_integer_memory("t1", "0($t0)", source.mode.bits);
+            }
         }
         return;
     }
@@ -2466,15 +3017,43 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                         "$f0,0($t0)");
             store_fvreg(function, target, "f0", value.location);
         } else {
-            load_integer_memory("t1", "0($t0)", target.mode.bits,
-                                opcode == Opcode::IndexedLoadSigned);
-            store_vreg(function, target, "t1", value.location);
+            if (legalizes_to_pair(target)) {
+                load_pair_memory("t1", "t2", 0, "t0");
+                store_vreg_pair(function, target, "t1", "t2",
+                                value.location);
+            } else {
+                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                                    opcode == Opcode::IndexedLoadSigned);
+                store_vreg(function, target, "t1", value.location);
+            }
         }
         return;
     }
     if (opcode == Opcode::Neg || opcode == Opcode::Not ||
         opcode == Opcode::Iszero) {
         const auto source = value.uses.front();
+        if (legalizes_to_pair(source)) {
+            load_vreg_pair(function, source, "t0", "t1", value.location);
+            if (opcode == Opcode::Neg) {
+                instruction("subu", "$t2,$zero,$t0");
+                instruction("sltu", "$t4,$zero,$t2");
+                instruction("subu", "$t3,$zero,$t1");
+                instruction("subu", "$t3,$t3,$t4");
+                store_vreg_pair(function, value.defs.front(), "t2", "t3",
+                                value.location);
+            } else if (opcode == Opcode::Not) {
+                instruction("nor", "$t2,$t0,$zero");
+                instruction("nor", "$t3,$t1,$zero");
+                store_vreg_pair(function, value.defs.front(), "t2", "t3",
+                                value.location);
+            } else {
+                instruction("or", "$t2,$t0,$t1");
+                instruction("sltiu", "$t2,$t2,1");
+                store_vreg(function, value.defs.front(), "t2",
+                           value.location);
+            }
+            return;
+        }
         load_vreg(function, source, "t0", value.location);
         if (opcode == Opcode::Neg) {
             instruction(source.mode.bits > 32 ? "dsubu" : "subu",
@@ -2496,7 +3075,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             store_fvreg(function, value.defs.front(), "f2", value.location);
         } else {
             if (source.mode.bits == 32) instruction("mtc1", "$zero,$f2");
-            else instruction("dmtc1", "$zero,$f2");
+            else if (subtarget_.has_feature(Feature::Mips3)) {
+                instruction("dmtc1", "$zero,$f2");
+            } else {
+                instruction("mtc1", "$zero,$f2");
+                instruction("mtc1", "$zero,$f3");
+            }
             instruction("c.eq" + suffix, "$f0,$f2");
             const auto yes = local_label(function);
             const auto done = local_label(function);
@@ -2643,10 +3227,15 @@ void AssemblyEmitter::emit_terminator(
 }
 
 void AssemblyEmitter::emit_function(machine::Function& function) {
-    if (!finalize_frame(function)) return;
     const auto& entity = hir_.function(function.source);
     active_signature_ = classify_entity(entity, function.location);
     if (!active_signature_) return;
+    // ABI register banks can overlap the emitter's scratch registers (EABI32
+    // deliberately continues through t0-t3).  Home every incoming register
+    // before parameter materialization so capturing an early argument cannot
+    // destroy a later one.
+    prepare_parameter_homes(function);
+    if (!finalize_frame(function)) return;
     if (!safe_assembly_text(function.symbol) ||
         (entity.section && !safe_assembly_text(*entity.section))) {
         diagnostics_.error(function.location,
@@ -2670,7 +3259,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     output_ << *directive << '\n';
     // ISA directives are scoped so llvm-mc's command-line ABI features (for
     // example +single-float) are restored before it finalizes .MIPS.abiflags.
-    output_ << ".set push\n.set noreorder\n.option pic0\n";
+    output_ << ".set push\n.set noreorder\n.set noat\n.option pic0\n";
     if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
     else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
@@ -2707,6 +3296,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     }
     instruction("move", "$fp,$sp");
     if (cfi) output_ << ".cfi_def_cfa_register 30\n";
+    emit_parameter_homes(function);
     epilogue_label_ = ".Lcross.mips." +
                       std::to_string(function.source.value) + ".return";
 

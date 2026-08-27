@@ -85,7 +85,12 @@ bool validate_shipped_abis() {
         model_registry().find_abi("mips", "o32", {});
     const auto* eabi32 =
         model_registry().find_abi("mips", "eabi32", {});
-    if (!cross_abi || !sysv || !microsoft || !o32 || !eabi32) return false;
+    const auto* mips_cross =
+        model_registry().find_abi("mips", "cross", {});
+    if (!cross_abi || !sysv || !microsoft || !o32 || !eabi32 ||
+        !mips_cross) {
+        return false;
+    }
     if (!cross_abi->gcc_calling_attribute.empty() ||
         sysv->gcc_calling_attribute != "sysv_abi" ||
         microsoft->gcc_calling_attribute != "ms_abi") {
@@ -221,6 +226,39 @@ bool validate_shipped_abis() {
         !eabi_small_record_result ||
         !register_is(eabi_small_record_result, 0, "v0") ||
         !register_is(eabi_small_record_result, 1, "v1")) {
+        return false;
+    }
+
+    // The 32-bit MIPS Cross ABI is stable across ISA selection.  MIPS III
+    // may select native 64-bit operations internally, but public i64 values
+    // retain the same word-pair interface as MIPS I and MIPS32 objects.
+    const std::array<std::string, 4> mips1_cross_features{
+        "mips1", "hard-float", "fp32", "odd-spreg"};
+    const std::array<std::string, 5> mips3_cross_features{
+        "mips1", "mips2", "mips3", "hard-float", "fp32"};
+    const auto mips_cross_mips1 = classify_call_arguments(
+        *mips_cross, std::array{i64, i64, o32_i32},
+        mips1_cross_features);
+    const auto mips_cross_mips3 = classify_call_arguments(
+        *mips_cross, std::array{i64, i64, o32_i32},
+        mips3_cross_features);
+    const auto mips_cross_result =
+        classify_return(*mips_cross, i64, mips1_cross_features);
+    if (!mips_cross_mips1 || !mips_cross_mips3 || !mips_cross_result) {
+        return false;
+    }
+    for (const auto* layout : {&mips_cross_mips1.layout,
+                               &mips_cross_mips3.layout}) {
+        if (!register_is(layout->arguments[0], 0, "a0") ||
+            !register_is(layout->arguments[0], 1, "a1") ||
+            !register_is(layout->arguments[1], 0, "a2") ||
+            !register_is(layout->arguments[1], 1, "a3") ||
+            !register_is(layout->arguments[2], 0, "t0")) {
+            return false;
+        }
+    }
+    if (!register_is(mips_cross_result, 0, "v0") ||
+        !register_is(mips_cross_result, 1, "v1")) {
         return false;
     }
 

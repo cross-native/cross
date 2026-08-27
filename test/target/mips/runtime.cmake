@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE MEMORY_SOURCE STARTUP LINKER WRAPPER_TEMPLATE
+foreach(required CC SOURCE MEMORY_SOURCE PAIR_SOURCE STARTUP LINKER WRAPPER_TEMPLATE
                  WRAPPER_LINKER OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
@@ -31,6 +31,7 @@ endfunction()
 
 set(functions "${OUTPUT}.functions.o")
 set(memory "${OUTPUT}.memory.o")
+set(pairs "${OUTPUT}.pairs.o")
 set(start "${OUTPUT}.start.o")
 set(elf32 "${OUTPUT}.elf32")
 set(image "${OUTPUT}.bin")
@@ -42,11 +43,14 @@ run_checked(cross-functions "${CC}" -c -O2 -mprofile=vr4300-o32
             "${SOURCE}" -o "${functions}")
 run_checked(cross-memory "${CC}" -c -O2 -mprofile=vr4300-o32
             "${MEMORY_SOURCE}" -o "${memory}")
+run_checked(cross-mips1-pairs "${CC}" -c -O2 -mprofile=r3000-o32
+            "${PAIR_SOURCE}" -o "${pairs}")
 run_checked(startup "${LLVM_MC}" --filetype=obj
             --triple=mips-unknown-elf --mcpu=mips3
             --mattr=+noabicalls "${STARTUP}" -o "${start}")
 run_checked(link-elf32 "${LLD}" -m elf32btsmip -T "${LINKER}"
-            "${start}" "${functions}" "${memory}" -o "${elf32}")
+            "${start}" "${functions}" "${memory}" "${pairs}"
+            -o "${elf32}")
 run_checked(flatten-image "${LLVM_OBJCOPY}" -O binary "${elf32}" "${image}")
 
 # Malta's 64-bit firmware preserves a 64-bit ELF entry address. The wrapper

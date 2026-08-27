@@ -252,6 +252,7 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
+                -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
                 -DMIPS1_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/mips1_load.x
                 -DF64_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/single_float_error.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-allegrex
@@ -260,6 +261,7 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
+                -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
                 -DRUNTIME=${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.x
                 -DMODULE_INFO=${CMAKE_SOURCE_DIR}/test/target/mips/psp/module_info.s
                 -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/psp/link.ld
@@ -271,6 +273,7 @@ if(BUILD_TESTING)
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.x
                 -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
+                -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
                 -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/runtime.s
                 -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
                 -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in

@@ -214,7 +214,9 @@ TargetInfo make_target(ByteOrder order,
             {"i8", 8, "mips1"}, {"u8", 8, "mips1"},
             {"i16", 16, "mips1"}, {"u16", 16, "mips1"},
             {"i32", 32, "mips1"}, {"u32", 32, "mips1"},
-            {"i64", 64, "mips3"}, {"u64", 64, "mips3"},
+            // MIPS I/II use target-legalized 32-bit GPR pairs; MIPS III and
+            // later select native 64-bit GPR operations for the same types.
+            {"i64", 64, "mips1"}, {"u64", 64, "mips1"},
             {"iptr", 32, "mips1"}, {"uptr", 32, "mips1"},
         },
         {},

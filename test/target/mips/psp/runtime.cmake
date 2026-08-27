@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE RUNTIME MODULE_INFO LINKER OUTPUT)
+foreach(required CC SOURCE PAIR_SOURCE RUNTIME MODULE_INFO LINKER OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -36,7 +36,20 @@ function(run_checked label)
     endif()
 endfunction()
 
+function(fatal_with_log headline variable)
+    set(log "${${variable}}")
+    string(LENGTH "${log}" log_length)
+    if(log_length GREATER 12000)
+        string(SUBSTRING "${log}" 0 6000 log_head)
+        math(EXPR log_tail_offset "${log_length} - 6000")
+        string(SUBSTRING "${log}" ${log_tail_offset} 6000 log_tail)
+        set(log "${log_head}\n... PPSSPP log truncated ...\n${log_tail}")
+    endif()
+    message(FATAL_ERROR "${headline}\n${log}")
+endfunction()
+
 set(functions "${OUTPUT}.functions.o")
+set(pairs "${OUTPUT}.pairs.o")
 set(runtime "${OUTPUT}.runtime.o")
 set(metadata_object "${OUTPUT}.metadata.o")
 set(metadata_binary "${OUTPUT}.metadata.bin")
@@ -44,6 +57,8 @@ set(executable "${OUTPUT}.elf")
 
 run_checked(cross-functions "${CC}" -c -O2 -mprofile=psp-allegrex
             "${SOURCE}" -o "${functions}")
+run_checked(cross-pairs "${CC}" -c -O2 -mprofile=psp-allegrex
+            "${PAIR_SOURCE}" -o "${pairs}")
 run_checked(cross-runtime "${CC}" -c -O2 -mprofile=psp-allegrex
             "${RUNTIME}" -o "${runtime}")
 run_checked(module-metadata "${LLVM_MC}" --filetype=obj
@@ -53,7 +68,8 @@ run_checked(flatten-module-metadata "${LLVM_OBJCOPY}"
             "--dump-section=.rodata.sceModuleInfo=${metadata_binary}"
             "${metadata_object}")
 run_checked(link "${LLD}" -m elf32ltsmip -T "${LINKER}"
-            "${runtime}" "${functions}" --format=binary "${metadata_binary}"
+            "${runtime}" "${functions}" "${pairs}"
+            --format=binary "${metadata_binary}"
             -o "${executable}")
 
 execute_process(
@@ -81,16 +97,15 @@ execute_process(
     OUTPUT_VARIABLE ppsspp_stdout
     ERROR_VARIABLE ppsspp_stderr
     TIMEOUT 15)
-if(NOT ppsspp_status EQUAL 0)
-    message(FATAL_ERROR
-        "Allegrex execution failed (status ${ppsspp_status})\n${ppsspp_stdout}\n${ppsspp_stderr}")
-endif()
 set(ppsspp_log "${ppsspp_stdout}\n${ppsspp_stderr}")
+if(NOT ppsspp_status EQUAL 0)
+    fatal_with_log(
+        "Allegrex execution failed (status ${ppsspp_status})" ppsspp_log)
+endif()
 foreach(expect "Loadable Segment Copied to 08804000"
                "Importing Module LoadExecForUser"
                "sceKernel: sceKernelExitGame")
     if(NOT ppsspp_log MATCHES "${expect}")
-        message(FATAL_ERROR
-            "PPSSPP did not report '${expect}'\n${ppsspp_log}")
+        fatal_with_log("PPSSPP did not report '${expect}'" ppsspp_log)
     endif()
 endforeach()

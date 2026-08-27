@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE MIPS1_SOURCE F64_SOURCE OUTPUT)
+foreach(required CC SOURCE PAIR_SOURCE MIPS1_SOURCE F64_SOURCE OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -29,6 +29,14 @@ set(o32_object "${OUTPUT}.o32.o")
 set(mips1_assembly "${OUTPUT}.mips1.s")
 set(mips1_object "${OUTPUT}.mips1.o")
 set(mips2_object "${OUTPUT}.mips2.o")
+set(pair_assembly "${OUTPUT}.pair.s")
+set(pair_object "${OUTPUT}.pair.o")
+set(pair_mips1_assembly "${OUTPUT}.pair-mips1.s")
+set(pair_mips1_object "${OUTPUT}.pair-mips1.o")
+set(pair_cross_be_assembly "${OUTPUT}.pair-cross-be.s")
+set(pair_cross_be_object "${OUTPUT}.pair-cross-be.o")
+set(pair_cross_le_assembly "${OUTPUT}.pair-cross-le.s")
+set(pair_cross_le_object "${OUTPUT}.pair-cross-le.o")
 
 run_cc(allegrex-assembly -S -O2 -mprofile=psp-allegrex "${SOURCE}"
        -o "${eabi_assembly}")
@@ -44,6 +52,26 @@ run_cc(mips1-object -c -O1 -mprofile=r3000-o32 "${MIPS1_SOURCE}"
        -o "${mips1_object}")
 run_cc(mips2-object -c -O1 -mprofile=r6000-eabi "${MIPS1_SOURCE}"
        -o "${mips2_object}")
+run_cc(allegrex-i64-pair-assembly -S -O2 -mprofile=psp-allegrex
+       "${PAIR_SOURCE}" -o "${pair_assembly}")
+run_cc(allegrex-i64-pair-object -c -O2 -mprofile=psp-allegrex
+       "${PAIR_SOURCE}" -o "${pair_object}")
+run_cc(mips1-i64-pair-assembly -S -O2 -mprofile=r3000-o32
+       "${PAIR_SOURCE}" -o "${pair_mips1_assembly}")
+run_cc(mips1-i64-pair-object -c -O2 -mprofile=r3000-o32
+       "${PAIR_SOURCE}" -o "${pair_mips1_object}")
+run_cc(mips-cross-be-i64-pair-assembly -S -O2
+       -target mips-unknown-elf "${PAIR_SOURCE}"
+       -o "${pair_cross_be_assembly}")
+run_cc(mips-cross-be-i64-pair-object -c -O2
+       -target mips-unknown-elf "${PAIR_SOURCE}"
+       -o "${pair_cross_be_object}")
+run_cc(mips-cross-le-i64-pair-assembly -S -O2
+       -target mipsel-unknown-elf "${PAIR_SOURCE}"
+       -o "${pair_cross_le_assembly}")
+run_cc(mips-cross-le-i64-pair-object -c -O2
+       -target mipsel-unknown-elf "${PAIR_SOURCE}"
+       -o "${pair_cross_le_object}")
 
 file(READ "${eabi_assembly}" assembly)
 foreach(pattern
@@ -63,6 +91,24 @@ if(assembly MATCHES "[	 ](daddu|dsubu|ld|sd|ldc1|sdc1)[	 ]")
     message(FATAL_ERROR
         "Allegrex assembly contains a MIPS-III/64-bit instruction\n${assembly}")
 endif()
+
+file(READ "${pair_assembly}" pair)
+file(READ "${pair_mips1_assembly}" pair_mips1)
+file(READ "${pair_cross_be_assembly}" pair_cross_be)
+file(READ "${pair_cross_le_assembly}" pair_cross_le)
+foreach(text pair pair_mips1 pair_cross_be pair_cross_le)
+    if("${${text}}" MATCHES "[	 ](dadd|dsub|dmult|ddiv|dsll|dsrl|dsra|ld|sd)[a-z0-9.]*[	 ]")
+        message(FATAL_ERROR
+            "pre-MIPS-III i64 legalization emitted a 64-bit GPR instruction\n${${text}}")
+    endif()
+    foreach(pattern "[	 ]addu[	 ]" "[	 ]multu[	 ]"
+                    "[	 ]sll[	 ]" "[	 ]srl[	 ]")
+        if(NOT "${${text}}" MATCHES "${pattern}")
+            message(FATAL_ERROR
+                "pre-MIPS-III i64 legalization is missing '${pattern}'\n${${text}}")
+        endif()
+    endforeach()
+endforeach()
 
 file(READ "${baseline_assembly}" baseline)
 if(baseline MATCHES "\\.word[	 ]+0x(01285046|0128500b)" OR

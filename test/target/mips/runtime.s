@@ -71,6 +71,15 @@ _start:
         bne     $v0,$t0,.Lfail
         nop
 
+        # Execute the MIPS-I word-pair legalization on a big-endian target.
+        # The same source is also run little-endian on Allegrex/PPSSPP.
+        jal     mips_pair_entry
+        nop
+        lui     $t0,0x7
+        ori     $t0,$t0,0xffff
+        bne     $v0,$t0,.Lfail
+        nop
+
         addiu   $a0,$zero,'P'
         b       .Lreport
         nop

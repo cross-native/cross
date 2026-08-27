@@ -15,14 +15,14 @@ abi "cross" {
     stack_layout = "packed";
     argument_stack_base = 0;
     stack_alignment = 16;
-    stack_slot_bytes = 8;
+    stack_slot_bytes = 4;
     return_address_bytes = 0;
     stack_order = ["arguments"];
     variadic_supported = true;
     variadic_save_banks = ["integer", "floating"];
-    variadic_save_alignment = 8;
+    variadic_save_alignment = 4;
     variadic_va_list_bytes = 16;
-    variadic_va_list_alignment = 8;
+    variadic_va_list_alignment = 4;
     call_clobbers = [
         "at", "v0", "v1", "a0", "a1", "a2", "a3",
         "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
@@ -38,7 +38,11 @@ abi "cross" {
     bank "integer" {
         class = "integer";
         cursor = "integer";
-        register_bits = 64;
+        # Cross has a stable ABI for a 32-bit MIPS data model.  MIPS III may
+        # use 64-bit GPR operations inside a function, but changing public
+        # argument widths with -march would make separately compiled objects
+        # incompatible.
+        register_bits = 32;
         arguments = [
             "a0", "a1", "a2", "a3", "t0", "t1",
             "t2", "t3", "t4", "t5", "t6", "t7"
@@ -62,10 +66,10 @@ abi "cross" {
     }
 
     variadic_state "gp_arg_area" {
-        type = "u64*";
+        type = "u32*";
         kind = "register_save_address";
         cursor = "integer";
-        stride = 8;
+        stride = 4;
     }
 
     variadic_state "fp_arg_area" {
@@ -86,17 +90,27 @@ abi "cross" {
         bank = "integer";
         min_bits = 1;
         max_bits = 128;
-        unit_bits = 64;
+        unit_bits = 32;
         carrier_bits = 32;
     }
 
-    rule "floating" {
+    rule "floating32" {
         match = ["floating"];
         action = "direct";
         bank = "floating";
         min_bits = 32;
+        max_bits = 32;
+        requires_features = ["hard-float"];
+    }
+
+    rule "floating64" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 64;
         max_bits = 64;
         requires_features = ["hard-float"];
+        forbids_features = ["single-float"];
     }
 
     rule "floating-soft" {
@@ -105,7 +119,7 @@ abi "cross" {
         bank = "integer";
         min_bits = 32;
         max_bits = 128;
-        unit_bits = 64;
+        unit_bits = 32;
     }
 
     rule "aggregate-registers" {
@@ -113,7 +127,7 @@ abi "cross" {
         action = "flatten";
         min_bits = 1;
         max_bits = 256;
-        unit_bits = 64;
+        unit_bits = 32;
         merge_banks = ["integer", "floating"];
         require_natural_alignment = true;
     }
