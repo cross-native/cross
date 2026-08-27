@@ -12,6 +12,9 @@
 #include "target/subtarget.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <fstream>
 #include <limits>
 #include <string>
 
@@ -86,6 +89,8 @@ public:
         }
         if (subtarget.has_feature(Feature::SoftFloat)) {
             result.emplace_back("+soft-float");
+        } else if (subtarget.has_feature(Feature::SingleFloat)) {
+            result.emplace_back("+single-float");
         } else if (subtarget.has_feature(Feature::Fpxx) ||
                    subtarget.has_feature(Feature::Fp32)) {
             // The managed slice uses only the FPXX-compatible subset of the
@@ -100,6 +105,131 @@ public:
         return result;
     }
 
+    bool finalize_object(const std::filesystem::path& path,
+                         const Subtarget& subtarget,
+                         Diagnostics& diagnostics) const override {
+        const bool needs_eabi32 = subtarget.abi() == "eabi32";
+        const bool needs_single_float =
+            subtarget.has_feature(Feature::SingleFloat);
+        if (!needs_eabi32 && !needs_single_float) return true;
+
+        // LLVM MC knows Allegrex encodings but currently writes the o32 ABI
+        // tag for the PSP triple.  Its `.set mips2` parser path also loses the
+        // command-line single-float ABI tag. Rewrite only those standardized
+        // metadata fields; architecture, PIC, ASE, and register masks remain
+        // assembler-owned.
+        std::fstream object(path, std::ios::in | std::ios::out |
+                                      std::ios::binary);
+        if (!object) {
+            diagnostics.command_error(
+                "cannot reopen MIPS object for target finalization: '" +
+                path.string() + "'");
+            return false;
+        }
+        std::array<unsigned char, 52> header{};
+        object.read(reinterpret_cast<char*>(header.data()),
+                    static_cast<std::streamsize>(header.size()));
+        if (object.gcount() != static_cast<std::streamsize>(header.size()) ||
+            header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' ||
+            header[3] != 'F' || header[4] != 1 ||
+            (header[5] != 1 && header[5] != 2)) {
+            diagnostics.command_error(
+                "assembler produced an invalid ELF32 MIPS object");
+            return false;
+        }
+        const bool little = header[5] == 1;
+        const auto decode16 = [&](const unsigned char* bytes) -> std::uint16_t {
+            if (little) {
+                return static_cast<std::uint16_t>(
+                    static_cast<std::uint16_t>(bytes[0]) |
+                    (static_cast<std::uint16_t>(bytes[1]) << 8U));
+            }
+            return static_cast<std::uint16_t>(
+                (static_cast<std::uint16_t>(bytes[0]) << 8U) |
+                static_cast<std::uint16_t>(bytes[1]));
+        };
+        if (decode16(header.data() + 18) != 8) {
+            diagnostics.command_error(
+                "assembler produced a non-MIPS object for a MIPS target");
+            return false;
+        }
+        const auto decode32 = [&](const unsigned char* bytes) -> std::uint32_t {
+            std::uint32_t value{};
+            for (unsigned index = 0; index < 4; ++index) {
+                const auto source = little ? index : 3U - index;
+                value |= static_cast<std::uint32_t>(bytes[source])
+                         << (index * 8U);
+            }
+            return value;
+        };
+        const auto write32 = [&](std::size_t offset, std::uint32_t value) {
+            for (unsigned index = 0; index < 4; ++index) {
+                const auto destination = little ? index : 3U - index;
+                header[offset + destination] = static_cast<unsigned char>(
+                    (value >> (index * 8U)) & 0xffU);
+            }
+        };
+        if (needs_eabi32) {
+            constexpr std::uint32_t abi_mask = 0x0000f000U;
+            constexpr std::uint32_t eabi32 = 0x00003000U;
+            write32(36, (decode32(header.data() + 36) & ~abi_mask) | eabi32);
+            object.clear();
+            object.seekp(36, std::ios::beg);
+            object.write(reinterpret_cast<const char*>(header.data() + 36), 4);
+            if (!object) {
+                diagnostics.command_error(
+                    "cannot finalize MIPS EABI32 flags in object '" +
+                    path.string() + "'");
+                return false;
+            }
+        }
+
+        if (needs_single_float) {
+            constexpr std::uint32_t sht_mips_abiflags = 0x7000002aU;
+            const auto section_table = decode32(header.data() + 32);
+            const auto section_size = decode16(header.data() + 46);
+            const auto section_count = decode16(header.data() + 48);
+            bool found = false;
+            if (section_size < 40 || section_count == 0) {
+                diagnostics.command_error(
+                    "MIPS object lacks a usable section table for single-float metadata");
+                return false;
+            }
+            for (std::uint16_t index = 0; index < section_count; ++index) {
+                std::array<unsigned char, 40> section{};
+                object.clear();
+                object.seekg(static_cast<std::streamoff>(section_table) +
+                                 static_cast<std::streamoff>(index) *
+                                     section_size,
+                             std::ios::beg);
+                object.read(reinterpret_cast<char*>(section.data()),
+                            static_cast<std::streamsize>(section.size()));
+                if (!object || decode32(section.data() + 4) !=
+                                   sht_mips_abiflags) {
+                    continue;
+                }
+                const auto offset = decode32(section.data() + 16);
+                const auto size = decode32(section.data() + 20);
+                if (size < 8) break;
+                object.clear();
+                object.seekp(static_cast<std::streamoff>(offset) + 7,
+                             std::ios::beg);
+                // Val_GNU_MIPS_ABI_FP_SINGLE from the standardized MIPS
+                // ABI flags enumeration.
+                object.put(static_cast<char>(2));
+                found = static_cast<bool>(object);
+                break;
+            }
+            if (!found) {
+                diagnostics.command_error(
+                    "cannot finalize single-float ABI metadata in MIPS object '" +
+                    path.string() + "'");
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool validate_hir(const hir::Module& hir_module,
                       const Subtarget& subtarget,
                       const CompilerOptions& options,
@@ -107,6 +237,14 @@ public:
         if (subtarget.object_format() != ObjectFormat::Elf) {
             diagnostics.command_error(
                 "the first MIPS backend slice supports ELF object targets only");
+        }
+        if (subtarget.cpu() == "allegrex" &&
+            (!subtarget.has_feature(Feature::Allegrex) ||
+             !subtarget.has_feature(Feature::Mips2) ||
+             !subtarget.has_feature(Feature::HardFloat) ||
+             !subtarget.has_feature(Feature::SingleFloat))) {
+            diagnostics.command_error(
+                "Allegrex requires MIPS II and its hard single-precision FPU; the CPU baseline cannot be disabled with -mno-* overrides");
         }
         if (options.position_independent || options.pie ||
             subtarget.has_feature(Feature::AbiCalls)) {
@@ -121,6 +259,10 @@ public:
             subtarget.has_feature(Feature::MicroMips)) {
             diagnostics.command_error(
                 "MIPS16 and microMIPS encodings are registered but not lowered yet");
+        }
+        if (subtarget.has_feature(Feature::Vfpu)) {
+            diagnostics.command_error(
+                "Allegrex VFPU is registered but awaits overlapping scalar/vector/matrix register lowering");
         }
         for (const auto& object : hir_module.objects) {
             if (object.is_thread_local) {

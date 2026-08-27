@@ -13,6 +13,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -396,7 +397,7 @@ private:
                                    "managed value has no fixed MIPS machine mode");
                 continue;
             }
-            if (mode.bits == 64 &&
+            if (mode.bits == 64 && !is_floating(hir_, value.type) &&
                 !subtarget_.has_feature(Feature::Mips3)) {
                 diagnostics_.error(
                     value.location,
@@ -407,6 +408,12 @@ private:
                 diagnostics_.error(
                     value.location,
                     "-msoft-float forbids FPU instructions; standalone Cross will not insert a software-float runtime call");
+            }
+            if (is_floating(hir_, value.type) && mode.bits > 32 &&
+                subtarget_.has_feature(Feature::SingleFloat)) {
+                diagnostics_.error(
+                    value.location,
+                    "the selected MIPS CPU has a single-precision-only FPU");
             }
             if (mode.bits > 64 || is_vector(hir_, value.type) ||
                 is_aggregate(hir_, value.type)) {
@@ -1054,6 +1061,13 @@ public:
                 "native MIPS assembly currently requires an ELF target");
             return {};
         }
+        if (subtarget_.abi() == "eabi32") {
+            // GNU MIPS linkers use this conventional empty marker in addition
+            // to EF_MIPS_ABI_EABI32.  LLVM MC accepts the section even though
+            // it cannot infer EABI32 from the PSP triple by itself.
+            output_ << ".section .mdebug.eabi32\n.previous\n"
+                       ".section .gcc_compiled_long32\n.previous\n";
+        }
         for (auto& function : module_.functions) emit_function(function);
         return output_.str();
     }
@@ -1064,11 +1078,74 @@ private:
         SignatureLayout layout;
     };
 
-    void instruction(std::string_view opcode,
-                     std::string_view operands = {}) {
+    void raw_instruction(std::string_view opcode,
+                         std::string_view operands = {}) {
         output_ << '\t' << opcode;
         if (!operands.empty()) output_ << '\t' << operands;
         output_ << '\n';
+    }
+
+    static bool writes_hilo(std::string_view opcode) {
+        return opcode == "mult" || opcode == "multu" ||
+               opcode == "dmult" || opcode == "dmultu" ||
+               opcode == "div" || opcode == "divu" ||
+               opcode == "ddiv" || opcode == "ddivu" ||
+               opcode == "mthi" || opcode == "mtlo";
+    }
+
+    static bool memory_load(std::string_view opcode) {
+        return opcode == "lb" || opcode == "lbu" || opcode == "lh" ||
+               opcode == "lhu" || opcode == "lw" || opcode == "lwu" ||
+               opcode == "ld" || opcode == "lwc1" || opcode == "ldc1" ||
+               opcode == "ll" || opcode == "lld";
+    }
+
+    void instruction(std::string_view opcode,
+                     std::string_view operands = {}) {
+        // MIPS I-III HI/LO is unusual: MFHI/MFLO may be followed by ordinary
+        // work, but not by a HI/LO writer until two instructions have passed.
+        // Preserve useful instructions and materialize NOPs only if a writer
+        // arrives while the architectural exclusion window is still open.
+        if (hilo_write_barrier_ != 0) {
+            if (writes_hilo(opcode)) {
+                while (hilo_write_barrier_ != 0) {
+                    raw_instruction("nop");
+                    --hilo_write_barrier_;
+                }
+            } else {
+                --hilo_write_barrier_;
+            }
+        }
+
+        raw_instruction(opcode, operands);
+        if (!subtarget_.has_feature(Feature::LoadInterlocks) &&
+            memory_load(opcode)) {
+            // This intentionally favors correctness over trying to infer a
+            // pseudo-instruction's eventual register dependencies.  A later
+            // scheduler can fill these MIPS-I load slots from Machine IR.
+            raw_instruction("nop");
+        }
+        if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
+            (opcode == "mfc1" || opcode == "mtc1" ||
+             opcode == "dmfc1" || opcode == "dmtc1")) {
+            raw_instruction("nop");
+        }
+        if (!subtarget_.has_feature(Feature::FpuCompareInterlocks) &&
+            opcode.starts_with("c.")) {
+            raw_instruction("nop");
+        }
+        if (!subtarget_.has_feature(Feature::HiloInterlocks) &&
+            (opcode == "mfhi" || opcode == "mflo")) {
+            hilo_write_barrier_ = 2;
+        }
+    }
+
+    void encoded(std::uint32_t word, std::string_view comment) {
+        output_ << "\t.word\t0x" << std::hex << std::setw(8)
+                << std::setfill('0') << word << std::dec << std::setfill(' ');
+        if (!comment.empty()) output_ << "\t# " << comment;
+        output_ << '\n';
+        if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
     }
 
     static std::string reg_name(std::string_view name) {
@@ -1765,6 +1842,7 @@ private:
     std::uint32_t saved_fp_offset_{};
     std::uint32_t saved_ra_offset_{};
     std::uint32_t next_label_{};
+    unsigned hilo_write_barrier_{};
     std::string epilogue_label_;
 };
 
@@ -1812,16 +1890,25 @@ void AssemblyEmitter::emit_integer_binary(
         instruction(wide ? "dsrlv" : "srlv", "$t2,$t0,$t1");
         break;
     case Opcode::Rotl:
-        instruction(wide ? "dsubu" : "subu", "$t3,$zero,$t1");
-        instruction(wide ? "dsllv" : "sllv", "$t2,$t0,$t1");
-        instruction(wide ? "dsrlv" : "srlv", "$t3,$t0,$t3");
-        instruction("or", "$t2,$t2,$t3");
+        if (!wide && subtarget_.has_feature(Feature::Rotate)) {
+            instruction("subu", "$t3,$zero,$t1");
+            encoded(0x01685046U, "rorv $t2,$t0,$t3");
+        } else {
+            instruction(wide ? "dsubu" : "subu", "$t3,$zero,$t1");
+            instruction(wide ? "dsllv" : "sllv", "$t2,$t0,$t1");
+            instruction(wide ? "dsrlv" : "srlv", "$t3,$t0,$t3");
+            instruction("or", "$t2,$t2,$t3");
+        }
         break;
     case Opcode::Rotr:
-        instruction(wide ? "dsubu" : "subu", "$t3,$zero,$t1");
-        instruction(wide ? "dsrlv" : "srlv", "$t2,$t0,$t1");
-        instruction(wide ? "dsllv" : "sllv", "$t3,$t0,$t3");
-        instruction("or", "$t2,$t2,$t3");
+        if (!wide && subtarget_.has_feature(Feature::Rotate)) {
+            encoded(0x01285046U, "rorv $t2,$t0,$t1");
+        } else {
+            instruction(wide ? "dsubu" : "subu", "$t3,$zero,$t1");
+            instruction(wide ? "dsrlv" : "srlv", "$t2,$t0,$t1");
+            instruction(wide ? "dsllv" : "sllv", "$t3,$t0,$t3");
+            instruction("or", "$t2,$t2,$t3");
+        }
         break;
     case Opcode::CmpEq:
         instruction("xor", "$t2,$t0,$t1");
@@ -2438,6 +2525,17 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
     }
     if (opcode == Opcode::Select) {
         if (value.uses.size() < 3 || value.defs.empty()) return;
+        if (value.defs.front().mode.bits <= 32 &&
+            subtarget_.has_feature(Feature::CondMove)) {
+            load_vreg(function, value.uses[0], "t0", value.location);
+            load_vreg(function, value.uses[1], "t1", value.location);
+            load_vreg(function, value.uses[2], "t2", value.location);
+            // Allegrex uses the MIPS conditional-move operand layout even
+            // though generic MIPS-II assemblers do not recognize its mnemonic.
+            encoded(0x0128500bU, "movn $t2,$t1,$t0");
+            store_vreg(function, value.defs.front(), "t2", value.location);
+            return;
+        }
         const auto otherwise = local_label(function);
         const auto done = local_label(function);
         load_vreg(function, value.uses[0], "t0", value.location);
@@ -2570,7 +2668,9 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         return;
     }
     output_ << *directive << '\n';
-    output_ << ".set noreorder\n.option pic0\n";
+    // ISA directives are scoped so llvm-mc's command-line ABI features (for
+    // example +single-float) are restored before it finalizes .MIPS.abiflags.
+    output_ << ".set push\n.set noreorder\n.option pic0\n";
     if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
     else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
@@ -2642,7 +2742,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     instruction("nop");
     if (cfi) output_ << ".cfi_endproc\n";
     output_ << ".end " << symbol << "\n.size " << symbol << ",.-"
-            << symbol << "\n.set reorder\n";
+            << symbol << "\n.set reorder\n.set pop\n";
     active_signature_.reset();
 }
 

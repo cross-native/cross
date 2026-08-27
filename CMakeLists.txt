@@ -246,6 +246,14 @@ if(BUILD_TESTING)
                 -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-o32
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.cmake")
+    add_test(NAME cross_mips_allegrex
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
+                -DMIPS1_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/mips1_load.x
+                -DF64_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/single_float_error.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-allegrex
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.cmake")
     add_test(NAME cross_mips_vr4300_runtime
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

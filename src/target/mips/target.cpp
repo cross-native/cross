@@ -92,28 +92,63 @@ const SubtargetTable subtargets{
         {"abicalls", false, true, {"mips1"}, {}},
         {"mips16", false, true, {"mips1"}, {"micromips"}},
         {"micromips", false, true, {"mips32"}, {"mips16"}},
+        {"single-float", false, true, {"hard-float"}, {"fp64", "fpxx"}},
+        {"allegrex", false, false,
+         {"mips2", "hard-float", "single-float"}, {}},
+        {"cond-move", false, true, {"mips1"}, {}},
+        {"rotate", false, true, {"mips1"}, {}},
+        {"vfpu", false, true, {"allegrex"}, {}},
+        // Pipeline interlocks are CPU facts rather than user-visible ISA
+        // extensions.  The printer uses their absence to insert the exact
+        // architectural separation required by older implementations.
+        {"load-interlocks", false, false, {"mips1"}, {}},
+        {"fpu-transfer-interlocks", false, false, {"mips1"}, {}},
+        {"fpu-compare-interlocks", false, false, {"mips1"}, {}},
+        {"hilo-interlocks", false, false, {"mips1"}, {}},
     },
     {
         {"generic", {"mips1", "hard-float", "fp32", "odd-spreg"}},
         {"mips1", {"mips1", "hard-float", "fp32", "odd-spreg"}},
+        {"r2000", {"mips1", "hard-float", "fp32", "odd-spreg"}},
+        {"r3000", {"mips1", "hard-float", "fp32", "odd-spreg"}},
         {"mips2", {"mips2", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely"}},
+                    "llsc", "branch-likely", "load-interlocks"}},
+        {"r6000", {"mips2", "hard-float", "fp32", "odd-spreg",
+                    "llsc", "branch-likely", "load-interlocks"}},
+        {"allegrex", {"mips2", "hard-float", "fp32", "single-float",
+                       "odd-spreg", "llsc", "branch-likely", "allegrex",
+                       "cond-move", "rotate", "load-interlocks",
+                       "fpu-transfer-interlocks", "hilo-interlocks"}},
         {"mips3", {"mips3", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely"}},
+                    "llsc", "branch-likely", "load-interlocks"}},
         {"r4000", {"mips3", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely"}},
+                    "llsc", "branch-likely", "load-interlocks"}},
+        {"r4400", {"mips3", "hard-float", "fp32", "odd-spreg",
+                    "llsc", "branch-likely", "load-interlocks"}},
+        {"r4600", {"mips3", "hard-float", "fp32", "odd-spreg",
+                    "llsc", "branch-likely", "load-interlocks"}},
         {"vr4300", {"mips3", "hard-float", "fp32", "odd-spreg",
-                     "llsc", "branch-likely"}},
+                     "llsc", "branch-likely", "load-interlocks"}},
         {"mips4", {"mips4", "hard-float", "fp64", "odd-spreg",
-                    "llsc", "branch-likely"}},
+                    "llsc", "branch-likely", "cond-move",
+                    "load-interlocks", "fpu-transfer-interlocks",
+                    "fpu-compare-interlocks"}},
         {"mips5", {"mips5", "hard-float", "fp64", "odd-spreg",
-                    "llsc", "branch-likely"}},
+                    "llsc", "branch-likely", "cond-move",
+                    "load-interlocks", "fpu-transfer-interlocks",
+                    "fpu-compare-interlocks"}},
         {"mips32", {"mips32", "hard-float", "fp32", "odd-spreg",
-                     "llsc", "branch-likely"}},
+                     "llsc", "branch-likely", "cond-move",
+                     "load-interlocks", "fpu-transfer-interlocks",
+                     "fpu-compare-interlocks", "hilo-interlocks"}},
         {"mips32r2", {"mips32r2", "hard-float", "fp32", "odd-spreg",
-                       "llsc", "branch-likely"}},
+                       "llsc", "branch-likely", "cond-move", "rotate",
+                       "load-interlocks", "fpu-transfer-interlocks",
+                       "fpu-compare-interlocks", "hilo-interlocks"}},
         {"mips64", {"mips64", "hard-float", "fp64", "odd-spreg",
-                     "llsc", "branch-likely"}},
+                     "llsc", "branch-likely", "cond-move",
+                     "load-interlocks", "fpu-transfer-interlocks",
+                     "fpu-compare-interlocks", "hilo-interlocks"}},
     },
 };
 
@@ -159,6 +194,13 @@ std::vector<OptionDefinition> target_options() {
             OptionImplementation::Partial);
     boolean("micromips", false, "enable microMIPS encoding",
             OptionImplementation::Partial);
+    boolean("single-float", false,
+            "limit hardware floating point to single precision");
+    boolean("cond-move", false,
+            "enable integer conditional-move selection");
+    boolean("rotate", false, "enable native variable rotates");
+    boolean("vfpu", false, "enable the Allegrex VFPU extension",
+            OptionImplementation::Partial);
     return result;
 }
 
@@ -184,9 +226,9 @@ TargetInfo make_target(ByteOrder order,
 }
 
 const TargetInfo big_endian = make_target(
-    ByteOrder::Big, {"mips"});
+    ByteOrder::Big, {"mipsallegrex", "mips"});
 const TargetInfo little_endian = make_target(
-    ByteOrder::Little, {"mipsel"});
+    ByteOrder::Little, {"mipsallegrexel", "mipsel"});
 
 } // namespace
 

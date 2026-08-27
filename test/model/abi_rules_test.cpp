@@ -83,7 +83,9 @@ bool validate_shipped_abis() {
         model_registry().find_abi("x86-64", "ms_abi", {});
     const auto* o32 =
         model_registry().find_abi("mips", "o32", {});
-    if (!cross_abi || !sysv || !microsoft || !o32) return false;
+    const auto* eabi32 =
+        model_registry().find_abi("mips", "eabi32", {});
+    if (!cross_abi || !sysv || !microsoft || !o32 || !eabi32) return false;
     if (!cross_abi->gcc_calling_attribute.empty() ||
         sysv->gcc_calling_attribute != "sysv_abi" ||
         microsoft->gcc_calling_attribute != "ms_abi") {
@@ -158,6 +160,67 @@ bool validate_shipped_abis() {
         !o32_soft_f64_result ||
         !register_is(o32_soft_f64_result, 0, "v0") ||
         !register_is(o32_soft_f64_result, 1, "v1")) {
+        return false;
+    }
+
+    const std::array<std::string, 5> eabi_single{
+        "mips2", "hard-float", "fp32", "single-float", "odd-spreg"};
+    const std::array<std::string, 4> eabi_double{
+        "mips2", "hard-float", "fp32", "odd-spreg"};
+    const auto eabi_independent = classify_call_arguments(
+        *eabi32,
+        std::array{o32_f32, o32_i32, o32_f32, o32_i32},
+        eabi_single);
+    if (!eabi_independent ||
+        !register_is(eabi_independent.layout.arguments[0], 0, "f12") ||
+        !register_is(eabi_independent.layout.arguments[1], 0, "a0") ||
+        !register_is(eabi_independent.layout.arguments[2], 0, "f13") ||
+        !register_is(eabi_independent.layout.arguments[3], 0, "a1")) {
+        return false;
+    }
+    const auto eabi_integer_pair = classify_call_arguments(
+        *eabi32, std::array{o32_i32, i64, o32_i32}, eabi_single);
+    if (!eabi_integer_pair ||
+        !register_is(eabi_integer_pair.layout.arguments[0], 0, "a0") ||
+        !register_is(eabi_integer_pair.layout.arguments[1], 0, "a2") ||
+        !register_is(eabi_integer_pair.layout.arguments[1], 1, "a3") ||
+        !register_is(eabi_integer_pair.layout.arguments[2], 0, "t0")) {
+        return false;
+    }
+    const std::array nine_i32{o32_i32, o32_i32, o32_i32, o32_i32,
+                              o32_i32, o32_i32, o32_i32, o32_i32,
+                              o32_i32};
+    const auto eabi_stack =
+        classify_call_arguments(*eabi32, nine_i32, eabi_single);
+    if (!eabi_stack ||
+        !register_is(eabi_stack.layout.arguments[7], 0, "t3") ||
+        !stack_is(eabi_stack.layout.arguments[8], 0, 0)) {
+        return false;
+    }
+    const auto eabi_single_f64_argument =
+        classify_call_arguments(*eabi32, std::array{f64}, eabi_single);
+    const auto eabi_single_f64_result =
+        classify_return(*eabi32, f64, eabi_single);
+    const auto eabi_double_f64_argument =
+        classify_call_arguments(*eabi32, std::array{f64}, eabi_double);
+    const auto eabi_double_f64_result =
+        classify_return(*eabi32, f64, eabi_double);
+    const auto eabi_small_record_result =
+        classify_return(*eabi32, aggregate(64, {o32_i32, o32_i32}),
+                        eabi_single);
+    if (!eabi_single_f64_argument ||
+        !register_is(eabi_single_f64_argument.layout.arguments[0], 0, "a0") ||
+        !register_is(eabi_single_f64_argument.layout.arguments[0], 1, "a1") ||
+        !eabi_single_f64_result ||
+        !register_is(eabi_single_f64_result, 0, "v0") ||
+        !register_is(eabi_single_f64_result, 1, "v1") ||
+        !eabi_double_f64_argument ||
+        !register_is(eabi_double_f64_argument.layout.arguments[0], 0, "f12") ||
+        !eabi_double_f64_result ||
+        !register_is(eabi_double_f64_result, 0, "f0") ||
+        !eabi_small_record_result ||
+        !register_is(eabi_small_record_result, 0, "v0") ||
+        !register_is(eabi_small_record_result, 1, "v1")) {
         return false;
     }
 

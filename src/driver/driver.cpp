@@ -592,7 +592,10 @@ int cc_main(int argc, char** argv) {
                 &object_writer_features, subtarget->object_format(), output,
                 options.verbose,
                 options.save_temps};
-            (void)native::assemble_object(request, diagnostics);
+            if (native::assemble_object(request, diagnostics)) {
+                (void)backend->finalize_object(output, *subtarget,
+                                               diagnostics);
+            }
         }
     }
     return diagnostics.errors() == 0 ? 0 : 1;
