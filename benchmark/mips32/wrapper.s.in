@@ -1,0 +1,9 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+        .set    noreorder
+        .set    mips3
+        .section .payload,"awx",@progbits
+        .globl  _payload
+_payload:
+        .incbin "@IMAGE@"

@@ -40,6 +40,11 @@ foreach(mode gimple rtl)
        NOT text MATCHES "gimple_bridge_rotate")
         message(FATAL_ERROR "MIR rotate helper was not emitted")
     endif()
+    if(text MATCHES "typedef (unsigned )?__int128" OR
+       text MATCHES "typedef __float128")
+        message(FATAL_ERROR
+            "GIMPLE bridge emitted unused target-dependent scalar types")
+    endif()
     execute_process(
         COMMAND "${GCC}" -c -O3 -fgimple -march=x86-64-v3
                 -ffreestanding -fno-builtin -fno-stack-protector

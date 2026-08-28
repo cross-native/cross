@@ -1,0 +1,114 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+typedef unsigned long uptr;
+
+typedef union FloatingBits {
+    double value;
+    u64 bits;
+} FloatingBits;
+
+static volatile u8 *const uart = (volatile u8 *)0xbf000900u;
+static u64 data_values[64];
+static u64 ordered_values[64];
+static u64 index_values[64];
+static u64 destination_values[64];
+static double floating_left[64];
+static double floating_right[64];
+static volatile u64 result_sink;
+
+@DECLARATIONS@
+
+static void put_character(u8 value) {
+    *uart = value;
+}
+
+static void put_string(const char *value) {
+    while (*value != 0) put_character((u8)*value++);
+}
+
+static void put_hex_digit(u32 value) {
+    put_character((u8)(value < 10 ? '0' + value : 'a' + value - 10));
+}
+
+static void put_hex32(u32 value) {
+    u32 shift = 32;
+    while (shift != 0) {
+        shift -= 4;
+        put_hex_digit((value >> shift) & 15u);
+    }
+}
+
+static void put_hex64(u64 value) {
+    put_hex32((u32)(value >> 32));
+    put_hex32((u32)value);
+}
+
+static __attribute__((always_inline)) inline u32 read_count(void) {
+    u32 value;
+    __asm__ volatile("mfc0 %0,$9\n\tnop\n\tnop" : "=r"(value) : : "memory");
+    return value;
+}
+
+typedef u64 (*Invocation)(void);
+
+static u32 measure(const char *name, Invocation invoke) {
+    u64 expected = invoke();
+    u32 sample = 0;
+    while (sample < @SAMPLES@u) {
+        u32 begin = read_count();
+        u64 result = invoke();
+        u32 end = read_count();
+        if (result != expected) {
+            put_string("mismatch,");
+            put_string(name);
+            put_character(',');
+            put_hex64(expected);
+            put_character(',');
+            put_hex64(result);
+            put_character('\n');
+            return 1;
+        }
+        result_sink = result;
+        put_string(name);
+        put_character(',');
+        put_hex32(sample);
+        put_character(',');
+        put_hex32(end - begin);
+        put_character(',');
+        put_hex64(result);
+        put_character('\n');
+        sample += 1;
+    }
+    return 0;
+}
+
+@WRAPPERS@
+
+static void initialize_data(void) {
+    u32 index = 0;
+    u64 state = 0x123456789abcdef0ull;
+    while (index < 64) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state *= 2685821657736338717ull;
+        data_values[index] = state;
+        ordered_values[index] = (u64)index * 3ull;
+        index_values[index] = (u64)((index * 37u + 11u) & 63u);
+        destination_values[index] = 0;
+        floating_left[index] = (double)(index + 1u) * 0.03125;
+        floating_right[index] = (double)(index + 3u) * 0.015625 + 0.5;
+        index += 1;
+    }
+}
+
+u32 benchmark_main(void) {
+    initialize_data();
+    put_string("kernel,sample,ticks,checksum\n");
+@RUNS@
+    return 0;
+}

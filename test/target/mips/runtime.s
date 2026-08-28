@@ -22,6 +22,7 @@ _start:
         nop
 
         # i64 values use high-word-first o32 slots on big-endian MIPS.
+        addiu   $k0,$zero,'1'
         move    $a0,$zero
         addiu   $a1,$zero,1
         move    $a2,$zero
@@ -36,6 +37,21 @@ _start:
         bne     $v1,$t0,.Lfail
         nop
 
+        # `lw` sign-extends on MIPS III; an unsigned widening conversion must
+        # explicitly clear that physical-register high half before return.
+        addiu   $k0,$zero,'2'
+        lui     $a0,0xf1cd
+        ori     $a0,$a0,0x194f
+        jal     mips_widen_u32
+        nop
+        bne     $v0,$zero,.Lfail
+        nop
+        lui     $t0,0xf1cd
+        ori     $t0,$t0,0x194f
+        bne     $v1,$t0,.Lfail
+        nop
+
+        addiu   $k0,$zero,'3'
         lui     $a0,%hi(runtime_words)
         addiu   $a0,$a0,%lo(runtime_words)
         addiu   $a1,$zero,1
@@ -45,6 +61,7 @@ _start:
         addiu   $t0,$zero,42
         bne     $v0,$t0,.Lfail
         nop
+        addiu   $k0,$zero,'4'
         lui     $a0,%hi(runtime_words)
         addiu   $a0,$a0,%lo(runtime_words)
         lw      $t1,4($a0)
@@ -52,11 +69,13 @@ _start:
         bne     $t1,$t0,.Lfail
         nop
 
+        addiu   $k0,$zero,'5'
         addiu   $a0,$zero,5
         jal     mips_atomic_add
         nop
         bne     $v0,$zero,.Lfail
         nop
+        addiu   $k0,$zero,'6'
         lui     $t0,%hi(mips_atomic)
         addiu   $t0,$t0,%lo(mips_atomic)
         lw      $t1,0($t0)
@@ -64,6 +83,7 @@ _start:
         bne     $t1,$t0,.Lfail
         nop
 
+        addiu   $k0,$zero,'7'
         jal     mips_patch_value
         nop
         lui     $t0,0x479e
@@ -73,6 +93,7 @@ _start:
 
         # Execute the MIPS-I word-pair legalization on a big-endian target.
         # The same source is also run little-endian on Allegrex/PPSSPP.
+        addiu   $k0,$zero,'8'
         jal     mips_pair_entry
         nop
         lui     $t0,0x7
@@ -84,7 +105,7 @@ _start:
         b       .Lreport
         nop
 .Lfail:
-        addiu   $a0,$zero,'F'
+        move    $a0,$k0
 .Lreport:
         xori    $t2,$a0,'P'
         sltu    $t2,$zero,$t2

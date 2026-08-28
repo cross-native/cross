@@ -138,7 +138,8 @@ class TypeEmitter {
 public:
     TypeEmitter(const hir::Module& hir_module, Diagnostics& diagnostics)
         : hir_(hir_module), diagnostics_(diagnostics),
-          emitted_(hir_module.types.size()), active_(hir_module.types.size()) {}
+          emitted_(hir_module.types.size()), active_(hir_module.types.size()),
+          required_(hir_module.types.size()) {}
 
     std::string name(hir::TypeId id) const {
         return "cross_t" + std::to_string(id.value);
@@ -250,6 +251,10 @@ public:
                std::to_string(id.value);
     }
 
+    void require(hir::TypeId id) {
+        required_.at(id.value) = true;
+    }
+
     void emit(std::ostringstream& out) {
         out << "typedef __SIZE_TYPE__ cross_gimple_size;\n";
         for (const auto& record : hir_.records) {
@@ -257,6 +262,7 @@ public:
         }
         if (!hir_.records.empty()) out << '\n';
         for (std::uint32_t id = 0; id < hir_.types.size(); ++id) {
+            if (!required_[id]) continue;
             emit_one({id}, out);
         }
         for (const auto& record : hir_.records) {
@@ -402,6 +408,7 @@ private:
     Diagnostics& diagnostics_;
     std::vector<bool> emitted_;
     std::vector<bool> active_;
+    std::vector<bool> required_;
 };
 
 class FunctionEmitter {
@@ -1296,6 +1303,7 @@ public:
         std::ostringstream out;
         out << "/* Cross language 0.8: experimental GCC __GIMPLE bridge.\n"
                "   Compile this file with GCC -fgimple. */\n\n";
+        collect_required_types();
         types_.emit(out);
         emit_rotate_helpers(out);
         emit_floating_division_helpers(out);
@@ -1326,6 +1334,33 @@ public:
     }
 
 private:
+    void collect_required_types() {
+        for (const auto& function : hir_.functions) {
+            types_.require(function.result_type);
+            for (const auto& parameter : function.parameters) {
+                types_.require(parameter.type);
+            }
+            for (const auto& binding : function.variadic_bindings) {
+                types_.require(binding.type);
+            }
+        }
+        for (const auto& object : data_.objects) {
+            types_.require(object.type);
+        }
+        for (const auto& function : managed_.functions) {
+            types_.require(function.result_type);
+            for (const auto& slot : function.slots) {
+                types_.require(slot.type);
+            }
+            for (const auto& value : function.values) {
+                types_.require(value.type);
+                for (const auto& argument : value.call_arguments) {
+                    types_.require(argument.type);
+                }
+            }
+        }
+    }
+
     void emit_rotate_helpers(std::ostringstream& out) const {
         struct UsedType {
             hir::TypeId type;

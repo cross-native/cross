@@ -519,6 +519,9 @@ if(BUILD_TESTING)
         add_test(NAME cross_x86_64_benchmark_driver
             COMMAND "${Python3_EXECUTABLE}" -m pytest -q -p no:cacheprovider
                     "${CMAKE_SOURCE_DIR}/benchmark/x86_64/test_run.py")
+        add_test(NAME cross_mips32_benchmark_driver
+            COMMAND "${Python3_EXECUTABLE}" -m pytest -q -p no:cacheprovider
+                    "${CMAKE_SOURCE_DIR}/benchmark/mips32/test_run.py")
     endif()
     add_test(NAME cross_x86_64_isa_selection
         COMMAND "${CMAKE_COMMAND}"

@@ -1918,6 +1918,14 @@ private:
             instruction(value_bits > 32 ? "dsrl" : "srl",
                         "$at,$at," + std::to_string(shift));
         }
+        if (subtarget_.has_feature(Feature::Mips3) &&
+            value_bits > piece.value_bits && piece.carrier_bits == 32) {
+            // o32 was specified for 32-bit GPRs.  On a MIPS III processor,
+            // GCC represents each 32-bit carrier as a sign-extended physical
+            // GPR value.  Callers may rely on that invariant when consuming
+            // split u64/f64 results, even though only the low word is payload.
+            normalize_integer("at", 32, true);
+        }
         if (piece.location.kind == LocationKind::Register) {
             instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
@@ -1976,6 +1984,10 @@ private:
         }
         if (!legalizes_to_pair(source) && shift != 0) {
             instruction("dsrl", "$at,$at," + std::to_string(shift));
+        }
+        if (subtarget_.has_feature(Feature::Mips3) &&
+            source.mode.bits > piece.value_bits && piece.carrier_bits == 32) {
+            normalize_integer("at", 32, true);
         }
         if (piece.location.kind == LocationKind::Register) {
             instruction("move", reg_name(piece.location.reg) + ",$at");
@@ -2726,7 +2738,17 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
             store_vreg_pair(function, target, "t0", "t1", value.location);
         } else {
             load_vreg(function, source, "t0", value.location);
-            normalize_integer("t0", target.mode.bits, sign);
+            // MIPS III `lw` sign-extends into the 64-bit physical GPR even
+            // when the Machine IR value is unsigned.  Extension semantics
+            // are determined by the source width; normalizing to the wider
+            // destination is a no-op and used to leak those sign bits into
+            // u32 -> u64 casts.  Truncation instead normalizes the retained
+            // destination width.  Reinterpretation preserves all bits.
+            if (opcode == Opcode::Sext || opcode == Opcode::Zext) {
+                normalize_integer("t0", source.mode.bits, sign);
+            } else if (opcode == Opcode::Trunc) {
+                normalize_integer("t0", target.mode.bits, false);
+            }
             store_vreg(function, target, "t0", value.location);
         }
         return;

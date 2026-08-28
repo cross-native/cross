@@ -16,6 +16,11 @@ global i32 mips_choose(in i32 selector, in i32 yes, in i32 no) {
     return selector ? yes : no;
 }
 
+[[abi("o32"), noinline]]
+global u64 mips_widen_u32(in u32 value) {
+    return value;
+}
+
 global i64 mips_entry(in i64 left, in i64 right, in i32 selector) {
     i64 integer = mips_add64(left, right);
     f64 floating = mips_fma_shape(2.0f64, 3.0f64, 4.0f64);
