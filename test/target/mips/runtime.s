@@ -101,6 +101,18 @@ _start:
         bne     $v0,$t0,.Lfail
         nop
 
+        # A surviving private call uses Cross64 even though this public test
+        # boundary is o32. The fifth full-width argument travels through t0.
+        addiu   $k0,$zero,'9'
+        addiu   $a0,$zero,7
+        jal     mips_private_entry
+        nop
+        bne     $v0,$zero,.Lfail
+        nop
+        addiu   $t0,$zero,21
+        bne     $v1,$t0,.Lfail
+        nop
+
         addiu   $a0,$zero,'P'
         b       .Lreport
         nop

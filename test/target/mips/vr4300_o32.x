@@ -21,6 +21,20 @@ global u64 mips_widen_u32(in u32 value) {
     return value;
 }
 
+// The public adapter remains o32, while the private definition uses the
+// optimizer-selected MIPS-III Cross64 contract.  Its fifth u64 argument is
+// transported in t0 as one 64-bit carrier rather than an o32 word pair.
+[[noinline]]
+static u64 mips_private_channels(in u64 a, in u64 b, in u64 c,
+                                 in u64 d, in u64 e) {
+    return a + b + c + d + e;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_private_entry(in u32 seed) {
+    return mips_private_channels(seed, 2u64, 3u64, 4u64, 5u64);
+}
+
 global i64 mips_entry(in i64 left, in i64 right, in i32 selector) {
     i64 integer = mips_add64(left, right);
     f64 floating = mips_fma_shape(2.0f64, 3.0f64, 4.0f64);

@@ -85,10 +85,15 @@ bool validate_shipped_abis() {
         model_registry().find_abi("mips", "o32", {});
     const auto* eabi32 =
         model_registry().find_abi("mips", "eabi32", {});
-    const auto* mips_cross =
+    const auto* mips_cross32 =
+        model_registry().find_abi("mips", "cross32", {});
+    const auto* mips_cross_alias =
         model_registry().find_abi("mips", "cross", {});
+    const auto* mips_cross64 =
+        model_registry().find_abi("mips", "cross64", {});
     if (!cross_abi || !sysv || !microsoft || !o32 || !eabi32 ||
-        !mips_cross) {
+        !mips_cross32 || mips_cross_alias != mips_cross32 ||
+        !mips_cross64) {
         return false;
     }
     if (!cross_abi->gcc_calling_attribute.empty() ||
@@ -237,13 +242,13 @@ bool validate_shipped_abis() {
     const std::array<std::string, 5> mips3_cross_features{
         "mips1", "mips2", "mips3", "hard-float", "fp32"};
     const auto mips_cross_mips1 = classify_call_arguments(
-        *mips_cross, std::array{i64, i64, o32_i32},
+        *mips_cross32, std::array{i64, i64, o32_i32},
         mips1_cross_features);
     const auto mips_cross_mips3 = classify_call_arguments(
-        *mips_cross, std::array{i64, i64, o32_i32},
+        *mips_cross32, std::array{i64, i64, o32_i32},
         mips3_cross_features);
     const auto mips_cross_result =
-        classify_return(*mips_cross, i64, mips1_cross_features);
+        classify_return(*mips_cross32, i64, mips1_cross_features);
     if (!mips_cross_mips1 || !mips_cross_mips3 || !mips_cross_result) {
         return false;
     }
@@ -253,12 +258,33 @@ bool validate_shipped_abis() {
             !register_is(layout->arguments[0], 1, "a1") ||
             !register_is(layout->arguments[1], 0, "a2") ||
             !register_is(layout->arguments[1], 1, "a3") ||
-            !register_is(layout->arguments[2], 0, "t0")) {
+            !register_is(layout->arguments[2], 0, "s0")) {
             return false;
         }
     }
     if (!register_is(mips_cross_result, 0, "v0") ||
         !register_is(mips_cross_result, 1, "v1")) {
+        return false;
+    }
+
+    // Cross64 is deliberately a distinct contract: it is unavailable before
+    // MIPS III, carries an i64 in one 64-bit GPR, and makes the platform
+    // callee-saved bank available as private argument channels.
+    const std::array five_i64{i64, i64, i64, i64, i64};
+    const auto mips_cross64_unavailable = classify_call_arguments(
+        *mips_cross64, std::array{i64}, mips1_cross_features);
+    const auto mips_cross64_arguments = classify_call_arguments(
+        *mips_cross64, five_i64, mips3_cross_features);
+    const auto mips_cross64_result =
+        classify_return(*mips_cross64, i64, mips3_cross_features);
+    if (mips_cross64_unavailable || !mips_cross64_arguments ||
+        !mips_cross64_result ||
+        mips_cross64_arguments.layout.arguments[0].pieces.size() != 1 ||
+        !register_is(mips_cross64_arguments.layout.arguments[0], 0, "a0") ||
+        !register_is(mips_cross64_arguments.layout.arguments[3], 0, "a3") ||
+        !register_is(mips_cross64_arguments.layout.arguments[4], 0, "t0") ||
+        mips_cross64_result.pieces.size() != 1 ||
+        !register_is(mips_cross64_result, 0, "v0")) {
         return false;
     }
 

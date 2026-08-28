@@ -2,10 +2,10 @@
 # scheduling are selected by the compiled target registry; this model owns
 # external data-transport policy only.
 
-abi "cross" {
+abi "cross32" {
     architecture = "mips";
     address_bits = 32;
-    aliases = ["cross_abi"];
+    aliases = ["cross", "cross_abi", "cross-32"];
     llvm_calling_convention = "";
     gcc_calling_attribute = "";
     compilation_selectable = true;
@@ -44,8 +44,10 @@ abi "cross" {
         # incompatible.
         register_bits = 32;
         arguments = [
-            "a0", "a1", "a2", "a3", "t0", "t1",
-            "t2", "t3", "t4", "t5", "t6", "t7"
+            "a0", "a1", "a2", "a3",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "t8", "t9"
         ];
         results = ["v0", "v1", "a0", "a1"];
     }
@@ -143,6 +145,176 @@ abi "cross" {
         match = ["any"];
         action = "stack";
         applies_to = ["arguments"];
+    }
+}
+
+# MIPS III and later expose 64-bit GPRs even in an ELF32/address32 data
+# model.  Cross64 is an explicit, separately compiled Cross-only contract:
+# each scalar through 64 bits consumes one physical GPR and wider integers
+# split into 64-bit carriers.  The s-register bank remains stable across a
+# call and doubles as the overflow register-argument bank after every volatile
+# channel is consumed.  Every rule requires MIPS III so selecting this ABI on
+# a 32-bit-GPR CPU fails classification instead of silently degrading to a
+# different wire format.
+abi "cross64" {
+    architecture = "mips";
+    address_bits = 32;
+    aliases = ["cross-64"];
+    llvm_calling_convention = "";
+    gcc_calling_attribute = "";
+    compilation_selectable = true;
+    function_selectable = true;
+    argument_register_failure = "partial";
+    result_register_failure = "error";
+    stack_layout = "packed";
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 0;
+    stack_order = ["arguments"];
+    variadic_supported = true;
+    variadic_save_banks = ["integer", "floating"];
+    variadic_save_alignment = 8;
+    variadic_va_list_bytes = 16;
+    variadic_va_list_alignment = 8;
+    call_clobbers = [
+        "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "t8", "t9", "gp", "ra", "hi", "lo",
+        "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+        "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
+        "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23",
+        "f24", "f25", "f26", "f27", "f28", "f29", "f30", "f31",
+        "memory"
+    ];
+
+    bank "integer" {
+        class = "integer";
+        cursor = "integer";
+        register_bits = 64;
+        # Volatile channels come first so ordinary calls leave s0-s7 intact.
+        # Very wide signatures may still pass trailing values through the
+        # stable bank; the caller treats each register it writes as an exact
+        # call-site clobber even though the callee preserves its incoming bits.
+        arguments = [
+            "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "t8", "t9",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"
+        ];
+        results = ["v0", "v1", "a0", "a1"];
+    }
+
+    bank "floating" {
+        class = "floating";
+        cursor = "floating";
+        register_bits = 64;
+        arguments = [
+            "f12", "f14", "f16", "f18", "f4", "f6", "f8", "f10"
+        ];
+        results = ["f0", "f2", "f4", "f6"];
+    }
+
+    variadic_state "overflow_arg_area" {
+        type = "void*";
+        kind = "stack_address";
+    }
+
+    variadic_state "gp_arg_area" {
+        type = "u64*";
+        kind = "register_save_address";
+        cursor = "integer";
+        stride = 8;
+    }
+
+    variadic_state "fp_arg_area" {
+        type = "f64*";
+        kind = "register_save_address";
+        cursor = "floating";
+        stride = 8;
+    }
+
+    rule "zero" {
+        match = ["zero"];
+        action = "ignore";
+        requires_features = ["mips3"];
+    }
+
+    rule "integer-small" {
+        match = ["integer", "pointer"];
+        action = "direct";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "integer-wide" {
+        match = ["integer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 65;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "floating32" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 32;
+        max_bits = 32;
+        requires_features = ["mips3", "hard-float"];
+    }
+
+    rule "floating64" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 64;
+        max_bits = 64;
+        requires_features = ["mips3", "hard-float"];
+        forbids_features = ["single-float"];
+    }
+
+    rule "floating-soft" {
+        match = ["floating"];
+        action = "split";
+        bank = "integer";
+        min_bits = 32;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-registers" {
+        match = ["pair", "aggregate", "array"];
+        action = "flatten";
+        min_bits = 1;
+        max_bits = 512;
+        unit_bits = 64;
+        merge_banks = ["integer", "floating"];
+        require_natural_alignment = true;
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-result-memory" {
+        match = ["pair", "aggregate", "array"];
+        action = "indirect";
+        bank = "integer";
+        applies_to = ["results"];
+        requires_features = ["mips3"];
+    }
+
+    rule "argument-memory" {
+        match = ["any"];
+        action = "stack";
+        applies_to = ["arguments"];
+        requires_features = ["mips3"];
     }
 }
 
@@ -566,7 +738,7 @@ abi "eabi32" {
 profile "mips-elf" {
     default_for = ["mips", "mips-*"];
     target = "mips-unknown-elf";
-    abi = "cross";
+    abi = "cross32";
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
@@ -575,9 +747,18 @@ profile "mips-elf" {
 profile "mipsel-elf" {
     default_for = ["mipsel", "mipsel-*"];
     target = "mipsel-unknown-elf";
-    abi = "cross";
+    abi = "cross32";
     mangling = "cross";
     m.arch = "generic";
+    m.risc-cisc-balance = 0;
+}
+
+profile "vr4300-cross64" {
+    target = "mips-unknown-elf";
+    abi = "cross64";
+    mangling = "cross";
+    m.arch = "vr4300";
+    m.tune = "vr4300";
     m.risc-cisc-balance = 0;
 }
 

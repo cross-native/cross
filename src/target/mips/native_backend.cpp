@@ -16,12 +16,14 @@
 #include <bit>
 #include <cstdint>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,8 +35,58 @@ enum class LoweringPass : std::uint16_t {
     EliminateRedundantExpressions,
     EliminateRedundantLoads,
     EliminateDeadValues,
+    AllocateRegisters,
     ElideUnusedSpillSlots,
 };
+
+// Physical GPR identities use the architectural register numbers.  Machine
+// IR keeps them numeric; this table is the single target-local conversion to
+// assembly names and model ABI resources.
+constexpr std::array<std::string_view, 32> gpr_names{
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+    "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+constexpr std::array<std::string_view, 32> fpr_names{
+    "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+    "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
+    "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23",
+    "f24", "f25", "f26", "f27", "f28", "f29", "f30", "f31"};
+constexpr std::uint32_t fpr_physical_base = 32;
+
+std::optional<machine::PhysicalRegisterId> gpr_id(std::string_view name) {
+    const auto found = std::find(gpr_names.begin(), gpr_names.end(), name);
+    if (found == gpr_names.end()) return std::nullopt;
+    return machine::PhysicalRegisterId{
+        static_cast<std::uint32_t>(found - gpr_names.begin())};
+}
+
+std::string_view gpr_name(machine::PhysicalRegisterId id) {
+    return id.value < gpr_names.size() ? gpr_names[id.value]
+                                       : std::string_view{};
+}
+
+std::optional<machine::PhysicalRegisterId> fpr_id(std::string_view name) {
+    const auto found = std::find(fpr_names.begin(), fpr_names.end(), name);
+    if (found == fpr_names.end()) return std::nullopt;
+    return machine::PhysicalRegisterId{
+        fpr_physical_base +
+        static_cast<std::uint32_t>(found - fpr_names.begin())};
+}
+
+std::string_view fpr_name(machine::PhysicalRegisterId id) {
+    if (id.value < fpr_physical_base ||
+        id.value >= fpr_physical_base + fpr_names.size()) {
+        return {};
+    }
+    return fpr_names[id.value - fpr_physical_base];
+}
+
+std::optional<machine::PhysicalRegisterId> physical_register_id(
+    std::string_view name) {
+    if (const auto gpr = gpr_id(name)) return gpr;
+    return fpr_id(name);
+}
 
 bool is_void(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
@@ -226,6 +278,22 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
 const AbiEntry* abi_model(AbiId id) {
     const auto* abi = model_registry().find_abi(id);
     return abi && abi->architecture == "mips" ? abi : nullptr;
+}
+
+const AbiEntry* managed_abi_model(const hir::Function& function,
+                                  const Subtarget& subtarget,
+                                  const CompilerOptions& options) {
+    if (options.private_abi &&
+        function.abi_contract == hir::AbiContract::Dynamic) {
+        const auto name = subtarget.has_feature(Feature::Mips3)
+            ? std::string_view{"cross64"}
+            : std::string_view{"cross32"};
+        if (const auto* abi = model_registry().find_abi(
+                "mips", name, options.target)) {
+            return abi;
+        }
+    }
+    return abi_model(function.abi);
 }
 
 machine::Operand register_operand(machine::Register value) {
@@ -780,6 +848,77 @@ private:
                 }
             }
             if (has_result(value)) result.defs.push_back(reg(value.id));
+            const auto append_clobbers =
+                [&](const std::vector<std::string>& names) {
+                    for (const auto& name : names) {
+                        const auto physical = physical_register_id(name);
+                        if (!physical || std::any_of(
+                                result.clobbers.begin(),
+                                result.clobbers.end(),
+                                [&](const machine::Register& present) {
+                                    return present.kind ==
+                                               machine::RegisterKind::Physical &&
+                                           present.id == physical->value;
+                                })) {
+                            continue;
+                        }
+                        result.clobbers.push_back(
+                            machine::Register::physical_register(
+                                *physical, machine::i64));
+                    }
+                };
+            if (const auto* abi = managed_abi_model(
+                    callee, subtarget_, options_)) {
+                append_clobbers(abi->call_clobbers);
+                std::vector<AbiValue> arguments;
+                arguments.reserve(value.call_arguments.size());
+                for (std::size_t index = 0;
+                     index < value.call_arguments.size(); ++index) {
+                    const auto transport =
+                        index < callee.parameters.size() &&
+                                callee.parameters[index].mode !=
+                                    ParameterMode::In
+                            ? ValueTransport::ByReference
+                            : ValueTransport::Direct;
+                    arguments.push_back(abi_value_for(
+                        hir_, value.call_arguments[index].type,
+                        subtarget_.target().data_layout, *abi, transport));
+                }
+                std::vector<AbiValue> results;
+                if (!is_void(hir_, callee.result_type)) {
+                    results.push_back(abi_value_for(
+                        hir_, callee.result_type,
+                        subtarget_.target().data_layout, *abi));
+                }
+                const auto classified = callee.variadic
+                    ? classify_variadic_signature(
+                          *abi, arguments, results,
+                          callee.parameters.size(),
+                          subtarget_.enabled_features())
+                    : classify_signature(
+                          *abi, arguments, results,
+                          subtarget_.enabled_features());
+                if (classified) {
+                    const auto append_pieces =
+                        [&](const auto& pieces) {
+                            for (const auto& piece : pieces) {
+                                if (piece.location.kind ==
+                                    LocationKind::Register) {
+                                    append_clobbers({piece.location.reg});
+                                }
+                            }
+                        };
+                    for (const auto& assignment :
+                         classified.layout.call.arguments) {
+                        append_pieces(assignment.pieces);
+                        append_pieces(assignment.shadows);
+                    }
+                    for (const auto& assignment : classified.layout.results) {
+                        append_pieces(assignment.pieces);
+                    }
+                }
+            }
+            append_clobbers(callee.clobbers);
             result.has_side_effects = true;
             return result;
         }
@@ -978,6 +1117,489 @@ private:
         }
     }
 
+    bool allocate_registers(machine::Function& function) {
+        if (!options_.register_allocation) return false;
+        const auto count = function.virtual_registers.size();
+        if (count == 0) return false;
+
+        std::vector<bool> eligible(count);
+        std::vector<unsigned> use_count(count);
+        for (std::size_t id = 0; id < count; ++id) {
+            const auto register_class =
+                function.virtual_register_classes[id];
+            const bool integer =
+                register_class == machine::VirtualRegisterClass::Integer &&
+                (function.virtual_registers[id].bits <= 32 ||
+                 subtarget_.has_feature(Feature::Mips3));
+            const bool floating =
+                register_class == machine::VirtualRegisterClass::Floating &&
+                function.virtual_registers[id].bits <= 64 &&
+                subtarget_.has_feature(Feature::Mips3) &&
+                subtarget_.has_feature(Feature::HardFloat);
+            eligible[id] = integer || floating;
+        }
+        const auto virtual_id = [&](const machine::Register& value)
+            -> std::optional<std::uint32_t> {
+            return value.kind == machine::RegisterKind::Virtual &&
+                           value.id < count
+                ? std::optional<std::uint32_t>{value.id}
+                : std::nullopt;
+        };
+        const auto withdraw = [&](const machine::Register& value) {
+            if (const auto id = virtual_id(value)) eligible[*id] = false;
+        };
+
+        // Call arguments, results, and phi nodes remain ordinary allocatable
+        // SSA values. Exact endpoint exclusions and caller-save splits are
+        // derived after liveness; phi uses live on predecessor edges and are
+        // resolved in parallel by the assembly emitter.
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& use : instruction.uses) {
+                    if (const auto id = virtual_id(use)) ++use_count[*id];
+                }
+                if (instruction.kind == machine::InstructionKind::Return) {
+                    for (const auto& definition : instruction.defs) {
+                        withdraw(definition);
+                    }
+                }
+            }
+        }
+
+        using LiveSet = std::unordered_set<std::uint32_t>;
+        const auto block_count = function.blocks.size();
+        std::vector<LiveSet> block_uses(block_count), block_defs(block_count);
+        std::vector<std::unordered_map<std::uint32_t, LiveSet>>
+            phi_edge_uses(block_count);
+        std::vector<LiveSet> live_in(block_count), live_out(block_count);
+        for (const auto& block : function.blocks) {
+            if (block.id.value >= block_count) continue;
+            auto& uses = block_uses[block.id.value];
+            auto& defs = block_defs[block.id.value];
+            for (const auto& instruction : block.instructions) {
+                if (instruction.opcode == Opcode::Phi) {
+                    for (std::size_t index = 0;
+                         index + 1 < instruction.operands.size(); index += 2) {
+                        const auto* predecessor =
+                            std::get_if<machine::BlockOperand>(
+                                &instruction.operands[index]);
+                        const auto* incoming =
+                            std::get_if<machine::RegisterOperand>(
+                                &instruction.operands[index + 1]);
+                        if (!predecessor || !incoming) continue;
+                        if (const auto id = virtual_id(incoming->value)) {
+                            phi_edge_uses[block.id.value]
+                                         [predecessor->target.value]
+                                             .insert(*id);
+                        }
+                    }
+                } else {
+                    for (const auto& use : instruction.uses) {
+                        if (const auto id = virtual_id(use);
+                            id && !defs.contains(*id)) {
+                            uses.insert(*id);
+                        }
+                    }
+                }
+                for (const auto& definition : instruction.defs) {
+                    if (const auto id = virtual_id(definition)) {
+                        defs.insert(*id);
+                    }
+                }
+            }
+        }
+        bool liveness_changed = true;
+        while (liveness_changed) {
+            liveness_changed = false;
+            for (auto item = function.layout.rbegin();
+                 item != function.layout.rend(); ++item) {
+                if (item->value >= block_count) continue;
+                const auto& block = function.blocks[item->value];
+                LiveSet next_out;
+                for (const auto successor : block.successors) {
+                    if (successor.value >= block_count) continue;
+                    next_out.insert(live_in[successor.value].begin(),
+                                    live_in[successor.value].end());
+                    const auto edge =
+                        phi_edge_uses[successor.value].find(block.id.value);
+                    if (edge != phi_edge_uses[successor.value].end()) {
+                        next_out.insert(edge->second.begin(),
+                                        edge->second.end());
+                    }
+                }
+                LiveSet next_in = block_uses[item->value];
+                for (const auto id : next_out) {
+                    if (!block_defs[item->value].contains(id)) {
+                        next_in.insert(id);
+                    }
+                }
+                if (next_out != live_out[item->value] ||
+                    next_in != live_in[item->value]) {
+                    live_out[item->value] = std::move(next_out);
+                    live_in[item->value] = std::move(next_in);
+                    liveness_changed = true;
+                }
+            }
+        }
+
+        // Record the physical colors each live range may not occupy. Stable
+        // ABI registers remain allocatable across a call; volatile colors are
+        // still legal elsewhere and are split through their fallback homes
+        // after coloring.
+        std::vector<LiveSet> forbidden_colors(count);
+        std::vector<LiveSet> hard_forbidden_colors(count);
+        const auto& entity = hir_.function(function.source);
+        const auto* function_abi = managed_abi_model(
+            entity, subtarget_, options_);
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if ((instruction.opcode == Opcode::Parameter ||
+                     instruction.opcode == Opcode::Fparameter) &&
+                    function_abi) {
+                    for (const auto& definition : instruction.defs) {
+                        const auto id = virtual_id(definition);
+                        if (!id) continue;
+                        // Parameter captures are emitted in source order.
+                        // Keep each assigned destination outside the complete
+                        // incoming bank so an early capture cannot overwrite
+                        // a later argument before it is consumed.
+                        for (const auto& bank : function_abi->banks) {
+                            for (const auto& name : bank.arguments) {
+                                if (const auto physical =
+                                        physical_register_id(name)) {
+                                    hard_forbidden_colors[*id].insert(
+                                        physical->value);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (instruction.kind == machine::InstructionKind::Return) {
+                    if (!function_abi) continue;
+                    for (const auto& use : instruction.uses) {
+                        const auto id = virtual_id(use);
+                        if (!id) continue;
+                        for (const auto& bank : function_abi->banks) {
+                            for (const auto& name : bank.results) {
+                                if (const auto physical =
+                                        physical_register_id(name)) {
+                                    hard_forbidden_colors[*id].insert(
+                                        physical->value);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (instruction.kind != machine::InstructionKind::Call) {
+                    continue;
+                }
+                for (const auto& use : instruction.uses) {
+                    const auto id = virtual_id(use);
+                    if (!id) continue;
+                    // Argument placement is emitted sequentially today. Keep
+                    // an allocated source outside every register the call may
+                    // overwrite, including exact stable-bank argument slots,
+                    // so the sequence is a trivially safe parallel copy.
+                    for (const auto& clobber : instruction.clobbers) {
+                        if (clobber.kind ==
+                            machine::RegisterKind::Physical) {
+                            hard_forbidden_colors[*id].insert(clobber.id);
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto& block : function.blocks) {
+            if (block.id.value >= block_count) continue;
+            auto live = live_out[block.id.value];
+            for (auto item = block.instructions.rbegin();
+                 item != block.instructions.rend(); ++item) {
+                for (const auto& definition : item->defs) {
+                    if (const auto id = virtual_id(definition)) {
+                        live.erase(*id);
+                    }
+                }
+                if (item->kind == machine::InstructionKind::Call) {
+                    for (const auto id : live) {
+                        if (id >= count) continue;
+                        for (const auto& clobber : item->clobbers) {
+                            if (clobber.kind ==
+                                machine::RegisterKind::Physical) {
+                                forbidden_colors[id].insert(clobber.id);
+                            }
+                        }
+                    }
+                }
+                if (item->opcode != Opcode::Phi) {
+                    for (const auto& use : item->uses) {
+                        if (const auto id = virtual_id(use)) live.insert(*id);
+                    }
+                }
+            }
+        }
+
+        std::vector<LiveSet> interference(count);
+        std::vector<LiveSet> affinity(count);
+        for (const auto& block : function.blocks) {
+            if (block.id.value >= block_count) continue;
+            auto live = live_out[block.id.value];
+            for (auto item = block.instructions.rbegin();
+                 item != block.instructions.rend(); ++item) {
+                if (item->opcode != Opcode::Phi) {
+                    // Simultaneously consumed values must not share a color,
+                    // even when both die at this instruction. Reverse
+                    // liveness alone adds them only after visiting the use.
+                    for (std::size_t left = 0; left < item->uses.size();
+                         ++left) {
+                        const auto lhs = virtual_id(item->uses[left]);
+                        if (!lhs) continue;
+                        for (std::size_t right = left + 1;
+                             right < item->uses.size(); ++right) {
+                            const auto rhs = virtual_id(item->uses[right]);
+                            if (!rhs || *lhs == *rhs) continue;
+                            interference[*lhs].insert(*rhs);
+                            interference[*rhs].insert(*lhs);
+                        }
+                    }
+                }
+                for (const auto& definition : item->defs) {
+                    const auto id = virtual_id(definition);
+                    if (!id) continue;
+                    for (const auto other : live) {
+                        if (other == *id) continue;
+                        interference[*id].insert(other);
+                        interference[other].insert(*id);
+                    }
+                    live.erase(*id);
+                }
+                if (item->opcode != Opcode::Phi) {
+                    for (const auto& use : item->uses) {
+                        if (const auto id = virtual_id(use)) live.insert(*id);
+                    }
+                }
+            }
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.opcode != Opcode::Phi ||
+                    instruction.defs.size() != 1) {
+                    continue;
+                }
+                const auto target = virtual_id(instruction.defs.front());
+                if (!target) continue;
+                for (std::size_t index = 1;
+                     index < instruction.operands.size(); index += 2) {
+                    const auto* incoming =
+                        std::get_if<machine::RegisterOperand>(
+                            &instruction.operands[index]);
+                    if (!incoming) continue;
+                    const auto source = virtual_id(incoming->value);
+                    if (!source || *source == *target ||
+                        interference[*source].contains(*target)) {
+                        continue;
+                    }
+                    affinity[*target].insert(*source);
+                    affinity[*source].insert(*target);
+                }
+            }
+        }
+
+        std::vector<machine::PhysicalRegisterId> integer_colors;
+        if (subtarget_.has_feature(Feature::Mips3)) {
+            // These registers are never implicit emitter scratches on the
+            // MIPS-III scalar path. They are preferred because they require
+            // no prologue save under o32/EABI.
+            for (const auto id : {2U, 3U, 4U, 5U, 6U, 7U,
+                                  14U, 15U, 24U, 25U}) {
+                integer_colors.push_back({id});
+            }
+        }
+        for (std::uint32_t id = 16; id <= 23; ++id) {
+            integer_colors.push_back({id});
+        }
+        // F0/F2/F4 remain reserved for conversion, comparison, and ABI
+        // staging. Even registers avoid an FR=0 odd-double restriction while
+        // still covering the volatile o32/VR4300 bank without prologue saves.
+        std::vector<machine::PhysicalRegisterId> floating_colors;
+        for (const auto number : {6U, 8U, 10U, 12U, 14U, 16U, 18U,
+                                  20U, 22U, 24U, 26U, 28U, 30U}) {
+            floating_colors.push_back({fpr_physical_base + number});
+        }
+
+        std::vector<std::uint32_t> order(count);
+        for (std::uint32_t id = 0; id < count; ++id) order[id] = id;
+        std::sort(order.begin(), order.end(), [&](std::uint32_t left,
+                                                  std::uint32_t right) -> bool {
+            if (eligible[left] != eligible[right]) return eligible[left];
+            if (interference[left].size() != interference[right].size()) {
+                return interference[left].size() >
+                       interference[right].size();
+            }
+            if (use_count[left] != use_count[right]) {
+                return use_count[left] > use_count[right];
+            }
+            return left < right;
+        });
+
+        bool changed = false;
+        for (const auto id : order) {
+            if (!eligible[id]) continue;
+            const auto& colors =
+                function.virtual_register_classes[id] ==
+                        machine::VirtualRegisterClass::Floating
+                    ? floating_colors
+                    : integer_colors;
+            std::vector<machine::PhysicalRegisterId> preferred;
+            const auto append = [&](machine::PhysicalRegisterId color) {
+                if (std::find(preferred.begin(), preferred.end(), color) ==
+                    preferred.end()) {
+                    preferred.push_back(color);
+                }
+            };
+            const auto append_affinity = [&](bool volatile_color) {
+                for (const auto neighbor : affinity[id]) {
+                    if (neighbor >= count) continue;
+                    const auto color =
+                        function.virtual_register_assignments[neighbor];
+                    if (color && forbidden_colors[id].contains(color->value) ==
+                                     volatile_color) {
+                        append(*color);
+                    }
+                }
+            };
+            // A call-stable affinity/color avoids a split. Volatile colors
+            // remain valid fallbacks when stable pressure is exhausted.
+            append_affinity(false);
+            for (const auto color : colors) {
+                if (!forbidden_colors[id].contains(color.value)) append(color);
+            }
+            append_affinity(true);
+            for (const auto color : colors) {
+                if (forbidden_colors[id].contains(color.value)) append(color);
+            }
+            const auto selected = std::find_if(
+                preferred.begin(), preferred.end(),
+                [&](machine::PhysicalRegisterId color) {
+                    if (hard_forbidden_colors[id].contains(color.value)) {
+                        return false;
+                    }
+                    return std::none_of(
+                        interference[id].begin(),
+                        interference[id].end(),
+                        [&](std::uint32_t neighbor) {
+                            return neighbor < count &&
+                                function.virtual_register_assignments[
+                                    neighbor] == color;
+                        });
+                });
+            if (selected == preferred.end()) continue;
+            function.virtual_register_assignments[id] = *selected;
+            changed = true;
+        }
+        if (!changed) return false;
+
+        // Preserve only volatile assignments that actually cross a specific
+        // call. Stable colors need no traffic; volatile colors retain their
+        // existing spill home for one store/reload pair around that call.
+        std::unordered_set<std::uint32_t> call_live_homes;
+        for (auto& block : function.blocks) {
+            if (block.id.value >= block_count) continue;
+            auto live = live_out[block.id.value];
+            for (auto item = block.instructions.rbegin();
+                 item != block.instructions.rend(); ++item) {
+                item->live_across_call.clear();
+                for (const auto& definition : item->defs) {
+                    if (const auto id = virtual_id(definition)) {
+                        live.erase(*id);
+                    }
+                }
+                if (item->kind == machine::InstructionKind::Call) {
+                    std::vector<std::uint32_t> ids(live.begin(), live.end());
+                    std::sort(ids.begin(), ids.end());
+                    for (const auto id : ids) {
+                        if (id >= count ||
+                            !function.virtual_register_assignments[id]) {
+                            continue;
+                        }
+                        const auto color =
+                            *function.virtual_register_assignments[id];
+                        const bool clobbered = std::any_of(
+                            item->clobbers.begin(), item->clobbers.end(),
+                            [&](const machine::Register& clobber) {
+                                return clobber.kind ==
+                                           machine::RegisterKind::Physical &&
+                                       clobber.id == color.value;
+                            });
+                        if (!clobbered) continue;
+                        item->live_across_call.push_back(
+                            machine::Register::virtual_register(
+                                {id}, function.virtual_registers[id]));
+                        call_live_homes.insert(id);
+                    }
+                }
+                if (item->opcode != Opcode::Phi) {
+                    for (const auto& use : item->uses) {
+                        if (const auto id = virtual_id(use)) live.insert(*id);
+                    }
+                }
+            }
+        }
+
+        const auto* abi = managed_abi_model(entity, subtarget_, options_);
+        const auto function_clobbers = [&](std::string_view name) {
+            const auto contains = [&](const std::vector<std::string>& names) {
+                return std::find(names.begin(), names.end(), name) !=
+                       names.end();
+            };
+            return (abi && contains(abi->call_clobbers)) ||
+                   contains(entity.clobbers);
+        };
+        std::unordered_set<std::uint32_t> saved;
+        for (std::size_t id = 0; id < count; ++id) {
+            const auto assignment =
+                function.virtual_register_assignments[id];
+            if (!assignment) continue;
+            for (auto& slot : function.stack_slots) {
+                if (slot.spill_for && slot.spill_for->value == id) {
+                    if (!call_live_homes.contains(
+                            static_cast<std::uint32_t>(id))) {
+                        slot.elided = true;
+                        slot.frame_offset.reset();
+                    }
+                    break;
+                }
+            }
+            const auto integer_name = gpr_name(*assignment);
+            const auto floating_name = fpr_name(*assignment);
+            const bool preserved_integer =
+                assignment->value >= 16 && assignment->value <= 23 &&
+                !function_clobbers(integer_name);
+            const bool preserved_floating = !floating_name.empty() &&
+                !function_clobbers(floating_name);
+            if ((!preserved_integer && !preserved_floating) ||
+                !saved.insert(assignment->value).second) {
+                continue;
+            }
+            function.callee_saved_registers.push_back(*assignment);
+            machine::StackSlot save;
+            save.id = {static_cast<std::uint32_t>(
+                function.stack_slots.size())};
+            save.kind = machine::StackSlotKind::Spill;
+            save.size = preserved_floating ||
+                    subtarget_.has_feature(Feature::Mips3)
+                ? 8U : 4U;
+            save.alignment = save.size;
+            save.location = function.location;
+            save.name = "$callee.save." +
+                std::string(preserved_floating ? floating_name
+                                               : integer_name);
+            function.stack_slots.push_back(std::move(save));
+        }
+        return true;
+    }
+
     void optimize_machine_function() {
         native::MachineFunctionPassManager passes;
         using Stage = native::MachineStage;
@@ -1079,6 +1701,12 @@ private:
                     });
             });
         passes.add(
+            {{LoweringPass::AllocateRegisters}, Stage::RegisterAllocation,
+              "allocate-registers"},
+            [this](machine::Function& function) {
+                return allocate_registers(function);
+            });
+        passes.add(
             {{LoweringPass::ElideUnusedSpillSlots},
              Stage::FrameFinalization, "elide-unused-spill-slots"},
             [](machine::Function& function) {
@@ -1095,7 +1723,9 @@ private:
         current_.source_entry = source.entry;
         current_.location = source.location;
         current_.symbol = entity.link_symbol;
-        current_.abi = entity.abi;
+        current_.abi = managed_abi_model(entity, subtarget_, options_)
+            ? managed_abi_model(entity, subtarget_, options_)->id
+            : entity.abi;
         current_.entry = {source.entry.value};
         current_.frame.stack_alignment =
             std::max(1U, subtarget_.abi_info().stack_alignment);
@@ -1287,6 +1917,69 @@ private:
                ".bb." + std::to_string(block.value);
     }
 
+    std::optional<machine::BlockId> layout_successor(
+        const machine::Function& function,
+        machine::BlockId block) const {
+        const auto found = std::find(function.layout.begin(),
+                                     function.layout.end(), block);
+        if (found == function.layout.end() ||
+            std::next(found) == function.layout.end()) {
+            return std::nullopt;
+        }
+        return *std::next(found);
+    }
+
+    bool same_physical_assignment(const machine::Function& function,
+                                  machine::Register left,
+                                  machine::Register right) const {
+        if (left == right) return true;
+        if (left.kind != machine::RegisterKind::Virtual ||
+            right.kind != machine::RegisterKind::Virtual ||
+            left.id >= function.virtual_register_assignments.size() ||
+            right.id >= function.virtual_register_assignments.size()) {
+            return false;
+        }
+        const auto lhs = function.virtual_register_assignments[left.id];
+        const auto rhs = function.virtual_register_assignments[right.id];
+        return lhs && rhs && lhs == rhs;
+    }
+
+    bool edge_has_phi_copies(const machine::Function& function,
+                             machine::BlockId predecessor,
+                             machine::BlockId successor) const {
+        const auto found = std::find_if(
+            function.blocks.begin(), function.blocks.end(),
+            [&](const machine::Block& candidate) {
+                return candidate.id == successor;
+            });
+        if (found == function.blocks.end()) return false;
+        for (const auto& phi : found->instructions) {
+            if (phi.kind != machine::InstructionKind::Target ||
+                phi.opcode != Opcode::Phi || phi.defs.empty()) {
+                continue;
+            }
+            for (std::size_t index = 0;
+                 index + 1 < phi.operands.size(); index += 2) {
+                const auto* incoming =
+                    std::get_if<machine::BlockOperand>(
+                        &phi.operands[index]);
+                const auto* source =
+                    std::get_if<machine::RegisterOperand>(
+                        &phi.operands[index + 1]);
+                if (!incoming || !source ||
+                    incoming->target != predecessor) {
+                    continue;
+                }
+                if (!same_physical_assignment(
+                        function, source->value, phi.defs.front())) {
+                    return true;
+                }
+                break;
+            }
+        }
+        return false;
+    }
+
     std::string local_label(const machine::Function& function) {
         return ".Lcross.mips." + std::to_string(function.source.value) +
                ".tmp." + std::to_string(next_label_++);
@@ -1311,6 +2004,97 @@ private:
             function.stack_slots.begin(), function.stack_slots.end(),
             [&](const machine::StackSlot& slot) { return slot.name == name; });
         return found == function.stack_slots.end() ? nullptr : &*found;
+    }
+
+    std::optional<std::string_view> assigned_gpr(
+        const machine::Function& function,
+        machine::Register value) const {
+        if (value.kind != machine::RegisterKind::Virtual ||
+            value.id >= function.virtual_register_assignments.size() ||
+            !function.virtual_register_assignments[value.id]) {
+            return std::nullopt;
+        }
+        const auto name = gpr_name(
+            *function.virtual_register_assignments[value.id]);
+        return name.empty() ? std::nullopt
+                            : std::optional<std::string_view>{name};
+    }
+
+    std::optional<std::string_view> assigned_fpr(
+        const machine::Function& function,
+        machine::Register value) const {
+        if (value.kind != machine::RegisterKind::Virtual ||
+            value.id >= function.virtual_register_assignments.size() ||
+            !function.virtual_register_assignments[value.id]) {
+            return std::nullopt;
+        }
+        const auto name = fpr_name(
+            *function.virtual_register_assignments[value.id]);
+        return name.empty() ? std::nullopt
+                            : std::optional<std::string_view>{name};
+    }
+
+    std::string_view input_gpr(const machine::Function& function,
+                               machine::Register value,
+                               std::string_view fallback,
+                               SourceLocation location) {
+        if (const auto assigned = assigned_gpr(function, value)) {
+            return *assigned;
+        }
+        load_vreg(function, value, fallback, location);
+        return fallback;
+    }
+
+    std::string_view output_gpr(const machine::Function& function,
+                                machine::Register value,
+                                std::string_view fallback) const {
+        if (const auto assigned = assigned_gpr(function, value)) {
+            return *assigned;
+        }
+        return fallback;
+    }
+
+    void commit_gpr(const machine::Function& function,
+                    machine::Register value, std::string_view source,
+                    SourceLocation location) {
+        if (!assigned_gpr(function, value)) {
+            store_vreg(function, value, source, location);
+        }
+    }
+
+    void form_indexed_address(const machine::Function& function,
+                              const machine::Instruction& value,
+                              std::string_view destination) {
+        const auto base = input_gpr(
+            function, value.uses[0], "t0", value.location);
+        const auto index = input_gpr(
+            function, value.uses[1], "t1", value.location);
+        const auto scale = static_cast<unsigned>(
+            std::get<machine::ImmediateOperand>(
+                value.operands.back()).value);
+        if (scale == 1) {
+            instruction("addu", reg_name(destination) + "," +
+                                    reg_name(base) + "," + reg_name(index));
+            return;
+        }
+        const auto scaled = destination != base && base != index
+            ? destination : std::string_view{"t2"};
+        if (scale == 0) {
+            instruction("move", reg_name(destination) + "," +
+                                    reg_name(base));
+            return;
+        }
+        if (std::has_single_bit(scale)) {
+            instruction("sll", reg_name(scaled) + "," + reg_name(index) +
+                                   "," +
+                                   std::to_string(std::countr_zero(scale)));
+        } else {
+            instruction("li", "$t3," + std::to_string(scale));
+            instruction("multu", reg_name(index) + ",$t3");
+            instruction("mflo", reg_name(scaled));
+        }
+        instruction("addu", reg_name(destination) + "," + reg_name(base) +
+                                "," + reg_name(scaled));
     }
 
     std::int32_t slot_offset(const machine::Function& function,
@@ -1340,7 +2124,7 @@ private:
     std::optional<ActiveSignature> classify_entity(
         const hir::Function& entity, SourceLocation location,
         std::span<const hir::TypeId> actual_types = {}) {
-        const auto* abi = abi_model(entity.abi);
+        const auto* abi = managed_abi_model(entity, subtarget_, options_);
         if (!abi) {
             diagnostics_.error(location,
                                "MIPS function has no registered ABI model");
@@ -1389,10 +2173,89 @@ private:
         return "$abi.in." + std::string(reg);
     }
 
+    std::optional<machine::Register> parameter_target(
+        const machine::Function& function, std::size_t parameter) const {
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if ((instruction.opcode != Opcode::Parameter &&
+                     instruction.opcode != Opcode::Fparameter) ||
+                    instruction.defs.empty() ||
+                    instruction.operands.empty()) {
+                    continue;
+                }
+                const auto* index =
+                    std::get_if<machine::ImmediateOperand>(
+                        &instruction.operands.front());
+                if (index && index->value == parameter) {
+                    return instruction.defs.front();
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool individually_direct_parameter_capture(
+        const machine::Function& function, std::size_t index) const {
+        if (!active_signature_ ||
+            index >= active_signature_->layout.call.arguments.size()) {
+            return false;
+        }
+        const auto& entity = hir_.function(function.source);
+        if (index >= entity.parameters.size() ||
+            entity.parameters[index].mode != ParameterMode::In) {
+            return false;
+        }
+        const auto& assignment =
+            active_signature_->layout.call.arguments[index];
+        if (assignment.pieces.size() != 1 ||
+            assignment.pieces.front().location.kind !=
+                LocationKind::Register) {
+            return false;
+        }
+        const auto target = parameter_target(function, index);
+        if (!target) return false;
+        if (is_floating(hir_, entity.parameters[index].type)) {
+            return assigned_fpr(function, *target).has_value();
+        }
+        return assigned_gpr(function, *target).has_value();
+    }
+
+    bool direct_parameter_capture(const machine::Function& function,
+                                  std::size_t index) const {
+        if (!individually_direct_parameter_capture(function, index) ||
+            !active_signature_) {
+            return false;
+        }
+        // A fallback capture uses t0/t1 assembly scratches. If any incoming
+        // register still needs that fallback, preserve every incoming
+        // register first; otherwise all register captures are non-destructive
+        // direct moves and stack parameters may be read afterward.
+        for (std::size_t other = 0;
+             other < active_signature_->layout.call.arguments.size();
+             ++other) {
+            const auto& assignment =
+                active_signature_->layout.call.arguments[other];
+            const bool arrives_in_register = std::any_of(
+                assignment.pieces.begin(), assignment.pieces.end(),
+                [](const ValuePiece& piece) {
+                    return piece.location.kind == LocationKind::Register;
+                });
+            if (arrives_in_register &&
+                !individually_direct_parameter_capture(function, other)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void prepare_parameter_homes(machine::Function& function) {
         if (!active_signature_) return;
-        for (const auto& assignment :
-             active_signature_->layout.call.arguments) {
+        for (std::size_t index = 0;
+             index < active_signature_->layout.call.arguments.size();
+             ++index) {
+            if (direct_parameter_capture(function, index)) continue;
+            const auto& assignment =
+                active_signature_->layout.call.arguments[index];
             for (const auto& piece : assignment.pieces) {
                 if (piece.location.kind != LocationKind::Register) continue;
                 const auto name = parameter_home_name(piece.location.reg);
@@ -1415,8 +2278,12 @@ private:
     void emit_parameter_homes(const machine::Function& function) {
         if (!active_signature_) return;
         std::vector<std::string> saved;
-        for (const auto& assignment :
-             active_signature_->layout.call.arguments) {
+        for (std::size_t index = 0;
+             index < active_signature_->layout.call.arguments.size();
+             ++index) {
+            if (direct_parameter_capture(function, index)) continue;
+            const auto& assignment =
+                active_signature_->layout.call.arguments[index];
             for (const auto& piece : assignment.pieces) {
                 if (piece.location.kind != LocationKind::Register ||
                     std::find(saved.begin(), saved.end(),
@@ -1442,6 +2309,53 @@ private:
                 }
                 saved.push_back(piece.location.reg);
             }
+        }
+    }
+
+    void emit_callee_saves(const machine::Function& function, bool cfi) {
+        for (const auto physical : function.callee_saved_registers) {
+            const auto integer_name = gpr_name(physical);
+            const auto floating_name = fpr_name(physical);
+            const auto name = floating_name.empty()
+                ? integer_name : floating_name;
+            const auto* slot = named_slot(
+                function, "$callee.save." + std::string(name));
+            if (name.empty() || !slot || !slot->frame_offset) {
+                diagnostics_.error(
+                    function.location,
+                    "MIPS allocated callee-save register has no frame home");
+                continue;
+            }
+            instruction(!floating_name.empty()
+                            ? "sdc1"
+                            : slot->size > 4 ? "sd" : "sw",
+                        reg_name(name) + "," +
+                            memory(*slot->frame_offset));
+            if (cfi) {
+                output_ << ".cfi_offset " << physical.value << ','
+                        << static_cast<std::int64_t>(*slot->frame_offset) -
+                               frame_size_
+                        << '\n';
+            }
+        }
+    }
+
+    void emit_callee_restores(const machine::Function& function, bool cfi) {
+        for (auto item = function.callee_saved_registers.rbegin();
+             item != function.callee_saved_registers.rend(); ++item) {
+            const auto integer_name = gpr_name(*item);
+            const auto floating_name = fpr_name(*item);
+            const auto name = floating_name.empty()
+                ? integer_name : floating_name;
+            const auto* slot = named_slot(
+                function, "$callee.save." + std::string(name));
+            if (name.empty() || !slot || !slot->frame_offset) continue;
+            instruction(!floating_name.empty()
+                            ? "ldc1"
+                            : slot->size > 4 ? "ld" : "lw",
+                        reg_name(name) + "," +
+                            memory(*slot->frame_offset));
+            if (cfi) output_ << ".cfi_restore " << item->value << '\n';
         }
     }
 
@@ -1561,6 +2475,13 @@ private:
     void load_vreg(const machine::Function& function,
                    machine::Register value, std::string_view target,
                    SourceLocation location) {
+        if (const auto assigned = assigned_gpr(function, value)) {
+            if (*assigned != target) {
+                instruction("move", reg_name(target) + "," +
+                                        reg_name(*assigned));
+            }
+            return;
+        }
         const auto offset = vreg_offset(function, value, location);
         load_integer_memory(target, memory(offset),
                             value.mode.bits > 32 ? 64U : 32U, true);
@@ -1569,6 +2490,13 @@ private:
     void store_vreg(const machine::Function& function,
                     machine::Register value, std::string_view source,
                     SourceLocation location) {
+        if (const auto assigned = assigned_gpr(function, value)) {
+            if (*assigned != source) {
+                instruction("move", reg_name(*assigned) + "," +
+                                        reg_name(source));
+            }
+            return;
+        }
         const auto offset = vreg_offset(function, value, location);
         store_integer_memory(source, memory(offset),
                              value.mode.bits > 32 ? 64U : 32U);
@@ -1577,6 +2505,13 @@ private:
     void load_fvreg(const machine::Function& function,
                     machine::Register value, std::string_view target,
                     SourceLocation location) {
+        if (const auto assigned = assigned_fpr(function, value)) {
+            if (*assigned != target) {
+                instruction(value.mode.bits == 32 ? "mov.s" : "mov.d",
+                            reg_name(target) + "," + reg_name(*assigned));
+            }
+            return;
+        }
         const auto offset = vreg_offset(function, value, location);
         instruction(value.mode.bits == 32 ? "lwc1" : "ldc1",
                     reg_name(target) + "," + memory(offset));
@@ -1585,9 +2520,44 @@ private:
     void store_fvreg(const machine::Function& function,
                      machine::Register value, std::string_view source,
                      SourceLocation location) {
+        if (const auto assigned = assigned_fpr(function, value)) {
+            if (*assigned != source) {
+                instruction(value.mode.bits == 32 ? "mov.s" : "mov.d",
+                            reg_name(*assigned) + "," + reg_name(source));
+            }
+            return;
+        }
         const auto offset = vreg_offset(function, value, location);
         instruction(value.mode.bits == 32 ? "swc1" : "sdc1",
                     reg_name(source) + "," + memory(offset));
+    }
+
+    std::string_view input_fpr(const machine::Function& function,
+                               machine::Register value,
+                               std::string_view fallback,
+                               SourceLocation location) {
+        if (const auto assigned = assigned_fpr(function, value)) {
+            return *assigned;
+        }
+        load_fvreg(function, value, fallback, location);
+        return fallback;
+    }
+
+    std::string_view output_fpr(const machine::Function& function,
+                                machine::Register value,
+                                std::string_view fallback) const {
+        if (const auto assigned = assigned_fpr(function, value)) {
+            return *assigned;
+        }
+        return fallback;
+    }
+
+    void commit_fpr(const machine::Function& function,
+                    machine::Register value, std::string_view source,
+                    SourceLocation location) {
+        if (!assigned_fpr(function, value)) {
+            store_fvreg(function, value, source, location);
+        }
     }
 
     void copy_vreg(const machine::Function& function,
@@ -1638,11 +2608,41 @@ private:
     bool finalize_frame(machine::Function& function) {
         auto offset = outgoing_size(function);
         function.frame.outgoing_argument_size = offset;
+        bool has_call = false;
+        for (const auto& block : function.blocks) {
+            has_call = has_call || std::any_of(
+                block.instructions.begin(), block.instructions.end(),
+                [](const machine::Instruction& instruction) {
+                    return instruction.kind ==
+                           machine::InstructionKind::Call;
+                });
+        }
         for (auto& slot : function.stack_slots) {
             if (slot.elided) continue;
             offset = align_up(offset, slot.alignment);
             slot.frame_offset = static_cast<std::int32_t>(offset);
             offset += slot.size;
+        }
+        bool incoming_stack = false;
+        if (active_signature_) {
+            for (const auto& assignment :
+                 active_signature_->layout.call.arguments) {
+                incoming_stack = incoming_stack || std::any_of(
+                    assignment.pieces.begin(), assignment.pieces.end(),
+                    [](const ValuePiece& piece) {
+                        return piece.location.kind == LocationKind::Stack;
+                    });
+            }
+        }
+        if (offset == 0 && !has_call && !incoming_stack &&
+            function.callee_saved_registers.empty()) {
+            saved_fp_offset_ = 0;
+            saved_ra_offset_ = 0;
+            frame_size_ = 0;
+            function.frame.has_frame_pointer = false;
+            function.frame.local_size = 0;
+            function.frame.finalized = true;
+            return true;
         }
         offset = align_up(offset, 4);
         saved_fp_offset_ = offset;
@@ -1775,6 +2775,35 @@ private:
                                "MIPS ABI parameter has no transport piece");
             return;
         }
+        if (direct_parameter_capture(function, index)) {
+            const auto& piece = assignment.pieces.front();
+            if (is_floating(hir_, parameter.type)) {
+                const auto destination = assigned_fpr(function, target);
+                if (!destination) return;
+                if (fpr(piece.location.reg)) {
+                    if (*destination != piece.location.reg) {
+                        instruction(target.mode.bits == 32 ? "mov.s" : "mov.d",
+                                    reg_name(*destination) + "," +
+                                        reg_name(piece.location.reg));
+                    }
+                } else {
+                    instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
+                                reg_name(piece.location.reg) + "," +
+                                    reg_name(*destination));
+                }
+                return;
+            }
+            const auto destination = assigned_gpr(function, target);
+            if (!destination) return;
+            if (*destination != piece.location.reg) {
+                instruction("move", reg_name(*destination) + "," +
+                                        reg_name(piece.location.reg));
+            }
+            normalize_integer(*destination,
+                              type_bits(hir_, parameter.type),
+                              is_signed_integer(hir_, parameter.type));
+            return;
+        }
         if (parameter.mode != ParameterMode::In) {
             const auto* pointer = named_slot(
                 function, "$paramptr." + std::to_string(index));
@@ -1846,8 +2875,14 @@ private:
         if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
             // The pair was written above, including floating bit transport.
         } else if (is_floating(hir_, parameter.type)) {
-            const auto offset = vreg_offset(function, target, value.location);
-            store_integer_memory("t0", memory(offset), target.mode.bits);
+            if (const auto destination = assigned_fpr(function, target)) {
+                instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
+                            "$t0," + reg_name(*destination));
+            } else {
+                const auto offset =
+                    vreg_offset(function, target, value.location);
+                store_integer_memory("t0", memory(offset), target.mode.bits);
+            }
         } else {
             store_vreg(function, target, "t0", value.location);
         }
@@ -1965,11 +3000,14 @@ private:
         }
         // Soft-float and the o32 "integer seen" rule transport floating bits
         // through ordinary GPR pieces.
-        const auto offset = vreg_offset(function, source, location);
         const auto shift = effective_piece_offset(
             piece, source.mode.bits,
             subtarget_.target().data_layout.byte_order);
-        if (legalizes_to_pair(source)) {
+        if (const auto assigned = assigned_fpr(function, source)) {
+            instruction(source.mode.bits == 32 ? "mfc1" : "dmfc1",
+                        "$at," + reg_name(*assigned));
+        } else if (legalizes_to_pair(source)) {
+            const auto offset = vreg_offset(function, source, location);
             const bool high = shift >= 32;
             instruction("lw", "$at," +
                                   memory(word_offset(offset, high)));
@@ -1979,6 +3017,7 @@ private:
                                        std::to_string(word_shift));
             }
         } else {
+            const auto offset = vreg_offset(function, source, location);
             load_integer_memory("at", memory(offset), source.mode.bits,
                                 false);
         }
@@ -2036,11 +3075,63 @@ private:
         if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
             // Already stored as two ABI words.
         } else if (is_floating(hir_, callee.result_type)) {
-            store_integer_memory(
-                "t0", memory(vreg_offset(function, target, call.location)),
-                target.mode.bits);
+            if (const auto destination = assigned_fpr(function, target)) {
+                instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
+                            "$t0," + reg_name(*destination));
+            } else {
+                store_integer_memory(
+                    "t0",
+                    memory(vreg_offset(function, target, call.location)),
+                    target.mode.bits);
+            }
         } else {
             store_vreg(function, target, "t0", call.location);
+        }
+    }
+
+    void spill_call_live_registers(
+        const machine::Function& function,
+        const machine::Instruction& call) {
+        for (const auto value : call.live_across_call) {
+            if (const auto assigned = assigned_gpr(function, value)) {
+                store_integer_memory(
+                    *assigned,
+                    memory(vreg_offset(function, value, call.location)),
+                    value.mode.bits > 32 ? 64U : 32U);
+                continue;
+            }
+            if (const auto assigned = assigned_fpr(function, value)) {
+                instruction(value.mode.bits == 32 ? "swc1" : "sdc1",
+                            reg_name(*assigned) + "," + memory(
+                                vreg_offset(function, value, call.location)));
+                continue;
+            }
+            diagnostics_.error(
+                call.location,
+                "MIPS call-live value lost its physical assignment");
+        }
+    }
+
+    void reload_call_live_registers(
+        const machine::Function& function,
+        const machine::Instruction& call) {
+        for (const auto value : call.live_across_call) {
+            if (const auto assigned = assigned_gpr(function, value)) {
+                load_integer_memory(
+                    *assigned,
+                    memory(vreg_offset(function, value, call.location)),
+                    value.mode.bits > 32 ? 64U : 32U, true);
+                continue;
+            }
+            if (const auto assigned = assigned_fpr(function, value)) {
+                instruction(value.mode.bits == 32 ? "lwc1" : "ldc1",
+                            reg_name(*assigned) + "," + memory(
+                                vreg_offset(function, value, call.location)));
+                continue;
+            }
+            diagnostics_.error(
+                call.location,
+                "MIPS call-live value lost its physical assignment");
         }
     }
 
@@ -2061,6 +3152,7 @@ private:
                                "MIPS call operands disagree with ABI layout");
             return;
         }
+        spill_call_live_registers(function, call);
         for (std::size_t index = 0;
              index < signature->layout.call.arguments.size(); ++index) {
             const auto& assignment =
@@ -2110,6 +3202,7 @@ private:
         instruction("jal", assembly_symbol(callee_symbol->name));
         instruction("nop");
         capture_call_result(function, call, *signature);
+        reload_call_live_registers(function, call);
     }
 
     void place_return(const machine::Function& function,
@@ -2154,8 +3247,13 @@ private:
                 }
             }
         }
-        instruction("b", epilogue_label_);
-        instruction("nop");
+        if (frame_size_ == 0) {
+            instruction("jr", "$ra");
+            instruction("nop");
+        } else {
+            instruction("b", epilogue_label_);
+            instruction("nop");
+        }
     }
 
     // Instruction and control-flow emission are defined in the following
@@ -2555,96 +3653,157 @@ void AssemblyEmitter::emit_integer_binary(
         emit_integer_pair_binary(function, value);
         return;
     }
-    load_vreg(function, left, "t0", value.location);
-    load_vreg(function, right, "t1", value.location);
-    switch (decode_opcode(value.opcode)) {
+    const auto opcode = decode_opcode(value.opcode);
+    // Allegrex RORV is currently emitted as a fixed instruction word. Keep
+    // that one form on its fixed scratch tuple until the encoder accepts
+    // arbitrary register fields; all ordinary MIPS-III operations consume
+    // and define their allocated registers directly.
+    const bool fixed_rotate = !wide && subtarget_.has_feature(Feature::Rotate) &&
+        (opcode == Opcode::Rotl || opcode == Opcode::Rotr);
+    const auto left_gpr = fixed_rotate
+        ? (load_vreg(function, left, "t0", value.location),
+           std::string_view{"t0"})
+        : input_gpr(function, left, "t0", value.location);
+    const auto right_gpr = fixed_rotate
+        ? (load_vreg(function, right, "t1", value.location),
+           std::string_view{"t1"})
+        : input_gpr(function, right, "t1", value.location);
+    const auto target_gpr = fixed_rotate
+        ? std::string_view{"t2"}
+        : output_gpr(function, target, "t2");
+    const auto binary_operands = [&] {
+        return reg_name(target_gpr) + "," + reg_name(left_gpr) + "," +
+            reg_name(right_gpr);
+    };
+    switch (opcode) {
     case Opcode::Add:
-        instruction(wide ? "daddu" : "addu", "$t2,$t0,$t1");
+        instruction(wide ? "daddu" : "addu", binary_operands());
         break;
     case Opcode::Sub:
-        instruction(wide ? "dsubu" : "subu", "$t2,$t0,$t1");
+        instruction(wide ? "dsubu" : "subu", binary_operands());
         break;
     case Opcode::Mul:
-        instruction(wide ? "dmult" : "mult", "$t0,$t1");
-        instruction("mflo", "$t2");
+        instruction(wide ? "dmult" : "mult",
+                    reg_name(left_gpr) + "," + reg_name(right_gpr));
+        instruction("mflo", reg_name(target_gpr));
         break;
     case Opcode::Sdiv:
     case Opcode::Srem:
-        instruction(wide ? "ddiv" : "div", "$zero,$t0,$t1");
-        instruction(value.opcode == Opcode::Srem ? "mfhi" : "mflo", "$t2");
+        instruction(wide ? "ddiv" : "div",
+                    "$zero," + reg_name(left_gpr) + "," +
+                        reg_name(right_gpr));
+        instruction(value.opcode == Opcode::Srem ? "mfhi" : "mflo",
+                    reg_name(target_gpr));
         break;
     case Opcode::Udiv:
     case Opcode::Urem:
-        instruction(wide ? "ddivu" : "divu", "$zero,$t0,$t1");
-        instruction(value.opcode == Opcode::Urem ? "mfhi" : "mflo", "$t2");
+        instruction(wide ? "ddivu" : "divu",
+                    "$zero," + reg_name(left_gpr) + "," +
+                        reg_name(right_gpr));
+        instruction(value.opcode == Opcode::Urem ? "mfhi" : "mflo",
+                    reg_name(target_gpr));
         break;
-    case Opcode::And: instruction("and", "$t2,$t0,$t1"); break;
-    case Opcode::Or: instruction("or", "$t2,$t0,$t1"); break;
-    case Opcode::Xor: instruction("xor", "$t2,$t0,$t1"); break;
+    case Opcode::And: instruction("and", binary_operands()); break;
+    case Opcode::Or: instruction("or", binary_operands()); break;
+    case Opcode::Xor: instruction("xor", binary_operands()); break;
     case Opcode::Shl:
-        instruction(wide ? "dsllv" : "sllv", "$t2,$t0,$t1");
+        instruction(wide ? "dsllv" : "sllv", binary_operands());
         break;
     case Opcode::ShrS:
-        instruction(wide ? "dsrav" : "srav", "$t2,$t0,$t1");
+        instruction(wide ? "dsrav" : "srav", binary_operands());
         break;
     case Opcode::ShrU:
-        instruction(wide ? "dsrlv" : "srlv", "$t2,$t0,$t1");
+        instruction(wide ? "dsrlv" : "srlv", binary_operands());
         break;
     case Opcode::Rotl:
         if (!wide && subtarget_.has_feature(Feature::Rotate)) {
             instruction("subu", "$t3,$zero,$t1");
             encoded(0x01685046U, "rorv $t2,$t0,$t3");
         } else {
-            instruction(wide ? "dsubu" : "subu", "$t3,$zero,$t1");
-            instruction(wide ? "dsllv" : "sllv", "$t2,$t0,$t1");
-            instruction(wide ? "dsrlv" : "srlv", "$t3,$t0,$t3");
-            instruction("or", "$t2,$t2,$t3");
+            instruction(wide ? "dsubu" : "subu",
+                        "$t3,$zero," + reg_name(right_gpr));
+            // The rotate expansion needs its original left operand twice;
+            // avoid destroying it when allocation coalesces the result.
+            const auto rotate_target = target_gpr == left_gpr
+                ? std::string_view{"t2"} : target_gpr;
+            instruction(wide ? "dsllv" : "sllv",
+                        reg_name(rotate_target) + "," + reg_name(left_gpr) +
+                            "," + reg_name(right_gpr));
+            instruction(wide ? "dsrlv" : "srlv",
+                        "$t3," + reg_name(left_gpr) + ",$t3");
+            instruction("or", reg_name(target_gpr) + "," +
+                                  reg_name(rotate_target) + ",$t3");
         }
         break;
     case Opcode::Rotr:
         if (!wide && subtarget_.has_feature(Feature::Rotate)) {
             encoded(0x01285046U, "rorv $t2,$t0,$t1");
         } else {
-            instruction(wide ? "dsubu" : "subu", "$t3,$zero,$t1");
-            instruction(wide ? "dsrlv" : "srlv", "$t2,$t0,$t1");
-            instruction(wide ? "dsllv" : "sllv", "$t3,$t0,$t3");
-            instruction("or", "$t2,$t2,$t3");
+            instruction(wide ? "dsubu" : "subu",
+                        "$t3,$zero," + reg_name(right_gpr));
+            const auto rotate_target = target_gpr == left_gpr
+                ? std::string_view{"t2"} : target_gpr;
+            instruction(wide ? "dsrlv" : "srlv",
+                        reg_name(rotate_target) + "," + reg_name(left_gpr) +
+                            "," + reg_name(right_gpr));
+            instruction(wide ? "dsllv" : "sllv",
+                        "$t3," + reg_name(left_gpr) + ",$t3");
+            instruction("or", reg_name(target_gpr) + "," +
+                                  reg_name(rotate_target) + ",$t3");
         }
         break;
     case Opcode::CmpEq:
-        instruction("xor", "$t2,$t0,$t1");
-        instruction("sltiu", "$t2,$t2,1");
+        instruction("xor", binary_operands());
+        instruction("sltiu", reg_name(target_gpr) + "," +
+                                  reg_name(target_gpr) + ",1");
         break;
     case Opcode::CmpNe:
-        instruction("xor", "$t2,$t0,$t1");
-        instruction("sltu", "$t2,$zero,$t2");
+        instruction("xor", binary_operands());
+        instruction("sltu", reg_name(target_gpr) + ",$zero," +
+                                 reg_name(target_gpr));
         break;
-    case Opcode::CmpSlt: instruction("slt", "$t2,$t0,$t1"); break;
-    case Opcode::CmpUlt: instruction("sltu", "$t2,$t0,$t1"); break;
-    case Opcode::CmpSgt: instruction("slt", "$t2,$t1,$t0"); break;
-    case Opcode::CmpUgt: instruction("sltu", "$t2,$t1,$t0"); break;
+    case Opcode::CmpSlt: instruction("slt", binary_operands()); break;
+    case Opcode::CmpUlt: instruction("sltu", binary_operands()); break;
+    case Opcode::CmpSgt:
+        instruction("slt", reg_name(target_gpr) + "," +
+                               reg_name(right_gpr) + "," +
+                               reg_name(left_gpr));
+        break;
+    case Opcode::CmpUgt:
+        instruction("sltu", reg_name(target_gpr) + "," +
+                                reg_name(right_gpr) + "," +
+                                reg_name(left_gpr));
+        break;
     case Opcode::CmpSle:
-        instruction("slt", "$t2,$t1,$t0");
-        instruction("xori", "$t2,$t2,1");
+        instruction("slt", reg_name(target_gpr) + "," +
+                               reg_name(right_gpr) + "," +
+                               reg_name(left_gpr));
+        instruction("xori", reg_name(target_gpr) + "," +
+                                 reg_name(target_gpr) + ",1");
         break;
     case Opcode::CmpUle:
-        instruction("sltu", "$t2,$t1,$t0");
-        instruction("xori", "$t2,$t2,1");
+        instruction("sltu", reg_name(target_gpr) + "," +
+                                reg_name(right_gpr) + "," +
+                                reg_name(left_gpr));
+        instruction("xori", reg_name(target_gpr) + "," +
+                                 reg_name(target_gpr) + ",1");
         break;
     case Opcode::CmpSge:
-        instruction("slt", "$t2,$t0,$t1");
-        instruction("xori", "$t2,$t2,1");
+        instruction("slt", binary_operands());
+        instruction("xori", reg_name(target_gpr) + "," +
+                                 reg_name(target_gpr) + ",1");
         break;
     case Opcode::CmpUge:
-        instruction("sltu", "$t2,$t0,$t1");
-        instruction("xori", "$t2,$t2,1");
+        instruction("sltu", binary_operands());
+        instruction("xori", reg_name(target_gpr) + "," +
+                                 reg_name(target_gpr) + ",1");
         break;
     default:
         diagnostics_.error(value.location,
                            "unknown MIPS integer Machine IR operation");
         return;
     }
-    store_vreg(function, target, "t2", value.location);
+    commit_gpr(function, target, target_gpr, value.location);
 }
 
 void AssemblyEmitter::emit_floating_binary(
@@ -2655,40 +3814,53 @@ void AssemblyEmitter::emit_floating_binary(
     const auto right = value.uses[1];
     const auto target = value.defs.front();
     const std::string suffix = left.mode.bits == 32 ? ".s" : ".d";
-    load_fvreg(function, left, "f0", value.location);
-    load_fvreg(function, right, "f2", value.location);
-    switch (decode_opcode(value.opcode)) {
-    case Opcode::Fadd:
-        instruction("add" + suffix, "$f4,$f0,$f2");
-        store_fvreg(function, target, "f4", value.location);
+    const auto left_fpr = input_fpr(
+        function, left, "f0", value.location);
+    const auto right_fpr = input_fpr(
+        function, right, "f2", value.location);
+    const auto opcode = decode_opcode(value.opcode);
+    if (opcode >= Opcode::Fadd && opcode <= Opcode::Fdiv) {
+        const auto target_fpr = output_fpr(function, target, "f4");
+        const auto operands = reg_name(target_fpr) + "," +
+            reg_name(left_fpr) + "," + reg_name(right_fpr);
+        switch (opcode) {
+        case Opcode::Fadd: instruction("add" + suffix, operands); break;
+        case Opcode::Fsub: instruction("sub" + suffix, operands); break;
+        case Opcode::Fmul:
+            instruction("mul" + suffix, operands);
+            if (subtarget_.has_feature(Feature::Fix4300)) instruction("nop");
+            break;
+        case Opcode::Fdiv: instruction("div" + suffix, operands); break;
+        default: break;
+        }
+        commit_fpr(function, target, target_fpr, value.location);
         return;
-    case Opcode::Fsub:
-        instruction("sub" + suffix, "$f4,$f0,$f2");
-        store_fvreg(function, target, "f4", value.location);
-        return;
-    case Opcode::Fmul:
-        instruction("mul" + suffix, "$f4,$f0,$f2");
-        if (subtarget_.has_feature(Feature::Fix4300)) instruction("nop");
-        store_fvreg(function, target, "f4", value.location);
-        return;
-    case Opcode::Fdiv:
-        instruction("div" + suffix, "$f4,$f0,$f2");
-        store_fvreg(function, target, "f4", value.location);
-        return;
-    default: break;
     }
-
     bool true_on_condition = true;
-    switch (decode_opcode(value.opcode)) {
-    case Opcode::FcmpEq: instruction("c.eq" + suffix, "$f0,$f2"); break;
+    const auto comparison_operands =
+        reg_name(left_fpr) + "," + reg_name(right_fpr);
+    switch (opcode) {
+    case Opcode::FcmpEq:
+        instruction("c.eq" + suffix, comparison_operands);
+        break;
     case Opcode::FcmpNe:
-        instruction("c.eq" + suffix, "$f0,$f2");
+        instruction("c.eq" + suffix, comparison_operands);
         true_on_condition = false;
         break;
-    case Opcode::FcmpLt: instruction("c.lt" + suffix, "$f0,$f2"); break;
-    case Opcode::FcmpLe: instruction("c.le" + suffix, "$f0,$f2"); break;
-    case Opcode::FcmpGt: instruction("c.lt" + suffix, "$f2,$f0"); break;
-    case Opcode::FcmpGe: instruction("c.le" + suffix, "$f2,$f0"); break;
+    case Opcode::FcmpLt:
+        instruction("c.lt" + suffix, comparison_operands);
+        break;
+    case Opcode::FcmpLe:
+        instruction("c.le" + suffix, comparison_operands);
+        break;
+    case Opcode::FcmpGt:
+        instruction("c.lt" + suffix,
+                    reg_name(right_fpr) + "," + reg_name(left_fpr));
+        break;
+    case Opcode::FcmpGe:
+        instruction("c.le" + suffix,
+                    reg_name(right_fpr) + "," + reg_name(left_fpr));
+        break;
     default:
         diagnostics_.error(value.location,
                            "unknown MIPS floating Machine IR operation");
@@ -2696,14 +3868,15 @@ void AssemblyEmitter::emit_floating_binary(
     }
     const auto yes = local_label(function);
     const auto done = local_label(function);
+    const auto result_gpr = output_gpr(function, target, "t0");
     instruction(true_on_condition ? "bc1t" : "bc1f", yes);
-    instruction("move", "$t0,$zero");
+    instruction("move", reg_name(result_gpr) + ",$zero");
     instruction("b", done);
     instruction("nop");
     output_ << yes << ":\n";
-    instruction("li", "$t0,1");
+    instruction("li", reg_name(result_gpr) + ",1");
     output_ << done << ":\n";
-    store_vreg(function, target, "t0", value.location);
+    commit_gpr(function, target, result_gpr, value.location);
 }
 
 void AssemblyEmitter::emit_cast(const machine::Function& function,
@@ -2970,6 +4143,15 @@ void AssemblyEmitter::emit_phi_edge_copies(
         function.blocks.begin(), function.blocks.end(),
         [&](const machine::Block& block) { return block.id == successor; });
     if (found == function.blocks.end()) return;
+    struct Copy {
+        machine::Register source;
+        machine::Register target;
+        SourceLocation location;
+        bool source_temporary{};
+    };
+    std::vector<Copy> copies;
+    std::vector<Copy> floating_copies;
+    std::vector<Copy> fallback_copies;
     for (const auto& phi : found->instructions) {
         if (phi.kind != machine::InstructionKind::Target ||
             phi.opcode != Opcode::Phi || phi.defs.empty()) {
@@ -2984,10 +4166,145 @@ void AssemblyEmitter::emit_phi_edge_copies(
             if (!incoming || !source || incoming->target != predecessor) {
                 continue;
             }
-            copy_vreg(function, phi.defs.front(), source->value,
-                      phi.location);
+            const auto target = phi.defs.front();
+            const auto source_assignment =
+                source->value.kind == machine::RegisterKind::Virtual &&
+                        source->value.id <
+                            function.virtual_register_assignments.size()
+                    ? function.virtual_register_assignments[source->value.id]
+                    : std::nullopt;
+            const auto target_assignment =
+                target.kind == machine::RegisterKind::Virtual &&
+                        target.id <
+                            function.virtual_register_assignments.size()
+                    ? function.virtual_register_assignments[target.id]
+                    : std::nullopt;
+            if (source->value == target ||
+                (source_assignment && target_assignment &&
+                 *source_assignment == *target_assignment)) {
+                break;
+            }
+            const bool scalar_integer =
+                target.kind == machine::RegisterKind::Virtual &&
+                target.id < function.virtual_register_classes.size() &&
+                function.virtual_register_classes[target.id] ==
+                    machine::VirtualRegisterClass::Integer &&
+                !legalizes_to_pair(target) && target.mode.bits <= 64;
+            const bool scalar_floating =
+                target.kind == machine::RegisterKind::Virtual &&
+                target.id < function.virtual_register_classes.size() &&
+                function.virtual_register_classes[target.id] ==
+                    machine::VirtualRegisterClass::Floating &&
+                target.mode.bits <= 64;
+            auto& destination = scalar_integer
+                ? copies
+                : scalar_floating ? floating_copies : fallback_copies;
+            destination.push_back(
+                {source->value, target, phi.location, false});
             break;
         }
+    }
+    const auto location_key = [&](machine::Register value,
+                                  bool temporary) {
+        if (temporary) return std::string("temporary");
+        if (value.kind == machine::RegisterKind::Virtual &&
+            value.id < function.virtual_register_assignments.size() &&
+            function.virtual_register_assignments[value.id]) {
+            return std::string("physical:") + std::to_string(
+                function.virtual_register_assignments[value.id]->value);
+        }
+        return std::string("virtual:") + std::to_string(value.id);
+    };
+    const auto save_target = [&](const Copy& copy) {
+        if (const auto target = assigned_gpr(function, copy.target)) {
+            instruction("move", "$at," + reg_name(*target));
+        } else {
+            load_vreg(function, copy.target, "at", copy.location);
+        }
+    };
+    const auto emit_copy = [&](const Copy& copy) {
+        if (copy.source_temporary) {
+            store_vreg(function, copy.target, "at", copy.location);
+            return;
+        }
+        if (const auto source = assigned_gpr(function, copy.source)) {
+            store_vreg(function, copy.target, *source, copy.location);
+            return;
+        }
+        if (const auto target = assigned_gpr(function, copy.target)) {
+            load_vreg(function, copy.source, *target, copy.location);
+            return;
+        }
+        copy_vreg(function, copy.target, copy.source, copy.location);
+    };
+
+    const auto resolve = [&](std::vector<Copy>& pending,
+                             const auto& save,
+                             const auto& emit) {
+        while (!pending.empty()) {
+            std::optional<std::size_t> ready;
+            for (std::size_t index = 0; index < pending.size(); ++index) {
+                const auto target = location_key(pending[index].target, false);
+                const bool target_is_source = std::any_of(
+                    pending.begin(), pending.end(),
+                    [&](const Copy& candidate) {
+                        return location_key(candidate.source,
+                                            candidate.source_temporary) ==
+                               target;
+                    });
+                if (!target_is_source) {
+                    ready = index;
+                    break;
+                }
+            }
+            if (ready) {
+                emit(pending[*ready]);
+                pending.erase(pending.begin() +
+                              static_cast<std::ptrdiff_t>(*ready));
+                continue;
+            }
+
+            const auto preserved =
+                location_key(pending.front().target, false);
+            save(pending.front());
+            for (auto& copy : pending) {
+                if (location_key(copy.source, copy.source_temporary) ==
+                    preserved) {
+                    copy.source_temporary = true;
+                }
+            }
+        }
+    };
+    resolve(copies, save_target, emit_copy);
+
+    const auto save_floating_target = [&](const Copy& copy) {
+        if (const auto target = assigned_fpr(function, copy.target)) {
+            instruction(copy.target.mode.bits == 32 ? "mov.s" : "mov.d",
+                        "$f0," + reg_name(*target));
+        } else {
+            load_fvreg(function, copy.target, "f0", copy.location);
+        }
+    };
+    const auto emit_floating_copy = [&](const Copy& copy) {
+        if (copy.source_temporary) {
+            store_fvreg(function, copy.target, "f0", copy.location);
+            return;
+        }
+        if (const auto source = assigned_fpr(function, copy.source)) {
+            store_fvreg(function, copy.target, *source, copy.location);
+            return;
+        }
+        if (const auto target = assigned_fpr(function, copy.target)) {
+            load_fvreg(function, copy.source, *target, copy.location);
+            return;
+        }
+        copy_vreg(function, copy.target, copy.source, copy.location);
+    };
+    resolve(floating_copies, save_floating_target, emit_floating_copy);
+    // Pre-MIPS-III register-pair phis retain their established lowering until
+    // the paired-GPR class gains a dedicated allocator.
+    for (const auto& copy : fallback_copies) {
+        copy_vreg(function, copy.target, copy.source, copy.location);
     }
 }
 
@@ -3050,14 +4367,24 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             store_vreg_pair(function, target, "t0", "t1", value.location);
             return;
         }
-        instruction(target.mode.bits > 32 ? "dli" : "li",
-                    "$t0," + std::to_string(immediate.value));
         if (opcode == Opcode::Fconstant) {
-            store_integer_memory(
-                "t0", memory(vreg_offset(function, target, value.location)),
-                target.mode.bits);
+            instruction(target.mode.bits > 32 ? "dli" : "li",
+                        "$t0," + std::to_string(immediate.value));
+            if (const auto destination = assigned_fpr(function, target)) {
+                instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
+                            "$t0," + reg_name(*destination));
+            } else {
+                store_integer_memory(
+                    "t0",
+                    memory(vreg_offset(function, target, value.location)),
+                    target.mode.bits);
+            }
         } else {
-            store_vreg(function, target, "t0", value.location);
+            const auto destination = output_gpr(function, target, "t0");
+            instruction(target.mode.bits > 32 ? "dli" : "li",
+                        reg_name(destination) + "," +
+                            std::to_string(immediate.value));
+            commit_gpr(function, target, destination, value.location);
         }
         return;
     }
@@ -3066,8 +4393,11 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             std::get<machine::StackSlotOperand>(value.operands.front());
         const auto offset = slot_offset(function, slot.slot, value.location) +
                             slot.offset;
-        instruction("addiu", "$t0,$fp," + std::to_string(offset));
-        store_vreg(function, value.defs.front(), "t0", value.location);
+        const auto target = value.defs.front();
+        const auto destination = output_gpr(function, target, "t0");
+        instruction("addiu", reg_name(destination) + ",$fp," +
+                                 std::to_string(offset));
+        commit_gpr(function, target, destination, value.location);
         return;
     }
     if (opcode == Opcode::GlobalAddress || opcode == Opcode::GlobalLoadSigned ||
@@ -3076,10 +4406,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto& symbol =
             std::get<machine::SymbolOperand>(value.operands.front());
         const auto name = assembly_symbol(symbol.name);
-        instruction("lui", "$t0,%hi(" + name + ")");
-        instruction("addiu", "$t0,$t0,%lo(" + name + ")");
+        const auto address = opcode == Opcode::GlobalAddress
+            ? output_gpr(function, value.defs.front(), "t0")
+            : std::string_view{"t0"};
+        instruction("lui", reg_name(address) + ",%hi(" + name + ")");
+        instruction("addiu", reg_name(address) + "," + reg_name(address) +
+                                 ",%lo(" + name + ")");
         if (opcode == Opcode::GlobalAddress) {
-            store_vreg(function, value.defs.front(), "t0", value.location);
+            commit_gpr(function, value.defs.front(), address,
+                       value.location);
         } else if (opcode == Opcode::GlobalLoadSigned ||
                    opcode == Opcode::GlobalLoadUnsigned) {
             const auto target = value.defs.front();
@@ -3088,29 +4423,34 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 store_vreg_pair(function, target, "t1", "t2",
                                 value.location);
             } else {
-                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                const auto destination = output_gpr(function, target, "t1");
+                load_integer_memory(destination, "0($t0)", target.mode.bits,
                                     opcode == Opcode::GlobalLoadSigned);
-                store_vreg(function, target, "t1", value.location);
+                commit_gpr(function, target, destination, value.location);
             }
         } else if (opcode == Opcode::FglobalLoad) {
             const auto target = value.defs.front();
+            const auto destination = output_fpr(function, target, "f0");
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
-                        "$f0,0($t0)");
-            store_fvreg(function, target, "f0", value.location);
+                        reg_name(destination) + ",0($t0)");
+            commit_fpr(function, target, destination, value.location);
         } else {
             const auto source = value.uses.front();
             if (opcode == Opcode::FglobalStore) {
-                load_fvreg(function, source, "f0", value.location);
+                const auto source_fpr = input_fpr(
+                    function, source, "f0", value.location);
                 instruction(source.mode.bits == 32 ? "swc1" : "sdc1",
-                            "$f0,0($t0)");
+                            reg_name(source_fpr) + ",0($t0)");
             } else {
                 if (legalizes_to_pair(source)) {
                     load_vreg_pair(function, source, "t1", "t2",
                                    value.location);
                     store_pair_memory("t1", "t2", 0, "t0");
                 } else {
-                    load_vreg(function, source, "t1", value.location);
-                    store_integer_memory("t1", "0($t0)", source.mode.bits);
+                    const auto source_gpr = input_gpr(
+                        function, source, "t1", value.location);
+                    store_integer_memory(source_gpr, "0($t0)",
+                                         source.mode.bits);
                 }
             }
         }
@@ -3120,28 +4460,20 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto& block =
             std::get<machine::BlockOperand>(value.operands.front());
         const auto label = block_label(function, block.target);
-        instruction("lui", "$t0,%hi(" + label + ")");
-        instruction("addiu", "$t0,$t0,%lo(" + label + ")");
-        store_vreg(function, value.defs.front(), "t0", value.location);
+        const auto target = value.defs.front();
+        const auto destination = output_gpr(function, target, "t0");
+        instruction("lui", reg_name(destination) + ",%hi(" + label + ")");
+        instruction("addiu", reg_name(destination) + "," +
+                                 reg_name(destination) + ",%lo(" + label +
+                                 ")");
+        commit_gpr(function, target, destination, value.location);
         return;
     }
     if (opcode == Opcode::IndexedAddress) {
-        load_vreg(function, value.uses[0], "t0", value.location);
-        load_vreg(function, value.uses[1], "t1", value.location);
-        const auto scale = static_cast<unsigned>(
-            std::get<machine::ImmediateOperand>(value.operands.back()).value);
-        if (scale != 1) {
-            if (std::has_single_bit(scale)) {
-                instruction("sll", "$t1,$t1," +
-                                       std::to_string(std::countr_zero(scale)));
-            } else {
-                instruction("li", "$t2," + std::to_string(scale));
-                instruction("multu", "$t1,$t2");
-                instruction("mflo", "$t1");
-            }
-        }
-        instruction("addu", "$t0,$t0,$t1");
-        store_vreg(function, value.defs.front(), "t0", value.location);
+        const auto target = value.defs.front();
+        const auto destination = output_gpr(function, target, "t0");
+        form_indexed_address(function, value, destination);
+        commit_gpr(function, target, destination, value.location);
         return;
     }
     if (opcode == Opcode::LoadSigned || opcode == Opcode::LoadUnsigned ||
@@ -3158,20 +4490,24 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 store_vreg_pair(function, target, "t0", "t1",
                                 value.location);
             } else {
-                load_integer_memory("t0", memory(offset), target.mode.bits,
+                const auto destination = output_gpr(function, target, "t0");
+                load_integer_memory(destination, memory(offset),
+                                    target.mode.bits,
                                     opcode == Opcode::LoadSigned);
-                store_vreg(function, target, "t0", value.location);
+                commit_gpr(function, target, destination, value.location);
             }
         } else if (opcode == Opcode::Fload) {
             const auto target = value.defs.front();
+            const auto destination = output_fpr(function, target, "f0");
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
-                        "$f0," + memory(offset));
-            store_fvreg(function, target, "f0", value.location);
+                        reg_name(destination) + "," + memory(offset));
+            commit_fpr(function, target, destination, value.location);
         } else if (opcode == Opcode::Fstore) {
             const auto source = value.uses.front();
-            load_fvreg(function, source, "f0", value.location);
+            const auto source_fpr = input_fpr(
+                function, source, "f0", value.location);
             instruction(source.mode.bits == 32 ? "swc1" : "sdc1",
-                        "$f0," + memory(offset));
+                        reg_name(source_fpr) + "," + memory(offset));
         } else {
             const auto source = value.uses.front();
             if (legalizes_to_pair(source)) {
@@ -3179,8 +4515,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                                value.location);
                 store_pair_memory("t0", "t1", offset);
             } else {
-                load_vreg(function, source, "t0", value.location);
-                store_integer_memory("t0", memory(offset), source.mode.bits);
+                const auto source_gpr = input_gpr(
+                    function, source, "t0", value.location);
+                store_integer_memory(source_gpr, memory(offset),
+                                     source.mode.bits);
             }
         }
         return;
@@ -3189,38 +4527,49 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         opcode == Opcode::PointerLoadUnsigned ||
         opcode == Opcode::FpointerLoad || opcode == Opcode::PointerStore ||
         opcode == Opcode::FpointerStore) {
-        load_vreg(function, value.uses.front(), "t0", value.location);
+        const auto address = input_gpr(
+            function, value.uses.front(), "t0", value.location);
         if (opcode == Opcode::PointerLoadSigned ||
             opcode == Opcode::PointerLoadUnsigned) {
             const auto target = value.defs.front();
             if (legalizes_to_pair(target)) {
-                load_pair_memory("t1", "t2", 0, "t0");
+                load_pair_memory("t1", "t2", 0, address);
                 store_vreg_pair(function, target, "t1", "t2",
                                 value.location);
             } else {
-                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                const auto destination = output_gpr(function, target, "t1");
+                load_integer_memory(destination,
+                                    "0(" + reg_name(address) + ")",
+                                    target.mode.bits,
                                     opcode == Opcode::PointerLoadSigned);
-                store_vreg(function, target, "t1", value.location);
+                commit_gpr(function, target, destination, value.location);
             }
         } else if (opcode == Opcode::FpointerLoad) {
             const auto target = value.defs.front();
+            const auto destination = output_fpr(function, target, "f0");
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
-                        "$f0,0($t0)");
-            store_fvreg(function, target, "f0", value.location);
+                        reg_name(destination) + ",0(" + reg_name(address) +
+                            ")");
+            commit_fpr(function, target, destination, value.location);
         } else if (opcode == Opcode::FpointerStore) {
             const auto source = value.uses[1];
-            load_fvreg(function, source, "f0", value.location);
+            const auto source_fpr = input_fpr(
+                function, source, "f0", value.location);
             instruction(source.mode.bits == 32 ? "swc1" : "sdc1",
-                        "$f0,0($t0)");
+                        reg_name(source_fpr) + ",0(" + reg_name(address) +
+                            ")");
         } else {
             const auto source = value.uses[1];
             if (legalizes_to_pair(source)) {
                 load_vreg_pair(function, source, "t1", "t2",
                                value.location);
-                store_pair_memory("t1", "t2", 0, "t0");
+                store_pair_memory("t1", "t2", 0, address);
             } else {
-                load_vreg(function, source, "t1", value.location);
-                store_integer_memory("t1", "0($t0)", source.mode.bits);
+                const auto source_gpr = input_gpr(
+                    function, source, "t1", value.location);
+                store_integer_memory(
+                    source_gpr, "0(" + reg_name(address) + ")",
+                    source.mode.bits);
             }
         }
         return;
@@ -3228,35 +4577,29 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
     if (opcode == Opcode::IndexedLoadSigned ||
         opcode == Opcode::IndexedLoadUnsigned ||
         opcode == Opcode::FindexedLoad) {
-        load_vreg(function, value.uses[0], "t0", value.location);
-        load_vreg(function, value.uses[1], "t1", value.location);
-        const auto scale = static_cast<unsigned>(
-            std::get<machine::ImmediateOperand>(value.operands.back()).value);
-        if (scale != 1) {
-            if (std::has_single_bit(scale)) {
-                instruction("sll", "$t1,$t1," +
-                                       std::to_string(std::countr_zero(scale)));
-            } else {
-                instruction("li", "$t2," + std::to_string(scale));
-                instruction("multu", "$t1,$t2");
-                instruction("mflo", "$t1");
-            }
-        }
-        instruction("addu", "$t0,$t0,$t1");
         const auto target = value.defs.front();
+        const auto address = opcode != Opcode::FindexedLoad &&
+                !legalizes_to_pair(target)
+            ? output_gpr(function, target, "t0")
+            : std::string_view{"t0"};
+        form_indexed_address(function, value, address);
         if (opcode == Opcode::FindexedLoad) {
+            const auto destination = output_fpr(function, target, "f0");
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
-                        "$f0,0($t0)");
-            store_fvreg(function, target, "f0", value.location);
+                        reg_name(destination) + ",0(" + reg_name(address) +
+                            ")");
+            commit_fpr(function, target, destination, value.location);
         } else {
             if (legalizes_to_pair(target)) {
-                load_pair_memory("t1", "t2", 0, "t0");
+                load_pair_memory("t1", "t2", 0, address);
                 store_vreg_pair(function, target, "t1", "t2",
                                 value.location);
             } else {
-                load_integer_memory("t1", "0($t0)", target.mode.bits,
+                load_integer_memory(address,
+                                    "0(" + reg_name(address) + ")",
+                                    target.mode.bits,
                                     opcode == Opcode::IndexedLoadSigned);
-                store_vreg(function, target, "t1", value.location);
+                commit_gpr(function, target, address, value.location);
             }
         }
         return;
@@ -3286,25 +4629,35 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             }
             return;
         }
-        load_vreg(function, source, "t0", value.location);
+        const auto source_gpr = input_gpr(
+            function, source, "t0", value.location);
+        const auto target = value.defs.front();
+        const auto destination = output_gpr(function, target, "t2");
         if (opcode == Opcode::Neg) {
             instruction(source.mode.bits > 32 ? "dsubu" : "subu",
-                        "$t0,$zero,$t0");
+                        reg_name(destination) + ",$zero," +
+                            reg_name(source_gpr));
         } else if (opcode == Opcode::Not) {
-            instruction("nor", "$t0,$t0,$zero");
+            instruction("nor", reg_name(destination) + "," +
+                                   reg_name(source_gpr) + ",$zero");
         } else {
-            instruction("sltiu", "$t0,$t0,1");
+            instruction("sltiu", reg_name(destination) + "," +
+                                     reg_name(source_gpr) + ",1");
         }
-        store_vreg(function, value.defs.front(), "t0", value.location);
+        commit_gpr(function, target, destination, value.location);
         return;
     }
     if (opcode == Opcode::Fneg || opcode == Opcode::Fiszero) {
         const auto source = value.uses.front();
         const std::string suffix = source.mode.bits == 32 ? ".s" : ".d";
-        load_fvreg(function, source, "f0", value.location);
+        const auto source_fpr = input_fpr(
+            function, source, "f0", value.location);
         if (opcode == Opcode::Fneg) {
-            instruction("neg" + suffix, "$f2,$f0");
-            store_fvreg(function, value.defs.front(), "f2", value.location);
+            const auto target = value.defs.front();
+            const auto destination = output_fpr(function, target, "f2");
+            instruction("neg" + suffix, reg_name(destination) + "," +
+                                            reg_name(source_fpr));
+            commit_fpr(function, target, destination, value.location);
         } else {
             if (source.mode.bits == 32) instruction("mtc1", "$zero,$f2");
             else if (subtarget_.has_feature(Feature::Mips3)) {
@@ -3313,17 +4666,20 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 instruction("mtc1", "$zero,$f2");
                 instruction("mtc1", "$zero,$f3");
             }
-            instruction("c.eq" + suffix, "$f0,$f2");
+            instruction("c.eq" + suffix,
+                        reg_name(source_fpr) + ",$f2");
             const auto yes = local_label(function);
             const auto done = local_label(function);
+            const auto target = value.defs.front();
+            const auto destination = output_gpr(function, target, "t0");
             instruction("bc1t", yes);
-            instruction("move", "$t0,$zero");
+            instruction("move", reg_name(destination) + ",$zero");
             instruction("b", done);
             instruction("nop");
             output_ << yes << ":\n";
-            instruction("li", "$t0,1");
+            instruction("li", reg_name(destination) + ",1");
             output_ << done << ":\n";
-            store_vreg(function, value.defs.front(), "t0", value.location);
+            commit_gpr(function, target, destination, value.location);
         }
         return;
     }
@@ -3400,8 +4756,10 @@ void AssemblyEmitter::emit_terminator(
         const auto successor =
             std::get<machine::BlockOperand>(value.operands.front()).target;
         emit_phi_edge_copies(function, predecessor, successor);
-        instruction("b", block_label(function, successor));
-        instruction("nop");
+        if (layout_successor(function, predecessor) != successor) {
+            instruction("b", block_label(function, successor));
+            instruction("nop");
+        }
         return;
     }
     if (value.kind == machine::InstructionKind::ConditionalBranch) {
@@ -3410,9 +4768,39 @@ void AssemblyEmitter::emit_terminator(
             std::get<machine::BlockOperand>(value.operands[1]).target;
         const auto no =
             std::get<machine::BlockOperand>(value.operands[2]).target;
+        const bool yes_copies = edge_has_phi_copies(
+            function, predecessor, yes);
+        const bool no_copies = edge_has_phi_copies(
+            function, predecessor, no);
+        const auto next = layout_successor(function, predecessor);
+        if (!yes_copies && !no_copies) {
+            if (next == yes) {
+                instruction("beq", reg_name(input_gpr(
+                    function, condition, "t0", value.location)) +
+                    ",$zero," + block_label(function, no));
+                instruction("nop");
+                return;
+            }
+            if (next == no) {
+                instruction("bne", reg_name(input_gpr(
+                    function, condition, "t0", value.location)) +
+                    ",$zero," + block_label(function, yes));
+                instruction("nop");
+                return;
+            }
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            instruction("bne", reg_name(condition_gpr) + ",$zero," +
+                                   block_label(function, yes));
+            instruction("nop");
+            instruction("b", block_label(function, no));
+            instruction("nop");
+            return;
+        }
         const auto yes_edge = local_label(function);
-        load_vreg(function, condition, "t0", value.location);
-        instruction("bne", "$t0,$zero," + yes_edge);
+        const auto condition_gpr = input_gpr(
+            function, condition, "t0", value.location);
+        instruction("bne", reg_name(condition_gpr) + ",$zero," + yes_edge);
         instruction("nop");
         emit_phi_edge_copies(function, predecessor, no);
         instruction("b", block_label(function, no));
@@ -3445,8 +4833,9 @@ void AssemblyEmitter::emit_terminator(
                 return;
             }
         }
-        load_vreg(function, value.uses.front(), "t0", value.location);
-        instruction("jr", "$t0");
+        const auto target = input_gpr(
+            function, value.uses.front(), "t0", value.location);
+        instruction("jr", reg_name(target));
         instruction("nop");
         return;
     }
@@ -3462,10 +4851,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     const auto& entity = hir_.function(function.source);
     active_signature_ = classify_entity(entity, function.location);
     if (!active_signature_) return;
-    // ABI register banks can overlap the emitter's scratch registers (EABI32
-    // deliberately continues through t0-t3).  Home every incoming register
-    // before parameter materialization so capturing an early argument cannot
-    // destroy a later one.
+    // Fully allocated, non-overlapping parameter sets are captured directly.
+    // Otherwise home the whole incoming register set before materialization:
+    // EABI/Cross banks may overlap t0/t1 assembly scratches, so mixing direct
+    // and fallback captures would let an early value destroy a later one.
     prepare_parameter_homes(function);
     if (!finalize_frame(function)) return;
     if (!safe_assembly_text(function.symbol) ||
@@ -3510,24 +4899,30 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     }
     output_ << ".type " << symbol << ",@function\n"
             << ".ent " << symbol << '\n' << symbol << ":\n"
-            << "\t.frame\t$fp," << frame_size_ << ",$ra\n";
+            << "\t.frame\t" << (frame_size_ == 0 ? "$sp," : "$fp,")
+            << frame_size_ << ",$ra\n";
     const bool cfi = (options_.unwind_tables ||
                       options_.asynchronous_unwind_tables) &&
                      assembly_uses_dwarf_cfi(format_);
     if (cfi) output_ << ".cfi_startproc\n";
-    instruction("addiu", "$sp,$sp,-" + std::to_string(frame_size_));
-    if (cfi) output_ << ".cfi_def_cfa_offset " << frame_size_ << '\n';
-    instruction("sw", "$ra," + memory(saved_ra_offset_, "sp"));
-    instruction("sw", "$fp," + memory(saved_fp_offset_, "sp"));
-    if (cfi) {
-        output_ << ".cfi_offset 31,"
-                << static_cast<std::int64_t>(saved_ra_offset_) - frame_size_
-                << "\n.cfi_offset 30,"
-                << static_cast<std::int64_t>(saved_fp_offset_) - frame_size_
-                << '\n';
+    if (frame_size_ != 0) {
+        instruction("addiu", "$sp,$sp,-" + std::to_string(frame_size_));
+        if (cfi) output_ << ".cfi_def_cfa_offset " << frame_size_ << '\n';
+        instruction("sw", "$ra," + memory(saved_ra_offset_, "sp"));
+        instruction("sw", "$fp," + memory(saved_fp_offset_, "sp"));
+        if (cfi) {
+            output_ << ".cfi_offset 31,"
+                    << static_cast<std::int64_t>(saved_ra_offset_) -
+                           frame_size_
+                    << "\n.cfi_offset 30,"
+                    << static_cast<std::int64_t>(saved_fp_offset_) -
+                           frame_size_
+                    << '\n';
+        }
+        instruction("move", "$fp,$sp");
+        if (cfi) output_ << ".cfi_def_cfa_register 30\n";
+        emit_callee_saves(function, cfi);
     }
-    instruction("move", "$fp,$sp");
-    if (cfi) output_ << ".cfi_def_cfa_register 30\n";
     emit_parameter_homes(function);
     epilogue_label_ = ".Lcross.mips." +
                       std::to_string(function.source.value) + ".return";
@@ -3555,13 +4950,16 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         }
     }
 
-    output_ << epilogue_label_ << ":\n";
-    instruction("move", "$sp,$fp");
-    instruction("lw", "$fp," + memory(saved_fp_offset_, "sp"));
-    instruction("lw", "$ra," + memory(saved_ra_offset_, "sp"));
-    instruction("addiu", "$sp,$sp," + std::to_string(frame_size_));
-    instruction("jr", "$ra");
-    instruction("nop");
+    if (frame_size_ != 0) {
+        output_ << epilogue_label_ << ":\n";
+        emit_callee_restores(function, cfi);
+        instruction("move", "$sp,$fp");
+        instruction("lw", "$fp," + memory(saved_fp_offset_, "sp"));
+        instruction("lw", "$ra," + memory(saved_ra_offset_, "sp"));
+        instruction("addiu", "$sp,$sp," + std::to_string(frame_size_));
+        instruction("jr", "$ra");
+        instruction("nop");
+    }
     if (cfi) output_ << ".cfi_endproc\n";
     output_ << ".end " << symbol << "\n.size " << symbol << ",.-"
             << symbol << "\n.set reorder\n.set pop\n";

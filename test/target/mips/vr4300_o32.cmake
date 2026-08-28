@@ -49,8 +49,8 @@ foreach(pattern
         "\\.frame[\t ]+\\$fp,"
         "[\t ]daddu[\t ]"
         "[\t ]mul\\.d[\t ]"
-        "[\t ]sdc1[\t ][$]f12"
-        "[\t ]sdc1[\t ][$]f14"
+        "[\t ]mov\\.d[\t ][^\n]*[$]f12"
+        "[\t ]mov\\.d[\t ][^\n]*[$]f14"
         "[\t ]jal[\t ]mips_add64"
         "[\t ]jal[\t ]mips_fma_shape")
     if(NOT assembly MATCHES "${pattern}")
