@@ -50,6 +50,10 @@ compile_assembly("-fif-conversion -fno-peephole2"
 compile_assembly("-O3 -fif-conversion" scheduled scheduled_assembly)
 compile_assembly("-O3 -fif-conversion -fno-peephole2"
                  scheduled-no-peephole scheduled_no_peephole_assembly)
+compile_assembly("-fif-conversion -fif-conversion-limit=5 -mrisc-cisc-balance=0"
+                 risc-cost risc_cost_assembly)
+compile_assembly("-fif-conversion -fif-conversion-limit=5 -mrisc-cisc-balance=100"
+                 cisc-cost cisc_cost_assembly)
 execute_process(
     COMMAND "${CC}" -S -Oz -fif-conversion -fno-eval-calls
             -target x86_64-unknown-linux-gnu "${SOURCE}"
@@ -79,6 +83,8 @@ foreach(symbol ifconv_compare ifconv_return ifconv_small)
     endif()
 endforeach()
 extract_function("${selected_assembly}" ifconv_expensive selected_expensive)
+extract_function("${risc_cost_assembly}" ifconv_balance risc_cost_balance)
+extract_function("${cisc_cost_assembly}" ifconv_balance cisc_cost_balance)
 extract_function("${selected_assembly}" ifconv_sign_boundary selected_sign)
 extract_function("${selected_assembly}" ifconv_shared_condition
                  selected_shared)
@@ -94,6 +100,15 @@ if(NOT selected_expensive MATCHES "[\t ]j[a-z]+[\t ]" OR
     message(FATAL_ERROR
         "costly if-conversion diamond was not kept branchy\n"
         "${selected_expensive}")
+endif()
+if(NOT risc_cost_balance MATCHES "[\t ]j[a-z]+[\t ]" OR
+   risc_cost_balance MATCHES "[\t ]cmov[a-z]+[\t ]" OR
+   NOT cisc_cost_balance MATCHES "[\t ]cmov[a-z]+[\t ]" OR
+   cisc_cost_balance MATCHES "[\t ]j[a-z]+[\t ]")
+    message(FATAL_ERROR
+        "continuous RISC/CISC MIR cost did not change if-conversion profitability\n"
+        "RISC endpoint:\n${risc_cost_balance}\n"
+        "CISC endpoint:\n${cisc_cost_balance}")
 endif()
 extract_function("${selected_assembly}" ifconv_masked_load selected_masked)
 extract_function("${no_peephole_assembly}" ifconv_masked_load

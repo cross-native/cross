@@ -162,6 +162,10 @@ std::vector<OptionDefinition> target_options() {
          0, 0, OptionCategory::Target, true,
          OptionImplementation::Implemented,
          "MIPS scheduling and cost CPU"},
+        {"m.risc-cisc-balance", {}, OptionValueKind::Unsigned,
+         std::uint64_t{50}, {}, 0, 100, OptionCategory::Target, true,
+         OptionImplementation::Implemented,
+         "continuous MIR cost position: 0 is RISC-like, 100 is CISC-like"},
     };
     const auto boolean = [&](std::string name, bool value,
                              std::string description,

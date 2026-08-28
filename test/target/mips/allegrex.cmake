@@ -30,6 +30,7 @@ set(mips1_assembly "${OUTPUT}.mips1.s")
 set(mips1_object "${OUTPUT}.mips1.o")
 set(mips2_object "${OUTPUT}.mips2.o")
 set(pair_assembly "${OUTPUT}.pair.s")
+set(pair_baseline_assembly "${OUTPUT}.pair-baseline.s")
 set(pair_object "${OUTPUT}.pair.o")
 set(pair_mips1_assembly "${OUTPUT}.pair-mips1.s")
 set(pair_mips1_object "${OUTPUT}.pair-mips1.o")
@@ -54,6 +55,9 @@ run_cc(mips2-object -c -O1 -mprofile=r6000-eabi "${MIPS1_SOURCE}"
        -o "${mips2_object}")
 run_cc(allegrex-i64-pair-assembly -S -O2 -mprofile=psp-allegrex
        "${PAIR_SOURCE}" -o "${pair_assembly}")
+run_cc(allegrex-i64-pair-baseline-assembly -S -O2
+       -fno-machine-combine -mprofile=psp-allegrex
+       "${PAIR_SOURCE}" -o "${pair_baseline_assembly}")
 run_cc(allegrex-i64-pair-object -c -O2 -mprofile=psp-allegrex
        "${PAIR_SOURCE}" -o "${pair_object}")
 run_cc(mips1-i64-pair-assembly -S -O2 -mprofile=r3000-o32
@@ -93,6 +97,7 @@ if(assembly MATCHES "[	 ](daddu|dsubu|ld|sd|ldc1|sdc1)[	 ]")
 endif()
 
 file(READ "${pair_assembly}" pair)
+file(READ "${pair_baseline_assembly}" pair_baseline)
 file(READ "${pair_mips1_assembly}" pair_mips1)
 file(READ "${pair_cross_be_assembly}" pair_cross_be)
 file(READ "${pair_cross_le_assembly}" pair_cross_le)
@@ -109,6 +114,13 @@ foreach(text pair pair_mips1 pair_cross_be pair_cross_le)
         endif()
     endforeach()
 endforeach()
+
+if(pair MATCHES "addiu[\t ]+[$]t2,[$]t2,-1" OR
+   NOT pair MATCHES "sltiu[\t ]+[$]t6,[$]t2,32" OR
+   NOT pair_baseline MATCHES "addiu[\t ]+[$]t2,[$]t2,-1")
+    message(FATAL_ERROR
+        "independent MIPS machine-combine control did not select the constant-time i64 shift expansion\noptimized:\n${pair}\nbaseline:\n${pair_baseline}")
+endif()
 
 file(READ "${baseline_assembly}" baseline)
 if(baseline MATCHES "\\.word[	 ]+0x(01285046|0128500b)" OR

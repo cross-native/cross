@@ -89,7 +89,12 @@ struct CompilerOptions {
     // its origin metadata remain authoritative; these fields keep lowering
     // independent from command/model spellings.
     OptimizationGoal optimize_for{OptimizationGoal::Debug};
-    unsigned optimization_effort{};
+    unsigned ccp_rounds{1};
+    unsigned if_conversion_limit{6};
+    unsigned if_conversion_memory_limit{12};
+    unsigned unroll_factor{2};
+    unsigned vector_interleave{2};
+    unsigned risc_cisc_balance{50};
     unsigned function_alignment{};
     unsigned loop_alignment{};
     bool function_sections{};
@@ -114,11 +119,32 @@ struct CompilerOptions {
     bool tree_dse{};
     bool tree_fre{};
     bool tree_tail_merge{};
+    bool thread_jumps{};
+    bool tree_cfg_cleanup{};
+    bool ivopts{};
     bool move_loop_invariants{};
     bool unroll_loops{};
     bool tree_loop_vectorize{};
+    bool tree_early_exit_vectorize{};
     bool tree_slp_vectorize{};
     bool if_conversion{};
+    bool expensive_optimizations{};
+    bool machine_combine{};
+    bool vector_combine{};
+    bool machine_cse{};
+    bool machine_load_cse{};
+    bool machine_dce{};
+    bool compare_branch_fusion{};
+    bool compare_select_fusion{};
+    bool jump_tables{};
+    bool combine_addresses{};
+    bool fold_memory_operands{};
+    bool schedule_insns{};
+    bool schedule_insns2{};
+    bool reorder_blocks{};
+    bool register_allocation{};
+    bool rematerialize{};
+    bool optimize_sibling_calls{};
     bool cprop_registers{};
     bool peephole2{};
     bool inline_functions{};

@@ -3,6 +3,8 @@
 
 #include "target/mips/native_backend.hpp"
 
+#include "backend/native/machine_pass.hpp"
+#include "backend/native/machine_transform.hpp"
 #include "model/model.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
@@ -25,6 +27,14 @@
 
 namespace cross::mips {
 namespace {
+
+enum class LoweringPass : std::uint16_t {
+    PropagateCopies,
+    EliminateRedundantExpressions,
+    EliminateRedundantLoads,
+    EliminateDeadValues,
+    ElideUnusedSpillSlots,
+};
 
 bool is_void(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
@@ -335,9 +345,7 @@ public:
                    const CompilerOptions& options,
                    Diagnostics& diagnostics)
         : managed_(managed), hir_(hir_module), subtarget_(subtarget),
-          diagnostics_(diagnostics) {
-        (void)options;
-    }
+          options_(options), diagnostics_(diagnostics) {}
 
     machine::Module run() {
         for (const auto& function : managed_.functions) {
@@ -970,6 +978,115 @@ private:
         }
     }
 
+    void optimize_machine_function() {
+        native::MachineFunctionPassManager passes;
+        using Stage = native::MachineStage;
+        passes.add(
+            {{LoweringPass::PropagateCopies}, Stage::Canonicalization,
+             "propagate-copies"},
+            [this](machine::Function& function) {
+                if (!options_.cprop_registers) return false;
+                const auto is_copy = [](const machine::Instruction& value) {
+                    const auto opcode = decode_opcode(value.opcode);
+                    return opcode == Opcode::Expect ||
+                           opcode == Opcode::Reinterpret ||
+                           opcode == Opcode::Freinterpret;
+                };
+                return native::propagate_virtual_register_copies(
+                    function, is_copy);
+            });
+        passes.add(
+            {{LoweringPass::EliminateRedundantExpressions},
+             Stage::Canonicalization, "eliminate-redundant-expressions"},
+            [this](machine::Function& function) {
+                if (!options_.machine_cse) return false;
+                const auto eligible = [](const machine::Instruction& value) {
+                    switch (decode_opcode(value.opcode)) {
+                    case Opcode::None:
+                    case Opcode::Parameter:
+                    case Opcode::Fparameter:
+                    case Opcode::Phi:
+                    case Opcode::Patch:
+                    case Opcode::IntrinsicNoop:
+                    case Opcode::LifetimeStart:
+                    case Opcode::LifetimeEnd:
+                    case Opcode::AtomicLoad:
+                    case Opcode::AtomicStore:
+                    case Opcode::AtomicExchange:
+                    case Opcode::AtomicCompareExchange:
+                    case Opcode::AtomicFetchAdd:
+                    case Opcode::AtomicFetchSub:
+                    case Opcode::AtomicFetchAnd:
+                    case Opcode::AtomicFetchXor:
+                    case Opcode::AtomicFetchOr:
+                    case Opcode::AtomicFetchUpdate:
+                    case Opcode::AtomicThreadFence:
+                    case Opcode::AtomicSignalFence:
+                    case Opcode::VariadicState:
+                    case Opcode::StackSave:
+                    case Opcode::StackAllocate:
+                    case Opcode::StackRestore:
+                    case Opcode::Invalid: return false;
+                    default: return true;
+                    }
+                };
+                return native::eliminate_redundant_expressions(
+                    function, eligible);
+            });
+        passes.add(
+            {{LoweringPass::EliminateRedundantLoads},
+             Stage::Canonicalization, "eliminate-redundant-loads"},
+            [this](machine::Function& function) {
+                if (!options_.machine_load_cse) return false;
+                return native::eliminate_redundant_loads(
+                    function, [](const machine::Instruction&) {
+                        return true;
+                    });
+            });
+        passes.add(
+            {{LoweringPass::EliminateDeadValues}, Stage::Canonicalization,
+             "eliminate-dead-machine-values"},
+            [this](machine::Function& function) {
+                if (!options_.machine_dce) return false;
+                std::vector<bool> implicit_parameter_storage(
+                    function.virtual_registers.size());
+                for (const auto& block : function.blocks) {
+                    for (const auto& value : block.instructions) {
+                        const auto opcode = decode_opcode(value.opcode);
+                        if (opcode != Opcode::Parameter &&
+                            opcode != Opcode::Fparameter) {
+                            continue;
+                        }
+                        for (const auto& definition : value.defs) {
+                            if (definition.kind ==
+                                    machine::RegisterKind::Virtual &&
+                                definition.id <
+                                    implicit_parameter_storage.size()) {
+                                implicit_parameter_storage[definition.id] =
+                                    true;
+                            }
+                        }
+                    }
+                }
+                return native::eliminate_dead_definitions(
+                    function,
+                    [&](const machine::Register& definition) {
+                        return definition.kind ==
+                                   machine::RegisterKind::Virtual &&
+                               definition.id <
+                                   implicit_parameter_storage.size() &&
+                               implicit_parameter_storage[definition.id];
+                    });
+            });
+        passes.add(
+            {{LoweringPass::ElideUnusedSpillSlots},
+             Stage::FrameFinalization, "elide-unused-spill-slots"},
+            [](machine::Function& function) {
+                return native::elide_unused_virtual_spill_slots(function);
+            });
+        (void)passes.run(current_);
+    }
+
     void lower_function(const mir::ManagedFunction& source) {
         current_ = {};
         source_ = &source;
@@ -991,12 +1108,14 @@ private:
         for (const auto& label : source.labels) {
             current_.labels.push_back({label.label, {label.block.value}});
         }
+        optimize_machine_function();
         result_.functions.push_back(std::move(current_));
     }
 
     const mir::ManagedModule& managed_;
     const hir::Module& hir_;
     const Subtarget& subtarget_;
+    const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     machine::Module result_;
     machine::Function current_;
@@ -1520,6 +1639,7 @@ private:
         auto offset = outgoing_size(function);
         function.frame.outgoing_argument_size = offset;
         for (auto& slot : function.stack_slots) {
+            if (slot.elided) continue;
             offset = align_up(offset, slot.alignment);
             slot.frame_offset = static_cast<std::int32_t>(offset);
             offset += slot.size;
@@ -2180,6 +2300,96 @@ void AssemblyEmitter::emit_integer_pair_binary(
     case Opcode::ShrU:
     case Opcode::Rotl:
     case Opcode::Rotr: {
+        if (options_.machine_combine &&
+            options_.optimize_for == OptimizationGoal::Speed) {
+            const auto below_word = local_label(function);
+            const auto rotate_word = local_label(function);
+            const auto done = local_label(function);
+            instruction("andi", "$t2,$t2,63");
+            instruction("move", "$t4,$t0");
+            instruction("move", "$t5,$t1");
+            instruction("beq", "$t2,$zero," + done);
+            instruction("nop");
+            instruction("sltiu", "$t6,$t2,32");
+            instruction("bne", "$t6,$zero," + below_word);
+            instruction("nop");
+            instruction("addiu", "$t2,$t2,-32");
+
+            if (opcode == Opcode::Shl) {
+                instruction("move", "$t4,$zero");
+                instruction("sllv", "$t5,$t0,$t2");
+            } else if (opcode == Opcode::ShrU ||
+                       opcode == Opcode::ShrS) {
+                instruction(opcode == Opcode::ShrS ? "srav" : "srlv",
+                            "$t4,$t1,$t2");
+                instruction(opcode == Opcode::ShrS ? "sra" : "move",
+                            opcode == Opcode::ShrS ? "$t5,$t1,31"
+                                                   : "$t5,$zero");
+            } else {
+                instruction("beq", "$t2,$zero," + rotate_word);
+                instruction("nop");
+                instruction("subu", "$t7,$zero,$t2");
+                if (opcode == Opcode::Rotl) {
+                    instruction("sllv", "$t4,$t1,$t2");
+                    instruction("srlv", "$t6,$t0,$t7");
+                    instruction("or", "$t4,$t4,$t6");
+                    instruction("sllv", "$t5,$t0,$t2");
+                    instruction("srlv", "$t6,$t1,$t7");
+                    instruction("or", "$t5,$t5,$t6");
+                } else {
+                    instruction("srlv", "$t4,$t1,$t2");
+                    instruction("sllv", "$t6,$t0,$t7");
+                    instruction("or", "$t4,$t4,$t6");
+                    instruction("srlv", "$t5,$t0,$t2");
+                    instruction("sllv", "$t6,$t1,$t7");
+                    instruction("or", "$t5,$t5,$t6");
+                }
+            }
+            instruction("b", done);
+            instruction("nop");
+
+            if (opcode == Opcode::Rotl || opcode == Opcode::Rotr) {
+                output_ << rotate_word << ":\n";
+                instruction("move", "$t4,$t1");
+                instruction("move", "$t5,$t0");
+                instruction("b", done);
+                instruction("nop");
+            }
+
+            output_ << below_word << ":\n";
+            instruction("subu", "$t7,$zero,$t2");
+            if (opcode == Opcode::Shl) {
+                instruction("sllv", "$t4,$t0,$t2");
+                instruction("sllv", "$t5,$t1,$t2");
+                instruction("srlv", "$t6,$t0,$t7");
+                instruction("or", "$t5,$t5,$t6");
+            } else if (opcode == Opcode::ShrU ||
+                       opcode == Opcode::ShrS) {
+                instruction("srlv", "$t4,$t0,$t2");
+                instruction("sllv", "$t6,$t1,$t7");
+                instruction("or", "$t4,$t4,$t6");
+                instruction(opcode == Opcode::ShrS ? "srav" : "srlv",
+                            "$t5,$t1,$t2");
+            } else if (opcode == Opcode::Rotl) {
+                instruction("sllv", "$t4,$t0,$t2");
+                instruction("srlv", "$t6,$t1,$t7");
+                instruction("or", "$t4,$t4,$t6");
+                instruction("sllv", "$t5,$t1,$t2");
+                instruction("srlv", "$t6,$t0,$t7");
+                instruction("or", "$t5,$t5,$t6");
+            } else {
+                instruction("srlv", "$t4,$t0,$t2");
+                instruction("sllv", "$t6,$t1,$t7");
+                instruction("or", "$t4,$t4,$t6");
+                instruction("srlv", "$t5,$t1,$t2");
+                instruction("sllv", "$t6,$t0,$t7");
+                instruction("or", "$t5,$t5,$t6");
+            }
+            output_ << done << ":\n";
+            store_pair();
+            return;
+        }
+
         const auto loop = local_label(function);
         const auto done = local_label(function);
         instruction("andi", "$t2,$t2,63");

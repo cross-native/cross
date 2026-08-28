@@ -35,4 +35,11 @@ eliminate_redundant_loads(machine::Function& function,
     machine::Function& function,
     const MachineRegisterPredicate& definition_is_observable = {});
 
+// Selection commonly gives every virtual register a conservative fallback
+// home before target-independent cleanup has removed copies and dead values.
+// Elide homes whose virtual register no longer occurs in Machine IR so every
+// target can keep that early, simple construction without paying frame cost.
+[[nodiscard]] bool
+elide_unused_virtual_spill_slots(machine::Function& function);
+
 } // namespace cross::native

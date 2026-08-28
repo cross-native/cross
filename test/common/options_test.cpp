@@ -59,6 +59,9 @@ int main() {
                     !o0->omit_frame_pointer &&
                     !o0->fast_math && !o0->finite_math_only &&
                     o0->signed_zeros &&
+                    !o0->machine_combine && !o0->machine_cse &&
+                    !o0->expensive_optimizations &&
+                    !o0->register_allocation &&
                     o0->inline_unit_limit == 96,
                 "O0 does not match its model-defined baseline") &&
          ok;
@@ -66,7 +69,8 @@ int main() {
     const auto og = parse({"cc", "-Og"});
     ok = expect(og && og->tree_ccp && !og->tree_dce &&
                     !og->inline_functions &&
-                    og->optimization_effort == 1,
+                    og->machine_combine && !og->machine_dce &&
+                    !og->machine_cse,
                 "Og preset does not preserve debuggable policy") &&
          ok;
 
@@ -78,14 +82,19 @@ int main() {
                     o2->ipa_pure_const &&
                     o2->private_abi && !o2->ipa_cp_clone &&
                     o2->inline_unit_limit == 96 &&
-                    o2->optimization_effort == 2,
+                    o2->ccp_rounds == 2 &&
+                    o2->machine_combine && o2->machine_cse &&
+                    o2->machine_load_cse && o2->machine_dce &&
+                    !o2->expensive_optimizations &&
+                    o2->register_allocation && o2->schedule_insns &&
+                    o2->schedule_insns2,
                 "O2 preset does not resolve to the model-defined passes") &&
          ok;
 
     const auto o3_override = parse(
         {"cc", "-fno-inline", "-fno-tree-dce", "-O3",
          "-fno-tree-dse", "-fno-tree-tail-merge", "-fno-ipa-ra",
-         "-fno-ipa-pure-const"});
+         "-fno-ipa-pure-const", "-fno-expensive-optimizations"});
     ok = expect(o3_override && o3_override->tree_ccp &&
                     !o3_override->tree_dce &&
                     !o3_override->tree_dse &&
@@ -94,7 +103,8 @@ int main() {
                     !o3_override->ipa_ra &&
                     !o3_override->ipa_pure_const &&
                     o3_override->private_abi &&
-                    o3_override->ipa_cp_clone,
+                    o3_override->ipa_cp_clone &&
+                    !o3_override->expensive_optimizations,
                 "explicit negative pass options did not override O3") &&
          ok;
 
@@ -120,11 +130,35 @@ int main() {
 
     const auto explicit_o0 = parse(
         {"cc", "-O0", "-finline-functions", "-ftree-ccp",
-         "-finline-limit=17"});
+         "-finline-limit=17", "-fmachine-cse",
+         "-fregister-allocation", "-fccp-rounds=4",
+         "-funroll-factor=3", "-fexpensive-optimizations"});
     ok = expect(explicit_o0 && explicit_o0->inline_functions &&
                     explicit_o0->tree_ccp &&
-                    explicit_o0->inline_unit_limit == 17,
+                    explicit_o0->inline_unit_limit == 17 &&
+                    explicit_o0->machine_cse &&
+                    explicit_o0->register_allocation &&
+                    explicit_o0->expensive_optimizations &&
+                    !explicit_o0->tree_fre &&
+                    explicit_o0->ccp_rounds == 4 &&
+                    explicit_o0->unroll_factor == 3,
                 "direct optimization controls are gated by O0") &&
+         ok;
+
+    const auto mips_policy = parse(
+        {"cc", "-O2", "-mprofile=vr4300-o32"});
+    const auto x86_policy = parse(
+        {"cc", "-O2", "-mprofile=x86_64-elf"});
+    const auto custom_policy = parse(
+        {"cc", "-O2", "-mprofile=vr4300-o32",
+         "-mrisc-cisc-balance=37", "-fno-machine-cse"});
+    ok = expect(mips_policy && x86_policy && custom_policy &&
+                    mips_policy->risc_cisc_balance == 0 &&
+                    x86_policy->risc_cisc_balance == 100 &&
+                    custom_policy->risc_cisc_balance == 37 &&
+                    !custom_policy->machine_cse &&
+                    custom_policy->machine_load_cse,
+                "target policy or independent machine-pass override did not resolve") &&
          ok;
 
     const auto fast_then_granular = parse(

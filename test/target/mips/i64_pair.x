@@ -96,11 +96,33 @@ global i32 mips_pair_test() {
     if (mips_pair_rem(0x100000006u64, 3u64) == 1u64) passed |= 0x0010;
     if (mips_pair_sdiv(-10000000000i64, 3i64) == -3333333333i64) passed |= 0x0020;
     if (mips_pair_srem(-10000000000i64, 3i64) == -1i64) passed |= 0x0040;
-    if (mips_pair_shl(1u64, 33u64) == 0x200000000u64) passed |= 0x0080;
-    if (mips_pair_shr(0x8000000000000000u64, 63u64) == 1u64) passed |= 0x0100;
-    if (mips_pair_sar(-8i64, 2i64) == -2i64) passed |= 0x0200;
-    if (mips_pair_rotl(1u64, 63u64) == 0x8000000000000000u64) passed |= 0x0400;
-    if (mips_pair_rotr(1u64, 1u64) == 0x8000000000000000u64) passed |= 0x0800;
+    if (mips_pair_shl(1u64, 0u64) == 1u64 &&
+        mips_pair_shl(1u64, 31u64) == 0x80000000u64 &&
+        mips_pair_shl(1u64, 32u64) == 0x100000000u64 &&
+        mips_pair_shl(1u64, 33u64) == 0x200000000u64 &&
+        mips_pair_shl(1u64, 63u64) == 0x8000000000000000u64) passed |= 0x0080;
+    if (mips_pair_shr(0x8000000000000000u64, 0u64) ==
+            0x8000000000000000u64 &&
+        mips_pair_shr(0x8000000000000000u64, 31u64) == 0x100000000u64 &&
+        mips_pair_shr(0x8000000000000000u64, 32u64) == 0x80000000u64 &&
+        mips_pair_shr(0x8000000000000000u64, 33u64) == 0x40000000u64 &&
+        mips_pair_shr(0x8000000000000000u64, 63u64) == 1u64) passed |= 0x0100;
+    if (mips_pair_sar(-8i64, 0i64) == -8i64 &&
+        mips_pair_sar(-8i64, 2i64) == -2i64 &&
+        mips_pair_sar(-8i64, 31i64) == -1i64 &&
+        mips_pair_sar(-8i64, 32i64) == -1i64 &&
+        mips_pair_sar(-8i64, 63i64) == -1i64) passed |= 0x0200;
+    if (mips_pair_rotl(1u64, 0u64) == 1u64 &&
+        mips_pair_rotl(1u64, 31u64) == 0x80000000u64 &&
+        mips_pair_rotl(1u64, 32u64) == 0x100000000u64 &&
+        mips_pair_rotl(1u64, 33u64) == 0x200000000u64 &&
+        mips_pair_rotl(1u64, 63u64) == 0x8000000000000000u64) passed |= 0x0400;
+    if (mips_pair_rotr(1u64, 0u64) == 1u64 &&
+        mips_pair_rotr(1u64, 1u64) == 0x8000000000000000u64 &&
+        mips_pair_rotr(1u64, 31u64) == 0x200000000u64 &&
+        mips_pair_rotr(1u64, 32u64) == 0x100000000u64 &&
+        mips_pair_rotr(1u64, 33u64) == 0x80000000u64 &&
+        mips_pair_rotr(1u64, 63u64) == 2u64) passed |= 0x0800;
     if ((0x100000000u64 > 0xffffffffu64) &&
         (-2i64 < -1i64) &&
         (0x8000000000000000u64 >= 0x7fffffffffffffffu64)) passed |= 0x1000;

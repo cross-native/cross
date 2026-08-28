@@ -569,6 +569,7 @@ profile "mips-elf" {
     abi = "cross";
     mangling = "cross";
     m.arch = "generic";
+    m.risc-cisc-balance = 0;
 }
 
 profile "mipsel-elf" {
@@ -577,6 +578,7 @@ profile "mipsel-elf" {
     abi = "cross";
     mangling = "cross";
     m.arch = "generic";
+    m.risc-cisc-balance = 0;
 }
 
 profile "vr4300-o32" {
@@ -584,6 +586,7 @@ profile "vr4300-o32" {
     abi = "o32";
     mangling = "cross";
     m.arch = "vr4300";
+    m.risc-cisc-balance = 0;
 }
 
 profile "psp-allegrex" {
@@ -593,6 +596,7 @@ profile "psp-allegrex" {
     mangling = "cross";
     m.arch = "allegrex";
     m.tune = "allegrex";
+    m.risc-cisc-balance = 0;
 }
 
 profile "allegrex-o32" {
@@ -601,6 +605,7 @@ profile "allegrex-o32" {
     mangling = "cross";
     m.arch = "allegrex";
     m.tune = "allegrex";
+    m.risc-cisc-balance = 0;
 }
 
 profile "r3000-o32" {
@@ -609,6 +614,7 @@ profile "r3000-o32" {
     mangling = "cross";
     m.arch = "r3000";
     m.tune = "r3000";
+    m.risc-cisc-balance = 0;
 }
 
 profile "r6000-eabi" {
@@ -617,4 +623,5 @@ profile "r6000-eabi" {
     mangling = "cross";
     m.arch = "r6000";
     m.tune = "r6000";
+    m.risc-cisc-balance = 0;
 }

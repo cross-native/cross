@@ -18,7 +18,8 @@ namespace cross::x86_64 {
 
 // Legalize verified target-independent managed MIR into x86-64 Machine IR.
 // Every virtual register receives a stable spill home as a correctness
-// fallback. At -O2 and above, liveness/interference allocation assigns
+// fallback. When f.register-allocation is enabled, liveness/interference
+// allocation assigns
 // eligible integer, floating, and fixed-vector values to caller-clobbered or
 // ABI-preserved registers, with call splitting, cross-ABI bridge saves, and
 // finalized unwind-aware frames.

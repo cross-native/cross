@@ -284,10 +284,26 @@ std::span<const OptionDefinition> common_option_definitions() {
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
          "profitability objective"},
-        {"f.optimization-effort", {}, OptionValueKind::Unsigned,
-         std::uint64_t{0}, {}, 0, 3, OptionCategory::Optimization, true,
+        {"f.ccp-rounds", {}, OptionValueKind::Unsigned,
+         std::uint64_t{1}, {}, 1, 16, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
-         "discretionary analysis and fixed-point effort"},
+         "constant-propagation fixed-point rounds"},
+        {"f.if-conversion-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{6}, {}, 0, 1024, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "maximum ordinary MIR cost speculated by if-conversion"},
+        {"f.if-conversion-memory-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{12}, {}, 0, 1024, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "maximum MIR cost speculated for an unpredictable memory condition"},
+        {"f.unroll-factor", {}, OptionValueKind::Unsigned,
+         std::uint64_t{2}, {}, 1, 16, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "maximum target-independent loop unroll factor"},
+        {"f.vector-interleave", {}, OptionValueKind::Unsigned,
+         std::uint64_t{2}, {}, 1, 16, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "maximum independent vector reduction streams"},
         {"f.tree-ccp", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "scalar constant propagation and folding"},
@@ -306,6 +322,15 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.tree-tail-merge", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "factor profitable common SSA tails before machine selection"},
+        {"f.thread-jumps", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "thread branches through proven boolean SSA phis"},
+        {"f.tree-cfg-cleanup", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "remove forwarding blocks and repair value/effect SSA"},
+        {"f.ivopts", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "coalesce equivalent loop induction variables"},
         {"f.move-loop-invariants", {}, OptionValueKind::Boolean, false, {},
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
@@ -317,6 +342,10 @@ std::span<const OptionDefinition> common_option_definitions() {
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Partial,
          "vectorize legal counted loops using target-registered vectors"},
+        {"f.tree-early-exit-vectorize", {}, OptionValueKind::Boolean, false,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Partial,
+         "vectorize legal loops with an observable early exit"},
         {"f.tree-slp-vectorize", {}, OptionValueKind::Boolean, false, {}, 0,
          0, OptionCategory::Optimization, true,
          OptionImplementation::Partial,
@@ -324,6 +353,63 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.if-conversion", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "replace profitable control diamonds with data selection"},
+        {"f.expensive-optimizations", {}, OptionValueKind::Boolean, false,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "permit compile-time-intensive profitable machine transforms"},
+        {"f.machine-combine", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "combine selected scalar and immediate machine operations"},
+        {"f.vector-combine", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "combine and hoist selected vector operations"},
+        {"f.machine-cse", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "eliminate redundant pure Machine IR expressions"},
+        {"f.machine-load-cse", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "eliminate redundant nonvolatile Machine IR loads"},
+        {"f.machine-dce", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "eliminate dead side-effect-free Machine IR definitions"},
+        {"f.compare-branch-fusion", {}, OptionValueKind::Boolean, false, {},
+         0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Partial,
+         "fuse selected comparisons with conditional branches"},
+        {"f.compare-select-fusion", {}, OptionValueKind::Boolean, false, {},
+         0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Partial,
+         "fuse selected comparisons with data selections"},
+        {"f.jump-tables", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "permit profitable dense machine jump tables"},
+        {"f.combine-addresses", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "fold compatible address calculations into memory operations"},
+        {"f.fold-memory-operands", {}, OptionValueKind::Boolean, false, {},
+         0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Partial,
+         "fold SSA producers and consumers into target memory operands"},
+        {"f.schedule-insns", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "schedule instructions within machine basic blocks"},
+        {"f.schedule-insns2", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "schedule safe instructions across machine block boundaries"},
+        {"f.reorder-blocks", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "lay out machine blocks along profitable control-flow traces"},
+        {"f.register-allocation", {}, OptionValueKind::Boolean, false, {},
+         0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Partial,
+         "assign eligible virtual values to target registers"},
+        {"f.rematerialize", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "rematerialize cheap values instead of retaining spill homes"},
+        {"f.optimize-sibling-calls", {}, OptionValueKind::Boolean, false, {},
+         0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Partial,
+         "replace compatible terminal calls with sibling jumps"},
         {"f.cprop-registers", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "propagate compatible physical-register copies after allocation"},
@@ -581,8 +667,18 @@ bool resolve_registered_options(
               : optimize_for == "minimum-size"
                     ? OptimizationGoal::MinimumSize
                     : OptimizationGoal::Debug;
-    options.optimization_effort = static_cast<unsigned>(
-        resolved_unsigned(options, "f.optimization-effort"));
+    options.ccp_rounds = static_cast<unsigned>(
+        resolved_unsigned(options, "f.ccp-rounds", 1));
+    options.if_conversion_limit = static_cast<unsigned>(
+        resolved_unsigned(options, "f.if-conversion-limit", 6));
+    options.if_conversion_memory_limit = static_cast<unsigned>(
+        resolved_unsigned(options, "f.if-conversion-memory-limit", 12));
+    options.unroll_factor = static_cast<unsigned>(
+        resolved_unsigned(options, "f.unroll-factor", 2));
+    options.vector_interleave = static_cast<unsigned>(
+        resolved_unsigned(options, "f.vector-interleave", 2));
+    options.risc_cisc_balance = static_cast<unsigned>(
+        resolved_unsigned(options, "m.risc-cisc-balance", 50));
     options.function_alignment = static_cast<unsigned>(
         resolved_unsigned(options, "f.align-functions"));
     options.loop_alignment = static_cast<unsigned>(
@@ -595,14 +691,45 @@ bool resolve_registered_options(
     options.tree_fre = resolved_bool(options, "f.tree-fre");
     options.tree_tail_merge =
         resolved_bool(options, "f.tree-tail-merge");
+    options.thread_jumps = resolved_bool(options, "f.thread-jumps");
+    options.tree_cfg_cleanup =
+        resolved_bool(options, "f.tree-cfg-cleanup");
+    options.ivopts = resolved_bool(options, "f.ivopts");
     options.move_loop_invariants =
         resolved_bool(options, "f.move-loop-invariants");
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");
     options.tree_loop_vectorize =
         resolved_bool(options, "f.tree-loop-vectorize");
+    options.tree_early_exit_vectorize =
+        resolved_bool(options, "f.tree-early-exit-vectorize");
     options.tree_slp_vectorize =
         resolved_bool(options, "f.tree-slp-vectorize");
     options.if_conversion = resolved_bool(options, "f.if-conversion");
+    options.expensive_optimizations =
+        resolved_bool(options, "f.expensive-optimizations");
+    options.machine_combine = resolved_bool(options, "f.machine-combine");
+    options.vector_combine = resolved_bool(options, "f.vector-combine");
+    options.machine_cse = resolved_bool(options, "f.machine-cse");
+    options.machine_load_cse =
+        resolved_bool(options, "f.machine-load-cse");
+    options.machine_dce = resolved_bool(options, "f.machine-dce");
+    options.compare_branch_fusion =
+        resolved_bool(options, "f.compare-branch-fusion");
+    options.compare_select_fusion =
+        resolved_bool(options, "f.compare-select-fusion");
+    options.jump_tables = resolved_bool(options, "f.jump-tables");
+    options.combine_addresses =
+        resolved_bool(options, "f.combine-addresses");
+    options.fold_memory_operands =
+        resolved_bool(options, "f.fold-memory-operands");
+    options.schedule_insns = resolved_bool(options, "f.schedule-insns");
+    options.schedule_insns2 = resolved_bool(options, "f.schedule-insns2");
+    options.reorder_blocks = resolved_bool(options, "f.reorder-blocks");
+    options.register_allocation =
+        resolved_bool(options, "f.register-allocation");
+    options.rematerialize = resolved_bool(options, "f.rematerialize");
+    options.optimize_sibling_calls =
+        resolved_bool(options, "f.optimize-sibling-calls");
     options.cprop_registers =
         resolved_bool(options, "f.cprop-registers");
     options.peephole2 = resolved_bool(options, "f.peephole2");

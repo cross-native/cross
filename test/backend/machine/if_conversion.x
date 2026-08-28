@@ -31,6 +31,15 @@ global u64 ifconv_expensive(in bool choose, in u64 left, in u64 right) {
     }
 }
 
+[[runtime_only, noinline, link_name("ifconv_balance")]]
+global u64 ifconv_balance(in bool choose, in u64 value) {
+    if (choose) {
+        return value * 3;
+    } else {
+        return value + 1;
+    }
+}
+
 [[runtime_only, noinline, link_name("ifconv_masked_load")]]
 global u64 ifconv_masked_load(in const u64 *source, in u64 result) {
     u64 value = source[0];

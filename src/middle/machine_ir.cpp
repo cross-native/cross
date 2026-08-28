@@ -335,6 +335,28 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
         ok = fail(diagnostics, function.location,
                   "machine outgoing-argument alignment must be a power of two");
     }
+    std::vector<bool> referenced_virtuals(function.virtual_registers.size());
+    const auto mark_virtual = [&](const Register& value) {
+        if (value.kind == RegisterKind::Virtual &&
+            value.id < referenced_virtuals.size()) {
+            referenced_virtuals[value.id] = true;
+        }
+    };
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            for (const auto& definition : instruction.defs)
+                mark_virtual(definition);
+            for (const auto& use : instruction.uses) mark_virtual(use);
+            for (const auto& live : instruction.live_across_call)
+                mark_virtual(live);
+            for (const auto& operand : instruction.operands) {
+                if (const auto* reg =
+                        std::get_if<RegisterOperand>(&operand)) {
+                    mark_virtual(reg->value);
+                }
+            }
+        }
+    }
     std::unordered_set<std::uint32_t> spill_homes;
     for (std::size_t index = 0; index < function.stack_slots.size(); ++index) {
         const StackSlot& slot = function.stack_slots[index];
@@ -365,12 +387,17 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
                 function.rematerialized_immediates.size() &&
             function.rematerialized_immediates[slot.spill_for->value]
                 .has_value();
+        const bool unused_spill =
+            slot.spill_for &&
+            slot.spill_for->value < referenced_virtuals.size() &&
+            !referenced_virtuals[slot.spill_for->value];
         if (slot.elided &&
-            ((!assigned_spill && !rematerialized_spill) ||
+            ((!assigned_spill && !rematerialized_spill && !unused_spill) ||
              slot.frame_offset)) {
             ok = fail(diagnostics, slot.location,
                       "machine stack slot may be elided only for an assigned "
-                      "or rematerialized virtual register");
+                      "or rematerialized virtual register, or one removed "
+                      "from Machine IR");
         }
         if (function.frame.finalized && !slot.elided &&
             !slot.frame_offset.has_value()) {

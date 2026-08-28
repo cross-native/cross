@@ -89,5 +89,54 @@ int main() {
                     "empty target opcode was accepted") &&
              ok;
     }
+    {
+        auto function = valid_function();
+        function.virtual_registers = {cross::machine::i64};
+        function.virtual_register_assignments.resize(1);
+        function.rematerialized_immediates.resize(1);
+        function.virtual_register_classes = {
+            cross::machine::VirtualRegisterClass::Integer};
+        cross::machine::StackSlot slot;
+        slot.id = {0};
+        slot.kind = cross::machine::StackSlotKind::Spill;
+        slot.size = 8;
+        slot.alignment = 8;
+        slot.spill_for = cross::machine::VirtualRegisterId{0};
+        slot.elided = true;
+        function.stack_slots.push_back(std::move(slot));
+        std::ostringstream text;
+        cross::Diagnostics diagnostics(text);
+        ok = expect(cross::machine::verify(function, diagnostics),
+                    "elided home for a removed virtual was rejected") &&
+             ok;
+    }
+    {
+        auto function = valid_function();
+        function.virtual_registers = {cross::machine::i64};
+        function.virtual_register_assignments.resize(1);
+        function.rematerialized_immediates.resize(1);
+        function.virtual_register_classes = {
+            cross::machine::VirtualRegisterClass::Integer};
+        cross::machine::StackSlot slot;
+        slot.id = {0};
+        slot.kind = cross::machine::StackSlotKind::Spill;
+        slot.size = 8;
+        slot.alignment = 8;
+        slot.spill_for = cross::machine::VirtualRegisterId{0};
+        slot.elided = true;
+        function.stack_slots.push_back(std::move(slot));
+        cross::machine::Instruction target;
+        target.kind = cross::machine::InstructionKind::Target;
+        target.opcode = cross::machine::TargetOpcodeId{1};
+        target.defs.push_back(cross::machine::Register::virtual_register(
+            {0}, cross::machine::i64));
+        function.blocks.front().instructions.insert(
+            function.blocks.front().instructions.begin(),
+            std::move(target));
+        ok = expect(rejected(std::move(function),
+                             "may be elided only"),
+                    "elided home for a referenced unassigned virtual was accepted") &&
+             ok;
+    }
     return ok ? 0 : 1;
 }

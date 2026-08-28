@@ -93,13 +93,23 @@ if(volatile_body MATCHES "[	 ]vptest[	 ]")
 endif()
 
 compile_assembly("${OUTPUT}.disabled.s" -O3 -march=x86-64-v3
-                 -fno-tree-loop-vectorize)
+                 -fno-tree-early-exit-vectorize)
 file(READ "${OUTPUT}.disabled.s" disabled)
 extract_function("${disabled}" early_exit_less disabled_less)
 if(disabled_less MATCHES "[	 ]vptest[	 ]")
     message(FATAL_ERROR
-        "-fno-tree-loop-vectorize did not disable early-exit vectorization\n"
+        "-fno-tree-early-exit-vectorize did not disable its pass\n"
         "${disabled_less}")
+endif()
+
+compile_assembly("${OUTPUT}.independent.s" -O3 -march=x86-64-v3
+                 -fno-tree-loop-vectorize)
+file(READ "${OUTPUT}.independent.s" independent)
+extract_function("${independent}" early_exit_less independent_less)
+if(NOT independent_less MATCHES "[\t ]vptest[\t ]")
+    message(FATAL_ERROR
+        "ordinary and early-exit loop vectorizers are not independently selectable\n"
+        "${independent_less}")
 endif()
 
 execute_process(

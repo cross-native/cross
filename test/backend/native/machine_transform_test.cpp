@@ -174,6 +174,32 @@ bool dead_definition_test() {
     return ok;
 }
 
+bool spill_elision_test() {
+    auto function = function_with_registers(2);
+    function.virtual_register_assignments.resize(2);
+    function.rematerialized_immediates.resize(2);
+    auto retained = target(10, {reg(0)}, {});
+    retained.has_side_effects = true;
+    function.blocks[0].instructions = {retained};
+    for (std::uint32_t index = 0; index < 2; ++index) {
+        machine::StackSlot slot;
+        slot.id = {index};
+        slot.kind = machine::StackSlotKind::Spill;
+        slot.size = 8;
+        slot.alignment = 8;
+        slot.spill_for = machine::VirtualRegisterId{index};
+        function.stack_slots.push_back(slot);
+    }
+
+    bool ok = true;
+    ok &= expect(native::elide_unused_virtual_spill_slots(function),
+                 "unused virtual spill home should be elided");
+    ok &= expect(!function.stack_slots[0].elided &&
+                     function.stack_slots[1].elided,
+                 "only the unreferenced virtual spill home may be elided");
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -182,5 +208,6 @@ int main() {
     ok &= expression_elimination_test();
     ok &= load_elimination_test();
     ok &= dead_definition_test();
+    ok &= spill_elision_test();
     return ok ? 0 : 1;
 }

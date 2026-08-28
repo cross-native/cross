@@ -240,4 +240,40 @@ bool eliminate_dead_definitions(
     return any_changed;
 }
 
+bool elide_unused_virtual_spill_slots(machine::Function& function) {
+    std::vector<bool> referenced(function.virtual_registers.size());
+    const auto mark = [&](const machine::Register& value) {
+        if (value.kind == machine::RegisterKind::Virtual &&
+            value.id < referenced.size()) {
+            referenced[value.id] = true;
+        }
+    };
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            for (const auto& definition : instruction.defs) mark(definition);
+            for (const auto& use : instruction.uses) mark(use);
+            for (const auto& live : instruction.live_across_call) mark(live);
+            for (const auto& operand : instruction.operands) {
+                if (const auto* reg =
+                        std::get_if<machine::RegisterOperand>(&operand)) {
+                    mark(reg->value);
+                }
+            }
+        }
+    }
+
+    bool changed = false;
+    for (auto& slot : function.stack_slots) {
+        if (!slot.spill_for || slot.spill_for->value >= referenced.size() ||
+            referenced[slot.spill_for->value]) {
+            continue;
+        }
+        if (slot.elided && !slot.frame_offset) continue;
+        slot.elided = true;
+        slot.frame_offset.reset();
+        changed = true;
+    }
+    return changed;
+}
+
 } // namespace cross::native

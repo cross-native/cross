@@ -68,8 +68,10 @@ enum class LoweringPass : std::uint16_t {
 
 bool prefer_direct_dense_dispatch(const CompilerOptions& options,
                                   std::size_t explicit_cases) {
-    constexpr std::size_t maximum_direct_destinations = 8;
-    return options.optimization_effort >= 3 &&
+    const auto balance = std::min(options.risc_cisc_balance, 100U);
+    const auto maximum_direct_destinations =
+        std::size_t{2} + (std::size_t{6} * balance + 50U) / 100U;
+    return options.jump_tables && options.expensive_optimizations &&
         options.optimize_for == OptimizationGoal::Speed &&
         explicit_cases + 1U <= maximum_direct_destinations;
 }
@@ -1805,7 +1807,7 @@ private:
     }
 
     void fold_splat_constants() {
-        if (options_.optimization_effort == 0) return;
+        if (!options_.machine_combine) return;
         const auto count = current_.virtual_registers.size();
         std::vector<std::optional<machine::ImmediateOperand>> constants(count);
         std::vector<unsigned> uses(count);
@@ -1870,7 +1872,7 @@ private:
     }
 
     void fold_vector_qword_multiply_immediates() {
-        if (options_.optimization_effort == 0) return;
+        if (!options_.machine_combine) return;
         std::vector<const machine::Instruction*> definitions(
             current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
@@ -1962,7 +1964,7 @@ private:
     }
 
     void hoist_vector_qword_multiply_high_halves() {
-        if (options_.optimization_effort < 3 ||
+        if (!options_.vector_combine || !options_.expensive_optimizations ||
             options_.optimize_for != OptimizationGoal::Speed ||
             !subtarget_.has_feature(Feature::Avx2) ||
             subtarget_.has_feature(Feature::Avx512dq) ||
@@ -2114,7 +2116,7 @@ private:
     }
 
     void fold_vector_shift_immediates() {
-        if (options_.optimization_effort == 0) return;
+        if (!options_.machine_combine) return;
         std::vector<const machine::Instruction*> definitions(
             current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
@@ -2182,7 +2184,7 @@ private:
     }
 
     void recognize_vector_byte_swaps() {
-        if (options_.optimization_effort < 2 ||
+        if (!options_.vector_combine ||
             options_.code_model == CodeModel::Medium ||
             options_.code_model == CodeModel::Large) {
             return;
@@ -2305,7 +2307,7 @@ private:
     }
 
     void hoist_vector_byte_swap_masks() {
-        if (options_.optimization_effort < 3 ||
+        if (!options_.vector_combine || !options_.expensive_optimizations ||
             options_.optimize_for != OptimizationGoal::Speed ||
             current_.entry.value >= current_.blocks.size()) {
             return;
@@ -2389,7 +2391,7 @@ private:
     }
 
     void eliminate_dead_machine_values() {
-        if (!options_.tree_dce) return;
+        if (!options_.machine_dce) return;
         const unsigned native_vector_bits =
             subtarget_.has_feature(Feature::Avx512f) ? 512U :
             subtarget_.has_feature(Feature::Avx2) ? 256U : 128U;
@@ -2452,7 +2454,7 @@ private:
         // SSA allocation artificially raises SIMD pressure across loops.
         // Medium and large data models cannot assume the pool is within a
         // signed 32-bit displacement, so retain their addressable fallback.
-        if (options_.optimization_effort < 2 ||
+        if (!options_.rematerialize ||
             options_.code_model == CodeModel::Medium ||
             options_.code_model == CodeModel::Large ||
             manual_plans_.find(current_.source)) {
@@ -2535,7 +2537,7 @@ private:
     }
 
     void fuse_vector_reductions() {
-        if (options_.optimization_effort < 2) return;
+        if (!options_.vector_combine) return;
 
         const auto count = current_.virtual_registers.size();
         std::vector<unsigned> use_counts(count);
@@ -2818,7 +2820,7 @@ private:
     }
 
     void select_binary_immediates() {
-        if (options_.optimization_effort == 0) return;
+        if (!options_.machine_combine) return;
         std::vector<std::optional<machine::ImmediateOperand>> constants(
             current_.virtual_registers.size());
         std::vector<unsigned> uses(current_.virtual_registers.size());
@@ -2929,7 +2931,7 @@ private:
     }
 
     void combine_machine_immediates() {
-        if (!options_.peephole2) return;
+        if (!options_.machine_combine) return;
         bool changed = true;
         while (changed) {
             changed = false;
@@ -3068,7 +3070,7 @@ private:
     }
 
     void eliminate_redundant_machine_expressions() {
-        if (!options_.tree_fre) return;
+        if (!options_.machine_cse) return;
         const auto eligible = [](const machine::Instruction& instruction) {
             const auto opcode = instruction.opcode;
             return instruction.uses.size() == 1 &&
@@ -3088,7 +3090,7 @@ private:
     }
 
     void eliminate_redundant_machine_loads() {
-        if (!options_.tree_fre) return;
+        if (!options_.machine_load_cse) return;
         const auto eligible = [](const machine::Instruction& instruction) {
             const auto& opcode = instruction.opcode;
             return opcode == Opcode::Load || opcode == Opcode::Fload ||
@@ -3107,7 +3109,7 @@ private:
     }
 
     void fuse_scalar_division_results() {
-        if (!options_.peephole2) return;
+        if (!options_.machine_combine) return;
         const auto quotient_kind = [](machine::TargetOpcodeId opcode) {
             return opcode == Opcode::Sdiv || opcode == Opcode::Udiv;
         };
@@ -3174,7 +3176,7 @@ private:
     }
 
     void fuse_compare_branches() {
-        if (options_.optimization_effort == 0) return;
+        if (!options_.compare_branch_fusion) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -3374,7 +3376,7 @@ private:
     }
 
     void hoist_vector_comparison_sign_masks() {
-        if (options_.optimization_effort < 3 ||
+        if (!options_.vector_combine || !options_.expensive_optimizations ||
             options_.optimize_for != OptimizationGoal::Speed ||
             !subtarget_.has_feature(Feature::Avx2) ||
             current_.entry.value >= current_.blocks.size()) {
@@ -3673,7 +3675,7 @@ private:
     }
 
     void form_dense_jump_tables() {
-        if (options_.optimization_effort < 2 ||
+        if (!options_.jump_tables ||
             options_.code_model != CodeModel::Small) {
             return;
         }
@@ -3897,7 +3899,7 @@ private:
     }
 
     void fuse_compare_selects() {
-        if (!options_.if_conversion) return;
+        if (!options_.compare_select_fusion) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -4060,7 +4062,8 @@ private:
     }
 
     void fuse_vector_sign_selects() {
-        if (!options_.if_conversion || !subtarget_.has_feature(Feature::Avx)) {
+        if (!options_.compare_select_fusion ||
+            !subtarget_.has_feature(Feature::Avx)) {
             return;
         }
         const auto count = current_.virtual_registers.size();
@@ -4213,7 +4216,7 @@ private:
     }
 
     void fold_indexed_memory_addresses() {
-        if (options_.optimization_effort == 0) return;
+        if (!options_.combine_addresses) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -4429,7 +4432,7 @@ private:
     }
 
     void fold_vector_memory_operands() {
-        if (options_.optimization_effort < 2) return;
+        if (!options_.fold_memory_operands) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -4548,7 +4551,7 @@ private:
     }
 
     void fold_scalar_memory_operands() {
-        if (options_.optimization_effort < 2) return;
+        if (!options_.fold_memory_operands) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -4666,7 +4669,7 @@ private:
     }
 
     void fold_float_memory_operands() {
-        if (options_.optimization_effort < 2) return;
+        if (!options_.fold_memory_operands) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -4814,7 +4817,7 @@ private:
         if (count < 2) return;
         std::unordered_map<std::uint32_t, std::uint32_t>
             backedge_phi_sources;
-        if (options_.optimization_effort >= 3 &&
+        if (options_.schedule_insns && options_.expensive_optimizations &&
             options_.optimize_for == OptimizationGoal::Speed) {
             const auto reaches_owner = [&](machine::BlockId start) {
                 std::vector<machine::BlockId> pending{start};
@@ -4951,7 +4954,7 @@ private:
         // clobbering arithmetic first lets late emission place TEST ahead of
         // a flag-preserving LEA chain and hide the flags-to-CMOV latency.
         std::vector<bool> prefer_early(count);
-        if (options_.optimization_effort >= 3 &&
+        if (options_.schedule_insns && options_.expensive_optimizations &&
             options_.optimize_for == OptimizationGoal::Speed) {
             // A definition carried from this block into a phi on a genuine
             // backedge is next-iteration setup.  Once its current-iteration
@@ -5106,7 +5109,7 @@ private:
     }
 
     void schedule_blocks() {
-        if (options_.optimization_effort < 2) return;
+        if (!options_.schedule_insns) return;
         for (auto& block : current_.blocks) {
             std::size_t begin = 0;
             while (begin < block.instructions.size()) {
@@ -5126,7 +5129,7 @@ private:
     }
 
     void cluster_shared_compare_selects() {
-        if (!options_.if_conversion || options_.optimization_effort < 2 ||
+        if (!options_.compare_select_fusion || !options_.schedule_insns ||
             options_.optimize_for != OptimizationGoal::Speed) {
             return;
         }
@@ -5204,7 +5207,7 @@ private:
     }
 
     void schedule_block_layout() {
-        if (options_.optimization_effort < 2 || current_.layout.size() < 2) {
+        if (!options_.reorder_blocks || current_.layout.size() < 2) {
             return;
         }
         const auto original = current_.layout;
@@ -5501,7 +5504,7 @@ private:
     }
 
     void schedule_across_blocks() {
-        if (options_.optimization_effort < 2 || current_.layout.size() < 2) {
+        if (!options_.schedule_insns2 || current_.layout.size() < 2) {
             return;
         }
         const auto has_addressable_label = [&](machine::BlockId id) {
@@ -5533,7 +5536,7 @@ private:
                 predecessor.successors.size() == 1 &&
                 predecessor.successors.front() == successor.id;
             const bool speculate =
-                !linear && options_.optimization_effort >= 3 &&
+                !linear && options_.expensive_optimizations &&
                 options_.optimize_for == OptimizationGoal::Speed &&
                 kind == machine::InstructionKind::ConditionalBranch &&
                 std::find(predecessor.successors.begin(),
@@ -5582,7 +5585,7 @@ private:
     }
 
     void allocate_registers() {
-        if (options_.optimization_effort < 2 ||
+        if (!options_.register_allocation ||
             manual_plans_.find(current_.source) ||
             std::any_of(current_.stack_slots.begin(),
                         current_.stack_slots.end(),
@@ -10910,7 +10913,6 @@ private:
         fused_adds_.clear();
         fused_multiplications_.clear();
         if (options_.fp_contract != FpContractMode::Fast ||
-            options_.optimization_effort == 0 ||
             !subtarget_.has_feature(Feature::Fma)) {
             return;
         }
@@ -11089,7 +11091,8 @@ private:
         const machine::Function& function) {
         speculative_vector_advances_.clear();
         speculative_vector_advance_adds_.clear();
-        if (!options_.peephole2 || options_.optimization_effort < 3 ||
+        if (!options_.peephole2 || !options_.vector_combine ||
+            !options_.expensive_optimizations ||
             options_.optimize_for != OptimizationGoal::Speed) {
             return;
         }
@@ -19929,7 +19932,7 @@ private:
         const machine::Function& function,
         const machine::Instruction& call,
         const machine::Instruction& result) const {
-        if (options_.optimization_effort == 0 ||
+        if (!options_.optimize_sibling_calls ||
             options_.code_model == CodeModel::Large || dynamic_stack_ ||
             function.frame.outgoing_argument_size != 0 ||
             call.kind != machine::InstructionKind::Call ||
@@ -21533,7 +21536,8 @@ private:
         }
         std::vector<const machine::Instruction*> early_test_before(
             value.instructions.size());
-        if (options_.optimization_effort >= 3 &&
+        if (options_.compare_select_fusion && options_.schedule_insns &&
+            options_.expensive_optimizations &&
             options_.optimize_for == OptimizationGoal::Speed) {
             for (std::size_t index = 0;
                  index < value.instructions.size(); ++index) {

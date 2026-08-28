@@ -7419,32 +7419,45 @@ bool safely_speculatable_for_if_conversion(
 }
 
 unsigned if_conversion_cost(const ManagedValue& value,
-                            const hir::Module& hir_module) {
+                            const hir::Module& hir_module,
+                            const CompilerOptions& options) {
+    constexpr unsigned cost_scale = 100;
+    const auto blended = [&](unsigned risc, unsigned cisc) {
+        const auto balance = std::min(options.risc_cisc_balance, 100U);
+        return risc * (100U - balance) + cisc * balance;
+    };
     switch (value.kind) {
-    case ValueKind::ConstantInteger:
-    case ValueKind::SlotAddress:
-    case ValueKind::GlobalAddress:
     case ValueKind::Intrinsic:
         // These normally disappear into an immediate/addressing mode or are
         // pure metadata. Counting every MIR node equally used to make the
         // decision depend on front-end spelling instead of generated work.
         return 0;
+    case ValueKind::ConstantInteger:
+        // A CISC target commonly absorbs the literal into its consumer;
+        // load/store RISCs more often need an explicit materialization.
+        return blended(1U, 0U);
+    case ValueKind::SlotAddress:
+    case ValueKind::GlobalAddress:
+        return blended(2U, 1U);
     case ValueKind::Cast:
-        return value.cast == CastOperation::Reinterpret ? 0U : 1U;
+        return value.cast == CastOperation::Reinterpret ? 0U : cost_scale;
     case ValueKind::Binary:
-        if (value.binary == BinaryOperation::Multiply) return 3U;
+        if (value.binary == BinaryOperation::Multiply) {
+            return blended(4U, 3U);
+        }
         if (value.binary == BinaryOperation::ShiftLeft ||
             value.binary == BinaryOperation::ShiftRightArithmetic ||
             value.binary == BinaryOperation::ShiftRightLogical ||
             value.binary == BinaryOperation::RotateLeft ||
             value.binary == BinaryOperation::RotateRight) {
-            return 2U;
+            return blended(1U, 2U);
         }
-        return 1U;
+        return cost_scale;
     case ValueKind::Unary:
-        return 1U;
+        return cost_scale;
     default:
-        return std::max(1U, type_bits(hir_module, value.type) / 64U);
+        return std::max(1U, type_bits(hir_module, value.type) / 64U) *
+               cost_scale;
     }
 }
 
@@ -7592,7 +7605,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
         }
         return expected == 0 && length >= 4;
     };
-    if (options.optimization_effort >= 2 && dense_equality_tail()) {
+    if (options.jump_tables && dense_equality_tail()) {
         return false;
     }
 
@@ -7618,18 +7631,18 @@ bool if_convert_one_diamond(ManagedFunction& function,
     if (!pure_arm(truth) || !pure_arm(falsity)) return false;
 
     const auto profitable = [&](unsigned cost) {
-        unsigned limit = options.optimize_for == OptimizationGoal::MinimumSize ? 3U
-            : options.optimize_for == OptimizationGoal::Size ? 5U
-            : options.optimization_effort >= 3 ? 12U : 6U;
+        constexpr unsigned cost_scale = 100;
+        unsigned limit = options.if_conversion_limit * cost_scale;
         // A low-bit test of loaded data commonly has little branch
         // predictability. Once allocation and if-conversion are enabled,
         // tolerate a few more cheap, nontrapping integer operations to replace
         // its misprediction with a select. Other diamonds retain the ordinary
         // profile-sensitive threshold because simultaneously live arm values
         // can cost more save/restore code than CMOV removes.
-        if (options.optimization_effort >= 2 &&
-            masked_memory_condition(function, condition)) {
-            limit = std::max(limit, 12U);
+        if (masked_memory_condition(function, condition)) {
+            limit = std::max(
+                limit,
+                options.if_conversion_memory_limit * cost_scale);
         }
         return cost <= limit;
     };
@@ -7637,7 +7650,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
         unsigned result{};
         for (const auto id : arm.values) {
             result += if_conversion_cost(
-                function.values[id.value], hir_module);
+                function.values[id.value], hir_module, options);
         }
         return result;
     };
@@ -9014,10 +9027,7 @@ void unroll_loops(ManagedFunction& function,
                   const hir::Module& hir_module,
                   const CompilerOptions& options,
                   std::span<const CanonicalLoop> loops) {
-    if (options.optimize_for != OptimizationGoal::Speed ||
-        options.optimization_effort < 2) {
-        return;
-    }
+    if (options.unroll_factor < 2) return;
     for (const auto& loop : loops) {
         const auto pattern =
             find_unrollable_loop(function, hir_module, loop);
@@ -9053,13 +9063,14 @@ void unroll_loops(ManagedFunction& function,
                 return floating_type(hir_module,
                                      function.values[id.value].type);
             });
-        const unsigned factor =
+        const unsigned preferred =
             body_cost <= 24 &&
                 (contains_select || contains_ordered_store || !reads_memory ||
-                 (options.optimization_effort >= 3 &&
+                 (options.unroll_factor >= 4 &&
                   contains_floating_recurrence))
                 ? 4U
                 : 2U;
+        const unsigned factor = std::min(preferred, options.unroll_factor);
         (void)unroll_loop(function, *pattern, hir_module, factor);
     }
 }
@@ -9621,14 +9632,15 @@ bool vectorize_reduction_loop(
     };
     const auto conditional_depth = select_depth(pattern.term);
     // Independent accumulators hide packed-add latency and let targets issue
-    // several loads per cycle. At the highest optimization effort, use four
-    // streams for store loops too. AVX2 i64 multiplication is the exception:
+    // several loads per cycle. The model-defined vector-interleave budget can
+    // permit four streams for store loops too. AVX2 i64 multiplication is the
+    // exception:
     // without AVX-512DQ every multiply expands into a long instruction chain,
     // and four simultaneous chains exceed the sixteen-register AVX2 file.
-    // Keep that form at two streams to avoid hot-loop spills. O2 also keeps
-    // the smaller two-stream form to limit code size and preserved-register
-    // pressure. A vector select has substantially higher live pressure and
-    // remains capped at two streams.
+    // Keep that form at two streams to avoid hot-loop spills. A profile may
+    // likewise select a smaller budget to limit code size and
+    // preserved-register pressure. A vector select has substantially higher
+    // live pressure and remains capped at two streams.
     // Strict floating reductions retain a single carrier because changing
     // their addition order is observable.
     const bool expanded_avx2_qword_multiply =
@@ -9641,10 +9653,9 @@ bool vectorize_reduction_loop(
                         return value.kind == ValueKind::Binary &&
                                value.binary == BinaryOperation::Multiply;
                     });
-    const unsigned memory_interleave =
-        options.optimization_effort >= 3 &&
-                !expanded_avx2_qword_multiply
-            ? 4U : 2U;
+    const unsigned memory_interleave = expanded_avx2_qword_multiply
+        ? std::min(options.vector_interleave, 2U)
+        : options.vector_interleave;
     const unsigned interleave = reassociate
         ? (conditional_depth >= 2U
                ? 1U
@@ -11716,10 +11727,6 @@ bool vectorize_early_exit_loops(ManagedFunction& function,
                                 const CompilerOptions& options,
                                 std::span<const CanonicalLoop> loops,
                                 const UseLists& uses) {
-    if (options.optimize_for != OptimizationGoal::Speed ||
-        options.optimization_effort < 3) {
-        return false;
-    }
     bool changed = false;
     const auto definitions = value_definition_blocks(function);
     for (const auto& loop : loops) {
@@ -11936,7 +11943,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             });
     }
     if (options.tree_ccp) {
-        const auto rounds = std::max(1U, options.optimization_effort);
+        const auto rounds = std::max(1U, options.ccp_rounds);
         for (unsigned round = 0; round < rounds; ++round) {
             pipeline.add(
                 PassId::ConstantFolding,
@@ -11963,7 +11970,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                                : PassResult::unchanged();
             });
     }
-    if (options.tree_ccp && options.optimization_effort >= 2) {
+    if (options.thread_jumps) {
         pipeline.add(
             PassId::BranchThreading,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
@@ -11997,7 +12004,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     // Preserve complete diamonds until if-conversion has had the opportunity
     // to form semantic selects. Forwarding one empty arm first would turn a
     // diamond into a triangle and hide the target-independent conversion.
-    if (options.optimization_effort != 0) {
+    if (options.tree_cfg_cleanup) {
         pipeline.add(
             PassId::ForwardingBlockElimination,
             [](ManagedFunction& function, FunctionAnalysisManager&) {
@@ -12014,7 +12021,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
-    if (options.tree_copy_prop && options.optimization_effort >= 2) {
+    if (options.ivopts) {
         pipeline.add(
             PassId::InductionCoalescing,
             [&](ManagedFunction& function,
@@ -12049,6 +12056,8 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     analyses.loops().canonical_loops());
                 return PassResult::changed_cfg();
             });
+    }
+    if (options.tree_early_exit_vectorize) {
         pipeline.add(
             PassId::EarlyExitVectorization,
             [&](ManagedFunction& function,
@@ -12139,7 +12148,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     // Simplification and loop transforms can expose equivalent recurrences
     // after the first induction pass. Canonicalize them while SSA IDs are
     // still sparse; final DCE performs the safe global compaction.
-    if (options.tree_copy_prop && options.optimization_effort >= 2) {
+    if (options.ivopts) {
         pipeline.add(
             PassId::InductionCoalescing,
             [&](ManagedFunction& function,
@@ -12162,7 +12171,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
-    if (options.optimization_effort != 0) {
+    if (options.tree_cfg_cleanup) {
         pipeline.add(
             PassId::ForwardingBlockElimination,
             [](ManagedFunction& function, FunctionAnalysisManager&) {

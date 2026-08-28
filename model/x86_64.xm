@@ -1140,6 +1140,7 @@ profile "x86_64-windows" {
     target = "x86_64-w64-windows-gnu";
     abi = "cross";
     mangling = "cross";
+    m.risc-cisc-balance = 100;
 }
 
 profile "x86_64-elf" {
@@ -1147,5 +1148,6 @@ profile "x86_64-elf" {
     target = "x86_64-unknown-linux-gnu";
     abi = "cross";
     mangling = "cross";
+    m.risc-cisc-balance = 100;
     m.red-zone = true;
 }
