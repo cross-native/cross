@@ -46,7 +46,7 @@ run_cc(memory-object -c -O2 -mprofile=vr4300-o32
 file(READ "${big_assembly}" assembly)
 foreach(pattern
         ".set mips3"
-        "\\.frame[\t ]+\\$fp,"
+        "\\.frame[\t ]+\\$sp,"
         "[\t ]daddu[\t ]"
         "[\t ]mul\\.d[\t ]"
         "[\t ]mov\\.d[\t ][^\n]*[$]f12"

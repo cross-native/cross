@@ -11,6 +11,14 @@ global u32 mips_memory(in u32 *base, in u32 index, in u32 value) {
     return mips_global;
 }
 
+// Keep the address as an ABI-captured pointer all the way to a folded
+// displacement.  On MIPS III/o32 this checks that KSEG addresses are
+// canonicalized before a direct memory operand dereferences them.
+[[noinline]]
+global u32 mips_direct_load(in const u32 *base) {
+    return base[1];
+}
+
 [[noinline]]
 global u32 mips_atomic_add(in u32 value) {
     return $::atomic_fetch_add(

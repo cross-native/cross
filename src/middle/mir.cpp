@@ -8359,6 +8359,305 @@ void coalesce_equivalent_inductions(ManagedFunction& function,
     }
 }
 
+bool reduce_affine_address_inductions(
+    ManagedFunction& function, const hir::Module& hir_module,
+    const TargetInfo& target, const CompilerOptions& options,
+    std::span<const CanonicalLoop> input_loops) {
+    struct Access {
+        ValueId load;
+        BlockId block;
+        std::uint64_t element_offset{};
+    };
+    struct Group {
+        ValueId base;
+        hir::TypeId pointer_type;
+        hir::TypeId index_type;
+        std::uint64_t element_size{};
+        std::vector<Access> accesses;
+    };
+
+    bool changed = false;
+    auto loops = std::vector<CanonicalLoop>(input_loops.begin(),
+                                             input_loops.end());
+    std::stable_sort(loops.begin(), loops.end(),
+                     [](const CanonicalLoop& left,
+                        const CanonicalLoop& right) {
+                         return left.blocks.size() < right.blocks.size();
+                     });
+    const auto definition_blocks = value_definition_blocks(function);
+    const auto append = [&](ManagedValue value) {
+        value.id = ValueId{static_cast<std::uint32_t>(
+            function.values.size())};
+        const auto id = value.id;
+        function.values.push_back(std::move(value));
+        return id;
+    };
+
+    for (const auto& loop : loops) {
+        if (loop.header.value >= function.blocks.size() ||
+            loop.preheader.value >= function.blocks.size()) {
+            continue;
+        }
+        const auto header_values =
+            function.blocks[loop.header.value].values;
+        for (const auto index_phi_id : header_values) {
+            if (index_phi_id.value >= function.values.size()) continue;
+            const auto& index_phi = function.values[index_phi_id.value];
+            if (index_phi.kind != ValueKind::Phi ||
+                !integer_type(hir_module, index_phi.type) ||
+                index_phi.incoming.size() != 2) {
+                continue;
+            }
+            const auto initial = std::find_if(
+                index_phi.incoming.begin(), index_phi.incoming.end(),
+                [&](const PhiIncoming& incoming) {
+                    return incoming.predecessor == loop.preheader;
+                });
+            const auto carried = std::find_if(
+                index_phi.incoming.begin(), index_phi.incoming.end(),
+                [&](const PhiIncoming& incoming) {
+                    return incoming.predecessor != loop.preheader;
+                });
+            if (initial == index_phi.incoming.end() ||
+                carried == index_phi.incoming.end() ||
+                !loop.blocks.contains(carried->predecessor.value) ||
+                initial->value.value >= function.values.size() ||
+                carried->value.value >= function.values.size()) {
+                continue;
+            }
+            const auto& initial_value =
+                function.values[initial->value.value];
+            const auto& update = function.values[carried->value.value];
+            if (initial_value.kind != ValueKind::ConstantInteger ||
+                initial_value.integer != 0 ||
+                initial_value.integer_high != 0 ||
+                update.kind != ValueKind::Binary ||
+                update.binary != BinaryOperation::Add ||
+                update.operands.size() != 2) {
+                continue;
+            }
+            std::optional<ValueId> step_id;
+            if (update.operands[0] == index_phi_id) {
+                step_id = update.operands[1];
+            } else if (update.operands[1] == index_phi_id) {
+                step_id = update.operands[0];
+            }
+            if (!step_id || step_id->value >= function.values.size()) {
+                continue;
+            }
+            const auto& step = function.values[step_id->value];
+            if (step.kind != ValueKind::ConstantInteger ||
+                step.integer == 0 || step.integer_high != 0) {
+                continue;
+            }
+            const auto latch = carried->predecessor;
+            const auto index_type = index_phi.type;
+            const auto index_location = index_phi.location;
+            const auto update_location = update.location;
+            const auto step_elements = step.integer;
+
+            const auto affine_offset = [&](ValueId candidate) {
+                std::optional<std::uint64_t> result;
+                std::unordered_set<std::uint32_t> visited;
+                std::function<bool(ValueId, std::uint64_t&)> derive =
+                    [&](ValueId id, std::uint64_t& offset) {
+                        if (id == index_phi_id) {
+                            offset = 0;
+                            return true;
+                        }
+                        if (id.value >= function.values.size() ||
+                            !visited.insert(id.value).second) {
+                            return false;
+                        }
+                        const auto& value = function.values[id.value];
+                        if (value.kind == ValueKind::Cast &&
+                            value.cast == CastOperation::Reinterpret &&
+                            value.operands.size() == 1 &&
+                            type_bits(hir_module, value.type) ==
+                        type_bits(hir_module, index_type)) {
+                            return derive(value.operands.front(), offset);
+                        }
+                        if (value.kind != ValueKind::Binary ||
+                            value.binary != BinaryOperation::Add ||
+                            value.operands.size() != 2) {
+                            return false;
+                        }
+                        for (unsigned side = 0; side < 2; ++side) {
+                            const auto constant_id = value.operands[1U - side];
+                            if (constant_id.value >= function.values.size()) {
+                                continue;
+                            }
+                            const auto& constant =
+                                function.values[constant_id.value];
+                            if (constant.kind != ValueKind::ConstantInteger ||
+                                constant.integer_high != 0) {
+                                continue;
+                            }
+                            std::uint64_t base_offset{};
+                            if (!derive(value.operands[side], base_offset) ||
+                                constant.integer >
+                                    std::numeric_limits<std::uint64_t>::max() -
+                                        base_offset) {
+                                continue;
+                            }
+                            offset = base_offset + constant.integer;
+                            return true;
+                        }
+                        return false;
+                    };
+                std::uint64_t offset{};
+                if (derive(candidate, offset)) result = offset;
+                return result;
+            };
+
+            std::vector<Group> groups;
+            for (const auto raw_block : loop.blocks) {
+                if (raw_block >= function.blocks.size()) continue;
+                const auto block_id = BlockId{raw_block};
+                const auto values = function.blocks[raw_block].values;
+                for (const auto id : values) {
+                    if (id.value >= function.values.size()) continue;
+                    const auto& load = function.values[id.value];
+                    if (load.is_volatile_access) {
+                        continue;
+                    }
+                    std::optional<ValueId> base;
+                    std::optional<ValueId> index;
+                    if (load.kind == ValueKind::IndexedLoad &&
+                        load.operands.size() == 2) {
+                        base = load.operands[0];
+                        index = load.operands[1];
+                    } else if (load.kind == ValueKind::PointerLoad &&
+                               load.operands.size() == 1 &&
+                               load.operands.front().value <
+                                   function.values.size()) {
+                        const auto& address =
+                            function.values[load.operands.front().value];
+                        if (address.kind == ValueKind::IndexedAddress &&
+                            address.operands.size() == 2) {
+                            base = address.operands[0];
+                            index = address.operands[1];
+                        }
+                    }
+                    if (!base || !index) continue;
+                    const auto offset = affine_offset(*index);
+                    if (!offset) continue;
+                    if (base->value >= definition_blocks.size() ||
+                        !definition_blocks[base->value] ||
+                        loop.blocks.contains(
+                            definition_blocks[base->value]->value)) {
+                        continue;
+                    }
+                    const auto& base_value = function.values[base->value];
+                    const auto& pointer = hir_module.type(base_value.type);
+                    if (pointer.kind != hir::Type::Kind::Pointer ||
+                        !pointer.pointee) {
+                        continue;
+                    }
+                    const auto element_size =
+                        storage_size(hir_module, load.type, target);
+                    const auto pointee_size =
+                        storage_size(hir_module, *pointer.pointee, target);
+                    if (element_size == 0 || element_size != pointee_size ||
+                        *offset > static_cast<std::uint64_t>(
+                                      std::numeric_limits<std::int16_t>::max()) /
+                                      element_size ||
+                        step_elements > static_cast<std::uint64_t>(
+                                           std::numeric_limits<std::int16_t>::max()) /
+                                           element_size) {
+                        continue;
+                    }
+                    auto group = std::find_if(
+                        groups.begin(), groups.end(),
+                        [&](const Group& candidate) {
+                            return candidate.base == *base &&
+                                   candidate.element_size == element_size;
+                        });
+                    if (group == groups.end()) {
+                        groups.push_back({*base, base_value.type,
+                                          index_type, element_size, {}});
+                        group = std::prev(groups.end());
+                    }
+                    group->accesses.push_back({id, block_id, *offset});
+                }
+            }
+
+            for (auto& group : groups) {
+                const auto address_cost = group.element_size == 1 ? 1U : 2U;
+                const auto risc_weight =
+                    100U - std::min(options.risc_cisc_balance, 100U);
+                const auto benefit = static_cast<std::uint64_t>(
+                    group.accesses.size()) * address_cost * risc_weight;
+                if (benefit <= 100U) continue;
+
+                ManagedValue pointer_phi;
+                pointer_phi.location = index_location;
+                pointer_phi.type = group.pointer_type;
+                pointer_phi.kind = ValueKind::Phi;
+                const auto pointer_phi_id = append(std::move(pointer_phi));
+
+                ManagedValue pointer_next;
+                pointer_next.location = update_location;
+                pointer_next.type = group.pointer_type;
+                pointer_next.kind = ValueKind::IndexedAddress;
+                pointer_next.operands = {pointer_phi_id, *step_id};
+                const auto pointer_next_id = append(std::move(pointer_next));
+                function.blocks[latch.value].values.push_back(
+                    pointer_next_id);
+
+                auto& completed_phi = function.values[pointer_phi_id.value];
+                completed_phi.incoming = {
+                    {loop.preheader, group.base},
+                    {latch, pointer_next_id}};
+                auto& header = function.blocks[loop.header.value].values;
+                const auto first_non_phi = std::find_if(
+                    header.begin(), header.end(), [&](ValueId id) {
+                        return function.values[id.value].kind != ValueKind::Phi;
+                    });
+                header.insert(first_non_phi, pointer_phi_id);
+
+                std::unordered_map<std::uint64_t, ValueId> offsets;
+                for (const auto& access : group.accesses) {
+                    auto& block = function.blocks[access.block.value];
+                    const auto load_position = std::find(
+                        block.values.begin(), block.values.end(), access.load);
+                    if (load_position == block.values.end()) continue;
+                    ValueId address = pointer_phi_id;
+                    if (access.element_offset != 0) {
+                        auto offset = offsets.find(access.element_offset);
+                        if (offset == offsets.end()) {
+                            ManagedValue constant;
+                            constant.location = index_location;
+                            constant.type = group.index_type;
+                            constant.kind = ValueKind::ConstantInteger;
+                            constant.integer = access.element_offset;
+                            const auto constant_id = append(std::move(constant));
+                            function.blocks[loop.preheader.value].values.push_back(
+                                constant_id);
+                            offset = offsets.emplace(access.element_offset,
+                                                     constant_id).first;
+                        }
+                        ManagedValue lane_address;
+                        lane_address.location =
+                            function.values[access.load.value].location;
+                        lane_address.type = group.pointer_type;
+                        lane_address.kind = ValueKind::IndexedAddress;
+                        lane_address.operands = {pointer_phi_id,
+                                                 offset->second};
+                        address = append(std::move(lane_address));
+                        block.values.insert(load_position, address);
+                    }
+                    auto& load = function.values[access.load.value];
+                    load.kind = ValueKind::PointerLoad;
+                    load.operands = {address};
+                }
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 struct UnrollLoopPattern {
     CanonicalLoop loop;
     BlockId body;
@@ -12160,6 +12459,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                         options.optimize_for ==
                             OptimizationGoal::MinimumSize);
                 return PassResult::changed_values();
+            });
+        pipeline.add(
+            PassId::AddressInductionStrengthReduction,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                const bool changed = reduce_affine_address_inductions(
+                    function, hir_module, subtarget.target(), options,
+                    analyses.loops().canonical_loops());
+                return changed ? PassResult::changed_values()
+                               : PassResult::unchanged();
             });
     }
     if (options.fast_math || options.finite_math_only ||

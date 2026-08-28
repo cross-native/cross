@@ -69,6 +69,13 @@ _start:
         bne     $t1,$t0,.Lfail
         nop
 
+        addiu   $k0,$zero,'D'
+        jal     mips_direct_load
+        nop
+        addiu   $t0,$zero,41
+        bne     $v0,$t0,.Lfail
+        nop
+
         addiu   $k0,$zero,'5'
         addiu   $a0,$zero,5
         jal     mips_atomic_add

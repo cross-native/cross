@@ -26,6 +26,8 @@ std::string_view pass_name(PassId pass) {
     case PassId::RedundantExpressionElimination:
         return "redundant-expression-elimination";
     case PassId::InductionCoalescing: return "induction-coalescing";
+    case PassId::AddressInductionStrengthReduction:
+        return "address-induction-strength-reduction";
     case PassId::LoopInvariantMotion: return "loop-invariant-motion";
     case PassId::ReductionVectorization: return "reduction-vectorization";
     case PassId::EarlyExitVectorization:

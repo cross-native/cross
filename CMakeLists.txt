@@ -248,6 +248,12 @@ if(BUILD_TESTING)
                 -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-o32
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.cmake")
+    add_test(NAME cross_mips_optimization_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/optimization/codegen.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-optimization-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/optimization/codegen.cmake")
     add_test(NAME cross_mips_allegrex
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
