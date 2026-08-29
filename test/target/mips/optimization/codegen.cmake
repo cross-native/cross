@@ -34,7 +34,7 @@ function(compile_unroll_variant name balance)
     execute_process(
         COMMAND "${CC}" -S -O3 -mprofile=vr4300-o32 -funroll-loops
                 -funroll-factor=4 "-mrisc-cisc-balance=${balance}"
-                "${SOURCE}" -o "${OUTPUT}.${name}.s"
+                ${ARGN} "${SOURCE}" -o "${OUTPUT}.${name}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
     if(NOT status EQUAL 0)
         message(FATAL_ERROR
@@ -76,6 +76,7 @@ compile_reassociation_variant(reassoc_cisc_off 100 -fno-unroll-loops
                               -fno-tree-reassoc)
 compile_unroll_variant(unroll_risc 0)
 compile_unroll_variant(unroll_cisc 100)
+compile_unroll_variant(unroll_risc_no_delay 0 -fno-schedule-insns2)
 execute_process(
     COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"
@@ -263,4 +264,16 @@ if(NOT range_default STREQUAL range_branch OR
         "the MIPS profile did not preserve an ordinary range branch or "
         "honor -fif-conversion-limit\n"
         "default:\n${range_default}\nforced:\n${range_forced}")
+endif()
+
+function_body("${OUTPUT}.unroll_risc.s"
+              mips_phi_copy_edge likely_phi_edge)
+function_body("${OUTPUT}.unroll_risc_no_delay.s"
+              mips_phi_copy_edge ordinary_phi_edge)
+if(NOT likely_phi_edge MATCHES
+       "[\t ]b(eq|ne)zl[^\n]*\n[\t ]+move[\t ]" OR
+   ordinary_phi_edge MATCHES "[\t ]b(eq|ne)zl[\t ]")
+    message(FATAL_ERROR
+        "a single MIPS PHI-edge copy did not use an annulled delay slot\n"
+        "enabled:\n${likely_phi_edge}\ndisabled:\n${ordinary_phi_edge}")
 endif()

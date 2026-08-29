@@ -2747,6 +2747,61 @@ private:
         return false;
     }
 
+    struct AssignedPhiCopy {
+        std::string_view source;
+        std::string_view target;
+    };
+
+    std::optional<AssignedPhiCopy> single_assigned_gpr_phi_copy(
+        const machine::Function& function,
+        machine::BlockId predecessor,
+        machine::BlockId successor) const {
+        const auto found = std::find_if(
+            function.blocks.begin(), function.blocks.end(),
+            [&](const machine::Block& candidate) {
+                return candidate.id == successor;
+            });
+        if (found == function.blocks.end()) return std::nullopt;
+        std::optional<AssignedPhiCopy> result;
+        for (const auto& phi : found->instructions) {
+            if (phi.kind != machine::InstructionKind::Target ||
+                phi.opcode != Opcode::Phi || phi.defs.empty()) {
+                continue;
+            }
+            for (std::size_t index = 0;
+                 index + 1 < phi.operands.size(); index += 2) {
+                const auto* incoming = std::get_if<machine::BlockOperand>(
+                    &phi.operands[index]);
+                const auto* source = std::get_if<machine::RegisterOperand>(
+                    &phi.operands[index + 1]);
+                if (!incoming || !source ||
+                    incoming->target != predecessor) {
+                    continue;
+                }
+                const auto target = phi.defs.front();
+                if (same_physical_assignment(
+                        function, source->value, target)) {
+                    break;
+                }
+                const bool scalar_integer =
+                    target.kind == machine::RegisterKind::Virtual &&
+                    target.id < function.virtual_register_classes.size() &&
+                    function.virtual_register_classes[target.id] ==
+                        machine::VirtualRegisterClass::Integer &&
+                    !legalizes_to_pair(target) && target.mode.bits <= 64;
+                const auto source_gpr = assigned_gpr(
+                    function, source->value);
+                const auto target_gpr = assigned_gpr(function, target);
+                if (!scalar_integer || !source_gpr || !target_gpr || result) {
+                    return std::nullopt;
+                }
+                result = AssignedPhiCopy{*source_gpr, *target_gpr};
+                break;
+            }
+        }
+        return result;
+    }
+
     std::string local_label(const machine::Function& function) {
         return ".Lcross.mips." + std::to_string(function.source.value) +
                ".tmp." + std::to_string(next_label_++);
@@ -6228,6 +6283,35 @@ void AssemblyEmitter::emit_terminator(
             instruction("b", block_label(function, no));
             instruction("nop");
             return;
+        }
+        // A branch-likely executes its delay slot only on the taken edge.
+        // When the taken edge needs exactly one assigned-register PHI copy
+        // and the no-copy edge is the layout successor, place that move in
+        // the annulled slot.  This removes both edge stubs without executing
+        // the copy on the fallthrough path.
+        if (options_.schedule_insns2 &&
+            subtarget_.has_feature(Feature::BranchLikely)) {
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            if (next == yes && !yes_copies) {
+                if (const auto copy = single_assigned_gpr_phi_copy(
+                        function, predecessor, no)) {
+                    instruction("beqzl", reg_name(condition_gpr) + "," +
+                                             block_label(function, no));
+                    instruction("move", reg_name(copy->target) + "," +
+                                            reg_name(copy->source));
+                    return;
+                }
+            } else if (next == no && !no_copies) {
+                if (const auto copy = single_assigned_gpr_phi_copy(
+                        function, predecessor, yes)) {
+                    instruction("bnezl", reg_name(condition_gpr) + "," +
+                                             block_label(function, yes));
+                    instruction("move", reg_name(copy->target) + "," +
+                                            reg_name(copy->source));
+                    return;
+                }
+            }
         }
         const auto yes_edge = local_label(function);
         const auto condition_gpr = input_gpr(

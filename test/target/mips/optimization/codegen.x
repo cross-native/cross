@@ -161,3 +161,18 @@ global u64 mips_range_select(in const u64 *source, in uptr index) {
     }
     return selected;
 }
+
+[[abi("o32"), noinline]]
+global u64 mips_phi_copy_edge(in const u64 *data,
+                              in const u64 *indices,
+                              in uptr count) {
+    u64 result = 0u64;
+    uptr slot = 0;
+    uptr index = 0;
+    while (index < count) {
+        slot = indices[slot] & (count - 1);
+        result ^= data[slot] + index;
+        index += 1;
+    }
+    return result ^ slot;
+}
