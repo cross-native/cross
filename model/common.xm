@@ -20,6 +20,7 @@ optimization "O0" {
     f.ivopts = false;
     f.move-loop-invariants = false;
     f.unroll-loops = false;
+    f.tree-reassoc = false;
     f.tree-loop-vectorize = false;
     f.tree-early-exit-vectorize = false;
     f.tree-slp-vectorize = false;
@@ -104,6 +105,7 @@ optimization "O2" {
     f.tree-loop-vectorize = true;
     f.tree-slp-vectorize = true;
     f.unroll-loops = true;
+    f.tree-reassoc = true;
     f.vector-combine = true;
     f.machine-cse = true;
     f.machine-load-cse = true;

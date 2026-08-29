@@ -341,6 +341,9 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.unroll-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "unroll target-independent loops when legality and profitability are proven"},
+        {"f.tree-reassoc", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "rebalance legal associative SSA expressions under target cost policy"},
         {"f.tree-loop-vectorize", {}, OptionValueKind::Boolean, false, {},
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Partial,
@@ -702,6 +705,7 @@ bool resolve_registered_options(
     options.move_loop_invariants =
         resolved_bool(options, "f.move-loop-invariants");
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");
+    options.tree_reassoc = resolved_bool(options, "f.tree-reassoc");
     options.tree_loop_vectorize =
         resolved_bool(options, "f.tree-loop-vectorize");
     options.tree_early_exit_vectorize =

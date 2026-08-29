@@ -18,6 +18,18 @@ function(compile_variant name)
     endif()
 endfunction()
 
+function(compile_reassociation_variant name balance)
+    execute_process(
+        COMMAND "${CC}" -S -O3 -mprofile=vr4300-o32
+                "-mrisc-cisc-balance=${balance}" ${ARGN} "${SOURCE}"
+                -o "${OUTPUT}.${name}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR
+            "${name} MIPS reassociation compilation failed\n${stdout}\n${stderr}")
+    endif()
+endfunction()
+
 function(function_body output symbol result)
     file(READ "${output}" assembly)
     string(FIND "${assembly}" "${symbol}:" start)
@@ -39,6 +51,10 @@ compile_variant(no_tail -fno-optimize-sibling-calls)
 compile_variant(no_fusion -fno-compare-branch-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
+compile_reassociation_variant(reassoc_risc 0)
+compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
+compile_reassociation_variant(reassoc_cisc 100)
+compile_reassociation_variant(reassoc_cisc_off 100 -fno-tree-reassoc)
 execute_process(
     COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"
@@ -124,4 +140,22 @@ function_body("${OUTPUT}.enabled.s" mips_volatile_narrow_mask volatile_load)
 if(NOT volatile_load MATCHES "[	 ]ld[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)")
     message(FATAL_ERROR
         "bit propagation changed a volatile load width\n${volatile_load}")
+endif()
+
+function_body("${OUTPUT}.reassoc_risc.s"
+              mips_reassociation_pressure reassoc_risc)
+function_body("${OUTPUT}.reassoc_risc_off.s"
+              mips_reassociation_pressure reassoc_risc_off)
+if(NOT reassoc_risc STREQUAL reassoc_risc_off)
+    message(FATAL_ERROR
+        "the RISC endpoint accepted a pressure-increasing reassociation\n"
+        "enabled:\n${reassoc_risc}\ndisabled:\n${reassoc_risc_off}")
+endif()
+function_body("${OUTPUT}.reassoc_cisc.s"
+              mips_reassociation_pressure reassoc_cisc)
+function_body("${OUTPUT}.reassoc_cisc_off.s"
+              mips_reassociation_pressure reassoc_cisc_off)
+if(reassoc_cisc STREQUAL reassoc_cisc_off)
+    message(FATAL_ERROR
+        "the CISC endpoint did not accept a dependency-shortening reassociation")
 endif()

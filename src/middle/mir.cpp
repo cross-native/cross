@@ -9385,9 +9385,9 @@ void unroll_loops(ManagedFunction& function,
 // effect keep their original evaluation graph.  Signed addition is excluded
 // because reassociation could introduce overflow into a source execution that
 // did not previously overflow.
-void rebalance_unrolled_unsigned_add_recurrences(
+bool rebalance_unrolled_unsigned_add_recurrences(
     ManagedFunction& function, const hir::Module& hir_module,
-    const UseLists& use_lists) {
+    const CompilerOptions& options, const UseLists& use_lists) {
     struct Candidate {
         ValueId phi;
         std::size_t incoming_index{};
@@ -9467,6 +9467,30 @@ void rebalance_unrolled_unsigned_add_recurrences(
                 }
                 std::erase(leaves, phi_id);
                 if (leaves.size() < 2) continue;
+
+                // Reassociation shortens the loop-carried dependency by one
+                // add per independent term, but every term then remains live
+                // until the contribution tree is complete. Blend the two
+                // costs continuously: a load/store RISC endpoint prefers the
+                // original short live ranges, while a CISC/OoO endpoint can
+                // profit from the shallower recurrence. Wider-than-register
+                // values pay proportionally more pressure.
+                const auto balance =
+                    std::min(options.risc_cisc_balance, 100U);
+                const auto blended = [&](unsigned risc, unsigned cisc) {
+                    return static_cast<std::uint64_t>(risc) *
+                               (100U - balance) +
+                           static_cast<std::uint64_t>(cisc) * balance;
+                };
+                const auto independent_terms = leaves.size() - 1U;
+                const auto pressure_units = std::max(
+                    1U, (type_bits(hir_module, phi.type) + 63U) / 64U);
+                const auto dependency_benefit =
+                    independent_terms * blended(1U, 3U);
+                const auto live_range_cost = independent_terms *
+                    pressure_units * blended(3U, 1U);
+                if (dependency_benefit <= live_range_cost) continue;
+
                 std::sort(leaves.begin(), leaves.end(),
                           [](ValueId left, ValueId right) {
                               return left.value < right.value;
@@ -9513,6 +9537,7 @@ void rebalance_unrolled_unsigned_add_recurrences(
             .incoming[candidate.incoming_index]
             .value = root;
     }
+    return !candidates.empty();
 }
 
 bool scalar_vector_element(const hir::Module& hir_module,
@@ -12380,14 +12405,18 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                              analyses.loops().canonical_loops());
                 return PassResult::changed_cfg();
             });
-        pipeline.add(
-            PassId::RecurrenceRebalancing,
-            [&](ManagedFunction& function,
-                FunctionAnalysisManager& analyses) {
-                rebalance_unrolled_unsigned_add_recurrences(function,
-                    hir_module, analyses.uses());
-                return PassResult::changed_values();
-            });
+        if (options.tree_reassoc) {
+            pipeline.add(
+                PassId::RecurrenceRebalancing,
+                [&](ManagedFunction& function,
+                    FunctionAnalysisManager& analyses) {
+                    return rebalance_unrolled_unsigned_add_recurrences(
+                               function, hir_module, options,
+                               analyses.uses())
+                        ? PassResult::changed_values()
+                        : PassResult::unchanged();
+                });
+        }
     }
     if (options.tree_slp_vectorize) {
         pipeline.add(
