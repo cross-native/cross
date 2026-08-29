@@ -65,6 +65,7 @@ compile_variant(grouped_select -fif-conversion-limit=12)
 compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
                 -fno-compare-select-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
+compile_variant(no_machine_combine -fno-machine-combine)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_variant(no_if_conversion -fno-if-conversion)
 compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
@@ -139,6 +140,31 @@ endif()
 if(NOT empty_delay MATCHES "[	 ]b(eq|ne)[^\n]*\n[	 ]+nop")
     message(FATAL_ERROR
         "-fno-schedule-insns2 did not leave the delay slot empty\n${empty_delay}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_integer_immediates integer_immediates)
+foreach(pattern
+        "[	 ]addiu[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,17"
+        "[	 ]xori[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,255"
+        "[	 ]srl[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,13"
+        "[	 ]addiu[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,-32768"
+        "[	 ]andi[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,65535")
+    if(NOT integer_immediates MATCHES "${pattern}")
+        message(FATAL_ERROR
+            "MIPS integer immediate selection is missing '${pattern}'\n"
+            "${integer_immediates}")
+    endif()
+endforeach()
+function_body("${OUTPUT}.no_machine_combine.s"
+              mips_integer_immediates register_constants)
+if(register_constants MATCHES
+       "[	 ](addiu|xori|andi)[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,(17|255|-32768|65535)" OR
+   register_constants MATCHES
+       "[	 ]srl[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,13")
+    message(FATAL_ERROR
+        "-fno-machine-combine did not preserve register constants\n"
+        "${register_constants}")
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_narrow_mask narrow_big)
@@ -225,9 +251,9 @@ string(REGEX MATCH
        pressure_cisc_frame "${pressure_cisc}")
 set(pressure_cisc_frame_size "${CMAKE_MATCH_1}")
 if(pressure_risc_frame STREQUAL "" OR pressure_cisc_frame STREQUAL "" OR
-   NOT pressure_risc_frame_size LESS pressure_cisc_frame_size)
+   pressure_risc_frame_size GREATER pressure_cisc_frame_size)
     message(FATAL_ERROR
-        "the RISC store-loop frame was not smaller than the CISC frame\n"
+        "the RISC store-loop frame exceeded the CISC frame\n"
         "RISC (${pressure_risc_frame_size}):\n${pressure_risc}\n"
         "CISC (${pressure_cisc_frame_size}):\n${pressure_cisc}")
 endif()

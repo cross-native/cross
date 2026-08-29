@@ -33,6 +33,7 @@ namespace {
 
 enum class LoweringPass : std::uint16_t {
     PropagateCopies,
+    SelectIntegerImmediates,
     FoldPointerOffsets,
     EliminateRedundantExpressions,
     EliminateRedundantLoads,
@@ -1829,6 +1830,127 @@ private:
         return changed;
     }
 
+    bool select_integer_immediates(machine::Function& function) {
+        if (!options_.machine_combine) return false;
+
+        std::vector<std::optional<machine::ImmediateOperand>> constants(
+            function.virtual_registers.size());
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (decode_opcode(instruction.opcode) != Opcode::Constant ||
+                    instruction.defs.size() != 1 ||
+                    instruction.defs.front().kind !=
+                        machine::RegisterKind::Virtual ||
+                    instruction.operands.empty()) {
+                    continue;
+                }
+                const auto* immediate =
+                    std::get_if<machine::ImmediateOperand>(
+                        &instruction.operands.front());
+                const auto id = instruction.defs.front().id;
+                if (immediate && id < constants.size()) {
+                    constants[id] = *immediate;
+                }
+            }
+        }
+
+        const auto constant_for = [&](machine::Register value)
+            -> const machine::ImmediateOperand* {
+            if (value.kind != machine::RegisterKind::Virtual ||
+                value.id >= constants.size() || !constants[value.id]) {
+                return nullptr;
+            }
+            return &*constants[value.id];
+        };
+        const auto signed_value = [](const machine::ImmediateOperand& value,
+                                     unsigned bits) {
+            auto raw = value.value;
+            if (bits < 64) {
+                const auto mask = (std::uint64_t{1} << bits) - 1U;
+                raw &= mask;
+                if ((raw & (std::uint64_t{1} << (bits - 1U))) != 0) {
+                    raw |= ~mask;
+                }
+            }
+            return static_cast<std::int64_t>(raw);
+        };
+        const auto fits_signed_16 = [](std::int64_t value) {
+            return value >= std::numeric_limits<std::int16_t>::min() &&
+                   value <= std::numeric_limits<std::int16_t>::max();
+        };
+
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (instruction.kind != machine::InstructionKind::Target ||
+                    instruction.uses.size() != 2 ||
+                    instruction.defs.size() != 1) {
+                    continue;
+                }
+                auto opcode = decode_opcode(instruction.opcode);
+                const bool commutative =
+                    opcode == Opcode::Add || opcode == Opcode::And ||
+                    opcode == Opcode::Or || opcode == Opcode::Xor;
+                auto variable = instruction.uses[0];
+                auto* immediate = constant_for(instruction.uses[1]);
+                if (!immediate && commutative) {
+                    immediate = constant_for(instruction.uses[0]);
+                    variable = instruction.uses[1];
+                }
+                if (!immediate || immediate->high != 0 ||
+                    variable.mode.bits < 32 || variable.mode.bits > 64 ||
+                    (variable.mode.bits > 32 &&
+                     !subtarget_.has_feature(Feature::Mips3))) {
+                    continue;
+                }
+
+                auto selected = *immediate;
+                selected.mode = variable.mode;
+                bool encodable = false;
+                if (opcode == Opcode::Add || opcode == Opcode::Sub) {
+                    // ADDIU/DADDIU sign-extend their 16-bit field. Interpret
+                    // the source constant modulo the value width, then use
+                    // addition for both x+C and x-C when the resulting field
+                    // is representable.
+                    auto amount = signed_value(
+                        selected, variable.mode.bits);
+                    if (opcode == Opcode::Sub) {
+                        if (amount == std::numeric_limits<std::int64_t>::min()) {
+                            continue;
+                        }
+                        amount = -amount;
+                    }
+                    if (fits_signed_16(amount)) {
+                        selected.value =
+                            static_cast<std::uint64_t>(amount);
+                        selected.high = 0;
+                        selected.is_signed = true;
+                        instruction.opcode = Opcode::Add;
+                        encodable = true;
+                    }
+                } else if (opcode == Opcode::And || opcode == Opcode::Or ||
+                           opcode == Opcode::Xor) {
+                    // Logical immediates are zero-extended. Wider masks keep
+                    // their register form so upper bits remain exact.
+                    encodable = selected.value <= 0xffffU;
+                    selected.is_signed = false;
+                } else if (opcode == Opcode::Shl || opcode == Opcode::ShrS ||
+                           opcode == Opcode::ShrU) {
+                    selected.value %= variable.mode.bits;
+                    selected.is_signed = false;
+                    encodable = true;
+                }
+                if (!encodable) continue;
+
+                instruction.uses = {variable};
+                instruction.operands = {
+                    machine::RegisterOperand{variable}, selected};
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     bool scheduling_barrier(const machine::Instruction& instruction) const {
         if (instruction.kind != machine::InstructionKind::Target ||
             instruction.may_store || instruction.has_side_effects ||
@@ -2356,6 +2478,12 @@ private:
                 };
                 return native::propagate_virtual_register_copies(
                     function, is_copy);
+            });
+        passes.add(
+            {{LoweringPass::SelectIntegerImmediates},
+             Stage::InstructionCombining, "select-integer-immediates"},
+            [this](machine::Function& function) {
+                return select_integer_immediates(function);
             });
         passes.add(
             {{LoweringPass::FoldPointerOffsets},
@@ -4897,9 +5025,15 @@ void AssemblyEmitter::emit_integer_pair_binary(
 void AssemblyEmitter::emit_integer_binary(
     const machine::Function& function,
     const machine::Instruction& value) {
-    if (value.uses.size() < 2 || value.defs.empty()) return;
+    if (value.uses.empty() || value.defs.empty() ||
+        value.operands.size() < 2) {
+        return;
+    }
     const auto left = value.uses[0];
-    const auto right = value.uses[1];
+    const auto* immediate =
+        std::get_if<machine::ImmediateOperand>(&value.operands[1]);
+    if (!immediate && value.uses.size() < 2) return;
+    const auto right = immediate ? machine::Register{} : value.uses[1];
     const auto target = value.defs.front();
     const bool wide = left.mode.bits > 32;
     if (wide && !subtarget_.has_feature(Feature::Mips3)) {
@@ -4917,7 +5051,7 @@ void AssemblyEmitter::emit_integer_binary(
         ? (load_vreg(function, left, "t0", value.location),
            std::string_view{"t0"})
         : input_gpr(function, left, "t0", value.location);
-    const auto right_gpr = fixed_rotate
+    const auto right_gpr = immediate ? std::string_view{} : fixed_rotate
         ? (load_vreg(function, right, "t1", value.location),
            std::string_view{"t1"})
         : input_gpr(function, right, "t1", value.location);
@@ -4928,9 +5062,33 @@ void AssemblyEmitter::emit_integer_binary(
         return reg_name(target_gpr) + "," + reg_name(left_gpr) + "," +
             reg_name(right_gpr);
     };
+    const auto immediate_text = [&] {
+        return immediate->is_signed
+            ? std::to_string(static_cast<std::int64_t>(immediate->value))
+            : std::to_string(immediate->value);
+    };
+    const auto immediate_operands = [&] {
+        return reg_name(target_gpr) + "," + reg_name(left_gpr) + "," +
+            immediate_text();
+    };
+    const auto shift_immediate = [&](std::string_view narrow,
+                                     std::string_view low,
+                                     std::string_view high) {
+        auto amount = static_cast<unsigned>(immediate->value);
+        auto mnemonic = narrow;
+        if (wide) {
+            mnemonic = amount < 32 ? low : high;
+            amount %= 32;
+        }
+        instruction(mnemonic, reg_name(target_gpr) + "," +
+                                  reg_name(left_gpr) + "," +
+                                  std::to_string(amount));
+    };
     switch (opcode) {
     case Opcode::Add:
-        instruction(wide ? "daddu" : "addu", binary_operands());
+        instruction(immediate ? (wide ? "daddiu" : "addiu")
+                              : (wide ? "daddu" : "addu"),
+                    immediate ? immediate_operands() : binary_operands());
         break;
     case Opcode::Sub:
         instruction(wide ? "dsubu" : "subu", binary_operands());
@@ -4956,17 +5114,29 @@ void AssemblyEmitter::emit_integer_binary(
         instruction(value.opcode == Opcode::Urem ? "mfhi" : "mflo",
                     reg_name(target_gpr));
         break;
-    case Opcode::And: instruction("and", binary_operands()); break;
-    case Opcode::Or: instruction("or", binary_operands()); break;
-    case Opcode::Xor: instruction("xor", binary_operands()); break;
+    case Opcode::And:
+        instruction(immediate ? "andi" : "and",
+                    immediate ? immediate_operands() : binary_operands());
+        break;
+    case Opcode::Or:
+        instruction(immediate ? "ori" : "or",
+                    immediate ? immediate_operands() : binary_operands());
+        break;
+    case Opcode::Xor:
+        instruction(immediate ? "xori" : "xor",
+                    immediate ? immediate_operands() : binary_operands());
+        break;
     case Opcode::Shl:
-        instruction(wide ? "dsllv" : "sllv", binary_operands());
+        if (immediate) shift_immediate("sll", "dsll", "dsll32");
+        else instruction(wide ? "dsllv" : "sllv", binary_operands());
         break;
     case Opcode::ShrS:
-        instruction(wide ? "dsrav" : "srav", binary_operands());
+        if (immediate) shift_immediate("sra", "dsra", "dsra32");
+        else instruction(wide ? "dsrav" : "srav", binary_operands());
         break;
     case Opcode::ShrU:
-        instruction(wide ? "dsrlv" : "srlv", binary_operands());
+        if (immediate) shift_immediate("srl", "dsrl", "dsrl32");
+        else instruction(wide ? "dsrlv" : "srlv", binary_operands());
         break;
     case Opcode::Rotl:
         if (!wide && subtarget_.has_feature(Feature::Rotate)) {

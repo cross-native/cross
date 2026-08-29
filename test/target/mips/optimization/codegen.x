@@ -36,6 +36,15 @@ global i32 mips_delay_branch(in i32 value, in i32 addend) {
 }
 
 [[abi("o32"), noinline]]
+global u32 mips_integer_immediates(in u32 value) {
+    u32 result = value + 17u32;
+    result = result ^ 255u32;
+    result = result >> 13u32;
+    result = result - 32768u32;
+    return result & 65535u32;
+}
+
+[[abi("o32"), noinline]]
 global u32 mips_narrow_mask(in const u64 *data, in uptr index,
                             in u32 mask) {
     return data[index] & mask;
