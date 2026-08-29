@@ -444,7 +444,7 @@ def parse_hotblocks(output: str) -> tuple[HotBlock, ...]:
     reader = csv.DictReader(
         io.StringIO("\n".join(lines[start:])), skipinitialspace=True
     )
-    blocks: dict[int, HotBlock] = {}
+    blocks: dict[tuple[int, int], HotBlock] = {}
     try:
         for row in reader:
             pc = int(row["pc"], 0) & 0xFFFFFFFF
@@ -455,16 +455,21 @@ def parse_hotblocks(output: str) -> tuple[HotBlock, ...]:
                 raise ValueError
             if execution_count == 0:
                 continue
-            if pc in blocks:
-                raise BenchmarkError(
-                    f"QEMU hotblocks output contains duplicate PC 0x{pc:08x}"
-                )
-            blocks[pc] = HotBlock(pc, instruction_count, execution_count)
+            key = (pc, instruction_count)
+            previous = blocks.get(key)
+            blocks[key] = HotBlock(
+                pc,
+                instruction_count,
+                execution_count
+                + (previous.execution_count if previous is not None else 0),
+            )
     except (KeyError, TypeError, ValueError) as error:
         raise BenchmarkError("QEMU hotblocks output contains an invalid row") from error
     if not blocks:
         raise BenchmarkError("QEMU hotblocks output contains no executed blocks")
-    return tuple(sorted(blocks.values(), key=lambda value: value.pc))
+    return tuple(
+        sorted(blocks.values(), key=lambda value: (value.pc, value.instruction_count))
+    )
 
 
 def parse_link_map_code_ranges(

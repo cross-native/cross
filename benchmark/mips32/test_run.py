@@ -96,10 +96,12 @@ pc, tcount, icount, ecount
         benchmark.HotBlock(0x80101234, 4, 7),
         benchmark.HotBlock(0xBFC00000, 1, 3),
     )
-    with pytest.raises(benchmark.BenchmarkError, match="duplicate PC"):
-        benchmark.parse_hotblocks(
-            "pc,tcount,icount,ecount\n0x1000,1,1,1\n0x1000,1,1,1\n"
-        )
+    assert benchmark.parse_hotblocks(
+        "pc,tcount,icount,ecount\n" "0x1000,1,1,1\n" "0x1000,2,1,2\n" "0x1000,1,2,4\n"
+    ) == (
+        benchmark.HotBlock(0x1000, 1, 3),
+        benchmark.HotBlock(0x1000, 2, 4),
+    )
 
 
 def test_link_map_ranges_select_candidate_and_runtime_text() -> None:
