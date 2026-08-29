@@ -1243,11 +1243,14 @@ def slugify(value: str, limit: int = 64) -> str:
 async def discover_revision(trunk: Path) -> tuple[str, str]:
     """Return full revision identity and a commit-addressed directory name."""
 
-    commit = (await run_command(("git", "rev-parse", "HEAD"))).stdout.strip()
+    git = ("git", "-C", trunk)
+    commit = (await run_command((*git, "rev-parse", "HEAD"))).stdout.strip()
     subject = (
-        await run_command(("git", "show", "-s", "--format=%s", "HEAD"))
+        await run_command((*git, "show", "-s", "--format=%s", "HEAD"))
     ).stdout.strip()
-    dirty = bool((await run_command(("git", "status", "--porcelain"))).stdout.strip())
+    dirty = bool(
+        (await run_command((*git, "status", "--porcelain"))).stdout.strip()
+    )
     directory = f"{commit[:8]}-{slugify(subject)}" + ("-dirty" if dirty else "")
     return commit + ("-dirty" if dirty else ""), directory
 
