@@ -14,6 +14,8 @@ std::string_view pass_name(PassId pass) {
     case PassId::CopyPropagation: return "copy-propagation";
     case PassId::ConstantFolding: return "constant-folding";
     case PassId::IntegerSimplification: return "integer-simplification";
+    case PassId::BitwiseValueNarrowing:
+        return "bitwise-value-narrowing";
     case PassId::BitwiseCanonicalization:
         return "bitwise-canonicalization";
     case PassId::BranchFolding: return "branch-folding";

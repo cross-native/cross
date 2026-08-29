@@ -16,6 +16,7 @@ enum class PassId : std::uint8_t {
     CopyPropagation,
     ConstantFolding,
     IntegerSimplification,
+    BitwiseValueNarrowing,
     BitwiseCanonicalization,
     BranchFolding,
     BranchThreading,

@@ -12431,6 +12431,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
+    if (options.tree_bit_ccp) {
+        pipeline.add(
+            PassId::BitwiseValueNarrowing,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return narrow_bitwise_values(
+                           function, hir_module, subtarget.target())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
+    }
     // Keep shift/or forms visible to loop and SLP vectorization. Scalar
     // survivors become target-independent rotates only after those passes,
     // and -fpeephole2 remains independent from -ftree-ccp.

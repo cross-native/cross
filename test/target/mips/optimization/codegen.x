@@ -34,3 +34,15 @@ global i32 mips_delay_branch(in i32 value, in i32 addend) {
     if (value == 0) return adjusted + 1;
     return adjusted - 1;
 }
+
+[[abi("o32"), noinline]]
+global u32 mips_narrow_mask(in const u64 *data, in uptr index,
+                            in u32 mask) {
+    return data[index] & mask;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_volatile_narrow_mask(in volatile u64 *data,
+                                     in uptr index, in u32 mask) {
+    return data[index] & mask;
+}

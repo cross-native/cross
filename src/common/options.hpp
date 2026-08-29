@@ -114,6 +114,7 @@ struct CompilerOptions {
     bool evaluate_calls{true};
     bool omit_frame_pointer{};
     bool tree_ccp{};
+    bool tree_bit_ccp{};
     bool tree_copy_prop{};
     bool tree_dce{};
     bool tree_dse{};

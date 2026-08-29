@@ -78,7 +78,7 @@ int main() {
     ok = expect(o2 && o2->tree_ccp && o2->tree_copy_prop &&
                     o2->tree_dce && o2->tree_dse && o2->tree_fre &&
                     o2->tree_tail_merge &&
-                    o2->inline_functions && o2->ipa_ra &&
+                    o2->inline_functions && o2->tree_bit_ccp && o2->ipa_ra &&
                     o2->ipa_pure_const &&
                     o2->private_abi && !o2->ipa_cp_clone &&
                     o2->inline_unit_limit == 96 &&
@@ -96,6 +96,7 @@ int main() {
          "-fno-tree-dse", "-fno-tree-tail-merge", "-fno-ipa-ra",
          "-fno-ipa-pure-const", "-fno-expensive-optimizations"});
     ok = expect(o3_override && o3_override->tree_ccp &&
+                    o3_override->tree_bit_ccp &&
                     !o3_override->tree_dce &&
                     !o3_override->tree_dse &&
                     !o3_override->tree_tail_merge &&
@@ -130,11 +131,12 @@ int main() {
 
     const auto explicit_o0 = parse(
         {"cc", "-O0", "-finline-functions", "-ftree-ccp",
-         "-finline-limit=17", "-fmachine-cse",
+         "-fno-tree-bit-ccp", "-finline-limit=17", "-fmachine-cse",
          "-fregister-allocation", "-fccp-rounds=4",
          "-funroll-factor=3", "-fexpensive-optimizations"});
     ok = expect(explicit_o0 && explicit_o0->inline_functions &&
                     explicit_o0->tree_ccp &&
+                    !explicit_o0->tree_bit_ccp &&
                     explicit_o0->inline_unit_limit == 17 &&
                     explicit_o0->machine_cse &&
                     explicit_o0->register_allocation &&

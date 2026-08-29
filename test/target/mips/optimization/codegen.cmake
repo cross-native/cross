@@ -38,6 +38,19 @@ compile_variant(no_iv -fno-ivopts)
 compile_variant(no_tail -fno-optimize-sibling-calls)
 compile_variant(no_fusion -fno-compare-branch-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
+compile_variant(no_bit_ccp -fno-tree-bit-ccp)
+execute_process(
+    COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
+            -march=vr4300 -fno-unroll-loops "${SOURCE}"
+            -o "${OUTPUT}.little.s"
+    RESULT_VARIABLE little_status
+    OUTPUT_VARIABLE little_stdout
+    ERROR_VARIABLE little_stderr)
+if(NOT little_status EQUAL 0)
+    message(FATAL_ERROR
+        "little-endian MIPS optimization compilation failed\n"
+        "${little_stdout}\n${little_stderr}")
+endif()
 
 function_body("${OUTPUT}.enabled.s" mips_affine_sum affine)
 foreach(pattern
@@ -88,4 +101,27 @@ endif()
 if(NOT empty_delay MATCHES "[	 ]b(eq|ne)[^\n]*\n[	 ]+nop")
     message(FATAL_ERROR
         "-fno-schedule-insns2 did not leave the delay slot empty\n${empty_delay}")
+endif()
+
+function_body("${OUTPUT}.enabled.s" mips_narrow_mask narrow_big)
+if(NOT narrow_big MATCHES "[	 ]lwu[	 ][^\n]*,4\\(\\$[a-z0-9]+\\)" OR
+   narrow_big MATCHES "[	 ]ld[	 ]")
+    message(FATAL_ERROR
+        "big-endian masked truncation was not narrowed at +4\n${narrow_big}")
+endif()
+function_body("${OUTPUT}.little.s" mips_narrow_mask narrow_little)
+if(NOT narrow_little MATCHES "[	 ]lwu[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)" OR
+   narrow_little MATCHES "[	 ]ld[	 ]")
+    message(FATAL_ERROR
+        "little-endian masked truncation was not narrowed at +0\n${narrow_little}")
+endif()
+function_body("${OUTPUT}.no_bit_ccp.s" mips_narrow_mask wide_load)
+if(NOT wide_load MATCHES "[	 ]ld[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)")
+    message(FATAL_ERROR
+        "-fno-tree-bit-ccp did not preserve the wide load\n${wide_load}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_volatile_narrow_mask volatile_load)
+if(NOT volatile_load MATCHES "[	 ]ld[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)")
+    message(FATAL_ERROR
+        "bit propagation changed a volatile load width\n${volatile_load}")
 endif()

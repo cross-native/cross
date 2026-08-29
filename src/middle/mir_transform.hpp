@@ -12,6 +12,9 @@ namespace cross::mir {
 [[nodiscard]] bool
 canonicalize_bitwise_operations(ManagedFunction& function,
                                 const hir::Module& hir_module);
+[[nodiscard]] bool narrow_bitwise_values(
+    ManagedFunction& function, hir::Module& hir_module,
+    const TargetInfo& target);
 [[nodiscard]] bool eliminate_forwarding_blocks(ManagedFunction& function);
 [[nodiscard]] bool factor_common_phi_tails(
     ManagedFunction& function, const hir::Module& hir_module);

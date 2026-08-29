@@ -6,6 +6,7 @@
 #include "middle/mir_analysis.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -48,6 +49,250 @@ unsigned scalar_integer_bits(const hir::Module& module, hir::TypeId id) {
         return 0;
     }
     return 0;
+}
+
+void replace_value_uses(ManagedFunction& function, ValueId from,
+                        ValueId to) {
+    for (auto& value : function.values) {
+        for (auto& operand : value.operands) {
+            if (operand == from) operand = to;
+        }
+        for (auto& argument : value.call_arguments) {
+            if (argument.value == from) argument.value = to;
+        }
+        for (auto& incoming : value.incoming) {
+            if (incoming.value == from) incoming.value = to;
+        }
+    }
+    for (auto& block : function.blocks) {
+        if (block.terminator.value == from) block.terminator.value = to;
+    }
+}
+
+void remove_values(ManagedFunction& function,
+                   const std::unordered_set<std::uint32_t>& removed) {
+    if (removed.empty()) return;
+    for (auto& block : function.blocks) {
+        std::erase_if(block.values, [&](ValueId value) {
+            return removed.contains(value.value);
+        });
+    }
+    compact_managed_values(function);
+}
+
+bool commute_masked_truncations(ManagedFunction& function,
+                                const hir::Module& hir_module) {
+    const UseLists uses(function);
+    std::unordered_set<std::uint32_t> removed;
+    bool changed = false;
+    for (auto& block : function.blocks) {
+        for (std::size_t position = 0; position < block.values.size();
+             ++position) {
+            const auto truncate_id = block.values[position];
+            const auto truncate = function.values[truncate_id.value];
+            if (truncate.kind != ValueKind::Cast ||
+                truncate.cast != CastOperation::Truncate ||
+                truncate.operands.size() != 1 ||
+                scalar_integer_bits(hir_module, truncate.type) == 0) {
+                continue;
+            }
+            const auto and_id = truncate.operands.front();
+            if (and_id.value >= function.values.size()) continue;
+            const auto bit_and = function.values[and_id.value];
+            const auto wide_bits =
+                scalar_integer_bits(hir_module, bit_and.type);
+            const auto narrow_bits =
+                scalar_integer_bits(hir_module, truncate.type);
+            if (bit_and.kind != ValueKind::Binary ||
+                bit_and.binary != BinaryOperation::BitAnd ||
+                bit_and.operands.size() != 2 || wide_bits <= narrow_bits) {
+                continue;
+            }
+
+            std::optional<ValueId> narrow_mask;
+            ValueId wide_value{};
+            for (unsigned mask_index = 0; mask_index < 2; ++mask_index) {
+                const auto extend_id = bit_and.operands[mask_index];
+                if (extend_id.value >= function.values.size()) continue;
+                const auto& extend = function.values[extend_id.value];
+                if (extend.kind != ValueKind::Cast ||
+                    extend.cast != CastOperation::ZeroExtend ||
+                    extend.type != bit_and.type ||
+                    extend.operands.size() != 1 ||
+                    function.values[extend.operands.front().value].type !=
+                        truncate.type) {
+                    continue;
+                }
+                narrow_mask = extend.operands.front();
+                wide_value = bit_and.operands[1U - mask_index];
+                break;
+            }
+            if (!narrow_mask || wide_value.value >= function.values.size() ||
+                function.values[wide_value.value].type != bit_and.type) {
+                continue;
+            }
+
+            ManagedValue narrow;
+            narrow.id = {
+                static_cast<std::uint32_t>(function.values.size())};
+            narrow.location = truncate.location;
+            narrow.type = truncate.type;
+            narrow.kind = ValueKind::Cast;
+            narrow.cast = CastOperation::Truncate;
+            narrow.operands = {wide_value};
+            const auto narrow_id = narrow.id;
+            function.values.push_back(std::move(narrow));
+
+            auto& replacement = function.values[truncate_id.value];
+            replacement.kind = ValueKind::Binary;
+            replacement.binary = BinaryOperation::BitAnd;
+            replacement.operands = {narrow_id, *narrow_mask};
+            block.values.insert(
+                block.values.begin() +
+                    static_cast<std::ptrdiff_t>(position),
+                narrow_id);
+            ++position;
+            if (uses.uses(and_id).size() == 1) {
+                removed.insert(and_id.value);
+            }
+            changed = true;
+        }
+    }
+    remove_values(function, removed);
+    return changed;
+}
+
+bool narrow_single_use_integer_loads(ManagedFunction& function,
+                                     hir::Module& hir_module,
+                                     const TargetInfo& target) {
+    const UseLists uses(function);
+    std::unordered_set<std::uint32_t> removed;
+    bool changed = false;
+    for (const auto& block : function.blocks) {
+        // New address values are inserted in the load's defining block, which
+        // can differ from the truncation's block. Iterate a stable copy here.
+        const auto values = block.values;
+        for (const auto truncate_id : values) {
+            const auto truncate = function.values[truncate_id.value];
+            if (truncate.kind != ValueKind::Cast ||
+                truncate.cast != CastOperation::Truncate ||
+                truncate.operands.size() != 1) {
+                continue;
+            }
+            const auto target_bits =
+                scalar_integer_bits(hir_module, truncate.type);
+            const auto load_id = truncate.operands.front();
+            if (target_bits == 0 || load_id.value >= function.values.size()) {
+                continue;
+            }
+            const auto load = function.values[load_id.value];
+            const auto source_bits =
+                scalar_integer_bits(hir_module, load.type);
+            const auto& load_uses = uses.uses(load_id);
+            if ((load.kind != ValueKind::PointerLoad &&
+                 load.kind != ValueKind::IndexedLoad) ||
+                load.is_volatile_access || source_bits <= target_bits ||
+                source_bits % 8U != 0 || target_bits % 8U != 0 ||
+                load_uses.size() != 1 || !load_uses.front().user ||
+                *load_uses.front().user != truncate_id) {
+                continue;
+            }
+            const auto source_bytes = source_bits / 8U;
+            const auto target_bytes = target_bits / 8U;
+            const auto byte_offset =
+                target.data_layout.byte_order == ByteOrder::Big
+                    ? source_bytes - target_bytes
+                    : 0U;
+            if (target_bytes == 0 || byte_offset % target_bytes != 0) {
+                continue;
+            }
+
+            const auto load_block_id = uses.definition_block(load_id);
+            if (!load_block_id) continue;
+            auto& load_block = function.blocks[load_block_id->value];
+            const auto load_position = std::find(
+                load_block.values.begin(), load_block.values.end(), load_id);
+            if (load_position == load_block.values.end()) continue;
+
+            std::vector<ValueId> address_values;
+            ValueId wide_address{};
+            if (load.kind == ValueKind::IndexedLoad) {
+                if (load.operands.size() != 2) continue;
+                ManagedValue address;
+                address.id = {
+                    static_cast<std::uint32_t>(function.values.size())};
+                address.location = load.location;
+                address.type =
+                    function.values[load.operands.front().value].type;
+                address.kind = ValueKind::IndexedAddress;
+                address.operands = load.operands;
+                wide_address = address.id;
+                function.values.push_back(std::move(address));
+                address_values.push_back(wide_address);
+            } else {
+                if (load.operands.size() != 1) continue;
+                wide_address = load.operands.front();
+            }
+
+            const auto narrow_pointer = hir_module.pointer_to(truncate.type);
+            ManagedValue reinterpret;
+            reinterpret.id = {
+                static_cast<std::uint32_t>(function.values.size())};
+            reinterpret.location = load.location;
+            reinterpret.type = narrow_pointer;
+            reinterpret.kind = ValueKind::Cast;
+            reinterpret.cast = CastOperation::Reinterpret;
+            reinterpret.operands = {wide_address};
+            auto narrow_address = reinterpret.id;
+            function.values.push_back(std::move(reinterpret));
+            address_values.push_back(narrow_address);
+
+            if (byte_offset != 0) {
+                ManagedValue offset;
+                offset.id = {
+                    static_cast<std::uint32_t>(function.values.size())};
+                offset.location = load.location;
+                offset.type = *hir_module.builtin(BuiltinType::Uptr);
+                offset.kind = ValueKind::ConstantInteger;
+                offset.integer = byte_offset / target_bytes;
+                const auto offset_id = offset.id;
+                function.values.push_back(std::move(offset));
+                address_values.push_back(offset_id);
+
+                ManagedValue address;
+                address.id = {
+                    static_cast<std::uint32_t>(function.values.size())};
+                address.location = load.location;
+                address.type = narrow_pointer;
+                address.kind = ValueKind::IndexedAddress;
+                address.operands = {narrow_address, offset_id};
+                narrow_address = address.id;
+                function.values.push_back(std::move(address));
+                address_values.push_back(narrow_address);
+            }
+
+            const auto insertion = static_cast<std::size_t>(
+                load_position - load_block.values.begin());
+            load_block.values.insert(
+                load_block.values.begin() +
+                    static_cast<std::ptrdiff_t>(insertion),
+                address_values.begin(), address_values.end());
+
+            auto& replacement = function.values[load_id.value];
+            replacement.kind = ValueKind::PointerLoad;
+            replacement.type = truncate.type;
+            replacement.operands = {narrow_address};
+            if (replacement.memory_alignment != 0 && byte_offset != 0) {
+                replacement.memory_alignment = std::gcd(
+                    replacement.memory_alignment, byte_offset);
+            }
+            replace_value_uses(function, truncate_id, load_id);
+            removed.insert(truncate_id.value);
+            changed = true;
+        }
+    }
+    remove_values(function, removed);
+    return changed;
 }
 
 bool canonicalize_bitwise_operations_impl(ManagedFunction& function,
@@ -682,6 +927,16 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
 bool canonicalize_bitwise_operations(ManagedFunction& function,
                                      const hir::Module& hir_module) {
     return canonicalize_bitwise_operations_impl(function, hir_module);
+}
+
+bool narrow_bitwise_values(ManagedFunction& function,
+                           hir::Module& hir_module,
+                           const TargetInfo& target) {
+    const bool commuted =
+        commute_masked_truncations(function, hir_module);
+    const bool narrowed =
+        narrow_single_use_integer_loads(function, hir_module, target);
+    return commuted || narrowed;
 }
 
 void compact_managed_values(ManagedFunction& function) {

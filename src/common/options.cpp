@@ -307,6 +307,9 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.tree-ccp", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "scalar constant propagation and folding"},
+        {"f.tree-bit-ccp", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "propagate integer known bits and narrow compatible memory reads"},
         {"f.tree-copy-prop", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "SSA copy and trivial phi propagation"},
@@ -684,6 +687,7 @@ bool resolve_registered_options(
     options.loop_alignment = static_cast<unsigned>(
         resolved_unsigned(options, "f.align-loops"));
     options.tree_ccp = resolved_bool(options, "f.tree-ccp");
+    options.tree_bit_ccp = resolved_bool(options, "f.tree-bit-ccp");
     options.tree_copy_prop =
         resolved_bool(options, "f.tree-copy-prop");
     options.tree_dce = resolved_bool(options, "f.tree-dce");
