@@ -27,6 +27,16 @@ model. Checksums must agree bit-for-bit across every pipeline and preset.
 Runtime results use the median CP0 Count delta under deterministic QEMU
 `-icount`. This is a dynamic-execution proxy useful for compiler comparisons;
 it is not a claim about VR4300 hardware cycles, caches, or pipeline stalls.
+An opt-in pipeline layer builds an isolated two-invocation runner for every
+kernel, records QEMU's executed translation blocks, and weights LLVM-MCA's
+generic MIPS3 dependency/resource costs by those dynamic counts. Candidate
+objects and any linked `libgcc` helpers are included; runner, startup, and
+wrapper code are excluded by link-map origin. This is a better operation-cost
+estimate than raw instruction count, but LLVM's generic one-wide MIPS3 model is
+not a calibrated VR4300: cross-block dependencies, branch prediction, caches,
+and TLB behavior remain unmodeled. Repeating each block independently can also
+overstate dependencies for calls and other blocks that are not actual
+self-loops, so the layer is a comparative diagnostic rather than a cycle oracle.
 Text and load-image bytes are reported separately after subtracting the common
 runner/startup footprint. Linker padding and extracted runtime support remain
 charged to the candidate. The intended objectives are `O3` for speed and `Oz`
@@ -44,12 +54,26 @@ For a shorter validation run:
 python trunk/benchmark/mips32/run.py --levels O3 --samples 3 --run-name quick
 ```
 
+To add the path-weighted LLVM-MCA estimate (the driver auto-discovers QEMU's
+contributed hotblocks plugin beside the emulator when installed):
+
+```text
+python trunk/benchmark/mips32/run.py --levels O3 --samples 3 \
+  --pipeline-timing --run-name pipeline
+```
+
+Use `--qemu-hotblocks-plugin <path>` when the plugin is installed elsewhere.
+`--mca-iterations` controls the repeated-block simulation length and defaults
+to 100. Pipeline timing is deliberately opt-in because it links and executes a
+separate image for every kernel and compiler path.
+
 Results are grouped by source revision under:
 
 ```text
 build/benchmark/mips32/<commit>-<subject>[-dirty]/<run-name>/
 ```
 
-The output includes `report.md`, `build.csv`, `image.csv`, `runtime.csv`,
-metadata, exact generated GIMPLE, GCC optimized-GIMPLE and final-RTL dumps,
-link maps, objects, linked images, and disassembly.
+The output includes `report.md`, `build.csv`, `code_size.csv`, `image.csv`,
+`runtime.csv`, metadata, exact generated GIMPLE, GCC optimized-GIMPLE and
+final-RTL dumps, link maps, objects, linked images, and disassembly. A modeled
+run also emits `pipeline.csv` plus each hotblock trace, MCA input, and MCA JSON.

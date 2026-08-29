@@ -55,6 +55,7 @@ class Tools:
     target_ld: Path
     lld: Path
     qemu: Path
+    llvm_mca: Path | None
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,9 @@ class Configuration:
     revision_directory: str
     libgcc: Path
     libgcc_symbols: frozenset[str]
+    pipeline_timing: bool
+    qemu_hotblocks_plugin: Path | None
+    mca_iterations: int
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,52 @@ class RuntimeRecord:
     median_ticks: int
     ticks_per_unit: float
     checksum: str
+
+
+@dataclass(frozen=True)
+class CodeRange:
+    """One linked executable range attributed to candidate code."""
+
+    start: int
+    end: int
+    origin: str
+
+
+@dataclass(frozen=True)
+class HotBlock:
+    """One QEMU translation block and its dynamic execution count."""
+
+    pc: int
+    instruction_count: int
+    execution_count: int
+
+
+@dataclass(frozen=True)
+class McaBlockCost:
+    """LLVM-MCA steady-state costs for one translated block."""
+
+    name: str
+    instruction_count: int
+    modeled_cycles: float
+    throughput_cycles: float
+
+
+@dataclass(frozen=True)
+class PipelineRecord:
+    """QEMU-path-weighted LLVM-MCA estimate for one kernel invocation."""
+
+    compiler: str
+    level: str
+    category: str
+    kernel: str
+    work_units: int
+    dynamic_instructions: int
+    instructions_per_unit: float
+    modeled_cycles: float
+    cycles_per_unit: float
+    throughput_cycles: float
+    throughput_cycles_per_unit: float
+    executed_blocks: int
 
 
 UNITS: tuple[str, ...] = (
@@ -206,6 +256,35 @@ def resolve_tool(value: str, description: str) -> Path:
     if found is None:
         raise BenchmarkError(f"cannot find {description}: {value}")
     return Path(found).resolve()
+
+
+def resolve_existing_file(value: Path | str, description: str) -> Path:
+    """Resolve a non-executable support file."""
+
+    candidate = Path(value).expanduser().resolve()
+    if not candidate.is_file():
+        raise BenchmarkError(f"cannot find {description}: {value}")
+    return candidate
+
+
+def discover_hotblocks_plugin(qemu: Path) -> Path | None:
+    """Find QEMU's contributed hotblocks plugin beside a resolved emulator."""
+
+    names = (
+        "libhotblocks.dll" if sys.platform == "win32" else "libhotblocks.so",
+        "hotblocks.dll" if sys.platform == "win32" else "hotblocks.so",
+    )
+    roots = (qemu.parent.parent / "lib", qemu.parent.parent / "lib64")
+    for root in roots:
+        for relative in (
+            Path("qemu/plugins/contrib"),
+            Path("qemu/plugins"),
+        ):
+            for name in names:
+                candidate = root / relative / name
+                if candidate.is_file():
+                    return candidate.resolve()
+    return None
 
 
 def parse_levels(value: str) -> tuple[str, ...]:
@@ -348,6 +427,262 @@ def parse_nm_function_sizes(output: str, prefix: str = "bench_") -> dict[str, in
     return sizes
 
 
+def parse_hotblocks(output: str) -> tuple[HotBlock, ...]:
+    """Parse QEMU's hotblocks plugin table and normalize PCs to ELF32."""
+
+    lines = output.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if "".join(line.lower().split()) == "pc,tcount,icount,ecount"
+        ),
+        None,
+    )
+    if start is None:
+        raise BenchmarkError("QEMU hotblocks output contains no CSV header")
+    reader = csv.DictReader(
+        io.StringIO("\n".join(lines[start:])), skipinitialspace=True
+    )
+    blocks: dict[int, HotBlock] = {}
+    try:
+        for row in reader:
+            pc = int(row["pc"], 0) & 0xFFFFFFFF
+            translation_count = int(row["tcount"], 0)
+            instruction_count = int(row["icount"], 0)
+            execution_count = int(row["ecount"], 0)
+            if translation_count <= 0 or instruction_count <= 0 or execution_count < 0:
+                raise ValueError
+            if execution_count == 0:
+                continue
+            if pc in blocks:
+                raise BenchmarkError(
+                    f"QEMU hotblocks output contains duplicate PC 0x{pc:08x}"
+                )
+            blocks[pc] = HotBlock(pc, instruction_count, execution_count)
+    except (KeyError, TypeError, ValueError) as error:
+        raise BenchmarkError("QEMU hotblocks output contains an invalid row") from error
+    if not blocks:
+        raise BenchmarkError("QEMU hotblocks output contains no executed blocks")
+    return tuple(sorted(blocks.values(), key=lambda value: value.pc))
+
+
+def parse_link_map_code_ranges(
+    output: str, included_origins: Sequence[str]
+) -> tuple[CodeRange, ...]:
+    """Extract linked text ranges whose map origin belongs to candidate code."""
+
+    tokens = tuple(
+        value.replace("\\", "/").lower() for value in included_origins if value
+    )
+    if not tokens:
+        raise BenchmarkError("candidate code-range selection has no origins")
+    direct = re.compile(
+        r"^\s+\.text(?:\.[^\s]+)?\s+0x([0-9a-fA-F]+)\s+" r"0x([0-9a-fA-F]+)\s+(.+?)\s*$"
+    )
+    continuation = re.compile(r"^\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+(.+?)\s*$")
+    pending_text = False
+    ranges: list[CodeRange] = []
+    for line in output.splitlines():
+        match = direct.match(line)
+        if match is None and pending_text:
+            match = continuation.match(line)
+        pending_text = bool(re.match(r"^\s+\.text(?:\.[^\s]+)?\s*$", line))
+        if match is None:
+            continue
+        pending_text = False
+        start = int(match.group(1), 16) & 0xFFFFFFFF
+        size = int(match.group(2), 16)
+        origin = match.group(3).strip()
+        normalized = origin.replace("\\", "/").lower()
+        if start == 0 or size == 0 or not any(token in normalized for token in tokens):
+            continue
+        ranges.append(CodeRange(start, start + size, origin))
+    ranges.sort(key=lambda value: (value.start, value.end))
+    if not ranges:
+        raise BenchmarkError("link map contains no candidate executable ranges")
+    for previous, current in zip(ranges, ranges[1:]):
+        if current.start < previous.end:
+            raise BenchmarkError(
+                "candidate executable ranges overlap: "
+                f"{previous.origin} and {current.origin}"
+            )
+    return tuple(ranges)
+
+
+def parse_disassembly(output: str) -> dict[int, str]:
+    """Recover one textual MIPS instruction for each ELF32 address."""
+
+    instructions: dict[int, str] = {}
+    pattern = re.compile(r"^\s*([0-9a-fA-F]+):\s+(.+?)\s*$")
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match is None:
+            continue
+        address = int(match.group(1), 16) & 0xFFFFFFFF
+        instruction = re.sub(r"\s+<[^>]+>\s*$", "", match.group(2)).strip()
+        if not instruction or instruction == "..." or address in instructions:
+            raise BenchmarkError(f"invalid or duplicate disassembly row: {line}")
+        instructions[address] = instruction
+    if not instructions:
+        raise BenchmarkError("llvm-objdump emitted no instructions")
+    return instructions
+
+
+def select_candidate_blocks(
+    blocks: Sequence[HotBlock],
+    ranges: Sequence[CodeRange],
+    disassembly: Mapping[int, str],
+) -> tuple[tuple[HotBlock, tuple[str, ...]], ...]:
+    """Select complete executed TBs that lie in candidate or runtime code."""
+
+    selected: list[tuple[HotBlock, tuple[str, ...]]] = []
+    for block in blocks:
+        owner = next(
+            (value for value in ranges if value.start <= block.pc < value.end),
+            None,
+        )
+        if owner is None:
+            continue
+        end = block.pc + block.instruction_count * 4
+        if end > owner.end:
+            raise BenchmarkError(
+                f"QEMU block 0x{block.pc:08x} crosses candidate range "
+                f"{owner.origin}"
+            )
+        body: list[str] = []
+        for address in range(block.pc, end, 4):
+            instruction = disassembly.get(address)
+            if instruction is None:
+                raise BenchmarkError(
+                    f"disassembly omits executed instruction 0x{address:08x}"
+                )
+            body.append(instruction)
+        selected.append((block, tuple(body)))
+    if not selected:
+        raise BenchmarkError("QEMU executed no candidate code blocks")
+    return tuple(selected)
+
+
+def render_mca_source(
+    blocks: Sequence[tuple[HotBlock, Sequence[str]]],
+) -> tuple[str, dict[str, int]]:
+    """Render executed blocks as independent named LLVM-MCA regions."""
+
+    lines = (
+        "        .set noreorder",
+        "        .set noat",
+        "        .set mips3",
+        "        .text",
+    )
+    rendered = list(lines)
+    counts: dict[str, int] = {}
+    for index, (block, instructions) in enumerate(blocks):
+        name = f"tb_{index}"
+        label = f".Lmca_target_{index}"
+        counts[name] = block.instruction_count
+        if len(instructions) != block.instruction_count:
+            raise BenchmarkError(f"{name} instruction count disagrees with QEMU")
+        rendered.append(f"# LLVM-MCA-BEGIN {name}")
+        for instruction in instructions:
+            opcode = instruction.split(None, 1)[0].lower()
+            has_direct_target = opcode in {"b", "bal", "j", "jal"} or opcode.startswith(
+                ("bc", "beq", "bne", "bgez", "bgtz", "blez", "bltz")
+            )
+            if has_direct_target:
+                instruction = re.sub(r"0x[0-9a-fA-F]+\s*$", label, instruction)
+            rendered.append(f"        {instruction}")
+        rendered.append(f"{label}:")
+        rendered.append("# LLVM-MCA-END")
+    return "\n".join(rendered) + "\n", counts
+
+
+def parse_mca_costs(
+    output: str, expected_counts: Mapping[str, int], iterations: int
+) -> dict[str, McaBlockCost]:
+    """Validate LLVM-MCA JSON and recover per-block repeated costs."""
+
+    try:
+        document = json.loads(output)
+        regions = document["CodeRegions"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise BenchmarkError("llvm-mca emitted invalid JSON") from error
+    costs: dict[str, McaBlockCost] = {}
+    try:
+        for region in regions:
+            name = str(region["Name"])
+            summary = region["SummaryView"]
+            region_iterations = int(summary["Iterations"])
+            total_instructions = int(summary["Instructions"])
+            total_cycles = float(summary["TotalCycles"])
+            throughput = float(summary["BlockRThroughput"])
+            if name not in expected_counts or name in costs:
+                raise ValueError
+            count = expected_counts[name]
+            if (
+                region_iterations != iterations
+                or total_instructions != count * iterations
+                or total_cycles <= 0.0
+                or throughput <= 0.0
+            ):
+                raise ValueError
+            costs[name] = McaBlockCost(
+                name,
+                count,
+                total_cycles / iterations,
+                throughput,
+            )
+    except (KeyError, TypeError, ValueError) as error:
+        raise BenchmarkError("llvm-mca JSON contains an invalid code region") from error
+    if costs.keys() != expected_counts.keys():
+        missing = sorted(expected_counts.keys() - costs.keys())
+        raise BenchmarkError(f"llvm-mca omitted code regions: {', '.join(missing)}")
+    return costs
+
+
+def aggregate_pipeline_record(
+    compiler: str,
+    level: str,
+    kernel_value: Kernel,
+    blocks: Sequence[tuple[HotBlock, Sequence[str]]],
+    costs: Mapping[str, McaBlockCost],
+    invocations: int,
+) -> PipelineRecord:
+    """Weight per-TB scheduling costs by one deterministic kernel trace."""
+
+    if invocations <= 0 or not blocks:
+        raise BenchmarkError("pipeline aggregation requires executed invocations")
+    dynamic_total = 0
+    modeled_total = 0.0
+    throughput_total = 0.0
+    for index, (block, _) in enumerate(blocks):
+        cost = costs.get(f"tb_{index}")
+        if cost is None or cost.instruction_count != block.instruction_count:
+            raise BenchmarkError("pipeline block costs disagree with QEMU")
+        dynamic_total += block.instruction_count * block.execution_count
+        modeled_total += cost.modeled_cycles * block.execution_count
+        throughput_total += cost.throughput_cycles * block.execution_count
+    if dynamic_total <= 0 or dynamic_total % invocations != 0:
+        raise BenchmarkError("pipeline trace does not divide into equal invocations")
+    dynamic = dynamic_total // invocations
+    modeled = modeled_total / invocations
+    throughput = throughput_total / invocations
+    return PipelineRecord(
+        compiler,
+        level,
+        kernel_value.category,
+        kernel_value.name,
+        kernel_value.work_units,
+        dynamic,
+        dynamic / kernel_value.work_units,
+        modeled,
+        modeled / kernel_value.work_units,
+        throughput,
+        throughput / kernel_value.work_units,
+        len(blocks),
+    )
+
+
 async def measure_sections(config: Configuration, path: Path) -> tuple[int, int]:
     """Measure executable text and load-image sections in an object or ELF."""
 
@@ -403,13 +738,15 @@ def invocation(prefix: str, value: Kernel) -> str:
     raise BenchmarkError(f"unknown kernel kind: {value.kind}")
 
 
-def runner_fragments(prefix: str) -> tuple[str, str, str]:
+def runner_fragments(
+    prefix: str, kernels: Sequence[Kernel] = KERNELS
+) -> tuple[str, str, str]:
     """Generate declarations, checksum wrappers, and measurement calls."""
 
-    declarations = [declaration(prefix, value) for value in KERNELS]
+    declarations = [declaration(prefix, value) for value in kernels]
     wrappers: list[str] = []
     runs: list[str] = []
-    for value in KERNELS:
+    for value in kernels:
         call = invocation(prefix, value)
         if value.kind.startswith("floating"):
             body = f"FloatingBits result; result.value = {call}; return result.bits;"
@@ -813,6 +1150,39 @@ async def build_runner(config: Configuration) -> tuple[Path, Path]:
     return runner_object, startup_object
 
 
+async def build_pipeline_runners(config: Configuration) -> dict[str, Path]:
+    """Build one two-invocation trace harness for each isolated kernel."""
+
+    runners: dict[str, Path] = {}
+    for value in KERNELS:
+        declarations, wrappers, runs = runner_fragments("bench_", (value,))
+        source = config.output_dir / f"pipeline-runner-{value.name}.c"
+        runner_object = config.output_dir / f"pipeline-runner-{value.name}.o"
+        write_rendered(
+            config.source_dir / "runner.c.in",
+            source,
+            {
+                "DECLARATIONS": declarations,
+                "WRAPPERS": wrappers,
+                "RUNS": runs,
+                "SAMPLES": "1",
+            },
+        )
+        await run_command(
+            (
+                config.tools.gcc,
+                "-std=c11",
+                "-c",
+                *gcc_flags("O2"),
+                source,
+                "-o",
+                runner_object,
+            )
+        )
+        runners[value.name] = runner_object
+    return runners
+
+
 def parse_runtime_output(
     output: str, compiler: str, level: str, samples: int
 ) -> list[RuntimeRecord]:
@@ -868,28 +1238,20 @@ def parse_runtime_output(
     return sorted(result, key=lambda value: value.kernel)
 
 
-async def run_variant(
+async def link_wrapped_image(
     config: Configuration,
-    compiler: str,
-    level: str,
-    builds: Sequence[BuildRecord],
-    runner_object: Path,
-    startup_object: Path,
-    harness_size: tuple[int, int],
-) -> tuple[list[RuntimeRecord], ImageRecord]:
-    """Link, wrap, and execute one compiler/level bare-metal image."""
+    stem: str,
+    objects: Sequence[Path],
+    support_archives: Sequence[Path],
+) -> tuple[Path, Path, Path]:
+    """Link one ELF32 payload and wrap it for firmware-free Malta entry."""
 
-    stem = f"{compiler}-{level}"
     elf32 = config.output_dir / f"{stem}.elf32"
     image = config.output_dir / f"{stem}.bin"
     wrapper_source = config.output_dir / f"{stem}.wrapper.s"
     wrapper_object = config.output_dir / f"{stem}.wrapper.o"
     elf64 = config.output_dir / f"{stem}.elf64"
     link_map = config.output_dir / f"{stem}.map"
-    runtime_symbols = tuple(
-        sorted({symbol for build in builds for symbol in build.runtime_symbols})
-    )
-    support_archives: tuple[Path, ...] = (config.libgcc,) if runtime_symbols else ()
     await run_command(
         (
             config.tools.target_ld,
@@ -897,9 +1259,7 @@ async def run_variant(
             "elf32ebmip",
             "-T",
             config.source_dir / "bare.ld",
-            startup_object,
-            runner_object,
-            *(build.object_path for build in builds),
+            *objects,
             *support_archives,
             "-Map",
             link_map,
@@ -916,31 +1276,6 @@ async def run_variant(
             f"{elf32.name} remains unresolved after linking: "
             + ", ".join(sorted(unresolved))
         )
-    linked_text, linked_load = await measure_sections(config, elf32)
-    unit_text = sum(build.text_bytes for build in builds)
-    unit_load = sum(build.load_bytes for build in builds)
-    benchmark_text = linked_text - harness_size[0]
-    benchmark_load = linked_load - harness_size[1]
-    support_text = benchmark_text - unit_text
-    support_load = benchmark_load - unit_load
-    if min(benchmark_text, benchmark_load, support_text, support_load) < 0:
-        raise BenchmarkError(
-            f"{elf32.name} has inconsistent linked-size accounting: "
-            f"benchmark=({benchmark_text}, {benchmark_load}), "
-            f"support=({support_text}, {support_load})"
-        )
-    image_record = ImageRecord(
-        compiler,
-        level,
-        elf32,
-        linked_text,
-        linked_load,
-        benchmark_text,
-        benchmark_load,
-        support_text,
-        support_load,
-        runtime_symbols,
-    )
     await run_command((config.tools.llvm_objcopy, "-O", "binary", elf32, image))
     write_rendered(
         config.source_dir / "wrapper.s.in",
@@ -970,34 +1305,109 @@ async def run_variant(
             elf64,
         )
     )
+    return elf32, elf64, link_map
+
+
+def qemu_command(
+    config: Configuration,
+    elf64: Path,
+    *,
+    serial_output: bool,
+    hotblocks_log: Path | None = None,
+) -> tuple[str | Path, ...]:
+    """Build the deterministic Malta command, optionally with hotblocks."""
+
+    plugin: tuple[str | Path, ...] = ()
+    if hotblocks_log is not None:
+        if config.qemu_hotblocks_plugin is None:
+            raise BenchmarkError("QEMU hotblocks plugin was not configured")
+        plugin = (
+            "-plugin",
+            f"{config.qemu_hotblocks_plugin},inline=true,limit=0",
+            "-d",
+            "plugin",
+            "-D",
+            hotblocks_log,
+        )
+    return (
+        config.tools.qemu,
+        "-M",
+        "malta",
+        "-cpu",
+        "R4000",
+        "-m",
+        "64M",
+        "-bios",
+        "none",
+        "-kernel",
+        elf64,
+        "-display",
+        "none",
+        "-serial",
+        "none",
+        "-serial",
+        "none",
+        "-serial",
+        "stdio" if serial_output else "none",
+        "-monitor",
+        "none",
+        "-no-reboot",
+        "-semihosting",
+        "-icount",
+        "shift=0,align=off,sleep=off",
+        *plugin,
+    )
+
+
+async def run_variant(
+    config: Configuration,
+    compiler: str,
+    level: str,
+    builds: Sequence[BuildRecord],
+    runner_object: Path,
+    startup_object: Path,
+    harness_size: tuple[int, int],
+) -> tuple[list[RuntimeRecord], ImageRecord]:
+    """Link, wrap, and execute one compiler/level bare-metal image."""
+
+    stem = f"{compiler}-{level}"
+    runtime_symbols = tuple(
+        sorted({symbol for build in builds for symbol in build.runtime_symbols})
+    )
+    support_archives: tuple[Path, ...] = (config.libgcc,) if runtime_symbols else ()
+    elf32, elf64, _ = await link_wrapped_image(
+        config,
+        stem,
+        (startup_object, runner_object, *(build.object_path for build in builds)),
+        support_archives,
+    )
+    linked_text, linked_load = await measure_sections(config, elf32)
+    unit_text = sum(build.text_bytes for build in builds)
+    unit_load = sum(build.load_bytes for build in builds)
+    benchmark_text = linked_text - harness_size[0]
+    benchmark_load = linked_load - harness_size[1]
+    support_text = benchmark_text - unit_text
+    support_load = benchmark_load - unit_load
+    if min(benchmark_text, benchmark_load, support_text, support_load) < 0:
+        raise BenchmarkError(
+            f"{elf32.name} has inconsistent linked-size accounting: "
+            f"benchmark=({benchmark_text}, {benchmark_load}), "
+            f"support=({support_text}, {support_load})"
+        )
+    image_record = ImageRecord(
+        compiler,
+        level,
+        elf32,
+        linked_text,
+        linked_load,
+        benchmark_text,
+        benchmark_load,
+        support_text,
+        support_load,
+        runtime_symbols,
+    )
     executed = await run_command(
-        (
-            config.tools.qemu,
-            "-M",
-            "malta",
-            "-cpu",
-            "R4000",
-            "-m",
-            "64M",
-            "-bios",
-            "none",
-            "-kernel",
-            elf64,
-            "-display",
-            "none",
-            "-serial",
-            "none",
-            "-serial",
-            "none",
-            "-serial",
-            "stdio",
-            "-monitor",
-            "none",
-            "-no-reboot",
-            "-semihosting",
-            "-icount",
-            "shift=0,align=off,sleep=off",
-        ),
+        qemu_command(config, elf64, serial_output=True),
         timeout=config.timeout_seconds,
         check=False,
     )
@@ -1013,6 +1423,123 @@ async def run_variant(
         parse_runtime_output(executed.stdout, compiler, level, config.samples),
         image_record,
     )
+
+
+async def measure_pipeline_kernel(
+    config: Configuration,
+    compiler: str,
+    level: str,
+    kernel_value: Kernel,
+    build: BuildRecord,
+    runner_object: Path,
+    startup_object: Path,
+) -> PipelineRecord:
+    """Trace one kernel and weight generic MIPS3 scheduling costs by its path."""
+
+    if config.tools.llvm_mca is None or config.qemu_hotblocks_plugin is None:
+        raise BenchmarkError("pipeline timing tools were not configured")
+    stem = f"pipeline-{compiler}-{level}-{kernel_value.name}"
+    runtime_symbols = build.runtime_symbols
+    support_archives: tuple[Path, ...] = (config.libgcc,) if runtime_symbols else ()
+    elf32, elf64, link_map = await link_wrapped_image(
+        config,
+        stem,
+        (startup_object, runner_object, build.object_path),
+        support_archives,
+    )
+    hotblocks_log = config.output_dir / f"{stem}.hotblocks.csv"
+    hotblocks_log.unlink(missing_ok=True)
+    executed = await run_command(
+        qemu_command(
+            config,
+            elf64,
+            serial_output=False,
+            hotblocks_log=hotblocks_log,
+        ),
+        timeout=config.timeout_seconds,
+        check=False,
+    )
+    if executed.returncode != 0 or not hotblocks_log.is_file():
+        raise BenchmarkError(
+            f"QEMU hotblocks run failed for {compiler}/{level}/{kernel_value.name}: "
+            f"status={executed.returncode}\nstdout:\n{executed.stdout}\n"
+            f"stderr:\n{executed.stderr}"
+        )
+    blocks = parse_hotblocks(hotblocks_log.read_text(encoding="utf-8"))
+    origins = [str(build.object_path.resolve())]
+    if support_archives:
+        origins.append(str(config.libgcc.resolve()))
+    ranges = parse_link_map_code_ranges(
+        link_map.read_text(encoding="utf-8", errors="replace"), origins
+    )
+    disassembled = await run_command(
+        (
+            config.tools.llvm_objdump,
+            "--disassemble",
+            "--disassemble-zeroes",
+            "--no-show-raw-insn",
+            elf32,
+        )
+    )
+    (config.output_dir / f"{stem}.pipeline.disasm").write_text(
+        disassembled.stdout, encoding="utf-8", newline="\n"
+    )
+    selected = select_candidate_blocks(
+        blocks, ranges, parse_disassembly(disassembled.stdout)
+    )
+    mca_source, expected_counts = render_mca_source(selected)
+    mca_path = config.output_dir / f"{stem}.mca.s"
+    mca_path.write_text(mca_source, encoding="utf-8", newline="\n")
+    modeled = await run_command(
+        (
+            config.tools.llvm_mca,
+            "-mtriple=mips64-unknown-elf",
+            "-mcpu=mips3",
+            f"--iterations={config.mca_iterations}",
+            "--json",
+            mca_path,
+        )
+    )
+    (config.output_dir / f"{stem}.mca.json").write_text(
+        modeled.stdout, encoding="utf-8", newline="\n"
+    )
+    costs = parse_mca_costs(modeled.stdout, expected_counts, config.mca_iterations)
+    # runner.c.in executes once to establish the expected checksum and once
+    # inside its single measured sample. Candidate and runtime blocks therefore
+    # have exactly two deterministic invocations; runner/startup blocks were
+    # excluded by their link-map origins.
+    return aggregate_pipeline_record(
+        compiler, level, kernel_value, selected, costs, invocations=2
+    )
+
+
+async def run_pipeline_metrics(
+    config: Configuration,
+    compilers: Sequence[str],
+    builds: Sequence[BuildRecord],
+    startup_object: Path,
+) -> list[PipelineRecord]:
+    """Collect isolated path-weighted pipeline estimates for all variants."""
+
+    runners = await build_pipeline_runners(config)
+    indexed = {(build.compiler, build.level, build.unit): build for build in builds}
+    records: list[PipelineRecord] = []
+    for level in config.levels:
+        for compiler in compilers:
+            print(f"modeling pipeline {compiler}/{level} ...", flush=True)
+            for value in KERNELS:
+                records.append(
+                    await measure_pipeline_kernel(
+                        config,
+                        compiler,
+                        level,
+                        value,
+                        indexed[(compiler, level, value.unit)],
+                        runners[value.name],
+                        startup_object,
+                    )
+                )
+    return records
 
 
 def verify_checksums(records: Sequence[RuntimeRecord]) -> None:
@@ -1068,11 +1595,55 @@ def category_score(
     )
 
 
+def pipeline_field_score(
+    records: Sequence[PipelineRecord], compiler: str, level: str, field: str
+) -> float:
+    """Return an equal-category-weighted pipeline-record field."""
+
+    selected = [
+        value
+        for value in records
+        if value.compiler == compiler and value.level == level
+    ]
+    categories: defaultdict[str, list[float]] = defaultdict(list)
+    for value in selected:
+        categories[value.category].append(float(getattr(value, field)))
+    if not categories:
+        raise BenchmarkError(f"no pipeline records for {compiler}/{level}")
+    return geometric_mean(geometric_mean(values) for values in categories.values())
+
+
+def pipeline_score(
+    records: Sequence[PipelineRecord], compiler: str, level: str
+) -> float:
+    """Return the equal-category-weighted modeled-cycle score."""
+
+    return pipeline_field_score(records, compiler, level, "cycles_per_unit")
+
+
+def pipeline_category_score(
+    records: Sequence[PipelineRecord],
+    compiler: str,
+    level: str,
+    category: str,
+) -> float:
+    """Return one category's modeled-cycle geometric mean."""
+
+    return geometric_mean(
+        value.cycles_per_unit
+        for value in records
+        if value.compiler == compiler
+        and value.level == level
+        and value.category == category
+    )
+
+
 def write_csv_files(
     config: Configuration,
     builds: Sequence[BuildRecord],
     images: Sequence[ImageRecord],
     runtimes: Sequence[RuntimeRecord],
+    pipelines: Sequence[PipelineRecord],
 ) -> None:
     """Write stable machine-readable build and runtime tables."""
 
@@ -1164,6 +1735,16 @@ def write_csv_files(
                     runtime.checksum,
                 )
             )
+    pipeline_path = config.output_dir / "pipeline.csv"
+    if pipelines:
+        with pipeline_path.open("w", newline="", encoding="utf-8") as file:
+            field_names = tuple(PipelineRecord.__dataclass_fields__)
+            writer = csv.DictWriter(file, fieldnames=field_names)
+            writer.writeheader()
+            for record in pipelines:
+                writer.writerow(asdict(record))
+    else:
+        pipeline_path.unlink(missing_ok=True)
 
 
 def generate_report(
@@ -1172,6 +1753,7 @@ def generate_report(
     builds: Sequence[BuildRecord],
     images: Sequence[ImageRecord],
     runtimes: Sequence[RuntimeRecord],
+    pipelines: Sequence[PipelineRecord],
     clang_probe: str,
     llc_probe: str,
 ) -> str:
@@ -1191,6 +1773,15 @@ def generate_report(
         "## Pipelines",
         "",
     ]
+    if pipelines:
+        lines[6:6] = [
+            (
+                "Pipeline metric: isolated QEMU hot-block paths weighted by "
+                f"LLVM-MCA generic `mips3` TotalCycles/{config.mca_iterations} "
+                "iterations; lower is better."
+            ),
+            "",
+        ]
     for compiler in compilers:
         lines.append(f"- `{compiler}`: {PIPELINES[compiler]}.")
     lines.extend(
@@ -1248,11 +1839,61 @@ def generate_report(
             ]
             lines.append(f"| {category} | " + " | ".join(ratios) + " |")
         lines.extend(("", "Each cell is `Cross ticks / pipeline ticks`.", ""))
+        if pipelines:
+            lines.extend(("### Path-weighted LLVM-MCA estimate", ""))
+            lines.append(
+                "| pipeline | modeled cycles/work | Cross / row | "
+                "instructions/work | resource lower bound/work |"
+            )
+            lines.append("|---|---:|---:|---:|---:|")
+            cross_pipeline = pipeline_score(pipelines, "cross", level)
+            for compiler in compilers:
+                score = pipeline_score(pipelines, compiler, level)
+                instructions = pipeline_field_score(
+                    pipelines, compiler, level, "instructions_per_unit"
+                )
+                throughput = pipeline_field_score(
+                    pipelines,
+                    compiler,
+                    level,
+                    "throughput_cycles_per_unit",
+                )
+                lines.append(
+                    f"| {compiler} | {score:.4f} | "
+                    f"{cross_pipeline / score:.3f}x | {instructions:.4f} | "
+                    f"{throughput:.4f} |"
+                )
+            lines.extend(
+                (
+                    "",
+                    "Modeled cycles use dependency/resource simulation; the resource "
+                    "column is LLVM-MCA's `BlockRThroughput` lower bound. Both are "
+                    "weighted by QEMU dynamic TB executions.",
+                    "",
+                    "#### Modeled-cycle categories",
+                    "",
+                )
+            )
+            lines.append("| category | " + " | ".join(compilers) + " |")
+            lines.append("|---|" + "---:|" * len(compilers))
+            for category in categories:
+                cross = pipeline_category_score(pipelines, "cross", level, category)
+                ratios = [
+                    f"{cross / pipeline_category_score(pipelines, compiler, level, category):.3f}x"
+                    for compiler in compilers
+                ]
+                lines.append(f"| {category} | " + " | ".join(ratios) + " |")
+            lines.extend(
+                (
+                    "",
+                    "Each cell is `Cross modeled cycles / pipeline modeled cycles`.",
+                    "",
+                )
+            )
         if level == "O3":
             lines.extend(("### Kernel runtime", ""))
             lines.append(
-                "| kernel | " + " | ".join(compilers) +
-                " | Cross / fastest peer |"
+                "| kernel | " + " | ".join(compilers) + " | Cross / fastest peer |"
             )
             lines.append("|---|" + "---:|" * (len(compilers) + 1))
             for kernel_value in KERNELS:
@@ -1273,13 +1914,41 @@ def generate_report(
                 }
                 best_peer = min(peers.values())
                 lines.append(
-                    f"| {kernel_value.name} | " +
-                    " | ".join(f"{scores[name]:.4f}" for name in compilers) +
-                    f" | {scores['cross'] / best_peer:.3f}x |"
+                    f"| {kernel_value.name} | "
+                    + " | ".join(f"{scores[name]:.4f}" for name in compilers)
+                    + f" | {scores['cross'] / best_peer:.3f}x |"
                 )
-            lines.extend(
-                ("", "Runtime cells are ticks per declared work unit.", "")
-            )
+            lines.extend(("", "Runtime cells are ticks per declared work unit.", ""))
+            if pipelines:
+                lines.extend(("### Kernel modeled pipeline cost", ""))
+                lines.append(
+                    "| kernel | " + " | ".join(compilers) + " | Cross / fastest peer |"
+                )
+                lines.append("|---|" + "---:|" * (len(compilers) + 1))
+                for kernel_value in KERNELS:
+                    scores = {
+                        compiler: next(
+                            value.cycles_per_unit
+                            for value in pipelines
+                            if value.compiler == compiler
+                            and value.level == level
+                            and value.kernel == kernel_value.name
+                        )
+                        for compiler in compilers
+                    }
+                    best_peer = min(
+                        score
+                        for compiler, score in scores.items()
+                        if compiler != "cross"
+                    )
+                    lines.append(
+                        f"| {kernel_value.name} | "
+                        + " | ".join(f"{scores[name]:.4f}" for name in compilers)
+                        + f" | {scores['cross'] / best_peer:.3f}x |"
+                    )
+                lines.extend(
+                    ("", "Cells are modeled cycles per declared work unit.", "")
+                )
         if level == "Oz":
             size_rows = {
                 (build.compiler, name): size
@@ -1289,8 +1958,7 @@ def generate_report(
             }
             lines.extend(("### Kernel function size", ""))
             lines.append(
-                "| kernel | " + " | ".join(compilers) +
-                " | Cross / smallest peer |"
+                "| kernel | " + " | ".join(compilers) + " | Cross / smallest peer |"
             )
             lines.append("|---|" + "---:|" * (len(compilers) + 1))
             for kernel_value in KERNELS:
@@ -1299,16 +1967,19 @@ def generate_report(
                     for compiler in compilers
                 }
                 best_peer = min(
-                    size for compiler, size in sizes.items()
-                    if compiler != "cross"
+                    size for compiler, size in sizes.items() if compiler != "cross"
                 )
                 lines.append(
-                    f"| {kernel_value.name} | " +
-                    " | ".join(str(sizes[name]) for name in compilers) +
-                    f" | {sizes['cross'] / best_peer:.3f}x |"
+                    f"| {kernel_value.name} | "
+                    + " | ".join(str(sizes[name]) for name in compilers)
+                    + f" | {sizes['cross'] / best_peer:.3f}x |"
                 )
             lines.extend(
-                ("", "Function-size cells are symbol bytes; whole-image totals above also charge shared runtime support and linker padding.", "")
+                (
+                    "",
+                    "Function-size cells are symbol bytes; whole-image totals above also charge shared runtime support and linker padding.",
+                    "",
+                )
             )
     lines.extend(
         (
@@ -1320,6 +1991,7 @@ def generate_report(
             "- All images use the same GCC-built runner, startup, linker scripts, data, and checksums.",
             "- GCC is tuned for `vr4300`; LLVM exposes only generic `mips3` here.",
             "- CP0 Count under QEMU `-icount` is useful for relative dynamic work but does not model VR4300 cache and pipeline timing.",
+            "- The optional LLVM-MCA layer uses LLVM's hypothetical one-wide generic MIPS3 scheduling model, not a calibrated VR4300. It preserves executed paths and intra-TB dependencies but not cross-TB dependencies, branch prediction, caches, or TLBs; independently repeating every TB can overstate dependencies for calls and other non-self-loop blocks.",
             "- Exact generated GIMPLE, optimized-GIMPLE dumps, final RTL dumps, objects, and disassemblies accompany this report.",
             "",
         )
@@ -1331,7 +2003,7 @@ async def tool_versions(tools: Tools) -> dict[str, str]:
     """Capture concise compiler and emulator identities."""
 
     versions: dict[str, str] = {}
-    for name, executable in (
+    entries: list[tuple[str, Path]] = [
         ("cross", tools.cross_cc),
         ("gcc", tools.gcc),
         ("clang", tools.clang),
@@ -1339,7 +2011,10 @@ async def tool_versions(tools: Tools) -> dict[str, str]:
         ("llc", tools.llc),
         ("target-ld", tools.target_ld),
         ("qemu", tools.qemu),
-    ):
+    ]
+    if tools.llvm_mca is not None:
+        entries.append(("llvm-mca", tools.llvm_mca))
+    for name, executable in entries:
         result = await run_command((executable, "--version"), check=False)
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
@@ -1375,9 +2050,7 @@ async def discover_revision(trunk: Path) -> tuple[str, str]:
     subject = (
         await run_command((*git, "show", "-s", "--format=%s", "HEAD"))
     ).stdout.strip()
-    dirty = bool(
-        (await run_command((*git, "status", "--porcelain"))).stdout.strip()
-    )
+    dirty = bool((await run_command((*git, "status", "--porcelain"))).stdout.strip())
     directory = f"{commit[:8]}-{slugify(subject)}" + ("-dirty" if dirty else "")
     return commit + ("-dirty" if dirty else ""), directory
 
@@ -1428,9 +2101,13 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--llvm-size", default="llvm-size")
     parser.add_argument("--llvm-nm", default="llvm-nm")
     parser.add_argument("--llvm-objdump", default="llvm-objdump")
+    parser.add_argument("--llvm-mca", default="llvm-mca")
     parser.add_argument("--target-ld")
     parser.add_argument("--lld", default="ld.lld")
     parser.add_argument("--qemu", default="qemu-system-mips64")
+    parser.add_argument("--pipeline-timing", action="store_true")
+    parser.add_argument("--qemu-hotblocks-plugin", type=Path)
+    parser.add_argument("--mca-iterations", type=int, default=100)
     parser.add_argument("--levels", default="O3,Oz")
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--timeout-seconds", type=int, default=120)
@@ -1446,10 +2123,14 @@ async def configuration_from_arguments(
 
     if arguments.output is not None and arguments.run_name is not None:
         raise BenchmarkError("--output and --run-name are mutually exclusive")
+    if arguments.qemu_hotblocks_plugin is not None and not arguments.pipeline_timing:
+        raise BenchmarkError("--qemu-hotblocks-plugin requires --pipeline-timing")
     if arguments.samples <= 0 or arguments.samples % 2 == 0:
         raise BenchmarkError("--samples must be a positive odd number")
     if arguments.timeout_seconds <= 0:
         raise BenchmarkError("--timeout-seconds must be positive")
+    if arguments.mca_iterations <= 0:
+        raise BenchmarkError("--mca-iterations must be positive")
     source_dir = Path(__file__).resolve().parent
     trunk = source_dir.parents[1]
     revision, revision_directory = await discover_revision(trunk)
@@ -1474,6 +2155,24 @@ async def configuration_from_arguments(
         if not reported_ld:
             raise BenchmarkError("MIPS GCC did not report its target linker")
         target_ld = resolve_tool(reported_ld, "MIPS GNU linker")
+    qemu = resolve_tool(arguments.qemu, "QEMU MIPS64 system emulator")
+    llvm_mca = (
+        resolve_tool(arguments.llvm_mca, "LLVM machine-code analyzer")
+        if arguments.pipeline_timing
+        else None
+    )
+    hotblocks_plugin: Path | None = None
+    if arguments.pipeline_timing:
+        if arguments.qemu_hotblocks_plugin is not None:
+            hotblocks_plugin = resolve_existing_file(
+                arguments.qemu_hotblocks_plugin, "QEMU hotblocks plugin"
+            )
+        else:
+            hotblocks_plugin = discover_hotblocks_plugin(qemu)
+            if hotblocks_plugin is None:
+                raise BenchmarkError(
+                    "cannot find QEMU hotblocks plugin; pass " "--qemu-hotblocks-plugin"
+                )
     tools = Tools(
         cross_cc=resolve_tool(arguments.cross_cc, "Cross compiler"),
         gcc=gcc,
@@ -1487,7 +2186,8 @@ async def configuration_from_arguments(
         llvm_objdump=resolve_tool(arguments.llvm_objdump, "LLVM objdump"),
         target_ld=target_ld,
         lld=resolve_tool(arguments.lld, "LLD"),
-        qemu=resolve_tool(arguments.qemu, "QEMU MIPS64 system emulator"),
+        qemu=qemu,
+        llvm_mca=llvm_mca,
     )
     libgcc, libgcc_symbols = await discover_libgcc(tools.gcc, tools.llvm_nm)
     return Configuration(
@@ -1502,6 +2202,9 @@ async def configuration_from_arguments(
         revision_directory=revision_directory,
         libgcc=libgcc,
         libgcc_symbols=libgcc_symbols,
+        pipeline_timing=arguments.pipeline_timing,
+        qemu_hotblocks_plugin=hotblocks_plugin,
+        mca_iterations=arguments.mca_iterations,
     )
 
 
@@ -1558,7 +2261,12 @@ async def async_main(argv: Sequence[str]) -> int:
             runtimes.extend(variant_runtimes)
             images.append(image)
     verify_checksums(runtimes)
-    write_csv_files(config, builds, images, runtimes)
+    pipelines = (
+        await run_pipeline_metrics(config, compilers, builds, startup_object)
+        if config.pipeline_timing
+        else []
+    )
+    write_csv_files(config, builds, images, runtimes, pipelines)
     clang_probe_text = (
         "supported and included" if clang_supported else f"excluded: {clang_message}"
     )
@@ -1571,6 +2279,7 @@ async def async_main(argv: Sequence[str]) -> int:
         builds,
         images,
         runtimes,
+        pipelines,
         clang_probe_text,
         probe_text,
     )
@@ -1583,6 +2292,16 @@ async def async_main(argv: Sequence[str]) -> int:
                 "revision": config.revision,
                 "levels": config.levels,
                 "samples": config.samples,
+                "pipeline_timing": {
+                    "enabled": config.pipeline_timing,
+                    "mca_iterations": config.mca_iterations,
+                    "model": "LLVM generic mips3",
+                    "qemu_hotblocks_plugin": (
+                        str(config.qemu_hotblocks_plugin)
+                        if config.qemu_hotblocks_plugin is not None
+                        else None
+                    ),
+                },
                 "compilers": compilers,
                 "pipelines": {name: PIPELINES[name] for name in compilers},
                 "llc_probe": {

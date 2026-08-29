@@ -83,6 +83,119 @@ bench_narrow T 388 264
     }
 
 
+def test_parse_hotblocks_normalizes_mips32_addresses() -> None:
+    """QEMU sign-extended PCs must map back to linked ELF32 addresses."""
+
+    output = """collected 3 entries in the hash table
+pc, tcount, icount, ecount
+0xffffffff80101234, 1, 4, 7
+0xffffffff80102000, 1, 2, 0
+0xffffffffbfc00000, 1, 1, 3
+"""
+    assert benchmark.parse_hotblocks(output) == (
+        benchmark.HotBlock(0x80101234, 4, 7),
+        benchmark.HotBlock(0xBFC00000, 1, 3),
+    )
+    with pytest.raises(benchmark.BenchmarkError, match="duplicate PC"):
+        benchmark.parse_hotblocks(
+            "pc,tcount,icount,ecount\n0x1000,1,1,1\n0x1000,1,1,1\n"
+        )
+
+
+def test_link_map_ranges_select_candidate_and_runtime_text() -> None:
+    """Trace attribution excludes startup/runner sections and linker fill."""
+
+    output = """ .text          0x80100000       0x40 C:\\out\\startup.o
+ .text          0x80100040       0x80 C:\\out\\candidate.o
+ .text.__udivdi3
+                0x801000c0       0x30 C:\\tools\\libgcc.a(_udivdi3.o)
+ *fill*         0x801000f0        0x8
+"""
+    assert benchmark.parse_link_map_code_ranges(
+        output, ("C:/out/candidate.o", "libgcc.a")
+    ) == (
+        benchmark.CodeRange(0x80100040, 0x801000C0, "C:\\out\\candidate.o"),
+        benchmark.CodeRange(
+            0x801000C0,
+            0x801000F0,
+            "C:\\tools\\libgcc.a(_udivdi3.o)",
+        ),
+    )
+
+
+def test_disassembly_selection_and_mca_render_preserve_delay_slots() -> None:
+    """Every QEMU-counted instruction, including a zero NOP, reaches MCA."""
+
+    disassembly = """Disassembly of section .text:
+80100040: addiu $2, $2, 0x1
+80100044: bne $2, $4, 0x80100040 <loop>
+80100048: nop
+"""
+    block = benchmark.HotBlock(0x80100040, 3, 8)
+    selected = benchmark.select_candidate_blocks(
+        (block,),
+        (benchmark.CodeRange(0x80100040, 0x8010004C, "candidate.o"),),
+        benchmark.parse_disassembly(disassembly),
+    )
+    source, counts = benchmark.render_mca_source(selected)
+    assert counts == {"tb_0": 3}
+    assert "bne $2, $4, .Lmca_target_0" in source
+    assert "        nop" in source
+
+
+def test_mca_cost_parsing_and_hotness_weighting() -> None:
+    """Dependency and resource costs use the same dynamic TB weights."""
+
+    document = {
+        "CodeRegions": [
+            {
+                "Name": "tb_0",
+                "SummaryView": {
+                    "Iterations": 100,
+                    "Instructions": 200,
+                    "TotalCycles": 301,
+                    "BlockRThroughput": 2,
+                },
+            },
+            {
+                "Name": "tb_1",
+                "SummaryView": {
+                    "Iterations": 100,
+                    "Instructions": 100,
+                    "TotalCycles": 101,
+                    "BlockRThroughput": 1,
+                },
+            },
+        ]
+    }
+    costs = benchmark.parse_mca_costs(
+        benchmark.json.dumps(document), {"tb_0": 2, "tb_1": 1}, 100
+    )
+    descriptor = benchmark.Kernel("probe", "integer", "scalar", "scalar", 5)
+    blocks = (
+        (benchmark.HotBlock(0x1000, 2, 4), ("addu $2, $2, $3",) * 2),
+        (benchmark.HotBlock(0x2000, 1, 2), ("nop",)),
+    )
+    record = benchmark.aggregate_pipeline_record(
+        "cross", "O3", descriptor, blocks, costs, invocations=2
+    )
+    assert record.dynamic_instructions == 5
+    assert record.instructions_per_unit == pytest.approx(1.0)
+    assert record.modeled_cycles == pytest.approx(7.03)
+    assert record.throughput_cycles == pytest.approx(5.0)
+
+
+def test_pipeline_timing_cli_is_explicit_and_bounded() -> None:
+    """The expensive modeled metric remains opt-in and reproducible."""
+
+    defaults = benchmark.parse_arguments([])
+    assert not defaults.pipeline_timing
+    assert defaults.mca_iterations == 100
+    enabled = benchmark.parse_arguments(["--pipeline-timing", "--mca-iterations", "64"])
+    assert enabled.pipeline_timing
+    assert enabled.mca_iterations == 64
+
+
 def test_first_diagnostic_prefers_fatal_lowering_failure() -> None:
     """An optional LLVM probe should report its cause, not an earlier warning."""
 
