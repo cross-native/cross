@@ -87,3 +87,21 @@ global u64 mips_reassociation_without_unroll(in const u64 *data,
     }
     return result;
 }
+
+[[abi("o32"), noinline]]
+global u32 mips_grouped_select(in u32 condition,
+                               in u32 true_left,
+                               in u32 false_left,
+                               in u32 true_right,
+                               in u32 false_right) {
+    u32 left;
+    u32 right;
+    if (condition) {
+        left = true_left;
+        right = true_right;
+    } else {
+        left = false_left;
+        right = false_right;
+    }
+    return left + right;
+}

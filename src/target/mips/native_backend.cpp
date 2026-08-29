@@ -19,6 +19,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -4463,6 +4464,9 @@ private:
                               machine::BlockId successor);
     void emit_target(const machine::Function& function,
                      const machine::Instruction& value);
+    void emit_select_group(
+        const machine::Function& function,
+        std::span<const machine::Instruction> values);
     void emit_terminator(const machine::Function& function,
                           const machine::Instruction& value,
                           machine::BlockId predecessor,
@@ -5988,6 +5992,31 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                        "unknown MIPS target opcode in assembly emission");
 }
 
+void AssemblyEmitter::emit_select_group(
+    const machine::Function& function,
+    std::span<const machine::Instruction> values) {
+    if (values.size() < 2 || values.front().uses.size() < 3) return;
+    const auto otherwise = local_label(function);
+    const auto done = local_label(function);
+    const auto condition = input_gpr(
+        function, values.front().uses.front(), "t0",
+        values.front().location);
+    instruction("beq", reg_name(condition) + ",$zero," + otherwise);
+    instruction("nop");
+    for (const auto& value : values) {
+        copy_vreg(function, value.defs.front(), value.uses[1],
+                  value.location);
+    }
+    instruction("b", done);
+    instruction("nop");
+    output_ << otherwise << ":\n";
+    for (const auto& value : values) {
+        copy_vreg(function, value.defs.front(), value.uses[2],
+                  value.location);
+    }
+    output_ << done << ":\n";
+}
+
 void AssemblyEmitter::emit_terminator(
     const machine::Function& function,
     const machine::Instruction& value,
@@ -6363,6 +6392,36 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             if (delay_plan && index == delay_plan->first) continue;
             const auto& value = found->instructions[index];
             if (value.kind == machine::InstructionKind::Target) {
+                if (options_.compare_select_fusion &&
+                    decode_opcode(value.opcode) == Opcode::Select &&
+                    value.uses.size() >= 3 && !value.defs.empty() &&
+                    !(value.defs.front().mode.bits <= 32 &&
+                      subtarget_.has_feature(Feature::CondMove))) {
+                    std::size_t end = index + 1;
+                    while (end < found->instructions.size()) {
+                        const auto& candidate = found->instructions[end];
+                        if (candidate.kind !=
+                                machine::InstructionKind::Target ||
+                            decode_opcode(candidate.opcode) != Opcode::Select ||
+                            candidate.uses.size() < 3 ||
+                            candidate.defs.empty() ||
+                            candidate.uses.front() != value.uses.front() ||
+                            (candidate.defs.front().mode.bits <= 32 &&
+                             subtarget_.has_feature(Feature::CondMove))) {
+                            break;
+                        }
+                        ++end;
+                    }
+                    if (end - index >= 2) {
+                        emit_select_group(
+                            function,
+                            std::span<const machine::Instruction>{
+                                found->instructions.data() + index,
+                                end - index});
+                        index = end - 1;
+                        continue;
+                    }
+                }
                 emit_target(function, value);
             } else if (value.kind == machine::InstructionKind::Call) {
                 if (index + 1 < found->instructions.size() &&

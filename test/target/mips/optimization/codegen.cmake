@@ -49,6 +49,7 @@ compile_variant(enabled)
 compile_variant(no_iv -fno-ivopts)
 compile_variant(no_tail -fno-optimize-sibling-calls)
 compile_variant(no_fusion -fno-compare-branch-fusion)
+compile_variant(no_select_fusion -fno-compare-select-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_reassociation_variant(reassoc_risc 0)
@@ -159,4 +160,21 @@ function_body("${OUTPUT}.reassoc_cisc_off.s"
 if(reassoc_cisc STREQUAL reassoc_cisc_off)
     message(FATAL_ERROR
         "-ftree-reassoc depended on loop unrolling or ignored the CISC endpoint")
+endif()
+
+function_body("${OUTPUT}.enabled.s" mips_grouped_select grouped_select)
+function_body("${OUTPUT}.no_select_fusion.s"
+              mips_grouped_select separate_selects)
+string(REGEX MATCHALL "[	 ]beq[	 ]" grouped_select_branches
+             "${grouped_select}")
+string(REGEX MATCHALL "[	 ]beq[	 ]" separate_select_branches
+             "${separate_selects}")
+list(LENGTH grouped_select_branches grouped_select_branch_count)
+list(LENGTH separate_select_branches separate_select_branch_count)
+if(NOT grouped_select_branch_count EQUAL 1 OR
+   NOT separate_select_branch_count EQUAL 2)
+    message(FATAL_ERROR
+        "same-condition MIPS selects did not share exactly one branch\n"
+        "enabled (${grouped_select_branch_count}):\n${grouped_select}\n"
+        "disabled (${separate_select_branch_count}):\n${separate_selects}")
 endif()
