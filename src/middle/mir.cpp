@@ -7488,14 +7488,55 @@ bool value_depends_on_ordinary_memory(
         });
 }
 
-bool masked_memory_condition(const ManagedFunction& function,
-                             ValueId condition) {
+bool unpredictable_memory_condition(const ManagedFunction& function,
+                                     const hir::Module& hir_module,
+                                     ValueId condition) {
     if (condition.value >= function.values.size()) return false;
     const auto& comparison = function.values[condition.value];
     if (comparison.kind != ValueKind::Binary ||
-        (comparison.binary != BinaryOperation::Equal &&
-         comparison.binary != BinaryOperation::NotEqual) ||
         comparison.operands.size() != 2) {
+        return false;
+    }
+    // Unsigned comparison with the top-bit boundary is exactly a test of one
+    // data bit.  Treat either polarity like a masked memory predicate: for
+    // unprofiled data it has the same high-entropy character, while arbitrary
+    // range comparisons (including binary-search bounds) remain ordinary.
+    const auto top_bit_boundary = [&](ValueId literal, ValueId data) {
+        if (literal.value >= function.values.size() ||
+            data.value >= function.values.size()) {
+            return false;
+        }
+        const auto& constant = function.values[literal.value];
+        const auto bits = type_bits(
+            hir_module, function.values[data.value].type);
+        if (constant.kind != ValueKind::ConstantInteger ||
+            constant.integer_high != 0 || bits == 0 || bits > 64 ||
+            constant.integer != (std::uint64_t{1} << (bits - 1U))) {
+            return false;
+        }
+        std::unordered_set<std::uint32_t> visited;
+        return value_depends_on_ordinary_memory(
+            function, data, visited);
+    };
+    switch (comparison.binary) {
+    case BinaryOperation::UnsignedLess:
+    case BinaryOperation::UnsignedGreaterEqual:
+        if (top_bit_boundary(
+                comparison.operands[1], comparison.operands[0])) {
+            return true;
+        }
+        break;
+    case BinaryOperation::UnsignedGreater:
+    case BinaryOperation::UnsignedLessEqual:
+        if (top_bit_boundary(
+                comparison.operands[0], comparison.operands[1])) {
+            return true;
+        }
+        break;
+    default: break;
+    }
+    if (comparison.binary != BinaryOperation::Equal &&
+        comparison.binary != BinaryOperation::NotEqual) {
         return false;
     }
     const auto is_zero = [&](ValueId id) {
@@ -7630,8 +7671,8 @@ bool if_convert_one_diamond(ManagedFunction& function,
     };
     if (!pure_arm(truth) || !pure_arm(falsity)) return false;
 
+    constexpr unsigned cost_scale = 100;
     const auto profitable = [&](unsigned cost) {
-        constexpr unsigned cost_scale = 100;
         unsigned limit = options.if_conversion_limit * cost_scale;
         // A low-bit test of loaded data commonly has little branch
         // predictability. Once allocation and if-conversion are enabled,
@@ -7639,7 +7680,8 @@ bool if_convert_one_diamond(ManagedFunction& function,
         // its misprediction with a select. Other diamonds retain the ordinary
         // profile-sensitive threshold because simultaneously live arm values
         // can cost more save/restore code than CMOV removes.
-        if (masked_memory_condition(function, condition)) {
+        if (unpredictable_memory_condition(
+                function, hir_module, condition)) {
             limit = std::max(
                 limit,
                 options.if_conversion_memory_limit * cost_scale);
@@ -7678,7 +7720,8 @@ bool if_convert_one_diamond(ManagedFunction& function,
             const auto type = function.values[truth_value.value].type;
             if (function.values[falsity_value.value].type != type ||
                 !if_conversion_scalar_type(hir_module, type) ||
-                !profitable(arm_cost(truth) + arm_cost(falsity) + 1U)) {
+                !profitable(arm_cost(truth) + arm_cost(falsity) +
+                            cost_scale)) {
                 return false;
             }
             ManagedValue value;
@@ -7765,8 +7808,9 @@ bool if_convert_one_diamond(ManagedFunction& function,
     }
     if (selections.empty()) return false;
 
-    const auto speculative_cost = arm_cost(truth) + arm_cost(falsity) +
-                                  static_cast<unsigned>(selections.size());
+    const auto speculative_cost =
+        arm_cost(truth) + arm_cost(falsity) +
+        static_cast<unsigned>(selections.size()) * cost_scale;
     if (!profitable(speculative_cost)) return false;
 
     const auto truth_values = truth.values;

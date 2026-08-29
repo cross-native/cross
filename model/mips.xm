@@ -735,6 +735,10 @@ abi "eabi32" {
     }
 }
 
+# MIPS profiles without a native conditional move preserve ordinary control
+# diamonds by default.  They retain the larger budget for recognized
+# high-entropy memory predicates, where speculation can still beat a branch.
+# Allegrex profiles keep the common policy because that ISA has MOVN/MOVZ.
 profile "mips-elf" {
     default_for = ["mips", "mips-*"];
     target = "mips-unknown-elf";
@@ -742,6 +746,8 @@ profile "mips-elf" {
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
 }
 
 profile "mipsel-elf" {
@@ -751,6 +757,8 @@ profile "mipsel-elf" {
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
 }
 
 profile "vr4300-cross64" {
@@ -760,6 +768,8 @@ profile "vr4300-cross64" {
     m.arch = "vr4300";
     m.tune = "vr4300";
     m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
 }
 
 profile "vr4300-o32" {
@@ -768,6 +778,8 @@ profile "vr4300-o32" {
     mangling = "cross";
     m.arch = "vr4300";
     m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
 }
 
 profile "psp-allegrex" {
@@ -796,6 +808,8 @@ profile "r3000-o32" {
     m.arch = "r3000";
     m.tune = "r3000";
     m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
 }
 
 profile "r6000-eabi" {
@@ -805,4 +819,6 @@ profile "r6000-eabi" {
     m.arch = "r6000";
     m.tune = "r6000";
     m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
 }

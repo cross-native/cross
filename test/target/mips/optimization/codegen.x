@@ -137,3 +137,27 @@ global u64 mips_compact_store(in const u64 *source,
     }
     return carry;
 }
+
+[[abi("o32"), noinline]]
+global u64 mips_high_bit_select(in const u64 *source, in uptr index) {
+    u64 value = source[index];
+    u64 selected;
+    if (value < 9223372036854775808u64) {
+        selected = value + 3u64;
+    } else {
+        selected = value ^ 11400714819323198485u64;
+    }
+    return selected;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_range_select(in const u64 *source, in uptr index) {
+    u64 value = source[index];
+    u64 selected;
+    if (value < 4611686018427387904u64) {
+        selected = value + 3u64;
+    } else {
+        selected = value ^ 11400714819323198485u64;
+    }
+    return selected;
+}

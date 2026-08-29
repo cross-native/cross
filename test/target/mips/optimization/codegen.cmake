@@ -61,9 +61,14 @@ compile_variant(enabled)
 compile_variant(no_iv -fno-ivopts)
 compile_variant(no_tail -fno-optimize-sibling-calls)
 compile_variant(no_fusion -fno-compare-branch-fusion)
-compile_variant(no_select_fusion -fno-compare-select-fusion)
+compile_variant(grouped_select -fif-conversion-limit=12)
+compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
+                -fno-compare-select-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
+compile_variant(no_if_conversion -fno-if-conversion)
+compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
+compile_variant(force_ordinary_if_conversion -fif-conversion-limit=12)
 compile_reassociation_variant(reassoc_risc 0)
 compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
 compile_reassociation_variant(reassoc_cisc 100 -fno-unroll-loops)
@@ -176,8 +181,9 @@ if(reassoc_cisc STREQUAL reassoc_cisc_off)
         "-ftree-reassoc depended on loop unrolling or ignored the CISC endpoint")
 endif()
 
-function_body("${OUTPUT}.enabled.s" mips_grouped_select grouped_select)
-function_body("${OUTPUT}.no_select_fusion.s"
+function_body("${OUTPUT}.grouped_select.s"
+              mips_grouped_select grouped_select)
+function_body("${OUTPUT}.grouped_select_no_fusion.s"
               mips_grouped_select separate_selects)
 string(REGEX MATCHALL "[	 ]beq[	 ]" grouped_select_branches
              "${grouped_select}")
@@ -234,4 +240,27 @@ if(NOT compact_risc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,4" OR
     message(FATAL_ERROR
         "an endpoint reduced a compact store loop below factor four\n"
         "RISC:\n${compact_risc}\nCISC:\n${compact_cisc}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_high_bit_select high_bit_select)
+function_body("${OUTPUT}.no_memory_if_conversion.s"
+              mips_high_bit_select high_bit_branch)
+if(high_bit_select STREQUAL high_bit_branch)
+    message(FATAL_ERROR
+        "the MIPS profile did not if-convert an unpredictable top-bit test")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_range_select range_default)
+function_body("${OUTPUT}.no_if_conversion.s"
+              mips_range_select range_branch)
+function_body("${OUTPUT}.force_ordinary_if_conversion.s"
+              mips_range_select range_forced)
+if(NOT range_default STREQUAL range_branch OR
+   range_default STREQUAL range_forced)
+    message(FATAL_ERROR
+        "the MIPS profile did not preserve an ordinary range branch or "
+        "honor -fif-conversion-limit\n"
+        "default:\n${range_default}\nforced:\n${range_forced}")
 endif()
