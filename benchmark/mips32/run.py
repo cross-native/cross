@@ -95,6 +95,7 @@ class BuildRecord:
     text_bytes: int
     load_bytes: int
     object_bytes: int
+    kernel_sizes: tuple[tuple[str, int], ...]
     runtime_symbols: tuple[str, ...]
 
 
@@ -326,6 +327,27 @@ def parse_nm_symbols(output: str, symbol_type: str | None = None) -> frozenset[s
     return frozenset(symbols)
 
 
+def parse_nm_function_sizes(output: str, prefix: str = "bench_") -> dict[str, int]:
+    """Parse decimal POSIX nm sizes for externally visible benchmark code."""
+
+    sizes: dict[str, int] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not fields[0].startswith(prefix):
+            continue
+        if fields[1].upper() != "T":
+            continue
+        try:
+            size = int(fields[3], 10)
+        except ValueError as error:
+            raise BenchmarkError(f"invalid llvm-nm size row: {line}") from error
+        name = fields[0].removeprefix(prefix)
+        if size <= 0 or name in sizes:
+            raise BenchmarkError(f"invalid or duplicate function size row: {line}")
+        sizes[name] = size
+    return sizes
+
+
 async def measure_sections(config: Configuration, path: Path) -> tuple[int, int]:
     """Measure executable text and load-image sections in an object or ELF."""
 
@@ -492,6 +514,25 @@ async def inspect_object(
             + ", ".join(sorted(unknown))
         )
     text_bytes, load_bytes = await measure_sections(config, path)
+    defined = await run_command(
+        (
+            config.tools.llvm_nm,
+            "--defined-only",
+            "--format=posix",
+            "--print-size",
+            "--radix=d",
+            path,
+        )
+    )
+    kernel_sizes = parse_nm_function_sizes(defined.stdout)
+    expected = {value.name for value in KERNELS if value.unit == unit}
+    if kernel_sizes.keys() != expected:
+        missing = sorted(expected - kernel_sizes.keys())
+        unexpected = sorted(kernel_sizes.keys() - expected)
+        raise BenchmarkError(
+            f"{path.name} function-size symbols disagree with {unit}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
     disassembly = await run_command(
         (config.tools.llvm_objdump, "--disassemble", "--no-show-raw-insn", path)
     )
@@ -506,6 +547,7 @@ async def inspect_object(
         text_bytes,
         load_bytes,
         path.stat().st_size,
+        tuple(sorted(kernel_sizes.items())),
         tuple(sorted(symbols)),
     )
 
@@ -1061,6 +1103,27 @@ def write_csv_files(
                     ";".join(build.runtime_symbols),
                 )
             )
+    with (config.output_dir / "code_size.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            ("compiler", "level", "category", "kernel", "unit", "function_bytes")
+        )
+        kernels = {value.name: value for value in KERNELS}
+        for build in builds:
+            for name, size in build.kernel_sizes:
+                value = kernels[name]
+                writer.writerow(
+                    (
+                        build.compiler,
+                        build.level,
+                        value.category,
+                        name,
+                        build.unit,
+                        size,
+                    )
+                )
     with (config.output_dir / "image.csv").open(
         "w", newline="", encoding="utf-8"
     ) as file:
@@ -1106,6 +1169,7 @@ def write_csv_files(
 def generate_report(
     config: Configuration,
     compilers: Sequence[str],
+    builds: Sequence[BuildRecord],
     images: Sequence[ImageRecord],
     runtimes: Sequence[RuntimeRecord],
     clang_probe: str,
@@ -1184,12 +1248,75 @@ def generate_report(
             ]
             lines.append(f"| {category} | " + " | ".join(ratios) + " |")
         lines.extend(("", "Each cell is `Cross ticks / pipeline ticks`.", ""))
+        if level == "O3":
+            lines.extend(("### Kernel runtime", ""))
+            lines.append(
+                "| kernel | " + " | ".join(compilers) +
+                " | Cross / fastest peer |"
+            )
+            lines.append("|---|" + "---:|" * (len(compilers) + 1))
+            for kernel_value in KERNELS:
+                scores = {
+                    compiler: next(
+                        value.ticks_per_unit
+                        for value in runtimes
+                        if value.compiler == compiler
+                        and value.level == level
+                        and value.kernel == kernel_value.name
+                    )
+                    for compiler in compilers
+                }
+                peers = {
+                    compiler: score
+                    for compiler, score in scores.items()
+                    if compiler != "cross"
+                }
+                best_peer = min(peers.values())
+                lines.append(
+                    f"| {kernel_value.name} | " +
+                    " | ".join(f"{scores[name]:.4f}" for name in compilers) +
+                    f" | {scores['cross'] / best_peer:.3f}x |"
+                )
+            lines.extend(
+                ("", "Runtime cells are ticks per declared work unit.", "")
+            )
+        if level == "Oz":
+            size_rows = {
+                (build.compiler, name): size
+                for build in builds
+                if build.level == level
+                for name, size in build.kernel_sizes
+            }
+            lines.extend(("### Kernel function size", ""))
+            lines.append(
+                "| kernel | " + " | ".join(compilers) +
+                " | Cross / smallest peer |"
+            )
+            lines.append("|---|" + "---:|" * (len(compilers) + 1))
+            for kernel_value in KERNELS:
+                sizes = {
+                    compiler: size_rows[(compiler, kernel_value.name)]
+                    for compiler in compilers
+                }
+                best_peer = min(
+                    size for compiler, size in sizes.items()
+                    if compiler != "cross"
+                )
+                lines.append(
+                    f"| {kernel_value.name} | " +
+                    " | ".join(str(sizes[name]) for name in compilers) +
+                    f" | {sizes['cross'] / best_peer:.3f}x |"
+                )
+            lines.extend(
+                ("", "Function-size cells are symbol bytes; whole-image totals above also charge shared runtime support and linker padding.", "")
+            )
     lines.extend(
         (
             "## Interpretation limits",
             "",
             "- Native Cross objects must be strictly standalone. Peer compiler-runtime references are resolved from GCC's target libgcc, named in the report, and charged to linked benchmark size.",
             "- `support/padding` is the final linked benchmark image minus the common harness and measured source-unit objects; it therefore includes extracted runtime members and linker alignment.",
+            "- Per-kernel function sizes measure each public symbol. Shared compiler-runtime members cannot be attributed to one function and remain charged only in the whole-image totals.",
             "- All images use the same GCC-built runner, startup, linker scripts, data, and checksums.",
             "- GCC is tuned for `vr4300`; LLVM exposes only generic `mips3` here.",
             "- CP0 Count under QEMU `-icount` is useful for relative dynamic work but does not model VR4300 cache and pipeline timing.",
@@ -1441,6 +1568,7 @@ async def async_main(argv: Sequence[str]) -> int:
     report = generate_report(
         config,
         compilers,
+        builds,
         images,
         runtimes,
         clang_probe_text,

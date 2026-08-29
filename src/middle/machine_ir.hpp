@@ -239,6 +239,24 @@ enum class InstructionKind {
     Trap,
 };
 
+// A narrow register may cross a wider ABI result boundary without first
+// materializing the extended value. The target places each result piece from
+// this semantic extension directly. None means the return use already has
+// the complete logical result width.
+enum class ExtensionKind : std::uint8_t { None, Zero, Sign };
+
+// A selected boundary value may consume only a contiguous bit range of its
+// logical ABI value.  Keeping this projection separate from the target opcode
+// lets calling-convention lowering select the required transport piece without
+// first materializing the complete source value.  The defining register holds
+// exactly `bit_width` bits beginning at `bit_offset`, where offset zero names
+// the least-significant bit independently of target byte order.
+struct ValueProjection {
+    std::uint16_t bit_offset{};
+    std::uint16_t bit_width{};
+    friend bool operator==(ValueProjection, ValueProjection) = default;
+};
+
 // `defs`, `uses`, and `clobbers` describe register effects independently from
 // target operand spelling.  A call's first operand is its callee (symbol or
 // register). Branch operands contain their target block(s): one for Branch,
@@ -273,6 +291,8 @@ struct Instruction {
     // Dense identity of model-provided incoming variadic state. It is local
     // to the function's ABI model and never appears in the operand stream.
     AbiStateId variadic_state;
+    std::optional<ValueProjection> input_projection;
+    ExtensionKind result_extension{ExtensionKind::None};
     bool may_load{};
     bool may_store{};
     bool has_side_effects{};

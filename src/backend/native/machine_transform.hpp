@@ -15,6 +15,14 @@ namespace cross::native {
 using MachineInstructionPredicate =
     std::function<bool(const machine::Instruction&)>;
 using MachineRegisterPredicate = std::function<bool(const machine::Register&)>;
+using MachineBlockPredicate = std::function<bool(machine::BlockId)>;
+
+// Forms hot fallthrough traces and rotates canonical test-first loops in
+// layout only. The CFG and SSA edges remain unchanged; targets retain control
+// over blocks whose source-visible labels make movement undesirable.
+[[nodiscard]] bool schedule_block_layout(
+    machine::Function& function,
+    const MachineBlockPredicate& is_addressable = {});
 
 [[nodiscard]] bool
 propagate_virtual_register_copies(machine::Function& function,

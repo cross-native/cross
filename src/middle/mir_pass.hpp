@@ -26,6 +26,8 @@ enum class PassId : std::uint8_t {
     SelectFactoring,
     RedundantExpressionElimination,
     InductionCoalescing,
+    UnitInductionExitSelection,
+    NativeInductionViewPromotion,
     AddressInductionStrengthReduction,
     LoopInvariantMotion,
     ReductionVectorization,

@@ -213,6 +213,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
               Diagnostics& diagnostics);
 
+// Materialize native-register-width views of proven non-wrapping unsigned
+// loop inductions. Targets whose integer registers are wider than their
+// pointer-sized source mode can call this bridge after the target-independent
+// pipeline, avoiding a repeated extension at every wide use while preserving
+// the source recurrence's modular semantics.
+bool promote_native_induction_views(ManagedModule& module,
+                                    hir::Module& hir_module,
+                                    unsigned native_integer_bits);
+
 // Specializes only calls that survived the inline phase. The driver invokes
 // this after its first whole-program ABI analysis; newly created private
 // variants are then included in the final boundary plan.

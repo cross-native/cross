@@ -69,7 +69,7 @@ foreach(level O2 O3 Os Oz)
                 "Oz did not cache spare volatile floating literals\n${polynomial}")
         endif()
         if(NOT polynomial MATCHES
-           "cmpq[^\r\n]*\r?\n[\t ]+jae[^\r\n]*\r?\n[.]Lcross[.]machine[^:]*:\r?\n[\t ]+movsd")
+           "cmpq[^\r\n]*\r?\n[\t ]+j(ae|e)[^\r\n]*\r?\n[.]Lcross[.]machine[^:]*:\r?\n[\t ]+movsd")
             message(FATAL_ERROR
                 "nested polynomial loop body is not the fallthrough edge\n"
                 "${polynomial}")

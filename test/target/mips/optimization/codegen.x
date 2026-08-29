@@ -45,6 +45,12 @@ global u32 mips_integer_immediates(in u32 value) {
 }
 
 [[abi("o32"), noinline]]
+global u32 mips_projected_parameter(in u64 value) {
+    u32 result = value;
+    return result;
+}
+
+[[abi("o32"), noinline]]
 global u32 mips_narrow_mask(in const u64 *data, in uptr index,
                             in u32 mask) {
     return data[index] & mask;
@@ -54,6 +60,19 @@ global u32 mips_narrow_mask(in const u64 *data, in uptr index,
 global u32 mips_volatile_narrow_mask(in volatile u64 *data,
                                      in uptr index, in u32 mask) {
     return data[index] & mask;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_affine_exit(in u32 state, in uptr iterations) {
+    u32 result = state;
+    u32 step = 1u32;
+    uptr index = 0;
+    while (index < iterations) {
+        result = result * 1664525u32 + step;
+        step = step + 17u32;
+        index = index + 1;
+    }
+    return result;
 }
 
 [[abi("o32"), noinline]]

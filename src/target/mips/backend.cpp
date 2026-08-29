@@ -323,12 +323,27 @@ public:
         return {};
     }
 
-    bool prepare_managed(mir::ManagedModule&, hir::Module&,
-                         const Subtarget&, const CompilerOptions&,
+    bool prepare_managed(mir::ManagedModule& managed_module,
+                         hir::Module& hir_module,
+                         const Subtarget& subtarget,
+                         const CompilerOptions& options,
                          Diagnostics& diagnostics) const override {
         // MIPS registered ABIs, including Cross's internal convention, are
         // interpreted directly during frame/call lowering. No ABI name is
         // hard-coded and no LLVM convention ID is involved.
+        //
+        // MIPS III couples a 32-bit address model to 64-bit integer
+        // registers. Keep source-width loop control, but carry reusable wide
+        // induction views in MIR so each u64 consumer does not re-extend the
+        // same value in the native backend.
+        if (options.ivopts && hir_module.address_bits < 64 &&
+            subtarget.has_feature(Feature::Mips3)) {
+            (void)mir::promote_native_induction_views(
+                managed_module, hir_module, 64);
+            if (!mir::verify(managed_module, hir_module, diagnostics)) {
+                return false;
+            }
+        }
         return diagnostics.errors() == 0;
     }
 

@@ -69,6 +69,20 @@ __umoddi3 U 0 0
     assert benchmark.parse_nm_symbols(output, "U") == {"__umoddi3"}
 
 
+def test_parse_nm_function_sizes_uses_decimal_symbol_bytes() -> None:
+    """Per-kernel size accounting ignores local labels and helper symbols."""
+
+    output = """.Lblock t 0 0
+bench_mix T 0 364
+helper T 364 24
+bench_narrow T 388 264
+"""
+    assert benchmark.parse_nm_function_sizes(output) == {
+        "mix": 364,
+        "narrow": 264,
+    }
+
+
 def test_first_diagnostic_prefers_fatal_lowering_failure() -> None:
     """An optional LLVM probe should report its cause, not an earlier warning."""
 

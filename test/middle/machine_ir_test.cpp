@@ -138,5 +138,28 @@ int main() {
                     "elided home for a referenced unassigned virtual was accepted") &&
              ok;
     }
+    {
+        auto function = valid_function();
+        cross::machine::Instruction target;
+        target.kind = cross::machine::InstructionKind::Target;
+        target.opcode = cross::machine::TargetOpcodeId{1};
+        target.defs.push_back(cross::machine::Register::physical_register(
+            {2}, cross::machine::i32));
+        target.input_projection = cross::machine::ValueProjection{0, 32};
+        function.blocks.front().instructions.insert(
+            function.blocks.front().instructions.begin(), target);
+        std::ostringstream text;
+        cross::Diagnostics diagnostics(text);
+        ok = expect(cross::machine::verify(function, diagnostics),
+                    "well-formed boundary projection was rejected") &&
+             ok;
+
+        target.input_projection = cross::machine::ValueProjection{0, 16};
+        function.blocks.front().instructions.front() = std::move(target);
+        ok = expect(rejected(std::move(function),
+                             "input projection requires"),
+                    "width-mismatched boundary projection was accepted") &&
+             ok;
+    }
     return ok ? 0 : 1;
 }

@@ -200,6 +200,45 @@ bool spill_elision_test() {
     return ok;
 }
 
+machine::Function canonical_loop_function() {
+    machine::Function function;
+    function.entry = {0};
+    function.layout = {{0}, {1}, {2}, {3}};
+    function.blocks.resize(4);
+    for (std::uint32_t index = 0; index < 4; ++index) {
+        function.blocks[index].id = {index};
+        function.blocks[index].reachable = true;
+    }
+    function.blocks[0].successors = {{1}};
+    function.blocks[1].predecessors = {{0}, {2}};
+    function.blocks[1].successors = {{2}, {3}};
+    function.blocks[2].predecessors = {{1}};
+    function.blocks[2].successors = {{1}};
+    function.blocks[3].predecessors = {{1}};
+    return function;
+}
+
+bool block_layout_test() {
+    auto function = canonical_loop_function();
+    bool ok = true;
+    ok &= expect(native::schedule_block_layout(function),
+                 "canonical loop layout should change");
+    ok &= expect(function.layout ==
+                     std::vector<machine::BlockId>{{0}, {2}, {1}, {3}},
+                 "loop body should fall through to its test");
+
+    auto labeled = canonical_loop_function();
+    ok &= expect(!native::schedule_block_layout(
+                     labeled, [](machine::BlockId block) {
+                         return block == machine::BlockId{2};
+                     }),
+                 "addressable loop body must not move");
+    ok &= expect(labeled.layout ==
+                     std::vector<machine::BlockId>{{0}, {1}, {2}, {3}},
+                 "addressable loop layout should remain stable");
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -209,5 +248,6 @@ int main() {
     ok &= load_elimination_test();
     ok &= dead_definition_test();
     ok &= spill_elision_test();
+    ok &= block_layout_test();
     return ok ? 0 : 1;
 }

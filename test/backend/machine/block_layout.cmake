@@ -66,11 +66,11 @@ string(REGEX MATCH
     "nested_layout:[^#]*[.]size nested_layout"
     nested_body "${assembly}")
 string(REGEX MATCHALL
-    "j(ae|b)[\t ]+[.]Lcross[.]machine[.][^\r\n]+[\r\n]+[.]Lcross[.]machine[.]"
+    "j(ae|b|e|ne)[\t ]+[.]Lcross[.]machine[.][^\r\n]+[\r\n]+[.]Lcross[.]machine[.]"
     nested_fallthroughs "${nested_body}")
 list(LENGTH nested_fallthroughs nested_fallthrough_count)
 if(nested_body STREQUAL "" OR NOT nested_fallthrough_count EQUAL 2 OR
-   nested_body MATCHES "j(ae|b)[^\r\n]*[\r\n]+[\t ]*jmp")
+   nested_body MATCHES "j(ae|b|e|ne)[^\r\n]*[\r\n]+[\t ]*jmp")
     message(FATAL_ERROR
         "nested rotated-loop exits did not use their laid-out fallthroughs\n"
         "${nested_body}")

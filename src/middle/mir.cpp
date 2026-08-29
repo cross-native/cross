@@ -7196,7 +7196,7 @@ bool thread_boolean_phi_branch_once(ManagedFunction& function) {
             continue;
         }
         const auto condition_id = *merge.terminator.value;
-        const auto& condition = function.values[condition_id.value];
+        const auto condition = function.values[condition_id.value];
         if (condition.kind != ValueKind::Phi ||
             condition.incoming.size() != merge.predecessors.size() ||
             merge.predecessors.size() < 2) {
@@ -8129,6 +8129,86 @@ std::vector<std::optional<BlockId>> value_definition_blocks(
     return result;
 }
 
+bool select_unit_induction_exits(
+    ManagedFunction& function, const hir::Module& hir_module,
+    std::span<const CanonicalLoop> loops) {
+    const auto definition_blocks = value_definition_blocks(function);
+    bool changed = false;
+    for (const auto& loop : loops) {
+        if (loop.header.value >= function.blocks.size()) continue;
+        auto& header = function.blocks[loop.header.value];
+        if (!header.terminator.value ||
+            header.terminator.value->value >= function.values.size()) {
+            continue;
+        }
+        const auto condition_id = *header.terminator.value;
+        const auto& condition = function.values[condition_id.value];
+        if (condition.kind != ValueKind::Binary ||
+            condition.binary != BinaryOperation::UnsignedLess ||
+            condition.operands.size() != 2) {
+            continue;
+        }
+        const auto induction_id = condition.operands[0];
+        const auto bound_id = condition.operands[1];
+        if (induction_id.value >= function.values.size() ||
+            bound_id.value >= definition_blocks.size() ||
+            (definition_blocks[bound_id.value] &&
+             loop.blocks.contains(
+                 definition_blocks[bound_id.value]->value))) {
+            continue;
+        }
+        const auto& induction = function.values[induction_id.value];
+        if (induction.kind != ValueKind::Phi ||
+            !unsigned_integer_type(hir_module, induction.type) ||
+            induction.incoming.size() != 2) {
+            continue;
+        }
+        const auto initial = phi_value_from(induction, loop.preheader);
+        const auto carried = std::find_if(
+            induction.incoming.begin(), induction.incoming.end(),
+            [&](const PhiIncoming& incoming) {
+                return incoming.predecessor != loop.preheader &&
+                    loop.blocks.contains(incoming.predecessor.value);
+            });
+        if (!initial || carried == induction.incoming.end() ||
+            initial->value >= function.values.size() ||
+            carried->value.value >= function.values.size()) {
+            continue;
+        }
+        const auto& zero = function.values[initial->value];
+        const auto& update = function.values[carried->value.value];
+        if (zero.kind != ValueKind::ConstantInteger || zero.integer != 0 ||
+            zero.integer_high != 0 || update.kind != ValueKind::Binary ||
+            update.binary != BinaryOperation::Add ||
+            update.operands.size() != 2) {
+            continue;
+        }
+        std::optional<ValueId> step_id;
+        if (update.operands[0] == induction_id) {
+            step_id = update.operands[1];
+        } else if (update.operands[1] == induction_id) {
+            step_id = update.operands[0];
+        }
+        if (!step_id || step_id->value >= function.values.size()) continue;
+        const auto& step = function.values[step_id->value];
+        if (step.kind != ValueKind::ConstantInteger || step.integer != 1 ||
+            step.integer_high != 0) {
+            continue;
+        }
+
+        ManagedValue selected = condition;
+        selected.id = ValueId{static_cast<std::uint32_t>(
+            function.values.size())};
+        selected.binary = BinaryOperation::NotEqual;
+        const auto selected_id = selected.id;
+        function.values.push_back(std::move(selected));
+        header.values.push_back(selected_id);
+        header.terminator.value = selected_id;
+        changed = true;
+    }
+    return changed;
+}
+
 void coalesce_equivalent_inductions(ManagedFunction& function,
                                     const hir::Module& hir_module,
                                     std::span<const CanonicalLoop> loops,
@@ -8627,6 +8707,12 @@ bool reduce_affine_address_inductions(
             }
 
             for (auto& group : groups) {
+                if ((options.optimize_for == OptimizationGoal::Size ||
+                     options.optimize_for ==
+                         OptimizationGoal::MinimumSize) &&
+                    group.accesses.size() < 2) {
+                    continue;
+                }
                 const auto address_cost = group.element_size == 1 ? 1U : 2U;
                 const auto risc_weight =
                     100U - std::min(options.risc_cisc_balance, 100U);
@@ -8985,7 +9071,8 @@ std::optional<UnrollLoopPattern> find_unrollable_loop(
 bool unroll_loop(ManagedFunction& function,
                  const UnrollLoopPattern& pattern,
                  const hir::Module& hir_module,
-                 unsigned factor) {
+                 unsigned factor,
+                 bool select_affine_exit) {
     if (factor < 2) return false;
     const auto& old_header = function.blocks[pattern.loop.header.value];
     const auto& old_body = function.blocks[pattern.body.value];
@@ -8997,6 +9084,86 @@ bool unroll_loop(ManagedFunction& function,
         function.values[pattern.index.value], pattern.backedge);
     const auto shared_masked_patterns = find_shared_masked_inductions(
         function, hir_module, pattern, factor);
+
+    struct AffineExitInduction {
+        ValueId phi;
+        ValueId initial;
+        std::uint64_t step{};
+        hir::TypeId type;
+        SourceLocation location;
+    };
+    const auto affine_exit = [&]() -> std::optional<AffineExitInduction> {
+        if (!select_affine_exit ||
+            !unsigned_integer_type(
+                hir_module, function.values[pattern.index.value].type)) {
+            return std::nullopt;
+        }
+        // The ordinary counter must exist solely to control this loop. Its
+        // value after a normal exit is then exactly the bound, so both the
+        // main unrolled loop and scalar cleanup can discard the recurrence.
+        for (const auto& value : function.values) {
+            const bool uses_index =
+                std::find(value.operands.begin(), value.operands.end(),
+                          pattern.index) != value.operands.end() ||
+                std::any_of(
+                    value.call_arguments.begin(), value.call_arguments.end(),
+                    [&](const CallArgument& argument) {
+                        return argument.value == pattern.index;
+                    }) ||
+                std::any_of(value.incoming.begin(), value.incoming.end(),
+                            [&](const PhiIncoming& incoming) {
+                                return incoming.value == pattern.index;
+                            });
+            if (uses_index && value.id != induction_update &&
+                value.id != condition_id) {
+                return std::nullopt;
+            }
+        }
+        for (const auto& block : function.blocks) {
+            if (block.terminator.value == pattern.index) {
+                return std::nullopt;
+            }
+        }
+
+        const auto index_bits = type_bits(
+            hir_module, function.values[pattern.index.value].type);
+        for (const auto candidate_id : pattern.phis) {
+            if (candidate_id == pattern.index) continue;
+            const auto& candidate = function.values[candidate_id.value];
+            if (!unsigned_integer_type(hir_module, candidate.type) ||
+                type_bits(hir_module, candidate.type) != index_bits) {
+                continue;
+            }
+            const auto initial = phi_value_from(
+                candidate, pattern.loop.preheader);
+            const auto update_id = phi_value_from(
+                candidate, pattern.backedge);
+            if (!initial || !update_id) continue;
+            const auto& update = function.values[update_id->value];
+            if (update.kind != ValueKind::Binary ||
+                update.binary != BinaryOperation::Add ||
+                update.operands.size() != 2) {
+                continue;
+            }
+            std::optional<ValueId> step_id;
+            if (update.operands[0] == candidate_id) {
+                step_id = update.operands[1];
+            } else if (update.operands[1] == candidate_id) {
+                step_id = update.operands[0];
+            }
+            if (!step_id) continue;
+            const auto& step = function.values[step_id->value];
+            if (step.kind != ValueKind::ConstantInteger ||
+                step.integer_high != 0 || step.integer == 0 ||
+                (step.integer & 1U) == 0) {
+                continue;
+            }
+            return AffineExitInduction{
+                candidate_id, *initial, step.integer, candidate.type,
+                candidate.location};
+        }
+        return std::nullopt;
+    }();
 
     const BlockId header_id{
         static_cast<std::uint32_t>(function.blocks.size())};
@@ -9130,6 +9297,51 @@ bool unroll_loop(ManagedFunction& function,
     const auto unrolled_limit =
         append_value(preheader_values, std::move(limit_value));
 
+    std::optional<ValueId> affine_main_limit;
+    std::optional<ValueId> affine_full_limit;
+    if (affine_exit) {
+        ManagedValue step;
+        step.location = affine_exit->location;
+        step.type = affine_exit->type;
+        step.kind = ValueKind::ConstantInteger;
+        step.integer = affine_exit->step;
+        const auto step_id =
+            append_value(preheader_values, std::move(step));
+
+        const auto as_affine_type = [&](ValueId source) {
+            if (function.values[source.value].type == affine_exit->type) {
+                return source;
+            }
+            ManagedValue cast;
+            cast.location = affine_exit->location;
+            cast.type = affine_exit->type;
+            cast.kind = ValueKind::Cast;
+            cast.cast = CastOperation::Reinterpret;
+            cast.operands = {source};
+            return append_value(preheader_values, std::move(cast));
+        };
+        const auto form_limit = [&](ValueId source) {
+            ManagedValue scale;
+            scale.location = affine_exit->location;
+            scale.type = affine_exit->type;
+            scale.kind = ValueKind::Binary;
+            scale.binary = BinaryOperation::Multiply;
+            scale.operands = {as_affine_type(source), step_id};
+            const auto scaled =
+                append_value(preheader_values, std::move(scale));
+
+            ManagedValue limit;
+            limit.location = affine_exit->location;
+            limit.type = affine_exit->type;
+            limit.kind = ValueKind::Binary;
+            limit.binary = BinaryOperation::Add;
+            limit.operands = {affine_exit->initial, scaled};
+            return append_value(preheader_values, std::move(limit));
+        };
+        affine_main_limit = form_limit(unrolled_limit);
+        affine_full_limit = form_limit(pattern.bound);
+    }
+
     // Materialize loop literals once for the four cloned iterations. Small
     // integers can still disappear into target immediates; large constants
     // avoid a repeated movabs/load in the unrolled body.
@@ -9170,13 +9382,69 @@ bool unroll_loop(ManagedFunction& function,
         state.emplace(original.value, id);
         new_phis.emplace(original.value, id);
     }
+
+    struct AffineUnrollRecurrence {
+        ValueId phi;
+        std::vector<ValueId> offsets;
+    };
+    std::unordered_map<std::uint32_t, AffineUnrollRecurrence>
+        affine_updates;
+    if (select_affine_exit) {
+        for (const auto original : pattern.phis) {
+            if (original == pattern.index) continue;
+            const auto& phi = function.values[original.value];
+            if (!unsigned_integer_type(hir_module, phi.type)) continue;
+            const auto update_id = phi_value_from(phi, pattern.backedge);
+            if (!update_id) continue;
+            const auto& update = function.values[update_id->value];
+            if (update.kind != ValueKind::Binary ||
+                update.binary != BinaryOperation::Add ||
+                update.operands.size() != 2) {
+                continue;
+            }
+            std::optional<ValueId> step_id;
+            if (update.operands[0] == original) {
+                step_id = update.operands[1];
+            } else if (update.operands[1] == original) {
+                step_id = update.operands[0];
+            }
+            if (!step_id) continue;
+            const auto& step = function.values[step_id->value];
+            const auto bits = type_bits(hir_module, phi.type);
+            if (step.kind != ValueKind::ConstantInteger || bits == 0 ||
+                bits > 64 || step.integer_high != 0) {
+                continue;
+            }
+            std::vector<ValueId> offsets(factor + 1U);
+            for (unsigned iteration = 1; iteration <= factor; ++iteration) {
+                ManagedValue offset;
+                offset.location = update.location;
+                offset.type = phi.type;
+                offset.kind = ValueKind::ConstantInteger;
+                offset.integer = mask_to(
+                    multiply(UInt128{step.integer}, UInt128{iteration}),
+                    bits).low;
+                offsets[iteration] =
+                    append_value(preheader_values, std::move(offset));
+            }
+            affine_updates.emplace(
+                update_id->value,
+                AffineUnrollRecurrence{original, std::move(offsets)});
+        }
+    }
     const auto index = state.at(pattern.index.value);
     ManagedValue guard;
     guard.location = header.location;
     guard.type = condition_type;
     guard.kind = ValueKind::Binary;
-    guard.binary = BinaryOperation::UnsignedLess;
-    guard.operands = {index, unrolled_limit};
+    if (affine_exit) {
+        guard.binary = BinaryOperation::NotEqual;
+        guard.operands = {
+            state.at(affine_exit->phi.value), *affine_main_limit};
+    } else {
+        guard.binary = BinaryOperation::UnsignedLess;
+        guard.operands = {index, unrolled_limit};
+    }
     const auto guard_id = append_value(header.values, std::move(guard));
 
     const auto resolve = [&](ValueId operand,
@@ -9269,6 +9537,22 @@ bool unroll_loop(ManagedFunction& function,
                 iteration.emplace(original.value, id);
                 continue;
             }
+            if (const auto found = affine_updates.find(original.value);
+                found != affine_updates.end()) {
+                ManagedValue next;
+                next.location = function.values[original.value].location;
+                next.type = function.values[found->second.phi.value].type;
+                next.kind = ValueKind::Binary;
+                next.binary = BinaryOperation::Add;
+                next.operands = {
+                    new_phis.at(found->second.phi.value),
+                    found->second.offsets[iteration_number + 1U]};
+                const auto id = iteration_number == 0
+                    ? append_value(header.values, std::move(next))
+                    : append_body_value(std::move(next));
+                iteration.emplace(original.value, id);
+                continue;
+            }
             if (original == induction_update) {
                 // Express every cloned induction value relative to the
                 // loop-header phi rather than as a chain of +1 updates.
@@ -9349,8 +9633,16 @@ bool unroll_loop(ManagedFunction& function,
         for (auto& incoming : phi.incoming) {
             if (incoming.predecessor != pattern.loop.preheader) continue;
             incoming.predecessor = exit_id;
-            incoming.value = new_phis.at(original.value);
+            incoming.value = affine_exit && original == pattern.index
+                ? unrolled_limit
+                : new_phis.at(original.value);
         }
+    }
+    if (affine_exit) {
+        auto& original_condition = function.values[condition_id.value];
+        original_condition.binary = BinaryOperation::NotEqual;
+        original_condition.operands = {
+            affine_exit->phi, *affine_full_limit};
     }
     auto& original_effect =
         function.effects[original_header.effect.value];
@@ -9426,7 +9718,8 @@ void unroll_loops(ManagedFunction& function,
                 ? 4U
                 : 2U;
         const unsigned factor = std::min(preferred, options.unroll_factor);
-        (void)unroll_loop(function, *pattern, hir_module, factor);
+        (void)unroll_loop(function, *pattern, hir_module, factor,
+                          options.ivopts);
     }
 }
 
@@ -12269,10 +12562,345 @@ bool fold_integer_constants(ManagedFunction& function,
     return changed;
 }
 
+std::optional<std::uint64_t> constant_u64(
+    const ManagedFunction& function, ValueId id) {
+    if (id.value >= function.values.size()) return std::nullopt;
+    const auto& value = function.values[id.value];
+    if (value.kind != ValueKind::ConstantInteger ||
+        value.integer_high != 0) {
+        return std::nullopt;
+    }
+    return value.integer;
+}
+
+std::optional<std::uint64_t> affine_phi_offset(
+    const ManagedFunction& function, ValueId value_id, ValueId phi,
+    std::uint64_t maximum_offset) {
+    if (value_id == phi) return 0;
+    if (value_id.value >= function.values.size()) return std::nullopt;
+    const auto& value = function.values[value_id.value];
+    if (value.kind != ValueKind::Binary ||
+        value.binary != BinaryOperation::Add ||
+        value.operands.size() != 2) {
+        return std::nullopt;
+    }
+    std::optional<ValueId> constant;
+    if (value.operands[0] == phi) constant = value.operands[1];
+    else if (value.operands[1] == phi) constant = value.operands[0];
+    if (!constant) return std::nullopt;
+    const auto offset = constant_u64(function, *constant);
+    if (!offset || *offset > maximum_offset) return std::nullopt;
+    return offset;
+}
+
+bool value_used_outside(
+    const ManagedFunction& function, ValueId sought,
+    const std::unordered_set<std::uint32_t>& ignored_users) {
+    for (const auto& value : function.values) {
+        if (ignored_users.contains(value.id.value)) continue;
+        if (std::find(value.operands.begin(), value.operands.end(), sought) !=
+                value.operands.end() ||
+            std::any_of(
+                value.call_arguments.begin(), value.call_arguments.end(),
+                [&](const CallArgument& argument) {
+                    return argument.value == sought;
+                }) ||
+            std::any_of(
+                value.incoming.begin(), value.incoming.end(),
+                [&](const PhiIncoming& incoming) {
+                    return incoming.value == sought;
+                })) {
+            return true;
+        }
+    }
+    return std::any_of(
+        function.blocks.begin(), function.blocks.end(),
+        [&](const ManagedBlock& block) {
+            return block.terminator.value == sought;
+        });
+}
+
+bool promote_native_induction_views(
+    ManagedFunction& function, const hir::Module& hir_module,
+    unsigned native_integer_bits, std::span<const CanonicalLoop> loops) {
+    const auto native_kind = [&]() -> std::optional<BuiltinType> {
+        switch (native_integer_bits) {
+        case 32: return BuiltinType::U32;
+        case 64: return BuiltinType::U64;
+        case 128: return BuiltinType::U128;
+        default: return std::nullopt;
+        }
+    }();
+    if (!native_kind) return false;
+    const auto native_type = hir_module.builtin(*native_kind);
+    if (!native_type) return false;
+
+    const auto definitions = value_definition_blocks(function);
+    std::unordered_set<std::uint32_t> removed;
+    std::vector<ValueId> possibly_dead_affine_values;
+    bool changed = false;
+
+    const auto append = [&](BlockId block, ManagedValue value,
+                            std::optional<ValueId> before = std::nullopt,
+                            bool phi_position = false) {
+        const ValueId id{
+            static_cast<std::uint32_t>(function.values.size())};
+        value.id = id;
+        function.values.push_back(std::move(value));
+        auto& values = function.blocks[block.value].values;
+        auto position = values.end();
+        if (before) position = std::find(values.begin(), values.end(), *before);
+        else if (phi_position) {
+            position = std::find_if(
+                values.begin(), values.end(), [&](ValueId candidate) {
+                    return function.values[candidate.value].kind !=
+                           ValueKind::Phi;
+                });
+        }
+        values.insert(position, id);
+        return id;
+    };
+
+    struct View {
+        ValueId cast;
+        ValueId source;
+        BlockId block;
+        std::uint64_t offset{};
+    };
+
+    for (const auto& loop : loops) {
+        if (loop.header.value >= function.blocks.size() ||
+            loop.preheader.value >= function.blocks.size()) {
+            continue;
+        }
+        const auto& header = function.blocks[loop.header.value];
+        if (header.predecessors.size() != 2 ||
+            header.terminator.kind != TerminatorKind::ConditionalBranch ||
+            !header.terminator.value) {
+            continue;
+        }
+        const auto condition_id = *header.terminator.value;
+        if (condition_id.value >= function.values.size()) continue;
+        const auto condition = function.values[condition_id.value];
+
+        std::vector<ValueId> phis;
+        for (const auto id : header.values) {
+            if (function.values[id.value].kind == ValueKind::Phi) {
+                phis.push_back(id);
+            }
+        }
+        for (const auto phi_id : phis) {
+            const auto& phi = function.values[phi_id.value];
+            const auto source_bits = type_bits(hir_module, phi.type);
+            if (!unsigned_integer_type(hir_module, phi.type) ||
+                source_bits == 0 || source_bits >= native_integer_bits ||
+                phi.incoming.size() != 2 ||
+                condition.kind != ValueKind::Binary ||
+                (condition.binary != BinaryOperation::UnsignedLess &&
+                 condition.binary != BinaryOperation::NotEqual) ||
+                condition.operands.size() != 2 ||
+                condition.operands[0] != phi_id) {
+                continue;
+            }
+
+            const auto outside = std::find_if(
+                phi.incoming.begin(), phi.incoming.end(),
+                [&](const PhiIncoming& incoming) {
+                    return incoming.predecessor == loop.preheader;
+                });
+            const auto inside = std::find_if(
+                phi.incoming.begin(), phi.incoming.end(),
+                [&](const PhiIncoming& incoming) {
+                    return loop.blocks.contains(incoming.predecessor.value) &&
+                           incoming.predecessor != loop.preheader;
+                });
+            if (outside == phi.incoming.end() ||
+                inside == phi.incoming.end() ||
+                outside == inside || inside->value.value >= function.values.size() ||
+                inside->value.value >= definitions.size() ||
+                definitions[inside->value.value] != inside->predecessor) {
+                continue;
+            }
+            const auto initial = constant_u64(function, outside->value);
+            if (!initial || *initial != 0) continue;
+
+            const auto& update = function.values[inside->value.value];
+            if (update.kind != ValueKind::Binary ||
+                update.binary != BinaryOperation::Add ||
+                update.operands.size() != 2) {
+                continue;
+            }
+            std::optional<ValueId> step_id;
+            if (update.operands[0] == phi_id) step_id = update.operands[1];
+            else if (update.operands[1] == phi_id) step_id = update.operands[0];
+            if (!step_id) continue;
+            const auto step = constant_u64(function, *step_id);
+            if (!step || *step == 0 || *step >
+                    (source_bits == 64
+                         ? std::numeric_limits<std::uint64_t>::max()
+                         : (std::uint64_t{1} << source_bits) - 1U)) {
+                continue;
+            }
+
+            // A unit recurrence guarded by phi < bound cannot wrap before
+            // its last useful view. For an unrolled power-of-two recurrence,
+            // require the loop limit to have the corresponding low bits
+            // cleared. This proves phi + [0, step) remains in source range.
+            if (*step > 1) {
+                if (!std::has_single_bit(*step)) continue;
+                const auto bound_id = condition.operands[1];
+                if (bound_id.value >= function.values.size()) continue;
+                const auto& bound = function.values[bound_id.value];
+                if (bound.kind != ValueKind::Binary ||
+                    bound.binary != BinaryOperation::BitAnd ||
+                    bound.operands.size() != 2) {
+                    continue;
+                }
+                std::optional<std::uint64_t> mask;
+                if (const auto left = constant_u64(
+                        function, bound.operands[0])) mask = left;
+                if (!mask) {
+                    if (const auto right = constant_u64(
+                            function, bound.operands[1])) mask = right;
+                }
+                if (!mask || (*mask & (*step - 1U)) != 0) continue;
+            }
+
+            std::vector<View> views;
+            std::optional<hir::TypeId> view_type;
+            for (const auto block_value : loop.blocks) {
+                if (block_value >= function.blocks.size()) continue;
+                for (const auto id : function.blocks[block_value].values) {
+                    const auto& value = function.values[id.value];
+                    if (value.kind != ValueKind::Cast ||
+                        value.cast != CastOperation::ZeroExtend ||
+                        type_bits(hir_module, value.type) !=
+                            native_integer_bits ||
+                        !unsigned_integer_type(hir_module, value.type) ||
+                        value.operands.size() != 1) {
+                        continue;
+                    }
+                    if (view_type && value.type != *view_type) continue;
+                    const auto offset = affine_phi_offset(
+                        function, value.operands[0], phi_id, *step - 1U);
+                    if (!offset) continue;
+                    if (!view_type) view_type = value.type;
+                    views.push_back(
+                        {id, value.operands[0], BlockId{block_value}, *offset});
+                }
+            }
+            if (views.empty()) continue;
+
+            const auto phi_location = phi.location;
+            const auto update_location = update.location;
+            const auto backedge = inside->predecessor;
+
+            ManagedValue zero;
+            zero.location = phi_location;
+            zero.type = *view_type;
+            zero.kind = ValueKind::ConstantInteger;
+            const auto wide_initial = append(loop.preheader, std::move(zero));
+
+            ManagedValue wide_step;
+            wide_step.location = update_location;
+            wide_step.type = *view_type;
+            wide_step.kind = ValueKind::ConstantInteger;
+            wide_step.integer = *step;
+            const auto wide_step_id =
+                append(loop.preheader, std::move(wide_step));
+
+            ManagedValue wide_phi;
+            wide_phi.location = phi_location;
+            wide_phi.type = *view_type;
+            wide_phi.kind = ValueKind::Phi;
+            wide_phi.incoming = {
+                {loop.preheader, wide_initial},
+                {backedge, ValueId{}}};
+            const auto wide_phi_id =
+                append(loop.header, std::move(wide_phi), std::nullopt, true);
+
+            ManagedValue wide_update;
+            wide_update.location = update_location;
+            wide_update.type = *view_type;
+            wide_update.kind = ValueKind::Binary;
+            wide_update.binary = BinaryOperation::Add;
+            wide_update.operands = {wide_phi_id, wide_step_id};
+            const auto wide_update_id =
+                append(backedge, std::move(wide_update));
+            function.values[wide_phi_id.value].incoming[1].value =
+                wide_update_id;
+
+            std::unordered_map<std::uint64_t, ValueId> offsets;
+            for (const auto& view : views) {
+                auto replacement = wide_phi_id;
+                if (view.offset != 0) {
+                    auto constant = offsets.find(view.offset);
+                    if (constant == offsets.end()) {
+                        ManagedValue offset;
+                        offset.location =
+                            function.values[view.cast.value].location;
+                        offset.type = *view_type;
+                        offset.kind = ValueKind::ConstantInteger;
+                        offset.integer = view.offset;
+                        constant = offsets.emplace(
+                            view.offset,
+                            append(loop.preheader, std::move(offset))).first;
+                    }
+                    ManagedValue derived;
+                    derived.location =
+                        function.values[view.cast.value].location;
+                    derived.type = *view_type;
+                    derived.kind = ValueKind::Binary;
+                    derived.binary = BinaryOperation::Add;
+                    derived.operands = {wide_phi_id, constant->second};
+                    replacement = append(
+                        view.block, std::move(derived), view.cast);
+                }
+                replace_value_uses(function, view.cast, replacement);
+                removed.insert(view.cast.value);
+                if (view.source != phi_id) {
+                    possibly_dead_affine_values.push_back(view.source);
+                }
+            }
+            changed = true;
+        }
+    }
+
+    if (!changed) return false;
+    for (const auto candidate : possibly_dead_affine_values) {
+        if (!value_used_outside(function, candidate, removed)) {
+            removed.insert(candidate.value);
+        }
+    }
+    for (auto& block : function.blocks) {
+        std::erase_if(block.values, [&](ValueId id) {
+            return removed.contains(id.value);
+        });
+    }
+    compact_managed_values(function);
+    return true;
+}
+
 } // namespace
 
 void prune_unreachable_blocks(ManagedFunction& function) {
     eliminate_unreachable_blocks(function);
+}
+
+bool promote_native_induction_views(ManagedModule& module,
+                                    hir::Module& hir_module,
+                                    unsigned native_integer_bits) {
+    FunctionPassManager pipeline;
+    pipeline.add(
+        PassId::NativeInductionViewPromotion,
+        [&](ManagedFunction& function, FunctionAnalysisManager& analyses) {
+            const bool changed = promote_native_induction_views(
+                function, hir_module, native_integer_bits,
+                analyses.loops().canonical_loops());
+            return changed ? PassResult::changed_values()
+                           : PassResult::unchanged();
+        });
+    return pipeline.run(module);
 }
 
 void optimize(ManagedModule& module, hir::Module& hir_module,
@@ -12543,6 +13171,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     // after the first induction pass. Canonicalize them while SSA IDs are
     // still sparse; final DCE performs the safe global compaction.
     if (options.ivopts) {
+        pipeline.add(
+            PassId::UnitInductionExitSelection,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                return select_unit_induction_exits(
+                           function, hir_module,
+                           analyses.loops().canonical_loops())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
         pipeline.add(
             PassId::InductionCoalescing,
             [&](ManagedFunction& function,

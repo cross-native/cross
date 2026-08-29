@@ -33,12 +33,14 @@ namespace {
 
 enum class LoweringPass : std::uint16_t {
     PropagateCopies,
+    FoldBoundaryProjections,
     SelectIntegerImmediates,
     FoldPointerOffsets,
     EliminateRedundantExpressions,
     EliminateRedundantLoads,
     FuseCompareBranches,
     EliminateDeadValues,
+    ScheduleBlockLayout,
     ScheduleInstructions,
     AllocateRegisters,
     ElideUnusedSpillSlots,
@@ -1057,7 +1059,23 @@ private:
         case mir::TerminatorKind::Return:
             result.kind = machine::InstructionKind::Return;
             if (terminator.value) {
-                const auto source = reg(*terminator.value);
+                auto source_id = *terminator.value;
+                const auto& returned = source_->values[source_id.value];
+                if (returned.kind == mir::ValueKind::Cast &&
+                    returned.operands.size() == 1 &&
+                    (returned.cast == mir::CastOperation::ZeroExtend ||
+                     returned.cast == mir::CastOperation::SignExtend) &&
+                    type_bits(hir_, source_->values[
+                                         returned.operands.front().value]
+                                         .type) <
+                        type_bits(hir_, returned.type)) {
+                    source_id = returned.operands.front();
+                    result.result_extension =
+                        returned.cast == mir::CastOperation::ZeroExtend
+                            ? machine::ExtensionKind::Zero
+                            : machine::ExtensionKind::Sign;
+                }
+                const auto source = reg(source_id);
                 result.operands.push_back(register_operand(source));
                 result.uses.push_back(source);
             }
@@ -1332,6 +1350,36 @@ private:
                             hard_forbidden_colors[*id].insert(
                                 incoming_endpoint_colors.begin(),
                                 incoming_endpoint_colors.end());
+                            const auto* parameter_index =
+                                instruction.operands.empty()
+                                ? nullptr
+                                : std::get_if<machine::ImmediateOperand>(
+                                      &instruction.operands.front());
+                            if (parameter_index &&
+                                parameter_index->value <
+                                    function_layout->call.arguments.size()) {
+                                const auto& assignment =
+                                    function_layout->call.arguments[
+                                        parameter_index->value];
+                                if (assignment.pieces.size() == 1 &&
+                                    assignment.pieces.front().location.kind ==
+                                        LocationKind::Register) {
+                                    if (const auto physical =
+                                            physical_register_id(
+                                                assignment.pieces.front()
+                                                    .location.reg)) {
+                                        // Capturing a single-piece parameter
+                                        // in its own endpoint cannot destroy
+                                        // another input and removes the entry
+                                        // copy. Width normalization, when
+                                        // needed, is safe in place.
+                                        hard_forbidden_colors[*id].erase(
+                                            physical->value);
+                                        preferred_physical_colors[*id]
+                                            .push_back(*physical);
+                                    }
+                                }
+                            }
                         } else {
                             for (const auto& bank : function_abi->banks) {
                                 for (const auto& name : bank.arguments) {
@@ -1525,6 +1573,23 @@ private:
             for (const auto id : {2U, 3U, 4U, 5U, 6U, 7U,
                                   14U, 15U, 24U, 25U}) {
                 integer_colors.push_back({id});
+            }
+            const bool needs_atomic_compare_scratch = std::any_of(
+                function.blocks.begin(), function.blocks.end(),
+                [](const machine::Block& block) {
+                    return std::any_of(
+                        block.instructions.begin(), block.instructions.end(),
+                        [](const machine::Instruction& instruction) {
+                            return decode_opcode(instruction.opcode) ==
+                                Opcode::AtomicCompareExchange;
+                        });
+                });
+            // The pair legalizer owns t4/t5 only on pre-MIPS-III targets.
+            // Keep them available to native-width scalar code unless the one
+            // LL/SC expansion that explicitly needs both appears.
+            if (!needs_atomic_compare_scratch) {
+                integer_colors.push_back({12});
+                integer_colors.push_back({13});
             }
         }
         for (std::uint32_t id = 16; id <= 23; ++id) {
@@ -1828,6 +1893,120 @@ private:
             }
         }
         return changed;
+    }
+
+    bool fold_boundary_projections(machine::Function& function) {
+        if (!options_.cprop_registers) return false;
+
+        const auto& entity = hir_.function(function.source);
+        std::unordered_map<std::uint32_t, machine::Register> replacements;
+        std::unordered_set<std::uint32_t> removed_truncations;
+        bool changed = false;
+
+        for (auto& block : function.blocks) {
+            for (auto& parameter : block.instructions) {
+                if (decode_opcode(parameter.opcode) != Opcode::Parameter ||
+                    parameter.defs.size() != 1 ||
+                    parameter.defs.front().kind !=
+                        machine::RegisterKind::Virtual ||
+                    parameter.operands.empty()) {
+                    continue;
+                }
+                const auto* parameter_index =
+                    std::get_if<machine::ImmediateOperand>(
+                        &parameter.operands.front());
+                const auto source = parameter.defs.front();
+                if (!parameter_index ||
+                    parameter_index->value >= entity.parameters.size() ||
+                    entity.parameters[parameter_index->value].mode !=
+                        ParameterMode::In ||
+                    source.id >= function.virtual_register_classes.size() ||
+                    function.virtual_register_classes[source.id] !=
+                        machine::VirtualRegisterClass::Integer) {
+                    continue;
+                }
+
+                std::vector<machine::Register> truncations;
+                bool eligible = true;
+                for (const auto& use_block : function.blocks) {
+                    for (const auto& consumer : use_block.instructions) {
+                        const auto occurrences = static_cast<unsigned>(
+                            std::count(consumer.uses.begin(),
+                                       consumer.uses.end(), source));
+                        if (occurrences == 0) continue;
+                        if (occurrences != 1 ||
+                            decode_opcode(consumer.opcode) != Opcode::Trunc ||
+                            consumer.kind !=
+                                machine::InstructionKind::Target ||
+                            consumer.uses.size() != 1 ||
+                            consumer.defs.size() != 1 ||
+                            consumer.defs.front().kind !=
+                                machine::RegisterKind::Virtual ||
+                            consumer.defs.front().mode.bits > 32 ||
+                            consumer.defs.front().mode.bits >=
+                                source.mode.bits ||
+                            consumer.defs.front().id >=
+                                function.virtual_register_classes.size() ||
+                            function.virtual_register_classes[
+                                consumer.defs.front().id] !=
+                                machine::VirtualRegisterClass::Integer ||
+                            (!truncations.empty() &&
+                             consumer.defs.front().mode !=
+                                 truncations.front().mode)) {
+                            eligible = false;
+                            break;
+                        }
+                        truncations.push_back(consumer.defs.front());
+                    }
+                    if (!eligible) break;
+                }
+                if (!eligible || truncations.empty()) continue;
+
+                const auto replacement = truncations.front();
+                parameter.defs.front() = replacement;
+                parameter.input_projection = machine::ValueProjection{
+                    0, replacement.mode.bits};
+                for (const auto truncation : truncations) {
+                    removed_truncations.insert(truncation.id);
+                    if (truncation != replacement) {
+                        replacements[truncation.id] = replacement;
+                    }
+                }
+                changed = true;
+            }
+        }
+        if (!changed) return false;
+
+        const auto replace = [&](machine::Register value) {
+            if (value.kind != machine::RegisterKind::Virtual) return value;
+            const auto found = replacements.find(value.id);
+            return found == replacements.end() ? value : found->second;
+        };
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                for (auto& use : instruction.uses) use = replace(use);
+                for (auto& live : instruction.live_across_call) {
+                    live = replace(live);
+                }
+                for (auto& operand : instruction.operands) {
+                    if (auto* reg =
+                            std::get_if<machine::RegisterOperand>(&operand)) {
+                        reg->value = replace(reg->value);
+                    }
+                }
+            }
+            std::erase_if(
+                block.instructions,
+                [&](const machine::Instruction& instruction) {
+                    return decode_opcode(instruction.opcode) == Opcode::Trunc &&
+                        instruction.defs.size() == 1 &&
+                        instruction.defs.front().kind ==
+                            machine::RegisterKind::Virtual &&
+                        removed_truncations.contains(
+                            instruction.defs.front().id);
+                });
+        }
+        return true;
     }
 
     bool select_integer_immediates(machine::Function& function) {
@@ -2206,9 +2385,26 @@ private:
         std::vector<bool> emitted(count);
         std::vector<std::size_t> order;
         order.reserve(count);
+        unsigned hilo_gap{};
+        const auto uses_hilo_pipeline = [&](std::size_t index) {
+            const auto opcode =
+                decode_opcode(instructions[begin + index].opcode);
+            return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
+                opcode == Opcode::Udiv || opcode == Opcode::Srem ||
+                opcode == Opcode::Urem;
+        };
         while (order.size() != count) {
             std::optional<std::size_t> best;
             int best_score = std::numeric_limits<int>::min();
+            const bool ready_non_hilo = [&] {
+                for (std::size_t index = 0; index < count; ++index) {
+                    if (!emitted[index] && indegree[index] == 0 &&
+                        !uses_hilo_pipeline(index)) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
             for (std::size_t index = 0; index < count; ++index) {
                 if (emitted[index] || indegree[index] != 0) continue;
                 const auto& candidate = instructions[begin + index];
@@ -2239,6 +2435,14 @@ private:
                              static_cast<int>(births)) *
                                 (compact ? 40 : 24);
                 if (prefer_early[index]) score += compact ? 1 : 4;
+                // MFHI/MFLO on pre-interlocked MIPS forbids a following
+                // HI/LO writer for two architectural instructions. Prefer
+                // ready scalar work during that window so the emitter does
+                // not have to repair the schedule with NOPs.
+                if (hilo_gap != 0 && ready_non_hilo &&
+                    uses_hilo_pipeline(index)) {
+                    score -= 10000;
+                }
                 const auto opcode = decode_opcode(candidate.opcode);
                 if (opcode == Opcode::Constant ||
                     opcode == Opcode::Fconstant ||
@@ -2258,6 +2462,8 @@ private:
             if (!best) return false;
             emitted[*best] = true;
             order.push_back(*best);
+            if (uses_hilo_pipeline(*best)) hilo_gap = 2;
+            else if (hilo_gap != 0) --hilo_gap;
             for (const auto& use : instructions[begin + *best].uses) {
                 if (use.kind == machine::RegisterKind::Virtual &&
                     use.id < remaining_uses.size() &&
@@ -2334,10 +2540,31 @@ private:
         }
         const auto original_pressure = measure_pressure(original);
         const auto scheduled_pressure = measure_pressure(order);
+        const auto hilo_stalls = [&](const std::vector<std::size_t>& plan) {
+            unsigned gap{};
+            unsigned stalls{};
+            for (const auto index : plan) {
+                if (uses_hilo_pipeline(index)) {
+                    stalls += gap;
+                    gap = 2;
+                } else if (gap != 0) {
+                    --gap;
+                }
+            }
+            return stalls;
+        };
+        const bool removes_hilo_stalls =
+            options_.optimize_for == OptimizationGoal::Speed &&
+            hilo_stalls(order) < hilo_stalls(original);
         for (std::size_t bank = 0;
              bank < original_pressure.peak.size(); ++bank) {
+            const auto latency_allowance =
+                removes_hilo_stalls &&
+                    bank == static_cast<std::size_t>(
+                                machine::VirtualRegisterClass::Integer)
+                ? 1U : 0U;
             if (scheduled_pressure.peak[bank] >
-                original_pressure.peak[bank]) {
+                original_pressure.peak[bank] + latency_allowance) {
                 return false;
             }
         }
@@ -2416,10 +2643,9 @@ private:
                             return instruction.opcode == Opcode::Phi;
                         });
             };
-            if (edge_has_phi(terminator.operands[1]) ||
-                edge_has_phi(terminator.operands[2])) {
-                continue;
-            }
+            const bool yes_has_phi = edge_has_phi(terminator.operands[1]);
+            const bool no_has_phi = edge_has_phi(terminator.operands[2]);
+            if (yes_has_phi && no_has_phi) continue;
             const auto condition = terminator.uses.front();
             if (condition.kind != machine::RegisterKind::Virtual ||
                 condition.id >= uses.size() || uses[condition.id] != 1) {
@@ -2446,6 +2672,8 @@ private:
             const bool floating = opcode == Opcode::Fiszero ||
                 (opcode >= Opcode::FcmpEq && opcode <= Opcode::FcmpGe);
             if ((!integer && !floating) ||
+                ((yes_has_phi || no_has_phi) &&
+                 opcode != Opcode::CmpEq && opcode != Opcode::CmpNe) ||
                 (!subtarget_.has_feature(Feature::Mips3) &&
                  found->uses.front().mode.bits > 32) ||
                 (floating && std::next(found) !=
@@ -2478,6 +2706,12 @@ private:
                 };
                 return native::propagate_virtual_register_copies(
                     function, is_copy);
+            });
+        passes.add(
+            {{LoweringPass::FoldBoundaryProjections},
+             Stage::InstructionCombining, "fold-boundary-projections"},
+            [this](machine::Function& function) {
+                return fold_boundary_projections(function);
             });
         passes.add(
             {{LoweringPass::SelectIntegerImmediates},
@@ -2578,6 +2812,20 @@ private:
                                definition.id <
                                    implicit_parameter_storage.size() &&
                                implicit_parameter_storage[definition.id];
+                    });
+            });
+        passes.add(
+            {{LoweringPass::ScheduleBlockLayout}, Stage::Scheduling,
+              "schedule-block-layout"},
+            [this](machine::Function& function) {
+                if (!options_.reorder_blocks) return false;
+                return native::schedule_block_layout(
+                    function, [&](machine::BlockId block) {
+                        return std::any_of(
+                            function.labels.begin(), function.labels.end(),
+                            [&](const machine::Function::LocalLabel& label) {
+                                return label.block == block;
+                            });
                     });
             });
         passes.add(
@@ -3765,6 +4013,63 @@ private:
                                "MIPS ABI parameter has no transport piece");
             return;
         }
+        if (value.input_projection) {
+            const auto logical_bits = type_bits(hir_, parameter.type);
+            const auto projection_begin =
+                static_cast<unsigned>(value.input_projection->bit_offset);
+            const auto projection_end = projection_begin +
+                static_cast<unsigned>(value.input_projection->bit_width);
+            const auto selected = std::find_if(
+                assignment.pieces.begin(), assignment.pieces.end(),
+                [&](const ValuePiece& piece) {
+                    const auto piece_begin = effective_piece_offset(
+                        piece, logical_bits,
+                        subtarget_.target().data_layout.byte_order);
+                    return projection_begin >= piece_begin &&
+                        projection_end <= piece_begin + piece.value_bits;
+                });
+            if (selected == assignment.pieces.end()) {
+                diagnostics_.error(
+                    value.location,
+                    "MIPS projected parameter is not contained in one ABI "
+                    "transport piece");
+                return;
+            }
+            const auto piece_begin = effective_piece_offset(
+                *selected, logical_bits,
+                subtarget_.target().data_layout.byte_order);
+            const auto shift = projection_begin - piece_begin;
+            if (direct_parameter_capture(function, index) &&
+                selected->location.kind == LocationKind::Register) {
+                const auto destination = assigned_gpr(function, target);
+                if (!destination) return;
+                if (*destination != selected->location.reg) {
+                    instruction("move", reg_name(*destination) + "," +
+                                            reg_name(selected->location.reg));
+                }
+                if (shift != 0) {
+                    instruction(selected->carrier_bits > 32 ? "dsrl" : "srl",
+                                reg_name(*destination) + "," +
+                                    reg_name(*destination) + "," +
+                                    std::to_string(shift));
+                }
+                if (target.mode.bits < 32) {
+                    normalize_integer(*destination, target.mode.bits, false);
+                }
+                return;
+            }
+            load_abi_piece(function, *selected, *active_signature_->abi,
+                           "t0", true);
+            if (shift != 0) {
+                instruction(selected->carrier_bits > 32 ? "dsrl" : "srl",
+                            "$t0,$t0," + std::to_string(shift));
+            }
+            if (target.mode.bits < 32) {
+                normalize_integer("t0", target.mode.bits, false);
+            }
+            store_vreg(function, target, "t0", value.location);
+            return;
+        }
         if (direct_parameter_capture(function, index)) {
             const auto& piece = assignment.pieces.front();
             if (is_floating(hir_, parameter.type)) {
@@ -3803,6 +4108,29 @@ private:
             // is a safe parallel entry capture without a stack home.
             bool first = true;
             const auto bits = type_bits(hir_, parameter.type);
+            if (bits == 64 && assignment.pieces.size() == 2) {
+                const ValuePiece* low = nullptr;
+                const ValuePiece* high = nullptr;
+                for (const auto& input : assignment.pieces) {
+                    const auto offset = effective_piece_offset(
+                        input, bits,
+                        subtarget_.target().data_layout.byte_order);
+                    if (input.value_bits == 32 && offset == 0) low = &input;
+                    if (input.value_bits == 32 && offset == 32) high = &input;
+                }
+                if (low && high) {
+                    instruction("dsll32", reg_name(*destination) + "," +
+                                              reg_name(high->location.reg) +
+                                              ",0");
+                    instruction("dsll32", "$at," +
+                                              reg_name(low->location.reg) +
+                                              ",0");
+                    instruction("dsrl32", "$at,$at,0");
+                    instruction("or", reg_name(*destination) + "," +
+                                          reg_name(*destination) + ",$at");
+                    return;
+                }
+            }
             for (const auto& input : assignment.pieces) {
                 auto work = std::string_view{"at"};
                 if (first) work = *destination;
@@ -4096,6 +4424,64 @@ private:
         }
     }
 
+    bool place_split_integer_registers(
+        const machine::Function& function, machine::Register source,
+        const std::vector<ValuePiece>& pieces, unsigned value_bits,
+        bool fill_return_delay = false) {
+        if (!subtarget_.has_feature(Feature::Mips3) || value_bits != 64 ||
+            source.mode.bits != 64 || pieces.size() != 2) {
+            return false;
+        }
+        const ValuePiece* low = nullptr;
+        const ValuePiece* high = nullptr;
+        for (const auto& piece : pieces) {
+            if (piece.location.kind != LocationKind::Register ||
+                piece.value_bits != 32 || piece.carrier_bits != 32) {
+                return false;
+            }
+            const auto offset = effective_piece_offset(
+                piece, value_bits,
+                subtarget_.target().data_layout.byte_order);
+            if (offset == 0) low = &piece;
+            if (offset == 32) high = &piece;
+        }
+        const auto assigned = assigned_gpr(function, source);
+        if (!low || !high || !assigned ||
+            low->location.reg == high->location.reg) {
+            return false;
+        }
+
+        const auto place_low = [&] {
+            instruction("sll", reg_name(low->location.reg) + "," +
+                                   reg_name(*assigned) + ",0");
+        };
+        const auto place_high = [&] {
+            instruction("dsrl32", reg_name(high->location.reg) + "," +
+                                      reg_name(*assigned) + ",0");
+            instruction("sll", reg_name(high->location.reg) + "," +
+                                   reg_name(high->location.reg) + ",0");
+        };
+        if (fill_return_delay) {
+            if (*assigned == low->location.reg ||
+                *assigned == high->location.reg) {
+                return false;
+            }
+            place_high();
+            if (frame_size_ == 0) instruction("jr", "$ra");
+            else instruction("b", epilogue_label_);
+            place_low();
+            return true;
+        }
+        if (*assigned == high->location.reg) {
+            place_low();
+            place_high();
+        } else {
+            place_high();
+            place_low();
+        }
+        return true;
+    }
+
     void capture_call_result(const machine::Function& function,
                              const machine::Instruction& call,
                              const ActiveSignature& signature) {
@@ -4360,15 +4746,19 @@ private:
             const bool floating =
                 index < call.call_argument_types.size() &&
                 is_floating(hir_, call.call_argument_types[index]);
-            for (const auto& piece : assignment.pieces) {
-                if (floating) {
-                    place_floating_piece(function, source, piece,
-                                         call.location);
-                } else {
-                    place_integer_piece(
-                        function, source, piece,
-                        type_bits(hir_, call.call_argument_types[index]),
-                        call.location);
+            const auto argument_bits =
+                type_bits(hir_, call.call_argument_types[index]);
+            if (floating || !place_split_integer_registers(
+                                function, source, assignment.pieces,
+                                argument_bits)) {
+                for (const auto& piece : assignment.pieces) {
+                    if (floating) {
+                        place_floating_piece(function, source, piece,
+                                             call.location);
+                    } else {
+                        place_integer_piece(function, source, piece,
+                                            argument_bits, call.location);
+                    }
                 }
             }
             for (const auto& piece : assignment.shadows) {
@@ -4433,6 +4823,62 @@ private:
                         "MIPS indirect function results are not implemented yet");
                 } else {
                     const auto source = value.uses.front();
+                    if (!is_floating(hir_, entity.result_type) &&
+                        value.result_extension ==
+                            machine::ExtensionKind::Zero &&
+                        source.mode.bits <= 32 &&
+                        result.pieces.size() == 2) {
+                        const auto result_bits =
+                            type_bits(hir_, entity.result_type);
+                        const ValuePiece* low = nullptr;
+                        const ValuePiece* high = nullptr;
+                        for (const auto& piece : result.pieces) {
+                            if (piece.location.kind !=
+                                    LocationKind::Register ||
+                                piece.carrier_bits != 32) {
+                                low = nullptr;
+                                high = nullptr;
+                                break;
+                            }
+                            const auto offset = effective_piece_offset(
+                                piece, result_bits,
+                                subtarget_.target().data_layout.byte_order);
+                            if (offset == 0 &&
+                                piece.value_bits >= source.mode.bits) {
+                                low = &piece;
+                            }
+                            if (offset >= source.mode.bits) high = &piece;
+                        }
+                        if (low && high) {
+                            if (const auto assigned =
+                                    assigned_gpr(function, source);
+                                assigned &&
+                                *assigned != low->location.reg &&
+                                *assigned != high->location.reg) {
+                                instruction(
+                                    "move", reg_name(high->location.reg) +
+                                                ",$zero");
+                                if (frame_size_ == 0) instruction("jr", "$ra");
+                                else instruction("b", epilogue_label_);
+                                if (source.mode.bits == 32) {
+                                    instruction(
+                                        "sll", reg_name(low->location.reg) +
+                                                   "," + reg_name(*assigned) +
+                                                   ",0");
+                                } else {
+                                    const auto mask =
+                                        (std::uint64_t{1}
+                                         << source.mode.bits) - 1U;
+                                    instruction(
+                                        "andi", reg_name(low->location.reg) +
+                                                    "," + reg_name(*assigned) +
+                                                    "," +
+                                                    std::to_string(mask));
+                                }
+                                return;
+                            }
+                        }
+                    }
                     if (is_floating(hir_, entity.result_type) &&
                         result.pieces.size() == 1 &&
                         result.pieces.front().location.kind ==
@@ -4441,11 +4887,41 @@ private:
                         load_fvreg(function, source,
                                    result.pieces.front().location.reg,
                                    value.location);
+                    } else if (
+                        !is_floating(hir_, entity.result_type) &&
+                        value.result_extension ==
+                            machine::ExtensionKind::None &&
+                        place_split_integer_registers(
+                            function, source, result.pieces,
+                            type_bits(hir_, entity.result_type), true)) {
+                        return;
                     } else {
                         for (const auto& piece : result.pieces) {
                             if (is_floating(hir_, entity.result_type)) {
                                 place_floating_piece(function, source, piece,
                                                      value.location);
+                            } else if (
+                                value.result_extension ==
+                                    machine::ExtensionKind::Zero &&
+                                effective_piece_offset(
+                                    piece,
+                                    type_bits(hir_, entity.result_type),
+                                    subtarget_.target().data_layout.byte_order) >=
+                                    source.mode.bits) {
+                                if (piece.location.kind ==
+                                    LocationKind::Register) {
+                                    instruction(
+                                        "move",
+                                        reg_name(piece.location.reg) +
+                                            ",$zero");
+                                } else {
+                                    store_integer_memory(
+                                        "zero",
+                                        memory(static_cast<std::int64_t>(
+                                                   piece.location.stack_offset),
+                                               "sp"),
+                                        piece.carrier_bits);
+                                }
                             } else {
                                 place_integer_piece(
                                     function, source, piece,
@@ -4495,13 +4971,23 @@ private:
                 terminator.operands[1]).target;
             const auto no = std::get<machine::BlockOperand>(
                 terminator.operands[2]).target;
-            if (edge_has_phi_copies(function, predecessor, yes) ||
-                edge_has_phi_copies(function, predecessor, no)) {
+            const bool yes_copies =
+                edge_has_phi_copies(function, predecessor, yes);
+            const bool no_copies =
+                edge_has_phi_copies(function, predecessor, no);
+            const auto next = layout_successor(function, predecessor);
+            if ((yes_copies || no_copies) &&
+                !((next == yes && !no_copies) ||
+                  (next == no && !yes_copies))) {
                 return false;
             }
             for (const auto definition : candidate.defs) {
-                if (std::find(terminator.uses.begin(), terminator.uses.end(),
-                              definition) != terminator.uses.end()) {
+                if (std::any_of(
+                        terminator.uses.begin(), terminator.uses.end(),
+                        [&](machine::Register use) {
+                            return same_physical_assignment(
+                                function, definition, use);
+                        })) {
                     return false;
                 }
             }
@@ -4537,7 +5023,20 @@ private:
         // one architectural instruction.  The delay-slot emitter can then
         // move it as a unit without parsing assembly text or splitting a
         // legalization sequence.
-        switch (decode_opcode(candidate.opcode)) {
+        const auto opcode = decode_opcode(candidate.opcode);
+        if (opcode == Opcode::Expect || opcode == Opcode::Reinterpret) {
+            return candidate.uses.size() == 1 &&
+                !same_physical_assignment(function, candidate.defs.front(),
+                                          candidate.uses.front());
+        }
+        if (opcode == Opcode::Constant && candidate.operands.size() == 1) {
+            const auto* immediate =
+                std::get_if<machine::ImmediateOperand>(
+                    &candidate.operands.front());
+            return immediate && immediate->value == 0 &&
+                immediate->high == 0;
+        }
+        switch (opcode) {
         case Opcode::Neg:
         case Opcode::Not:
         case Opcode::Iszero:
@@ -6280,8 +6779,19 @@ void AssemblyEmitter::emit_terminator(
         const auto next = layout_successor(function, predecessor);
         if (!value.condition_predicate.empty()) {
             const auto predicate = decode_opcode(value.condition_predicate);
-            const auto emit_fused_branch = [&](machine::BlockId target,
-                                               bool branch_on_truth) {
+            const auto emit_fused_branch = [&, this](
+                                               machine::BlockId target,
+                                               bool branch_on_truth,
+                                               const AssignedPhiCopy* copy =
+                                                   nullptr) {
+                const auto selected_delay = [&] {
+                    if (copy) {
+                        instruction("move", reg_name(copy->target) + "," +
+                                                reg_name(copy->source));
+                    } else {
+                        emit_delay();
+                    }
+                };
                 if (predicate == Opcode::Iszero ||
                     (predicate >= Opcode::CmpEq &&
                      predicate <= Opcode::CmpUge)) {
@@ -6300,11 +6810,13 @@ void AssemblyEmitter::emit_terminator(
                         if (right.empty()) return false;
                         const bool truth_on_equal =
                             predicate != Opcode::CmpNe;
-                        instruction(branch_on_truth == truth_on_equal
-                                        ? "beq" : "bne",
+                        auto branch = branch_on_truth == truth_on_equal
+                            ? std::string{"beq"} : std::string{"bne"};
+                        if (copy) branch += 'l';
+                        instruction(branch,
                                     reg_name(left) + "," + reg_name(right) +
                                         "," + block_label(function, target));
-                        emit_delay();
+                        selected_delay();
                         return true;
                     }
                     if (value.uses.size() < 2) return false;
@@ -6326,11 +6838,13 @@ void AssemblyEmitter::emit_terminator(
                                 std::string{"$at,"} +
                                     reg_name(swap ? right : left) + "," +
                                     reg_name(swap ? left : right));
-                    instruction(branch_on_truth == truth_on_nonzero
-                                    ? "bne" : "beq",
+                    auto branch = branch_on_truth == truth_on_nonzero
+                        ? std::string{"bne"} : std::string{"beq"};
+                    if (copy) branch += 'l';
+                    instruction(branch,
                                 "$at,$zero," +
                                     block_label(function, target));
-                    emit_delay();
+                    selected_delay();
                     return true;
                 }
 
@@ -6382,10 +6896,12 @@ void AssemblyEmitter::emit_terminator(
                     }
                     instruction(comparison,
                                 reg_name(left) + "," + reg_name(right));
-                    instruction(branch_on_truth == truth_on_condition
-                                    ? "bc1t" : "bc1f",
+                    auto branch = branch_on_truth == truth_on_condition
+                        ? std::string{"bc1t"} : std::string{"bc1f"};
+                    if (copy) branch += 'l';
+                    instruction(branch,
                                 block_label(function, target));
-                    emit_delay();
+                    selected_delay();
                     return true;
                 }
                 return false;
@@ -6415,19 +6931,66 @@ void AssemblyEmitter::emit_terminator(
                 instruction("nop");
                 return;
             }
-            const auto yes_edge = local_label(function);
-            if (!emit_fused_branch(yes, true)) {
-                diagnostics_.error(value.location,
-                                   "malformed fused MIPS comparison branch");
+            if (options_.schedule_insns2 &&
+                subtarget_.has_feature(Feature::BranchLikely)) {
+                if (next == yes && !yes_copies) {
+                    if (const auto copy = single_assigned_gpr_phi_copy(
+                            function, predecessor, no)) {
+                        if (emit_fused_branch(no, false, &*copy)) return;
+                    }
+                } else if (next == no && !no_copies) {
+                    if (const auto copy = single_assigned_gpr_phi_copy(
+                            function, predecessor, yes)) {
+                        if (emit_fused_branch(yes, true, &*copy)) return;
+                    }
+                }
+            }
+            if (next == no && !yes_copies) {
+                if (!emit_fused_branch(yes, true)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused MIPS comparison branch");
+                    return;
+                }
+                emit_phi_edge_copies(function, predecessor, no);
                 return;
             }
-            // Retarget the just-emitted branch through the phi-copy stub by
-            // using the ordinary edge shape below. Fused predicates with phi
-            // copies are deliberately left unfused by the pass for now.
-            diagnostics_.error(
-                value.location,
-                "fused MIPS comparison branch with phi copies is not implemented");
-            (void)yes_edge;
+            if (next == yes && !no_copies) {
+                if (!emit_fused_branch(no, false)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused MIPS comparison branch");
+                    return;
+                }
+                emit_phi_edge_copies(function, predecessor, yes);
+                return;
+            }
+            if (!yes_copies) {
+                if (!emit_fused_branch(yes, true)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused MIPS comparison branch");
+                    return;
+                }
+                emit_phi_edge_copies(function, predecessor, no);
+                instruction("b", block_label(function, no));
+                instruction("nop");
+                return;
+            }
+            if (!no_copies) {
+                if (!emit_fused_branch(no, false)) {
+                    diagnostics_.error(
+                        value.location,
+                        "malformed fused MIPS comparison branch");
+                    return;
+                }
+                emit_phi_edge_copies(function, predecessor, yes);
+                instruction("b", block_label(function, yes));
+                instruction("nop");
+                return;
+            }
+            diagnostics_.error(value.location,
+                               "fused MIPS comparison branch cannot place its PHI edges");
             return;
         }
         if (!yes_copies && !no_copies) {
@@ -6482,6 +7045,51 @@ void AssemblyEmitter::emit_terminator(
                     return;
                 }
             }
+        }
+        // When the laid-out edge owns the PHI copies and the taken edge does
+        // not, branch directly to the copy-free destination and perform the
+        // copies only after the ordinary delay slot. This is the complement
+        // of the branch-likely form above and is especially useful after a
+        // loop body has been rotated ahead of its test.
+        if (next == no && !yes_copies) {
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            instruction("bne", reg_name(condition_gpr) + ",$zero," +
+                                   block_label(function, yes));
+            emit_delay();
+            emit_phi_edge_copies(function, predecessor, no);
+            return;
+        }
+        if (next == yes && !no_copies) {
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            instruction("beq", reg_name(condition_gpr) + ",$zero," +
+                                   block_label(function, no));
+            emit_delay();
+            emit_phi_edge_copies(function, predecessor, yes);
+            return;
+        }
+        if (!yes_copies) {
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            instruction("bne", reg_name(condition_gpr) + ",$zero," +
+                                   block_label(function, yes));
+            emit_delay();
+            emit_phi_edge_copies(function, predecessor, no);
+            instruction("b", block_label(function, no));
+            instruction("nop");
+            return;
+        }
+        if (!no_copies) {
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            instruction("beq", reg_name(condition_gpr) + ",$zero," +
+                                  block_label(function, no));
+            emit_delay();
+            emit_phi_edge_copies(function, predecessor, yes);
+            instruction("b", block_label(function, yes));
+            instruction("nop");
+            return;
         }
         const auto yes_edge = local_label(function);
         const auto condition_gpr = input_gpr(

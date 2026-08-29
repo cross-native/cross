@@ -226,6 +226,22 @@ bool verify_instruction(const Instruction& instruction, const Function& function
         ok = fail(diagnostics, instruction.location,
                   "variadic state metadata requires its target operation");
     }
+    if (instruction.input_projection &&
+        (instruction.kind != InstructionKind::Target ||
+         instruction.defs.size() != 1 ||
+         instruction.input_projection->bit_width == 0 ||
+         instruction.input_projection->bit_width !=
+             instruction.defs.front().mode.bits)) {
+        ok = fail(diagnostics, instruction.location,
+                  "machine input projection requires one equally wide "
+                  "target definition");
+    }
+    if (instruction.result_extension != ExtensionKind::None &&
+        (instruction.kind != InstructionKind::Return ||
+         instruction.uses.size() != 1)) {
+        ok = fail(diagnostics, instruction.location,
+                  "machine result extension requires one return value");
+    }
     if (instruction.patch) {
         if (instruction.kind != InstructionKind::Target ||
             instruction.patch->field_bits == 0 ||

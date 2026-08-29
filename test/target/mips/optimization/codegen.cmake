@@ -66,6 +66,7 @@ compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
                 -fno-compare-select-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_machine_combine -fno-machine-combine)
+compile_variant(no_cprop -fno-cprop-registers)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_variant(no_if_conversion -fno-if-conversion)
 compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
@@ -78,6 +79,10 @@ compile_reassociation_variant(reassoc_cisc_off 100 -fno-unroll-loops
 compile_unroll_variant(unroll_risc 0)
 compile_unroll_variant(unroll_cisc 100)
 compile_unroll_variant(unroll_risc_no_delay 0 -fno-schedule-insns2)
+compile_unroll_variant(unroll_risc_no_iv 0 -fno-ivopts)
+compile_unroll_variant(unroll_risc_no_reorder 0 -fno-reorder-blocks)
+compile_unroll_variant(unroll_risc_no_reorder_no_delay 0
+                       -fno-reorder-blocks -fno-schedule-insns2)
 execute_process(
     COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"
@@ -165,6 +170,30 @@ if(register_constants MATCHES
     message(FATAL_ERROR
         "-fno-machine-combine did not preserve register constants\n"
         "${register_constants}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_projected_parameter projected_parameter)
+function_body("${OUTPUT}.no_cprop.s"
+              mips_projected_parameter assembled_parameter)
+if(NOT projected_parameter MATCHES "[\t ]move[\t ][^\n]*,\\$a1" OR
+   projected_parameter MATCHES "[\t ](d?sll|d?srl|or)[\t ]" OR
+   NOT assembled_parameter MATCHES "[\t ]or[\t ]")
+    message(FATAL_ERROR
+        "MIPS ABI boundary projection did not select only the low o32 word "
+        "or honor -fno-cprop-registers\n"
+        "projected:\n${projected_parameter}\nordinary:\n${assembled_parameter}")
+endif()
+
+function_body("${OUTPUT}.enabled.s" mips_affine_exit unit_exit)
+function_body("${OUTPUT}.no_iv.s" mips_affine_exit ordered_exit)
+if(unit_exit MATCHES "[\t ]sltu[\t ]" OR
+   NOT unit_exit MATCHES "[\t ]bne[\t ]" OR
+   NOT ordered_exit MATCHES "[\t ]sltu[\t ]")
+    message(FATAL_ERROR
+        "MIR unit induction exit selection did not replace unsigned-less "
+        "or honor -fno-ivopts\n"
+        "selected:\n${unit_exit}\nordinary:\n${ordered_exit}")
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_narrow_mask narrow_big)
@@ -292,9 +321,9 @@ if(NOT range_default STREQUAL range_branch OR
         "default:\n${range_default}\nforced:\n${range_forced}")
 endif()
 
-function_body("${OUTPUT}.unroll_risc.s"
+function_body("${OUTPUT}.unroll_risc_no_reorder.s"
               mips_phi_copy_edge likely_phi_edge)
-function_body("${OUTPUT}.unroll_risc_no_delay.s"
+function_body("${OUTPUT}.unroll_risc_no_reorder_no_delay.s"
               mips_phi_copy_edge ordinary_phi_edge)
 if(NOT likely_phi_edge MATCHES
        "[\t ]b(eq|ne)zl[^\n]*\n[\t ]+move[\t ]" OR
@@ -302,4 +331,17 @@ if(NOT likely_phi_edge MATCHES
     message(FATAL_ERROR
         "a single MIPS PHI-edge copy did not use an annulled delay slot\n"
         "enabled:\n${likely_phi_edge}\ndisabled:\n${ordinary_phi_edge}")
+endif()
+
+function_body("${OUTPUT}.unroll_risc.s"
+              mips_affine_exit affine_exit)
+function_body("${OUTPUT}.unroll_risc_no_iv.s"
+              mips_affine_exit counted_exit)
+if(affine_exit MATCHES "[\t ]sltu[\t ]" OR
+   NOT affine_exit MATCHES "[\t ]bne[\t ]" OR
+   NOT counted_exit MATCHES "[\t ]sltu[\t ]")
+    message(FATAL_ERROR
+        "MIR affine-exit induction selection did not replace the loop counter "
+        "or honor -fno-ivopts\n"
+        "selected:\n${affine_exit}\nordinary:\n${counted_exit}")
 endif()

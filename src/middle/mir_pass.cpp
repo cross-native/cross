@@ -28,6 +28,10 @@ std::string_view pass_name(PassId pass) {
     case PassId::RedundantExpressionElimination:
         return "redundant-expression-elimination";
     case PassId::InductionCoalescing: return "induction-coalescing";
+    case PassId::UnitInductionExitSelection:
+        return "unit-induction-exit-selection";
+    case PassId::NativeInductionViewPromotion:
+        return "native-induction-view-promotion";
     case PassId::AddressInductionStrengthReduction:
         return "address-induction-strength-reduction";
     case PassId::LoopInvariantMotion: return "loop-invariant-motion";
