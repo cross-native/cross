@@ -9350,7 +9350,7 @@ void unroll_loops(ManagedFunction& function,
             [&](ValueId id) {
                 return function.values[id.value].kind == ValueKind::Select;
             });
-        const bool contains_ordered_store = std::any_of(
+        const bool contains_pointer_store = std::any_of(
             pattern->body_values.begin(), pattern->body_values.end(),
             [&](ValueId id) {
                 return function.values[id.value].kind ==
@@ -9362,9 +9362,21 @@ void unroll_loops(ManagedFunction& function,
                 return floating_type(hir_module,
                                      function.values[id.value].type);
             });
+        // A four-way store loop keeps the address, stored value, and each
+        // loop-carried result live together.  That is cheap on a wide CISC
+        // register file but can turn a compact load/store loop into spills on
+        // a smaller RISC bank.  Blend the largest body admitted at factor four
+        // instead of selecting a different MIR dialect for each architecture.
+        // Factor two still exposes independent memory operations and retains
+        // the user's explicit upper bound.
+        const auto balance = std::min(options.risc_cisc_balance, 100U);
+        const auto four_way_store_budget =
+            (12U * (100U - balance) + 24U * balance) / 100U;
+        const bool store_pressure_limited =
+            contains_pointer_store && body_cost > four_way_store_budget;
         const unsigned preferred =
-            body_cost <= 24 &&
-                (contains_select || contains_ordered_store || !reads_memory ||
+            body_cost <= 24 && !store_pressure_limited &&
+                (contains_select || contains_pointer_store || !reads_memory ||
                  (options.unroll_factor >= 4 &&
                   contains_floating_recurrence))
                 ? 4U

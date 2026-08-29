@@ -105,3 +105,35 @@ global u32 mips_grouped_select(in u32 condition,
     }
     return left + right;
 }
+
+[[abi("o32"), noinline]]
+global u64 mips_store_pressure(in const u64 *source,
+                               in u64 *destination,
+                               in uptr count) {
+    u64 result = 0u64;
+    u64 salt = 0u64;
+    uptr index = 0;
+    while (index < count) {
+        u64 value = (source[index] + salt) ^ 11400714819323198485u64;
+        value *= 6364136223846793005u64;
+        destination[index] = value;
+        result += value;
+        salt += 1442695040888963407u64;
+        index += 1;
+    }
+    return result;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_compact_store(in const u64 *source,
+                              in u64 *destination,
+                              in uptr count) {
+    u64 carry = 1u64;
+    uptr index = 0;
+    while (index < count) {
+        carry += source[index];
+        destination[index] = carry;
+        index += 1;
+    }
+    return carry;
+}

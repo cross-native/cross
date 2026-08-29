@@ -30,6 +30,18 @@ function(compile_reassociation_variant name balance)
     endif()
 endfunction()
 
+function(compile_unroll_variant name balance)
+    execute_process(
+        COMMAND "${CC}" -S -O3 -mprofile=vr4300-o32 -funroll-loops
+                -funroll-factor=4 "-mrisc-cisc-balance=${balance}"
+                "${SOURCE}" -o "${OUTPUT}.${name}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR
+            "${name} MIPS unroll compilation failed\n${stdout}\n${stderr}")
+    endif()
+endfunction()
+
 function(function_body output symbol result)
     file(READ "${output}" assembly)
     string(FIND "${assembly}" "${symbol}:" start)
@@ -57,6 +69,8 @@ compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
 compile_reassociation_variant(reassoc_cisc 100 -fno-unroll-loops)
 compile_reassociation_variant(reassoc_cisc_off 100 -fno-unroll-loops
                               -fno-tree-reassoc)
+compile_unroll_variant(unroll_risc 0)
+compile_unroll_variant(unroll_cisc 100)
 execute_process(
     COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"
@@ -177,4 +191,47 @@ if(NOT grouped_select_branch_count EQUAL 1 OR
         "same-condition MIPS selects did not share exactly one branch\n"
         "enabled (${grouped_select_branch_count}):\n${grouped_select}\n"
         "disabled (${separate_select_branch_count}):\n${separate_selects}")
+endif()
+
+function_body("${OUTPUT}.unroll_risc.s"
+              mips_store_pressure pressure_risc)
+function_body("${OUTPUT}.unroll_cisc.s"
+              mips_store_pressure pressure_cisc)
+if(pressure_risc STREQUAL pressure_cisc)
+    message(FATAL_ERROR
+        "the RISC endpoint did not reduce pressure-heavy store unrolling")
+endif()
+if(NOT pressure_risc MATCHES
+       "[\t ]li[\t ]+\\\$[a-z0-9]+,4294967294" OR
+   NOT pressure_cisc MATCHES
+       "[\t ]li[\t ]+\\\$[a-z0-9]+,4294967292")
+    message(FATAL_ERROR
+        "store-loop pressure did not select factors two and four\n"
+        "RISC:\n${pressure_risc}\nCISC:\n${pressure_cisc}")
+endif()
+string(REGEX MATCH
+       "\\.frame[\t ]+\\\$sp,([0-9]+),\\\$ra"
+       pressure_risc_frame "${pressure_risc}")
+set(pressure_risc_frame_size "${CMAKE_MATCH_1}")
+string(REGEX MATCH
+       "\\.frame[\t ]+\\\$sp,([0-9]+),\\\$ra"
+       pressure_cisc_frame "${pressure_cisc}")
+set(pressure_cisc_frame_size "${CMAKE_MATCH_1}")
+if(pressure_risc_frame STREQUAL "" OR pressure_cisc_frame STREQUAL "" OR
+   NOT pressure_risc_frame_size LESS pressure_cisc_frame_size)
+    message(FATAL_ERROR
+        "the RISC store-loop frame was not smaller than the CISC frame\n"
+        "RISC (${pressure_risc_frame_size}):\n${pressure_risc}\n"
+        "CISC (${pressure_cisc_frame_size}):\n${pressure_cisc}")
+endif()
+
+function_body("${OUTPUT}.unroll_risc.s"
+              mips_compact_store compact_risc)
+function_body("${OUTPUT}.unroll_cisc.s"
+              mips_compact_store compact_cisc)
+if(NOT compact_risc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,4" OR
+   NOT compact_cisc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,4")
+    message(FATAL_ERROR
+        "an endpoint reduced a compact store loop below factor four\n"
+        "RISC:\n${compact_risc}\nCISC:\n${compact_cisc}")
 endif()
