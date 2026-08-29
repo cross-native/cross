@@ -9374,7 +9374,7 @@ void unroll_loops(ManagedFunction& function,
     }
 }
 
-// An unrolled reduction such as
+// An additive recurrence, often exposed by unrolling, such as
 //
 //     sum = (((sum + a) + b) + c) + d
 //
@@ -9385,7 +9385,7 @@ void unroll_loops(ManagedFunction& function,
 // effect keep their original evaluation graph.  Signed addition is excluded
 // because reassociation could introduce overflow into a source execution that
 // did not previously overflow.
-bool rebalance_unrolled_unsigned_add_recurrences(
+bool rebalance_unsigned_add_recurrences(
     ManagedFunction& function, const hir::Module& hir_module,
     const CompilerOptions& options, const UseLists& use_lists) {
     struct Candidate {
@@ -12405,18 +12405,18 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                              analyses.loops().canonical_loops());
                 return PassResult::changed_cfg();
             });
-        if (options.tree_reassoc) {
-            pipeline.add(
-                PassId::RecurrenceRebalancing,
-                [&](ManagedFunction& function,
-                    FunctionAnalysisManager& analyses) {
-                    return rebalance_unrolled_unsigned_add_recurrences(
-                               function, hir_module, options,
-                               analyses.uses())
-                        ? PassResult::changed_values()
-                        : PassResult::unchanged();
-                });
-        }
+    }
+    if (options.tree_reassoc) {
+        pipeline.add(
+            PassId::RecurrenceRebalancing,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                return rebalance_unsigned_add_recurrences(
+                           function, hir_module, options,
+                           analyses.uses())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
     }
     if (options.tree_slp_vectorize) {
         pipeline.add(

@@ -53,8 +53,9 @@ compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_reassociation_variant(reassoc_risc 0)
 compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
-compile_reassociation_variant(reassoc_cisc 100)
-compile_reassociation_variant(reassoc_cisc_off 100 -fno-tree-reassoc)
+compile_reassociation_variant(reassoc_cisc 100 -fno-unroll-loops)
+compile_reassociation_variant(reassoc_cisc_off 100 -fno-unroll-loops
+                              -fno-tree-reassoc)
 execute_process(
     COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"
@@ -152,10 +153,10 @@ if(NOT reassoc_risc STREQUAL reassoc_risc_off)
         "enabled:\n${reassoc_risc}\ndisabled:\n${reassoc_risc_off}")
 endif()
 function_body("${OUTPUT}.reassoc_cisc.s"
-              mips_reassociation_pressure reassoc_cisc)
+              mips_reassociation_without_unroll reassoc_cisc)
 function_body("${OUTPUT}.reassoc_cisc_off.s"
-              mips_reassociation_pressure reassoc_cisc_off)
+              mips_reassociation_without_unroll reassoc_cisc_off)
 if(reassoc_cisc STREQUAL reassoc_cisc_off)
     message(FATAL_ERROR
-        "the CISC endpoint did not accept a dependency-shortening reassociation")
+        "-ftree-reassoc depended on loop unrolling or ignored the CISC endpoint")
 endif()

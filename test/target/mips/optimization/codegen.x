@@ -73,3 +73,17 @@ global u64 mips_reassociation_pressure(in const u64 *data,
     }
     return result;
 }
+
+[[abi("o32"), noinline]]
+global u64 mips_reassociation_without_unroll(in const u64 *data,
+                                              in uptr count) {
+    u64 result = 0u64;
+    uptr index = 0;
+    while (index < count) {
+        u64 value = data[index];
+        result += value;
+        result += value ^ index;
+        index += 1;
+    }
+    return result;
+}
