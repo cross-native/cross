@@ -60,9 +60,10 @@ foreach(pattern
 endforeach()
 
 file(READ "${fix_assembly}" fixed)
-if(NOT fixed MATCHES "[\t ]mul\\.d[^\n]*\n[\t ]nop")
+if(NOT fixed MATCHES "[\t ]mul\\.d[^\n]*\n[\t ]add\\.d" OR
+   fixed MATCHES "[\t ]mul\\.d[^\n]*\n[\t ]nop")
     message(FATAL_ERROR
-        "-mfix4300 did not place a nop immediately after FP multiply\n${fixed}")
+        "-mfix4300 did not use safe work between FP multiplies\n${fixed}")
 endif()
 
 file(READ "${memory_assembly}" memory)

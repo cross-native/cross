@@ -77,6 +77,11 @@ X(Sitofp, "mips.sitofp")
 X(Uitofp, "mips.uitofp")
 X(Fptosi, "mips.fptosi")
 X(Fptoui, "mips.fptoui")
+// Scheduler-visible halves of a native-width multiply.  The Memory-class
+// dependency token between them represents the architectural HI/LO resource;
+// it is not an allocatable program value.
+X(MulStart, "mips.mul.start")
+X(MoveFromLo, "mips.mflo")
 X(Select, "mips.select")
 X(Phi, "mips.phi")
 X(Patch, "mips.patch")

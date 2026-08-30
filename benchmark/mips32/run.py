@@ -829,6 +829,9 @@ def cross_flags(level: str) -> tuple[str, ...]:
     return (
         f"-{level}",
         "-mprofile=vr4300-o32",
+        # Match GCC's early-VR4300 floating-multiply workaround so neither
+        # pipeline is credited for omitting required target separation.
+        "-mfix4300",
         "-ffp-contract=off",
         "-fno-unwind-tables",
         "-fno-asynchronous-unwind-tables",

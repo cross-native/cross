@@ -65,7 +65,14 @@ compile_variant(grouped_select -fif-conversion-limit=12)
 compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
                 -fno-compare-select-fusion)
 compile_variant(no_delay -fno-schedule-insns2)
+compile_variant(no_schedule -fno-schedule-insns)
 compile_variant(no_machine_combine -fno-machine-combine)
+compile_variant(no_slsr -fno-tree-slsr)
+compile_variant(no_ccp -fno-tree-ccp)
+compile_variant(cisc -mrisc-cisc-balance=100)
+compile_variant(fix4300 -mfix4300)
+compile_variant(fix4300_no_schedule -mfix4300 -fno-schedule-insns)
+compile_variant(r4000 -march=r4000 -mtune=r4000)
 compile_variant(no_cprop -fno-cprop-registers)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_variant(no_if_conversion -fno-if-conversion)
@@ -148,6 +155,56 @@ if(NOT empty_delay MATCHES "[	 ]b(eq|ne)[^\n]*\n[	 ]+nop")
 endif()
 
 function_body("${OUTPUT}.enabled.s"
+              mips_fp_latency_schedule scheduled_fp)
+function_body("${OUTPUT}.no_schedule.s"
+              mips_fp_latency_schedule serial_fp)
+if(NOT scheduled_fp MATCHES
+       "[\t ]mul[.]d[^\n]*\n[\t ]+ldc1[^\n]*\n[\t ]+ldc1[^\n]*\n[\t ]+mul[.]d" OR
+   scheduled_fp MATCHES "[\t ]sdc1[\t ]+\\$f(0|2|4)," OR
+   NOT serial_fp MATCHES
+       "[\t ]mul[.]d[^\n]*\n[\t ]+add[.]d")
+    message(FATAL_ERROR
+        "MIPS FP latency scheduling did not overlap independent products "
+        "without spills or honor -fno-schedule-insns\n"
+        "scheduled:\n${scheduled_fp}\nserial:\n${serial_fp}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_fp_delay_slot fp_delay_slot)
+function_body("${OUTPUT}.no_delay.s"
+              mips_fp_delay_slot fp_empty_delay)
+if(NOT fp_delay_slot MATCHES
+       "[\t ]b(eq|ne)[^\n]*\n[\t ]+add[.]d[\t ]" OR
+   fp_empty_delay MATCHES
+       "[\t ]b(eq|ne)[^\n]*\n[\t ]+add[.]d[\t ]")
+    message(FATAL_ERROR
+        "MIPS floating arithmetic did not fill a safe branch delay slot or "
+        "-fno-schedule-insns2 was ignored\n"
+        "scheduled:\n${fp_delay_slot}\ndisabled:\n${fp_empty_delay}")
+endif()
+
+function_body("${OUTPUT}.fix4300.s"
+              mips_fp_mul_delay_slot fixed_fp_multiply)
+if(fixed_fp_multiply MATCHES
+       "[\t ]b(eq|ne)[^\n]*\n[\t ]+mul[.]d[\t ]" OR
+   fixed_fp_multiply MATCHES
+       "[\t ]mul[.]d[^\n]*\n[\t ]+nop")
+    message(FATAL_ERROR
+        "-mfix4300 split a multiply workaround across a branch or failed "
+        "to use intervening work\n"
+        "${fixed_fp_multiply}")
+endif()
+
+function_body("${OUTPUT}.fix4300_no_schedule.s"
+              mips_fp_mul_pair consecutive_fp_multiplies)
+if(NOT consecutive_fp_multiplies MATCHES
+       "[\t ]mul[.]d[^\n]*\n[\t ]+nop\n[\t ]+mul[.]d")
+    message(FATAL_ERROR
+        "-mfix4300 did not separate consecutive floating multiplies\n"
+        "${consecutive_fp_multiplies}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
               mips_integer_immediates integer_immediates)
 foreach(pattern
         "[	 ]addiu[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+,17"
@@ -170,6 +227,63 @@ if(register_constants MATCHES
     message(FATAL_ERROR
         "-fno-machine-combine did not preserve register constants\n"
         "${register_constants}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_small_constant_multiply reduced_multiply)
+function_body("${OUTPUT}.no_slsr.s"
+              mips_small_constant_multiply hardware_multiply)
+if(NOT reduced_multiply MATCHES
+       "[\t ]dsll[\t ][^\n]*,4" OR
+   NOT reduced_multiply MATCHES "[\t ]daddu[\t ]" OR
+   reduced_multiply MATCHES "[\t ]dmult[\t ]" OR
+   NOT hardware_multiply MATCHES "[\t ]dmult[\t ]" OR
+   NOT hardware_multiply MATCHES "[\t ]mflo[\t ]")
+    message(FATAL_ERROR
+        "MIR constant-multiply strength reduction is missing or "
+        "-fno-tree-slsr was ignored\n"
+        "reduced:\n${reduced_multiply}\nhardware:\n${hardware_multiply}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_signed_constant_multiply signed_multiply)
+if(NOT signed_multiply MATCHES "[\t ]dmult[\t ]" OR
+   NOT signed_multiply MATCHES "[\t ]mflo[\t ]")
+    message(FATAL_ERROR
+        "MIR strength reduction changed signed-overflow semantics\n"
+        "${signed_multiply}")
+endif()
+
+function_body("${OUTPUT}.no_ccp.s"
+              mips_untyped_constant_multiply independent_slsr)
+function_body("${OUTPUT}.cisc.s"
+              mips_small_constant_multiply cisc_multiply)
+if(NOT independent_slsr MATCHES "[\t ]dsll[\t ][^\n]*,4" OR
+   NOT independent_slsr MATCHES "[\t ]daddu[\t ]" OR
+   independent_slsr MATCHES "[\t ]dmult[\t ]" OR
+   NOT cisc_multiply MATCHES "[\t ]dmult[\t ]")
+    message(FATAL_ERROR
+        "MIR SLSR depends on CCP or ignored the RISC/CISC endpoint\n"
+        "without CCP:\n${independent_slsr}\nCISC:\n${cisc_multiply}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_hilo_latency scheduled_hilo)
+function_body("${OUTPUT}.no_schedule.s"
+              mips_hilo_latency adjacent_hilo)
+function_body("${OUTPUT}.r4000.s"
+              mips_hilo_latency r4000_hilo)
+if(NOT scheduled_hilo MATCHES
+       "[\t ]mult[\t ][^\n]*\n[\t ]+srl[\t ][^\n]*\n[\t ]+mflo[\t ]" OR
+   NOT adjacent_hilo MATCHES
+       "[\t ]mult[\t ][^\n]*\n[\t ]+mflo[\t ]" OR
+   NOT r4000_hilo MATCHES
+       "[\t ]mult[\t ][^\n]*\n[\t ]+mflo[\t ]")
+    message(FATAL_ERROR
+        "MIPS HI/LO splitting did not fill multiply latency or honor "
+        "-fno-schedule-insns/R4000 erratum policy\n"
+        "scheduled:\n${scheduled_hilo}\nadjacent:\n${adjacent_hilo}\n"
+        "R4000:\n${r4000_hilo}")
 endif()
 
 function_body("${OUTPUT}.enabled.s"

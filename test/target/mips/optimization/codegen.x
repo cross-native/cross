@@ -45,6 +45,26 @@ global u32 mips_integer_immediates(in u32 value) {
 }
 
 [[abi("o32"), noinline]]
+global u64 mips_small_constant_multiply(in u64 value) {
+    return value * 17u64;
+}
+
+[[abi("o32"), noinline]]
+global i64 mips_signed_constant_multiply(in i64 value) {
+    return value * 17i64;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_untyped_constant_multiply(in u64 value) {
+    return value * 17;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_hilo_latency(in u32 value) {
+    return (value * 1664525u32) ^ (value >> 13);
+}
+
+[[abi("o32"), noinline]]
 global u32 mips_projected_parameter(in u64 value) {
     u32 result = value;
     return result;
@@ -203,4 +223,41 @@ global u64 mips_phi_copy_edge(in const u64 *data,
         index += 1;
     }
     return result ^ slot;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_fp_latency_schedule(in const f64 *left,
+                                    in const f64 *right) {
+    f64 result = 0.0f64;
+    result += left[0] * right[0];
+    result += left[1] * right[1];
+    result += left[2] * right[2];
+    result += left[3] * right[3];
+    return result;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_fp_delay_slot(in f64 left, in f64 right,
+                              in u32 condition, in f64 *destination) {
+    f64 result = left + right;
+    if (condition) {
+        destination[0] = left;
+    }
+    return result;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_fp_mul_delay_slot(in f64 left, in f64 right,
+                                  in u32 condition, in f64 *destination) {
+    f64 result = left * right;
+    if (condition) {
+        destination[0] = left;
+    }
+    return result;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_fp_mul_pair(in f64 left0, in f64 right0,
+                            in f64 left1, in f64 right1) {
+    return left0 * right0 + left1 * right1;
 }

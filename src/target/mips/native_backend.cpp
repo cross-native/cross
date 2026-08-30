@@ -2191,7 +2191,8 @@ private:
                            instruction.defs.front().mode.bits <= 32
                        ? 20U
                        : 36U;
-        case Opcode::Mul: return 8U;
+        case Opcode::Mul:
+        case Opcode::MulStart: return 8U;
         case Opcode::Fmul:
             return instruction.defs.empty() ||
                            instruction.defs.front().mode.bits <= 32
@@ -2212,6 +2213,99 @@ private:
         case Opcode::PointerOffset: return 2U;
         default: return 1U;
         }
+    }
+
+    machine::Register create_hilo_dependency(machine::Function& function) {
+        const machine::VirtualRegisterId id{
+            static_cast<std::uint32_t>(function.virtual_registers.size())};
+        function.virtual_registers.push_back(machine::i1);
+        function.virtual_register_classes.push_back(
+            machine::VirtualRegisterClass::Memory);
+        function.virtual_register_assignments.push_back(std::nullopt);
+        function.rematerialized_immediates.push_back(std::nullopt);
+        return machine::Register::virtual_register(id, machine::i1);
+    }
+
+    bool indexed_operation_writes_hilo(
+        const machine::Instruction& instruction) const {
+        const auto opcode = decode_opcode(instruction.opcode);
+        if (opcode != Opcode::IndexedAddress &&
+            opcode != Opcode::IndexedLoadSigned &&
+            opcode != Opcode::IndexedLoadUnsigned &&
+            opcode != Opcode::FindexedLoad) {
+            return false;
+        }
+        if (instruction.operands.empty()) return false;
+        const auto* scale = std::get_if<machine::ImmediateOperand>(
+            &instruction.operands.back());
+        return scale && scale->value > 1 &&
+            !std::has_single_bit(scale->value);
+    }
+
+    bool atomic_hilo_operation(const machine::Instruction& instruction) const {
+        const auto opcode = decode_opcode(instruction.opcode);
+        return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
+            opcode == Opcode::Udiv || opcode == Opcode::Srem ||
+            opcode == Opcode::Urem ||
+            indexed_operation_writes_hilo(instruction);
+    }
+
+    bool split_hilo_operations(machine::Function& function) {
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            std::optional<machine::Register> completed_hilo;
+            std::vector<machine::Instruction> expanded;
+            expanded.reserve(block.instructions.size());
+            for (auto& instruction : block.instructions) {
+                const auto opcode = decode_opcode(instruction.opcode);
+                // Original R4000 silicon can misexecute extended or variable
+                // shifts while an integer multiply is in flight. Keep the
+                // producer/read atomic until that erratum has its own target
+                // hazard model; other MIPS-I--III CPUs interlock the result.
+                const bool r4000_multiply_erratum =
+                    subtarget_.cpu() == "r4000" ||
+                    subtarget_.tune() == "r4000";
+                const bool native_multiply =
+                    opcode == Opcode::Mul && instruction.defs.size() == 1 &&
+                    instruction.uses.size() >= 2 &&
+                    !r4000_multiply_erratum &&
+                    (instruction.defs.front().mode.bits <= 32 ||
+                     subtarget_.has_feature(Feature::Mips3));
+                if (native_multiply) {
+                    const auto result = instruction.defs.front();
+                    const auto active = create_hilo_dependency(function);
+                    const auto completed = create_hilo_dependency(function);
+
+                    instruction.opcode = Opcode::MulStart;
+                    instruction.defs = {active};
+                    if (completed_hilo) {
+                        instruction.uses.push_back(*completed_hilo);
+                    }
+                    expanded.push_back(std::move(instruction));
+
+                    auto read = target_instruction(Opcode::MoveFromLo,
+                                                   expanded.back().location);
+                    read.uses.push_back(active);
+                    read.defs = {result, completed};
+                    expanded.push_back(std::move(read));
+                    completed_hilo = completed;
+                    changed = true;
+                    continue;
+                }
+                if (atomic_hilo_operation(instruction)) {
+                    if (completed_hilo) {
+                        instruction.uses.push_back(*completed_hilo);
+                    }
+                    const auto completed = create_hilo_dependency(function);
+                    instruction.defs.push_back(completed);
+                    completed_hilo = completed;
+                    changed = true;
+                }
+                expanded.push_back(std::move(instruction));
+            }
+            block.instructions = std::move(expanded);
+        }
+        return changed;
     }
 
     bool schedule_region(std::vector<machine::Instruction>& instructions,
@@ -2382,24 +2476,158 @@ private:
         const bool compact =
             options_.optimize_for == OptimizationGoal::Size ||
             options_.optimize_for == OptimizationGoal::MinimumSize;
+        const bool speed =
+            options_.optimize_for == OptimizationGoal::Speed;
+        const auto pressure_weight = [&](std::uint32_t id) {
+            if (id < current_.virtual_register_classes.size()) {
+                const auto register_class =
+                    current_.virtual_register_classes[id];
+                // Memory-class virtuals include effect and architectural-
+                // resource tokens. They impose ordering through dependencies
+                // but consume no allocatable register.
+                if (register_class ==
+                        machine::VirtualRegisterClass::Memory) {
+                    return 0;
+                }
+                if (compact || !speed) return compact ? 40 : 24;
+                if (register_class ==
+                        machine::VirtualRegisterClass::Floating) {
+                    // A latency-bearing floating operation commonly has
+                    // several independent unrolled lanes available. Keeping
+                    // every lane in one short-lived temporary serializes those
+                    // chains.
+                    return 4;
+                }
+                if (register_class ==
+                        machine::VirtualRegisterClass::Integer) {
+                    // Integer address and HI/LO chains have shorter latency,
+                    // so retain more pressure bias than floating point while
+                    // still allowing independent loads/shifts to start early.
+                    return 8;
+                }
+            }
+            // Hard per-bank budgets and the post-schedule profitability check
+            // below remain authoritative; this weight only chooses among
+            // otherwise-ready nodes.
+            return compact ? 40 : 24;
+        };
         std::vector<bool> emitted(count);
         std::vector<std::size_t> order;
         order.reserve(count);
-        unsigned hilo_gap{};
-        const auto uses_hilo_pipeline = [&](std::size_t index) {
+        std::vector<bool> scheduled_live(remaining_uses.size());
+        std::array<unsigned, 4> scheduled_live_counts{};
+        for (std::size_t id = 0; id < scheduled_live.size(); ++id) {
+            scheduled_live[id] = region_use[id] &&
+                !definition.contains(static_cast<std::uint32_t>(id));
+            if (!scheduled_live[id] ||
+                id >= current_.virtual_register_classes.size()) {
+                continue;
+            }
+            const auto bank = static_cast<std::size_t>(
+                current_.virtual_register_classes[id]);
+            if (bank < scheduled_live_counts.size()) {
+                ++scheduled_live_counts[bank];
+            }
+        }
+        // Leave two colors for loop-PHI interference and emitter staging that
+        // are not visible in a single straight-line scheduling region.
+        constexpr unsigned schedulable_gpr_peak = 17U;
+        constexpr unsigned schedulable_fpr_peak = 11U;
+        const auto projected_pressure = [&](std::size_t index) {
+            auto projected = scheduled_live_counts;
+            std::unordered_map<std::uint32_t, unsigned> uses;
+            for (const auto use : instructions[begin + index].uses) {
+                if (use.kind == machine::RegisterKind::Virtual &&
+                    use.id < remaining_uses.size()) {
+                    ++uses[use.id];
+                }
+            }
+            for (const auto [id, consumed] : uses) {
+                if (!scheduled_live[id] ||
+                    remaining_uses[id] > consumed ||
+                    id >= current_.virtual_register_classes.size()) {
+                    continue;
+                }
+                const auto bank = static_cast<std::size_t>(
+                    current_.virtual_register_classes[id]);
+                if (bank < projected.size() && projected[bank] != 0) {
+                    --projected[bank];
+                }
+            }
+            for (const auto definition_value :
+                 instructions[begin + index].defs) {
+                if (definition_value.kind !=
+                        machine::RegisterKind::Virtual ||
+                    definition_value.id >= remaining_uses.size() ||
+                    remaining_uses[definition_value.id] == 0 ||
+                    scheduled_live[definition_value.id] ||
+                    definition_value.id >=
+                        current_.virtual_register_classes.size()) {
+                    continue;
+                }
+                const auto bank = static_cast<std::size_t>(
+                    current_.virtual_register_classes[
+                        definition_value.id]);
+                if (bank < projected.size()) ++projected[bank];
+            }
+            return projected;
+        };
+        unsigned hilo_write_gap{};
+        unsigned hilo_result_gap{};
+        const auto opcode_at = [&](std::size_t index) {
+            return decode_opcode(instructions[begin + index].opcode);
+        };
+        const auto starts_hilo_operation = [&](std::size_t index) {
+            const auto opcode = opcode_at(index);
+            return opcode == Opcode::MulStart ||
+                atomic_hilo_operation(instructions[begin + index]);
+        };
+        const auto reads_split_hilo = [&](std::size_t index) {
+            return opcode_at(index) == Opcode::MoveFromLo;
+        };
+        const auto completes_atomic_hilo = [&](std::size_t index) {
             const auto opcode =
                 decode_opcode(instructions[begin + index].opcode);
-            return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
-                opcode == Opcode::Udiv || opcode == Opcode::Srem ||
-                opcode == Opcode::Urem;
+            return opcode != Opcode::MulStart &&
+                atomic_hilo_operation(instructions[begin + index]);
         };
         while (order.size() != count) {
             std::optional<std::size_t> best;
             int best_score = std::numeric_limits<int>::min();
-            const bool ready_non_hilo = [&] {
+            const bool ready_non_hilo_writer = [&] {
                 for (std::size_t index = 0; index < count; ++index) {
                     if (!emitted[index] && indegree[index] == 0 &&
-                        !uses_hilo_pipeline(index)) {
+                        !starts_hilo_operation(index)) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            const bool ready_non_hilo_read = [&] {
+                for (std::size_t index = 0; index < count; ++index) {
+                    if (!emitted[index] && indegree[index] == 0 &&
+                        !reads_split_hilo(index)) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            const auto floating_bank = static_cast<std::size_t>(
+                machine::VirtualRegisterClass::Floating);
+            const auto integer_bank = static_cast<std::size_t>(
+                machine::VirtualRegisterClass::Integer);
+            const auto integer_limit = std::max(
+                schedulable_gpr_peak,
+                scheduled_live_counts[integer_bank]);
+            const auto floating_limit = std::max(
+                schedulable_fpr_peak,
+                scheduled_live_counts[floating_bank]);
+            const bool ready_within_pressure_budget = [&] {
+                for (std::size_t index = 0; index < count; ++index) {
+                    if (emitted[index] || indegree[index] != 0) continue;
+                    const auto projected = projected_pressure(index);
+                    if (projected[integer_bank] <= integer_limit &&
+                        projected[floating_bank] <= floating_limit) {
                         return true;
                     }
                 }
@@ -2408,21 +2636,25 @@ private:
             for (std::size_t index = 0; index < count; ++index) {
                 if (emitted[index] || indegree[index] != 0) continue;
                 const auto& candidate = instructions[begin + index];
-                unsigned births{};
+                int pressure_delta{};
                 for (const auto definition_value : candidate.defs) {
                     if (definition_value.kind ==
                             machine::RegisterKind::Virtual &&
                         definition_value.id < remaining_uses.size() &&
                         remaining_uses[definition_value.id] != 0) {
-                        ++births;
+                        pressure_delta -= pressure_weight(definition_value.id);
                     }
                 }
-                unsigned deaths{};
+                std::unordered_map<std::uint32_t, unsigned> consumed_uses;
                 for (const auto& use : candidate.uses) {
                     if (use.kind == machine::RegisterKind::Virtual &&
-                        use.id < remaining_uses.size() &&
-                        remaining_uses[use.id] == 1) {
-                        ++deaths;
+                        use.id < remaining_uses.size()) {
+                        ++consumed_uses[use.id];
+                    }
+                }
+                for (const auto [id, consumed] : consumed_uses) {
+                    if (remaining_uses[id] <= consumed) {
+                        pressure_delta += pressure_weight(id);
                     }
                 }
                 // VR4300 has a small allocatable bank and spilling costs more
@@ -2430,17 +2662,28 @@ private:
                 // ready node that closes live ranges; use critical height to
                 // choose among schedules with comparable pressure.
                 int score = static_cast<int>(critical_height[index]) *
-                                (compact ? 1 : 2) +
-                            (static_cast<int>(deaths) -
-                             static_cast<int>(births)) *
-                                (compact ? 40 : 24);
+                                (compact ? 1 : 2) + pressure_delta;
                 if (prefer_early[index]) score += compact ? 1 : 4;
                 // MFHI/MFLO on pre-interlocked MIPS forbids a following
                 // HI/LO writer for two architectural instructions. Prefer
                 // ready scalar work during that window so the emitter does
                 // not have to repair the schedule with NOPs.
-                if (hilo_gap != 0 && ready_non_hilo &&
-                    uses_hilo_pipeline(index)) {
+                if (hilo_write_gap != 0 && ready_non_hilo_writer &&
+                    starts_hilo_operation(index)) {
+                    score -= 10000;
+                }
+                // A split MFLO is data-ready only after the multiply latency.
+                // Prefer independent ready work during that interval.  The
+                // dependency token still forces the read after its writer and
+                // serializes every other use of the architectural HI/LO pair.
+                if (hilo_result_gap != 0 && ready_non_hilo_read &&
+                    reads_split_hilo(index)) {
+                    score -= 10000;
+                }
+                const auto projected = projected_pressure(index);
+                if (ready_within_pressure_budget &&
+                    (projected[integer_bank] > integer_limit ||
+                     projected[floating_bank] > floating_limit)) {
                     score -= 10000;
                 }
                 const auto opcode = decode_opcode(candidate.opcode);
@@ -2462,13 +2705,62 @@ private:
             if (!best) return false;
             emitted[*best] = true;
             order.push_back(*best);
-            if (uses_hilo_pipeline(*best)) hilo_gap = 2;
-            else if (hilo_gap != 0) --hilo_gap;
+            if (opcode_at(*best) == Opcode::MulStart) {
+                // A remaining post-MFLO exclusion is paid as hardware/emitter
+                // stalls when no independent node can fill it.  It no longer
+                // applies after this writer has issued.
+                hilo_write_gap = 0;
+                hilo_result_gap = estimated_latency(
+                    instructions[begin + *best]);
+            } else if (reads_split_hilo(*best)) {
+                hilo_result_gap = 0;
+                hilo_write_gap =
+                    subtarget_.has_feature(Feature::HiloInterlocks) ? 0U : 2U;
+            } else {
+                if (hilo_result_gap != 0) --hilo_result_gap;
+                if (completes_atomic_hilo(*best)) {
+                    hilo_write_gap =
+                        subtarget_.has_feature(Feature::HiloInterlocks)
+                        ? 0U : 2U;
+                } else if (hilo_write_gap != 0) {
+                    --hilo_write_gap;
+                }
+            }
             for (const auto& use : instructions[begin + *best].uses) {
                 if (use.kind == machine::RegisterKind::Virtual &&
                     use.id < remaining_uses.size() &&
                     remaining_uses[use.id] != 0) {
                     --remaining_uses[use.id];
+                    if (remaining_uses[use.id] == 0 &&
+                        scheduled_live[use.id] &&
+                        use.id < current_.virtual_register_classes.size()) {
+                        scheduled_live[use.id] = false;
+                        const auto bank = static_cast<std::size_t>(
+                            current_.virtual_register_classes[use.id]);
+                        if (bank < scheduled_live_counts.size() &&
+                            scheduled_live_counts[bank] != 0) {
+                            --scheduled_live_counts[bank];
+                        }
+                    }
+                }
+            }
+            for (const auto definition_value :
+                 instructions[begin + *best].defs) {
+                if (definition_value.kind !=
+                        machine::RegisterKind::Virtual ||
+                    definition_value.id >= remaining_uses.size() ||
+                    remaining_uses[definition_value.id] == 0 ||
+                    scheduled_live[definition_value.id] ||
+                    definition_value.id >=
+                        current_.virtual_register_classes.size()) {
+                    continue;
+                }
+                scheduled_live[definition_value.id] = true;
+                const auto bank = static_cast<std::size_t>(
+                    current_.virtual_register_classes[
+                        definition_value.id]);
+                if (bank < scheduled_live_counts.size()) {
+                    ++scheduled_live_counts[bank];
                 }
             }
             for (const auto successor : successors[*best]) {
@@ -2540,29 +2832,92 @@ private:
         }
         const auto original_pressure = measure_pressure(original);
         const auto scheduled_pressure = measure_pressure(order);
+        const auto estimated_cycles = [&](const std::vector<std::size_t>& plan) {
+            std::vector<unsigned> ready(count);
+            unsigned next_issue{};
+            unsigned completion{};
+            for (const auto index : plan) {
+                unsigned issue = next_issue;
+                for (const auto use : instructions[begin + index].uses) {
+                    if (use.kind != machine::RegisterKind::Virtual) continue;
+                    const auto producer = definition.find(use.id);
+                    if (producer != definition.end() &&
+                        producer->second != index) {
+                        issue = std::max(issue, ready[producer->second]);
+                    }
+                }
+                ready[index] = issue +
+                    estimated_latency(instructions[begin + index]);
+                next_issue = issue + 1;
+                completion = std::max(completion, ready[index]);
+            }
+            return completion;
+        };
+        const auto original_cycles = estimated_cycles(original);
+        const auto scheduled_cycles = estimated_cycles(order);
         const auto hilo_stalls = [&](const std::vector<std::size_t>& plan) {
-            unsigned gap{};
+            unsigned write_gap{};
+            unsigned result_gap{};
             unsigned stalls{};
             for (const auto index : plan) {
-                if (uses_hilo_pipeline(index)) {
-                    stalls += gap;
-                    gap = 2;
-                } else if (gap != 0) {
-                    --gap;
+                if (starts_hilo_operation(index)) {
+                    stalls += write_gap;
+                    write_gap = 0;
+                    if (opcode_at(index) == Opcode::MulStart) {
+                        result_gap = estimated_latency(
+                            instructions[begin + index]);
+                    } else if (completes_atomic_hilo(index)) {
+                        write_gap = subtarget_.has_feature(
+                            Feature::HiloInterlocks) ? 0U : 2U;
+                    }
+                } else if (reads_split_hilo(index)) {
+                    stalls += result_gap;
+                    result_gap = 0;
+                    write_gap = subtarget_.has_feature(
+                        Feature::HiloInterlocks) ? 0U : 2U;
+                } else {
+                    if (result_gap != 0) --result_gap;
+                    if (completes_atomic_hilo(index)) {
+                        write_gap = subtarget_.has_feature(
+                            Feature::HiloInterlocks) ? 0U : 2U;
+                    } else if (write_gap != 0) {
+                        --write_gap;
+                    }
                 }
             }
             return stalls;
         };
         const bool removes_hilo_stalls =
-            options_.optimize_for == OptimizationGoal::Speed &&
+            speed &&
             hilo_stalls(order) < hilo_stalls(original);
         for (std::size_t bank = 0;
              bank < original_pressure.peak.size(); ++bank) {
-            const auto latency_allowance =
-                removes_hilo_stalls &&
-                    bank == static_cast<std::size_t>(
-                                machine::VirtualRegisterClass::Integer)
-                ? 1U : 0U;
+            unsigned latency_allowance{};
+            if (speed &&
+                bank == static_cast<std::size_t>(
+                            machine::VirtualRegisterClass::Integer) &&
+                scheduled_cycles < original_cycles) {
+                const auto available =
+                    original_pressure.peak[bank] < schedulable_gpr_peak
+                    ? schedulable_gpr_peak - original_pressure.peak[bank]
+                    : 0U;
+                auto repaid = original_cycles - scheduled_cycles;
+                if (removes_hilo_stalls) repaid = std::max(1U, repaid);
+                latency_allowance = std::min(available, repaid);
+            }
+            if (speed &&
+                bank == static_cast<std::size_t>(
+                            machine::VirtualRegisterClass::Floating) &&
+                scheduled_cycles < original_cycles) {
+                const auto available =
+                    original_pressure.peak[bank] < schedulable_fpr_peak
+                    ? schedulable_fpr_peak -
+                          original_pressure.peak[bank]
+                    : 0U;
+                const auto repaid =
+                    (original_cycles - scheduled_cycles) / 2U;
+                latency_allowance = std::min(available, repaid);
+            }
             if (scheduled_pressure.peak[bank] >
                 original_pressure.peak[bank] + latency_allowance) {
                 return false;
@@ -2581,7 +2936,7 @@ private:
 
     bool schedule_instructions(machine::Function& function) {
         if (!options_.schedule_insns) return false;
-        bool changed = false;
+        bool changed = split_hilo_operations(function);
         for (auto& block : function.blocks) {
             std::size_t begin{};
             while (begin < block.instructions.size()) {
@@ -2983,6 +3338,18 @@ private:
 
     void instruction(std::string_view opcode,
                      std::string_view operands = {}) {
+        const bool floating_multiply =
+            opcode == "mul.s" || opcode == "mul.d" || opcode == "mul.ps";
+        // Early VR4300 silicon only needs separation between consecutive FP
+        // multiplies. Let useful intervening work pay that gap and emit a NOP
+        // only when another multiply arrives immediately.
+        if (fpu_multiply_pending_) {
+            if (floating_multiply) {
+                raw_instruction("nop");
+                if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
+            }
+            fpu_multiply_pending_ = false;
+        }
         // MIPS I-III HI/LO is unusual: MFHI/MFLO may be followed by ordinary
         // work, but not by a HI/LO writer until two instructions have passed.
         // Preserve useful instructions and materialize NOPs only if a writer
@@ -3019,6 +3386,9 @@ private:
             (opcode == "mfhi" || opcode == "mflo")) {
             hilo_write_barrier_ = 2;
         }
+        if (subtarget_.has_feature(Feature::Fix4300) && floating_multiply) {
+            fpu_multiply_pending_ = true;
+        }
     }
 
     void encoded(std::uint32_t word, std::string_view comment) {
@@ -3026,6 +3396,7 @@ private:
                 << std::setfill('0') << word << std::dec << std::setfill(' ');
         if (!comment.empty()) output_ << "\t# " << comment;
         output_ << '\n';
+        fpu_multiply_pending_ = false;
         if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
     }
 
@@ -5055,8 +5426,12 @@ private:
         case Opcode::CmpUgt:
         case Opcode::Fadd:
         case Opcode::Fsub:
-        case Opcode::Fmul:
         case Opcode::Fdiv: return true;
+        case Opcode::Fmul:
+            // -mfix4300 emits a second architectural instruction after the
+            // multiply. Moving only the multiply into a branch delay slot
+            // could skip that separation on the taken edge.
+            return !subtarget_.has_feature(Feature::Fix4300);
         default: return false;
         }
     }
@@ -5085,12 +5460,6 @@ private:
                                          block.id)) {
                     continue;
                 }
-                const auto opcode = decode_opcode(candidate.opcode);
-                const bool floating = opcode == Opcode::Fneg ||
-                    (opcode >= Opcode::Fadd && opcode <= Opcode::Fdiv);
-                if (floating && candidate_index + 1 != terminator_index) {
-                    continue;
-                }
                 bool legal = true;
                 for (std::size_t between = candidate_index + 1;
                      between < terminator_index && legal; ++between) {
@@ -5102,8 +5471,21 @@ private:
                         break;
                     }
                     for (const auto definition : candidate.defs) {
-                        if (std::find(crossed.uses.begin(), crossed.uses.end(),
-                                      definition) != crossed.uses.end()) {
+                        const bool read_or_overwritten =
+                            std::any_of(
+                                crossed.uses.begin(), crossed.uses.end(),
+                                [&](machine::Register use) {
+                                    return same_physical_assignment(
+                                        function, definition, use);
+                                }) ||
+                            std::any_of(
+                                crossed.defs.begin(), crossed.defs.end(),
+                                [&](machine::Register crossed_definition) {
+                                    return same_physical_assignment(
+                                        function, definition,
+                                        crossed_definition);
+                                });
+                        if (read_or_overwritten) {
                             legal = false;
                             break;
                         }
@@ -5172,6 +5554,7 @@ private:
     bool has_call_{};
     std::uint32_t next_label_{};
     unsigned hilo_write_barrier_{};
+    bool fpu_multiply_pending_{};
     std::string epilogue_label_;
 };
 
@@ -5748,10 +6131,7 @@ void AssemblyEmitter::emit_floating_binary(
         switch (opcode) {
         case Opcode::Fadd: instruction("add" + suffix, operands); break;
         case Opcode::Fsub: instruction("sub" + suffix, operands); break;
-        case Opcode::Fmul:
-            instruction("mul" + suffix, operands);
-            if (subtarget_.has_feature(Feature::Fix4300)) instruction("nop");
-            break;
+        case Opcode::Fmul: instruction("mul" + suffix, operands); break;
         case Opcode::Fdiv: instruction("div" + suffix, operands); break;
         default: break;
         }
@@ -6655,6 +7035,34 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         }
         return;
     }
+    if (opcode == Opcode::MulStart) {
+        if (value.uses.size() < 2) {
+            diagnostics_.error(value.location,
+                               "malformed MIPS split multiply producer");
+            return;
+        }
+        const auto left = value.uses[0];
+        const auto right = value.uses[1];
+        const auto left_gpr = input_gpr(
+            function, left, "t0", value.location);
+        const auto right_gpr = input_gpr(
+            function, right, "t1", value.location);
+        instruction(left.mode.bits > 32 ? "dmult" : "mult",
+                    reg_name(left_gpr) + "," + reg_name(right_gpr));
+        return;
+    }
+    if (opcode == Opcode::MoveFromLo) {
+        if (value.defs.empty()) {
+            diagnostics_.error(value.location,
+                               "malformed MIPS split multiply consumer");
+            return;
+        }
+        const auto target = value.defs.front();
+        const auto destination = output_gpr(function, target, "t2");
+        instruction("mflo", reg_name(destination));
+        commit_gpr(function, target, destination, value.location);
+        return;
+    }
     if ((opcode >= Opcode::Add && opcode <= Opcode::CmpUge)) {
         emit_integer_binary(function, value);
         return;
@@ -7145,6 +7553,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     const auto& entity = hir_.function(function.source);
     active_signature_ = classify_entity(entity, function.location);
     if (!active_signature_) return;
+    hilo_write_barrier_ = 0;
+    fpu_multiply_pending_ = false;
     // Fully allocated, non-overlapping parameter sets are captured directly.
     // Otherwise home the whole incoming register set before materialization:
     // EABI/Cross banks may overlap t0/t1 assembly scratches, so mixing direct

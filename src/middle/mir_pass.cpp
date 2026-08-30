@@ -40,6 +40,8 @@ std::string_view pass_name(PassId pass) {
         return "early-exit-vectorization";
     case PassId::LoopUnrolling: return "loop-unrolling";
     case PassId::RecurrenceRebalancing: return "recurrence-rebalancing";
+    case PassId::StraightLineStrengthReduction:
+        return "straight-line-strength-reduction";
     case PassId::SlpVectorization: return "slp-vectorization";
     case PassId::FloatingSimplification: return "floating-simplification";
     case PassId::DeadCodeElimination: return "dead-code-elimination";

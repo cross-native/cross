@@ -126,6 +126,7 @@ struct CompilerOptions {
     bool move_loop_invariants{};
     bool unroll_loops{};
     bool tree_reassoc{};
+    bool tree_slsr{};
     bool tree_loop_vectorize{};
     bool tree_early_exit_vectorize{};
     bool tree_slp_vectorize{};

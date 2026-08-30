@@ -6913,6 +6913,236 @@ void simplify_integer_operations(ManagedFunction& function,
     remove_replaced_values(function, removed);
 }
 
+std::optional<UInt128> folded_integer_constant(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    ValueId id) {
+    if (id.value >= function.values.size()) return std::nullopt;
+    const auto& value = function.values[id.value];
+    const auto bits = type_bits(hir_module, value.type);
+    if (bits == 0) return std::nullopt;
+    if (value.kind == ValueKind::ConstantInteger) {
+        return mask_to(UInt128{value.integer, value.integer_high}, bits);
+    }
+    if (value.kind != ValueKind::Cast || value.operands.size() != 1) {
+        return std::nullopt;
+    }
+    const auto source_id = value.operands.front();
+    if (source_id.value >= function.values.size()) return std::nullopt;
+    const auto source_bits = type_bits(
+        hir_module, function.values[source_id.value].type);
+    if (source_bits == 0) return std::nullopt;
+    auto folded = folded_integer_constant(function, hir_module, source_id);
+    if (!folded) return std::nullopt;
+    *folded = mask_to(*folded, source_bits);
+    if (value.cast == CastOperation::SignExtend &&
+        bit(*folded, source_bits - 1U)) {
+        *folded = bit_or(
+            *folded,
+            bit_not(mask_to(bit_not(UInt128{}), source_bits)));
+    } else if (value.cast != CastOperation::ZeroExtend &&
+               value.cast != CastOperation::Truncate &&
+               value.cast != CastOperation::Reinterpret &&
+               value.cast != CastOperation::SignExtend) {
+        return std::nullopt;
+    }
+    return mask_to(*folded, bits);
+}
+
+bool reduce_constant_multiplications(ManagedFunction& function,
+                                     const hir::Module& hir_module,
+                                     const CompilerOptions& options) {
+    const auto balance = std::min(options.risc_cisc_balance, 100U);
+    const auto risc_weight = 100U - balance;
+    const unsigned risc_budget =
+        options.optimize_for == OptimizationGoal::Speed ? 5U : 2U;
+    const auto operation_budget = risc_budget * risc_weight / 100U;
+    if (operation_budget == 0) return false;
+
+    struct Digit {
+        unsigned shift{};
+        bool subtract{};
+    };
+
+    bool changed = false;
+    std::unordered_set<std::uint32_t> removed;
+    for (auto& block : function.blocks) {
+        std::vector<ValueId> rewritten;
+        rewritten.reserve(block.values.size());
+        const auto append = [&](ManagedValue value) {
+            value.id = {
+                static_cast<std::uint32_t>(function.values.size())};
+            const auto id = value.id;
+            function.values.push_back(std::move(value));
+            rewritten.push_back(id);
+            return id;
+        };
+
+        for (const auto id : block.values) {
+            const auto source = function.values[id.value];
+            if (source.kind != ValueKind::Binary ||
+                source.binary != BinaryOperation::Multiply ||
+                source.operands.size() != 2 ||
+                !unsigned_integer_type(hir_module, source.type)) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto bits = type_bits(hir_module, source.type);
+            if (bits == 0 || bits > 64) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto left = source.operands[0];
+            const auto right = source.operands[1];
+            const auto left_constant = folded_integer_constant(
+                function, hir_module, left);
+            const auto right_constant = folded_integer_constant(
+                function, hir_module, right);
+            if (left_constant.has_value() == right_constant.has_value()) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto literal = left_constant ? left : right;
+            const auto variable = left_constant ? right : left;
+            const auto constant = left_constant ? *left_constant
+                                                : *right_constant;
+            if (constant.high != 0) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto mask = bits == 64
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (std::uint64_t{1} << bits) - 1U;
+            const auto multiplier = constant.low & mask;
+            if (multiplier == 0) {
+                replace_value_uses(function, id, literal);
+                removed.insert(id.value);
+                changed = true;
+                continue;
+            }
+            if (multiplier == 1) {
+                replace_value_uses(function, id, variable);
+                removed.insert(id.value);
+                changed = true;
+                continue;
+            }
+            if (multiplier == mask) {
+                auto& replacement = function.values[id.value];
+                replacement.kind = ValueKind::Unary;
+                replacement.unary = UnaryOperation::Negate;
+                replacement.operands = {variable};
+                replacement.incoming.clear();
+                rewritten.push_back(id);
+                changed = true;
+                continue;
+            }
+            // Keep the signed-digit builder away from the one uint64 carry
+            // case. Large modular constants are better left to the target's
+            // multiply instruction in any event.
+            if (multiplier > std::numeric_limits<std::int64_t>::max()) {
+                rewritten.push_back(id);
+                continue;
+            }
+
+            // Non-adjacent signed digits minimize the number of shifted
+            // addends. For example, 3*x becomes (x<<2)-x and 17*x becomes
+            // (x<<4)+x. This is target-independent modular arithmetic; the
+            // RISC/CISC factor controls only its profitability.
+            std::vector<Digit> digits;
+            auto remaining = multiplier;
+            unsigned shift{};
+            while (remaining != 0) {
+                if ((remaining & 1U) != 0) {
+                    const bool subtract =
+                        (remaining & 3U) == 3U;
+                    digits.push_back({shift, subtract});
+                    if (subtract) ++remaining;
+                    else --remaining;
+                }
+                remaining >>= 1U;
+                ++shift;
+            }
+            std::reverse(digits.begin(), digits.end());
+            unsigned cost =
+                static_cast<unsigned>(digits.size() - 1U);
+            for (const auto digit : digits) {
+                if (digit.shift != 0) ++cost;
+            }
+            if (cost == 0 || cost > operation_budget) {
+                rewritten.push_back(id);
+                continue;
+            }
+
+            if (digits.size() == 1) {
+                ManagedValue amount;
+                amount.location = source.location;
+                amount.type = source.type;
+                amount.kind = ValueKind::ConstantInteger;
+                amount.integer = digits.front().shift;
+                const auto amount_id = append(std::move(amount));
+                auto& replacement = function.values[id.value];
+                replacement.kind = ValueKind::Binary;
+                replacement.binary = BinaryOperation::ShiftLeft;
+                replacement.operands = {variable, amount_id};
+                replacement.incoming.clear();
+                rewritten.push_back(id);
+                changed = true;
+                continue;
+            }
+
+            const auto shifted_term = [&](unsigned amount) {
+                if (amount == 0) return variable;
+                ManagedValue amount_value;
+                amount_value.location = source.location;
+                amount_value.type = source.type;
+                amount_value.kind = ValueKind::ConstantInteger;
+                amount_value.integer = amount;
+                const auto amount_id = append(std::move(amount_value));
+
+                ManagedValue shifted;
+                shifted.location = source.location;
+                shifted.type = source.type;
+                shifted.kind = ValueKind::Binary;
+                shifted.binary = BinaryOperation::ShiftLeft;
+                shifted.operands = {variable, amount_id};
+                return append(std::move(shifted));
+            };
+
+            std::vector<ValueId> terms;
+            terms.reserve(digits.size());
+            for (const auto digit : digits) {
+                terms.push_back(shifted_term(digit.shift));
+            }
+            auto combined = terms.front();
+            for (std::size_t index = 1; index < terms.size(); ++index) {
+                const auto operation = digits[index].subtract
+                    ? BinaryOperation::Subtract
+                    : BinaryOperation::Add;
+                if (index + 1U == terms.size()) {
+                    auto& replacement = function.values[id.value];
+                    replacement.kind = ValueKind::Binary;
+                    replacement.binary = operation;
+                    replacement.operands = {combined, terms[index]};
+                    replacement.incoming.clear();
+                    combined = id;
+                } else {
+                    ManagedValue next;
+                    next.location = source.location;
+                    next.type = source.type;
+                    next.kind = ValueKind::Binary;
+                    next.binary = operation;
+                    next.operands = {combined, terms[index]};
+                    combined = append(std::move(next));
+                }
+            }
+            rewritten.push_back(id);
+            changed = true;
+        }
+        block.values = std::move(rewritten);
+    }
+    remove_replaced_values(function, removed);
+    return changed;
+}
+
 bool floating_zero(const ManagedValue& value, unsigned bits) {
     if (value.kind != ValueKind::ConstantFloating) return false;
     if (bits == 32) return (value.integer & 0x7fffffffU) == 0;
@@ -13142,6 +13372,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     propagate_trivial_copies(function);
                 }
                 return PassResult::changed_values();
+            });
+    }
+    if (options.tree_slsr) {
+        pipeline.add(
+            PassId::StraightLineStrengthReduction,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return reduce_constant_multiplications(
+                           function, hir_module, options)
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
             });
     }
     if (options.tree_bit_ccp) {
