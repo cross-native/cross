@@ -568,22 +568,18 @@ int main() {
     ok &= expect(rotate_guarded_loops(guarded),
                  "guarded loop should rotate to a bottom test");
     ok &= expect(
-        guarded.blocks.size() == 6 &&
+        guarded.blocks.size() == 5 &&
             guarded.blocks[1].predecessors == std::vector<BlockId>{{0}} &&
             guarded.blocks[2].predecessors ==
-                std::vector<BlockId>{{1}, {5}} &&
+                std::vector<BlockId>{{1}, {3}} &&
             guarded.blocks[4].predecessors ==
-                std::vector<BlockId>{{1}, {5}} &&
+                std::vector<BlockId>{{1}, {3}} &&
             guarded.blocks[2].terminator.successors ==
                 std::vector<BlockId>{{3}} &&
             guarded.blocks[3].terminator.successors ==
-                std::vector<BlockId>{{5}} &&
-            guarded.blocks[5].predecessors ==
-                std::vector<BlockId>{{3}} &&
-            guarded.blocks[5].terminator.successors ==
                 std::vector<BlockId>{{2}, {4}},
-        "rotation should preserve an initial guard and form one backedge");
-    if (guarded.blocks.size() == 6 &&
+        "rotation should preserve an initial guard and reuse the latch test");
+    if (guarded.blocks.size() == 5 &&
         !guarded.blocks[2].values.empty() &&
         !guarded.blocks[4].values.empty()) {
         const auto& body_phi =
@@ -593,25 +589,21 @@ int main() {
         ok &= expect(
             body_phi.kind == ValueKind::Phi &&
                 body_phi.incoming ==
-                    std::vector<PhiIncoming>{{{1}, {3}}, {{5}, {5}}} &&
+                    std::vector<PhiIncoming>{{{1}, {3}}, {{3}, {5}}} &&
                 exit_phi.kind == ValueKind::Phi &&
                 exit_phi.incoming ==
-                    std::vector<PhiIncoming>{{{1}, {3}}, {{5}, {5}}},
+                    std::vector<PhiIncoming>{{{1}, {3}}, {{3}, {5}}},
             "rotation should distinguish recurrence and live-out PHIs");
-        const auto& rotated_effect = guarded.effects.back();
         ok &= expect(
-            rotated_effect.kind == EffectKind::Phi &&
-                rotated_effect.incoming.size() == 1 &&
-                rotated_effect.incoming.front().predecessor == BlockId{3} &&
-                rotated_effect.incoming.front().effect == EffectId{3} &&
+            guarded.effects.size() == 5 &&
                 guarded.effects[guarded.blocks[2].effect.value]
-                        .incoming.back().predecessor == BlockId{5} &&
+                        .incoming.back().predecessor == BlockId{3} &&
                 guarded.effects[guarded.blocks[2].effect.value]
-                        .incoming.back().effect == rotated_effect.id &&
+                        .incoming.back().effect == EffectId{3} &&
                 guarded.effects[guarded.blocks[4].effect.value]
-                        .incoming.back().predecessor == BlockId{5} &&
+                        .incoming.back().predecessor == BlockId{3} &&
                 guarded.effects[guarded.blocks[4].effect.value]
-                        .incoming.back().effect == rotated_effect.id,
+                        .incoming.back().effect == EffectId{3},
             "rotation should repair effect PHIs on both outgoing edges");
     }
     ManagedModule rotated_module;
@@ -632,13 +624,13 @@ int main() {
     header_invariant.blocks[1].values = {{3}, {1}, {4}};
     ok &= expect(rotate_guarded_loops(header_invariant),
                  "header-local guard invariants should remain reusable");
-    if (header_invariant.blocks.size() == 6) {
-        const auto& test = header_invariant.blocks[5];
+    if (header_invariant.blocks.size() == 5) {
+        const auto& test = header_invariant.blocks[3];
         ok &= expect(
-            test.values.size() == 1 &&
-                header_invariant.values[test.values[0].value].kind ==
+            test.values.size() == 2 &&
+                header_invariant.values[test.values.back().value].kind ==
                     ValueKind::Binary &&
-                header_invariant.values[test.values[0].value].operands[1] ==
+                header_invariant.values[test.values.back().value].operands[1] ==
                     ValueId{1},
             "the one-time guard should dominate invariant rotated uses");
     }
@@ -650,7 +642,7 @@ int main() {
         header_invariant_diagnostics_text);
     ok &= expect(verify(header_invariant_module, hir,
                         header_invariant_diagnostics),
-                 "cloned header guard invariants should preserve MIR SSA");
+                 "reused header guard invariants should preserve MIR SSA");
     if (!header_invariant_diagnostics_text.str().empty()) {
         std::cerr << header_invariant_diagnostics_text.str();
     }
@@ -676,7 +668,7 @@ int main() {
     auto cross_recurrence = cross_recurrence_loop_function();
     ok &= expect(rotate_guarded_loops(cross_recurrence),
                  "cross-state recurrence should rotate");
-    if (cross_recurrence.blocks.size() == 6 &&
+    if (cross_recurrence.blocks.size() == 5 &&
         cross_recurrence.blocks[2].values.size() >= 2) {
         const auto first = cross_recurrence.blocks[2].values[0];
         const auto second = cross_recurrence.blocks[2].values[1];
@@ -684,9 +676,9 @@ int main() {
         const auto& second_phi = cross_recurrence.values[second.value];
         ok &= expect(
             first_phi.incoming.size() == 2 &&
-                first_phi.incoming[1] == PhiIncoming{{5}, second} &&
+                first_phi.incoming[1] == PhiIncoming{{3}, second} &&
                 second_phi.incoming.size() == 2 &&
-                second_phi.incoming[1] == PhiIncoming{{5}, first},
+                second_phi.incoming[1] == PhiIncoming{{3}, first},
             "rotation should map mutually dependent carried state to body PHIs");
     }
     ManagedModule cross_recurrence_module;

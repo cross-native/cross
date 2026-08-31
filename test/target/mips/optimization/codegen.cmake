@@ -88,9 +88,11 @@ compile_unroll_variant(unroll_risc 0)
 compile_unroll_variant(unroll_cisc 100)
 compile_unroll_variant(unroll_risc_no_delay 0 -fno-schedule-insns2)
 compile_unroll_variant(unroll_risc_no_iv 0 -fno-ivopts)
-compile_unroll_variant(unroll_risc_no_reorder 0 -fno-reorder-blocks)
+compile_unroll_variant(unroll_risc_no_reorder 0 -fno-reorder-blocks
+                       -fno-tree-loop-rotate)
 compile_unroll_variant(unroll_risc_no_reorder_no_delay 0
-                       -fno-reorder-blocks -fno-schedule-insns2)
+                       -fno-reorder-blocks -fno-schedule-insns2
+                       -fno-tree-loop-rotate)
 execute_process(
     COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"

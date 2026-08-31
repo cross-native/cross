@@ -1013,8 +1013,6 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         }
     }
 
-    const BlockId rotated_test_id{
-        static_cast<std::uint32_t>(function.blocks.size())};
     const auto first_body_phi = function.values.size();
     for (std::size_t index = 0; index < states.size(); ++index) {
         states[index].body = ValueId{static_cast<std::uint32_t>(
@@ -1038,7 +1036,7 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         phi.type = state.type;
         phi.kind = ValueKind::Phi;
         phi.incoming = {{header_id, state.header},
-                        {rotated_test_id, map_carried(state.carried)}};
+                        {latch_id, map_carried(state.carried)}};
         function.values.push_back(std::move(phi));
     }
     for (const auto& state : states) {
@@ -1048,7 +1046,7 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         phi.type = state.type;
         phi.kind = ValueKind::Phi;
         phi.incoming = {{header_id, state.header},
-                        {rotated_test_id, map_carried(state.carried)}};
+                        {latch_id, map_carried(state.carried)}};
         function.values.push_back(std::move(phi));
     }
 
@@ -1106,11 +1104,19 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         });
 
     auto& mutable_latch = function.blocks[latch_id.value];
-    mutable_latch.terminator.successors.front() = rotated_test_id;
     const auto latch_final_effect = mutable_latch.terminator.effect;
+    mutable_latch.values.insert(mutable_latch.values.end(),
+                                rotated_values.begin(),
+                                rotated_values.end());
+    mutable_latch.terminator = {
+        TerminatorKind::ConditionalBranch,
+        header_snapshot.terminator.location,
+        rotated_condition,
+        header_snapshot.terminator.successors,
+        latch_final_effect};
 
     auto& mutable_body = function.blocks[body_id->value];
-    mutable_body.predecessors.push_back(rotated_test_id);
+    mutable_body.predecessors.push_back(latch_id);
     std::vector<ValueId> body_values;
     body_values.reserve(states.size() + mutable_body.values.size());
     for (const auto& state : states) body_values.push_back(state.body);
@@ -1119,7 +1125,7 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
     mutable_body.values = std::move(body_values);
 
     auto& mutable_exit = function.blocks[exit_id->value];
-    mutable_exit.predecessors.push_back(rotated_test_id);
+    mutable_exit.predecessors.push_back(latch_id);
     std::vector<ValueId> exit_values;
     exit_values.reserve(states.size() + mutable_exit.values.size());
     for (const auto& state : states) exit_values.push_back(state.exit);
@@ -1127,32 +1133,10 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
                        mutable_exit.values.end());
     mutable_exit.values = std::move(exit_values);
 
-    const EffectId rotated_effect_id{
-        static_cast<std::uint32_t>(function.effects.size())};
-    ManagedEffect rotated_effect;
-    rotated_effect.id = rotated_effect_id;
-    rotated_effect.location = header_snapshot.terminator.location;
-    rotated_effect.kind = EffectKind::Phi;
-    rotated_effect.incoming = {{latch_id, latch_final_effect}};
-    function.effects.push_back(std::move(rotated_effect));
     function.effects[mutable_body.effect.value].incoming.push_back(
-        {rotated_test_id, rotated_effect_id});
+        {latch_id, latch_final_effect});
     function.effects[mutable_exit.effect.value].incoming.push_back(
-        {rotated_test_id, rotated_effect_id});
-
-    ManagedBlock rotated_test;
-    rotated_test.id = rotated_test_id;
-    rotated_test.location = header_snapshot.location;
-    rotated_test.values = std::move(rotated_values);
-    rotated_test.predecessors = {latch_id};
-    rotated_test.effect = rotated_effect_id;
-    rotated_test.terminator = {
-        TerminatorKind::ConditionalBranch,
-        header_snapshot.terminator.location,
-        rotated_condition,
-        header_snapshot.terminator.successors,
-        rotated_effect_id};
-    function.blocks.push_back(std::move(rotated_test));
+        {latch_id, latch_final_effect});
     return true;
 }
 
@@ -1433,9 +1417,9 @@ bool factor_common_phi_tails(ManagedFunction& function,
 
 bool rotate_guarded_loops(ManagedFunction& function) {
     bool changed = false;
-    // Each rotation appends one test block and invalidates every CFG-derived
+    // Each rotation rewires the latch and invalidates every CFG-derived
     // analysis. Rebuild before considering another loop; the original block
-    // count is also a natural progress bound for one invocation.
+    // count is also a conservative progress bound for one invocation.
     const auto budget = function.blocks.size();
     for (std::size_t round = 0; round < budget; ++round) {
         const DominatorTree dominators(function);
@@ -1443,13 +1427,10 @@ bool rotate_guarded_loops(ManagedFunction& function) {
         const UseLists uses(function);
         bool rotated = false;
         for (const auto& loop : loops.loops()) {
-            // Rotate the outer control of a loop nest, not each nested
-            // member.  The inner loop's compact header/backedge can already
-            // be laid out as a bottom test by the machine block placer;
-            // cloning its guard merely adds a zero-trip guard and an exit
-            // transfer on delay-slot targets.  A later target cost model can
-            // relax this when duplicating an inner guard is demonstrably
-            // profitable.
+            // Keep inner compact loops in their canonical form. Duplicating
+            // their guards increases code size and regresses mixed workloads;
+            // target block placement can still make their hot bodies and
+            // backedges contiguous without changing MIR.
             if (loop.parent) continue;
             if (!rotate_one_guarded_loop(function, loop, uses)) continue;
             changed = true;
