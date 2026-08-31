@@ -51,6 +51,17 @@ global i32 mips_delay_branch(in i32 value, in i32 addend) {
 }
 
 [[abi("o32"), noinline]]
+global u32 mips_successor_delay(in volatile u32 *cell,
+                                in u32 condition, in u32 value) {
+    if (condition != 0) {
+        *cell = value;
+    } else {
+        *cell = value + 1u32;
+    }
+    return (value ^ 255u32) + 3u32;
+}
+
+[[abi("o32"), noinline]]
 global u32 mips_integer_immediates(in u32 value) {
     u32 result = value + 17u32;
     result = result ^ 255u32;

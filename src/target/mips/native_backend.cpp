@@ -3400,6 +3400,13 @@ private:
         SignatureLayout layout;
     };
 
+    struct SuccessorDelayEntry {
+        machine::BlockId successor;
+        std::size_t instruction{};
+        std::string resume_label;
+        bool fused_compare{};
+    };
+
     void raw_instruction(std::string_view opcode,
                          std::string_view operands = {}) {
         output_ << '\t' << opcode;
@@ -5412,15 +5419,89 @@ private:
         }
     }
 
-    bool can_fill_delay_slot(const machine::Function& function,
-                             const machine::Instruction& candidate,
-                             const machine::Instruction& terminator,
-                             machine::BlockId predecessor) const {
+    bool single_delay_slot_instruction(
+        const machine::Function& function,
+        const machine::Instruction& candidate) const {
         if (!options_.schedule_insns2 ||
             candidate.kind != machine::InstructionKind::Target ||
             candidate.may_load || candidate.may_store ||
             candidate.has_side_effects || candidate.patch ||
-            candidate.defs.size() != 1 ||
+            candidate.defs.size() != 1) {
+            return false;
+        }
+
+        const auto allocated = [&](machine::Register value) {
+            if (value.kind != machine::RegisterKind::Virtual ||
+                value.id >= function.virtual_register_classes.size()) {
+                return false;
+            }
+            const auto kind = function.virtual_register_classes[value.id];
+            if (kind == machine::VirtualRegisterClass::Floating) {
+                return assigned_fpr(function, value).has_value();
+            }
+            if (kind != machine::VirtualRegisterClass::Integer) return false;
+            return assigned_gpr(function, value).has_value();
+        };
+        if (!std::all_of(candidate.defs.begin(), candidate.defs.end(),
+                         allocated) ||
+            !std::all_of(candidate.uses.begin(), candidate.uses.end(),
+                         allocated)) {
+            return false;
+        }
+        if (!subtarget_.has_feature(Feature::Mips3) &&
+            std::any_of(candidate.defs.begin(), candidate.defs.end(),
+                        [](machine::Register value) {
+                            return value.mode.bits > 32;
+                        })) {
+            return false;
+        }
+
+        // Only admit Machine IR operations whose allocated form is exactly
+        // one architectural instruction.  The delay-slot emitter can then
+        // move it as a unit without parsing assembly text or splitting a
+        // legalization sequence.
+        const auto opcode = decode_opcode(candidate.opcode);
+        if (opcode == Opcode::Constant && candidate.operands.size() == 1) {
+            const auto* immediate =
+                std::get_if<machine::ImmediateOperand>(
+                    &candidate.operands.front());
+            return immediate && immediate->value == 0 &&
+                immediate->high == 0;
+        }
+        switch (opcode) {
+        case Opcode::Neg:
+        case Opcode::Not:
+        case Opcode::Iszero:
+        case Opcode::Fneg:
+        case Opcode::Add:
+        case Opcode::Sub:
+        case Opcode::And:
+        case Opcode::Or:
+        case Opcode::Xor:
+        case Opcode::Shl:
+        case Opcode::ShrS:
+        case Opcode::ShrU:
+        case Opcode::CmpSlt:
+        case Opcode::CmpSgt:
+        case Opcode::CmpUlt:
+        case Opcode::CmpUgt:
+        case Opcode::Fadd:
+        case Opcode::Fsub:
+        case Opcode::Fdiv: return true;
+        case Opcode::Fmul:
+            // -mfix4300 emits a second architectural instruction after the
+            // multiply. Moving only the multiply into a branch delay slot
+            // could skip that separation on the taken edge.
+            return !subtarget_.has_feature(Feature::Fix4300);
+        default: return false;
+        }
+    }
+
+    bool can_fill_delay_slot(const machine::Function& function,
+                             const machine::Instruction& candidate,
+                             const machine::Instruction& terminator,
+                             machine::BlockId predecessor) const {
+        if (!single_delay_slot_instruction(function, candidate) ||
             (terminator.kind != machine::InstructionKind::Branch &&
              terminator.kind !=
                  machine::InstructionKind::ConditionalBranch)) {
@@ -5462,77 +5543,31 @@ private:
                 }
             }
         }
+        return true;
+    }
 
-        const auto allocated = [&](machine::Register value) {
-            if (value.kind != machine::RegisterKind::Virtual ||
-                value.id >= function.virtual_register_classes.size()) {
-                return false;
-            }
-            const auto kind = function.virtual_register_classes[value.id];
-            if (kind == machine::VirtualRegisterClass::Floating) {
-                return assigned_fpr(function, value).has_value();
-            }
-            if (kind != machine::VirtualRegisterClass::Integer) return false;
-            return assigned_gpr(function, value).has_value();
-        };
-        if (!std::all_of(candidate.defs.begin(), candidate.defs.end(),
-                         allocated) ||
-            !std::all_of(candidate.uses.begin(), candidate.uses.end(),
-                         allocated)) {
+    bool single_fused_compare_instruction(
+        const machine::Function& function,
+        const machine::Instruction& candidate) const {
+        if (!options_.schedule_insns2 ||
+            candidate.kind !=
+                machine::InstructionKind::ConditionalBranch ||
+            candidate.condition_predicate.empty() ||
+            candidate.uses.size() < 2) {
             return false;
         }
-        if (!subtarget_.has_feature(Feature::Mips3) &&
-            std::any_of(candidate.defs.begin(), candidate.defs.end(),
-                        [](machine::Register value) {
-                            return value.mode.bits > 32;
-                        })) {
+        const auto predicate = decode_opcode(
+            candidate.condition_predicate);
+        if (predicate < Opcode::CmpSlt ||
+            predicate > Opcode::CmpUge) {
             return false;
         }
-
-        // Only admit Machine IR operations whose allocated form is exactly
-        // one architectural instruction.  The delay-slot emitter can then
-        // move it as a unit without parsing assembly text or splitting a
-        // legalization sequence.
-        const auto opcode = decode_opcode(candidate.opcode);
-        if (opcode == Opcode::Expect || opcode == Opcode::Reinterpret) {
-            return candidate.uses.size() == 1 &&
-                !same_physical_assignment(function, candidate.defs.front(),
-                                          candidate.uses.front());
-        }
-        if (opcode == Opcode::Constant && candidate.operands.size() == 1) {
-            const auto* immediate =
-                std::get_if<machine::ImmediateOperand>(
-                    &candidate.operands.front());
-            return immediate && immediate->value == 0 &&
-                immediate->high == 0;
-        }
-        switch (opcode) {
-        case Opcode::Neg:
-        case Opcode::Not:
-        case Opcode::Iszero:
-        case Opcode::Fneg:
-        case Opcode::Add:
-        case Opcode::Sub:
-        case Opcode::And:
-        case Opcode::Or:
-        case Opcode::Xor:
-        case Opcode::Shl:
-        case Opcode::ShrS:
-        case Opcode::ShrU:
-        case Opcode::CmpSlt:
-        case Opcode::CmpSgt:
-        case Opcode::CmpUlt:
-        case Opcode::CmpUgt:
-        case Opcode::Fadd:
-        case Opcode::Fsub:
-        case Opcode::Fdiv: return true;
-        case Opcode::Fmul:
-            // -mfix4300 emits a second architectural instruction after the
-            // multiply. Moving only the multiply into a branch delay slot
-            // could skip that separation on the taken edge.
-            return !subtarget_.has_feature(Feature::Fix4300);
-        default: return false;
-        }
+        const unsigned register_bits =
+            subtarget_.has_feature(Feature::Mips3) ? 64U : 32U;
+        return candidate.uses[0].mode.bits <= register_bits &&
+            candidate.uses[1].mode.bits <= register_bits &&
+            assigned_gpr(function, candidate.uses[0]).has_value() &&
+            assigned_gpr(function, candidate.uses[1]).has_value();
     }
 
     std::optional<std::pair<std::size_t, std::size_t>> delay_slot_plan(
@@ -5609,6 +5644,105 @@ private:
         return std::nullopt;
     }
 
+    void plan_successor_delay_slots(const machine::Function& function) {
+        edge_delay_entries_.clear();
+        successor_delay_entries_.clear();
+        if (!options_.schedule_insns2) return;
+
+        const auto no_output_prefix = [](const machine::Instruction& value) {
+            if (value.kind != machine::InstructionKind::Target) return false;
+            const auto opcode = decode_opcode(value.opcode);
+            return opcode == Opcode::Phi ||
+                opcode == Opcode::LifetimeStart ||
+                opcode == Opcode::LifetimeEnd ||
+                opcode == Opcode::IntrinsicNoop;
+        };
+        const auto plan_edge = [&](const machine::Block& source,
+                                   machine::BlockId target) {
+            if (target == source.id ||
+                layout_successor(function, source.id) == target ||
+                edge_has_phi_copies(function, source.id, target)) {
+                return;
+            }
+            const auto successor = std::find_if(
+                function.blocks.begin(), function.blocks.end(),
+                [&](const machine::Block& block) {
+                    return block.id == target;
+                });
+            if (successor == function.blocks.end()) return;
+
+            std::optional<std::size_t> candidate_index;
+            bool fused_compare = false;
+            for (std::size_t index = 0;
+                 index < successor->instructions.size(); ++index) {
+                const auto& candidate = successor->instructions[index];
+                if (no_output_prefix(candidate)) continue;
+                if (single_delay_slot_instruction(function, candidate)) {
+                    candidate_index = index;
+                } else if (single_fused_compare_instruction(
+                               function, candidate)) {
+                    candidate_index = index;
+                    fused_compare = true;
+                }
+                break;
+            }
+            if (!candidate_index) return;
+            if (const auto successor_plan =
+                    delay_slot_plan(function, *successor);
+                successor_plan &&
+                successor_plan->first == *candidate_index) {
+                return;
+            }
+
+            auto entry = successor_delay_entries_.find(target.value);
+            if (entry == successor_delay_entries_.end()) {
+                SuccessorDelayEntry planned{
+                    target, *candidate_index, local_label(function),
+                    fused_compare};
+                entry = successor_delay_entries_
+                            .emplace(target.value, std::move(planned))
+                            .first;
+            }
+            edge_delay_entries_.emplace(source.id.value, entry->second);
+        };
+        for (const auto& source : function.blocks) {
+            if (source.instructions.empty()) continue;
+            const auto& branch = source.instructions.back();
+            if (branch.kind == machine::InstructionKind::Branch) {
+                if (branch.operands.size() != 1 ||
+                    delay_slot_plan(function, source)) {
+                    continue;
+                }
+                const auto* target = std::get_if<machine::BlockOperand>(
+                    &branch.operands.front());
+                if (target) plan_edge(source, target->target);
+                continue;
+            }
+            if (branch.kind !=
+                    machine::InstructionKind::ConditionalBranch ||
+                branch.operands.size() < 3) {
+                continue;
+            }
+            const auto* yes = std::get_if<machine::BlockOperand>(
+                &branch.operands[1]);
+            const auto* no = std::get_if<machine::BlockOperand>(
+                &branch.operands[2]);
+            if (!yes || !no ||
+                edge_has_phi_copies(function, source.id, yes->target) ||
+                edge_has_phi_copies(function, source.id, no->target)) {
+                continue;
+            }
+            const auto next = layout_successor(function, source.id);
+            if (next != yes->target && next != no->target) {
+                // Both conditional encodings emit the false edge as a
+                // secondary unconditional branch when neither destination
+                // is the layout successor. Its otherwise-empty delay slot
+                // can execute the false successor's first operation.
+                plan_edge(source, no->target);
+            }
+        }
+    }
+
     // Instruction and control-flow emission are defined in the following
     // section; ABI transport is intentionally complete before target opcode
     // selection so o32 never depends on LLVM's calling-convention lowering.
@@ -5630,10 +5764,18 @@ private:
     void emit_select_group(
         const machine::Function& function,
         std::span<const machine::Instruction> values);
+    bool emit_fused_order_compare(
+        const machine::Function& function,
+        const machine::Instruction& branch);
+    void emit_successor_delay_branch(
+        const machine::Function& function,
+        machine::BlockId predecessor,
+        machine::BlockId successor);
     void emit_terminator(const machine::Function& function,
                           const machine::Instruction& value,
                           machine::BlockId predecessor,
-                          const machine::Instruction* delay = nullptr);
+                          const machine::Instruction* delay = nullptr,
+                          std::string_view resume_after_compare = {});
     void emit_function(machine::Function& function);
 
     machine::Module& module_;
@@ -5655,6 +5797,10 @@ private:
     unsigned hilo_write_barrier_{};
     bool fpu_multiply_pending_{};
     std::string epilogue_label_;
+    std::unordered_map<std::uint32_t, SuccessorDelayEntry>
+        edge_delay_entries_;
+    std::unordered_map<std::uint32_t, SuccessorDelayEntry>
+        successor_delay_entries_;
 };
 
 void AssemblyEmitter::emit_integer_pair_binary(
@@ -7248,11 +7394,69 @@ void AssemblyEmitter::emit_select_group(
     output_ << done << ":\n";
 }
 
+bool AssemblyEmitter::emit_fused_order_compare(
+    const machine::Function& function,
+    const machine::Instruction& branch) {
+    if (branch.condition_predicate.empty() || branch.uses.size() < 2) {
+        return false;
+    }
+    const auto predicate = decode_opcode(branch.condition_predicate);
+    if (predicate < Opcode::CmpSlt || predicate > Opcode::CmpUge) {
+        return false;
+    }
+    const auto left = input_gpr(
+        function, branch.uses[0], "t0", branch.location);
+    const auto right = input_gpr(
+        function, branch.uses[1], "t1", branch.location);
+    const bool unsigned_compare =
+        predicate >= Opcode::CmpUlt && predicate <= Opcode::CmpUge;
+    const bool swap = predicate == Opcode::CmpSle ||
+        predicate == Opcode::CmpSgt ||
+        predicate == Opcode::CmpUle ||
+        predicate == Opcode::CmpUgt;
+    instruction(unsigned_compare ? "sltu" : "slt",
+                std::string{"$at,"} + reg_name(swap ? right : left) +
+                    "," + reg_name(swap ? left : right));
+    return true;
+}
+
+void AssemblyEmitter::emit_successor_delay_branch(
+    const machine::Function& function,
+    machine::BlockId predecessor,
+    machine::BlockId successor) {
+    const auto planned = edge_delay_entries_.find(predecessor.value);
+    if (planned != edge_delay_entries_.end() &&
+        planned->second.successor == successor) {
+        const auto block = std::find_if(
+            function.blocks.begin(), function.blocks.end(),
+            [&](const machine::Block& candidate) {
+                return candidate.id == successor;
+            });
+        if (block != function.blocks.end() &&
+            planned->second.instruction < block->instructions.size()) {
+            instruction("b", planned->second.resume_label);
+            const auto& candidate =
+                block->instructions[planned->second.instruction];
+            if (planned->second.fused_compare) {
+                if (!emit_fused_order_compare(function, candidate)) {
+                    instruction("nop");
+                }
+            } else {
+                emit_target(function, candidate);
+            }
+            return;
+        }
+    }
+    instruction("b", block_label(function, successor));
+    instruction("nop");
+}
+
 void AssemblyEmitter::emit_terminator(
     const machine::Function& function,
     const machine::Instruction& value,
     machine::BlockId predecessor,
-    const machine::Instruction* delay) {
+    const machine::Instruction* delay,
+    std::string_view resume_after_compare) {
     const auto emit_delay = [&] {
         if (delay) emit_target(function, *delay);
         else instruction("nop");
@@ -7269,8 +7473,13 @@ void AssemblyEmitter::emit_terminator(
             std::get<machine::BlockOperand>(value.operands.front()).target;
         emit_phi_edge_copies(function, predecessor, successor);
         if (layout_successor(function, predecessor) != successor) {
-            instruction("b", block_label(function, successor));
-            emit_delay();
+            if (delay) {
+                instruction("b", block_label(function, successor));
+                emit_target(function, *delay);
+            } else {
+                emit_successor_delay_branch(
+                    function, predecessor, successor);
+            }
         } else if (delay) {
             emit_target(function, *delay);
         }
@@ -7311,11 +7520,12 @@ void AssemblyEmitter::emit_terminator(
                     (predicate >= Opcode::CmpEq &&
                      predicate <= Opcode::CmpUge)) {
                     if (value.uses.empty()) return false;
-                    const auto left = input_gpr(
-                        function, value.uses[0], "t0", value.location);
                     if (predicate == Opcode::Iszero ||
                         predicate == Opcode::CmpEq ||
                         predicate == Opcode::CmpNe) {
+                        const auto left = input_gpr(
+                            function, value.uses[0], "t0",
+                            value.location);
                         const auto right = predicate == Opcode::Iszero
                             ? std::string_view{"zero"}
                             : value.uses.size() >= 2
@@ -7335,24 +7545,17 @@ void AssemblyEmitter::emit_terminator(
                         return true;
                     }
                     if (value.uses.size() < 2) return false;
-                    const auto right = input_gpr(
-                        function, value.uses[1], "t1", value.location);
-                    const bool unsigned_compare =
-                        predicate >= Opcode::CmpUlt &&
-                        predicate <= Opcode::CmpUge;
-                    const bool swap = predicate == Opcode::CmpSle ||
-                        predicate == Opcode::CmpSgt ||
-                        predicate == Opcode::CmpUle ||
-                        predicate == Opcode::CmpUgt;
                     const bool truth_on_nonzero =
                         predicate == Opcode::CmpSlt ||
                         predicate == Opcode::CmpSgt ||
                         predicate == Opcode::CmpUlt ||
                         predicate == Opcode::CmpUgt;
-                    instruction(unsigned_compare ? "sltu" : "slt",
-                                std::string{"$at,"} +
-                                    reg_name(swap ? right : left) + "," +
-                                    reg_name(swap ? left : right));
+                    if (!emit_fused_order_compare(function, value)) {
+                        return false;
+                    }
+                    if (!resume_after_compare.empty()) {
+                        output_ << resume_after_compare << ":\n";
+                    }
                     auto branch = branch_on_truth == truth_on_nonzero
                         ? std::string{"bne"} : std::string{"beq"};
                     if (copy) branch += 'l';
@@ -7441,8 +7644,7 @@ void AssemblyEmitter::emit_terminator(
                                        "malformed fused MIPS comparison branch");
                     return;
                 }
-                instruction("b", block_label(function, no));
-                instruction("nop");
+                emit_successor_delay_branch(function, predecessor, no);
                 return;
             }
             if (options_.schedule_insns2 &&
@@ -7539,8 +7741,7 @@ void AssemblyEmitter::emit_terminator(
             instruction("bne", reg_name(condition_gpr) + ",$zero," +
                                    block_label(function, yes));
             emit_delay();
-            instruction("b", block_label(function, no));
-            instruction("nop");
+            emit_successor_delay_branch(function, predecessor, no);
             return;
         }
         // A branch-likely executes its delay slot only on the taken edge.
@@ -7763,6 +7964,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     emit_parameter_homes(function);
     epilogue_label_ = ".Lcross.mips." +
                       std::to_string(function.source.value) + ".return";
+    plan_successor_delay_slots(function);
 
     for (const auto block_id : function.layout) {
         const auto found = std::find_if(
@@ -7813,6 +8015,13 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                     }
                 }
                 emit_target(function, value);
+                const auto successor_delay =
+                    successor_delay_entries_.find(found->id.value);
+                if (successor_delay != successor_delay_entries_.end() &&
+                    successor_delay->second.instruction == index &&
+                    !successor_delay->second.fused_compare) {
+                    output_ << successor_delay->second.resume_label << ":\n";
+                }
             } else if (value.kind == machine::InstructionKind::Call) {
                 if (index + 1 < found->instructions.size() &&
                     can_emit_tail_call(function, value,
@@ -7827,7 +8036,17 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 if (delay_plan && index == delay_plan->second) {
                     delay = &found->instructions[delay_plan->first];
                 }
-                emit_terminator(function, value, found->id, delay);
+                std::string_view resume_after_compare;
+                const auto successor_delay =
+                    successor_delay_entries_.find(found->id.value);
+                if (successor_delay != successor_delay_entries_.end() &&
+                    successor_delay->second.instruction == index &&
+                    successor_delay->second.fused_compare) {
+                    resume_after_compare =
+                        successor_delay->second.resume_label;
+                }
+                emit_terminator(function, value, found->id, delay,
+                                resume_after_compare);
             }
         }
     }

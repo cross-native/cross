@@ -194,6 +194,39 @@ if(NOT empty_delay MATCHES "[	 ]b(eq|ne)[^\n]*\n[	 ]+nop")
 endif()
 
 function_body("${OUTPUT}.enabled.s"
+              mips_successor_delay scheduled_successor)
+function_body("${OUTPUT}.no_delay.s"
+              mips_successor_delay empty_successor)
+if(NOT scheduled_successor MATCHES
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+\n[\t ]+xori[\t ]" OR
+   NOT scheduled_successor MATCHES
+       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+:\n[\t ]+addiu[\t ]" OR
+   NOT empty_successor MATCHES
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]bb[.][0-9]+\n[\t ]+nop")
+    message(FATAL_ERROR
+        "an unconditional edge did not execute a safe successor operation "
+        "in its delay slot or -fno-schedule-insns2 was ignored\n"
+        "scheduled:\n${scheduled_successor}\ndisabled:\n${empty_successor}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_reassociation_pressure scheduled_successor_compare)
+function_body("${OUTPUT}.no_delay.s"
+              mips_reassociation_pressure empty_successor_compare)
+if(NOT scheduled_successor_compare MATCHES
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+\n[\t ]+sltu[\t ]" OR
+   NOT scheduled_successor_compare MATCHES
+       "[\t ]sltu[^\n]*\n\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)[\t ]" OR
+   NOT empty_successor_compare MATCHES
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]bb[.][0-9]+\n[\t ]+nop")
+    message(FATAL_ERROR
+        "a fused successor comparison did not fill an unconditional edge "
+        "delay slot or -fno-schedule-insns2 was ignored\n"
+        "scheduled:\n${scheduled_successor_compare}\n"
+        "disabled:\n${empty_successor_compare}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
               mips_fp_latency_schedule scheduled_fp)
 function_body("${OUTPUT}.no_schedule.s"
               mips_fp_latency_schedule serial_fp)
