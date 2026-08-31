@@ -60,7 +60,7 @@ int main() {
                     !o0->fast_math && !o0->finite_math_only &&
                     o0->signed_zeros &&
                     !o0->machine_combine && !o0->machine_cse &&
-                    !o0->tree_slsr &&
+                    !o0->tree_slsr && !o0->tree_loop_rotate &&
                     !o0->expensive_optimizations &&
                     !o0->register_allocation &&
                     o0->inline_unit_limit == 96,
@@ -80,7 +80,8 @@ int main() {
                     o2->tree_dce && o2->tree_dse && o2->tree_fre &&
                     o2->tree_tail_merge &&
                     o2->inline_functions && o2->tree_bit_ccp &&
-                    o2->tree_reassoc && o2->tree_slsr && o2->ipa_ra &&
+                    o2->tree_reassoc && o2->tree_slsr &&
+                    o2->tree_loop_rotate && o2->ipa_ra &&
                     o2->ipa_pure_const &&
                     o2->private_abi && !o2->ipa_cp_clone &&
                     o2->inline_unit_limit == 96 &&
@@ -97,7 +98,7 @@ int main() {
         {"cc", "-fno-inline", "-fno-tree-dce", "-O3",
          "-fno-tree-dse", "-fno-tree-tail-merge", "-fno-ipa-ra",
          "-fno-ipa-pure-const", "-fno-tree-reassoc",
-         "-fno-tree-slsr",
+         "-fno-tree-slsr", "-fno-tree-loop-rotate",
          "-fno-expensive-optimizations"});
     ok = expect(o3_override && o3_override->tree_ccp &&
                     o3_override->tree_bit_ccp &&
@@ -109,6 +110,7 @@ int main() {
                     !o3_override->ipa_pure_const &&
                     !o3_override->tree_reassoc &&
                     !o3_override->tree_slsr &&
+                    !o3_override->tree_loop_rotate &&
                     o3_override->private_abi &&
                     o3_override->ipa_cp_clone &&
                     !o3_override->expensive_optimizations,
@@ -140,7 +142,7 @@ int main() {
          "-fno-tree-bit-ccp", "-finline-limit=17", "-fmachine-cse",
          "-fregister-allocation", "-fccp-rounds=4",
          "-funroll-factor=3", "-ftree-reassoc",
-         "-fexpensive-optimizations"});
+         "-ftree-loop-rotate", "-fexpensive-optimizations"});
     ok = expect(explicit_o0 && explicit_o0->inline_functions &&
                     explicit_o0->tree_ccp &&
                     !explicit_o0->tree_bit_ccp &&
@@ -148,6 +150,7 @@ int main() {
                     explicit_o0->machine_cse &&
                     explicit_o0->register_allocation &&
                     explicit_o0->tree_reassoc &&
+                    explicit_o0->tree_loop_rotate &&
                     explicit_o0->expensive_optimizations &&
                     !explicit_o0->tree_fre &&
                     explicit_o0->ccp_rounds == 4 &&

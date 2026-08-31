@@ -42,6 +42,7 @@ std::string_view pass_name(PassId pass) {
     case PassId::RecurrenceRebalancing: return "recurrence-rebalancing";
     case PassId::StraightLineStrengthReduction:
         return "straight-line-strength-reduction";
+    case PassId::LoopRotation: return "loop-rotation";
     case PassId::SlpVectorization: return "slp-vectorization";
     case PassId::FloatingSimplification: return "floating-simplification";
     case PassId::DeadCodeElimination: return "dead-code-elimination";

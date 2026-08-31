@@ -67,6 +67,7 @@ class Configuration:
     output_dir: Path
     tools: Tools
     levels: tuple[str, ...]
+    cross_extra_flags: tuple[str, ...]
     samples: int
     timeout_seconds: int
     revision: str
@@ -922,6 +923,7 @@ async def build_unit(
                 config.tools.cross_cc,
                 "-c",
                 *cross_flags(level),
+                *config.cross_extra_flags,
                 source,
                 "-o",
                 object_path,
@@ -935,6 +937,7 @@ async def build_unit(
                 config.tools.cross_cc,
                 emit,
                 *cross_flags(level),
+                *config.cross_extra_flags,
                 source,
                 "-o",
                 gimple,
@@ -991,6 +994,7 @@ async def build_unit(
                 config.tools.cross_cc,
                 "-emit-llvm",
                 *cross_flags(level),
+                *config.cross_extra_flags,
                 source,
                 "-o",
                 input_ir,
@@ -1063,6 +1067,7 @@ async def probe_llc(config: Configuration) -> tuple[bool, str]:
             config.tools.cross_cc,
             "-emit-llvm",
             *cross_flags("O3"),
+            *config.cross_extra_flags,
             source,
             "-o",
             input_ir,
@@ -1771,25 +1776,35 @@ def generate_report(
         "# MIPS III/o32 code-generation comparison",
         "",
         f"Revision: `{config.revision}`  ",
-        "Target: VR4300 / MIPS III / big-endian o32  ",
-        (
-            "Runtime metric: median QEMU `-icount` CP0 Count ticks; lower is "
-            "better. This is a deterministic dynamic-execution proxy, not a "
-            "VR4300 hardware-cycle claim."
-        ),
-        "",
-        "## Pipelines",
-        "",
     ]
-    if pipelines:
-        lines[6:6] = [
+    if config.cross_extra_flags:
+        lines.append(
+            "Additional Cross flags: `"
+            + " ".join(config.cross_extra_flags)
+            + "`  "
+        )
+    lines.extend(
+        (
+            "Target: VR4300 / MIPS III / big-endian o32  ",
             (
-                "Pipeline metric: isolated QEMU hot-block paths weighted by "
-                f"LLVM-MCA generic `mips3` TotalCycles/{config.mca_iterations} "
-                "iterations; lower is better."
+                "Runtime metric: median QEMU `-icount` CP0 Count ticks; lower is "
+                "better. This is a deterministic dynamic-execution proxy, not a "
+                "VR4300 hardware-cycle claim."
             ),
-            "",
-        ]
+        )
+    )
+    if pipelines:
+        lines.extend(
+            (
+                "",
+                (
+                    "Pipeline metric: isolated QEMU hot-block paths weighted by "
+                    f"LLVM-MCA generic `mips3` TotalCycles/{config.mca_iterations} "
+                    "iterations; lower is better."
+                ),
+            )
+        )
+    lines.extend(("", "## Pipelines", ""))
     for compiler in compilers:
         lines.append(f"- `{compiler}`: {PIPELINES[compiler]}.")
     lines.extend(
@@ -2117,6 +2132,12 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--qemu-hotblocks-plugin", type=Path)
     parser.add_argument("--mca-iterations", type=int, default=100)
     parser.add_argument("--levels", default="O3,Oz")
+    parser.add_argument(
+        "--cross-flag",
+        action="append",
+        default=[],
+        help="append one flag to every Cross frontend invocation; repeatable",
+    )
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--output", type=Path)
@@ -2204,6 +2225,7 @@ async def configuration_from_arguments(
         output_dir=output_dir,
         tools=tools,
         levels=levels,
+        cross_extra_flags=tuple(arguments.cross_flag),
         samples=arguments.samples,
         timeout_seconds=arguments.timeout_seconds,
         revision=revision,
@@ -2299,6 +2321,7 @@ async def async_main(argv: Sequence[str]) -> int:
                 "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "revision": config.revision,
                 "levels": config.levels,
+                "cross_extra_flags": config.cross_extra_flags,
                 "samples": config.samples,
                 "pipeline_timing": {
                     "enabled": config.pipeline_timing,

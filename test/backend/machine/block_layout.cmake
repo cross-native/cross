@@ -10,6 +10,7 @@ endforeach()
 execute_process(
     COMMAND "${CC}" -S -O2 -fno-tree-loop-vectorize
             -fno-unroll-loops -fno-if-conversion -fno-eval-calls
+            -fno-tree-loop-rotate
             -target x86_64-unknown-linux-gnu "${SOURCE}"
             -o "${OUTPUT}.s"
     RESULT_VARIABLE assembly_status
@@ -78,6 +79,7 @@ endif()
 
 execute_process(
     COMMAND "${CC}" -S -O3 -fno-eval-calls
+            -fno-tree-loop-rotate
             -target x86_64-unknown-linux-gnu "${SOURCE}"
             -o "${OUTPUT}.O3.s"
     RESULT_VARIABLE o3_status

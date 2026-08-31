@@ -347,6 +347,9 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.tree-slsr", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "replace profitable unsigned constant multiplies with shifts and adds"},
+        {"f.tree-loop-rotate", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "rotate legal guarded loops to a bottom continuation test"},
         {"f.tree-loop-vectorize", {}, OptionValueKind::Boolean, false, {},
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Partial,
@@ -710,6 +713,8 @@ bool resolve_registered_options(
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");
     options.tree_reassoc = resolved_bool(options, "f.tree-reassoc");
     options.tree_slsr = resolved_bool(options, "f.tree-slsr");
+    options.tree_loop_rotate =
+        resolved_bool(options, "f.tree-loop-rotate");
     options.tree_loop_vectorize =
         resolved_bool(options, "f.tree-loop-vectorize");
     options.tree_early_exit_vectorize =

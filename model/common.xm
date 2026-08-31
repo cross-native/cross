@@ -22,6 +22,7 @@ optimization "O0" {
     f.unroll-loops = false;
     f.tree-reassoc = false;
     f.tree-slsr = false;
+    f.tree-loop-rotate = false;
     f.tree-loop-vectorize = false;
     f.tree-early-exit-vectorize = false;
     f.tree-slp-vectorize = false;
@@ -108,6 +109,7 @@ optimization "O2" {
     f.unroll-loops = true;
     f.tree-reassoc = true;
     f.tree-slsr = true;
+    f.tree-loop-rotate = true;
     f.vector-combine = true;
     f.machine-cse = true;
     f.machine-load-cse = true;
@@ -137,6 +139,7 @@ optimization "O3" {
 optimization "Os" {
     inherits = "O2";
     f.optimize-for = "size";
+    f.tree-loop-rotate = false;
     f.if-conversion-limit = 5;
     f.inline-limit = 24;
     f.unroll-loops = false;

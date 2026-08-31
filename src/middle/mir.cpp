@@ -13444,6 +13444,31 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                                : PassResult::unchanged();
             });
     }
+    // Keep canonical top-tested loops available to vectorization, unrolling,
+    // LICM, and induction selection. Rotate only their surviving scalar CFGs
+    // late, when a bottom test removes the repeated header transfer without
+    // hiding those higher-level loop shapes.
+    if (options.tree_loop_rotate) {
+        pipeline.add(
+            PassId::LoopRotation,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                const bool changed = rotate_guarded_loops(function);
+                if (changed) {
+                    // Rotation clones the continuation predicate after the
+                    // ordinary scalar simplification rounds. Re-canonicalize
+                    // boolean cast/compare chains so machine compare-branch
+                    // fusion sees the same direct predicate at both tests.
+                    if (options.tree_ccp) {
+                        simplify_integer_operations(function, hir_module);
+                    }
+                    if (options.tree_copy_prop) {
+                        propagate_trivial_copies(function);
+                    }
+                }
+                return changed ? PassResult::changed_cfg()
+                               : PassResult::unchanged();
+            });
+    }
     if (options.fast_math || options.finite_math_only ||
         !options.signed_zeros) {
         pipeline.add(

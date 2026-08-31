@@ -18,6 +18,11 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 [[nodiscard]] bool eliminate_forwarding_blocks(ManagedFunction& function);
 [[nodiscard]] bool factor_common_phi_tails(
     ManagedFunction& function, const hir::Module& hir_module);
+// Convert a legal outermost top-tested natural loop into an initial zero-trip
+// guard and a bottom-tested loop. The transform repairs value SSA and effect
+// SSA and deliberately rejects secondary exits, multiple latches, and
+// addressable blocks rather than weakening those invariants.
+[[nodiscard]] bool rotate_guarded_loops(ManagedFunction& function);
 
 // Keep canonical dense value IDs after a transformation removes definitions.
 // The helper rewrites every value-bearing MIR edge, including effect owners,

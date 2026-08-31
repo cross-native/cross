@@ -35,6 +35,7 @@ enum class PassId : std::uint8_t {
     LoopUnrolling,
     RecurrenceRebalancing,
     StraightLineStrengthReduction,
+    LoopRotation,
     SlpVectorization,
     FloatingSimplification,
     DeadCodeElimination,

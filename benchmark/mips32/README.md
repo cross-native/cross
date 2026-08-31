@@ -54,6 +54,15 @@ For a shorter validation run:
 python trunk/benchmark/mips32/run.py --levels O3 --samples 3 --run-name quick
 ```
 
+Repeat `--cross-flag` to append independent Cross options to every Cross-based
+pipeline. This is useful for controlled pass ablations without changing a
+model, for example:
+
+```text
+python trunk/benchmark/mips32/run.py --levels O3 --samples 3 \
+  --cross-flag=-fno-tree-loop-rotate --run-name no-rotation
+```
+
 To add the path-weighted LLVM-MCA estimate (the driver auto-discovers QEMU's
 contributed hotblocks plugin beside the emulator when installed):
 

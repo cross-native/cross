@@ -6,6 +6,7 @@
 #include "middle/mir_analysis.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -723,6 +724,438 @@ bool apply_phi_tail_plan(ManagedFunction& function, const PhiTailPlan& plan,
     return true;
 }
 
+bool recorded_use_matches(const ManagedFunction& function,
+                          const ValueUse& use, ValueId from) {
+    if (use.kind == UseKind::Terminator) {
+        return use.block.value < function.blocks.size() &&
+               function.blocks[use.block.value].terminator.value == from;
+    }
+    if (!use.user || use.user->value >= function.values.size()) return false;
+    const auto& user = function.values[use.user->value];
+    switch (use.kind) {
+    case UseKind::Operand:
+        return use.index < user.operands.size() &&
+               user.operands[use.index] == from;
+    case UseKind::CallArgument:
+        return use.index < user.call_arguments.size() &&
+               user.call_arguments[use.index].value == from;
+    case UseKind::PhiIncoming:
+        return use.index < user.incoming.size() &&
+               user.incoming[use.index].value == from;
+    case UseKind::Terminator: break;
+    }
+    return false;
+}
+
+void rewrite_recorded_use(ManagedFunction& function, const ValueUse& use,
+                          ValueId from, ValueId to) {
+    assert(recorded_use_matches(function, use, from));
+    (void)from;
+    if (use.kind == UseKind::Terminator) {
+        function.blocks[use.block.value].terminator.value = to;
+        return;
+    }
+    auto& user = function.values[use.user->value];
+    switch (use.kind) {
+    case UseKind::Operand: user.operands[use.index] = to; return;
+    case UseKind::CallArgument:
+        user.call_arguments[use.index].value = to;
+        return;
+    case UseKind::PhiIncoming: user.incoming[use.index].value = to; return;
+    case UseKind::Terminator: return;
+    }
+}
+
+bool cloneable_rotated_guard_value(const ManagedValue& value) {
+    if (value.effect_input || value.effect_output || value.slot ||
+        value.callee || value.label || value.object || value.patch_sink ||
+        value.is_volatile_access || !value.call_arguments.empty() ||
+        !value.incoming.empty()) {
+        return false;
+    }
+    switch (value.kind) {
+    case ValueKind::Unary:
+    case ValueKind::Binary:
+    case ValueKind::Cast:
+    case ValueKind::Select:
+    case ValueKind::Splat:
+    case ValueKind::ExtractElement:
+    case ValueKind::InsertElement:
+        return true;
+    case ValueKind::Intrinsic:
+        return value.intrinsic == IntrinsicOperation::Expect;
+    default: return false;
+    }
+}
+
+bool rotate_one_guarded_loop(ManagedFunction& function,
+                             const NaturalLoop& loop,
+                             const UseLists& uses) {
+    if (!loop.preheader || loop.latches.size() != 1 ||
+        loop.header.value >= function.blocks.size()) {
+        return false;
+    }
+    const auto header_id = loop.header;
+    const auto preheader_id = *loop.preheader;
+    const auto latch_id = loop.latches.front();
+    if (preheader_id.value >= function.blocks.size() ||
+        latch_id.value >= function.blocks.size() || latch_id == header_id) {
+        return false;
+    }
+
+    const auto header_snapshot = function.blocks[header_id.value];
+    const auto latch_snapshot = function.blocks[latch_id.value];
+    if (header_snapshot.predecessors.size() != 2 ||
+        std::count(header_snapshot.predecessors.begin(),
+                   header_snapshot.predecessors.end(), preheader_id) != 1 ||
+        std::count(header_snapshot.predecessors.begin(),
+                   header_snapshot.predecessors.end(), latch_id) != 1 ||
+        header_snapshot.terminator.kind !=
+            TerminatorKind::ConditionalBranch ||
+        !header_snapshot.terminator.value ||
+        header_snapshot.terminator.successors.size() != 2 ||
+        header_snapshot.terminator.successors[0] ==
+            header_snapshot.terminator.successors[1] ||
+        header_snapshot.terminator.effect != header_snapshot.effect ||
+        latch_snapshot.terminator.kind != TerminatorKind::Branch ||
+        latch_snapshot.terminator.successors.size() != 1 ||
+        latch_snapshot.terminator.successors.front() != header_id) {
+        return false;
+    }
+
+    std::optional<BlockId> body_id;
+    std::optional<BlockId> exit_id;
+    for (const auto successor : header_snapshot.terminator.successors) {
+        if (loop.blocks.contains(successor.value)) body_id = successor;
+        else exit_id = successor;
+    }
+    if (!body_id || !exit_id || *body_id == header_id ||
+        *body_id == latch_id ||
+        *exit_id == preheader_id ||
+        body_id->value >= function.blocks.size() ||
+        exit_id->value >= function.blocks.size()) {
+        return false;
+    }
+    const auto body_snapshot = function.blocks[body_id->value];
+    const auto exit_snapshot = function.blocks[exit_id->value];
+    const auto valid_values = [&](const ManagedBlock& block) {
+        return std::all_of(block.values.begin(), block.values.end(),
+                           [&](ValueId id) {
+                               return id.value < function.values.size();
+                           });
+    };
+    if (!valid_values(header_snapshot) || !valid_values(body_snapshot) ||
+        !valid_values(exit_snapshot) ||
+        header_snapshot.terminator.value->value >= function.values.size() ||
+        body_snapshot.predecessors != std::vector<BlockId>{header_id} ||
+        exit_snapshot.predecessors != std::vector<BlockId>{header_id} ||
+        std::any_of(body_snapshot.values.begin(), body_snapshot.values.end(),
+                    [&](ValueId id) {
+                        return function.values[id.value].kind ==
+                               ValueKind::Phi;
+                    }) ||
+        std::any_of(exit_snapshot.values.begin(), exit_snapshot.values.end(),
+                    [&](ValueId id) {
+                        return function.values[id.value].kind ==
+                               ValueKind::Phi;
+                    })) {
+        return false;
+    }
+
+    // A secondary exit would need a distinct live-out/effect repair. Keep the
+    // first implementation deliberately single-exit so every use outside the
+    // loop is dominated by the one repaired exit block.
+    for (const auto member : loop.blocks) {
+        if (member >= function.blocks.size()) return false;
+        for (const auto successor :
+             function.blocks[member].terminator.successors) {
+            if (loop.blocks.contains(successor.value)) continue;
+            if (member != header_id.value || successor != *exit_id) {
+                return false;
+            }
+        }
+    }
+    if (std::any_of(function.labels.begin(), function.labels.end(),
+                    [&](const ManagedLabel& label) {
+                        return loop.blocks.contains(label.block.value) ||
+                               label.block == *exit_id;
+                    })) {
+        return false;
+    }
+
+    if (header_snapshot.effect.value >= function.effects.size() ||
+        body_snapshot.effect.value >= function.effects.size() ||
+        exit_snapshot.effect.value >= function.effects.size()) {
+        return false;
+    }
+    const auto& header_effect =
+        function.effects[header_snapshot.effect.value];
+    const auto& body_effect = function.effects[body_snapshot.effect.value];
+    const auto& exit_effect = function.effects[exit_snapshot.effect.value];
+    if (header_effect.kind != EffectKind::Phi ||
+        body_effect.kind != EffectKind::Phi ||
+        exit_effect.kind != EffectKind::Phi ||
+        std::any_of(header_snapshot.values.begin(),
+                    header_snapshot.values.end(), [&](ValueId id) {
+                        const auto& value = function.values[id.value];
+                        return value.effect_input || value.effect_output;
+                    })) {
+        return false;
+    }
+
+    struct StatePhi {
+        ValueId header;
+        ValueId initial;
+        ValueId carried;
+        ValueId body;
+        ValueId exit;
+        hir::TypeId type;
+        SourceLocation location;
+    };
+    std::vector<StatePhi> states;
+    std::unordered_map<std::uint32_t, std::size_t> state_index;
+    for (const auto id : header_snapshot.values) {
+        const auto& value = function.values[id.value];
+        if (value.kind != ValueKind::Phi) continue;
+        if (value.incoming.size() != 2) return false;
+        std::optional<ValueId> initial;
+        std::optional<ValueId> carried;
+        for (const auto& incoming : value.incoming) {
+            if (incoming.value.value >= function.values.size()) return false;
+            if (incoming.predecessor == preheader_id) initial = incoming.value;
+            else if (incoming.predecessor == latch_id) carried = incoming.value;
+        }
+        if (!initial || !carried) return false;
+        state_index.emplace(id.value, states.size());
+        states.push_back({id, *initial, *carried, {}, {}, value.type,
+                          value.location});
+    }
+    if (states.empty()) return false;
+
+    std::vector<std::int8_t> dependency(function.values.size(), -1);
+    const auto depends_on_state = [&](auto&& self, ValueId id) -> bool {
+        if (id.value >= function.values.size()) return true;
+        if (state_index.contains(id.value)) return true;
+        const auto definition = uses.definition_block(id);
+        if (!definition || *definition != header_id) return false;
+        auto& cached = dependency[id.value];
+        if (cached >= 0) return cached != 0;
+        cached = 0;
+        const auto& value = function.values[id.value];
+        for (const auto operand : value.operands) {
+            if (self(self, operand)) {
+                cached = 1;
+                break;
+            }
+        }
+        return cached != 0;
+    };
+    const auto condition_id = *header_snapshot.terminator.value;
+    if (!depends_on_state(depends_on_state, condition_id)) return false;
+
+    // Header-derived values used in the old body were recomputed on every
+    // visit to the header. Leaving such a use dominated by the one-time guard
+    // would be valid SSA but stale semantics, so reject it. Header PHIs are
+    // handled separately below.
+    for (const auto id : header_snapshot.values) {
+        if (state_index.contains(id.value) ||
+            !depends_on_state(depends_on_state, id)) {
+            continue;
+        }
+        if (std::any_of(uses.uses(id).begin(), uses.uses(id).end(),
+                        [&](const ValueUse& use) {
+                            return use.block != header_id;
+                        })) {
+            return false;
+        }
+    }
+    for (const auto& state : states) {
+        const auto definition = uses.definition_block(state.carried);
+        if (definition && *definition == header_id &&
+            !state_index.contains(state.carried.value) &&
+            depends_on_state(depends_on_state, state.carried)) {
+            return false;
+        }
+    }
+
+    std::vector<ValueId> guard_clone_order;
+    std::unordered_set<std::uint32_t> guard_seen;
+    const auto collect_guard = [&](auto&& self, ValueId id) -> bool {
+        if (id.value >= function.values.size()) return false;
+        if (!depends_on_state(depends_on_state, id) ||
+            state_index.contains(id.value)) {
+            return true;
+        }
+        const auto definition = uses.definition_block(id);
+        if (!definition || *definition != header_id ||
+            !cloneable_rotated_guard_value(function.values[id.value])) {
+            return false;
+        }
+        if (!guard_seen.insert(id.value).second) return true;
+        for (const auto operand : function.values[id.value].operands) {
+            if (!self(self, operand)) return false;
+        }
+        guard_clone_order.push_back(id);
+        return true;
+    };
+    if (!collect_guard(collect_guard, condition_id)) return false;
+
+    // Validate the immutable use-list coordinates before allocating any new
+    // values. Appending PHIs cannot invalidate these coordinates, so all
+    // rewrites below are then non-failing and the transform is transactional
+    // for every rejected input.
+    for (const auto& state : states) {
+        for (const auto& use : uses.uses(state.header)) {
+            if (use.block != header_id &&
+                !recorded_use_matches(function, use, state.header)) {
+                return false;
+            }
+        }
+    }
+
+    const BlockId rotated_test_id{
+        static_cast<std::uint32_t>(function.blocks.size())};
+    const auto first_body_phi = function.values.size();
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        states[index].body = ValueId{static_cast<std::uint32_t>(
+            first_body_phi + index)};
+    }
+    const auto first_exit_phi = first_body_phi + states.size();
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        states[index].exit = ValueId{static_cast<std::uint32_t>(
+            first_exit_phi + index)};
+    }
+    const auto map_carried = [&](ValueId value) {
+        const auto found = state_index.find(value.value);
+        return found == state_index.end() ? value
+                                          : states[found->second].body;
+    };
+
+    for (const auto& state : states) {
+        ManagedValue phi;
+        phi.id = state.body;
+        phi.location = state.location;
+        phi.type = state.type;
+        phi.kind = ValueKind::Phi;
+        phi.incoming = {{header_id, state.header},
+                        {rotated_test_id, map_carried(state.carried)}};
+        function.values.push_back(std::move(phi));
+    }
+    for (const auto& state : states) {
+        ManagedValue phi;
+        phi.id = state.exit;
+        phi.location = state.location;
+        phi.type = state.type;
+        phi.kind = ValueKind::Phi;
+        phi.incoming = {{header_id, state.header},
+                        {rotated_test_id, map_carried(state.carried)}};
+        function.values.push_back(std::move(phi));
+    }
+
+    // The use list predates the new PHIs, which is exactly what scoped
+    // replacement needs: initial guard uses remain on the old state, body
+    // uses receive the rotated recurrence, and live-outs receive exit PHIs.
+    for (const auto& state : states) {
+        for (const auto& use : uses.uses(state.header)) {
+            if (use.block == header_id) continue;
+            const auto replacement = loop.blocks.contains(use.block.value)
+                ? state.body
+                : state.exit;
+            rewrite_recorded_use(function, use, state.header, replacement);
+        }
+    }
+
+    std::vector<ValueId> rotated_values;
+    std::unordered_map<std::uint32_t, ValueId> cloned_guard;
+    const auto remap_guard_operand = [&](ValueId operand) {
+        const auto state = state_index.find(operand.value);
+        if (state != state_index.end()) {
+            return map_carried(states[state->second].carried);
+        }
+        const auto clone = cloned_guard.find(operand.value);
+        return clone == cloned_guard.end() ? operand : clone->second;
+    };
+    for (const auto source_id : guard_clone_order) {
+        auto clone = function.values[source_id.value];
+        clone.id = ValueId{
+            static_cast<std::uint32_t>(function.values.size())};
+        for (auto& operand : clone.operands) {
+            operand = remap_guard_operand(operand);
+        }
+        const auto clone_id = clone.id;
+        function.values.push_back(std::move(clone));
+        rotated_values.push_back(clone_id);
+        cloned_guard.emplace(source_id.value, clone_id);
+    }
+    const auto rotated_condition = remap_guard_operand(condition_id);
+
+    auto& mutable_header = function.blocks[header_id.value];
+    std::erase(mutable_header.predecessors, latch_id);
+    for (const auto& state : states) {
+        auto& phi = function.values[state.header.value];
+        std::erase_if(phi.incoming, [&](const PhiIncoming& incoming) {
+            return incoming.predecessor == latch_id;
+        });
+    }
+    auto& mutable_header_effect =
+        function.effects[mutable_header.effect.value];
+    std::erase_if(
+        mutable_header_effect.incoming,
+        [&](const EffectIncoming& incoming) {
+            return incoming.predecessor == latch_id;
+        });
+
+    auto& mutable_latch = function.blocks[latch_id.value];
+    mutable_latch.terminator.successors.front() = rotated_test_id;
+    const auto latch_final_effect = mutable_latch.terminator.effect;
+
+    auto& mutable_body = function.blocks[body_id->value];
+    mutable_body.predecessors.push_back(rotated_test_id);
+    std::vector<ValueId> body_values;
+    body_values.reserve(states.size() + mutable_body.values.size());
+    for (const auto& state : states) body_values.push_back(state.body);
+    body_values.insert(body_values.end(), mutable_body.values.begin(),
+                       mutable_body.values.end());
+    mutable_body.values = std::move(body_values);
+
+    auto& mutable_exit = function.blocks[exit_id->value];
+    mutable_exit.predecessors.push_back(rotated_test_id);
+    std::vector<ValueId> exit_values;
+    exit_values.reserve(states.size() + mutable_exit.values.size());
+    for (const auto& state : states) exit_values.push_back(state.exit);
+    exit_values.insert(exit_values.end(), mutable_exit.values.begin(),
+                       mutable_exit.values.end());
+    mutable_exit.values = std::move(exit_values);
+
+    const EffectId rotated_effect_id{
+        static_cast<std::uint32_t>(function.effects.size())};
+    ManagedEffect rotated_effect;
+    rotated_effect.id = rotated_effect_id;
+    rotated_effect.location = header_snapshot.terminator.location;
+    rotated_effect.kind = EffectKind::Phi;
+    rotated_effect.incoming = {{latch_id, latch_final_effect}};
+    function.effects.push_back(std::move(rotated_effect));
+    function.effects[mutable_body.effect.value].incoming.push_back(
+        {rotated_test_id, rotated_effect_id});
+    function.effects[mutable_exit.effect.value].incoming.push_back(
+        {rotated_test_id, rotated_effect_id});
+
+    ManagedBlock rotated_test;
+    rotated_test.id = rotated_test_id;
+    rotated_test.location = header_snapshot.location;
+    rotated_test.values = std::move(rotated_values);
+    rotated_test.predecessors = {latch_id};
+    rotated_test.effect = rotated_effect_id;
+    rotated_test.terminator = {
+        TerminatorKind::ConditionalBranch,
+        header_snapshot.terminator.location,
+        rotated_condition,
+        header_snapshot.terminator.successors,
+        rotated_effect_id};
+    function.blocks.push_back(std::move(rotated_test));
+    return true;
+}
+
 bool eliminate_one_forwarding_block(ManagedFunction& function) {
     const UseLists uses(function);
     for (const auto& forwarding : function.blocks) {
@@ -996,6 +1429,36 @@ bool factor_common_phi_tails(ManagedFunction& function,
     }
     compact_managed_values(function);
     return true;
+}
+
+bool rotate_guarded_loops(ManagedFunction& function) {
+    bool changed = false;
+    // Each rotation appends one test block and invalidates every CFG-derived
+    // analysis. Rebuild before considering another loop; the original block
+    // count is also a natural progress bound for one invocation.
+    const auto budget = function.blocks.size();
+    for (std::size_t round = 0; round < budget; ++round) {
+        const DominatorTree dominators(function);
+        const LoopForest loops(function, dominators);
+        const UseLists uses(function);
+        bool rotated = false;
+        for (const auto& loop : loops.loops()) {
+            // Rotate the outer control of a loop nest, not each nested
+            // member.  The inner loop's compact header/backedge can already
+            // be laid out as a bottom test by the machine block placer;
+            // cloning its guard merely adds a zero-trip guard and an exit
+            // transfer on delay-slot targets.  A later target cost model can
+            // relax this when duplicating an inner guard is demonstrably
+            // profitable.
+            if (loop.parent) continue;
+            if (!rotate_one_guarded_loop(function, loop, uses)) continue;
+            changed = true;
+            rotated = true;
+            break;
+        }
+        if (!rotated) break;
+    }
+    return changed;
 }
 
 bool eliminate_forwarding_blocks(ManagedFunction& function) {

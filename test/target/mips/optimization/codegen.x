@@ -123,6 +123,22 @@ global u64 mips_reassociation_pressure(in const u64 *data,
 }
 
 [[abi("o32"), noinline]]
+global u32 mips_rotated_outer(in u32 state, in uptr count,
+                              in uptr rounds) {
+    u32 result = state;
+    uptr round = 0;
+    while (round != rounds) {
+        uptr index = 0;
+        while (index != count) {
+            result += index;
+            index += 1;
+        }
+        round += 1;
+    }
+    return result;
+}
+
+[[abi("o32"), noinline]]
 global u64 mips_reassociation_without_unroll(in const u64 *data,
                                               in uptr count) {
     u64 result = 0u64;

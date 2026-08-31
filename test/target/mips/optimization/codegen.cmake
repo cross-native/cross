@@ -61,6 +61,7 @@ compile_variant(enabled)
 compile_variant(no_iv -fno-ivopts)
 compile_variant(no_tail -fno-optimize-sibling-calls)
 compile_variant(no_fusion -fno-compare-branch-fusion)
+compile_variant(no_rotation -fno-tree-loop-rotate)
 compile_variant(grouped_select -fif-conversion-limit=12)
 compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
                 -fno-compare-select-fusion)
@@ -141,6 +142,21 @@ if(NOT separate_compare MATCHES "[	 ]xor[	 ]" OR
    NOT separate_compare MATCHES "[	 ]sltiu[	 ]")
     message(FATAL_ERROR
         "-fno-compare-branch-fusion did not preserve the comparison value\n${separate_compare}")
+endif()
+
+function_body("${OUTPUT}.enabled.s" mips_rotated_outer rotated_outer)
+function_body("${OUTPUT}.no_fusion.s" mips_rotated_outer separate_rotated_compare)
+function_body("${OUTPUT}.no_rotation.s" mips_rotated_outer unrotated_outer)
+if(rotated_outer MATCHES "[\t ]xor[\t ]" OR
+   NOT rotated_outer MATCHES
+       "[\t ]b(eq|ne)[\t ]+\\$[a-z0-9]+,\\$[a-z0-9]+," OR
+   NOT separate_rotated_compare MATCHES "[\t ]xor[\t ]" OR
+   NOT separate_rotated_compare MATCHES "[\t ]sltu[\t ]" OR
+   rotated_outer STREQUAL unrotated_outer)
+    message(FATAL_ERROR
+        "rotated two-PHI edges did not retain direct comparison branches\n"
+        "enabled:\n${rotated_outer}\nno fusion:\n${separate_rotated_compare}\n"
+        "no rotation:\n${unrotated_outer}")
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_delay_branch scheduled_delay)

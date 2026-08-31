@@ -1501,6 +1501,55 @@ private:
 
         std::vector<LiveSet> interference(count);
         std::vector<LiveSet> affinity(count);
+        std::vector<LiveSet> backedge_affinity(count);
+        std::vector<LiveSet> dominators;
+        if (options_.cprop_registers) {
+            LiveSet all_blocks;
+            for (const auto& block : function.blocks) {
+                if (block.id.value < block_count) {
+                    all_blocks.insert(block.id.value);
+                }
+            }
+            dominators.assign(block_count, all_blocks);
+            if (function.entry.value < block_count) {
+                dominators[function.entry.value] = {function.entry.value};
+            }
+            bool dominators_changed = true;
+            while (dominators_changed) {
+                dominators_changed = false;
+                for (const auto& block : function.blocks) {
+                    if (block.id == function.entry ||
+                        block.id.value >= block_count ||
+                        std::any_of(
+                            block.predecessors.begin(),
+                            block.predecessors.end(),
+                            [&](machine::BlockId predecessor) {
+                                return predecessor.value >= block_count;
+                            })) {
+                        continue;
+                    }
+                    LiveSet next;
+                    if (!block.predecessors.empty()) {
+                        next = dominators[
+                            block.predecessors.front().value];
+                        for (std::size_t index = 1;
+                             index < block.predecessors.size(); ++index) {
+                            const auto& other = dominators[
+                                block.predecessors[index].value];
+                            std::erase_if(
+                                next, [&](std::uint32_t candidate) {
+                                    return !other.contains(candidate);
+                                });
+                        }
+                    }
+                    next.insert(block.id.value);
+                    if (next != dominators[block.id.value]) {
+                        dominators[block.id.value] = std::move(next);
+                        dominators_changed = true;
+                    }
+                }
+            }
+        }
         for (const auto& block : function.blocks) {
             if (block.id.value >= block_count) continue;
             auto live = live_out[block.id.value];
@@ -1550,17 +1599,34 @@ private:
                 if (!target) continue;
                 for (std::size_t index = 1;
                      index < instruction.operands.size(); index += 2) {
+                    const auto* predecessor =
+                        std::get_if<machine::BlockOperand>(
+                            &instruction.operands[index - 1]);
                     const auto* incoming =
                         std::get_if<machine::RegisterOperand>(
                             &instruction.operands[index]);
                     if (!incoming) continue;
                     const auto source = virtual_id(incoming->value);
                     if (!source || *source == *target ||
+                        function.virtual_register_classes[*source] !=
+                            function.virtual_register_classes[*target] ||
                         interference[*source].contains(*target)) {
                         continue;
                     }
                     affinity[*target].insert(*source);
                     affinity[*source].insert(*target);
+                    if (options_.cprop_registers && predecessor &&
+                        predecessor->target.value < block_count &&
+                        dominators[predecessor->target.value].contains(
+                            block.id.value)) {
+                        // Reserve a common color for a genuine loop-carried
+                        // edge before unrelated ranges consume it. This is
+                        // especially important for rotated loops, where a
+                        // conditional critical edge cannot emit unconditional
+                        // PHI moves in the latch itself.
+                        backedge_affinity[*target].insert(*source);
+                        backedge_affinity[*source].insert(*target);
+                    }
                 }
             }
         }
@@ -1621,7 +1687,10 @@ private:
 
         bool changed = false;
         for (const auto id : order) {
-            if (!eligible[id]) continue;
+            if (!eligible[id] ||
+                function.virtual_register_assignments[id]) {
+                continue;
+            }
             const auto& colors =
                 function.virtual_register_classes[id] ==
                         machine::VirtualRegisterClass::Floating
@@ -1680,6 +1749,24 @@ private:
             if (selected == preferred.end()) continue;
             function.virtual_register_assignments[id] = *selected;
             changed = true;
+            for (const auto neighbor : backedge_affinity[id]) {
+                if (neighbor >= count || !eligible[neighbor] ||
+                    function.virtual_register_assignments[neighbor] ||
+                    hard_forbidden_colors[neighbor].contains(
+                        selected->value) ||
+                    interference[id].contains(neighbor) ||
+                    std::any_of(
+                        interference[neighbor].begin(),
+                        interference[neighbor].end(),
+                        [&](std::uint32_t other) {
+                            return other < count &&
+                                function.virtual_register_assignments[other] ==
+                                    *selected;
+                        })) {
+                    continue;
+                }
+                function.virtual_register_assignments[neighbor] = *selected;
+            }
         }
         if (!changed) return false;
 
@@ -3000,7 +3087,6 @@ private:
             };
             const bool yes_has_phi = edge_has_phi(terminator.operands[1]);
             const bool no_has_phi = edge_has_phi(terminator.operands[2]);
-            if (yes_has_phi && no_has_phi) continue;
             const auto condition = terminator.uses.front();
             if (condition.kind != machine::RegisterKind::Virtual ||
                 condition.id >= uses.size() || uses[condition.id] != 1) {
@@ -7191,7 +7277,12 @@ void AssemblyEmitter::emit_terminator(
                                                machine::BlockId target,
                                                bool branch_on_truth,
                                                const AssignedPhiCopy* copy =
-                                                   nullptr) {
+                                                   nullptr,
+                                               std::string_view target_label =
+                                                   {}) {
+                const auto destination = target_label.empty()
+                    ? block_label(function, target)
+                    : std::string{target_label};
                 const auto selected_delay = [&] {
                     if (copy) {
                         instruction("move", reg_name(copy->target) + "," +
@@ -7223,7 +7314,7 @@ void AssemblyEmitter::emit_terminator(
                         if (copy) branch += 'l';
                         instruction(branch,
                                     reg_name(left) + "," + reg_name(right) +
-                                        "," + block_label(function, target));
+                                        "," + destination);
                         selected_delay();
                         return true;
                     }
@@ -7251,7 +7342,7 @@ void AssemblyEmitter::emit_terminator(
                     if (copy) branch += 'l';
                     instruction(branch,
                                 "$at,$zero," +
-                                    block_label(function, target));
+                                    destination);
                     selected_delay();
                     return true;
                 }
@@ -7307,8 +7398,7 @@ void AssemblyEmitter::emit_terminator(
                     auto branch = branch_on_truth == truth_on_condition
                         ? std::string{"bc1t"} : std::string{"bc1f"};
                     if (copy) branch += 'l';
-                    instruction(branch,
-                                block_label(function, target));
+                    instruction(branch, destination);
                     selected_delay();
                     return true;
                 }
@@ -7397,8 +7487,20 @@ void AssemblyEmitter::emit_terminator(
                 instruction("nop");
                 return;
             }
-            diagnostics_.error(value.location,
-                               "fused MIPS comparison branch cannot place its PHI edges");
+            const auto yes_edge = local_label(function);
+            if (!emit_fused_branch(yes, true, nullptr, yes_edge)) {
+                diagnostics_.error(
+                    value.location,
+                    "malformed fused MIPS comparison branch");
+                return;
+            }
+            emit_phi_edge_copies(function, predecessor, no);
+            instruction("b", block_label(function, no));
+            instruction("nop");
+            output_ << yes_edge << ":\n";
+            emit_phi_edge_copies(function, predecessor, yes);
+            instruction("b", block_label(function, yes));
+            instruction("nop");
             return;
         }
         if (!yes_copies && !no_copies) {
