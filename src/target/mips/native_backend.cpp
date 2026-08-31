@@ -5263,7 +5263,8 @@ private:
     }
 
     void place_return(const machine::Function& function,
-                      const machine::Instruction& value) {
+                      const machine::Instruction& value,
+                      bool fallthrough_epilogue) {
         emit_copyouts(function, value.location);
         const auto& entity = hir_.function(function.source);
         if (!value.uses.empty()) {
@@ -5315,22 +5316,33 @@ private:
                                 instruction(
                                     "move", reg_name(high->location.reg) +
                                                 ",$zero");
-                                if (frame_size_ == 0) instruction("jr", "$ra");
-                                else instruction("b", epilogue_label_);
-                                if (source.mode.bits == 32) {
-                                    instruction(
-                                        "sll", reg_name(low->location.reg) +
-                                                   "," + reg_name(*assigned) +
-                                                   ",0");
+                                const auto place_low = [&] {
+                                    if (source.mode.bits == 32) {
+                                        instruction(
+                                            "sll",
+                                            reg_name(low->location.reg) +
+                                                "," + reg_name(*assigned) +
+                                                ",0");
+                                    } else {
+                                        const auto mask =
+                                            (std::uint64_t{1}
+                                             << source.mode.bits) - 1U;
+                                        instruction(
+                                            "andi",
+                                            reg_name(low->location.reg) +
+                                                "," + reg_name(*assigned) +
+                                                "," +
+                                                std::to_string(mask));
+                                    }
+                                };
+                                if (frame_size_ == 0) {
+                                    instruction("jr", "$ra");
+                                    place_low();
+                                } else if (!fallthrough_epilogue) {
+                                    instruction("b", epilogue_label_);
+                                    place_low();
                                 } else {
-                                    const auto mask =
-                                        (std::uint64_t{1}
-                                         << source.mode.bits) - 1U;
-                                    instruction(
-                                        "andi", reg_name(low->location.reg) +
-                                                    "," + reg_name(*assigned) +
-                                                    "," +
-                                                    std::to_string(mask));
+                                    place_low();
                                 }
                                 return;
                             }
@@ -5350,7 +5362,8 @@ private:
                             machine::ExtensionKind::None &&
                         place_split_integer_registers(
                             function, source, result.pieces,
-                            type_bits(hir_, entity.result_type), true)) {
+                            type_bits(hir_, entity.result_type),
+                            frame_size_ == 0 || !fallthrough_epilogue)) {
                         return;
                     } else {
                         for (const auto& piece : result.pieces) {
@@ -5393,7 +5406,7 @@ private:
         if (frame_size_ == 0) {
             instruction("jr", "$ra");
             instruction("nop");
-        } else {
+        } else if (!fallthrough_epilogue) {
             instruction("b", epilogue_label_);
             instruction("nop");
         }
@@ -7245,7 +7258,10 @@ void AssemblyEmitter::emit_terminator(
         else instruction("nop");
     };
     if (value.kind == machine::InstructionKind::Return) {
-        place_return(function, value);
+        const bool fallthrough_epilogue = frame_size_ != 0 &&
+            !function.layout.empty() &&
+            function.layout.back() == predecessor;
+        place_return(function, value, fallthrough_epilogue);
         return;
     }
     if (value.kind == machine::InstructionKind::Branch) {

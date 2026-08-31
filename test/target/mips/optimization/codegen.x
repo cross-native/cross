@@ -23,6 +23,21 @@ global i32 mips_tail_wrapper(in i32 value) {
 }
 
 [[abi("o32"), noinline]]
+global i32 mips_shared_epilogue(in i32 value) {
+    i32 left = mips_tail_leaf(value);
+    i32 right = mips_tail_leaf(value + 1);
+    return left + right;
+}
+
+[[abi("o32"), noinline]]
+global i32 mips_multiple_epilogues(in i32 value) {
+    if (value == 0) {
+        return mips_tail_leaf(1) + 1;
+    }
+    return mips_tail_leaf(value) + 2;
+}
+
+[[abi("o32"), noinline]]
 global i32 mips_equal_branch(in i32 left, in i32 right) {
     if (left == right) return left + 1;
     return right - 1;

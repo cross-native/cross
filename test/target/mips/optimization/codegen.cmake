@@ -133,6 +133,27 @@ if(NOT ordinary_call MATCHES "[	 ]jal[	 ]+mips_tail_leaf")
         "-fno-optimize-sibling-calls did not preserve a call\n${ordinary_call}")
 endif()
 
+function_body("${OUTPUT}.enabled.s" mips_shared_epilogue shared_epilogue)
+if(shared_epilogue MATCHES
+       "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9]+[.]return" OR
+   NOT shared_epilogue MATCHES
+       "\\.Lcross[.]mips[.][0-9]+[.]return:\n" OR
+   NOT shared_epilogue MATCHES "[.]cfi_restore")
+    message(FATAL_ERROR
+        "a final return should fall through to its CFI epilogue\n"
+        "${shared_epilogue}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_multiple_epilogues multiple_epilogues)
+string(REGEX MATCHALL
+       "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9]+[.]return"
+       epilogue_branches "${multiple_epilogues}")
+list(LENGTH epilogue_branches epilogue_branch_count)
+if(NOT epilogue_branch_count EQUAL 1)
+    message(FATAL_ERROR
+        "only non-final returns should branch to the shared epilogue\n"
+        "${multiple_epilogues}")
+endif()
+
 function_body("${OUTPUT}.enabled.s" mips_equal_branch fused)
 if(NOT fused MATCHES
    "[	 ]b(eq|ne)[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+," OR
