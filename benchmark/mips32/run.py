@@ -67,6 +67,7 @@ class Configuration:
     output_dir: Path
     tools: Tools
     levels: tuple[str, ...]
+    kernels: tuple[Kernel, ...]
     cross_extra_flags: tuple[str, ...]
     samples: int
     timeout_seconds: int
@@ -301,6 +302,21 @@ def parse_levels(value: str) -> tuple[str, ...]:
             "MIPS benchmark currently accepts O3 and Oz only: " + ", ".join(unknown)
         )
     return tuple(dict.fromkeys(levels))
+
+
+def parse_kernels(value: str) -> tuple[Kernel, ...]:
+    """Parse a stable, duplicate-free subset of benchmark kernels."""
+
+    names = [item.strip() for item in value.split(",")]
+    if not value.strip() or any(not item for item in names):
+        raise BenchmarkError("--kernels requires a non-empty comma-separated list")
+    by_name = {item.name: item for item in KERNELS}
+    unknown = [name for name in names if name not in by_name]
+    if unknown:
+        raise BenchmarkError(
+            "unknown kernel(s): " + ", ".join(dict.fromkeys(unknown))
+        )
+    return tuple(dict.fromkeys(by_name[name] for name in names))
 
 
 def render_template(template: str, replacements: Mapping[str, str]) -> str:
@@ -870,15 +886,19 @@ async def inspect_object(
             path,
         )
     )
-    kernel_sizes = parse_nm_function_sizes(defined.stdout)
+    unit_sizes = parse_nm_function_sizes(defined.stdout)
     expected = {value.name for value in KERNELS if value.unit == unit}
-    if kernel_sizes.keys() != expected:
-        missing = sorted(expected - kernel_sizes.keys())
-        unexpected = sorted(kernel_sizes.keys() - expected)
+    if unit_sizes.keys() != expected:
+        missing = sorted(expected - unit_sizes.keys())
+        unexpected = sorted(unit_sizes.keys() - expected)
         raise BenchmarkError(
             f"{path.name} function-size symbols disagree with {unit}: "
             f"missing={missing}, unexpected={unexpected}"
         )
+    selected = {value.name for value in config.kernels if value.unit == unit}
+    kernel_sizes = {
+        name: size for name, size in unit_sizes.items() if name in selected
+    }
     disassembly = await run_command(
         (config.tools.llvm_objdump, "--disassemble", "--no-show-raw-insn", path)
     )
@@ -1123,7 +1143,7 @@ async def probe_clang(config: Configuration) -> tuple[bool, str]:
 async def build_runner(config: Configuration) -> tuple[Path, Path]:
     """Build the shared o32 benchmark runner and startup objects."""
 
-    declarations, wrappers, runs = runner_fragments("bench_")
+    declarations, wrappers, runs = runner_fragments("bench_", config.kernels)
     source = config.output_dir / "runner.c"
     runner_object = config.output_dir / "runner.o"
     startup_object = config.output_dir / "startup.o"
@@ -1167,7 +1187,7 @@ async def build_pipeline_runners(config: Configuration) -> dict[str, Path]:
     """Build one two-invocation trace harness for each isolated kernel."""
 
     runners: dict[str, Path] = {}
-    for value in KERNELS:
+    for value in config.kernels:
         declarations, wrappers, runs = runner_fragments("bench_", (value,))
         source = config.output_dir / f"pipeline-runner-{value.name}.c"
         runner_object = config.output_dir / f"pipeline-runner-{value.name}.o"
@@ -1197,7 +1217,11 @@ async def build_pipeline_runners(config: Configuration) -> dict[str, Path]:
 
 
 def parse_runtime_output(
-    output: str, compiler: str, level: str, samples: int
+    output: str,
+    compiler: str,
+    level: str,
+    samples: int,
+    kernels: Sequence[Kernel] = KERNELS,
 ) -> list[RuntimeRecord]:
     """Validate UART CSV and reduce samples to per-kernel medians."""
 
@@ -1216,7 +1240,7 @@ def parse_runtime_output(
             )
     except (KeyError, TypeError, ValueError) as error:
         raise BenchmarkError("QEMU emitted an invalid benchmark CSV row") from error
-    expected_names = {value.name for value in KERNELS}
+    expected_names = {value.name for value in kernels}
     if set(grouped) != expected_names:
         missing = sorted(expected_names - set(grouped))
         extra = sorted(set(grouped) - expected_names)
@@ -1224,7 +1248,7 @@ def parse_runtime_output(
             f"QEMU kernel set mismatch; missing={missing}, extra={extra}"
         )
     result: list[RuntimeRecord] = []
-    by_name = {value.name: value for value in KERNELS}
+    by_name = {value.name: value for value in kernels}
     for name, measurements in grouped.items():
         if len(measurements) != samples:
             raise BenchmarkError(
@@ -1433,7 +1457,9 @@ async def run_variant(
             f"stdout:\n{executed.stdout}\nstderr:\n{executed.stderr}"
         )
     return (
-        parse_runtime_output(executed.stdout, compiler, level, config.samples),
+        parse_runtime_output(
+            executed.stdout, compiler, level, config.samples, config.kernels
+        ),
         image_record,
     )
 
@@ -1540,7 +1566,7 @@ async def run_pipeline_metrics(
     for level in config.levels:
         for compiler in compilers:
             print(f"modeling pipeline {compiler}/{level} ...", flush=True)
-            for value in KERNELS:
+            for value in config.kernels:
                 records.append(
                     await measure_pipeline_kernel(
                         config,
@@ -1694,7 +1720,7 @@ def write_csv_files(
         writer.writerow(
             ("compiler", "level", "category", "kernel", "unit", "function_bytes")
         )
-        kernels = {value.name: value for value in KERNELS}
+        kernels = {value.name: value for value in config.kernels}
         for build in builds:
             for name, size in build.kernel_sizes:
                 value = kernels[name]
@@ -1850,7 +1876,7 @@ def generate_report(
                 f"{image.support_load_bytes} |"
             )
         lines.append("")
-        categories = tuple(dict.fromkeys(value.category for value in KERNELS))
+        categories = tuple(dict.fromkeys(value.category for value in config.kernels))
         lines.extend(("### Runtime categories", ""))
         lines.append("| category | " + " | ".join(compilers) + " |")
         lines.append("|---|" + "---:|" * len(compilers))
@@ -1919,7 +1945,7 @@ def generate_report(
                 "| kernel | " + " | ".join(compilers) + " | Cross / fastest peer |"
             )
             lines.append("|---|" + "---:|" * (len(compilers) + 1))
-            for kernel_value in KERNELS:
+            for kernel_value in config.kernels:
                 scores = {
                     compiler: next(
                         value.ticks_per_unit
@@ -1948,7 +1974,7 @@ def generate_report(
                     "| kernel | " + " | ".join(compilers) + " | Cross / fastest peer |"
                 )
                 lines.append("|---|" + "---:|" * (len(compilers) + 1))
-                for kernel_value in KERNELS:
+                for kernel_value in config.kernels:
                     scores = {
                         compiler: next(
                             value.cycles_per_unit
@@ -1984,7 +2010,7 @@ def generate_report(
                 "| kernel | " + " | ".join(compilers) + " | Cross / smallest peer |"
             )
             lines.append("|---|" + "---:|" * (len(compilers) + 1))
-            for kernel_value in KERNELS:
+            for kernel_value in config.kernels:
                 sizes = {
                     compiler: size_rows[(compiler, kernel_value.name)]
                     for compiler in compilers
@@ -2011,6 +2037,7 @@ def generate_report(
             "- Native Cross objects must be strictly standalone. Peer compiler-runtime references are resolved from GCC's target libgcc, named in the report, and charged to linked benchmark size.",
             "- `support/padding` is the final linked benchmark image minus the common harness and measured source-unit objects; it therefore includes extracted runtime members and linker alignment.",
             "- Per-kernel function sizes measure each public symbol. Shared compiler-runtime members cannot be attributed to one function and remain charged only in the whole-image totals.",
+            "- A `--kernels` subset still compiles each containing source unit as a whole. Its runtime, pipeline, and per-function rows are filtered, while whole-image totals also include unselected companion functions from those units.",
             "- All images use the same GCC-built runner, startup, linker scripts, data, and checksums.",
             "- GCC is tuned for `vr4300`; LLVM exposes only generic `mips3` here.",
             "- CP0 Count under QEMU `-icount` is useful for relative dynamic work but does not model VR4300 cache and pipeline timing.",
@@ -2133,6 +2160,11 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--mca-iterations", type=int, default=100)
     parser.add_argument("--levels", default="O3,Oz")
     parser.add_argument(
+        "--kernels",
+        default=",".join(value.name for value in KERNELS),
+        help="comma-separated benchmark kernels to build and run (default: all)",
+    )
+    parser.add_argument(
         "--cross-flag",
         action="append",
         default=[],
@@ -2164,6 +2196,7 @@ async def configuration_from_arguments(
     trunk = source_dir.parents[1]
     revision, revision_directory = await discover_revision(trunk)
     levels = parse_levels(arguments.levels)
+    kernels = parse_kernels(arguments.kernels)
     if arguments.output is not None:
         output_dir = arguments.output.resolve()
     else:
@@ -2225,6 +2258,7 @@ async def configuration_from_arguments(
         output_dir=output_dir,
         tools=tools,
         levels=levels,
+        kernels=kernels,
         cross_extra_flags=tuple(arguments.cross_flag),
         samples=arguments.samples,
         timeout_seconds=arguments.timeout_seconds,
@@ -2256,10 +2290,11 @@ async def async_main(argv: Sequence[str]) -> int:
     print(f"LLVM llc probe: {llc_message}", flush=True)
 
     builds: list[BuildRecord] = []
+    selected_units = tuple(dict.fromkeys(value.unit for value in config.kernels))
     for level in config.levels:
         for compiler in compilers:
             print(f"building {compiler}/{level} ...", flush=True)
-            for unit in UNITS:
+            for unit in selected_units:
                 builds.append(await build_unit(config, compiler, level, unit))
 
     runner_object, startup_object = await build_runner(config)
@@ -2349,7 +2384,7 @@ async def async_main(argv: Sequence[str]) -> int:
                     "sha256": sha256_file(config.libgcc),
                 },
                 "cross_compiler_sha256": sha256_file(config.tools.cross_cc),
-                "kernels": [asdict(value) for value in KERNELS],
+                "kernels": [asdict(value) for value in config.kernels],
             },
             indent=2,
         )

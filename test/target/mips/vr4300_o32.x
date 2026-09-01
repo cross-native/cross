@@ -21,6 +21,21 @@ global u64 mips_widen_u32(in u32 value) {
     return value;
 }
 
+[[abi("o32"), noinline]]
+global f64 mips_u32_to_f64(in u32 value) {
+    return value;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_f32_to_u32(in f32 value) {
+    return value;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_f64_to_u32(in f64 value) {
+    return value;
+}
+
 // The public adapter remains o32, while the private definition uses the
 // optimizer-selected MIPS-III Cross64 contract.  Its fifth u64 argument is
 // transported in t0 as one 64-bit carrier rather than an o32 word pair.

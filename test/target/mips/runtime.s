@@ -51,6 +51,77 @@ _start:
         bne     $v1,$t0,.Lfail
         nop
 
+        # SImode is sign-canonical internally, but an unsigned FPU
+        # conversion must consume the zero-extended mathematical value.
+        addiu   $k0,$zero,'F'
+        lui     $a0,0x8000
+        jal     mips_u32_to_f64
+        nop
+        lui     $t0,%hi(runtime_words)
+        addiu   $t0,$t0,%lo(runtime_words)
+        sdc1    $f0,0($t0)
+        lw      $t2,0($t0)
+        lui     $t1,0x41e0
+        bne     $t2,$t1,.Lfail
+        nop
+        lw      $t2,4($t0)
+        bne     $t2,$zero,.Lfail
+        nop
+
+        # The high-range halving expansion must round an odd integer upward
+        # before doubling.  0xffffffff is exactly representable as f64.
+        addiu   $k0,$zero,'G'
+        addiu   $a0,$zero,-1
+        jal     mips_u32_to_f64
+        nop
+        lui     $t0,%hi(runtime_words)
+        addiu   $t0,$t0,%lo(runtime_words)
+        sdc1    $f0,0($t0)
+        lw      $t2,0($t0)
+        lui     $t1,0x41ef
+        ori     $t1,$t1,0xffff
+        bne     $t2,$t1,.Lfail
+        nop
+        lw      $t2,4($t0)
+        lui     $t1,0xffe0
+        bne     $t2,$t1,.Lfail
+        nop
+
+        # FP32 mode has no legal long-FPR conversion in ordinary execution.
+        # Exercise both sides of the runtime-free split-at-2^31 u32 lowering.
+        addiu   $k0,$zero,'U'
+        lui     $t0,0x42f7             # 123.75f32
+        ori     $t0,$t0,0x8000
+        mtc1    $t0,$f12
+        nop
+        jal     mips_f32_to_u32
+        nop
+        addiu   $t0,$zero,123
+        bne     $v0,$t0,.Lfail
+        nop
+
+        addiu   $k0,$zero,'V'
+        lui     $t0,0x4f7f             # 4294967040.0f32
+        ori     $t0,$t0,0xffff
+        mtc1    $t0,$f12
+        nop
+        jal     mips_f32_to_u32
+        nop
+        addiu   $t0,$zero,-256
+        bne     $v0,$t0,.Lfail
+        nop
+
+        addiu   $k0,$zero,'W'
+        lui     $t0,0x4f00             # +2147483648.0f32
+        mtc1    $t0,$f12
+        nop
+        cvt.d.s $f12,$f12
+        jal     mips_f64_to_u32
+        nop
+        lui     $t0,0x8000
+        bne     $v0,$t0,.Lfail
+        nop
+
         addiu   $k0,$zero,'3'
         lui     $a0,%hi(runtime_words)
         addiu   $a0,$a0,%lo(runtime_words)

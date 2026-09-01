@@ -54,6 +54,18 @@ For a shorter validation run:
 python trunk/benchmark/mips32/run.py --levels O3 --samples 3 --run-name quick
 ```
 
+Restrict runtime, pipeline, and per-function reporting to selected kernels.
+Each source unit containing one of them is still compiled as a whole, so linked
+image totals include companion functions from those units:
+
+```text
+python trunk/benchmark/mips32/run.py --kernels narrow,branch,pointer_chase,pointer_chase_pair \
+  --levels O3 --samples 3 --pipeline-timing --run-name narrow-branch-pointer
+```
+
+Kernel names are comma-separated; unknown or empty names are rejected. The
+default is all kernels.
+
 Repeat `--cross-flag` to append independent Cross options to every Cross-based
 pipeline. This is useful for controlled pass ablations without changing a
 model, for example:

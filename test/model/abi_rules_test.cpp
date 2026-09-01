@@ -44,6 +44,18 @@ bool stack_is(const ArgumentAssignment& value, std::size_t piece,
            value.pieces[piece].location.stack_offset == offset;
 }
 
+bool extension_is(const ArgumentAssignment& value, std::size_t piece,
+                  AbiExtensionKind extension) {
+    return piece < value.pieces.size() &&
+           value.pieces[piece].extension == extension;
+}
+
+bool extension_is(const ReturnAssignment& value, std::size_t piece,
+                  AbiExtensionKind extension) {
+    return piece < value.pieces.size() &&
+           value.pieces[piece].extension == extension;
+}
+
 AbiValue scalar(ScalarMode mode) {
     AbiValue result;
     result.mode = mode;
@@ -125,6 +137,7 @@ bool validate_shipped_abis() {
                  ValueTransport::ByReference};
 
     const auto o32_i32 = scalar(ScalarMode::integer(32));
+    const auto o32_pointer = scalar(ScalarMode::pointer(32));
     const auto o32_f32 = scalar(ScalarMode::floating(32));
     const std::array<std::string, 4> o32_hard{
         "mips3", "hard-float", "fp32", "odd-spreg"};
@@ -132,11 +145,24 @@ bool validate_shipped_abis() {
 
     const auto o32_integer_pair = classify_call_arguments(
         *o32, std::array{o32_i32, i64, o32_i32}, o32_hard);
+    const auto o32_pointer_argument = classify_call_arguments(
+        *o32, std::array{o32_pointer}, o32_hard);
     if (!o32_integer_pair ||
         !register_is(o32_integer_pair.layout.arguments[0], 0, "a0") ||
+        !extension_is(o32_integer_pair.layout.arguments[0], 0,
+                      AbiExtensionKind::Sign) ||
         !register_is(o32_integer_pair.layout.arguments[1], 0, "a2") ||
+        !extension_is(o32_integer_pair.layout.arguments[1], 0,
+                      AbiExtensionKind::Sign) ||
         !register_is(o32_integer_pair.layout.arguments[1], 1, "a3") ||
-        !stack_is(o32_integer_pair.layout.arguments[2], 0, 16)) {
+        !extension_is(o32_integer_pair.layout.arguments[1], 1,
+                      AbiExtensionKind::Sign) ||
+        !stack_is(o32_integer_pair.layout.arguments[2], 0, 16) ||
+        !extension_is(o32_integer_pair.layout.arguments[2], 0,
+                      AbiExtensionKind::None) ||
+        !o32_pointer_argument ||
+        !extension_is(o32_pointer_argument.layout.arguments[0], 0,
+                      AbiExtensionKind::Sign)) {
         return false;
     }
 
@@ -165,11 +191,17 @@ bool validate_shipped_abis() {
     const auto o32_soft_f64_result = classify_return(*o32, f64, o32_soft);
     if (!o32_i64_result ||
         !register_is(o32_i64_result, 0, "v0") ||
+        !extension_is(o32_i64_result, 0, AbiExtensionKind::Sign) ||
         !register_is(o32_i64_result, 1, "v1") ||
+        !extension_is(o32_i64_result, 1, AbiExtensionKind::Sign) ||
         !o32_f64_result || !register_is(o32_f64_result, 0, "f0") ||
         !o32_soft_f64_result ||
         !register_is(o32_soft_f64_result, 0, "v0") ||
-        !register_is(o32_soft_f64_result, 1, "v1")) {
+        !extension_is(o32_soft_f64_result, 0,
+                      AbiExtensionKind::None) ||
+        !register_is(o32_soft_f64_result, 1, "v1") ||
+        !extension_is(o32_soft_f64_result, 1,
+                      AbiExtensionKind::None)) {
         return false;
     }
 

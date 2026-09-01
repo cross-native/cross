@@ -89,9 +89,11 @@ if(NOT go_mangling_status EQUAL 0)
 endif()
 file(READ "${OUTPUT}.go-mangling.s" go_mangling_assembly)
 if(NOT go_mangling_assembly MATCHES "_ZT16composition_echo" OR
-   NOT go_mangling_assembly MATCHES "movl[\t ]+%eax")
+   NOT go_mangling_assembly MATCHES "movl[\t ]+%eax" OR
+   NOT go_mangling_assembly MATCHES
+       "movslq[\t ]+%eax,[\t ]+%rax")
     message(FATAL_ERROR
-        "Go ABI and selected mangler did not compose\n${go_mangling_assembly}")
+        "Go ABI extension and selected mangler did not compose\n${go_mangling_assembly}")
 endif()
 
 execute_process(

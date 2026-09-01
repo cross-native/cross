@@ -157,7 +157,7 @@ endif()
 
 function_body("${OUTPUT}.enabled.s" mips_equal_branch fused)
 if(NOT fused MATCHES
-   "[	 ]b(eq|ne)[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+," OR
+   "[	 ]b(eq|ne)l?[	 ]+\\$[a-z0-9]+,\\$[a-z0-9]+," OR
    fused MATCHES "[	 ]sltiu[	 ]")
     message(FATAL_ERROR "direct comparison branch is missing\n${fused}")
 endif()
@@ -173,7 +173,7 @@ function_body("${OUTPUT}.no_fusion.s" mips_rotated_outer separate_rotated_compar
 function_body("${OUTPUT}.no_rotation.s" mips_rotated_outer unrotated_outer)
 if(rotated_outer MATCHES "[\t ]xor[\t ]" OR
    NOT rotated_outer MATCHES
-       "[\t ]b(eq|ne)[\t ]+\\$[a-z0-9]+,\\$[a-z0-9]+," OR
+       "[\t ]b(eq|ne)l?[\t ]+\\$[a-z0-9]+,\\$[a-z0-9]+," OR
    NOT separate_rotated_compare MATCHES "[\t ]xor[\t ]" OR
    NOT separate_rotated_compare MATCHES "[\t ]sltu[\t ]" OR
    rotated_outer STREQUAL unrotated_outer)
@@ -217,7 +217,7 @@ function_body("${OUTPUT}.no_delay.s"
 if(NOT scheduled_successor_compare MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+\n[\t ]+sltu[\t ]" OR
    NOT scheduled_successor_compare MATCHES
-       "[\t ]sltu[^\n]*\n\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)[\t ]" OR
+       "[\t ]sltu[^\n]*\n\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)z?l?[\t ]" OR
    NOT empty_successor_compare MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]bb[.][0-9]+\n[\t ]+nop")
     message(FATAL_ERROR
@@ -374,13 +374,24 @@ endif()
 
 function_body("${OUTPUT}.enabled.s" mips_affine_exit unit_exit)
 function_body("${OUTPUT}.no_iv.s" mips_affine_exit ordered_exit)
+function_body("${OUTPUT}.no_delay.s" mips_affine_exit unscheduled_exit)
 if(unit_exit MATCHES "[\t ]sltu[\t ]" OR
-   NOT unit_exit MATCHES "[\t ]bne[\t ]" OR
+   NOT unit_exit MATCHES "[\t ]bnel?[\t ]" OR
    NOT ordered_exit MATCHES "[\t ]sltu[\t ]")
     message(FATAL_ERROR
         "MIR unit induction exit selection did not replace unsigned-less "
         "or honor -fno-ivopts\n"
         "selected:\n${unit_exit}\nordinary:\n${ordered_exit}")
+endif()
+if(NOT unit_exit MATCHES
+       "[\t ]bnel[^\n]*\n[\t ]+mult[\t ]" OR
+   NOT unscheduled_exit MATCHES
+       "[\t ]bne[^\n]*\n[\t ]+nop\n" OR
+   unscheduled_exit MATCHES "[\t ]bnel[\t ]")
+    message(FATAL_ERROR
+        "MIPS successor scheduling did not start HI/LO work in an annulled "
+        "taken-edge slot or honor -fno-schedule-insns2\n"
+        "scheduled:\n${unit_exit}\nunscheduled:\n${unscheduled_exit}")
 endif()
 
 function_body("${OUTPUT}.no_licm.s" mips_affine_exit rematerialized_exit)
@@ -395,16 +406,18 @@ if(NOT unit_exit MATCHES "[\t ]li[\t ][^\n]*,1664525" OR
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_narrow_mask narrow_big)
-if(NOT narrow_big MATCHES "[	 ]lwu[	 ][^\n]*,4\\(\\$[a-z0-9]+\\)" OR
+if(NOT narrow_big MATCHES "[	 ]lw[	 ][^\n]*,4\\(\\$[a-z0-9]+\\)" OR
    narrow_big MATCHES "[	 ]ld[	 ]")
     message(FATAL_ERROR
-        "big-endian masked truncation was not narrowed at +4\n${narrow_big}")
+        "big-endian masked truncation was not narrowed to a native "
+        "sign-canonical word at +4\n${narrow_big}")
 endif()
 function_body("${OUTPUT}.little.s" mips_narrow_mask narrow_little)
-if(NOT narrow_little MATCHES "[	 ]lwu[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)" OR
+if(NOT narrow_little MATCHES "[	 ]lw[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)" OR
    narrow_little MATCHES "[	 ]ld[	 ]")
     message(FATAL_ERROR
-        "little-endian masked truncation was not narrowed at +0\n${narrow_little}")
+        "little-endian masked truncation was not narrowed to a native "
+        "sign-canonical word at +0\n${narrow_little}")
 endif()
 function_body("${OUTPUT}.no_bit_ccp.s" mips_narrow_mask wide_load)
 if(NOT wide_load MATCHES "[	 ]ld[	 ][^\n]*,0\\(\\$[a-z0-9]+\\)")
@@ -511,8 +524,14 @@ function_body("${OUTPUT}.no_if_conversion.s"
               mips_range_select range_branch)
 function_body("${OUTPUT}.force_ordinary_if_conversion.s"
               mips_range_select range_forced)
-if(NOT range_default STREQUAL range_branch OR
-   range_default STREQUAL range_forced)
+string(REGEX REPLACE "[.]tmp[.][0-9]+" ".tmp.N"
+       range_default_shape "${range_default}")
+string(REGEX REPLACE "[.]tmp[.][0-9]+" ".tmp.N"
+       range_branch_shape "${range_branch}")
+string(REGEX REPLACE "[.]tmp[.][0-9]+" ".tmp.N"
+       range_forced_shape "${range_forced}")
+if(NOT range_default_shape STREQUAL range_branch_shape OR
+   range_default_shape STREQUAL range_forced_shape)
     message(FATAL_ERROR
         "the MIPS profile did not preserve an ordinary range branch or "
         "honor -fif-conversion-limit\n"

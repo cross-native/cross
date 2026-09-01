@@ -101,6 +101,9 @@ struct ValuePiece {
     // Nonzero only for an indirect piece. It is the number of source-value
     // bits addressed by this pointer channel.
     std::uint16_t indirect_value_bits{};
+    // Defined physical-register bits above carrier_bits. Stack pieces always
+    // use None because memory stores only the carrier itself.
+    AbiExtensionKind extension{AbiExtensionKind::None};
 };
 
 struct ArgumentAssignment {

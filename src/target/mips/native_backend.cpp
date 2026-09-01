@@ -3405,6 +3405,7 @@ private:
         std::size_t instruction{};
         std::string resume_label;
         bool fused_compare{};
+        bool elide_original{};
     };
 
     void raw_instruction(std::string_view opcode,
@@ -4082,15 +4083,68 @@ private:
         }
     }
 
+    void move_gpr_to_fpr(std::string_view source,
+                         std::string_view destination,
+                         unsigned bits) {
+        instruction(bits <= 32 ? "mtc1" : "dmtc1",
+                    reg_name(source) + "," + reg_name(destination));
+    }
+
+    void move_fpr_to_gpr(std::string_view source,
+                         std::string_view destination,
+                         unsigned bits) {
+        instruction(bits <= 32 ? "mfc1" : "dmfc1",
+                    reg_name(destination) + "," + reg_name(source));
+    }
+
+    // MIPS64 word operations define an SImode result by sign-extending bit
+    // 31 regardless of the source-language signedness. Keep all internal
+    // 32-bit values in that hardware-native form; explicit widening still
+    // uses normalize_integer() to apply zero- versus sign-extension semantics.
+    void canonicalize_integer_value(std::string_view reg, unsigned bits,
+                                    bool sign) {
+        if (bits == 32 && subtarget_.has_feature(Feature::Mips3)) {
+            instruction("sll", reg_name(reg) + "," + reg_name(reg) + ",0");
+            return;
+        }
+        normalize_integer(reg, bits, sign);
+    }
+
+    bool abi_supplies_canonical_word(const ValuePiece& piece,
+                                     unsigned bits) const {
+        return bits == 32 && piece.carrier_bits == 32 &&
+            piece.extension == AbiExtensionKind::Sign &&
+            subtarget_.has_feature(Feature::Mips3);
+    }
+
+    bool internal_value_matches_extension(const ValuePiece& piece,
+                                          unsigned bits) const {
+        if (!subtarget_.has_feature(Feature::Mips3) ||
+            piece.extension == AbiExtensionKind::None) {
+            return true;
+        }
+        return bits == 32 && piece.carrier_bits == 32 &&
+            piece.extension == AbiExtensionKind::Sign;
+    }
+
+    void apply_abi_register_extension(std::string_view reg,
+                                      const ValuePiece& piece) {
+        if (!subtarget_.has_feature(Feature::Mips3) ||
+            piece.extension == AbiExtensionKind::None ||
+            piece.carrier_bits >= 64) {
+            return;
+        }
+        normalize_integer(
+            reg, piece.carrier_bits,
+            piece.extension == AbiExtensionKind::Sign);
+    }
+
     void load_integer_memory(std::string_view target,
                              std::string memory_operand, unsigned bits,
                              bool sign) {
         const auto opcode = bits <= 8 ? (sign ? "lb" : "lbu") :
                             bits <= 16 ? (sign ? "lh" : "lhu") :
-                            bits <= 32 && !sign &&
-                                    subtarget_.has_feature(Feature::Mips3)
-                                ? "lwu"
-                            : bits <= 32 ? "lw" : "ld";
+                            bits <= 32 ? "lw" : "ld";
         instruction(opcode, reg_name(target) + "," + memory_operand);
     }
 
@@ -4375,15 +4429,17 @@ private:
                         "MIPS incoming argument register has no frame home");
                     return;
                 }
-                load_integer_memory(gpr, memory(*home->frame_offset),
-                                    piece.carrier_bits, false);
+                load_integer_memory(
+                    gpr, memory(*home->frame_offset), piece.carrier_bits,
+                    piece.extension == AbiExtensionKind::Sign);
             } else {
                 instruction("move", reg_name(gpr) + "," +
                                         reg_name(piece.location.reg));
             }
         } else {
             load_integer_memory(
-                gpr, incoming_memory(piece, abi), piece.carrier_bits, false);
+                gpr, incoming_memory(piece, abi), piece.carrier_bits,
+                piece.extension == AbiExtensionKind::Sign);
         }
     }
 
@@ -4398,7 +4454,10 @@ private:
             pieces.front().value_bits >= value_bits) {
             load_abi_piece(function, pieces.front(), abi, "t0",
                            parameter_entry);
-            normalize_integer("t0", value_bits, sign);
+            if (!abi_supplies_canonical_word(
+                    pieces.front(), value_bits)) {
+                canonicalize_integer_value("t0", value_bits, sign);
+            }
             return;
         }
         instruction("move", "$t0,$zero");
@@ -4420,7 +4479,7 @@ private:
             }
             instruction(value_bits > 32 ? "or" : "or", "$t0,$t0,$t1");
         }
-        normalize_integer("t0", value_bits, sign);
+        canonicalize_integer_value("t0", value_bits, sign);
     }
 
     void assemble_incoming_pair(const machine::Function& function,
@@ -4517,8 +4576,10 @@ private:
                                     reg_name(*destination) + "," +
                                     std::to_string(shift));
                 }
-                if (target.mode.bits < 32) {
-                    normalize_integer(*destination, target.mode.bits, false);
+                if (!abi_supplies_canonical_word(
+                        *selected, target.mode.bits)) {
+                    canonicalize_integer_value(
+                        *destination, target.mode.bits, false);
                 }
                 return;
             }
@@ -4528,8 +4589,10 @@ private:
                 instruction(selected->carrier_bits > 32 ? "dsrl" : "srl",
                             "$t0,$t0," + std::to_string(shift));
             }
-            if (target.mode.bits < 32) {
-                normalize_integer("t0", target.mode.bits, false);
+            if (!abi_supplies_canonical_word(
+                    *selected, target.mode.bits)) {
+                canonicalize_integer_value(
+                    "t0", target.mode.bits, false);
             }
             store_vreg(function, target, "t0", value.location);
             return;
@@ -4546,9 +4609,8 @@ private:
                                         reg_name(piece.location.reg));
                     }
                 } else {
-                    instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
-                                reg_name(piece.location.reg) + "," +
-                                    reg_name(*destination));
+                    move_gpr_to_fpr(piece.location.reg, *destination,
+                                    target.mode.bits);
                 }
                 return;
             }
@@ -4559,10 +4621,13 @@ private:
                     instruction("move", reg_name(*destination) + "," +
                                             reg_name(piece.location.reg));
                 }
-                normalize_integer(*destination,
-                                  type_bits(hir_, parameter.type),
-                                  is_signed_integer(hir_, parameter.type) ||
-                                      is_address_value(hir_, parameter.type));
+                const auto bits = type_bits(hir_, parameter.type);
+                if (!abi_supplies_canonical_word(piece, bits)) {
+                    canonicalize_integer_value(
+                        *destination, bits,
+                        is_signed_integer(hir_, parameter.type) ||
+                            is_address_value(hir_, parameter.type));
+                }
                 return;
             }
 
@@ -4629,9 +4694,10 @@ private:
                 }
                 first = false;
             }
-            normalize_integer(*destination, bits,
-                              is_signed_integer(hir_, parameter.type) ||
-                                  is_address_value(hir_, parameter.type));
+            canonicalize_integer_value(
+                *destination, bits,
+                is_signed_integer(hir_, parameter.type) ||
+                    is_address_value(hir_, parameter.type));
             return;
         }
         if (parameter.mode != ParameterMode::In) {
@@ -4713,8 +4779,7 @@ private:
             // The pair was written above, including floating bit transport.
         } else if (is_floating(hir_, parameter.type)) {
             if (const auto destination = assigned_fpr(function, target)) {
-                instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
-                            "$t0," + reg_name(*destination));
+                move_gpr_to_fpr("t0", *destination, target.mode.bits);
             } else {
                 const auto offset =
                     vreg_offset(function, target, value.location);
@@ -4772,7 +4837,8 @@ private:
             piece, value_bits, subtarget_.target().data_layout.byte_order);
         if (!legalizes_to_pair(source) && shift == 0 &&
             piece.value_bits >= value_bits &&
-            piece.location.kind == LocationKind::Register) {
+            piece.location.kind == LocationKind::Register &&
+            internal_value_matches_extension(piece, value_bits)) {
             if (const auto assigned = assigned_gpr(function, source)) {
                 if (*assigned != piece.location.reg) {
                     instruction("move", reg_name(piece.location.reg) + "," +
@@ -4801,14 +4867,7 @@ private:
             instruction(value_bits > 32 ? "dsrl" : "srl",
                         "$at,$at," + std::to_string(shift));
         }
-        if (subtarget_.has_feature(Feature::Mips3) &&
-            value_bits > piece.value_bits && piece.carrier_bits == 32) {
-            // o32 was specified for 32-bit GPRs.  On a MIPS III processor,
-            // GCC represents each 32-bit carrier as a sign-extended physical
-            // GPR value.  Callers may rely on that invariant when consuming
-            // split u64/f64 results, even though only the low word is payload.
-            normalize_integer("at", 32, true);
-        }
+        apply_abi_register_extension("at", piece);
         if (piece.location.kind == LocationKind::Register) {
             instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
@@ -4828,6 +4887,7 @@ private:
                             source.offset;
         instruction("addiu", "$at," + reg_name(frame_base()) + "," +
                                  std::to_string(offset));
+        apply_abi_register_extension("at", piece);
         if (piece.location.kind == LocationKind::Register) {
             instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
@@ -4853,8 +4913,7 @@ private:
             piece, source.mode.bits,
             subtarget_.target().data_layout.byte_order);
         if (const auto assigned = assigned_fpr(function, source)) {
-            instruction(source.mode.bits == 32 ? "mfc1" : "dmfc1",
-                        "$at," + reg_name(*assigned));
+            move_fpr_to_gpr(*assigned, "at", source.mode.bits);
         } else if (legalizes_to_pair(source)) {
             const auto offset = vreg_offset(function, source, location);
             const bool high = shift >= 32;
@@ -4873,10 +4932,7 @@ private:
         if (!legalizes_to_pair(source) && shift != 0) {
             instruction("dsrl", "$at,$at," + std::to_string(shift));
         }
-        if (subtarget_.has_feature(Feature::Mips3) &&
-            source.mode.bits > piece.value_bits && piece.carrier_bits == 32) {
-            normalize_integer("at", 32, true);
-        }
+        apply_abi_register_extension("at", piece);
         if (piece.location.kind == LocationKind::Register) {
             instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
@@ -4900,7 +4956,8 @@ private:
         const ValuePiece* high = nullptr;
         for (const auto& piece : pieces) {
             if (piece.location.kind != LocationKind::Register ||
-                piece.value_bits != 32 || piece.carrier_bits != 32) {
+                piece.value_bits != 32 || piece.carrier_bits != 32 ||
+                piece.extension != AbiExtensionKind::Sign) {
                 return false;
             }
             const auto offset = effective_piece_offset(
@@ -4975,10 +5032,13 @@ private:
                     instruction("move", reg_name(*destination) + "," +
                                             reg_name(source));
                 }
-                normalize_integer(
-                    *destination, bits,
-                    is_signed_integer(hir_, callee.result_type) ||
-                        is_address_value(hir_, callee.result_type));
+                if (!abi_supplies_canonical_word(
+                        assignment.pieces.front(), bits)) {
+                    canonicalize_integer_value(
+                        *destination, bits,
+                        is_signed_integer(hir_, callee.result_type) ||
+                            is_address_value(hir_, callee.result_type));
+                }
                 return;
             }
         }
@@ -5006,8 +5066,7 @@ private:
             // Already stored as two ABI words.
         } else if (is_floating(hir_, callee.result_type)) {
             if (const auto destination = assigned_fpr(function, target)) {
-                instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
-                            "$t0," + reg_name(*destination));
+                move_gpr_to_fpr("t0", *destination, target.mode.bits);
             } else {
                 store_integer_memory(
                     "t0",
@@ -5144,7 +5203,8 @@ private:
                 left.location.stack_offset != right.location.stack_offset ||
                 left.value_bit_offset != right.value_bit_offset ||
                 left.value_bits != right.value_bits ||
-                left.carrier_bits != right.carrier_bits) {
+                left.carrier_bits != right.carrier_bits ||
+                left.extension != right.extension) {
                 return false;
             }
         }
@@ -5442,6 +5502,25 @@ private:
             if (kind != machine::VirtualRegisterClass::Integer) return false;
             return assigned_gpr(function, value).has_value();
         };
+        const auto opcode = decode_opcode(candidate.opcode);
+        if (opcode == Opcode::MulStart) {
+            const auto memory_token = [&](machine::Register value) {
+                return value.kind == machine::RegisterKind::Virtual &&
+                    value.id < function.virtual_register_classes.size() &&
+                    function.virtual_register_classes[value.id] ==
+                        machine::VirtualRegisterClass::Memory;
+            };
+            if (candidate.uses.size() < 2 ||
+                !assigned_gpr(function, candidate.uses[0]) ||
+                !assigned_gpr(function, candidate.uses[1]) ||
+                !memory_token(candidate.defs.front()) ||
+                !std::all_of(candidate.uses.begin() + 2,
+                             candidate.uses.end(), memory_token)) {
+                return false;
+            }
+            return candidate.uses.front().mode.bits <= 32 ||
+                subtarget_.has_feature(Feature::Mips3);
+        }
         if (!std::all_of(candidate.defs.begin(), candidate.defs.end(),
                          allocated) ||
             !std::all_of(candidate.uses.begin(), candidate.uses.end(),
@@ -5460,7 +5539,6 @@ private:
         // one architectural instruction.  The delay-slot emitter can then
         // move it as a unit without parsing assembly text or splitting a
         // legalization sequence.
-        const auto opcode = decode_opcode(candidate.opcode);
         if (opcode == Opcode::Constant && candidate.operands.size() == 1) {
             const auto* immediate =
                 std::get_if<machine::ImmediateOperand>(
@@ -5657,8 +5735,77 @@ private:
                 opcode == Opcode::LifetimeEnd ||
                 opcode == Opcode::IntrinsicNoop;
         };
+        // A non-interlocked MIPS I--III core forbids a HI/LO writer in the
+        // two instructions following MFHI/MFLO.  The branch itself pays one
+        // slot, so a moved MulStart is safe when at least one emitted
+        // instruction follows the most recent MoveFromLo.  Only an
+        // unconditional branch to the next layout block can cross a block
+        // boundary without emitting a branch and delay slot; walk exactly
+        // that fallthrough chain.  Every other incoming edge clears the
+        // two-instruction exclusion window by construction.
+        const auto hilo_delay_safe = [&](machine::BlockId source) {
+            if (subtarget_.has_feature(Feature::HiloInterlocks)) return true;
+            std::unordered_set<std::uint32_t> visited;
+            auto current = source;
+            while (visited.insert(current.value).second) {
+                const auto block = std::find_if(
+                    function.blocks.begin(), function.blocks.end(),
+                    [&](const machine::Block& candidate) {
+                        return candidate.id == current;
+                    });
+                if (block == function.blocks.end() ||
+                    block->instructions.empty()) {
+                    return true;
+                }
+                auto end = block->instructions.size();
+                if (block->instructions.back().kind !=
+                    machine::InstructionKind::Target) {
+                    --end;
+                }
+                while (end != 0) {
+                    const auto& value = block->instructions[--end];
+                    if (no_output_prefix(value)) continue;
+                    if (value.kind != machine::InstructionKind::Target) {
+                        return true;
+                    }
+                    return decode_opcode(value.opcode) != Opcode::MoveFromLo;
+                }
+
+                const auto layout = std::find(
+                    function.layout.begin(), function.layout.end(), current);
+                if (layout == function.layout.begin() ||
+                    layout == function.layout.end()) {
+                    return true;
+                }
+                const auto previous_id = *std::prev(layout);
+                const auto previous = std::find_if(
+                    function.blocks.begin(), function.blocks.end(),
+                    [&](const machine::Block& candidate) {
+                        return candidate.id == previous_id;
+                    });
+                if (previous == function.blocks.end() ||
+                    previous->instructions.empty()) {
+                    return true;
+                }
+                const auto& terminator = previous->instructions.back();
+                if (terminator.kind != machine::InstructionKind::Branch ||
+                    terminator.operands.empty()) {
+                    return true;
+                }
+                const auto* target = std::get_if<machine::BlockOperand>(
+                    &terminator.operands.front());
+                if (!target || target->target != current ||
+                    layout_successor(function, previous_id) != current) {
+                    return true;
+                }
+                current = previous_id;
+            }
+            return false;
+        };
         const auto plan_edge = [&](const machine::Block& source,
-                                   machine::BlockId target) {
+                                   machine::BlockId target,
+                                   bool allow_fused_compare,
+                                   bool prior_branch_clears_hilo = false) {
             if (target == source.id ||
                 layout_successor(function, source.id) == target ||
                 edge_has_phi_copies(function, source.id, target)) {
@@ -5678,8 +5825,14 @@ private:
                 const auto& candidate = successor->instructions[index];
                 if (no_output_prefix(candidate)) continue;
                 if (single_delay_slot_instruction(function, candidate)) {
+                    if (decode_opcode(candidate.opcode) == Opcode::MulStart &&
+                        !prior_branch_clears_hilo &&
+                        !hilo_delay_safe(source.id)) {
+                        break;
+                    }
                     candidate_index = index;
-                } else if (single_fused_compare_instruction(
+                } else if (allow_fused_compare &&
+                           single_fused_compare_instruction(
                                function, candidate)) {
                     candidate_index = index;
                     fused_compare = true;
@@ -5715,7 +5868,7 @@ private:
                 }
                 const auto* target = std::get_if<machine::BlockOperand>(
                     &branch.operands.front());
-                if (target) plan_edge(source, target->target);
+                if (target) plan_edge(source, target->target, true);
                 continue;
             }
             if (branch.kind !=
@@ -5727,7 +5880,7 @@ private:
                 &branch.operands[1]);
             const auto* no = std::get_if<machine::BlockOperand>(
                 &branch.operands[2]);
-            if (!yes || !no ||
+            if (!yes || !no || delay_slot_plan(function, source) ||
                 edge_has_phi_copies(function, source.id, yes->target) ||
                 edge_has_phi_copies(function, source.id, no->target)) {
                 continue;
@@ -5738,7 +5891,61 @@ private:
                 // secondary unconditional branch when neither destination
                 // is the layout successor. Its otherwise-empty delay slot
                 // can execute the false successor's first operation.
-                plan_edge(source, no->target);
+                plan_edge(source, no->target, true, true);
+            } else if (subtarget_.has_feature(Feature::BranchLikely)) {
+                // A branch-likely annuls its delay slot on the fallthrough
+                // edge. This makes the first target operation edge-specific
+                // without speculative side effects or physical-register
+                // liveness assumptions.
+                if (next == yes->target) {
+                    plan_edge(source, no->target, false);
+                } else if (next == no->target) {
+                    plan_edge(source, yes->target, false);
+                }
+            }
+        }
+
+        // When every incoming edge executes the same target instruction in
+        // its delay slot, no ordinary entry can reach the original copy.
+        // Remove that copy rather than trading one NOP for duplicated code.
+        for (auto& [target, entry] : successor_delay_entries_) {
+            if (entry.fused_compare || entry.successor.value != target ||
+                entry.successor == function.entry ||
+                std::any_of(
+                    function.labels.begin(), function.labels.end(),
+                    [&](const machine::Function::LocalLabel& label) {
+                        return label.block == entry.successor;
+                    })) {
+                continue;
+            }
+            bool has_predecessor = false;
+            bool every_predecessor_planned = true;
+            for (const auto& source : function.blocks) {
+                if (std::find(source.successors.begin(),
+                              source.successors.end(), entry.successor) ==
+                    source.successors.end()) {
+                    continue;
+                }
+                has_predecessor = true;
+                const auto planned =
+                    edge_delay_entries_.find(source.id.value);
+                if (planned == edge_delay_entries_.end() ||
+                    planned->second.successor != entry.successor ||
+                    planned->second.instruction != entry.instruction ||
+                    planned->second.fused_compare != entry.fused_compare) {
+                    every_predecessor_planned = false;
+                    break;
+                }
+            }
+            entry.elide_original =
+                has_predecessor && every_predecessor_planned;
+        }
+        for (auto& [source, entry] : edge_delay_entries_) {
+            (void)source;
+            const auto canonical =
+                successor_delay_entries_.find(entry.successor.value);
+            if (canonical != successor_delay_entries_.end()) {
+                entry.elide_original = canonical->second.elide_original;
             }
         }
     }
@@ -6467,7 +6674,8 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
             if (opcode == Opcode::Sext || opcode == Opcode::Zext) {
                 normalize_integer("t0", source.mode.bits, sign);
             } else if (opcode == Opcode::Trunc) {
-                normalize_integer("t0", target.mode.bits, false);
+                canonicalize_integer_value(
+                    "t0", target.mode.bits, false);
             }
             store_vreg(function, target, "t0", value.location);
         }
@@ -6484,13 +6692,11 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
             copy_vreg(function, target, source, value.location);
         } else if (source_float) {
             load_fvreg(function, source, "f0", value.location);
-            instruction(source.mode.bits == 32 ? "mfc1" : "dmfc1",
-                        "$t0,$f0");
+            move_fpr_to_gpr("f0", "t0", source.mode.bits);
             store_vreg(function, target, "t0", value.location);
         } else if (target_float) {
             load_vreg(function, source, "t0", value.location);
-            instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
-                        "$t0,$f0");
+            move_gpr_to_fpr("t0", "f0", target.mode.bits);
             store_fvreg(function, target, "f0", value.location);
         }
         return;
@@ -6504,10 +6710,49 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
     }
     if (opcode == Opcode::Sitofp || opcode == Opcode::Uitofp) {
         load_vreg(function, source, "t0", value.location);
-        const bool use_long = source.mode.bits > 32 || opcode == Opcode::Uitofp;
-        if (use_long && !subtarget_.has_feature(Feature::Mips3)) {
-            diagnostics_.error(value.location,
-                               "64-bit integer-to-float conversion requires MIPS III");
+        const auto destination = target.mode.bits == 32
+            ? std::string{"cvt.s."} : std::string{"cvt.d."};
+        if (opcode == Opcode::Uitofp && source.mode.bits <= 32) {
+            // MIPS has signed-word conversion only. For a high-bit u32, an
+            // f32 uses the standard sticky-low-bit halving expansion so its
+            // first rounding makes the same tie decision as a direct unsigned
+            // conversion. An f64 can represent every u32 exactly, so convert
+            // floor(value / 2), double it, and add the saved low bit.
+            const auto ordinary = local_label(function);
+            const auto done = local_label(function);
+            instruction("bgez", "$t0," + ordinary);
+            instruction("srl", "$t1,$t0,1");
+            instruction("andi", "$t0,$t0,1");
+            if (target.mode.bits <= 32) {
+                instruction("or", "$t0,$t1,$t0");
+            } else {
+                move_gpr_to_fpr("t0", "f4", 32);
+            }
+            if (target.mode.bits > 32) {
+                instruction("move", "$t0,$t1");
+            }
+            move_gpr_to_fpr("t0", "f0", 32);
+            instruction(destination + "w", "$f2,$f0");
+            instruction(target.mode.bits == 32 ? "add.s" : "add.d",
+                        "$f2,$f2,$f2");
+            if (target.mode.bits > 32) {
+                instruction("cvt.d.w", "$f4,$f4");
+                instruction("add.d", "$f2,$f2,$f4");
+            }
+            instruction("b", done);
+            instruction("nop");
+            output_ << ordinary << ":\n";
+            move_gpr_to_fpr("t0", "f0", 32);
+            instruction(destination + "w", "$f2,$f0");
+            output_ << done << ":\n";
+            store_fvreg(function, target, "f2", value.location);
+            return;
+        }
+        const bool use_long = source.mode.bits > 32;
+        if (use_long && !subtarget_.has_feature(Feature::Fp64)) {
+            diagnostics_.error(
+                value.location,
+                "64-bit integer-to-float conversion requires 64-bit MIPS FPR mode; standalone Cross will not insert a runtime call");
             return;
         }
         if (opcode == Opcode::Uitofp && source.mode.bits == 64) {
@@ -6516,8 +6761,7 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
                 "full-range u64-to-float conversion is not implemented in the MIPS slice yet");
             return;
         }
-        instruction(use_long ? "dmtc1" : "mtc1", "$t0,$f0");
-        const auto destination = target.mode.bits == 32 ? "cvt.s." : "cvt.d.";
+        move_gpr_to_fpr("t0", "f0", use_long ? 64U : 32U);
         instruction(destination + std::string(use_long ? "l" : "w"),
                     "$f2,$f0");
         store_fvreg(function, target, "f2", value.location);
@@ -6525,12 +6769,6 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
     }
     if (opcode == Opcode::Fptosi || opcode == Opcode::Fptoui) {
         load_fvreg(function, source, "f0", value.location);
-        const bool use_long = target.mode.bits > 32 || opcode == Opcode::Fptoui;
-        if (use_long && !subtarget_.has_feature(Feature::Mips3)) {
-            diagnostics_.error(value.location,
-                               "wide float-to-integer conversion requires MIPS III");
-            return;
-        }
         if (opcode == Opcode::Fptoui && target.mode.bits == 64) {
             diagnostics_.error(
                 value.location,
@@ -6538,12 +6776,63 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
             return;
         }
         const auto source_suffix = source.mode.bits == 32 ? ".s" : ".d";
-        instruction(std::string(use_long ? "trunc.l" : "trunc.w") +
-                        source_suffix,
-                    "$f2,$f0");
-        instruction(use_long ? "dmfc1" : "mfc1", "$t0,$f2");
-        normalize_integer("t0", target.mode.bits,
-                          opcode == Opcode::Fptosi);
+        if (target.mode.bits <= 32) {
+            if (!subtarget_.has_feature(Feature::Mips2)) {
+                diagnostics_.error(
+                    value.location,
+                    "float-to-integer conversion requires MIPS II trunc.w support; standalone Cross will not alter FCSR or insert a runtime call");
+                return;
+            }
+            if (opcode == Opcode::Fptoui && target.mode.bits == 32) {
+                // TRUNC.W is signed. Split the defined u32 range at 2^31,
+                // subtract that exactly representable threshold on the high
+                // path, then restore its integer bit. Construct the floating
+                // threshold through a word FPR so FP32 targets never execute
+                // the reserved TRUNC.L/DMFC1 forms.
+                const auto ordinary = local_label(function);
+                const auto done = local_label(function);
+                instruction("lui", "$t0,32768");
+                move_gpr_to_fpr("t0", "f4", 32);
+                instruction(std::string("cvt") + source_suffix + ".w",
+                            "$f4,$f4");
+                instruction(std::string("abs") + source_suffix,
+                            "$f4,$f4");
+                instruction(std::string("c.lt") + source_suffix,
+                            "$f0,$f4");
+                instruction("bc1t", ordinary);
+                instruction("nop");
+                instruction(std::string("sub") + source_suffix,
+                            "$f2,$f0,$f4");
+                instruction(std::string("trunc.w") + source_suffix,
+                            "$f2,$f2");
+                move_fpr_to_gpr("f2", "t0", 32);
+                instruction("lui", "$t1,32768");
+                instruction("xor", "$t0,$t0,$t1");
+                instruction("b", done);
+                instruction("nop");
+                output_ << ordinary << ":\n";
+                instruction(std::string("trunc.w") + source_suffix,
+                            "$f2,$f0");
+                move_fpr_to_gpr("f2", "t0", 32);
+                output_ << done << ":\n";
+            } else {
+                instruction(std::string("trunc.w") + source_suffix,
+                            "$f2,$f0");
+                move_fpr_to_gpr("f2", "t0", 32);
+            }
+        } else {
+            if (!subtarget_.has_feature(Feature::Fp64)) {
+                diagnostics_.error(
+                    value.location,
+                    "64-bit float-to-integer conversion requires 64-bit MIPS FPR mode; standalone Cross will not insert a runtime call");
+                return;
+            }
+            instruction(std::string("trunc.l") + source_suffix,
+                        "$f2,$f0");
+            move_fpr_to_gpr("f2", "t0", 64);
+        }
+        canonicalize_integer_value(
+            "t0", target.mode.bits, opcode == Opcode::Fptosi);
         store_vreg(function, target, "t0", value.location);
         return;
     }
@@ -6918,8 +7207,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             instruction(target.mode.bits > 32 ? "dli" : "li",
                         "$t0," + std::to_string(immediate.value));
             if (const auto destination = assigned_fpr(function, target)) {
-                instruction(target.mode.bits == 32 ? "mtc1" : "dmtc1",
-                            "$t0," + reg_name(*destination));
+                move_gpr_to_fpr("t0", *destination, target.mode.bits);
             } else {
                 store_integer_memory(
                     "t0",
@@ -7256,9 +7544,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                                             reg_name(source_fpr));
             commit_fpr(function, target, destination, value.location);
         } else {
-            if (source.mode.bits == 32) instruction("mtc1", "$zero,$f2");
-            else if (subtarget_.has_feature(Feature::Mips3)) {
-                instruction("dmtc1", "$zero,$f2");
+            if (source.mode.bits <= 32 ||
+                subtarget_.has_feature(Feature::Mips3)) {
+                move_gpr_to_fpr("zero", "f2", source.mode.bits);
             } else {
                 instruction("mtc1", "$zero,$f2");
                 instruction("mtc1", "$zero,$f3");
@@ -7496,6 +7784,25 @@ void AssemblyEmitter::emit_terminator(
         const bool no_copies = edge_has_phi_copies(
             function, predecessor, no);
         const auto next = layout_successor(function, predecessor);
+        const SuccessorDelayEntry* taken_delay{};
+        const machine::Instruction* taken_candidate{};
+        const auto planned = edge_delay_entries_.find(predecessor.value);
+        if (planned != edge_delay_entries_.end() &&
+            (next == yes || next == no) &&
+            planned->second.successor == (next == yes ? no : yes)) {
+            const auto successor = std::find_if(
+                function.blocks.begin(), function.blocks.end(),
+                [&](const machine::Block& block) {
+                    return block.id == planned->second.successor;
+                });
+            if (successor != function.blocks.end() &&
+                planned->second.instruction <
+                    successor->instructions.size()) {
+                taken_delay = &planned->second;
+                taken_candidate = &successor->instructions[
+                    planned->second.instruction];
+            }
+        }
         if (!value.condition_predicate.empty()) {
             const auto predicate = decode_opcode(value.condition_predicate);
             const auto emit_fused_branch = [&, this](
@@ -7504,7 +7811,8 @@ void AssemblyEmitter::emit_terminator(
                                                const AssignedPhiCopy* copy =
                                                    nullptr,
                                                std::string_view target_label =
-                                                   {}) {
+                                                   {},
+                                               bool use_taken_delay = false) {
                 const auto destination = target_label.empty()
                     ? block_label(function, target)
                     : std::string{target_label};
@@ -7512,6 +7820,8 @@ void AssemblyEmitter::emit_terminator(
                     if (copy) {
                         instruction("move", reg_name(copy->target) + "," +
                                                 reg_name(copy->source));
+                    } else if (use_taken_delay && taken_candidate) {
+                        emit_target(function, *taken_candidate);
                     } else {
                         emit_delay();
                     }
@@ -7537,7 +7847,7 @@ void AssemblyEmitter::emit_terminator(
                             predicate != Opcode::CmpNe;
                         auto branch = branch_on_truth == truth_on_equal
                             ? std::string{"beq"} : std::string{"bne"};
-                        if (copy) branch += 'l';
+                        if (copy || use_taken_delay) branch += 'l';
                         instruction(branch,
                                     reg_name(left) + "," + reg_name(right) +
                                         "," + destination);
@@ -7558,7 +7868,7 @@ void AssemblyEmitter::emit_terminator(
                     }
                     auto branch = branch_on_truth == truth_on_nonzero
                         ? std::string{"bne"} : std::string{"beq"};
-                    if (copy) branch += 'l';
+                    if (copy || use_taken_delay) branch += 'l';
                     instruction(branch,
                                 "$at,$zero," +
                                     destination);
@@ -7579,9 +7889,14 @@ void AssemblyEmitter::emit_terminator(
                         ? std::string{".s"} : std::string{".d"};
                     if (predicate == Opcode::Fiszero) {
                         right = "f2";
-                        instruction(value.uses[0].mode.bits == 32
-                                        ? "mtc1" : "dmtc1",
-                                    "$zero,$f2");
+                        if (value.uses[0].mode.bits <= 32 ||
+                            subtarget_.has_feature(Feature::Mips3)) {
+                            move_gpr_to_fpr(
+                                "zero", "f2", value.uses[0].mode.bits);
+                        } else {
+                            instruction("mtc1", "$zero,$f2");
+                            instruction("mtc1", "$zero,$f3");
+                        }
                         comparison = "c.eq" + suffix;
                     } else {
                         if (value.uses.size() < 2) return false;
@@ -7616,13 +7931,23 @@ void AssemblyEmitter::emit_terminator(
                                 reg_name(left) + "," + reg_name(right));
                     auto branch = branch_on_truth == truth_on_condition
                         ? std::string{"bc1t"} : std::string{"bc1f"};
-                    if (copy) branch += 'l';
+                    if (copy || use_taken_delay) branch += 'l';
                     instruction(branch, destination);
                     selected_delay();
                     return true;
                 }
                 return false;
             };
+
+            if (!yes_copies && !no_copies && taken_delay &&
+                taken_candidate) {
+                if (emit_fused_branch(
+                        taken_delay->successor,
+                        taken_delay->successor == yes, nullptr,
+                        taken_delay->resume_label, true)) {
+                    return;
+                }
+            }
 
             if (!yes_copies && !no_copies) {
                 if (next == yes) {
@@ -7719,6 +8044,16 @@ void AssemblyEmitter::emit_terminator(
             emit_phi_edge_copies(function, predecessor, yes);
             instruction("b", block_label(function, yes));
             instruction("nop");
+            return;
+        }
+        if (!yes_copies && !no_copies && taken_delay &&
+            taken_candidate) {
+            const auto condition_gpr = input_gpr(
+                function, condition, "t0", value.location);
+            instruction(taken_delay->successor == yes ? "bnezl" : "beqzl",
+                        reg_name(condition_gpr) + "," +
+                            taken_delay->resume_label);
+            emit_target(function, *taken_candidate);
             return;
         }
         if (!yes_copies && !no_copies) {
@@ -7984,6 +8319,15 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             if (delay_plan && index == delay_plan->first) continue;
             const auto& value = found->instructions[index];
             if (value.kind == machine::InstructionKind::Target) {
+                const auto successor_delay =
+                    successor_delay_entries_.find(found->id.value);
+                if (successor_delay != successor_delay_entries_.end() &&
+                    successor_delay->second.instruction == index &&
+                    !successor_delay->second.fused_compare &&
+                    successor_delay->second.elide_original) {
+                    output_ << successor_delay->second.resume_label << ":\n";
+                    continue;
+                }
                 if (options_.compare_select_fusion &&
                     decode_opcode(value.opcode) == Opcode::Select &&
                     value.uses.size() >= 3 && !value.defs.empty() &&
@@ -8015,8 +8359,6 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                     }
                 }
                 emit_target(function, value);
-                const auto successor_delay =
-                    successor_delay_entries_.find(found->id.value);
                 if (successor_delay != successor_delay_entries_.end() &&
                     successor_delay->second.instruction == index &&
                     !successor_delay->second.fused_compare) {

@@ -18,6 +18,7 @@ struct PieceRequest {
     std::uint16_t value_bits{};
     std::uint16_t carrier_bits{};
     std::uint16_t indirect_value_bits{};
+    AbiExtensionKind extension{AbiExtensionKind::None};
 };
 
 struct LoweredValue {
@@ -262,7 +263,8 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
             return std::nullopt;
         }
         result.pieces.push_back(
-            {bank, 0, effective_bits, carrier(effective_bits)});
+            {bank, 0, effective_bits, carrier(effective_bits), 0,
+             rule->extension});
         break;
     case AbiRuleAction::Split:
     case AbiRuleAction::Coerce: {
@@ -275,7 +277,8 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                 std::min<std::uint32_t>(
                     unit_bits, effective_bits - offset));
             result.pieces.push_back(
-                {bank, offset, bits, carrier(bits)});
+                {bank, offset, bits, carrier(bits), 0,
+                 rule->extension});
         }
         break;
     }
@@ -366,6 +369,11 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                         }
                     }
                     if (!overlaps) continue;
+                    // Bank merging creates a new raw aggregate carrier.  A
+                    // scalar child's extension does not describe aggregate
+                    // padding (for example, a struct containing an i8 is not
+                    // passed as a sign-extended scalar i8), so the rebuilt
+                    // transport deliberately starts with no extension.
                     merged.push_back(
                         {selected, begin,
                          static_cast<std::uint16_t>(end - begin),
@@ -422,7 +430,7 @@ ValuePiece register_piece(std::string reg,
     return {{LocationKind::Register, std::move(reg), 0},
             static_cast<std::uint16_t>(request.value_bit_offset),
             request.value_bits, request.carrier_bits,
-            request.indirect_value_bits};
+            request.indirect_value_bits, request.extension};
 }
 
 ValuePiece stack_piece(std::size_t offset,
@@ -430,7 +438,7 @@ ValuePiece stack_piece(std::size_t offset,
     return {{LocationKind::Stack, {}, offset},
             static_cast<std::uint16_t>(request.value_bit_offset),
             request.value_bits, request.carrier_bits,
-            request.indirect_value_bits};
+            request.indirect_value_bits, AbiExtensionKind::None};
 }
 
 AbiRegisterFailure failure_policy(const AbiEntry& abi,
@@ -1081,6 +1089,7 @@ SignatureClassificationResult classify_signature_values(
                     if (position >= target->arguments.size()) continue;
                     auto duplicate = piece;
                     duplicate.location.reg = target->arguments[position];
+                    duplicate.extension = AbiExtensionKind::None;
                     assignment.shadows.push_back(std::move(duplicate));
                 }
             }

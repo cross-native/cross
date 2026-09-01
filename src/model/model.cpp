@@ -1298,6 +1298,23 @@ private:
         return std::nullopt;
     }
 
+    std::optional<AbiExtensionKind> abi_extension(
+        std::string_view spelling, unsigned line) {
+        static constexpr std::pair<std::string_view, AbiExtensionKind>
+            extensions[] = {
+                {"none", AbiExtensionKind::None},
+                {"zero", AbiExtensionKind::Zero},
+                {"sign", AbiExtensionKind::Sign},
+            };
+        const auto found = std::find_if(
+            std::begin(extensions), std::end(extensions),
+            [&](const auto& item) { return item.first == spelling; });
+        if (found != std::end(extensions)) return found->second;
+        fail(line, "unknown ABI register extension '" +
+                       std::string(spelling) + "'");
+        return std::nullopt;
+    }
+
     std::optional<AbiEntry> make_abi(
         std::string name, const ModelProperties& properties,
         const std::vector<AbiNestedBlock>& bank_blocks,
@@ -1540,7 +1557,8 @@ private:
             if (!known_properties(
                     block.properties,
                     {"match", "action", "bank", "min_bits", "max_bits",
-                     "unit_bits", "carrier_bits", "max_elements",
+                     "unit_bits", "carrier_bits", "extension",
+                     "max_elements",
                      "cursor_alignment", "cursor_advance",
                      "argument_limit", "requires_unused_banks",
                      "stack_alignment", "stack_size", "applies_to",
@@ -1594,6 +1612,12 @@ private:
             if (const auto value =
                     unsigned_property(block.properties, "carrier_bits")) {
                 rule.carrier_bits = *value;
+            }
+            if (const auto value =
+                    text_property(block.properties, "extension")) {
+                const auto parsed = abi_extension(*value, block.line);
+                if (!parsed) return std::nullopt;
+                rule.extension = *parsed;
             }
             if (const auto value =
                     unsigned_property(block.properties, "max_elements")) {
@@ -2073,6 +2097,16 @@ bool validate_abi_model(const TargetInfo& target, const AbiEntry& abi,
             rule.action == AbiRuleAction::Split ||
             rule.action == AbiRuleAction::Coerce ||
             rule.action == AbiRuleAction::Indirect;
+        if (rule.extension != AbiExtensionKind::None &&
+            rule.action != AbiRuleAction::Direct &&
+            rule.action != AbiRuleAction::Split &&
+            rule.action != AbiRuleAction::Coerce) {
+            diagnostics.command_error(
+                "ABI model '" + abi.canonical_name + "' rule '" +
+                rule.canonical_name +
+                "' uses extension without a direct register transport");
+            return false;
+        }
         const auto rule_failure = [&](bool arguments) {
             if (rule.failure_override) return rule.failure;
             return arguments ? abi.argument_register_failure
@@ -2100,6 +2134,15 @@ bool validate_abi_model(const TargetInfo& target, const AbiEntry& abi,
                 "ABI model '" + abi.canonical_name + "' rule '" +
                 rule.canonical_name + "' names unknown bank '" +
                 rule.bank + "'");
+            return false;
+        }
+        if (rule.extension != AbiExtensionKind::None &&
+            bank != abi.banks.end() &&
+            bank->register_class != "integer") {
+            diagnostics.command_error(
+                "ABI model '" + abi.canonical_name + "' rule '" +
+                rule.canonical_name +
+                "' uses extension with a non-integer register bank");
             return false;
         }
         if (!needs_bank && !rule.bank.empty()) {

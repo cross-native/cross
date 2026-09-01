@@ -51,6 +51,12 @@ foreach(pattern
         "[\t ]mul\\.d[\t ]"
         "[\t ]mov\\.d[\t ][^\n]*[$]f12"
         "[\t ]mov\\.d[\t ][^\n]*[$]f14"
+        "[\t ]c\\.lt\\.s[\t ]"
+        "[\t ]c\\.lt\\.d[\t ]"
+        "[\t ]sub\\.s[\t ]"
+        "[\t ]sub\\.d[\t ]"
+        "[\t ]trunc\\.w\\.s[\t ]"
+        "[\t ]trunc\\.w\\.d[\t ]"
         "[\t ]jal[\t ]mips_add64"
         "[\t ]jal[\t ]mips_fma_shape")
     if(NOT assembly MATCHES "${pattern}")
@@ -58,6 +64,11 @@ foreach(pattern
             "VR4300/o32 assembly is missing '${pattern}'\n${assembly}")
     endif()
 endforeach()
+if(assembly MATCHES
+   "[\t ](trunc\\.l\\.[sd]|cvt\\.[sd]\\.l)[\t ]")
+    message(FATAL_ERROR
+        "VR4300 FP32 conversion selected a reserved long-FPR instruction\n${assembly}")
+endif()
 
 file(READ "${fix_assembly}" fixed)
 if(NOT fixed MATCHES "[\t ]mul\\.d[^\n]*\n[\t ]add\\.d" OR

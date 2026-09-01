@@ -395,6 +395,7 @@ abi "o32" {
         min_bits = 1;
         max_bits = 32;
         carrier_bits = 32;
+        extension = "sign";
     }
 
     rule "integer-wide-argument" {
@@ -404,6 +405,7 @@ abi "o32" {
         min_bits = 33;
         max_bits = 128;
         unit_bits = 32;
+        extension = "sign";
         cursor_alignment = 2;
         applies_to = ["arguments"];
     }
@@ -415,6 +417,7 @@ abi "o32" {
         min_bits = 33;
         max_bits = 64;
         unit_bits = 32;
+        extension = "sign";
         applies_to = ["results"];
     }
 

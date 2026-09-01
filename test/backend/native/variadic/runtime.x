@@ -34,6 +34,12 @@ static i32 ms_floating(in u64 tag, ...) {
     return arguments[0] == 1.5f64;
 }
 
+[[abi("ms_abi"), noinline,
+  variadic(u64 *arguments "argument_area")]]
+static i32 ms_shadow_overlap(in u64 tag, ...) {
+    return arguments[1] == 17u64;
+}
+
 global i32 variadic_sysv_entry() {
     return sysv_registers(0u64, 7u8, 2.5f32) +
            sysv_overflow(0u64, 1u64, 2u64, 3u64, 4u64,
@@ -43,8 +49,12 @@ global i32 variadic_sysv_entry() {
 }
 
 global i32 variadic_ms_entry() {
+    // The float's integer shadow uses rdx, while the following integer goes
+    // to r8.  Its hard rdx source must be copied before the shadow is written.
+    register u64 integer_source "rdx" = 17u64;
     return ms_integer(0u64, 9u64) +
-           ms_floating(0u64, 1.5f32);
+           ms_floating(0u64, 1.5f32) +
+           ms_shadow_overlap(0u64, 1.5f32, integer_source);
 }
 
 global i32 variadic_entry() {

@@ -1087,7 +1087,7 @@ if(BUILD_TESTING)
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-variadics
                 -DENTRY=variadic_entry
-                -DEXPECTED=9
+                -DEXPECTED=10
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_variadic_diagnostics

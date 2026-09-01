@@ -60,6 +60,10 @@ enum class AbiRuleAction {
     Ignore,
 };
 
+// A register transport can define physical bits wider than its declared
+// carrier. This is an ABI wire-format guarantee, not source signedness.
+enum class AbiExtensionKind : std::uint8_t { None, Zero, Sign };
+
 enum class AbiRegisterFailure {
     Stack,
     Partial,
@@ -126,6 +130,7 @@ struct AbiRule {
     unsigned max_bits{};
     unsigned unit_bits{};
     unsigned carrier_bits{};
+    AbiExtensionKind extension{AbiExtensionKind::None};
     unsigned max_elements{~0U};
     // Register cursors are counted in model-defined slots rather than bytes.
     // Some ABIs align a value to an even slot and/or consume more slots than

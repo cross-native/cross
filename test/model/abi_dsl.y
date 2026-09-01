@@ -59,14 +59,26 @@ abi "go_internal" {
         action = "stack";
     }
 
-    rule "integer" {
-        match = ["integer", "pointer"];
+    rule "pointer" {
+        match = ["pointer"];
         action = "split";
         bank = "integer";
         min_bits = 1;
         max_bits = 128;
         unit_bits = 64;
         carrier_bits = 8;
+        extension = "zero";
+    }
+
+    rule "integer" {
+        match = ["integer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 8;
+        extension = "sign";
     }
 
     rule "floating" {

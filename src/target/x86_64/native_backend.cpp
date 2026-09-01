@@ -8810,6 +8810,7 @@ struct EmittedAbiPiece {
     std::uint16_t value_bits{};
     std::uint16_t carrier_bits{};
     std::uint16_t indirect_value_bits{};
+    AbiExtensionKind extension{AbiExtensionKind::None};
 };
 
 struct EmittedAbiValue {
@@ -8847,6 +8848,7 @@ std::vector<EmittedAbiValue> dynamic_argument_locations(
                 piece.value_bits,
                 piece.carrier_bits,
                 piece.indirect_value_bits,
+                piece.extension,
             });
         }
         result.push_back(std::move(value));
@@ -8945,6 +8947,7 @@ AutomaticAbiSignature classify_scalar_signature(
                 piece.value_bits,
                 piece.carrier_bits,
                 piece.indirect_value_bits,
+                piece.extension,
             });
         }
         for (const auto& piece : assignment.shadows) {
@@ -8963,6 +8966,7 @@ AutomaticAbiSignature classify_scalar_signature(
                 piece.value_bits,
                 piece.carrier_bits,
                 piece.indirect_value_bits,
+                piece.extension,
             });
         }
         emitted.arguments.push_back(std::move(argument));
@@ -15410,6 +15414,90 @@ private:
         }
     }
 
+    void apply_abi_register_extension(
+        std::string_view reg, unsigned carrier_bits,
+        AbiExtensionKind extension) {
+        if (extension == AbiExtensionKind::None || carrier_bits >= 64) {
+            return;
+        }
+        if (carrier_bits == 0) return;
+        const auto* view = find_register_view(reg);
+        if (!view || view->register_class != RegisterClass::integer) return;
+        const auto storage = view->storage_name;
+
+        // AH/BH/CH/DH are independent byte slices rather than the low byte of
+        // their storage register.  They cannot participate in a REX.W source
+        // encoding, so first extend into the corresponding 32-bit low view.
+        const bool high_byte = carrier_bits == 8 &&
+            (reg == "ah" || reg == "bh" || reg == "ch" || reg == "dh");
+        if (high_byte) {
+            instruction(extension == AbiExtensionKind::Sign ? "movsbl"
+                                                            : "movzbl",
+                        register_name(reg, 8) + ", " +
+                            register_name(storage, 32));
+            if (extension == AbiExtensionKind::Sign) {
+                instruction("movslq", register_name(storage, 32) + ", " +
+                                           register_name(storage, 64));
+            }
+            return;
+        }
+
+        if (extension == AbiExtensionKind::Zero) {
+            if (carrier_bits == 8) {
+                instruction("movzbl", register_name(storage, 8) + ", " +
+                                           register_name(storage, 32));
+                return;
+            }
+            if (carrier_bits == 16) {
+                instruction("movzwl", register_name(storage, 16) + ", " +
+                                           register_name(storage, 32));
+                return;
+            }
+            if (carrier_bits == 32) {
+                instruction("movl", register_name(storage, 32) + ", " +
+                                         register_name(storage, 32));
+                return;
+            }
+        } else {
+            if (carrier_bits == 8) {
+                instruction("movsbq", register_name(storage, 8) + ", " +
+                                           register_name(storage, 64));
+                return;
+            }
+            if (carrier_bits == 16) {
+                instruction("movswq", register_name(storage, 16) + ", " +
+                                           register_name(storage, 64));
+                return;
+            }
+            if (carrier_bits == 32) {
+                instruction("movslq", register_name(storage, 32) + ", " +
+                                           register_name(storage, 64));
+                return;
+            }
+        }
+
+        // Model files may describe non-native carrier widths. Shifts retain
+        // exactly those low bits without reserving another ABI register.
+        const auto shift = 64U - carrier_bits;
+        instruction("shlq", "$" + std::to_string(shift) + ", " +
+                                register_name(storage, 64));
+        instruction(extension == AbiExtensionKind::Sign ? "sarq" : "shrq",
+                    "$" + std::to_string(shift) + ", " +
+                        register_name(storage, 64));
+    }
+
+    void apply_abi_register_extension(
+        std::string_view reg, const EmittedAbiPiece& piece) {
+        apply_abi_register_extension(
+            reg, piece.carrier_bits, piece.extension);
+    }
+
+    void apply_abi_register_extension(
+        std::string_view reg, const ValuePiece& piece) {
+        apply_abi_register_extension(
+            reg, piece.carrier_bits, piece.extension);
+    }
+
     void integer_register_to_f80(const machine::Function& function,
                                  machine::Register target,
                                  bool signed_integer,
@@ -19610,6 +19698,14 @@ private:
                 load(function, copy.source,
                      copy.destination->storage_name);
             }
+            // Extension is a property of the completed ABI boundary, not an
+            // ordinary copy. Delay it until every parallel source has been
+            // consumed so an argument cycle cannot observe transformed bits.
+            for (std::size_t index = 0; index < locations.size(); ++index) {
+                if (!parallel_integer_argument[index]) continue;
+                const auto& piece = locations[index].pieces.front();
+                apply_abi_register_extension(piece.reg, piece);
+            }
         };
         const auto place = [&](std::size_t index,
                                bool registers) {
@@ -19624,6 +19720,8 @@ private:
                 if (destination.in_register) {
                     instruction("leaq", memory(address) + ", " +
                                             register_name(destination.reg, 64));
+                    apply_abi_register_extension(
+                        destination.reg, destination);
                 } else {
                     instruction("leaq", memory(address) + ", %rax");
                     instruction(
@@ -19649,6 +19747,8 @@ private:
                         instruction(
                             "leaq", memory(address) + ", " +
                                         register_name(destination.reg, 64));
+                        apply_abi_register_extension(
+                            destination.reg, destination);
                     } else {
                         instruction("leaq", memory(address) + ", %rax");
                         instruction(
@@ -19691,6 +19791,8 @@ private:
                                               static_cast<std::int32_t>(byte));
                             },
                             destination.reg, destination.value_bits);
+                        apply_abi_register_extension(
+                            destination.reg, destination);
                     } else {
                         copy_frame_to_outgoing(
                             source_offset + offset,
@@ -19747,6 +19849,8 @@ private:
                                            static_cast<std::int32_t>(piece * 8U)) +
                                         ", " +
                                         register_name(destination.reg, 64));
+                        apply_abi_register_extension(
+                            destination.reg, destination);
                     } else {
                         instruction("movq",
                                     memory(source_offset +
@@ -19788,31 +19892,68 @@ private:
         for (std::size_t index = 0; index < modes.size(); ++index) {
             place(index, false);
         }
-        // Variadic shadow views are also parallel boundary moves.  Emit them
-        // before ordinary register placement so the scratch XMM/GPR cannot
-        // destroy an already prepared argument register.
+        std::optional<ReturnAssignment> result =
+            dynamic ? dynamic->result : stable.result;
+        emit_parallel_integer_arguments();
+        for (std::size_t index = 0; index < modes.size(); ++index) {
+            place(index, true);
+        }
+        // A variadic shadow is another view of an already placed argument.
+        // Copy from that stable ABI endpoint after ordinary placement instead
+        // of rereading a source register that another boundary move may have
+        // overwritten.
         for (std::size_t index = 0; index < modes.size(); ++index) {
             const auto& operand = value.operands[index + 1U];
             const auto* source =
                 std::get_if<machine::RegisterOperand>(&operand);
             if (!source) continue;
-            for (const auto& shadow : locations[index].shadows) {
+            const auto& location = locations[index];
+            for (const auto& shadow : location.shadows) {
                 if (!shadow.in_register) continue;
+                const auto primary = std::find_if(
+                    location.pieces.begin(), location.pieces.end(),
+                    [&](const EmittedAbiPiece& piece) {
+                        return piece.in_register &&
+                            piece.value_bit_offset == shadow.value_bit_offset;
+                    });
+                const auto transfer_bits =
+                    source->value.mode.bits <= 32 ? 32U : 64U;
                 if (shadow.floating) {
-                    load_float(function, source->value, "xmm0");
-                    instruction(
-                        source->value.mode.bits <= 32 ? "movd" : "movq",
-                        "%xmm0, " +
-                            register_name(shadow.reg,
-                                          source->value.mode.bits <= 32
-                                              ? 32 : 64));
+                    if (primary != location.pieces.end() &&
+                        primary->floating) {
+                        instruction(
+                            source->value.mode.bits <= 32 ? "movd" : "movq",
+                            register_name(primary->reg,
+                                          source->value.mode.bits) + ", " +
+                                register_name(shadow.reg, transfer_bits));
+                    } else {
+                        load_float(function, source->value, "xmm0");
+                        instruction(
+                            source->value.mode.bits <= 32 ? "movd" : "movq",
+                            "%xmm0, " +
+                                register_name(shadow.reg, transfer_bits));
+                    }
+                } else if (primary != location.pieces.end() &&
+                           !primary->floating) {
+                    const auto* input = find_register_view(primary->reg);
+                    const auto* output = find_register_view(shadow.reg);
+                    if (!input || !output ||
+                        input->storage_id != output->storage_id) {
+                        instruction(
+                            "mov" + std::string(1, suffix(transfer_bits)),
+                            register_name(primary->reg, transfer_bits) + ", " +
+                                register_name(shadow.reg, transfer_bits));
+                    }
+                    apply_abi_register_extension(shadow.reg, shadow);
                 } else {
                     load(function, source->value, shadow.reg);
+                    apply_abi_register_extension(shadow.reg, shadow);
                 }
             }
         }
-        std::optional<ReturnAssignment> result =
-            dynamic ? dynamic->result : stable.result;
+        // The hidden result pointer is itself a register-boundary write.  It
+        // is independent of every argument, so materialize it last: doing so
+        // cannot destroy a source still needed by the parallel argument move.
         if (result && result->indirect) {
             if (value.defs.empty() || result->pieces.empty() ||
                 result->pieces.front().location.kind !=
@@ -19826,11 +19967,10 @@ private:
                     memory(vreg_offset(function, value.defs.front())) + ", " +
                         register_name(
                             result->pieces.front().location.reg, 64));
+                apply_abi_register_extension(
+                    result->pieces.front().location.reg,
+                    result->pieces.front());
             }
-        }
-        emit_parallel_integer_arguments();
-        for (std::size_t index = 0; index < modes.size(); ++index) {
-            place(index, true);
         }
         if (tail) {
             if (uses_wide_vectors_) instruction("vzeroupper");
@@ -19992,7 +20132,15 @@ private:
             const auto* callee_view = find_register_view(
                 callee_result.pieces.front().location.reg);
             if (!caller_view || !callee_view ||
-                caller_view->storage_id != callee_view->storage_id) {
+                caller_view->storage_id != callee_view->storage_id ||
+                caller_result.pieces.front().value_bit_offset !=
+                    callee_result.pieces.front().value_bit_offset ||
+                caller_result.pieces.front().value_bits !=
+                    callee_result.pieces.front().value_bits ||
+                caller_result.pieces.front().carrier_bits !=
+                    callee_result.pieces.front().carrier_bits ||
+                caller_result.pieces.front().extension !=
+                    callee_result.pieces.front().extension) {
                 return false;
             }
         }
@@ -20885,6 +21033,8 @@ private:
                                         piece.value_bit_offset / 8U + byte));
                             },
                             piece.location.reg, piece.value_bits);
+                        apply_abi_register_extension(
+                            piece.location.reg, piece);
                     }
                 } else if (is_vector(hir_, entity.result_type)) {
                     const auto source =
@@ -20912,9 +21062,18 @@ private:
                     load(function, value.uses.front(),
                          result->pieces[0].location.reg,
                          result->pieces[1].location.reg);
+                    apply_abi_register_extension(
+                        result->pieces[0].location.reg,
+                        result->pieces[0]);
+                    apply_abi_register_extension(
+                        result->pieces[1].location.reg,
+                        result->pieces[1]);
                 } else {
                     load(function, value.uses.front(),
                          result->pieces.front().location.reg);
+                    apply_abi_register_extension(
+                        result->pieces.front().location.reg,
+                        result->pieces.front());
                 }
             }
         }
