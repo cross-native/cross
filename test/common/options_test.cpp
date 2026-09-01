@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "common/options.hpp"
 #include "model/model.hpp"
+#include "target/mips/target.hpp"
 #include "target/subtarget.hpp"
 #include "target/x86_64/target.hpp"
 
@@ -160,18 +161,61 @@ int main() {
 
     const auto mips_policy = parse(
         {"cc", "-O2", "-mprofile=vr4300-o32"});
+    const auto mips1_policy = parse(
+        {"cc", "-O2", "-mprofile=r3000-o32"});
     const auto x86_policy = parse(
         {"cc", "-O2", "-mprofile=x86_64-elf"});
     const auto custom_policy = parse(
         {"cc", "-O2", "-mprofile=vr4300-o32",
          "-mrisc-cisc-balance=37", "-fno-machine-cse"});
-    ok = expect(mips_policy && x86_policy && custom_policy &&
+    ok = expect(mips_policy && mips1_policy && x86_policy && custom_policy &&
                     mips_policy->risc_cisc_balance == 0 &&
                     x86_policy->risc_cisc_balance == 100 &&
                     custom_policy->risc_cisc_balance == 37 &&
                     !custom_policy->machine_cse &&
                     custom_policy->machine_load_cse,
                 "target policy or independent machine-pass override did not resolve") &&
+         ok;
+
+    std::ostringstream mips_cost_errors;
+    cross::Diagnostics mips_cost_diagnostics(mips_cost_errors);
+    const auto mips_selected = mips_policy
+        ? cross::resolve_subtarget(
+              cross::mips_target(), *mips_policy, mips_cost_diagnostics)
+        : std::nullopt;
+    ok = expect(
+             mips_selected &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {32, 1664525, 0, false}) == 2 &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {32, 65536, 0, false}) == 1 &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {32, 0xffff8000U, 0, true}) == 1 &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {64, 0x100000000ULL, 0, false}) == 2 &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {64, 0x100000001ULL, 0, false}) == 3 &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {64, 0x0000ffffffff0000ULL, 0, false}) == 3 &&
+                 mips_selected->integer_constant_materialization_cost(
+                     {64, 0xffffffffffff8000ULL, 0, true}) == 1,
+             "MIPS integer materialization costs do not match ISA forms") &&
+         ok;
+
+    std::ostringstream mips1_cost_errors;
+    cross::Diagnostics mips1_cost_diagnostics(mips1_cost_errors);
+    const auto mips1_selected = mips1_policy
+        ? cross::resolve_subtarget(
+              cross::mips_target(), *mips1_policy,
+              mips1_cost_diagnostics)
+        : std::nullopt;
+    ok = expect(
+             mips1_selected &&
+                 mips1_selected->integer_constant_materialization_cost(
+                     {64, 0x000000010019660dULL, 0, false}) == 3 &&
+                 mips1_selected->integer_constant_materialization_cost(
+                     {64, 0xffff800000010000ULL, 0, false}) == 2,
+             "pre-MIPS-III pair materialization costs do not match word forms") &&
          ok;
 
     const auto fast_then_granular = parse(
@@ -277,8 +321,12 @@ int main() {
                     selected->has_feature(
                         cross::x86_64::Feature::Avx512bw) &&
                     selected->feature_name(
-                        cross::x86_64::Feature::Avx2) == "avx2",
-                "typed target-feature queries did not match text resolution") &&
+                        cross::x86_64::Feature::Avx2) == "avx2" &&
+                    selected->integer_constant_materialization_cost(
+                        {32, 1664525, 0, false}) == 1 &&
+                    selected->integer_constant_materialization_cost(
+                        {64, 0x100000000ULL, 0, false}) == 2,
+                "typed target feature/cost queries did not match resolution") &&
          ok;
 
     const auto architecture_level = parse({"cc", "-march=x86-64-v4"});

@@ -8146,23 +8146,21 @@ bool if_convert_diamonds(ManagedFunction& function,
 
 bool safely_loop_invariant(const ManagedValue& value,
                            const ManagedFunction& function,
-                           const hir::Module& hir_module) {
+                           const hir::Module& hir_module,
+                           const Subtarget& subtarget) {
     if (value.effect_input || value.effect_output ||
         value.is_volatile_access || value.patch_sink) {
         return false;
     }
     switch (value.kind) {
-    // Small integers normally become instruction immediates and are best
-    // rematerialized. Values wider than the target's common signed 32-bit
-    // immediate require one or more materialization instructions, so keeping
-    // them outside a hot loop is worth the longer live range.
+    // Keep immediate-like values close to their uses, but hoist constants
+    // that the resolved target says are expensive to rematerialize.  The
+    // target owns encoding and ISA-feature details; MIR owns LICM policy.
     case ValueKind::ConstantInteger: {
         const auto bits = type_bits(hir_module, value.type);
-        if (bits > 64 || value.integer_high != 0) return true;
-        if (bits < 64) return false;
-        const auto signed_value = static_cast<std::int64_t>(value.integer);
-        return signed_value < std::numeric_limits<std::int32_t>::min() ||
-               signed_value > std::numeric_limits<std::int32_t>::max();
+        return subtarget.integer_constant_materialization_cost(
+                   {bits, value.integer, value.integer_high,
+                    signed_type(hir_module, value.type)}) > 1;
     }
     // A nonzero f32/f64 literal otherwise costs a GPR materialization plus a
     // transfer to SIMD on every trip. Hoist it once; zero remains a cheap
@@ -8208,8 +8206,10 @@ bool safely_loop_invariant(const ManagedValue& value,
 
 bool supports_loop_invariant(const ManagedValue& value,
                              const ManagedFunction& function,
-                             const hir::Module& hir_module) {
-    if (safely_loop_invariant(value, function, hir_module)) return true;
+                             const hir::Module& hir_module,
+                             const Subtarget& subtarget) {
+    if (safely_loop_invariant(
+            value, function, hir_module, subtarget)) return true;
     // Small integer literals are deliberately rematerialized in ordinary
     // loop bodies, but they must still participate in the invariant closure.
     // Otherwise a cheap literal such as the mask in `bound & -16` pins the
@@ -8222,6 +8222,7 @@ bool supports_loop_invariant(const ManagedValue& value,
 
 void move_loop_invariants(ManagedFunction& function,
                           const hir::Module& hir_module,
+                          const Subtarget& subtarget,
                           std::span<const CanonicalLoop> loops) {
     if (function.blocks.size() < 2) return;
     std::vector<std::optional<BlockId>> definition_block(
@@ -8243,7 +8244,7 @@ void move_loop_invariants(ManagedFunction& function,
                     if (invariant.contains(id.value)) continue;
                     const auto& value = function.values[id.value];
                     if (!supports_loop_invariant(
-                            value, function, hir_module)) {
+                            value, function, hir_module, subtarget)) {
                         continue;
                     }
                     const bool operands_invariant = std::all_of(
@@ -8272,7 +8273,8 @@ void move_loop_invariants(ManagedFunction& function,
         std::vector<ValueId> pending;
         for (const auto id : moved) {
             if (safely_loop_invariant(
-                    function.values[id.value], function, hir_module)) {
+                    function.values[id.value], function, hir_module,
+                    subtarget)) {
                 required.insert(id.value);
                 pending.push_back(id);
             }
@@ -13279,7 +13281,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             [&](ManagedFunction& function,
                 FunctionAnalysisManager& analyses) {
                 move_loop_invariants(
-                    function, hir_module,
+                    function, hir_module, subtarget,
                     analyses.loops().canonical_loops());
                 return PassResult::changed_values();
             });
@@ -13346,7 +13348,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             [&](ManagedFunction& function,
                 FunctionAnalysisManager& analyses) {
                 move_loop_invariants(
-                    function, hir_module,
+                    function, hir_module, subtarget,
                     analyses.loops().canonical_loops());
                 return PassResult::changed_values();
             });

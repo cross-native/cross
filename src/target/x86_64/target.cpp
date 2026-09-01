@@ -51,6 +51,17 @@ std::vector<RegisterEntry> target_registers() {
     return result;
 }
 
+unsigned integer_constant_materialization_cost(
+    const Subtarget&, const IntegerConstantCostQuery& query) {
+    if (query.bits > 64 || query.high != 0) return 2;
+    if (query.bits < 64) return 1;
+    const auto value = static_cast<std::int64_t>(query.low);
+    return value < std::numeric_limits<std::int32_t>::min() ||
+                   value > std::numeric_limits<std::int32_t>::max()
+               ? 2U
+               : 1U;
+}
+
 InstructionOperandEntry integer_register_operand(
     InstructionOperandRole role, unsigned bits) {
     return {role, true, false, bits, 0, false,
@@ -2662,6 +2673,7 @@ const TargetInfo target{
          "preferred maximum width for internal vector operations"},
     },
     &subtargets,
+    {integer_constant_materialization_cost},
 };
 
 } // namespace

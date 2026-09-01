@@ -90,6 +90,8 @@ public:
         std::string_view name) const;
     [[nodiscard]] std::string_view feature_name(
         TargetFeatureId feature) const;
+    [[nodiscard]] unsigned integer_constant_materialization_cost(
+        const IntegerConstantCostQuery& query) const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;
     }

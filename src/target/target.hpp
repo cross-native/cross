@@ -14,6 +14,7 @@
 
 namespace cross {
 
+class Subtarget;
 struct SubtargetTable;
 
 struct AbiId {
@@ -342,6 +343,25 @@ struct TargetDataLayout {
     unsigned f80_alignment{1};
 };
 
+// Target-independent optimizations describe the value they need priced;
+// target modules decide how expensive that value is for the resolved ISA and
+// tuning CPU.  Costs are relative rematerialization units rather than literal
+// instruction counts: one means cheap enough to recreate at a use, while a
+// larger value can justify extending a live range.
+struct IntegerConstantCostQuery {
+    unsigned bits{};
+    std::uint64_t low{};
+    std::uint64_t high{};
+    bool is_signed{};
+};
+
+struct TargetCostModel {
+    using IntegerConstantMaterializationCost =
+        unsigned (*)(const Subtarget&, const IntegerConstantCostQuery&);
+
+    IntegerConstantMaterializationCost integer_constant_materialization{};
+};
+
 struct TargetInfo {
     std::string_view architecture;
     std::vector<std::string_view> triple_prefixes;
@@ -356,6 +376,7 @@ struct TargetInfo {
     std::vector<VectorWidthEntry> native_vector_widths;
     std::vector<OptionDefinition> options;
     const SubtargetTable* subtargets{};
+    TargetCostModel cost_model;
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;

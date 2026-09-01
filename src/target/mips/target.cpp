@@ -3,10 +3,15 @@
 #include "target/mips/target.hpp"
 
 #include "common/options.hpp"
+#include "target/mips/features.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
+#include <limits>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -67,6 +72,87 @@ std::vector<RegisterEntry> target_registers() {
     result.push_back({"lo", "lo", 64, "special", "mips1", false,
                       {}, true});
     return result;
+}
+
+unsigned word_constant_materialization_cost(std::uint32_t value) {
+    const auto signed_value = static_cast<std::int32_t>(value);
+    if ((signed_value >= std::numeric_limits<std::int16_t>::min() &&
+         signed_value <= std::numeric_limits<std::int16_t>::max()) ||
+        value <= std::numeric_limits<std::uint16_t>::max() ||
+        (value & std::numeric_limits<std::uint16_t>::max()) == 0) {
+        return 1;
+    }
+    return 2;
+}
+
+unsigned mips64_constant_materialization_cost(std::uint64_t value) {
+    if (value == 0) return 1;
+
+    const auto word = static_cast<std::uint32_t>(value);
+    const auto sign_extended_word = (word & 0x80000000U) != 0
+        ? 0xffffffff00000000ULL | word
+        : static_cast<std::uint64_t>(word);
+    if (value == sign_extended_word) {
+        return word_constant_materialization_cost(word);
+    }
+
+    // GNU as first searches for an unsigned 16-bit value plus one DSLL.
+    // This catches sparse constants such as 1<<32 without committing to the
+    // fixed four-chunk construction used for a general `dli`.
+    const auto low_bit = static_cast<unsigned>(std::countr_zero(value));
+    const auto shifted = value >> low_bit;
+    if (std::bit_width(shifted) <= 16) return 2;
+
+    // A shifted run of ones is cheaper to create from ADDIU -1 followed by
+    // one or two shifts.  This is the other GNU-as fast path used by the
+    // compiler's emitted `dli` pseudo-op.
+    if ((shifted & (shifted + 1U)) == 0) {
+        const auto leading_zeroes = static_cast<unsigned>(
+            std::countl_zero(static_cast<std::uint32_t>(value >> 32U)));
+        if (leading_zeroes != 0) return low_bit == 0 ? 2U : 3U;
+    }
+
+    // General GNU-as construction: load a sign-extended high word, then
+    // append the nonzero 16-bit pieces of the low word with DSLL/ORI.
+    const auto high = static_cast<std::uint32_t>(value >> 32U);
+    const auto low = static_cast<std::uint32_t>(value);
+    unsigned cost = high == 0 ? 0U
+                              : word_constant_materialization_cost(high);
+    const bool loaded = high != 0;
+    if ((low & 0xffff0000U) == 0) {
+        if (loaded) ++cost; // DSLL32
+    } else {
+        if (loaded) ++cost; // DSLL 16
+        ++cost;             // ORI high half
+        ++cost;             // DSLL 16
+    }
+    if ((low & 0xffffU) != 0) ++cost;
+    return cost;
+}
+
+unsigned integer_constant_materialization_cost(
+    const Subtarget& subtarget, const IntegerConstantCostQuery& query) {
+    if (query.bits == 0) return 1;
+    if (query.bits > 64 || query.high != 0) return 4;
+
+    const auto width = std::min(query.bits, 64U);
+    const auto mask = width == 64
+        ? std::numeric_limits<std::uint64_t>::max()
+        : (std::uint64_t{1} << width) - 1U;
+    const auto value = query.low & mask;
+    if (width <= 32) {
+        return word_constant_materialization_cost(
+            static_cast<std::uint32_t>(value));
+    }
+
+    if (!subtarget.has_feature(mips::Feature::Mips3)) {
+        return word_constant_materialization_cost(
+                   static_cast<std::uint32_t>(value)) +
+               word_constant_materialization_cost(
+                   static_cast<std::uint32_t>(value >> 32U));
+    }
+
+    return mips64_constant_materialization_cost(value);
 }
 
 const SubtargetTable subtargets{
@@ -228,6 +314,7 @@ TargetInfo make_target(ByteOrder order,
         {},
         target_options(),
         &subtargets,
+        {integer_constant_materialization_cost},
     };
 }
 

@@ -70,6 +70,7 @@ compile_variant(no_schedule -fno-schedule-insns)
 compile_variant(no_machine_combine -fno-machine-combine)
 compile_variant(no_slsr -fno-tree-slsr)
 compile_variant(no_ccp -fno-tree-ccp)
+compile_variant(no_licm -fno-move-loop-invariants)
 compile_variant(cisc -mrisc-cisc-balance=100)
 compile_variant(fix4300 -mfix4300)
 compile_variant(fix4300_no_schedule -mfix4300 -fno-schedule-insns)
@@ -380,6 +381,17 @@ if(unit_exit MATCHES "[\t ]sltu[\t ]" OR
         "MIR unit induction exit selection did not replace unsigned-less "
         "or honor -fno-ivopts\n"
         "selected:\n${unit_exit}\nordinary:\n${ordered_exit}")
+endif()
+
+function_body("${OUTPUT}.no_licm.s" mips_affine_exit rematerialized_exit)
+if(NOT unit_exit MATCHES "[\t ]li[\t ][^\n]*,1664525" OR
+   unit_exit MATCHES "\\.bb\\.[0-9]+:\n[\t ]+li[\t ][^\n]*,1664525" OR
+   NOT rematerialized_exit MATCHES
+       "\\.bb\\.[0-9]+:\n[\t ]+li[\t ][^\n]*,1664525")
+    message(FATAL_ERROR
+        "target-costed MIR LICM did not hoist a two-instruction MIPS "
+        "constant or honor -fno-move-loop-invariants\n"
+        "enabled:\n${unit_exit}\ndisabled:\n${rematerialized_exit}")
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_narrow_mask narrow_big)

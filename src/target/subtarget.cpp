@@ -44,6 +44,25 @@ bool Subtarget::has_feature(TargetFeatureId feature) const {
            (enabled_feature_words_[word] & (std::uint64_t{1} << bit)) != 0;
 }
 
+unsigned Subtarget::integer_constant_materialization_cost(
+    const IntegerConstantCostQuery& query) const {
+    if (target_ && target_->cost_model.integer_constant_materialization) {
+        return target_->cost_model.integer_constant_materialization(
+            *this, query);
+    }
+
+    // Preserve the generic policy used before targets supplied costs.  Small
+    // integers normally fold into an instruction immediate; wide values need
+    // a separately materialized register on common 64-bit machines.
+    if (query.bits > 64 || query.high != 0) return 2;
+    if (query.bits < 64) return 1;
+    const auto value = static_cast<std::int64_t>(query.low);
+    return value < std::numeric_limits<std::int32_t>::min() ||
+                   value > std::numeric_limits<std::int32_t>::max()
+               ? 2U
+               : 1U;
+}
+
 std::optional<TargetFeatureId> Subtarget::feature_id(
     std::string_view name) const {
     if (!table_) return std::nullopt;
