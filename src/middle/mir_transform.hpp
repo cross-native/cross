@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "middle/mir.hpp"
+#include "middle/mir_analysis.hpp"
+
+#include <span>
 
 namespace cross::mir {
 
@@ -15,9 +17,20 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 [[nodiscard]] bool narrow_bitwise_values(
     ManagedFunction& function, hir::Module& hir_module,
     const TargetInfo& target);
+// Combine equal-width narrow operands before one shared zero extension. This
+// preserves exact bitwise semantics while shortening wide XOR/OR/AND chains.
+[[nodiscard]] bool factor_zero_extended_bitwise_chains(
+    ManagedFunction& function, const hir::Module& hir_module);
 [[nodiscard]] bool eliminate_forwarding_blocks(ManagedFunction& function);
 [[nodiscard]] bool factor_common_phi_tails(
     ManagedFunction& function, const hir::Module& hir_module);
+// Reuse an existing unsigned `index + 1` latch value in expressions shaped
+// as `(base + index) + 1`. This is modular integer algebra, but deliberately
+// requires a canonical unit recurrence so the rewrite removes an add instead
+// of merely changing evaluation order or increasing register pressure.
+[[nodiscard]] bool reassociate_unit_recurrence_adds(
+    ManagedFunction& function, const hir::Module& hir_module,
+    std::span<const CanonicalLoop> loops, const UseLists& use_lists);
 // Convert a legal outermost top-tested natural loop into an initial zero-trip
 // guard and a bottom-tested loop. The transform repairs value SSA and effect
 // SSA and deliberately rejects secondary exits, multiple latches, compact

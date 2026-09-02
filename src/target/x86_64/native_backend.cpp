@@ -1515,6 +1515,46 @@ private:
             }
             instruction.uses.push_back(source);
             instruction.defs.push_back(reg(value.id));
+            const auto append_clobber = [&](std::string_view name,
+                                            machine::IntegerMode mode) {
+                if (const auto* scratch = find_register_view(name)) {
+                    instruction.clobbers.push_back(
+                        machine::Register::physical_register(
+                            {scratch->storage_id}, mode));
+                }
+            };
+            const auto source_bits = reg(value.operands.front()).mode.bits;
+            const auto target_bits = reg(value.id).mode.bits;
+            if ((value.cast == mir::CastOperation::SignedIntegerToFloat ||
+                 value.cast == mir::CastOperation::UnsignedIntegerToFloat) &&
+                source_bits <= 64 && target_bits <= 64) {
+                // Scalar CVTSI lowering stages its integer through RAX and
+                // publishes through XMM0.  These fixed scratches must be
+                // visible to allocation even when the conversion result is
+                // later coalesced toward a return endpoint.
+                append_clobber("rax", machine::i64);
+                append_clobber("xmm0", machine::i128);
+                if (value.cast ==
+                        mir::CastOperation::UnsignedIntegerToFloat &&
+                    source_bits == 64) {
+                    append_clobber("r10", machine::i64);
+                }
+            } else if (
+                (value.cast == mir::CastOperation::FloatToSignedInteger ||
+                 value.cast == mir::CastOperation::FloatToUnsignedInteger) &&
+                source_bits <= 64 && target_bits <= 64) {
+                // Scalar CVTT lowering consumes XMM0 and writes RAX.  The
+                // unsigned 64-bit expansion additionally uses XMM1/R10 for
+                // its 2^63 split.
+                append_clobber("rax", machine::i64);
+                append_clobber("xmm0", machine::i128);
+                if (value.cast ==
+                        mir::CastOperation::FloatToUnsignedInteger &&
+                    target_bits == 64) {
+                    append_clobber("r10", machine::i64);
+                    append_clobber("xmm1", machine::i128);
+                }
+            }
             return instruction;
         }
         if (value.kind == ValueKind::Select) {

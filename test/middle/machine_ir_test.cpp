@@ -3,6 +3,7 @@
 
 #include "middle/machine_ir.hpp"
 
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <string_view>
@@ -159,6 +160,46 @@ int main() {
         ok = expect(rejected(std::move(function),
                              "input projection requires"),
                     "width-mismatched boundary projection was accepted") &&
+             ok;
+    }
+    {
+        auto function = valid_function();
+        function.virtual_registers = {
+            cross::machine::i64, cross::machine::i32};
+        function.virtual_register_assignments.resize(2);
+        function.rematerialized_immediates.resize(2);
+        function.virtual_register_classes = {
+            cross::machine::VirtualRegisterClass::Integer,
+            cross::machine::VirtualRegisterClass::Integer};
+        for (std::uint32_t id = 0; id < 2; ++id) {
+            cross::machine::Instruction definition;
+            definition.kind = cross::machine::InstructionKind::Target;
+            definition.opcode = cross::machine::TargetOpcodeId{id + 1};
+            definition.defs.push_back(
+                cross::machine::Register::virtual_register(
+                    {id}, function.virtual_registers[id]));
+            function.blocks.front().instructions.insert(
+                function.blocks.front().instructions.end() - 1,
+                std::move(definition));
+        }
+        auto& result = function.blocks.front().instructions.back();
+        result.uses = {
+            cross::machine::Register::virtual_register(
+                {0}, cross::machine::i64),
+            cross::machine::Register::virtual_register(
+                {1}, cross::machine::i32)};
+        result.result_composition =
+            cross::machine::ResultComposition::XorZeroExtend;
+        std::ostringstream text;
+        cross::Diagnostics diagnostics(text);
+        ok = expect(cross::machine::verify(function, diagnostics),
+                    "well-formed result composition was rejected") &&
+             ok;
+
+        result.result_extension = cross::machine::ExtensionKind::Zero;
+        ok = expect(rejected(std::move(function),
+                             "result composition requires"),
+                    "composed and extended result was accepted") &&
              ok;
     }
     return ok ? 0 : 1;

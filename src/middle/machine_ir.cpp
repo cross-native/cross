@@ -242,6 +242,17 @@ bool verify_instruction(const Instruction& instruction, const Function& function
         ok = fail(diagnostics, instruction.location,
                   "machine result extension requires one return value");
     }
+    if (instruction.result_composition != ResultComposition::None &&
+        (instruction.kind != InstructionKind::Return ||
+         instruction.uses.size() != 2 ||
+         instruction.uses[0].mode.bits <=
+             instruction.uses[1].mode.bits ||
+         instruction.result_extension != ExtensionKind::None)) {
+        ok = fail(
+            diagnostics, instruction.location,
+            "machine result composition requires two differently wide "
+            "return values and no result extension");
+    }
     if (instruction.patch) {
         if (instruction.kind != InstructionKind::Target ||
             instruction.patch->field_bits == 0 ||

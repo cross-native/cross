@@ -296,6 +296,194 @@ bool narrow_single_use_integer_loads(ManagedFunction& function,
     return changed;
 }
 
+bool factor_zero_extended_bitwise_chains_impl(
+    ManagedFunction& function, const hir::Module& hir_module) {
+    struct Plan {
+        BlockId block;
+        ValueId root;
+        ValueId inner;
+        ValueId first_extend;
+        ValueId second_extend;
+        ValueId wide_base;
+        ValueId first_narrow;
+        ValueId second_narrow;
+        hir::TypeId narrow_type;
+        BinaryOperation operation{BinaryOperation::BitXor};
+        SourceLocation location;
+        bool direct{};
+    };
+
+    const UseLists uses(function);
+    const auto zero_extension = [&](ValueId id, hir::TypeId wide_type)
+        -> const ManagedValue* {
+        if (id.value >= function.values.size()) return nullptr;
+        const auto& value = function.values[id.value];
+        return value.kind == ValueKind::Cast &&
+                value.cast == CastOperation::ZeroExtend &&
+                value.type == wide_type && value.operands.size() == 1 &&
+                !value.effect_input && !value.effect_output
+            ? &value
+            : nullptr;
+    };
+    const auto bitwise = [](BinaryOperation operation) {
+        return operation == BinaryOperation::BitAnd ||
+            operation == BinaryOperation::BitOr ||
+            operation == BinaryOperation::BitXor;
+    };
+
+    std::vector<Plan> plans;
+    std::unordered_set<std::uint32_t> reserved;
+    for (const auto& block : function.blocks) {
+        for (const auto root_id : block.values) {
+            const auto& root = function.values[root_id.value];
+            if (root.kind != ValueKind::Binary || !bitwise(root.binary) ||
+                root.operands.size() != 2 || root.effect_input ||
+                root.effect_output || reserved.contains(root_id.value)) {
+                continue;
+            }
+            const auto wide_bits =
+                scalar_integer_bits(hir_module, root.type);
+            if (wide_bits == 0) continue;
+
+            const auto* left_extend =
+                zero_extension(root.operands[0], root.type);
+            const auto* right_extend =
+                zero_extension(root.operands[1], root.type);
+            if (left_extend && right_extend) {
+                const auto first = left_extend->operands.front();
+                const auto second = right_extend->operands.front();
+                if (function.values[first.value].type !=
+                        function.values[second.value].type ||
+                    scalar_integer_bits(
+                        hir_module, function.values[first.value].type) >=
+                        wide_bits) {
+                    continue;
+                }
+                plans.push_back(
+                    {block.id, root_id, {}, root.operands[0],
+                     root.operands[1], {}, first, second,
+                     function.values[first.value].type, root.binary,
+                     root.location, true});
+                reserved.insert(root_id.value);
+                reserved.insert(root.operands[0].value);
+                reserved.insert(root.operands[1].value);
+                continue;
+            }
+
+            for (unsigned outer_extend_index = 0;
+                 outer_extend_index < 2; ++outer_extend_index) {
+                const auto outer_extend_id =
+                    root.operands[outer_extend_index];
+                const auto inner_id =
+                    root.operands[1U - outer_extend_index];
+                const auto* outer_extend =
+                    zero_extension(outer_extend_id, root.type);
+                if (!outer_extend || inner_id.value >= function.values.size() ||
+                    reserved.contains(inner_id.value)) {
+                    continue;
+                }
+                const auto& inner = function.values[inner_id.value];
+                if (inner.kind != ValueKind::Binary ||
+                    inner.binary != root.binary || inner.type != root.type ||
+                    inner.operands.size() != 2 || inner.effect_input ||
+                    inner.effect_output || uses.uses(inner_id).size() != 1) {
+                    continue;
+                }
+                for (unsigned inner_extend_index = 0;
+                     inner_extend_index < 2; ++inner_extend_index) {
+                    const auto inner_extend_id =
+                        inner.operands[inner_extend_index];
+                    const auto wide_base =
+                        inner.operands[1U - inner_extend_index];
+                    const auto* inner_extend =
+                        zero_extension(inner_extend_id, root.type);
+                    if (!inner_extend ||
+                        zero_extension(wide_base, root.type) ||
+                        reserved.contains(inner_extend_id.value)) {
+                        continue;
+                    }
+                    const auto first = inner_extend->operands.front();
+                    const auto second = outer_extend->operands.front();
+                    const auto narrow_type =
+                        function.values[first.value].type;
+                    const auto narrow_bits =
+                        scalar_integer_bits(hir_module, narrow_type);
+                    if (function.values[second.value].type != narrow_type ||
+                        function.values[wide_base.value].type != root.type ||
+                        narrow_bits == 0 || narrow_bits >= wide_bits) {
+                        continue;
+                    }
+                    plans.push_back(
+                        {block.id, root_id, inner_id, inner_extend_id,
+                         outer_extend_id, wide_base, first, second,
+                         narrow_type, root.binary, root.location, false});
+                    reserved.insert(root_id.value);
+                    reserved.insert(inner_id.value);
+                    reserved.insert(inner_extend_id.value);
+                    reserved.insert(outer_extend_id.value);
+                    inner_extend_index = 2;
+                }
+                if (!plans.empty() && plans.back().root == root_id) break;
+            }
+        }
+    }
+    if (plans.empty()) return false;
+
+    std::unordered_set<std::uint32_t> removed;
+    for (const auto& plan : plans) {
+        auto& block = function.blocks[plan.block.value];
+        const auto position =
+            std::find(block.values.begin(), block.values.end(), plan.root);
+        if (position == block.values.end()) continue;
+
+        ManagedValue narrow;
+        narrow.id = {
+            static_cast<std::uint32_t>(function.values.size())};
+        narrow.location = plan.location;
+        narrow.type = plan.narrow_type;
+        narrow.kind = ValueKind::Binary;
+        narrow.binary = plan.operation;
+        narrow.operands = {plan.first_narrow, plan.second_narrow};
+        const auto narrow_id = narrow.id;
+        function.values.push_back(std::move(narrow));
+
+        ManagedValue extend;
+        extend.id = {
+            static_cast<std::uint32_t>(function.values.size())};
+        extend.location = plan.location;
+        extend.type = function.values[plan.root.value].type;
+        extend.kind = ValueKind::Cast;
+        extend.cast = CastOperation::ZeroExtend;
+        extend.operands = {narrow_id};
+        const auto extend_id = extend.id;
+        function.values.push_back(std::move(extend));
+
+        const auto insertion = static_cast<std::size_t>(
+            position - block.values.begin());
+        block.values.insert(
+            block.values.begin() + static_cast<std::ptrdiff_t>(insertion),
+            {narrow_id, extend_id});
+        auto& root = function.values[plan.root.value];
+        if (plan.direct) {
+            root.kind = ValueKind::Cast;
+            root.cast = CastOperation::ZeroExtend;
+            root.operands = {narrow_id};
+            removed.insert(extend_id.value);
+        } else {
+            root.operands = {plan.wide_base, extend_id};
+            removed.insert(plan.inner.value);
+        }
+        if (uses.uses(plan.first_extend).size() == 1) {
+            removed.insert(plan.first_extend.value);
+        }
+        if (uses.uses(plan.second_extend).size() == 1) {
+            removed.insert(plan.second_extend.value);
+        }
+    }
+    remove_values(function, removed);
+    return true;
+}
+
 bool canonicalize_bitwise_operations_impl(ManagedFunction& function,
                                           const hir::Module& hir_module) {
     const UseLists uses(function);
@@ -1349,11 +1537,18 @@ bool canonicalize_bitwise_operations(ManagedFunction& function,
 bool narrow_bitwise_values(ManagedFunction& function,
                            hir::Module& hir_module,
                            const TargetInfo& target) {
+    const bool factored =
+        factor_zero_extended_bitwise_chains_impl(function, hir_module);
     const bool commuted =
         commute_masked_truncations(function, hir_module);
     const bool narrowed =
         narrow_single_use_integer_loads(function, hir_module, target);
-    return commuted || narrowed;
+    return factored || commuted || narrowed;
+}
+
+bool factor_zero_extended_bitwise_chains(
+    ManagedFunction& function, const hir::Module& hir_module) {
+    return factor_zero_extended_bitwise_chains_impl(function, hir_module);
 }
 
 void compact_managed_values(ManagedFunction& function) {

@@ -87,6 +87,24 @@ global u64 allocated_expect(in u64 left, in u64 right) {
     return $::expect(left + right, 1);
 }
 
+[[noinline, abi("ms_abi")]]
+global u32 allocated_float_to_integer(in u32 left, in u32 right) {
+    f64 halved = left;
+    u32 converted_halved = halved * 0.5f64;
+    f64 direct = right;
+    u32 converted_direct = direct;
+    return converted_halved + converted_direct;
+}
+
+[[noinline, abi("ms_abi")]]
+global i32 allocated_float_to_signed_integer(in u32 left, in i32 right) {
+    f64 halved = left;
+    i32 converted_halved = halved * 0.5f64;
+    f64 direct = right;
+    i32 converted_direct = direct;
+    return converted_halved + converted_direct;
+}
+
 [[noinline]]
 global u64 allocated_rotate(in u64 value, in u64 count) {
     u64 result = value;
@@ -113,5 +131,8 @@ global i32 register_allocation_entry() {
            $::runtime(allocated_aligned_float_split(2.0, 4.0)) == 11.0 &&
            $::runtime(allocated_fptr(3.0fptr, 4.0fptr)) == 13.0fptr &&
            $::runtime(allocated_expect(6, 7)) == 13 &&
+           $::runtime(allocated_float_to_integer(10u32, 7u32)) == 12u32 &&
+           $::runtime(allocated_float_to_signed_integer(10u32, -7i32)) ==
+               -2i32 &&
            $::runtime(allocated_rotate(1u64, 3u64)) == 64u64;
 }

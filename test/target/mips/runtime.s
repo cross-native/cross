@@ -51,6 +51,38 @@ _start:
         bne     $v1,$t0,.Lfail
         nop
 
+        # Mixed-width XOR is returned by composing the two o32 result words
+        # directly. Exercise a low word with bit 31 set before the XOR so the
+        # optimization cannot rely on physical zero-canonical inputs.
+        addiu   $k0,$zero,'B'
+        lui     $a0,0x0123
+        ori     $a0,$a0,0x4567
+        lui     $a1,0x89ab
+        ori     $a1,$a1,0xcdef
+        lui     $a2,0x8000
+        jal     mips_mixed_xor
+        nop
+        lui     $t0,0x0123
+        ori     $t0,$t0,0x4567
+        bne     $v0,$t0,.Lfail
+        nop
+        lui     $t0,0x09ab
+        ori     $t0,$t0,0xcdef
+        bne     $v1,$t0,.Lfail
+        nop
+
+        addiu   $k0,$zero,'C'
+        lui     $a0,0x8000
+        lui     $a1,0x8000
+        lui     $a2,0x8000
+        jal     mips_mixed_xor_commuted
+        nop
+        lui     $t0,0x8000
+        bne     $v0,$t0,.Lfail
+        nop
+        bne     $v1,$zero,.Lfail
+        nop
+
         # SImode is sign-canonical internally, but an unsigned FPU
         # conversion must consume the zero-extended mathematical value.
         addiu   $k0,$zero,'F'
@@ -174,7 +206,7 @@ _start:
         addiu   $k0,$zero,'8'
         jal     mips_pair_entry
         nop
-        lui     $t0,0x7
+        lui     $t0,0xf
         ori     $t0,$t0,0xffff
         bne     $v0,$t0,.Lfail
         nop

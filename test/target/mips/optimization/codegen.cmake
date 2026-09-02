@@ -363,13 +363,75 @@ function_body("${OUTPUT}.enabled.s"
               mips_projected_parameter projected_parameter)
 function_body("${OUTPUT}.no_cprop.s"
               mips_projected_parameter assembled_parameter)
-if(NOT projected_parameter MATCHES "[\t ]move[\t ][^\n]*,\\$a1" OR
+if(NOT projected_parameter MATCHES
+       "[\t ]addiu[\t ][^\n]*,\\$a1,17" OR
+   projected_parameter MATCHES "[\t ]move[\t ][^\n]*,\\$a1" OR
    projected_parameter MATCHES "[\t ](d?sll|d?srl|or)[\t ]" OR
    NOT assembled_parameter MATCHES "[\t ]or[\t ]")
     message(FATAL_ERROR
-        "MIPS ABI boundary projection did not select only the low o32 word "
-        "or honor -fno-cprop-registers\n"
+        "MIPS ABI boundary projection did not compute directly from the low "
+        "o32 endpoint or honor -fno-cprop-registers\n"
         "projected:\n${projected_parameter}\nordinary:\n${assembled_parameter}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_shared_zero_extension factored_extension)
+function_body("${OUTPUT}.no_bit_ccp.s"
+              mips_shared_zero_extension separate_extensions)
+string(REGEX MATCHALL "dsll32" factored_left_shifts
+       "${factored_extension}")
+string(REGEX MATCHALL "dsll32" separate_left_shifts
+       "${separate_extensions}")
+list(LENGTH factored_left_shifts factored_extension_count)
+list(LENGTH separate_left_shifts separate_extension_count)
+if(NOT factored_extension_count EQUAL 2 OR
+   NOT separate_extension_count EQUAL 3)
+    message(FATAL_ERROR
+        "MIR bitwise factoring did not share a zero extension or honor "
+        "-fno-tree-bit-ccp\n"
+        "factored:\n${factored_extension}\n"
+        "separate:\n${separate_extensions}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_mixed_xor_return mixed_return)
+function_body("${OUTPUT}.enabled.s"
+              mips_mixed_xor_return_commuted mixed_return_commuted)
+function_body("${OUTPUT}.little.s"
+              mips_mixed_xor_return mixed_return_little)
+function_body("${OUTPUT}.no_machine_combine.s"
+              mips_mixed_xor_return ordinary_mixed_return)
+foreach(body mixed_return mixed_return_commuted)
+    if(NOT ${body} MATCHES "[\t ]xor[\t ]+\\$v1," OR
+       NOT ${body} MATCHES "[\t ]dsrl32[\t ]+\\$v0," OR
+       NOT ${body} MATCHES
+           "[\t ]jr[\t ]+\\$ra\n[\t ]+sll[\t ]+\\$v1,\\$v1,0")
+        message(FATAL_ERROR
+            "MIPS mixed-width return was not decomposed for big-endian o32\n"
+            "${${body}}")
+    endif()
+endforeach()
+if(NOT mixed_return_little MATCHES "[\t ]xor[\t ]+\\$v0," OR
+   NOT mixed_return_little MATCHES "[\t ]dsrl32[\t ]+\\$v1," OR
+   NOT mixed_return_little MATCHES
+       "[\t ]jr[\t ]+\\$ra\n[\t ]+sll[\t ]+\\$v0,\\$v0,0")
+    message(FATAL_ERROR
+        "MIPS mixed-width return lost little-endian o32 piece order\n"
+        "${mixed_return_little}")
+endif()
+string(REGEX MATCHALL "dsll32" mixed_return_left_shifts
+       "${mixed_return}")
+string(REGEX MATCHALL "dsll32" ordinary_mixed_return_left_shifts
+       "${ordinary_mixed_return}")
+list(LENGTH mixed_return_left_shifts mixed_return_extension_count)
+list(LENGTH ordinary_mixed_return_left_shifts
+     ordinary_mixed_return_extension_count)
+if(NOT mixed_return_extension_count EQUAL 2 OR
+   NOT ordinary_mixed_return_extension_count EQUAL 3)
+    message(FATAL_ERROR
+        "-fno-machine-combine did not preserve the materialized mixed-width "
+        "return\ncombined:\n${mixed_return}\n"
+        "ordinary:\n${ordinary_mixed_return}")
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_affine_exit unit_exit)
@@ -539,12 +601,12 @@ if(NOT range_default_shape STREQUAL range_branch_shape OR
 endif()
 
 function_body("${OUTPUT}.unroll_risc_no_reorder.s"
-              mips_phi_copy_edge likely_phi_edge)
+              mips_affine_exit likely_phi_edge)
 function_body("${OUTPUT}.unroll_risc_no_reorder_no_delay.s"
-              mips_phi_copy_edge ordinary_phi_edge)
+              mips_affine_exit ordinary_phi_edge)
 if(NOT likely_phi_edge MATCHES
-       "[\t ]b(eq|ne)zl[^\n]*\n[\t ]+move[\t ]" OR
-   ordinary_phi_edge MATCHES "[\t ]b(eq|ne)zl[\t ]")
+       "[\t ]b(eq|ne)l[^\n]*\n[\t ]+move[\t ]" OR
+   ordinary_phi_edge MATCHES "[\t ]b(eq|ne)l[\t ]")
     message(FATAL_ERROR
         "a single MIPS PHI-edge copy did not use an annulled delay slot\n"
         "enabled:\n${likely_phi_edge}\ndisabled:\n${ordinary_phi_edge}")

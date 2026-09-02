@@ -310,6 +310,17 @@ const AbiEntry* managed_abi_model(const hir::Function& function,
     return abi_model(function.abi);
 }
 
+unsigned effective_piece_offset(const ValuePiece& piece,
+                                unsigned value_bits, ByteOrder order) {
+    if (order == ByteOrder::Little || piece.value_bits >= value_bits) {
+        return piece.value_bit_offset;
+    }
+    const auto used = static_cast<unsigned>(piece.value_bit_offset) +
+                      piece.value_bits;
+    return used <= value_bits ? value_bits - used
+                              : piece.value_bit_offset;
+}
+
 machine::Operand register_operand(machine::Register value) {
     return machine::RegisterOperand{value};
 }
@@ -437,6 +448,89 @@ public:
     }
 
 private:
+    bool lower_xor_zero_extend_return(
+        mir::ValueId returned_id, machine::Instruction& result) const {
+        if (!options_.machine_combine ||
+            !subtarget_.has_feature(Feature::Mips3) || !source_ ||
+            returned_id.value >= source_->values.size()) {
+            return false;
+        }
+        const auto& returned = source_->values[returned_id.value];
+        if (returned.kind != mir::ValueKind::Binary ||
+            returned.binary != mir::BinaryOperation::BitXor ||
+            returned.operands.size() != 2 ||
+            type_bits(hir_, returned.type) != 64) {
+            return false;
+        }
+
+        std::optional<mir::ValueId> wide;
+        std::optional<mir::ValueId> narrow;
+        for (unsigned index = 0; index < 2; ++index) {
+            const auto candidate = returned.operands[index];
+            if (candidate.value >= source_->values.size()) return false;
+            const auto& extension = source_->values[candidate.value];
+            if (extension.kind != mir::ValueKind::Cast ||
+                extension.cast != mir::CastOperation::ZeroExtend ||
+                extension.operands.size() != 1 ||
+                type_bits(hir_, extension.type) != 64 ||
+                extension.operands.front().value >=
+                    source_->values.size() ||
+                type_bits(hir_, source_->values[
+                                    extension.operands.front().value]
+                                    .type) != 32) {
+                continue;
+            }
+            const auto other = returned.operands[1U - index];
+            if (other.value >= source_->values.size() ||
+                type_bits(hir_, source_->values[other.value].type) != 64) {
+                return false;
+            }
+            wide = other;
+            narrow = extension.operands.front();
+            break;
+        }
+        if (!wide || !narrow) return false;
+
+        const auto& entity = hir_.function(source_->source);
+        const auto* abi = managed_abi_model(entity, subtarget_, options_);
+        const auto signature = abi
+            ? classify_function_interface(entity, *abi)
+            : std::optional<SignatureLayout>{};
+        if (!signature || signature->results.size() != 1) return false;
+        const auto& assignment = signature->results.front();
+        if (assignment.indirect || assignment.pieces.size() != 2) {
+            return false;
+        }
+        bool low = false;
+        bool high = false;
+        std::string_view first_register;
+        for (const auto& piece : assignment.pieces) {
+            if (piece.location.kind != LocationKind::Register ||
+                piece.value_bits != 32 || piece.carrier_bits != 32 ||
+                piece.location.reg.empty() ||
+                piece.location.reg == first_register) {
+                return false;
+            }
+            if (first_register.empty()) first_register = piece.location.reg;
+            const auto offset = effective_piece_offset(
+                piece, 64,
+                subtarget_.target().data_layout.byte_order);
+            if (offset == 0) low = true;
+            else if (offset == 32) high = true;
+            else return false;
+        }
+        if (!low || !high) return false;
+
+        const auto wide_register = reg(*wide);
+        const auto narrow_register = reg(*narrow);
+        result.operands = {register_operand(wide_register),
+                           register_operand(narrow_register)};
+        result.uses = {wide_register, narrow_register};
+        result.result_composition =
+            machine::ResultComposition::XorZeroExtend;
+        return true;
+    }
+
     bool has_result(const mir::ManagedValue& value) const {
         if (is_void(hir_, value.type)) return false;
         return value.kind != mir::ValueKind::LifetimeStart &&
@@ -1060,6 +1154,7 @@ private:
             result.kind = machine::InstructionKind::Return;
             if (terminator.value) {
                 auto source_id = *terminator.value;
+                if (lower_xor_zero_extend_return(source_id, result)) break;
                 const auto& returned = source_->values[source_id.value];
                 if (returned.kind == mir::ValueKind::Cast &&
                     returned.operands.size() == 1 &&
@@ -1314,6 +1409,8 @@ private:
             ? classify_function_interface(entity, *function_abi)
             : std::optional<SignatureLayout>{};
         LiveSet incoming_endpoint_colors;
+        std::unordered_map<std::uint32_t, unsigned>
+            incoming_endpoint_uses;
         if (function_layout) {
             const auto append_endpoints = [&](const auto& pieces) {
                 for (const auto& piece : pieces) {
@@ -1323,6 +1420,7 @@ private:
                     if (const auto physical =
                             physical_register_id(piece.location.reg)) {
                         incoming_endpoint_colors.insert(physical->value);
+                        ++incoming_endpoint_uses[physical->value];
                     }
                 }
             };
@@ -1361,18 +1459,64 @@ private:
                                 const auto& assignment =
                                     function_layout->call.arguments[
                                         parameter_index->value];
-                                if (assignment.pieces.size() == 1 &&
-                                    assignment.pieces.front().location.kind ==
+                                const ValuePiece* preferred_piece = nullptr;
+                                if (assignment.pieces.size() == 1) {
+                                    preferred_piece =
+                                        &assignment.pieces.front();
+                                } else if (
+                                    instruction.input_projection &&
+                                    parameter_index->value <
+                                        entity.parameters.size()) {
+                                    const auto logical_bits = type_bits(
+                                        hir_, entity.parameters[
+                                                  parameter_index->value]
+                                                  .type);
+                                    const auto projection_begin =
+                                        static_cast<unsigned>(
+                                            instruction.input_projection
+                                                ->bit_offset);
+                                    const auto projection_end =
+                                        projection_begin +
+                                        static_cast<unsigned>(
+                                            instruction.input_projection
+                                                ->bit_width);
+                                    const auto selected = std::find_if(
+                                        assignment.pieces.begin(),
+                                        assignment.pieces.end(),
+                                        [&](const ValuePiece& piece) {
+                                            const auto piece_begin =
+                                                effective_piece_offset(
+                                                    piece, logical_bits,
+                                                    subtarget_.target()
+                                                        .data_layout
+                                                        .byte_order);
+                                            return projection_begin >=
+                                                       piece_begin &&
+                                                projection_end <=
+                                                    piece_begin +
+                                                        piece.value_bits;
+                                    });
+                                    if (selected != assignment.pieces.end() &&
+                                        definition.mode.bits <=
+                                            selected->carrier_bits) {
+                                        preferred_piece = &*selected;
+                                    }
+                                }
+                                if (preferred_piece &&
+                                    preferred_piece->location.kind ==
                                         LocationKind::Register) {
                                     if (const auto physical =
                                             physical_register_id(
-                                                assignment.pieces.front()
-                                                    .location.reg)) {
-                                        // Capturing a single-piece parameter
-                                        // in its own endpoint cannot destroy
-                                        // another input and removes the entry
-                                        // copy. Width normalization, when
-                                        // needed, is safe in place.
+                                                preferred_piece->location
+                                                    .reg);
+                                        physical &&
+                                        incoming_endpoint_uses[
+                                            physical->value] == 1) {
+                                        // A scalar or projected parameter can
+                                        // stay in the one ABI endpoint it
+                                        // consumes. Endpoint uniqueness keeps
+                                        // an early capture from destroying a
+                                        // later argument or shadow.
                                         hard_forbidden_colors[*id].erase(
                                             physical->value);
                                         preferred_physical_colors[*id]
@@ -1609,10 +1753,14 @@ private:
                     const auto source = virtual_id(incoming->value);
                     if (!source || *source == *target ||
                         function.virtual_register_classes[*source] !=
-                            function.virtual_register_classes[*target] ||
-                        interference[*source].contains(*target)) {
+                            function.virtual_register_classes[*target]) {
                         continue;
                     }
+                    // An existing edge is a real overlap: the PHI result may
+                    // still be read after this incoming value is defined in
+                    // the predecessor.  Single-use of the incoming value is
+                    // not enough to prove coalescing safe.
+                    if (interference[*source].contains(*target)) continue;
                     affinity[*target].insert(*source);
                     affinity[*source].insert(*target);
                     if (options_.cprop_registers && predecessor &&
@@ -1630,7 +1778,6 @@ private:
                 }
             }
         }
-
         std::vector<machine::PhysicalRegisterId> integer_colors;
         if (subtarget_.has_feature(Feature::Mips3)) {
             // These registers are never implicit emitter scratches on the
@@ -1672,9 +1819,21 @@ private:
 
         std::vector<std::uint32_t> order(count);
         for (std::uint32_t id = 0; id < count; ++id) order[id] = id;
+        const auto has_physical_preference = [&](std::uint32_t id) {
+            if (!preferred_physical_colors[id].empty()) return true;
+            return std::any_of(
+                affinity[id].begin(), affinity[id].end(),
+                [&](std::uint32_t neighbor) {
+                    return neighbor < count &&
+                        !preferred_physical_colors[neighbor].empty();
+                });
+        };
         std::sort(order.begin(), order.end(), [&](std::uint32_t left,
                                                   std::uint32_t right) -> bool {
             if (eligible[left] != eligible[right]) return eligible[left];
+            const auto left_preferred = has_physical_preference(left);
+            const auto right_preferred = has_physical_preference(right);
+            if (left_preferred != right_preferred) return left_preferred;
             if (interference[left].size() != interference[right].size()) {
                 return interference[left].size() >
                        interference[right].size();
@@ -1722,6 +1881,19 @@ private:
             // remain valid fallbacks when stable pressure is exhausted.
             for (const auto color : preferred_physical_colors[id]) {
                 if (!forbidden_colors[id].contains(color.value)) append(color);
+            }
+            // A PHI may be colored before its incoming parameter or return
+            // value. Carry explicit ABI endpoint preferences across affinity
+            // edges so allocation order does not turn one eliminated entry
+            // copy into a larger parallel-copy cycle at the loop boundary.
+            for (const auto neighbor : affinity[id]) {
+                if (neighbor >= count) continue;
+                for (const auto color :
+                     preferred_physical_colors[neighbor]) {
+                    if (!forbidden_colors[id].contains(color.value)) {
+                        append(color);
+                    }
+                }
             }
             append_affinity(false);
             for (const auto color : colors) {
@@ -4030,17 +4202,6 @@ private:
         }
     }
 
-    static unsigned effective_piece_offset(
-        const ValuePiece& piece, unsigned value_bits, ByteOrder order) {
-        if (order == ByteOrder::Little || piece.value_bits >= value_bits) {
-            return piece.value_bit_offset;
-        }
-        const auto used = static_cast<unsigned>(piece.value_bit_offset) +
-                          piece.value_bits;
-        return used <= value_bits ? value_bits - used
-                                  : piece.value_bit_offset;
-    }
-
     void normalize_integer(std::string_view reg, unsigned bits,
                            bool sign) {
         if (bits >= 64) return;
@@ -5329,6 +5490,146 @@ private:
         reload_call_live_registers(function, call);
     }
 
+    bool place_composed_return(
+        const machine::Function& function,
+        const machine::Instruction& value,
+        const ReturnAssignment& result,
+        bool fallthrough_epilogue) {
+        if (value.result_composition !=
+                machine::ResultComposition::XorZeroExtend) {
+            return false;
+        }
+        if (!subtarget_.has_feature(Feature::Mips3) ||
+            value.uses.size() != 2 || value.uses[0].mode.bits != 64 ||
+            value.uses[1].mode.bits != 32 || result.indirect ||
+            result.pieces.size() != 2) {
+            diagnostics_.error(
+                value.location,
+                "invalid MIPS mixed-width result composition");
+            return true;
+        }
+
+        const ValuePiece* low = nullptr;
+        const ValuePiece* high = nullptr;
+        for (const auto& piece : result.pieces) {
+            if (piece.location.kind != LocationKind::Register ||
+                piece.value_bits != 32 || piece.carrier_bits != 32) {
+                diagnostics_.error(
+                    value.location,
+                    "MIPS mixed-width result requires two 32-bit register pieces");
+                return true;
+            }
+            const auto offset = effective_piece_offset(
+                piece, 64,
+                subtarget_.target().data_layout.byte_order);
+            if (offset == 0) low = &piece;
+            else if (offset == 32) high = &piece;
+        }
+        if (!low || !high || low->location.reg == high->location.reg) {
+            diagnostics_.error(
+                value.location,
+                "MIPS mixed-width result has an invalid ABI piece map");
+            return true;
+        }
+
+        const auto wide_assignment = assigned_gpr(function, value.uses[0]);
+        const auto narrow_assignment = assigned_gpr(function, value.uses[1]);
+        const auto scratch = [&](std::initializer_list<std::string_view>
+                                     unavailable)
+            -> std::optional<std::string_view> {
+            static constexpr std::array<std::string_view, 11> candidates{
+                "t0", "t1", "t2", "t3", "t4", "t5",
+                "t6", "t7", "t8", "t9", "at"};
+            const auto found = std::find_if(
+                candidates.begin(), candidates.end(),
+                [&](std::string_view candidate) {
+                    return std::find(unavailable.begin(), unavailable.end(),
+                                     candidate) == unavailable.end();
+                });
+            return found == candidates.end()
+                ? std::nullopt
+                : std::optional<std::string_view>{*found};
+        };
+
+        std::string_view wide;
+        std::string_view narrow;
+        if (wide_assignment) {
+            wide = *wide_assignment;
+        } else {
+            const auto selected = scratch(
+                {low->location.reg, high->location.reg,
+                 narrow_assignment.value_or(std::string_view{})});
+            if (!selected) {
+                diagnostics_.error(value.location,
+                                   "MIPS return has no wide-value scratch register");
+                return true;
+            }
+            wide = *selected;
+            load_vreg(function, value.uses[0], wide, value.location);
+        }
+        if (narrow_assignment) {
+            narrow = *narrow_assignment;
+        } else {
+            const auto selected = scratch(
+                {low->location.reg, high->location.reg, wide});
+            if (!selected) {
+                diagnostics_.error(
+                    value.location,
+                    "MIPS return has no narrow-value scratch register");
+                return true;
+            }
+            narrow = *selected;
+            load_vreg(function, value.uses[1], narrow, value.location);
+        }
+        if (wide == narrow || wide == low->location.reg ||
+            wide == high->location.reg || narrow == low->location.reg ||
+            narrow == high->location.reg) {
+            diagnostics_.error(
+                value.location,
+                "MIPS allocator overlapped a composed return source and result");
+            return true;
+        }
+
+        instruction("xor", reg_name(low->location.reg) + "," +
+                               reg_name(wide) + "," + reg_name(narrow));
+        instruction("dsrl32", reg_name(high->location.reg) + "," +
+                                  reg_name(wide) + ",0");
+        if (high->extension == AbiExtensionKind::Sign) {
+            instruction("sll", reg_name(high->location.reg) + "," +
+                                   reg_name(high->location.reg) + ",0");
+        }
+
+        // Keep the final low-word normalization in the control-transfer
+        // delay slot whenever this block owns that transfer.
+        std::string delay_opcode = "nop";
+        std::string delay_operands;
+        if (low->extension == AbiExtensionKind::Sign) {
+            delay_opcode = "sll";
+            delay_operands = reg_name(low->location.reg) + "," +
+                reg_name(low->location.reg) + ",0";
+        } else if (low->extension == AbiExtensionKind::Zero) {
+            instruction("dsll32", reg_name(low->location.reg) + "," +
+                                      reg_name(low->location.reg) + ",0");
+            delay_opcode = "dsrl32";
+            delay_operands = reg_name(low->location.reg) + "," +
+                reg_name(low->location.reg) + ",0";
+        }
+        const auto emit_delay = [&] {
+            if (delay_opcode == "nop") instruction("nop");
+            else instruction(delay_opcode, delay_operands);
+        };
+        if (frame_size_ == 0) {
+            instruction("jr", "$ra");
+            emit_delay();
+        } else if (!fallthrough_epilogue) {
+            instruction("b", epilogue_label_);
+            emit_delay();
+        } else if (delay_opcode != "nop") {
+            instruction(delay_opcode, delay_operands);
+        }
+        return true;
+    }
+
     void place_return(const machine::Function& function,
                       const machine::Instruction& value,
                       bool fallthrough_epilogue) {
@@ -5346,6 +5647,10 @@ private:
                     diagnostics_.error(
                         value.location,
                         "MIPS indirect function results are not implemented yet");
+                } else if (place_composed_return(
+                               function, value, result,
+                               fallthrough_epilogue)) {
+                    return;
                 } else {
                     const auto source = value.uses.front();
                     if (!is_floating(hir_, entity.result_type) &&

@@ -23,7 +23,7 @@ global void psp_exit_stub() {
 global i32 psp_test_start() {
     i32 result = allegrex_entry(0x80000001u32, 1u32, 1i32);
     i32 pairs = mips_pair_entry();
-    if ((result != 6i32) || (pairs != 0x7ffffi32)) {
+    if ((result != 6i32) || (pairs != 0xfffffi32)) {
         while (1) {}
     }
     psp_exit_stub();

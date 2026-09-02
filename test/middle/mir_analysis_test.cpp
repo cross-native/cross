@@ -68,6 +68,14 @@ cross::hir::Module transform_hir() {
     integer.kind = hir::Type::Kind::Builtin;
     integer.builtin = BuiltinType::U64;
     module.types.push_back(integer);
+    hir::Type signed_integer;
+    signed_integer.kind = hir::Type::Kind::Builtin;
+    signed_integer.builtin = BuiltinType::I64;
+    module.types.push_back(signed_integer);
+    hir::Type narrow_integer;
+    narrow_integer.kind = hir::Type::Kind::Builtin;
+    narrow_integer.builtin = BuiltinType::U32;
+    module.types.push_back(narrow_integer);
     hir::Function source;
     source.id = {0};
     source.result_type = {1};
@@ -350,6 +358,123 @@ cross::mir::ManagedFunction cross_recurrence_loop_function() {
     return function;
 }
 
+cross::mir::ManagedFunction unit_recurrence_add_function() {
+    using namespace cross::mir;
+    ManagedFunction function;
+    function.source = {0};
+    function.result_type = {1};
+    function.entry = {0};
+    function.values.resize(9);
+    for (std::uint32_t index = 0; index < function.values.size(); ++index) {
+        function.values[index].id = {index};
+        function.values[index].type = {1};
+    }
+    function.values[0].kind = ValueKind::ConstantInteger;
+    function.values[1].kind = ValueKind::ConstantInteger;
+    function.values[1].integer = 1;
+    function.values[2].kind = ValueKind::ConstantInteger;
+    function.values[2].integer = 16;
+    function.values[3].kind = ValueKind::Phi;
+    function.values[3].incoming = {{{0}, {0}}, {{2}, {7}}};
+    function.values[4].kind = ValueKind::Phi;
+    function.values[4].incoming = {{{0}, {0}}, {{2}, {8}}};
+    function.values[5].kind = ValueKind::Binary;
+    function.values[5].type = {0};
+    function.values[5].binary = BinaryOperation::UnsignedLess;
+    function.values[5].operands = {{3}, {2}};
+    function.values[6].kind = ValueKind::Binary;
+    function.values[6].binary = BinaryOperation::Add;
+    function.values[6].operands = {{4}, {3}};
+    function.values[7].kind = ValueKind::Binary;
+    function.values[7].binary = BinaryOperation::Add;
+    function.values[7].operands = {{3}, {1}};
+    function.values[8].kind = ValueKind::Binary;
+    function.values[8].binary = BinaryOperation::Add;
+    function.values[8].operands = {{6}, {1}};
+
+    function.effects = {
+        {EffectId{0}, {}, EffectKind::Entry, std::nullopt, std::nullopt, {}},
+        {EffectId{1}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{0}, {0}}, {{2}, {2}}}},
+        {EffectId{2}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{1}, {1}}}},
+        {EffectId{3}, {}, EffectKind::Phi, std::nullopt, std::nullopt,
+         {{{1}, {1}}}},
+    };
+
+    ManagedBlock entry;
+    entry.id = {0};
+    entry.effect = {0};
+    entry.values = {{0}, {1}, {2}};
+    entry.terminator = {
+        TerminatorKind::Branch, {}, std::nullopt, {{1}}, {0}};
+    ManagedBlock header;
+    header.id = {1};
+    header.effect = {1};
+    header.predecessors = {{0}, {2}};
+    header.values = {{3}, {4}, {5}};
+    header.terminator = {
+        TerminatorKind::ConditionalBranch, {}, ValueId{5}, {{2}, {3}}, {1}};
+    ManagedBlock latch;
+    latch.id = {2};
+    latch.effect = {2};
+    latch.predecessors = {{1}};
+    // Keep the recurrence update after the candidate to exercise pure-value
+    // scheduling as well as the algebraic rewrite.
+    latch.values = {{6}, {8}, {7}};
+    latch.terminator = {
+        TerminatorKind::Branch, {}, std::nullopt, {{1}}, {2}};
+    ManagedBlock exit;
+    exit.id = {3};
+    exit.effect = {3};
+    exit.predecessors = {{1}};
+    exit.terminator = {
+        TerminatorKind::Return, {}, ValueId{4}, {}, {3}};
+    function.blocks = {entry, header, latch, exit};
+    return function;
+}
+
+cross::mir::ManagedFunction zero_extended_xor_chain_function() {
+    using namespace cross::mir;
+    ManagedFunction function;
+    function.source = {0};
+    function.result_type = {1};
+    function.entry = {0};
+    function.values.resize(7);
+    for (std::uint32_t index = 0; index < function.values.size(); ++index) {
+        function.values[index].id = {index};
+        function.values[index].type = index == 1 || index == 2
+            ? cross::hir::TypeId{3} : cross::hir::TypeId{1};
+    }
+    for (std::uint32_t index = 0; index < 3; ++index) {
+        function.values[index].kind = ValueKind::Parameter;
+        function.values[index].parameter_index = index;
+    }
+    function.values[3].kind = ValueKind::Cast;
+    function.values[3].cast = CastOperation::ZeroExtend;
+    function.values[3].operands = {{1}};
+    function.values[4].kind = ValueKind::Binary;
+    function.values[4].binary = BinaryOperation::BitXor;
+    function.values[4].operands = {{0}, {3}};
+    function.values[5].kind = ValueKind::Cast;
+    function.values[5].cast = CastOperation::ZeroExtend;
+    function.values[5].operands = {{2}};
+    function.values[6].kind = ValueKind::Binary;
+    function.values[6].binary = BinaryOperation::BitXor;
+    function.values[6].operands = {{4}, {5}};
+    function.parameters = {{0}, {1}, {2}};
+    function.effects = {
+        {EffectId{0}, {}, EffectKind::Entry, std::nullopt, std::nullopt, {}}};
+    ManagedBlock entry;
+    entry.id = {0};
+    entry.effect = {0};
+    entry.values = {{0}, {1}, {2}, {3}, {4}, {5}, {6}};
+    entry.terminator = {
+        TerminatorKind::Return, {}, ValueId{6}, {}, {0}};
+    function.blocks = {std::move(entry)};
+    return function;
+}
+
 cross::mir::ManagedFunction tail_factor_function() {
     using namespace cross::mir;
     ManagedFunction function;
@@ -526,8 +651,94 @@ int main() {
                  "tail merging should retain a typed pass name");
     ok &= expect(pass_name(PassId::LoopRotation) == "loop-rotation",
                  "loop rotation should retain a typed pass name");
+    ok &= expect(pass_name(PassId::UnitRecurrenceReassociation) ==
+                     "unit-recurrence-reassociation",
+                 "unit recurrence reassociation should retain a pass name");
 
     auto hir = transform_hir();
+    auto unit_recurrence = unit_recurrence_add_function();
+    DominatorTree recurrence_dominators(unit_recurrence);
+    LoopForest recurrence_loops(unit_recurrence, recurrence_dominators);
+    UseLists recurrence_uses(unit_recurrence);
+    ok &= expect(
+        reassociate_unit_recurrence_adds(
+            unit_recurrence, hir, recurrence_loops.canonical_loops(),
+            recurrence_uses),
+        "unit recurrence value should be reused by a neighboring add");
+    ok &= expect(
+        unit_recurrence.values[8].operands ==
+                std::vector<ValueId>{{4}, {7}} &&
+            unit_recurrence.blocks[2].values ==
+                std::vector<ValueId>{{6}, {7}, {8}},
+        "reassociation should reuse the update and preserve SSA order");
+    ManagedModule reassociated;
+    reassociated.functions.push_back(unit_recurrence);
+    reassociated.definitions.insert(0);
+    std::ostringstream reassociated_diagnostics_text;
+    cross::Diagnostics reassociated_diagnostics(
+        reassociated_diagnostics_text);
+    ok &= expect(verify(reassociated, hir, reassociated_diagnostics),
+                 "reassociated recurrence should satisfy MIR verification");
+    if (!reassociated_diagnostics_text.str().empty()) {
+        std::cerr << reassociated_diagnostics_text.str();
+    }
+
+    auto xor_chain = zero_extended_xor_chain_function();
+    ok &= expect(factor_zero_extended_bitwise_chains(xor_chain, hir),
+                 "equal narrow XOR operands should share one extension");
+    const auto xor_result = *xor_chain.blocks.front().terminator.value;
+    const auto& factored_xor = xor_chain.values[xor_result.value];
+    const auto shared_extend = factored_xor.operands[1];
+    const auto& extension = xor_chain.values[shared_extend.value];
+    const auto& narrow_xor =
+        xor_chain.values[extension.operands.front().value];
+    ok &= expect(
+        factored_xor.kind == ValueKind::Binary &&
+            factored_xor.binary == BinaryOperation::BitXor &&
+            factored_xor.operands.front() == ValueId{0} &&
+            extension.kind == ValueKind::Cast &&
+            extension.cast == CastOperation::ZeroExtend &&
+            narrow_xor.kind == ValueKind::Binary &&
+            narrow_xor.binary == BinaryOperation::BitXor &&
+            narrow_xor.type == cross::hir::TypeId{3} &&
+            narrow_xor.operands == std::vector<ValueId>{{1}, {2}},
+        "wide XOR chain should become wide xor zext(narrow xor)");
+    ManagedModule factored_xor_module;
+    factored_xor_module.functions.push_back(xor_chain);
+    factored_xor_module.definitions.insert(0);
+    std::ostringstream xor_diagnostics_text;
+    cross::Diagnostics xor_diagnostics(xor_diagnostics_text);
+    ok &= expect(verify(factored_xor_module, hir, xor_diagnostics),
+                 "factored extension chain should satisfy MIR verification");
+    if (!xor_diagnostics_text.str().empty()) {
+        std::cerr << xor_diagnostics_text.str();
+    }
+
+    auto nonunit_recurrence = unit_recurrence_add_function();
+    nonunit_recurrence.values[1].integer = 2;
+    DominatorTree nonunit_dominators(nonunit_recurrence);
+    LoopForest nonunit_loops(nonunit_recurrence, nonunit_dominators);
+    UseLists nonunit_uses(nonunit_recurrence);
+    ok &= expect(
+        !reassociate_unit_recurrence_adds(
+            nonunit_recurrence, hir,
+            nonunit_loops.canonical_loops(), nonunit_uses),
+        "non-unit recurrence must not use the specialized reassociation");
+
+    auto signed_recurrence = unit_recurrence_add_function();
+    signed_recurrence.result_type = {2};
+    for (auto& value : signed_recurrence.values) {
+        if (value.type == cross::hir::TypeId{1}) value.type = {2};
+    }
+    DominatorTree signed_dominators(signed_recurrence);
+    LoopForest signed_loops(signed_recurrence, signed_dominators);
+    UseLists signed_uses(signed_recurrence);
+    ok &= expect(
+        !reassociate_unit_recurrence_adds(
+            signed_recurrence, hir, signed_loops.canonical_loops(),
+            signed_uses),
+        "signed recurrence must retain source overflow evaluation order");
+
     auto rotate = rotate_function();
     ok &= expect(canonicalize_bitwise_operations(rotate, hir),
                  "shift/or funnel should canonicalize in MIR");

@@ -245,6 +245,15 @@ enum class InstructionKind {
 // the complete logical result width.
 enum class ExtensionKind : std::uint8_t { None, Zero, Sign };
 
+// A target may preserve a simple mixed-width result expression through
+// instruction selection so ABI piece placement can compute only the pieces
+// that actually change.  XorZeroExtend denotes:
+//
+//   uses[0] ^ zero_extend(uses[1])
+//
+// where uses[0] has the complete result width and uses[1] is narrower.
+enum class ResultComposition : std::uint8_t { None, XorZeroExtend };
+
 // A selected boundary value may consume only a contiguous bit range of its
 // logical ABI value.  Keeping this projection separate from the target opcode
 // lets calling-convention lowering select the required transport piece without
@@ -293,6 +302,7 @@ struct Instruction {
     AbiStateId variadic_state;
     std::optional<ValueProjection> input_projection;
     ExtensionKind result_extension{ExtensionKind::None};
+    ResultComposition result_composition{ResultComposition::None};
     bool may_load{};
     bool may_store{};
     bool has_side_effects{};

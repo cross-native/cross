@@ -22,6 +22,18 @@ global u64 mips_widen_u32(in u32 value) {
 }
 
 [[abi("o32"), noinline]]
+global u64 mips_mixed_xor(in u64 wide, in u32 narrow) {
+    u64 extended = narrow;
+    return wide ^ extended;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_mixed_xor_commuted(in u64 wide, in u32 narrow) {
+    u64 extended = narrow;
+    return extended ^ wide;
+}
+
+[[abi("o32"), noinline]]
 global f64 mips_u32_to_f64(in u32 value) {
     return value;
 }

@@ -14,6 +14,7 @@
 #include <charconv>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -9955,6 +9956,162 @@ void unroll_loops(ManagedFunction& function,
     }
 }
 
+bool reassociate_unit_recurrence_adds_impl(
+    ManagedFunction& function, const hir::Module& hir_module,
+    std::span<const CanonicalLoop> loops, const UseLists& use_lists) {
+    struct Candidate {
+        ValueId root;
+        ValueId inner;
+        ValueId base;
+        std::size_t position{};
+    };
+
+    const auto add_other_operand = [&](ValueId id, ValueId operand)
+        -> std::optional<ValueId> {
+        if (id.value >= function.values.size()) return std::nullopt;
+        const auto& value = function.values[id.value];
+        if (value.kind != ValueKind::Binary ||
+            value.binary != BinaryOperation::Add ||
+            value.operands.size() != 2 || is_effectful_value(value)) {
+            return std::nullopt;
+        }
+        if (value.operands[0] == operand) return value.operands[1];
+        if (value.operands[1] == operand) return value.operands[0];
+        return std::nullopt;
+    };
+    const auto unit_constant = [&](ValueId id, hir::TypeId type) {
+        return id.value < function.values.size() &&
+               function.values[id.value].type == type &&
+               constant_integer(function.values[id.value], UInt128{1});
+    };
+
+    bool changed = false;
+    std::unordered_set<std::uint32_t> rewritten_roots;
+    for (const auto& loop : loops) {
+        if (loop.header.value >= function.blocks.size()) continue;
+        const auto& header = function.blocks[loop.header.value];
+        std::vector<BlockId> backedges;
+        for (const auto predecessor : header.predecessors) {
+            if (loop.blocks.contains(predecessor.value)) {
+                backedges.push_back(predecessor);
+            }
+        }
+        if (backedges.size() != 1) continue;
+        const auto backedge = backedges.front();
+        auto& block = function.blocks[backedge.value];
+
+        for (const auto phi_id : header.values) {
+            const auto& phi = function.values[phi_id.value];
+            if (phi.kind != ValueKind::Phi ||
+                !unsigned_integer_type(hir_module, phi.type)) {
+                continue;
+            }
+            const auto incoming = std::find_if(
+                phi.incoming.begin(), phi.incoming.end(),
+                [&](const PhiIncoming& edge) {
+                    return edge.predecessor == backedge;
+                });
+            if (incoming == phi.incoming.end()) continue;
+            const auto next_id = incoming->value;
+            if (use_lists.definition_block(next_id) != backedge ||
+                function.values[next_id.value].type != phi.type) {
+                continue;
+            }
+            const auto recurrence_unit =
+                add_other_operand(next_id, phi_id);
+            if (!recurrence_unit ||
+                !unit_constant(*recurrence_unit, phi.type)) {
+                continue;
+            }
+
+            std::vector<Candidate> candidates;
+            for (std::size_t position = 0; position < block.values.size();
+                 ++position) {
+                const auto root_id = block.values[position];
+                if (rewritten_roots.contains(root_id.value)) continue;
+                const auto& root = function.values[root_id.value];
+                if (root.kind != ValueKind::Binary ||
+                    root.binary != BinaryOperation::Add ||
+                    root.type != phi.type || root.operands.size() != 2 ||
+                    is_effectful_value(root)) {
+                    continue;
+                }
+
+                std::optional<ValueId> inner_id;
+                if (unit_constant(root.operands[0], phi.type)) {
+                    inner_id = root.operands[1];
+                } else if (unit_constant(root.operands[1], phi.type)) {
+                    inner_id = root.operands[0];
+                }
+                if (!inner_id ||
+                    use_lists.definition_block(*inner_id) != backedge) {
+                    continue;
+                }
+                const auto& inner = function.values[inner_id->value];
+                if (inner.type != phi.type) continue;
+                const auto base = add_other_operand(*inner_id, phi_id);
+                if (!base || function.values[base->value].type != phi.type) {
+                    continue;
+                }
+                const auto& uses = use_lists.uses(*inner_id);
+                if (uses.size() != 1 || !uses.front().user ||
+                    *uses.front().user != root_id ||
+                    uses.front().kind != UseKind::Operand) {
+                    continue;
+                }
+                candidates.push_back(
+                    {root_id, *inner_id, *base, position});
+            }
+            if (candidates.empty()) continue;
+
+            const auto next_position = std::find(
+                block.values.begin(), block.values.end(), next_id);
+            if (next_position == block.values.end()) continue;
+            const auto earliest = std::min_element(
+                candidates.begin(), candidates.end(),
+                [](const Candidate& left, const Candidate& right) {
+                    return left.position < right.position;
+                })->position;
+            const auto current_next = static_cast<std::size_t>(
+                std::distance(block.values.begin(), next_position));
+            if (current_next > earliest) {
+                bool operands_available = true;
+                for (const auto operand :
+                     function.values[next_id.value].operands) {
+                    const auto definition =
+                        use_lists.definition_block(operand);
+                    if (definition != backedge) continue;
+                    const auto operand_position = std::find(
+                        block.values.begin(), block.values.end(), operand);
+                    if (operand_position == block.values.end() ||
+                        static_cast<std::size_t>(std::distance(
+                            block.values.begin(), operand_position)) >=
+                            earliest) {
+                        operands_available = false;
+                        break;
+                    }
+                }
+                if (!operands_available) continue;
+                block.values.erase(std::next(
+                    block.values.begin(),
+                    static_cast<std::ptrdiff_t>(current_next)));
+                block.values.insert(
+                    std::next(block.values.begin(),
+                              static_cast<std::ptrdiff_t>(earliest)),
+                    next_id);
+            }
+
+            for (const auto& candidate : candidates) {
+                function.values[candidate.root.value].operands = {
+                    candidate.base, next_id};
+                rewritten_roots.insert(candidate.root.value);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 // An additive recurrence, often exposed by unrolling, such as
 //
 //     sum = (((sum + a) + b) + c) + d
@@ -13115,6 +13272,13 @@ bool promote_native_induction_views(
 
 } // namespace
 
+bool reassociate_unit_recurrence_adds(
+    ManagedFunction& function, const hir::Module& hir_module,
+    std::span<const CanonicalLoop> loops, const UseLists& use_lists) {
+    return reassociate_unit_recurrence_adds_impl(
+        function, hir_module, loops, use_lists);
+}
+
 void prune_unreachable_blocks(ManagedFunction& function) {
     eliminate_unreachable_blocks(function);
 }
@@ -13323,6 +13487,17 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             });
     }
     if (options.tree_reassoc) {
+        pipeline.add(
+            PassId::UnitRecurrenceReassociation,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                return reassociate_unit_recurrence_adds(
+                           function, hir_module,
+                           analyses.loops().canonical_loops(),
+                           analyses.uses())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
         pipeline.add(
             PassId::RecurrenceRebalancing,
             [&](ManagedFunction& function,

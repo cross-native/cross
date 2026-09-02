@@ -2,6 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 global u64 mips_pair_cell;
+global volatile u32 mips_pair_volatile_cell;
+
+[[runtime_only, noinline]]
+global u32 mips_phi_volatile_after(in u32 count,
+                                   in volatile u32 *sink) {
+    u32 index = 0u32;
+    while (index < count) {
+        u32 next = index + 1u32;
+        *sink = index;
+        index = next;
+    }
+    return index;
+}
 
 [[runtime_only, noinline]]
 global u64 mips_pair_add(in u64 left, in u64 right) {
@@ -142,5 +155,7 @@ global i32 mips_pair_test() {
     u64 produced = 0u64;
     mips_pair_out(produced);
     if (produced == 0x89abcdef01234567u64) passed |= 0x40000;
+    if (mips_phi_volatile_after(5u32, &mips_pair_volatile_cell) == 5u32 &&
+        mips_pair_volatile_cell == 4u32) passed |= 0x80000;
     return passed;
 }

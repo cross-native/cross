@@ -39,6 +39,8 @@ std::string_view pass_name(PassId pass) {
     case PassId::EarlyExitVectorization:
         return "early-exit-vectorization";
     case PassId::LoopUnrolling: return "loop-unrolling";
+    case PassId::UnitRecurrenceReassociation:
+        return "unit-recurrence-reassociation";
     case PassId::RecurrenceRebalancing: return "recurrence-rebalancing";
     case PassId::StraightLineStrengthReduction:
         return "straight-line-strength-reduction";

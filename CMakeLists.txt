@@ -658,6 +658,28 @@ if(BUILD_TESTING)
                 -DEXPECTED=1
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_runtime_native_register_allocation_o3
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/register_allocation.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-register-allocation-o3
+                -DENTRY=register_allocation_entry
+                -DEXPECTED=1
+                -DCC_FLAGS=-O3
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_runtime_native_register_allocation_os
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/register_allocation.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-register-allocation-os
+                -DENTRY=register_allocation_entry
+                -DEXPECTED=1
+                -DCC_FLAGS=-Os
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_runtime_native_loop_rotation
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

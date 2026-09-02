@@ -93,7 +93,25 @@ global u32 mips_hilo_latency(in u32 value) {
 [[abi("o32"), noinline]]
 global u32 mips_projected_parameter(in u64 value) {
     u32 result = value;
-    return result;
+    return result + 17u32;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_shared_zero_extension(in u64 wide,
+                                      in u32 first, in u32 second) {
+    return wide ^ first ^ second;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_mixed_xor_return(in u64 wide, in u32 narrow) {
+    u64 extended = narrow;
+    return wide ^ extended;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_mixed_xor_return_commuted(in u64 wide, in u32 narrow) {
+    u64 extended = narrow;
+    return extended ^ wide;
 }
 
 [[abi("o32"), noinline]]
