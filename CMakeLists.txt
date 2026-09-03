@@ -301,6 +301,15 @@ if(BUILD_TESTING)
                 -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-n64-runtime
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+    add_test(NAME cross_mips_n64_runtime_large
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-n64-runtime-large
+                -DEXTRA_FLAGS=-mcmodel=large
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
     add_test(NAME cross_mips_differential_int_vr4300
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

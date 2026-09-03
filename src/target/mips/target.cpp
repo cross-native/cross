@@ -244,6 +244,13 @@ std::vector<OptionDefinition> target_options() {
          0, 0, OptionCategory::Target, false,
          OptionImplementation::Implemented,
          "instruction-compatible MIPS CPU or ISA"},
+        {"m.cmodel", {}, OptionValueKind::Enumeration,
+         std::string("small"), {"small", "large"},
+         0, 0, OptionCategory::Target, false,
+         OptionImplementation::Implemented,
+         "MIPS symbol addressability model: small keeps sign-extended "
+         "32-bit symbol addresses, large materializes complete 64-bit "
+         "addresses and calls through a register"},
         {"m.tune", {}, OptionValueKind::Text, std::string("generic"), {},
          0, 0, OptionCategory::Target, true,
          OptionImplementation::Implemented,

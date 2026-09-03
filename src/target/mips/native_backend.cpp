@@ -4037,6 +4037,31 @@ private:
         return wide_addresses_ ? "daddu" : "addu";
     }
 
+    // Symbol addresses default to the sym32 model: `lui`/`%lo` yields a
+    // sign-extended 32-bit address, which is complete for 32-bit ABIs and
+    // covers the low 2 GB plus KSEG0/KSEG1 under n64.  The large code model
+    // materializes every 64-bit address from all four relocation halves.
+    bool large_code_model() const {
+        return wide_addresses_ && options_.code_model == CodeModel::Large;
+    }
+
+    void materialize_symbol_address(std::string_view destination,
+                                    const std::string& symbol) {
+        const auto reg = reg_name(destination);
+        if (large_code_model()) {
+            instruction("lui", reg + ",%highest(" + symbol + ")");
+            instruction("daddiu", reg + "," + reg + ",%higher(" + symbol + ")");
+            instruction("dsll", reg + "," + reg + ",16");
+            instruction("daddiu", reg + "," + reg + ",%hi(" + symbol + ")");
+            instruction("dsll", reg + "," + reg + ",16");
+            instruction("daddiu", reg + "," + reg + ",%lo(" + symbol + ")");
+            return;
+        }
+        instruction("lui", reg + ",%hi(" + symbol + ")");
+        instruction(address_add_immediate(),
+                    reg + "," + reg + ",%lo(" + symbol + ")");
+    }
+
     std::string_view address_add_immediate() const {
         return wide_addresses_ ? "daddiu" : "addiu";
     }
@@ -5863,7 +5888,16 @@ private:
                 instruction(address_load(),
                             "$ra," + memory(saved_ra_offset_, "sp"));
             }
-            instruction("j", assembly_symbol(callee_symbol->name));
+            // Under the large model the callee may lie outside the 256 MB
+            // region a direct jump can name.  $at is the emitter's own
+            // scratch and never carries an argument or a live value here.
+            if (large_code_model()) {
+                materialize_symbol_address(
+                    "at", assembly_symbol(callee_symbol->name));
+                instruction("jr", "$at");
+            } else {
+                instruction("j", assembly_symbol(callee_symbol->name));
+            }
             if (frame_size_ == 0) instruction("nop");
             else {
                 instruction(address_add_immediate(),
@@ -5872,7 +5906,13 @@ private:
             if (cfi) output_ << ".cfi_restore_state\n";
             return;
         }
-        instruction("jal", assembly_symbol(callee_symbol->name));
+        if (large_code_model()) {
+            materialize_symbol_address(
+                "at", assembly_symbol(callee_symbol->name));
+            instruction("jalr", "$at");
+        } else {
+            instruction("jal", assembly_symbol(callee_symbol->name));
+        }
         instruction("nop");
         capture_call_result(function, call, *signature);
         reload_call_live_registers(function, call);
@@ -7878,9 +7918,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             else output_ << "\t.dword " << immediate.value << '\n';
             output_ << end << ":\n" << after << ":\n";
             const auto field = end + "-" + std::to_string(bytes);
-            instruction("lui", "$t0,%hi(" + field + ")");
-            instruction(address_add_immediate(),
-                        "$t0,$t0,%lo(" + field + ")");
+            materialize_symbol_address("t0", field);
             if (legalizes_to_pair(target)) {
                 load_pair_memory("t1", "t2", 0, "t0");
                 store_vreg_pair(function, target, "t1", "t2",
@@ -7905,6 +7943,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             if (const auto destination = assigned_fpr(function, target);
                 destination && prefer_float_literal(immediate)) {
                 const auto& literal = float_literal(immediate);
+                if (large_code_model()) {
+                    materialize_symbol_address("t0", literal.label);
+                    instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
+                                reg_name(*destination) + ",0($t0)");
+                    return;
+                }
                 instruction("lui", "$t0,%hi(" + literal.label + ")");
                 instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
                             reg_name(*destination) + ",%lo(" + literal.label +
@@ -7952,10 +7996,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto address = opcode == Opcode::GlobalAddress
             ? output_gpr(function, value.defs.front(), "t0")
             : std::string_view{"t0"};
-        instruction("lui", reg_name(address) + ",%hi(" + name + ")");
-        instruction(address_add_immediate(),
-                    reg_name(address) + "," + reg_name(address) + ",%lo(" +
-                        name + ")");
+        materialize_symbol_address(address, name);
         if (opcode == Opcode::GlobalAddress) {
             commit_gpr(function, value.defs.front(), address,
                        value.location);
@@ -8006,10 +8047,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto label = block_label(function, block.target);
         const auto target = value.defs.front();
         const auto destination = output_gpr(function, target, "t0");
-        instruction("lui", reg_name(destination) + ",%hi(" + label + ")");
-        instruction(address_add_immediate(),
-                    reg_name(destination) + "," + reg_name(destination) +
-                        ",%lo(" + label + ")");
+        materialize_symbol_address(destination, label);
         commit_gpr(function, target, destination, value.location);
         return;
     }

@@ -23,15 +23,36 @@ function(run_cc label)
 endfunction()
 
 set(assembly "${OUTPUT}.be.s")
+set(large_assembly "${OUTPUT}.large.s")
 set(big_object "${OUTPUT}.be.o")
 set(little_object "${OUTPUT}.le.o")
 
 run_cc(n64-assembly -S -O2 -mprofile=mips64-n64 "${SOURCE}" -o "${assembly}")
+run_cc(n64-large-assembly -S -O2 -mprofile=mips64-n64 -mcmodel=large
+       "${SOURCE}" -o "${large_assembly}")
+
+# The default sym32 model never needs the upper relocation halves; the large
+# model materializes every symbol address from all four and calls through
+# a register.
+file(READ "${large_assembly}" large_text)
+foreach(pattern
+        "%highest\\("
+        "%higher\\("
+        "[\t ]dsll[\t ][$][0-9]+,[$][0-9]+,16"
+        "[\t ]jalr[\t ]+[$]1")
+    if(NOT large_text MATCHES "${pattern}")
+        message(FATAL_ERROR
+            "n64 large-model assembly is missing '${pattern}'\n${large_text}")
+    endif()
+endforeach()
 run_cc(n64-object -c -O2 -mprofile=mips64-n64 "${SOURCE}" -o "${big_object}")
 run_cc(n64el-object -c -O2 -mprofile=mips64el-n64 "${SOURCE}"
        -o "${little_object}")
 
 file(READ "${assembly}" text)
+if(text MATCHES "%highest\\(")
+    message(FATAL_ERROR "n64 sym32 assembly must not use %highest\n${text}")
+endif()
 
 # GPRs must be spelled numerically: an n64 assembler reads $t0-$t3 as the
 # architectural registers 12-15 and $8-$11 as $a4-$a7.

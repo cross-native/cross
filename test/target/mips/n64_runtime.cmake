@@ -33,7 +33,12 @@ set(image "${OUTPUT}.elf64")
 
 # n64 objects are already ELF64 with a sign-extended KSEG0 entry address, so
 # unlike the o32 test this needs no ELF32-to-ELF64 wrapper.
-run_checked(cross-functions "${CC}" -c -O2 -mprofile=mips64-n64
+if(DEFINED EXTRA_FLAGS AND NOT "${EXTRA_FLAGS}" STREQUAL "")
+    separate_arguments(extra_flags NATIVE_COMMAND "${EXTRA_FLAGS}")
+else()
+    set(extra_flags "")
+endif()
+run_checked(cross-functions "${CC}" -c -O2 -mprofile=mips64-n64 ${extra_flags}
             "${SOURCE}" -o "${functions}")
 run_checked(startup "${LLVM_MC}" --filetype=obj
             --triple=mips64-unknown-elf --mcpu=mips64

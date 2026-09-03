@@ -295,9 +295,17 @@ public:
             diagnostics.command_error(
                 "MIPS PIC/PIE and -mabicalls need a GP/GOT call model and are not implemented yet");
         }
-        if (options.code_model != CodeModel::Small) {
+        if (options.code_model == CodeModel::Large) {
+            // The large model materializes complete 64-bit symbol addresses
+            // and calls through a register; it has no meaning for a 32-bit
+            // address ABI, whose sym32 addresses are already complete.
+            if (subtarget.abi_info().address_bits <= 32) {
+                diagnostics.command_error(
+                    "the large code model applies only to 64-bit address MIPS ABIs such as n64");
+            }
+        } else if (options.code_model != CodeModel::Small) {
             diagnostics.command_error(
-                "MIPS currently supports only the small absolute code model");
+                "MIPS supports only the small and large absolute code models");
         }
         if (subtarget.has_feature(Feature::Mips16) ||
             subtarget.has_feature(Feature::MicroMips)) {
