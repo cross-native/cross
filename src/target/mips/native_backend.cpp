@@ -17,6 +17,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -450,8 +451,55 @@ public:
           options_(options), diagnostics_(diagnostics) {}
 
     machine::Module run() {
-        for (const auto& function : managed_.functions) {
-            lower_function(function);
+        std::vector<std::size_t> order;
+        order.reserve(managed_.functions.size());
+        if (options_.ipa_ra && options_.private_abi) {
+            std::unordered_map<std::uint32_t, std::size_t> indices;
+            for (std::size_t index = 0; index < managed_.functions.size();
+                 ++index) {
+                indices.emplace(
+                    managed_.functions[index].source.value, index);
+            }
+            std::vector<unsigned char> state(managed_.functions.size());
+            std::function<void(std::size_t)> visit =
+                [&](std::size_t index) {
+                    if (state[index] != 0) return;
+                    state[index] = 1;
+                    for (const auto& value :
+                         managed_.functions[index].values) {
+                        if (value.kind != mir::ValueKind::Call ||
+                            !value.callee) {
+                            continue;
+                        }
+                        const auto found = indices.find(value.callee->value);
+                        if (found != indices.end() &&
+                            state[found->second] == 0) {
+                            visit(found->second);
+                        }
+                    }
+                    state[index] = 2;
+                    order.push_back(index);
+                };
+            for (std::size_t index = 0; index < managed_.functions.size();
+                 ++index) {
+                visit(index);
+            }
+        } else {
+            for (std::size_t index = 0; index < managed_.functions.size();
+                 ++index) {
+                order.push_back(index);
+            }
+        }
+
+        std::vector<std::optional<machine::Function>> lowered(
+            managed_.functions.size());
+        for (const auto index : order) {
+            lowered[index] = lower_function(managed_.functions[index]);
+        }
+        for (auto& function : lowered) {
+            if (function) {
+                result_.functions.push_back(std::move(*function));
+            }
         }
         return std::move(result_);
     }
@@ -984,9 +1032,36 @@ private:
                                 *physical, machine::i64));
                     }
                 };
+            const auto append_physical_clobbers =
+                [&](const std::vector<machine::PhysicalRegisterId>& ids) {
+                    for (const auto physical : ids) {
+                        if (std::any_of(
+                                result.clobbers.begin(),
+                                result.clobbers.end(),
+                                [&](const machine::Register& present) {
+                                    return present.kind ==
+                                               machine::RegisterKind::Physical &&
+                                           present.id == physical.value;
+                                })) {
+                            continue;
+                        }
+                        result.clobbers.push_back(
+                            machine::Register::physical_register(
+                                physical, machine::i64));
+                    }
+                };
             if (const auto* abi = managed_abi_model(
                     callee, subtarget_, options_)) {
-                append_clobbers(abi->call_clobbers);
+                const auto exact =
+                    options_.ipa_ra && options_.private_abi &&
+                            callee.abi_contract == hir::AbiContract::Dynamic
+                        ? private_clobbers_.find(callee.id.value)
+                        : private_clobbers_.end();
+                if (exact != private_clobbers_.end()) {
+                    append_physical_clobbers(exact->second);
+                } else {
+                    append_clobbers(abi->call_clobbers);
+                }
                 std::vector<AbiValue> arguments;
                 arguments.reserve(value.call_arguments.size());
                 for (std::size_t index = 0;
@@ -2144,6 +2219,7 @@ private:
 
     bool fold_pointer_offsets(machine::Function& function) {
         if (!options_.combine_addresses) return false;
+        bool changed = false;
         std::vector<std::optional<machine::ImmediateOperand>> constants(
             function.virtual_registers.size());
         for (const auto& block : function.blocks) {
@@ -2165,10 +2241,16 @@ private:
             }
         }
 
-        bool changed = false;
         for (auto& block : function.blocks) {
             for (auto& instruction : block.instructions) {
-                if (instruction.opcode != Opcode::IndexedAddress ||
+                const auto opcode = decode_opcode(instruction.opcode);
+                const bool indexed_address =
+                    opcode == Opcode::IndexedAddress;
+                const bool indexed_load =
+                    opcode == Opcode::IndexedLoadSigned ||
+                    opcode == Opcode::IndexedLoadUnsigned ||
+                    opcode == Opcode::FindexedLoad;
+                if ((!indexed_address && !indexed_load) ||
                     instruction.uses.size() != 2 ||
                     instruction.operands.empty()) {
                     continue;
@@ -2195,7 +2277,15 @@ private:
                     continue;
                 }
                 const auto base = instruction.uses.front();
-                instruction.opcode = Opcode::PointerOffset;
+                if (indexed_address) {
+                    instruction.opcode = Opcode::PointerOffset;
+                } else if (opcode == Opcode::IndexedLoadSigned) {
+                    instruction.opcode = Opcode::PointerLoadSigned;
+                } else if (opcode == Opcode::IndexedLoadUnsigned) {
+                    instruction.opcode = Opcode::PointerLoadUnsigned;
+                } else {
+                    instruction.opcode = Opcode::FpointerLoad;
+                }
                 instruction.uses = {base};
                 instruction.operands = {
                     machine::RegisterOperand{base},
@@ -2206,6 +2296,8 @@ private:
                 changed = true;
             }
         }
+
+        changed = share_index_scales(function) || changed;
 
         std::vector<const machine::Instruction*> definitions(
             function.virtual_registers.size());
@@ -2250,6 +2342,139 @@ private:
                 instruction.operands.push_back(*offset);
                 changed = true;
             }
+        }
+        return changed;
+    }
+
+    machine::Register create_integer_temporary(
+        machine::Function& function, machine::IntegerMode mode,
+        SourceLocation location, std::string_view purpose) {
+        const machine::VirtualRegisterId id{
+            static_cast<std::uint32_t>(function.virtual_registers.size())};
+        function.virtual_registers.push_back(mode);
+        function.virtual_register_classes.push_back(
+            machine::VirtualRegisterClass::Integer);
+        function.virtual_register_assignments.push_back(std::nullopt);
+        function.rematerialized_immediates.push_back(std::nullopt);
+
+        machine::StackSlot spill;
+        spill.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
+        spill.kind = machine::StackSlotKind::Spill;
+        spill.size = mode.bits > 32 ? 8U : 4U;
+        spill.alignment = spill.size;
+        spill.location = location;
+        spill.name = "$" + std::string(purpose) + "." +
+                     std::to_string(id.value);
+        spill.spill_for = id;
+        function.stack_slots.push_back(std::move(spill));
+        return machine::Register::virtual_register(id, mode);
+    }
+
+    bool share_index_scales(machine::Function& function) {
+        struct Group {
+            machine::Register index;
+            std::uint64_t scale{};
+            std::size_t first{};
+            unsigned uses{};
+            std::optional<machine::Register> scaled;
+        };
+        const auto scale_of = [&](const machine::Instruction& instruction)
+            -> std::optional<std::pair<machine::Register, std::uint64_t>> {
+            const auto opcode = decode_opcode(instruction.opcode);
+            if (opcode != Opcode::IndexedAddress &&
+                opcode != Opcode::IndexedLoadSigned &&
+                opcode != Opcode::IndexedLoadUnsigned &&
+                opcode != Opcode::FindexedLoad) {
+                return std::nullopt;
+            }
+            if (instruction.uses.size() != 2 ||
+                instruction.operands.size() < 3) {
+                return std::nullopt;
+            }
+            const auto index = instruction.uses[1];
+            const auto* scale = std::get_if<machine::ImmediateOperand>(
+                &instruction.operands.back());
+            if (index.kind != machine::RegisterKind::Virtual || !scale ||
+                scale->value <= 1 || !std::has_single_bit(scale->value) ||
+                index.mode.bits != hir_.address_bits) {
+                return std::nullopt;
+            }
+            return std::pair{index, scale->value};
+        };
+
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            std::vector<Group> groups;
+            for (std::size_t position = 0;
+                 position < block.instructions.size(); ++position) {
+                const auto candidate = scale_of(block.instructions[position]);
+                if (!candidate) continue;
+                const auto found = std::find_if(
+                    groups.begin(), groups.end(), [&](const Group& group) {
+                        return group.index == candidate->first &&
+                               group.scale == candidate->second;
+                    });
+                if (found == groups.end()) {
+                    groups.push_back(
+                        {candidate->first, candidate->second, position, 1,
+                         std::nullopt});
+                } else {
+                    ++found->uses;
+                }
+            }
+            std::erase_if(groups, [](const Group& group) {
+                return group.uses < 2;
+            });
+            if (groups.empty()) continue;
+
+            for (auto& group : groups) {
+                group.scaled = create_integer_temporary(
+                    function, group.index.mode,
+                    block.instructions[group.first].location,
+                    "index.scale");
+            }
+
+            std::vector<machine::Instruction> rewritten;
+            rewritten.reserve(block.instructions.size() + groups.size());
+            for (std::size_t position = 0;
+                 position < block.instructions.size(); ++position) {
+                for (const auto& group : groups) {
+                    if (group.first != position) continue;
+                    machine::Instruction shift;
+                    shift.kind = machine::InstructionKind::Target;
+                    shift.opcode = Opcode::Shl;
+                    shift.location = block.instructions[position].location;
+                    shift.operands = {
+                        machine::RegisterOperand{group.index},
+                        machine::ImmediateOperand{
+                            static_cast<std::uint64_t>(
+                                std::countr_zero(group.scale)), 0,
+                            group.index.mode, false}};
+                    shift.uses = {group.index};
+                    shift.defs = {*group.scaled};
+                    rewritten.push_back(std::move(shift));
+                }
+
+                auto instruction = std::move(block.instructions[position]);
+                const auto candidate = scale_of(instruction);
+                if (candidate) {
+                    const auto group = std::find_if(
+                        groups.begin(), groups.end(), [&](const Group& value) {
+                            return value.index == candidate->first &&
+                                   value.scale == candidate->second;
+                        });
+                    if (group != groups.end()) {
+                        instruction.uses[1] = *group->scaled;
+                        instruction.operands[1] =
+                            machine::RegisterOperand{*group->scaled};
+                        std::get<machine::ImmediateOperand>(
+                            instruction.operands.back()).value = 1;
+                    }
+                }
+                rewritten.push_back(std::move(instruction));
+            }
+            block.instructions = std::move(rewritten);
+            changed = true;
         }
         return changed;
     }
@@ -3562,7 +3787,91 @@ private:
         (void)passes.run(current_);
     }
 
-    void lower_function(const mir::ManagedFunction& source) {
+    void record_private_clobbers(const machine::Function& function) {
+        const auto& entity = hir_.function(function.source);
+        if (!options_.ipa_ra || !options_.private_abi ||
+            entity.abi_contract != hir::AbiContract::Dynamic ||
+            !subtarget_.has_feature(Feature::Mips3)) {
+            return;
+        }
+
+        std::unordered_set<std::uint32_t> preserved;
+        for (const auto physical : function.callee_saved_registers) {
+            preserved.insert(physical.value);
+        }
+        std::unordered_set<std::uint32_t> clobbered;
+        const auto append = [&](machine::PhysicalRegisterId physical) {
+            if (!preserved.contains(physical.value)) {
+                clobbered.insert(physical.value);
+            }
+        };
+        const auto append_name = [&](std::string_view name) {
+            if (const auto physical = physical_register_id(name)) {
+                append(*physical);
+            }
+        };
+
+        // These registers are reserved from allocation because emitter
+        // expansions may use them as scratch. Advertising them is harmless
+        // to callers and keeps the summary sound without duplicating every
+        // target expansion's internal sequence here.
+        for (const auto name : {"at", "t0", "t1", "t2", "t3", "ra",
+                                "f0", "f2", "f4"}) {
+            append_name(name);
+        }
+        for (const auto assignment :
+             function.virtual_register_assignments) {
+            if (assignment) append(*assignment);
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& definition : instruction.defs) {
+                    if (definition.kind ==
+                        machine::RegisterKind::Physical) {
+                        append({definition.id});
+                    }
+                }
+                for (const auto& clobber : instruction.clobbers) {
+                    if (clobber.kind == machine::RegisterKind::Physical) {
+                        append({clobber.id});
+                    }
+                }
+                if (decode_opcode(instruction.opcode) ==
+                    Opcode::AtomicCompareExchange) {
+                    append_name("t4");
+                    append_name("t5");
+                }
+            }
+        }
+        for (const auto& name : entity.clobbers) append_name(name);
+
+        if (const auto* abi = managed_abi_model(
+                entity, subtarget_, options_)) {
+            if (const auto signature =
+                    classify_function_interface(entity, *abi)) {
+                for (const auto& result : signature->results) {
+                    for (const auto& piece : result.pieces) {
+                        if (piece.location.kind == LocationKind::Register) {
+                            append_name(piece.location.reg);
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<machine::PhysicalRegisterId> summary;
+        summary.reserve(clobbered.size());
+        for (const auto id : clobbered) summary.push_back({id});
+        std::sort(summary.begin(), summary.end(),
+                  [](machine::PhysicalRegisterId left,
+                     machine::PhysicalRegisterId right) {
+                      return left.value < right.value;
+                  });
+        private_clobbers_.insert_or_assign(entity.id.value,
+                                            std::move(summary));
+    }
+
+    machine::Function lower_function(const mir::ManagedFunction& source) {
         current_ = {};
         source_ = &source;
         const auto& entity = hir_.function(source.source);
@@ -3586,7 +3895,8 @@ private:
             current_.labels.push_back({label.label, {label.block.value}});
         }
         optimize_machine_function();
-        result_.functions.push_back(std::move(current_));
+        record_private_clobbers(current_);
+        return std::move(current_);
     }
 
     const mir::ManagedModule& managed_;
@@ -3598,6 +3908,9 @@ private:
     machine::Function current_;
     const mir::ManagedFunction* source_{};
     std::vector<std::optional<machine::VirtualRegisterId>> value_registers_;
+    std::unordered_map<std::uint32_t,
+                       std::vector<machine::PhysicalRegisterId>>
+        private_clobbers_;
 };
 
 } // namespace
@@ -3669,7 +3982,7 @@ public:
                        ".section .gcc_compiled_long32\n.previous\n";
         }
         for (auto& function : module_.functions) emit_function(function);
-        emit_float_literal_pool();
+        emit_literal_pools();
         return output_.str();
     }
 
@@ -3690,6 +4003,11 @@ private:
     struct FloatLiteral {
         std::uint64_t bits{};
         unsigned width{};
+        std::string label;
+    };
+
+    struct IntegerLiteral {
+        std::uint64_t bits{};
         std::string label;
     };
 
@@ -3733,8 +4051,42 @@ private:
         return float_literals_.back();
     }
 
-    void emit_float_literal_pool() {
-        if (float_literals_.empty()) return;
+    bool prefer_integer_literal(
+        const machine::ImmediateOperand& immediate) const {
+        if (!options_.machine_combine || immediate.mode.bits != 64 ||
+            large_code_model() ||
+            (options_.optimize_for != OptimizationGoal::Size &&
+             options_.optimize_for != OptimizationGoal::MinimumSize)) {
+            return false;
+        }
+        // A pool reference costs two instructions and eight data bytes. Keep
+        // the transformation strictly profitable even after charging the
+        // data by accepting only constants whose four populated chunks need
+        // a full DLI construction. Leading 0xffff is excluded because GNU
+        // as can sometimes exploit sign extension for that shape.
+        for (unsigned shift = 0; shift < 64; shift += 16) {
+            if (((immediate.value >> shift) & 0xffffU) == 0) return false;
+        }
+        return (immediate.value >> 48U) != 0xffffU;
+    }
+
+    const IntegerLiteral& integer_literal(
+        const machine::ImmediateOperand& immediate) {
+        const auto found = std::find_if(
+            integer_literals_.begin(), integer_literals_.end(),
+            [&](const IntegerLiteral& candidate) {
+                return candidate.bits == immediate.value;
+            });
+        if (found != integer_literals_.end()) return *found;
+        const auto index = integer_literals_.size();
+        integer_literals_.push_back(
+            {immediate.value,
+             ".Lcross.mips.integer." + std::to_string(index)});
+        return integer_literals_.back();
+    }
+
+    void emit_literal_pools() {
+        if (float_literals_.empty() && integer_literals_.empty()) return;
         std::string error;
         const auto directive = assembly_section_directive(
             format_, {".rodata", AssemblySectionKind::ReadOnlyData,
@@ -3749,6 +4101,11 @@ private:
             output_ << ".p2align " << (literal.width == 32 ? 2 : 3) << '\n'
                     << literal.label << ":\n\t"
                     << (literal.width == 32 ? ".word " : ".quad ")
+                    << literal.bits << '\n';
+        }
+        for (const auto& literal : integer_literals_) {
+            output_ << ".p2align 3\n"
+                    << literal.label << ":\n\t.quad "
                     << literal.bits << '\n';
         }
     }
@@ -6338,6 +6695,10 @@ private:
             const bool no_copies =
                 edge_has_phi_copies(function, predecessor, no);
             const auto next = layout_successor(function, predecessor);
+            // Conditional edge copies are emitted after the architectural
+            // delay slot only on the directly encoded edge. Keep the
+            // candidate before any stub that must perform copies for the
+            // other edge.
             if ((yes_copies || no_copies) &&
                 !((next == yes && !no_copies) ||
                   (next == no && !yes_copies))) {
@@ -6740,6 +7101,7 @@ private:
     bool fpu_multiply_pending_{};
     std::optional<std::string> fpu_transfer_delay_register_;
     std::vector<FloatLiteral> float_literals_;
+    std::vector<IntegerLiteral> integer_literals_;
     std::string epilogue_label_;
     std::unordered_map<std::uint32_t, SuccessorDelayEntry>
         edge_delay_entries_;
@@ -7940,8 +8302,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             return;
         }
         if (opcode == Opcode::Fconstant) {
-            if (const auto destination = assigned_fpr(function, target);
-                destination && prefer_float_literal(immediate)) {
+            const auto destination = assigned_fpr(function, target);
+            if (destination && immediate.value == 0 && immediate.high == 0) {
+                move_gpr_to_fpr("zero", *destination, target.mode.bits);
+                return;
+            }
+            if (destination && prefer_float_literal(immediate)) {
                 const auto& literal = float_literal(immediate);
                 if (large_code_model()) {
                     materialize_symbol_address("t0", literal.label);
@@ -7957,7 +8323,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             }
             instruction(target.mode.bits > 32 ? "dli" : "li",
                         "$t0," + std::to_string(immediate.value));
-            if (const auto destination = assigned_fpr(function, target)) {
+            if (destination) {
                 move_gpr_to_fpr("t0", *destination, target.mode.bits);
             } else {
                 store_integer_memory(
@@ -7967,9 +8333,16 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             }
         } else {
             const auto destination = output_gpr(function, target, "t0");
-            instruction(target.mode.bits > 32 ? "dli" : "li",
-                        reg_name(destination) + "," +
-                            std::to_string(immediate.value));
+            if (prefer_integer_literal(immediate)) {
+                const auto& literal = integer_literal(immediate);
+                instruction("lui", "$t0,%hi(" + literal.label + ")");
+                instruction("ld", reg_name(destination) + ",%lo(" +
+                                      literal.label + ")($t0)");
+            } else {
+                instruction(target.mode.bits > 32 ? "dli" : "li",
+                            reg_name(destination) + "," +
+                                std::to_string(immediate.value));
+            }
             commit_gpr(function, target, destination, value.location);
         }
         return;

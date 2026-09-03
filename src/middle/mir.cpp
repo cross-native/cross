@@ -12825,12 +12825,28 @@ bool vectorize_early_exit_loops(ManagedFunction& function,
     return changed;
 }
 
-bool fold_integer_constants(ManagedFunction& function,
-                            const hir::Module& hir_module) {
+bool fold_constants(ManagedFunction& function,
+                    const hir::Module& hir_module) {
     bool changed = false;
     for (auto& value : function.values) {
         if (value.kind == ValueKind::Unary && value.operands.size() == 1) {
             const auto& operand = function.values[value.operands[0].value];
+            if (operand.kind == ValueKind::ConstantFloating &&
+                value.unary == UnaryOperation::Negate) {
+                const auto bits = type_bits(hir_module, value.type);
+                if (bits != 32 && bits != 64 && bits != 80 && bits != 128) {
+                    continue;
+                }
+                const auto folded = bit_xor(
+                    UInt128{operand.integer, operand.integer_high},
+                    shift_left(UInt128{1}, bits - 1U));
+                value.integer = folded.low;
+                value.integer_high = folded.high;
+                value.kind = ValueKind::ConstantFloating;
+                value.operands.clear();
+                changed = true;
+                continue;
+            }
             if (operand.kind != ValueKind::ConstantInteger) continue;
             const auto bits = type_bits(hir_module, value.type);
             const UInt128 input{operand.integer, operand.integer_high};
@@ -13370,7 +13386,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             pipeline.add(
                 PassId::ConstantFolding,
                 [&](ManagedFunction& function, FunctionAnalysisManager&) {
-                    return fold_integer_constants(function, hir_module)
+                    return fold_constants(function, hir_module)
                         ? PassResult::changed_values()
                         : PassResult::unchanged();
                 });

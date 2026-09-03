@@ -43,6 +43,18 @@ if(NOT strict_branch_count EQUAL expected_strict_branches)
     message(FATAL_ERROR
         "CCP did not fold the constant CFG edge\n${ccp_assembly}")
 endif()
+string(REGEX MATCHALL "[\t ]xorpd[\t ]" strict_xorpd
+       "${strict_assembly}")
+string(REGEX MATCHALL "[\t ]xorpd[\t ]" ccp_xorpd
+       "${ccp_assembly}")
+list(LENGTH strict_xorpd strict_xorpd_count)
+list(LENGTH ccp_xorpd ccp_xorpd_count)
+math(EXPR expected_strict_xorpd "${ccp_xorpd_count} + 1")
+if(NOT strict_xorpd_count EQUAL expected_strict_xorpd)
+    message(FATAL_ERROR
+        "CCP did not fold exact floating negation into the literal sign bit\n"
+        "${ccp_assembly}")
+endif()
 
 execute_process(
     COMMAND "${CC}" -S -O0 -ftree-dse -ftree-dce "${SOURCE}"

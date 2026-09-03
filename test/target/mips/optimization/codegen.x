@@ -71,6 +71,35 @@ global u32 mips_integer_immediates(in u32 value) {
 }
 
 [[abi("o32"), noinline]]
+global u64 mips_integer_literal(in u64 value) {
+    return value ^ 11400714819323198485u64;
+}
+
+[[runtime_only, noinline]]
+static u64 mips_ipa_step(in u64 value, in u64 step) {
+    return ((value ^ step) * 6364136223846793005u64) +
+           1442695040888963407u64;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_ipa_call_loop(in u64 state, in uptr count) {
+    u64 result = state;
+    uptr index = 0;
+    while (index < count) {
+        result = mips_ipa_step(result, index);
+        index += 1;
+    }
+    return result;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_shared_index_scale(in const f64 *left,
+                                   in const f64 *right,
+                                   in uptr index) {
+    return left[index] + right[index];
+}
+
+[[abi("o32"), noinline]]
 global u64 mips_small_constant_multiply(in u64 value) {
     return value * 17u64;
 }
@@ -320,4 +349,15 @@ global f64 mips_fp_mul_delay_slot(in f64 left, in f64 right,
 global f64 mips_fp_mul_pair(in f64 left0, in f64 right0,
                             in f64 left1, in f64 right1) {
     return left0 * right0 + left1 * right1;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_fp_literal(in f64 value) {
+    return value * 0.999999f64;
+}
+
+[[abi("o32"), noinline]]
+global f64 mips_fp_fixed_result(in f64 value) {
+    if (value < 0.0f64) return -value;
+    return value;
 }

@@ -10,6 +10,10 @@ global bool optimization_self_equal(in f64 value) {
     return value == value;
 }
 
+global f64 optimization_negated_constant() {
+    return -0.25f64;
+}
+
 global i32 optimization_redundant(in i32 left, in i32 right) {
     return (left + right) * (left + right);
 }

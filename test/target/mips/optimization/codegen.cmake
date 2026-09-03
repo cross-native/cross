@@ -18,6 +18,17 @@ function(compile_variant name)
     endif()
 endfunction()
 
+function(compile_size_variant name)
+    execute_process(
+        COMMAND "${CC}" -S -Oz -mprofile=vr4300-o32 -fno-unroll-loops
+                ${ARGN} "${SOURCE}" -o "${OUTPUT}.${name}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR
+            "${name} MIPS size compilation failed\n${stdout}\n${stderr}")
+    endif()
+endfunction()
+
 function(compile_reassociation_variant name balance)
     execute_process(
         COMMAND "${CC}" -S -O3 -mprofile=vr4300-o32
@@ -68,9 +79,11 @@ compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
 compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_schedule -fno-schedule-insns)
 compile_variant(no_machine_combine -fno-machine-combine)
+compile_variant(no_address_combine -fno-combine-addresses)
 compile_variant(no_slsr -fno-tree-slsr)
 compile_variant(no_ccp -fno-tree-ccp)
 compile_variant(no_licm -fno-move-loop-invariants)
+compile_variant(no_ipa_ra -fno-ipa-ra)
 compile_variant(cisc -mrisc-cisc-balance=100)
 compile_variant(fix4300 -mfix4300)
 compile_variant(fix4300_no_schedule -mfix4300 -fno-schedule-insns)
@@ -80,6 +93,8 @@ compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_variant(no_if_conversion -fno-if-conversion)
 compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
 compile_variant(force_ordinary_if_conversion -fif-conversion-limit=12)
+compile_size_variant(size)
+compile_size_variant(size_no_machine_combine -fno-machine-combine)
 compile_reassociation_variant(reassoc_risc 0)
 compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
 compile_reassociation_variant(reassoc_cisc 100 -fno-unroll-loops)
@@ -241,6 +256,79 @@ if(NOT scheduled_fp MATCHES
         "without spills or honor -fno-schedule-insns\n"
         "scheduled:\n${scheduled_fp}\nserial:\n${serial_fp}")
 endif()
+if(NOT scheduled_fp MATCHES
+       "[\t ]dmtc1[\t ]+\\$zero,\\$f[0-9]+\n[\t ]+nop\n[\t ]+add[.]d" OR
+   scheduled_fp MATCHES
+       "[\t ]dli[\t ][^\n]*,0\n[\t ]+dmtc1")
+    message(FATAL_ERROR
+        "MIPS zero floating constant did not use the architectural zero "
+        "register or lost its required transfer delay\n${scheduled_fp}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_fp_mul_pair fp_result_pair)
+if(fp_result_pair MATCHES
+       "[\t ]dmtc1[^\n]*\n[\t ]+nop" OR
+   NOT fp_result_pair MATCHES
+       "[\t ]dmtc1[^\n]*\n[\t ]+(move|mul[.]d)" OR
+   NOT fp_result_pair MATCHES
+       "[\t ]add[.]d[\t ]+\\$f0," OR
+   fp_result_pair MATCHES
+       "[\t ]mov[.]d[\t ]+\\$f0,")
+    message(FATAL_ERROR
+        "MIPS floating result recoloring or dependency-aware transfer "
+        "scheduling regressed\n${fp_result_pair}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_fp_fixed_result fp_fixed_result)
+if(NOT fp_fixed_result MATCHES "[\t ]c[.]lt[.]d[\t ]" OR
+   NOT fp_fixed_result MATCHES "[\t ]mov[.]d[\t ]+\\$f0,")
+    message(FATAL_ERROR
+        "MIPS fixed-F0 floating operations were unsafely recolored\n"
+        "${fp_fixed_result}")
+endif()
+
+function_body("${OUTPUT}.size.s" mips_fp_literal pooled_literal)
+function_body("${OUTPUT}.size_no_machine_combine.s"
+              mips_fp_literal materialized_literal)
+file(READ "${OUTPUT}.size.s" size_assembly)
+file(READ "${OUTPUT}.size_no_machine_combine.s"
+          materialized_assembly)
+if(NOT pooled_literal MATCHES
+       "[\t ]lui[\t ][^\n]*%hi[(]\\.Lcross[.]mips[.]float[.][0-9]+[)]" OR
+   NOT pooled_literal MATCHES
+       "[\t ]ldc1[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.]float[.][0-9]+[)]" OR
+   NOT size_assembly MATCHES
+       "\\.Lcross[.]mips[.]float[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
+   NOT materialized_literal MATCHES "[\t ]dli[\t ]" OR
+   materialized_assembly MATCHES
+       "\\.Lcross[.]mips[.]float[.][0-9]+:")
+    message(FATAL_ERROR
+        "MIPS size-mode floating literal pooling or "
+        "-fno-machine-combine regressed\n"
+        "pooled:\n${pooled_literal}\nmaterialized:\n${materialized_literal}")
+endif()
+
+function_body("${OUTPUT}.size.s"
+              mips_integer_literal pooled_integer)
+function_body("${OUTPUT}.size_no_machine_combine.s"
+              mips_integer_literal materialized_integer)
+if(NOT pooled_integer MATCHES
+       "[\t ]lui[\t ][^\n]*%hi[(]\\.Lcross[.]mips[.]integer[.][0-9]+[)]" OR
+   NOT pooled_integer MATCHES
+       "[\t ]ld[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.]integer[.][0-9]+[)]" OR
+   NOT size_assembly MATCHES
+       "\\.Lcross[.]mips[.]integer[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
+   NOT materialized_integer MATCHES "[\t ]dli[\t ]" OR
+   materialized_assembly MATCHES
+       "\\.Lcross[.]mips[.]integer[.][0-9]+:")
+    message(FATAL_ERROR
+        "MIPS size-mode integer literal pooling or "
+        "-fno-machine-combine regressed\n"
+        "pooled:\n${pooled_integer}\n"
+        "materialized:\n${materialized_integer}")
+endif()
 
 function_body("${OUTPUT}.enabled.s"
               mips_fp_delay_slot fp_delay_slot)
@@ -300,6 +388,40 @@ if(register_constants MATCHES
     message(FATAL_ERROR
         "-fno-machine-combine did not preserve register constants\n"
         "${register_constants}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_shared_index_scale shared_index_scale)
+function_body("${OUTPUT}.no_address_combine.s"
+              mips_shared_index_scale separate_index_scales)
+string(REGEX MATCHALL "[\t ]sll[\t ][^\n]*,3"
+       shared_index_shifts "${shared_index_scale}")
+string(REGEX MATCHALL "[\t ]sll[\t ][^\n]*,3"
+       separate_index_shifts "${separate_index_scales}")
+list(LENGTH shared_index_shifts shared_index_shift_count)
+list(LENGTH separate_index_shifts separate_index_shift_count)
+if(NOT shared_index_shift_count EQUAL 1 OR
+   NOT separate_index_shift_count EQUAL 2)
+    message(FATAL_ERROR
+        "MIPS address combining did not share a repeated scaled index or "
+        "-fno-combine-addresses was ignored\n"
+        "combined:\n${shared_index_scale}\n"
+        "separate:\n${separate_index_scales}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_ipa_call_loop precise_private_call)
+function_body("${OUTPUT}.no_ipa_ra.s"
+              mips_ipa_call_loop conservative_private_call)
+if(precise_private_call MATCHES
+       "[\t ](sd|ld)[\t ]+\\$s[0-7]," OR
+   NOT precise_private_call MATCHES "[\t ]jal[\t ]" OR
+   NOT conservative_private_call MATCHES
+       "[\t ](sd|ld)[\t ]+\\$s[0-7],")
+    message(FATAL_ERROR
+        "MIPS private-call clobber summaries or -fno-ipa-ra regressed\n"
+        "precise:\n${precise_private_call}\n"
+        "conservative:\n${conservative_private_call}")
 endif()
 
 function_body("${OUTPUT}.enabled.s"
