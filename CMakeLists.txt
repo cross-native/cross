@@ -280,12 +280,122 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.x
                 -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
                 -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
+                -DMIPS1_FLOAT_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/mips1_float.x
                 -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/runtime.s
                 -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
                 -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
                 -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-runtime
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
+    add_test(NAME cross_mips_n64
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-n64
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64.cmake")
+    add_test(NAME cross_mips_n64_runtime
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-n64-runtime
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+    add_test(NAME cross_mips_differential_int_vr4300
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/int_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_int.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_int.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=vr4300-o32
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-int-vr4300
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    add_test(NAME cross_mips_differential_int_r3000
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/int_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_int.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_int.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=r3000-o32
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-int-r3000
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    add_test(NAME cross_mips_differential_int_vr4300_le
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/int_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_int.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_int.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                "-DTARGET_FLAGS=-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
+                -DENDIAN=LE
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-int-vr4300-le
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    add_test(NAME cross_mips_differential_int_vr4300_os
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/int_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_int.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_int.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=vr4300-o32
+                -DOPT_LEVEL=-Os
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-int-vr4300-os
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    add_test(NAME cross_mips_differential_float_vr4300
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/float_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_float.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_float.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=vr4300-o32
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-float-vr4300
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    # k_p_float lives in the float set (see float_kernels.x.in), so the
+    # private set is integer-only and runs on both CPU profiles below.
+    add_test(NAME cross_mips_differential_private_vr4300
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/private_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_private.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_private.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=vr4300-o32
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-private-vr4300
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    add_test(NAME cross_mips_differential_private_r3000
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/private_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_private.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_private.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=r3000-o32
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-private-r3000
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
     add_test(NAME cross_model_system
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

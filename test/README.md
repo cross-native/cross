@@ -14,6 +14,9 @@
 - `backend/native/` covers native emission and standalone auditing.
 - `target/<architecture>/` covers architecture-specific profiles, assembly,
   object metadata, diagnostics, and optional emulator execution.
+  `target/mips/differential/` runs the same Cross kernels through the
+  native x86-64 backend and through QEMU on MIPS, comparing results to catch
+  backend divergences across byte order, CPU profile, and ABI boundary.
 - `support/` contains runners shared by multiple test families.
 
 Fixtures live beside their CMake test driver whenever they are not shared.

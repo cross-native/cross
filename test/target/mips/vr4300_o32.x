@@ -67,3 +67,30 @@ global i64 mips_entry(in i64 left, in i64 right, in i32 selector) {
     f64 floating = mips_fma_shape(2.0f64, 3.0f64, 4.0f64);
     return integer + mips_choose(selector, floating == 10.0f64, 0);
 }
+
+// A loop-carried value must not be coalesced with its own increment when the
+// old value is still read after the increment is computed. Each iteration
+// stores the current index and only then advances it.
+[[abi("o32"), noinline]]
+global u32 mips_phi_after_use(in u32 count, in volatile u32 *sink) {
+    u32 index = 0u32;
+    while (index < count) {
+        u32 next = index + 1u32;
+        *sink = index;
+        index = next;
+    }
+    return index;
+}
+
+// The same hazard with an arithmetic consumer of the old index.
+[[abi("o32"), noinline]]
+global u32 mips_phi_after_arith(in u32 count, in u32 seed) {
+    u32 index = 0u32;
+    u32 acc = seed;
+    while (index < count) {
+        u32 next = index + 1u32;
+        acc = acc * 3u32 + index;
+        index = next;
+    }
+    return acc;
+}

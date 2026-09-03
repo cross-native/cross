@@ -1,0 +1,151 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Private-ABI and projected-parameter kernels, merged: helpers carry no abi
+// attribute, so surviving calls use the optimizer-selected private contract
+// (cross64 on MIPS III, cross32 on earlier CPUs, cross on x86-64); the
+// k_proj_* kernels additionally exercise a u64 o32 pair parameter used both
+// as its low-word projection and as the whole value. Every kernel here is
+// integer-only (k_p_float moved to float_kernels.x.in, since MIPS I diagnoses
+// its float-to-integer conversion) so this set runs on both CPU profiles.
+
+[[noinline]]
+static u64 p_helper64(in u64 x, in u64 y) {
+    return (x + y) ^ (x - (y << 3));
+}
+
+[[noinline]]
+static u32 p_helper5(in u32 p1, in u32 p2, in u32 p3, in u32 p4, in u32 p5) {
+    return p1 + p2 * 2u32 + p3 * 3u32 + p4 * 4u32 + p5 * 5u32;
+}
+
+[[noinline]]
+static u64 p_helper_wide(in u32 p1, in u64 p2, in u32 p3, in u64 p4, in u64 p5,
+                         in u32 p6) {
+    u64 w1 = p1;
+    u64 w3 = p3;
+    u64 w6 = p6;
+    return p2 * 3u64 + p4 + w1 + (w3 << 40) + (p5 >> 3) + (w6 << 20);
+}
+
+[[noinline]]
+static i32 p_helper_signed(in i32 x, in i8 y, in u16 z, in i64 w) {
+    i32 wy = y;
+    i32 wz = z;
+    i64 sum = w + x;
+    i32 low = sum;
+    return x * 2 + wy - wz + low;
+}
+
+[[noinline]]
+static u32 p_recurse(in u32 n, in u64 acc) {
+    if (n == 0u32) {
+        u32 low = acc;
+        u32 high = acc >> 32;
+        return low ^ high;
+    }
+    u64 wn = n;
+    return p_recurse(n - 1u32, acc * 3u64 + wn) + n;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_p_call64(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 x = (wa << 32) | wb;
+    u64 y = c;
+    u64 r = p_helper64(x, y) + p_helper64(y, x);
+    u32 lr = r;
+    u32 hr = r >> 32;
+    return lr ^ hr;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_p_call5(in u32 a, in u32 b, in u32 c) {
+    return p_helper5(a, b, c, a + b, b + c) + p_helper5(c, b, a, 1u32, 2u32);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_p_call_wide(in u32 a, in u32 b, in u32 c) {
+    u64 wb = b;
+    u64 wc = c;
+    u64 wa = a;
+    u64 p2 = (wb << 32) | wc;
+    u64 p4 = wa * 5u64;
+    u64 p5 = (wc << 32) | wa;
+    u64 r = p_helper_wide(a, p2, c, p4, p5, b);
+    u32 lr = r;
+    u32 hr = r >> 32;
+    return lr ^ hr;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_p_signed(in u32 a, in u32 b, in u32 c) {
+    i32 x = a;
+    i8 y = b;
+    u16 z = c;
+    u64 wa = a;
+    u64 wb = b;
+    i64 w = (wa << 32) | wb;
+    i32 r = p_helper_signed(x, y, z, w);
+    u32 ur = r;
+    return ur;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_p_recurse(in u32 a, in u32 b, in u32 c) {
+    u64 wb = b;
+    u64 wc = c;
+    return p_recurse(a & 15u32, (wb << 32) | wc);
+}
+
+[[abi("@ABI@"), noinline]]
+static u64 both_uses(in u64 v, in u32 w) {
+    u32 low = v;
+    u64 wlow = low;
+    u64 ww = w;
+    return v + wlow * 3u64 + (ww << 32);
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 low_then_high(in u64 v) {
+    u32 low = v;
+    u32 high = v >> 32;
+    return low * 3u32 + high;
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 loop_over_low(in u64 v, in u32 n) {
+    u32 low = v;
+    u32 acc = 0u32;
+    for (u32 i = 0u32; i < (n & 7u32); i = i + 1u32) {
+        acc = acc * 5u32 + low + i;
+        u32 high = v >> 32;
+        acc = acc ^ high;
+    }
+    return acc;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_proj_both(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 r = both_uses((wa << 32) | wb, c);
+    u32 lr = r;
+    u32 hr = r >> 32;
+    return lr ^ hr;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_proj_low_high(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    return low_then_high((wa << 32) | wb) + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_proj_loop(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    return loop_over_low((wa << 32) | wb, c);
+}

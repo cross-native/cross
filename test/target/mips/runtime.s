@@ -223,6 +223,58 @@ _start:
         bne     $v1,$t0,.Lfail
         nop
 
+        # A loop index read after its increment must keep its own register.
+        # mips_phi_after_use(1, &phi_words) stores the old index 0 and
+        # returns 1.
+        addiu   $k0,$zero,'X'
+        addiu   $a0,$zero,1
+        lui     $a1,%hi(phi_words)
+        addiu   $a1,$a1,%lo(phi_words)
+        jal     mips_phi_after_use
+        nop
+        addiu   $t0,$zero,1
+        bne     $v0,$t0,.Lfail
+        nop
+        lui     $t0,%hi(phi_words)
+        addiu   $t0,$t0,%lo(phi_words)
+        lw      $t1,0($t0)
+        bne     $t1,$zero,.Lfail
+        nop
+
+        # mips_phi_after_arith(3, 1) = ((1*3+0)*3+1)*3+2 = 32; a coalesced
+        # remainder iteration would add the incremented index instead.
+        addiu   $k0,$zero,'Y'
+        addiu   $a0,$zero,3
+        addiu   $a1,$zero,1
+        jal     mips_phi_after_arith
+        nop
+        addiu   $t0,$zero,32
+        bne     $v0,$t0,.Lfail
+        nop
+
+        # MIPS I f64 through lwc1/swc1 pairs: mips_pair_f64(3.0, 4.0, 2)
+        # = (3*4 + 2.5)*2 - 3 = 26.0 = 0x403a000000000000, returned in
+        # the f0/f1 pair with the high word in the odd register.
+        addiu   $k0,$zero,'Z'
+        mtc1    $zero,$f12
+        lui     $t0,0x4008
+        mtc1    $t0,$f13
+        mtc1    $zero,$f14
+        lui     $t0,0x4010
+        mtc1    $t0,$f15
+        addiu   $t0,$zero,2
+        sw      $t0,16($sp)
+        jal     mips_pair_f64
+        nop
+        mfc1    $t1,$f1
+        lui     $t0,0x403a
+        bne     $t1,$t0,.Lfail
+        nop
+        mfc1    $t2,$f0
+        nop
+        bne     $t2,$zero,.Lfail
+        nop
+
         addiu   $a0,$zero,'P'
         b       .Lreport
         nop
@@ -252,3 +304,5 @@ _start:
         .p2align 3
 runtime_words:
         .space  16
+phi_words:
+        .space  8

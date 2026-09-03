@@ -1,0 +1,223 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Floating kernels: every kernel is u32 k(in u32 a, in u32 b, in u32 c).
+
+[[abi("@ABI@"), noinline]]
+static f64 helperf(in f64 x, in i32 y, in f64 z) {
+    f64 fy = y;
+    return x * 2.0f64 + fy - z;
+}
+
+[[abi("@ABI@"), noinline]]
+static f32 helperf32(in f32 x, in f32 y) {
+    return x * y + 1.0f32;
+}
+
+[[abi("@ABI@"), noinline]]
+static f64 helper_mixed(in i32 p1, in f64 p2, in f32 p3, in f64 p4) {
+    f64 f1 = p1;
+    f64 f3 = p3;
+    return f1 + p2 * 3.0f64 + f3 + p4;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f32_arith(in u32 a, in u32 b, in u32 c) {
+    f32 x = a & 0xffffu32;
+    f32 y = b & 0xffu32;
+    f32 z = c & 0xffu32;
+    f32 r = x * y + z + x / 4.0f32;
+    u32 ur = r;
+    return ur;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f64_arith(in u32 a, in u32 b, in u32 c) {
+    f64 x = a;
+    f64 y = b | 1u32;
+    f64 fc = c;
+    f64 r = x / y * 0.5f64 + fc * 0.25f64;
+    u32 ur = r;
+    return ur;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_cmp(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    i32 sc = c;
+    f64 x = sa;
+    f64 y = sb;
+    f32 z = sc;
+    f64 zd = z;
+    f32 yf = y;
+    u32 bits = 0u32;
+    if (x < y) bits = bits | 1u32;
+    if (x <= y) bits = bits | 2u32;
+    if (x == y) bits = bits | 4u32;
+    if (x > zd) bits = bits | 8u32;
+    if (z >= yf) bits = bits | 16u32;
+    if (x != y) bits = bits | 32u32;
+    return bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_select(in u32 a, in u32 b, in u32 c) {
+    f64 x = a;
+    f64 y = b;
+    f64 m = (x < y) ? x : y;
+    f64 n = (x > y) ? x : y;
+    f64 r = (m + n) * 0.25f64;
+    u32 ur = r;
+    return ur + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_u32_to_f(in u32 a, in u32 b, in u32 c) {
+    f64 x = a;
+    x = x * 0.5f64;
+    u32 rx = x;
+    f32 y = b;
+    f32 yh = y * 0.5f32;
+    u32 ry = yh;
+    f64 z = c;
+    f64 zq = z * 0.25f64;
+    u32 rz = zq;
+    return rx + ry + rz;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_to_u32(in u32 a, in u32 b, in u32 c) {
+    f64 x = a;
+    f64 xb = b;
+    x = (x + xb) * 0.25f64;
+    f32 y = c & 0xffffffu32;
+    y = y * 128.0f32;
+    u32 ux = x;
+    u32 uy = y;
+    return ux + uy;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_to_i32(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    f32 x = sa;
+    x = x / 2.0f32;
+    f64 y = sb;
+    y = y / 4.0f64;
+    i32 rx = x;
+    i32 ry = y;
+    u32 urx = rx;
+    u32 ury = ry;
+    return urx + ury * 3u32 + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_convert(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    sa = sa >> 2;
+    f32 x = sa;
+    f64 y = x;
+    f64 yb = sb;
+    y = y + yb;
+    f32 z = y;
+    i32 rz = z;
+    u32 urz = rz;
+    return urz + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_call(in u32 a, in u32 b, in u32 c) {
+    f64 fa = a;
+    i32 sb = b;
+    f64 fc = c;
+    f64 r = helperf(fa, sb, fc);
+    f32 xa = a & 0xffu32;
+    f32 xb = b & 0xffu32;
+    f32 s = helperf32(xa, xb);
+    i32 sa = a;
+    f64 fb = b;
+    f32 pc = c & 0xffu32;
+    f64 t = helper_mixed(sa, fb, pc, fc);
+    f64 rr = r * 0.0625f64;
+    f64 tt = t * 0.03125f64;
+    i32 ir = rr;
+    i32 it = tt;
+    u32 uir = ir;
+    u32 uit = it;
+    u32 us = s;
+    return uir + us * 3u32 + uit * 5u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_loop(in u32 a, in u32 b, in u32 c) {
+    f64 acc = c & 0xffffu32;
+    f32 facc = 0.0f32;
+    u32 base = a & 0xffffu32;
+    for (u32 i = 0u32; i < (b & 15u32); i = i + 1u32) {
+        f64 term = base + i;
+        f32 fi = i;
+        acc = acc * 1.5f64 + term;
+        facc = facc + fi * 0.5f32;
+    }
+    u32 ua = acc;
+    u32 uf = facc;
+    return ua + uf;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_neg_abs(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    f64 x = sa;
+    x = x * 0.5f64;
+    f64 n = -x;
+    f64 m = (x < 0.0f64) ? n : x;
+    f32 y = sb;
+    y = y * 0.5f32;
+    f32 k = -y;
+    i32 in = n;
+    i32 im = m;
+    i32 ik = k;
+    u32 uin = in;
+    u32 uim = im;
+    u32 uik = ik;
+    return uin + uim * 3u32 + uik * 5u32 + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_f_mul_chain(in u32 a, in u32 b, in u32 c) {
+    f64 x = a & 0xffu32;
+    f64 y = b & 0xffu32;
+    f64 z = c & 0xffu32;
+    f64 r = x * y * z * 0.5f64 + x * x + y * y * z;
+    u32 ur = r;
+    return ur;
+}
+
+// k_p_float lives here rather than in private_kernels.x.in. MIPS I
+// (r3000-o32) diagnoses float-to-integer conversion ("float-to-integer
+// conversion requires MIPS II trunc.w support"), so the private set keeps
+// only integer arithmetic and runs on both CPU profiles; this kernel and its
+// private-ABI helper stay in the float family, which already never runs on
+// r3000.
+[[noinline]]
+static f64 p_helperf(in f64 x, in i32 y, in f32 z, in f64 w) {
+    f64 fy = y;
+    f64 fz = z;
+    return x * 2.0f64 + fy - fz + w;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_p_float(in u32 a, in u32 b, in u32 c) {
+    f64 x = a & 0xffffu32;
+    i32 y = b;
+    f32 z = c & 0xffu32;
+    f64 w = c;
+    f64 r = p_helperf(x, y, z, w) * 0.125f64;
+    i32 ir = r;
+    u32 ur = ir;
+    return ur;
+}

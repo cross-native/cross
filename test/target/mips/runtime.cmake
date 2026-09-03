@@ -1,8 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE MEMORY_SOURCE PAIR_SOURCE STARTUP LINKER WRAPPER_TEMPLATE
-                 WRAPPER_LINKER OUTPUT)
+foreach(required CC SOURCE MEMORY_SOURCE PAIR_SOURCE MIPS1_FLOAT_SOURCE STARTUP
+                 LINKER WRAPPER_TEMPLATE WRAPPER_LINKER OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -32,6 +32,7 @@ endfunction()
 set(functions "${OUTPUT}.functions.o")
 set(memory "${OUTPUT}.memory.o")
 set(pairs "${OUTPUT}.pairs.o")
+set(mips1_float "${OUTPUT}.mips1-float.o")
 set(start "${OUTPUT}.start.o")
 set(elf32 "${OUTPUT}.elf32")
 set(image "${OUTPUT}.bin")
@@ -45,12 +46,17 @@ run_checked(cross-memory "${CC}" -c -O2 -mprofile=vr4300-o32
             "${MEMORY_SOURCE}" -o "${memory}")
 run_checked(cross-mips1-pairs "${CC}" -c -O2 -mprofile=r3000-o32
             "${PAIR_SOURCE}" -o "${pairs}")
+run_checked(cross-mips1-float "${CC}" -c -O2 -mprofile=r3000-o32
+            "${MIPS1_FLOAT_SOURCE}" -o "${mips1_float}")
+# MIPS I objects are FP32 with odd single-precision registers; the MIPS III
+# startup must carry a 32-bit FPU tag to link with them and with the FPXX
+# VR4300 objects alike.
 run_checked(startup "${LLVM_MC}" --filetype=obj
             --triple=mips-unknown-elf --mcpu=mips3
-            --mattr=+noabicalls "${STARTUP}" -o "${start}")
+            --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${start}")
 run_checked(link-elf32 "${LLD}" -m elf32btsmip -T "${LINKER}"
             "${start}" "${functions}" "${memory}" "${pairs}"
-            -o "${elf32}")
+            "${mips1_float}" -o "${elf32}")
 run_checked(flatten-image "${LLVM_OBJCOPY}" -O binary "${elf32}" "${image}")
 
 # Malta's 64-bit firmware preserves a 64-bit ELF entry address. The wrapper
