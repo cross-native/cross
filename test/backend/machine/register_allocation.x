@@ -105,6 +105,79 @@ global i32 allocated_float_to_signed_integer(in u32 left, in i32 right) {
     return converted_halved + converted_direct;
 }
 
+[[noinline, abi("ms_abi")]]
+global i32 allocated_float_to_signed_narrow(in i32 left, in i32 right) {
+    f32 scaled = left;
+    i32 converted_scaled = scaled * 0.5f32;
+    f32 direct = right;
+    i32 converted_direct = direct;
+    return converted_scaled + converted_direct;
+}
+
+[[noinline, abi("ms_abi")]]
+global u32 allocated_conversion_chain(in u32 left, in u32 middle,
+                                      in u32 right) {
+    f64 scaled = left;
+    u32 converted_scaled = scaled * 0.5f64;
+    // The integer-to-floating conversion between the two floating-to-integer
+    // conversions stages through the same fixed registers.
+    f64 reentered = converted_scaled + middle;
+    u32 converted_reentered = reentered * 2.0f64;
+    f64 direct = right;
+    u32 converted_direct = direct;
+    return converted_scaled + converted_reentered + converted_direct;
+}
+
+[[noinline, abi("ms_abi")]]
+global u64 allocated_extended_to_integer(in u64 left, in u64 right) {
+    f80 scaled = left;
+    u64 converted_scaled = scaled * 0.5f80;
+    f80 direct = right;
+    u64 converted_direct = direct;
+    return converted_scaled + converted_direct;
+}
+
+[[noinline, abi("ms_abi")]]
+global u64 allocated_quad_to_integer(in u64 left, in u64 right) {
+    f128 scaled = left;
+    u64 converted_scaled = scaled * 0.5f128;
+    f128 direct = right;
+    u64 converted_direct = direct;
+    return converted_scaled + converted_direct;
+}
+
+[[noinline, abi("ms_abi")]]
+global i32 allocated_float_sign_select(in i32 left, in i32 right) {
+    f64 scaled = left;
+    scaled = scaled * 0.5f64;
+    f64 negated = -scaled;
+    f64 magnitude = (scaled < 0.0f64) ? negated : scaled;
+    f32 other = right;
+    other = other * 0.5f32;
+    f32 flipped = -other;
+    i32 converted_negated = negated;
+    i32 converted_magnitude = magnitude;
+    i32 converted_flipped = flipped;
+    return converted_negated + converted_magnitude * 3 +
+           converted_flipped * 5;
+}
+
+[[noinline, abi("ms_abi")]]
+global u32 allocated_float_loop(in u32 base, in u32 count, in u32 seed) {
+    f64 accumulator = seed & 0xffffu32;
+    f32 tally = 0.0f32;
+    u32 start = base & 0xffffu32;
+    for (u32 index = 0u32; index < (count & 15u32); index = index + 1u32) {
+        f64 term = start + index;
+        f32 step = index;
+        accumulator = accumulator * 1.5f64 + term;
+        tally = tally + step * 0.5f32;
+    }
+    u32 converted_accumulator = accumulator;
+    u32 converted_tally = tally;
+    return converted_accumulator + converted_tally;
+}
+
 [[noinline]]
 global u64 allocated_rotate(in u64 value, in u64 count) {
     u64 result = value;
@@ -134,5 +207,14 @@ global i32 register_allocation_entry() {
            $::runtime(allocated_float_to_integer(10u32, 7u32)) == 12u32 &&
            $::runtime(allocated_float_to_signed_integer(10u32, -7i32)) ==
                -2i32 &&
+           $::runtime(allocated_float_to_signed_narrow(10i32, -7i32)) ==
+               -2i32 &&
+           $::runtime(allocated_conversion_chain(10u32, 3u32, 7u32)) ==
+               28u32 &&
+           $::runtime(allocated_extended_to_integer(10u64, 7u64)) == 12u64 &&
+           $::runtime(allocated_quad_to_integer(10u64, 7u64)) == 12u64 &&
+           $::runtime(allocated_float_sign_select(7i32, -6i32)) == 21i32 &&
+           $::runtime(allocated_float_sign_select(-9i32, 4i32)) == 6i32 &&
+           $::runtime(allocated_float_loop(1u32, 3u32, 5u32)) == 26u32 &&
            $::runtime(allocated_rotate(1u64, 3u64)) == 64u64;
 }

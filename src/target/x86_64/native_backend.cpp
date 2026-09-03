@@ -551,6 +551,99 @@ ParameterStoragePlan parameter_storage_plan(
     const DynamicAbiPlans& dynamic_plans,
     const Subtarget& subtarget);
 
+// Packed integer forms the emitter can issue at one width. Allocation
+// consults the same table so a colored vector value never reaches an
+// operation that would be chunked or expanded through its spill home.
+std::optional<unsigned> packed_vector_compare_predicate(
+    machine::TargetOpcodeId opcode) {
+    switch (decode_opcode(opcode)) {
+    case Opcode::VcmpEq: return 0;
+    case Opcode::VcmpNe: return 4;
+    case Opcode::VcmpSlt:
+    case Opcode::VcmpUlt: return 1;
+    case Opcode::VcmpSle:
+    case Opcode::VcmpUle: return 2;
+    case Opcode::VcmpSgt:
+    case Opcode::VcmpUgt: return 6;
+    case Opcode::VcmpSge:
+    case Opcode::VcmpUge: return 5;
+    default: break;
+    }
+    return std::nullopt;
+}
+
+bool packed_integer_operation_supported(const Subtarget& subtarget,
+                                        machine::TargetOpcodeId opcode,
+                                        unsigned element_bits,
+                                        unsigned width,
+                                        bool immediate_shift) {
+    const bool add_sub = opcode == Opcode::Vadd ||
+                         opcode == Opcode::Vsub;
+    const bool bitwise = opcode == Opcode::Vand ||
+                         opcode == Opcode::Vor ||
+                         opcode == Opcode::Vxor;
+    const bool multiply = opcode == Opcode::Vmul ||
+                          opcode == Opcode::VmulImm;
+    const bool shift = opcode == Opcode::Vshl ||
+                       opcode == Opcode::VshrS ||
+                       opcode == Opcode::VshrU;
+    const bool comparison = packed_vector_compare_predicate(opcode).has_value();
+    if (!add_sub && !bitwise && !multiply && !shift && !comparison) {
+        return false;
+    }
+    if (width == 512) {
+        if (!subtarget.has_feature(Feature::Avx512f)) return false;
+        if (comparison) {
+            return element_bits >= 32 ||
+                   subtarget.has_feature(Feature::Avx512bw);
+        }
+        if (shift) {
+            return element_bits >= 32 ||
+                   (element_bits == 16 &&
+                    subtarget.has_feature(Feature::Avx512bw));
+        }
+        if (bitwise) return true;
+        if (element_bits == 8 || element_bits == 16) {
+            return subtarget.has_feature(Feature::Avx512bw) &&
+                   (add_sub || (multiply && element_bits == 16));
+        }
+        return add_sub ||
+               (multiply && element_bits == 32) ||
+               (multiply && element_bits == 64 &&
+                subtarget.has_feature(Feature::Avx512dq));
+    }
+    if (width == 256) {
+        const bool packed_shift = shift &&
+            ((immediate_shift && element_bits == 16) ||
+             element_bits == 32 ||
+              (element_bits == 64 && opcode != Opcode::VshrS));
+        return subtarget.has_feature(Feature::Avx2) &&
+               (add_sub || bitwise || comparison || packed_shift ||
+               (multiply && (element_bits == 16 ||
+                              element_bits == 32 ||
+                              element_bits == 64)));
+    }
+    if (comparison) {
+        return element_bits <= 32 ||
+               subtarget.has_feature(Feature::Avx2);
+    }
+    if (shift) {
+        if (immediate_shift) {
+            return element_bits == 16 || element_bits == 32 ||
+                   (element_bits == 64 && opcode != Opcode::VshrS);
+        }
+        return subtarget.has_feature(Feature::Avx2) &&
+               (element_bits == 32 ||
+                (element_bits == 64 && opcode != Opcode::VshrS));
+    }
+    return add_sub || bitwise ||
+           (multiply && element_bits == 16) ||
+           (multiply && element_bits == 32 &&
+            subtarget.has_feature(Feature::Sse41)) ||
+           (multiply && element_bits == 64 &&
+            subtarget.has_feature(Feature::Avx2));
+}
+
 class MachineLowerer {
 public:
     MachineLowerer(const mir::ManagedModule& managed,
@@ -626,6 +719,20 @@ private:
         result.opcode = opcode;
         result.location = location;
         return result;
+    }
+
+    // A selected expansion that writes a fixed register besides its own
+    // operands must advertise that register here.  Allocation then keeps
+    // unrelated values that are live across the expansion, as well as its
+    // own operands, out of the register the emitter is about to destroy.
+    static void append_fixed_clobber(machine::Instruction& instruction,
+                                     std::string_view name,
+                                     machine::IntegerMode mode) {
+        if (const auto* scratch = find_register_view(name)) {
+            instruction.clobbers.push_back(
+                machine::Register::physical_register(
+                    {scratch->storage_id}, mode));
+        }
     }
 
     static bool names_clobber_storage(
@@ -1488,6 +1595,28 @@ private:
             }
             instruction.uses.push_back(source);
             instruction.defs.push_back(reg(value.id));
+            if (instruction.opcode == Opcode::Fneg && source.mode.bits <= 64) {
+                // The scalar sign mask is materialized in RAX and moved into
+                // XMM1 before the exclusive or.
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                append_fixed_clobber(instruction, "xmm1", machine::i128);
+            } else if (instruction.opcode == Opcode::Fneg &&
+                       source.mode.bits == 128) {
+                // The binary128 form toggles the sign in the RAX/RDX pair.
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                append_fixed_clobber(instruction, "rdx", machine::i64);
+            } else if (instruction.opcode == Opcode::Fiszero) {
+                // Every floating zero test combines its condition byte with
+                // a parity term staged in %dl.  The scalar form additionally
+                // zeroes XMM1 as the comparison operand and the binary128
+                // form folds both halves through RAX.
+                append_fixed_clobber(instruction, "rdx", machine::i64);
+                if (source.mode.bits <= 64) {
+                    append_fixed_clobber(instruction, "xmm1", machine::i128);
+                } else if (source.mode.bits == 128) {
+                    append_fixed_clobber(instruction, "rax", machine::i64);
+                }
+            }
             return instruction;
         }
         if (value.kind == ValueKind::Cast) {
@@ -1517,15 +1646,28 @@ private:
             instruction.defs.push_back(reg(value.id));
             const auto append_clobber = [&](std::string_view name,
                                             machine::IntegerMode mode) {
-                if (const auto* scratch = find_register_view(name)) {
-                    instruction.clobbers.push_back(
-                        machine::Register::physical_register(
-                            {scratch->storage_id}, mode));
-                }
+                append_fixed_clobber(instruction, name, mode);
             };
             const auto source_bits = reg(value.operands.front()).mode.bits;
             const auto target_bits = reg(value.id).mode.bits;
-            if ((value.cast == mir::CastOperation::SignedIntegerToFloat ||
+            const bool converts_floating =
+                instruction.opcode != Opcode::Vcast &&
+                (value.cast == mir::CastOperation::SignedIntegerToFloat ||
+                 value.cast == mir::CastOperation::UnsignedIntegerToFloat ||
+                 value.cast == mir::CastOperation::FloatToSignedInteger ||
+                 value.cast == mir::CastOperation::FloatToUnsignedInteger);
+            if (converts_floating &&
+                (source_bits > 64 || target_bits > 64)) {
+                // The x87 and binary128 conversions are software expansions
+                // over the whole fixed integer scratch bank and publish
+                // their scalar result from RAX.
+                for (const auto name : {"rax", "rcx", "rdx", "r8", "r9",
+                                        "r10", "r11"}) {
+                    append_clobber(name, machine::i64);
+                }
+                append_clobber("xmm0", machine::i128);
+            } else if (
+                (value.cast == mir::CastOperation::SignedIntegerToFloat ||
                  value.cast == mir::CastOperation::UnsignedIntegerToFloat) &&
                 source_bits <= 64 && target_bits <= 64) {
                 // Scalar CVTSI lowering stages its integer through RAX and
@@ -1668,9 +1810,10 @@ private:
             instruction.defs.push_back(reg(value.id));
             return instruction;
         }
+        const bool floating = floating_value(value.operands.front());
         auto instruction = target_instruction(
-            floating_value(value.operands.front())
-                ? floating_binary_opcode(value.binary) : binary_opcode(value.binary),
+            floating ? floating_binary_opcode(value.binary)
+                     : binary_opcode(value.binary),
             value.location);
         for (const auto operand : value.operands) {
             const auto source = reg(operand);
@@ -1678,6 +1821,26 @@ private:
             instruction.uses.push_back(source);
         }
         instruction.defs.push_back(reg(value.id));
+        if (floating && !instruction.uses.empty() &&
+            has_property(instruction.opcode, OpcodeProperty::Comparison)) {
+            const bool wide = instruction.uses.front().mode.bits > 64;
+            if (wide || instruction.opcode == Opcode::FcmpEq ||
+                instruction.opcode == Opcode::FcmpNe ||
+                instruction.opcode == Opcode::FcmpLt ||
+                instruction.opcode == Opcode::FcmpLe) {
+                // Every ordered comparison folds a parity term staged in
+                // %dl into its condition byte.
+                append_fixed_clobber(instruction, "rdx", machine::i64);
+            }
+            if (wide) {
+                // The x87 and binary128 comparisons are software expansions
+                // that form their condition byte in %al over the fixed
+                // integer scratches.
+                for (const auto name : {"rax", "rcx", "r8", "r10", "r11"}) {
+                    append_fixed_clobber(instruction, name, machine::i64);
+                }
+            }
+        }
         return instruction;
     }
 
@@ -5799,6 +5962,70 @@ private:
                      instruction.opcode == Opcode::Vsub ||
                      instruction.opcode == Opcode::Vmul)) {
                     vector_register_safe = false;
+                }
+                // The emitter only treats a vector value as register resident
+                // for operations it can issue at the value's full width; an
+                // operation it must chunk or expand lane by lane reads and
+                // writes the addressable home instead. Keep every operand of
+                // such an operation out of the color pool so allocation and
+                // emission agree on where the value lives.
+                if (has_vector_register && vector_register_safe &&
+                    vector_shape && !floating_vector) {
+                    const bool integer_packed =
+                        instruction.opcode == Opcode::Vadd ||
+                        instruction.opcode == Opcode::Vsub ||
+                        instruction.opcode == Opcode::Vand ||
+                        instruction.opcode == Opcode::Vor ||
+                        instruction.opcode == Opcode::Vxor ||
+                        instruction.opcode == Opcode::Vmul ||
+                        instruction.opcode == Opcode::VmulImm ||
+                        instruction.opcode == Opcode::Vshl ||
+                        instruction.opcode == Opcode::VshrS ||
+                        instruction.opcode == Opcode::VshrU ||
+                        packed_vector_compare_predicate(instruction.opcode)
+                            .has_value();
+                    const bool byte_swap =
+                        instruction.opcode == Opcode::Vbswap16 ||
+                        instruction.opcode == Opcode::Vbswap16Mask;
+                    if (integer_packed || byte_swap) {
+                        const bool immediate_shift =
+                            (instruction.opcode == Opcode::Vshl ||
+                             instruction.opcode == Opcode::VshrS ||
+                             instruction.opcode == Opcode::VshrU) &&
+                            instruction.uses.size() == 1 &&
+                            instruction.operands.size() >= 3 &&
+                            std::holds_alternative<machine::ImmediateOperand>(
+                                instruction.operands[1]);
+                        const auto issued_at_width = [&](unsigned bits) {
+                            if (byte_swap) {
+                                return bits == 128 ||
+                                       (bits == 256 &&
+                                        subtarget_.has_feature(
+                                            Feature::Avx2)) ||
+                                       (bits == 512 &&
+                                        subtarget_.has_feature(
+                                            Feature::Avx512bw));
+                            }
+                            return packed_integer_operation_supported(
+                                subtarget_, instruction.opcode,
+                                static_cast<unsigned>(vector_shape->value),
+                                bits, immediate_shift);
+                        };
+                        const auto retain_home =
+                            [&](const machine::Register& reg) {
+                                if (vector_register_operand(reg) &&
+                                    !issued_at_width(static_cast<unsigned>(
+                                        reg.mode.bits))) {
+                                    mark_ineligible(reg);
+                                }
+                            };
+                        for (const auto& reg : instruction.uses) {
+                            retain_home(reg);
+                        }
+                        for (const auto& reg : instruction.defs) {
+                            retain_home(reg);
+                        }
+                    }
                 }
                 if (has_vector_register && !vector_register_safe) {
                     for (const auto& reg : instruction.uses) {
@@ -10800,20 +11027,7 @@ private:
 
     std::optional<unsigned> vector_compare_predicate(
         machine::TargetOpcodeId opcode) const {
-        switch (decode_opcode(opcode)) {
-        case Opcode::VcmpEq: return 0;
-        case Opcode::VcmpNe: return 4;
-        case Opcode::VcmpSlt:
-        case Opcode::VcmpUlt: return 1;
-        case Opcode::VcmpSle:
-        case Opcode::VcmpUle: return 2;
-        case Opcode::VcmpSgt:
-        case Opcode::VcmpUgt: return 6;
-        case Opcode::VcmpSge:
-        case Opcode::VcmpUge: return 5;
-        default: break;
-        }
-        return std::nullopt;
+        return packed_vector_compare_predicate(opcode);
     }
 
     bool unsigned_vector_comparison(
@@ -10835,71 +11049,8 @@ private:
                                              unsigned element_bits,
                                              unsigned width,
                                              bool immediate_shift = false) const {
-        const bool add_sub = opcode == Opcode::Vadd ||
-                             opcode == Opcode::Vsub;
-        const bool bitwise = opcode == Opcode::Vand ||
-                             opcode == Opcode::Vor ||
-                             opcode == Opcode::Vxor;
-        const bool multiply = opcode == Opcode::Vmul ||
-                              opcode == Opcode::VmulImm;
-        const bool shift = opcode == Opcode::Vshl ||
-                           opcode == Opcode::VshrS ||
-                           opcode == Opcode::VshrU;
-        const bool comparison = vector_compare_predicate(opcode).has_value();
-        if (!add_sub && !bitwise && !multiply && !shift && !comparison) {
-            return false;
-        }
-        if (width == 512) {
-            if (!subtarget_.has_feature(Feature::Avx512f)) return false;
-            if (comparison) {
-                return element_bits >= 32 ||
-                       subtarget_.has_feature(Feature::Avx512bw);
-            }
-            if (shift) {
-                return element_bits >= 32 ||
-                       (element_bits == 16 &&
-                        subtarget_.has_feature(Feature::Avx512bw));
-            }
-            if (bitwise) return true;
-            if (element_bits == 8 || element_bits == 16) {
-                return subtarget_.has_feature(Feature::Avx512bw) &&
-                       (add_sub || (multiply && element_bits == 16));
-            }
-            return add_sub ||
-                   (multiply && element_bits == 32) ||
-                   (multiply && element_bits == 64 &&
-                    subtarget_.has_feature(Feature::Avx512dq));
-        }
-        if (width == 256) {
-            const bool packed_shift = shift &&
-                ((immediate_shift && element_bits == 16) ||
-                 element_bits == 32 ||
-                  (element_bits == 64 && opcode != Opcode::VshrS));
-            return subtarget_.has_feature(Feature::Avx2) &&
-                   (add_sub || bitwise || comparison || packed_shift ||
-                   (multiply && (element_bits == 16 ||
-                                  element_bits == 32 ||
-                                  element_bits == 64)));
-        }
-        if (comparison) {
-            return element_bits <= 32 ||
-                   subtarget_.has_feature(Feature::Avx2);
-        }
-        if (shift) {
-            if (immediate_shift) {
-                return element_bits == 16 || element_bits == 32 ||
-                       (element_bits == 64 && opcode != Opcode::VshrS);
-            }
-            return subtarget_.has_feature(Feature::Avx2) &&
-                   (element_bits == 32 ||
-                    (element_bits == 64 && opcode != Opcode::VshrS));
-        }
-        return add_sub || bitwise ||
-               (multiply && element_bits == 16) ||
-               (multiply && element_bits == 32 &&
-                subtarget_.has_feature(Feature::Avx2)) ||
-               (multiply && element_bits == 64 &&
-                subtarget_.has_feature(Feature::Avx2));
+        return packed_integer_operation_supported(
+            subtarget_, opcode, element_bits, width, immediate_shift);
     }
 
     unsigned preferred_vector_width() const {
@@ -20661,7 +20812,23 @@ private:
             // with a class-specific scratch register, or the single wide
             // frame temporary when the value cannot fit a scalar scratch.
             const auto preserved = location_key(copies.front().target, false);
-            save_target(copies.front());
+            // The location still holds the value another copy in this set
+            // reads, and that consumer, not the copy about to overwrite it,
+            // describes the live value's class and width.  Saving with the
+            // writer's mode would truncate a wider value that happens to
+            // share the register.
+            auto saved = copies.front();
+            for (const auto& copy : copies) {
+                if (location_key(copy.source, copy.source_temporary) !=
+                    preserved) {
+                    continue;
+                }
+                saved.target = copy.source;
+                saved.floating = copy.floating;
+                saved.vector = copy.vector;
+                break;
+            }
+            save_target(saved);
             for (auto& copy : copies) {
                 if (location_key(copy.source, copy.source_temporary) ==
                     preserved) {

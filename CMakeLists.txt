@@ -900,6 +900,21 @@ if(BUILD_TESTING)
                 -DEXPECTED=16
                 "-DCC_FLAGS=-O2;-march=x86-64-v3"
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    foreach(variant IN ITEMS "default;-O3" "sse41;-O2;-march=x86-64-v2")
+        list(GET variant 0 variant_name)
+        list(REMOVE_AT variant 0)
+        add_test(NAME cross_runtime_native_vector_reduction_bounds_${variant_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/reduction_bounds.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vector-reduction-bounds-${variant_name}
+                    -DENTRY=vector_reduction_bounds_entry
+                    -DEXPECTED=6
+                    "-DCC_FLAGS=${variant}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_test(NAME cross_x86_64_early_exit_vectorization
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

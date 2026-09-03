@@ -9648,14 +9648,20 @@ bool unroll_loop(ManagedFunction& function,
                 bits > 64 || step.integer_high != 0) {
                 continue;
             }
+            // Appending offsets grows function.values, which invalidates
+            // the phi/update/step references above; copy what the loop
+            // needs first.
+            const auto offset_location = update.location;
+            const auto offset_type = phi.type;
+            const auto step_integer = step.integer;
             std::vector<ValueId> offsets(factor + 1U);
             for (unsigned iteration = 1; iteration <= factor; ++iteration) {
                 ManagedValue offset;
-                offset.location = update.location;
-                offset.type = phi.type;
+                offset.location = offset_location;
+                offset.type = offset_type;
                 offset.kind = ValueKind::ConstantInteger;
                 offset.integer = mask_to(
-                    multiply(UInt128{step.integer}, UInt128{iteration}),
+                    multiply(UInt128{step_integer}, UInt128{iteration}),
                     bits).low;
                 offsets[iteration] =
                     append_value(preheader_values, std::move(offset));
@@ -10836,6 +10842,18 @@ bool vectorize_reduction_loop(
             ? lanes_constant
             : add_integer_constant(index_type, vector_step);
 
+    // The bound is loop invariant, but folding may have materialized it as
+    // a constant inside the loop, where it does not dominate the preheader
+    // or the alias guard. Give those blocks their own copy.
+    auto bound = pattern.bound;
+    if (definitions[bound.value] &&
+        pattern.loop.blocks.contains(definitions[bound.value]->value)) {
+        auto clone = function.values[bound.value];
+        clone.id = {};
+        clone.effect_input.reset();
+        clone.effect_output.reset();
+        bound = append_value(preheader_values, std::move(clone));
+    }
     // The recognized induction starts at zero, so rounding the bound down to
     // a whole vector group gives a loop-invariant end index. Comparing the
     // induction with this limit avoids a subtract in every vector iteration.
@@ -10856,7 +10874,7 @@ bool vectorize_reduction_loop(
     limit_value.type = index_type;
     limit_value.kind = ValueKind::Binary;
     limit_value.binary = BinaryOperation::BitAnd;
-    limit_value.operands = {pattern.bound, mask};
+    limit_value.operands = {bound, mask};
     const auto vector_limit =
         append_value(preheader_values, std::move(limit_value));
 
@@ -10870,7 +10888,7 @@ bool vectorize_reduction_loop(
                 end.location = alias_guard.location;
                 end.type = function.values[base.value].type;
                 end.kind = ValueKind::IndexedAddress;
-                end.operands = {base, pattern.bound};
+                end.operands = {base, bound};
                 return append_value(alias_guard.values, std::move(end));
             };
             const auto store_end = append_address(store.base);
