@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <iomanip>
 #include <iterator>
@@ -299,12 +301,19 @@ const AbiEntry* managed_abi_model(const hir::Function& function,
                                   const CompilerOptions& options) {
     if (options.private_abi &&
         function.abi_contract == hir::AbiContract::Dynamic) {
-        const auto name = subtarget.has_feature(Feature::Mips3)
-            ? std::string_view{"cross64"}
-            : std::string_view{"cross32"};
-        if (const auto* abi = model_registry().find_abi(
-                "mips", name, options.target)) {
-            return abi;
+        // Both Cross private MIPS conventions declare 32-bit addresses, and
+        // the shared ABI interpreter sizes pointer and by-reference channels
+        // from that width. Under a 64-bit address model they would truncate
+        // every pointer argument, so the compilation ABI stays the private
+        // contract until a 64-bit-address private convention exists.
+        if (subtarget.abi_info().address_bits <= 32) {
+            const auto name = subtarget.has_feature(Feature::Mips3)
+                ? std::string_view{"cross64"}
+                : std::string_view{"cross32"};
+            if (const auto* abi = model_registry().find_abi(
+                    "mips", name, options.target)) {
+                return abi;
+            }
         }
     }
     return abi_model(function.abi);
@@ -1940,6 +1949,97 @@ private:
                 function.virtual_register_assignments[neighbor] = *selected;
             }
         }
+
+        // F0 is normally kept out of the palette because several complex
+        // expansions use it as a fixed scratch. In a fully colored leaf that
+        // contains only direct floating operations, no fallback can need that
+        // scratch. Rename the return value's entire existing color class to
+        // the ABI result endpoint. Values already sharing one color are
+        // pairwise noninterfering, so this preserves PHI coalescing while
+        // removing the final MOV.D/MOV.S.
+        const auto uses_fixed_f0 = [](Opcode opcode) {
+            switch (opcode) {
+            case Opcode::Fiszero:
+            case Opcode::FcmpEq:
+            case Opcode::FcmpNe:
+            case Opcode::FcmpLt:
+            case Opcode::FcmpLe:
+            case Opcode::FcmpGt:
+            case Opcode::FcmpGe:
+            case Opcode::Freinterpret:
+            case Opcode::Fextend:
+            case Opcode::Ftruncate:
+            case Opcode::Sitofp:
+            case Opcode::Uitofp:
+            case Opcode::Fptosi:
+            case Opcode::Fptoui:
+            case Opcode::Select:
+                return true;
+            default:
+                return false;
+            }
+        };
+        bool can_rename_floating_result = std::none_of(
+            function.blocks.begin(), function.blocks.end(),
+            [&](const machine::Block& block) {
+                return std::any_of(
+                    block.instructions.begin(), block.instructions.end(),
+                    [&](const machine::Instruction& instruction) {
+                        return instruction.kind ==
+                                   machine::InstructionKind::Call ||
+                               uses_fixed_f0(decode_opcode(
+                                   instruction.opcode));
+                    });
+            });
+        if (can_rename_floating_result) {
+            for (std::uint32_t id = 0; id < count; ++id) {
+                if (eligible[id] &&
+                    function.virtual_register_classes[id] ==
+                        machine::VirtualRegisterClass::Floating &&
+                    !function.virtual_register_assignments[id]) {
+                    can_rename_floating_result = false;
+                    break;
+                }
+            }
+        }
+        if (can_rename_floating_result) {
+            const machine::PhysicalRegisterId f0{fpr_physical_base};
+            for (std::uint32_t id = 0; id < count; ++id) {
+                const auto& preferences = preferred_physical_colors[id];
+                const auto old = function.virtual_register_assignments[id];
+                if (!old || *old == f0 ||
+                    std::find(preferences.begin(), preferences.end(), f0) ==
+                        preferences.end()) {
+                    continue;
+                }
+                std::vector<std::uint32_t> color_class;
+                for (std::uint32_t member = 0; member < count; ++member) {
+                    if (function.virtual_register_assignments[member] == *old) {
+                        color_class.push_back(member);
+                    }
+                }
+                const bool legal = std::all_of(
+                    color_class.begin(), color_class.end(),
+                    [&](std::uint32_t member) {
+                        if (hard_forbidden_colors[member].contains(f0.value) ||
+                            forbidden_colors[member].contains(f0.value)) {
+                            return false;
+                        }
+                        return std::none_of(
+                            interference[member].begin(),
+                            interference[member].end(),
+                            [&](std::uint32_t neighbor) {
+                                return neighbor < count &&
+                                    function.virtual_register_assignments[
+                                        neighbor] == f0;
+                            });
+                    });
+                if (!legal) continue;
+                for (const auto member : color_class) {
+                    function.virtual_register_assignments[member] = f0;
+                }
+            }
+        }
         if (!changed) return false;
 
         // Preserve only volatile assignments that actually cross a specific
@@ -3546,7 +3646,13 @@ public:
                     const CompilerOptions& options,
                     Diagnostics& diagnostics)
         : module_(module), hir_(hir_module), subtarget_(subtarget), options_(options),
-          diagnostics_(diagnostics), format_(subtarget.object_format()) {}
+          diagnostics_(diagnostics), format_(subtarget.object_format()),
+          // n64 and n32 rename $t0-$t3 to the architectural registers 12-15
+          // and spell 8-11 as $a4-$a7.  Numeric GPR operands are the one
+          // spelling every MIPS ABI reads identically; FPR names are shared.
+          numeric_gprs_(subtarget.abi() == "n64" ||
+                        subtarget.abi() == "n32"),
+          wide_addresses_(hir_module.address_bits > 32) {}
 
     std::string run() {
         if (format_ != ObjectFormat::Elf && !module_.functions.empty()) {
@@ -3563,6 +3669,7 @@ public:
                        ".section .gcc_compiled_long32\n.previous\n";
         }
         for (auto& function : module_.functions) emit_function(function);
+        emit_float_literal_pool();
         return output_.str();
     }
 
@@ -3580,10 +3687,134 @@ private:
         bool elide_original{};
     };
 
+    struct FloatLiteral {
+        std::uint64_t bits{};
+        unsigned width{};
+        std::string label;
+    };
+
+    bool prefer_float_literal(
+        const machine::ImmediateOperand& immediate) const {
+        if (!options_.machine_combine || immediate.mode.bits != 64 ||
+            (options_.optimize_for != OptimizationGoal::Size &&
+             options_.optimize_for != OptimizationGoal::MinimumSize)) {
+            return false;
+        }
+        const auto signed_low = static_cast<std::int64_t>(immediate.value);
+        if (signed_low >= std::numeric_limits<std::int16_t>::min() &&
+            signed_low <= std::numeric_limits<std::int16_t>::max()) {
+            return false;
+        }
+        unsigned nonzero_halfwords = 0;
+        for (unsigned shift = 0; shift < 64; shift += 16) {
+            if (((immediate.value >> shift) & 0xffffU) != 0) {
+                ++nonzero_halfwords;
+            }
+        }
+        // Two relocation-bearing instructions plus eight pool bytes cost 16
+        // bytes. Three or more populated chunks require strictly more space
+        // for DLI followed by a GPR-to-FPR transfer.
+        return nonzero_halfwords >= 3;
+    }
+
+    const FloatLiteral& float_literal(
+        const machine::ImmediateOperand& immediate) {
+        const auto found = std::find_if(
+            float_literals_.begin(), float_literals_.end(),
+            [&](const FloatLiteral& candidate) {
+                return candidate.bits == immediate.value &&
+                       candidate.width == immediate.mode.bits;
+            });
+        if (found != float_literals_.end()) return *found;
+        const auto index = float_literals_.size();
+        float_literals_.push_back(
+            {immediate.value, immediate.mode.bits,
+             ".Lcross.mips.float." + std::to_string(index)});
+        return float_literals_.back();
+    }
+
+    void emit_float_literal_pool() {
+        if (float_literals_.empty()) return;
+        std::string error;
+        const auto directive = assembly_section_directive(
+            format_, {".rodata", AssemblySectionKind::ReadOnlyData,
+                      false, false},
+            error);
+        if (!directive) {
+            diagnostics_.error(module_.functions.front().location, error);
+            return;
+        }
+        output_ << *directive << '\n';
+        for (const auto& literal : float_literals_) {
+            output_ << ".p2align " << (literal.width == 32 ? 2 : 3) << '\n'
+                    << literal.label << ":\n\t"
+                    << (literal.width == 32 ? ".word " : ".quad ")
+                    << literal.bits << '\n';
+        }
+    }
+
+    static bool identifier_character(unsigned char ch) {
+        return std::isalnum(ch) || ch == '_' || ch == '.' || ch == '$';
+    }
+
+    // These opcodes take a symbol or label, never a register.  Cross symbols
+    // may legally contain '$', so they are exempt from register respelling.
+    static bool symbolic_operand_only(std::string_view opcode) {
+        return opcode == "j" || opcode == "jal" || opcode == "b";
+    }
+
+    // Rewrite `$name` GPR operands to `$number`.  Applied once, at the single
+    // point where operand text reaches the output stream, so literal operand
+    // strings elsewhere in the emitter stay readable.  Idempotent: a numeric
+    // spelling is not a GPR name and passes through untouched.
+    std::string respell_registers(std::string_view operands) const {
+        if (!numeric_gprs_ ||
+            operands.find('$') == std::string_view::npos) {
+            return std::string(operands);
+        }
+        std::string result;
+        result.reserve(operands.size());
+        for (std::size_t index = 0; index < operands.size(); ++index) {
+            const auto ch = operands[index];
+            if (ch != '$' ||
+                (index != 0 &&
+                 identifier_character(
+                     static_cast<unsigned char>(operands[index - 1])))) {
+                result.push_back(ch);
+                continue;
+            }
+            auto end = index + 1;
+            while (end < operands.size() &&
+                   std::isalnum(static_cast<unsigned char>(operands[end]))) {
+                ++end;
+            }
+            const auto id = gpr_id(operands.substr(index + 1,
+                                                   end - index - 1));
+            if (!id ||
+                (end < operands.size() &&
+                 identifier_character(
+                     static_cast<unsigned char>(operands[end])))) {
+                result.push_back(ch);
+                continue;
+            }
+            result += '$';
+            result += std::to_string(id->value);
+            index = end - 1;
+        }
+        return result;
+    }
+
     void raw_instruction(std::string_view opcode,
                          std::string_view operands = {}) {
         output_ << '\t' << opcode;
-        if (!operands.empty()) output_ << '\t' << operands;
+        if (!operands.empty()) {
+            output_ << '\t';
+            if (numeric_gprs_ && !symbolic_operand_only(opcode)) {
+                output_ << respell_registers(operands);
+            } else {
+                output_ << operands;
+            }
+        }
         output_ << '\n';
     }
 
@@ -3602,10 +3833,112 @@ private:
                opcode == "ll" || opcode == "lld";
     }
 
+    static std::optional<std::string> register_operand(
+        std::string_view operands, std::size_t wanted) {
+        std::size_t current = 0;
+        for (std::size_t offset = 0; offset < operands.size(); ++offset) {
+            if (operands[offset] != '$') continue;
+            const auto begin = offset + 1;
+            auto end = begin;
+            while (end < operands.size()) {
+                const auto ch = static_cast<unsigned char>(operands[end]);
+                if (!std::isalnum(ch) && ch != '_') break;
+                ++end;
+            }
+            if (current++ == wanted) {
+                return std::string(operands.substr(begin, end - begin));
+            }
+            offset = end == 0 ? end : end - 1;
+        }
+        return std::nullopt;
+    }
+
+    static bool mentions_register(std::string_view operands,
+                                  std::string_view name) {
+        for (std::size_t index = 0;; ++index) {
+            const auto operand = register_operand(operands, index);
+            if (!operand) return false;
+            if (*operand == name) return true;
+        }
+    }
+
+    // Rewrite a memory operand so it addresses the word four bytes above.
+    // The emitter spells addresses as `imm(base)` or `%lo(sym)(base)`; any
+    // other form is left to the caller.
+    static std::optional<std::string> next_word_address(
+        std::string_view address) {
+        if (address.starts_with("%lo(")) {
+            const auto close = address.find(")(");
+            if (close == std::string_view::npos) return std::nullopt;
+            return "%lo(" + std::string(address.substr(4, close - 4)) +
+                   "+4)" + std::string(address.substr(close + 1));
+        }
+        const auto open = address.find('(');
+        if (open == std::string_view::npos) return std::nullopt;
+        std::int64_t offset = 0;
+        if (open != 0 &&
+            std::from_chars(address.data(), address.data() + open, offset)
+                    .ec != std::errc{}) {
+            return std::nullopt;
+        }
+        return std::to_string(offset + 4) + std::string(address.substr(open));
+    }
+
+    // MIPS I has no doubleword coprocessor loads or stores. Access the FR=0
+    // register pair by words instead: the even register holds the low word
+    // and the odd register the high word, while big-endian memory keeps the
+    // high word at the lower address. The first word occupies the MIPS I
+    // load delay slot of the second, so only the pair's final load pays a
+    // NOP.
+    bool split_doubleword_coprocessor_access(std::string_view opcode,
+                                             std::string_view operands) {
+        if (subtarget_.has_feature(Feature::Mips2) ||
+            (opcode != "ldc1" && opcode != "sdc1")) {
+            return false;
+        }
+        const auto comma = operands.find(',');
+        if (comma == std::string_view::npos || !operands.starts_with("$f")) {
+            return false;
+        }
+        unsigned number = 0;
+        if (std::from_chars(operands.data() + 2, operands.data() + comma,
+                            number)
+                    .ec != std::errc{} ||
+            (number & 1U) != 0 || number + 1 >= fpr_names.size()) {
+            return false;
+        }
+        const auto address = operands.substr(comma + 1);
+        const auto upper = next_word_address(address);
+        if (!upper) return false;
+        const bool little = subtarget_.target().data_layout.byte_order ==
+                            ByteOrder::Little;
+        const std::string even = "$f" + std::to_string(number);
+        const std::string odd = "$f" + std::to_string(number + 1);
+        const std::string_view word = opcode == "ldc1" ? "lwc1" : "swc1";
+        instruction(word, (little ? even : odd) + "," + std::string(address),
+                    true);
+        instruction(word, (little ? odd : even) + "," + *upper);
+        return true;
+    }
+
     void instruction(std::string_view opcode,
-                     std::string_view operands = {}) {
+                     std::string_view operands = {},
+                     bool defer_load_delay = false) {
+        if (split_doubleword_coprocessor_access(opcode, operands)) return;
         const bool floating_multiply =
             opcode == "mul.s" || opcode == "mul.d" || opcode == "mul.ps";
+        // MIPS I--III only require a transfer delay when the immediately
+        // following instruction consumes the transferred register.  Keep the
+        // hazard pending for one emitted instruction so independent integer,
+        // address, or other-register work fills the slot instead of forcing a
+        // NOP after every MTC1/MFC1.
+        if (fpu_transfer_delay_register_) {
+            if (mentions_register(operands, *fpu_transfer_delay_register_)) {
+                raw_instruction("nop");
+                if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
+            }
+            fpu_transfer_delay_register_.reset();
+        }
         // Early VR4300 silicon only needs separation between consecutive FP
         // multiplies. Let useful intervening work pay that gap and emit a NOP
         // only when another multiply arrives immediately.
@@ -3632,7 +3965,8 @@ private:
         }
 
         raw_instruction(opcode, operands);
-        if (!subtarget_.has_feature(Feature::LoadInterlocks) &&
+        if (!defer_load_delay &&
+            !subtarget_.has_feature(Feature::LoadInterlocks) &&
             memory_load(opcode)) {
             // This intentionally favors correctness over trying to infer a
             // pseudo-instruction's eventual register dependencies.  A later
@@ -3642,7 +3976,12 @@ private:
         if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
             (opcode == "mfc1" || opcode == "mtc1" ||
              opcode == "dmfc1" || opcode == "dmtc1")) {
-            raw_instruction("nop");
+            const auto destination =
+                register_operand(operands,
+                                 opcode == "mfc1" || opcode == "dmfc1"
+                                     ? 0
+                                     : 1);
+            if (destination) fpu_transfer_delay_register_ = *destination;
         }
         if (!subtarget_.has_feature(Feature::FpuCompareInterlocks) &&
             opcode.starts_with("c.")) {
@@ -3658,6 +3997,15 @@ private:
     }
 
     void encoded(std::uint32_t word, std::string_view comment) {
+        // An encoded target instruction has no typed operand list here.  Keep
+        // the conservative separation if it follows a non-interlocked FPU
+        // transfer; Allegrex normally has the architectural interlock and
+        // therefore does not pay this fallback.
+        if (fpu_transfer_delay_register_) {
+            raw_instruction("nop");
+            if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
+            fpu_transfer_delay_register_.reset();
+        }
         output_ << "\t.word\t0x" << std::hex << std::setw(8)
                 << std::setfill('0') << word << std::dec << std::setfill(' ');
         if (!comment.empty()) output_ << "\t# " << comment;
@@ -3680,6 +4028,37 @@ private:
     static std::string memory(std::int64_t offset,
                               std::string_view base) {
         return std::to_string(offset) + "(" + reg_name(base) + ")";
+    }
+
+    // Address arithmetic follows the selected ABI's address width.  A 32-bit
+    // ABI on a 64-bit register file keeps the word forms: their sign-extended
+    // results are exactly the canonical 32-bit addresses MIPS III expects.
+    std::string_view address_add() const {
+        return wide_addresses_ ? "daddu" : "addu";
+    }
+
+    std::string_view address_add_immediate() const {
+        return wide_addresses_ ? "daddiu" : "addiu";
+    }
+
+    std::string_view address_shift_left() const {
+        return wide_addresses_ ? "dsll" : "sll";
+    }
+
+    std::string_view address_multiply() const {
+        return wide_addresses_ ? "dmultu" : "multu";
+    }
+
+    std::string_view address_load() const {
+        return wide_addresses_ ? "ld" : "lw";
+    }
+
+    std::string_view address_store() const {
+        return wide_addresses_ ? "sd" : "sw";
+    }
+
+    std::uint32_t address_bytes() const {
+        return (hir_.address_bits + 7U) / 8U;
     }
 
     std::string memory(std::int64_t offset) const {
@@ -3908,8 +4287,9 @@ private:
             std::get<machine::ImmediateOperand>(
                 value.operands.back()).value);
         if (scale == 1) {
-            instruction("addu", reg_name(destination) + "," +
-                                    reg_name(base) + "," + reg_name(index));
+            instruction(address_add(), reg_name(destination) + "," +
+                                           reg_name(base) + "," +
+                                           reg_name(index));
             return;
         }
         const auto scaled = destination != base && base != index
@@ -3920,16 +4300,17 @@ private:
             return;
         }
         if (std::has_single_bit(scale)) {
-            instruction("sll", reg_name(scaled) + "," + reg_name(index) +
-                                   "," +
-                                   std::to_string(std::countr_zero(scale)));
+            instruction(address_shift_left(),
+                        reg_name(scaled) + "," + reg_name(index) + "," +
+                            std::to_string(std::countr_zero(scale)));
         } else {
             instruction("li", "$t3," + std::to_string(scale));
-            instruction("multu", reg_name(index) + ",$t3");
+            instruction(address_multiply(), reg_name(index) + ",$t3");
             instruction("mflo", reg_name(scaled));
         }
-        instruction("addu", reg_name(destination) + "," + reg_name(base) +
-                                "," + reg_name(scaled));
+        instruction(address_add(), reg_name(destination) + "," +
+                                       reg_name(base) + "," +
+                                       reg_name(scaled));
     }
 
     std::int32_t slot_offset(const machine::Function& function,
@@ -4541,18 +4922,22 @@ private:
             return true;
         }
         function.frame.has_frame_pointer = !options_.omit_frame_pointer;
-        offset = align_up(offset, 4);
+        // $fp and $ra carry addresses, so their homes are as wide as the
+        // ABI's address model: one word under o32/EABI, a doubleword under
+        // n64.
+        const auto pointer_bytes = address_bytes();
+        offset = align_up(offset, pointer_bytes);
         saves_fp_ = function.frame.has_frame_pointer;
         if (saves_fp_) {
             saved_fp_offset_ = offset;
-            offset += 4;
+            offset += pointer_bytes;
         } else {
             saved_fp_offset_ = 0;
         }
         saves_ra_ = has_call;
         if (saves_ra_) {
             saved_ra_offset_ = offset;
-            offset += 4;
+            offset += pointer_bytes;
         } else {
             saved_ra_offset_ = 0;
         }
@@ -4876,7 +5261,8 @@ private:
             // formation used to provide this sign extension accidentally;
             // direct pointer loads (and pointer induction variables) do not.
             normalize_integer("t0", hir_.address_bits, true);
-            instruction("sw", "$t0," + memory(*pointer->frame_offset));
+            instruction(address_store(),
+                        "$t0," + memory(*pointer->frame_offset));
             if (parameter.mode == ParameterMode::Out) {
                 if (legalizes_to_pair(target)) {
                     store_vreg_pair(function, target, "zero", "zero",
@@ -4968,7 +5354,8 @@ private:
                     "MIPS output parameter lacks its managed copy-out cells");
                 continue;
             }
-            instruction("lw", "$t0," + memory(*pointer->frame_offset));
+            instruction(address_load(),
+                        "$t0," + memory(*pointer->frame_offset));
             const auto bits = type_bits(hir_, parameter.type);
             if (is_floating(hir_, parameter.type)) {
                 instruction(bits == 32 ? "lwc1" : "ldc1",
@@ -5046,16 +5433,17 @@ private:
                              SourceLocation location) {
         const auto offset = slot_offset(function, source.slot, location) +
                             source.offset;
-        instruction("addiu", "$at," + reg_name(frame_base()) + "," +
-                                 std::to_string(offset));
+        instruction(address_add_immediate(),
+                    "$at," + reg_name(frame_base()) + "," +
+                        std::to_string(offset));
         apply_abi_register_extension("at", piece);
         if (piece.location.kind == LocationKind::Register) {
             instruction("move", reg_name(piece.location.reg) + ",$at");
         } else {
-            instruction("sw", "$at," +
-                                  memory(static_cast<std::int64_t>(
-                                             piece.location.stack_offset),
-                                         "sp"));
+            instruction(address_store(),
+                        "$at," + memory(static_cast<std::int64_t>(
+                                            piece.location.stack_offset),
+                                        "sp"));
         }
     }
 
@@ -5468,18 +5856,18 @@ private:
                 instruction("move", "$sp,$fp");
             }
             if (saves_fp_) {
-                instruction("lw", "$fp," +
-                                      memory(saved_fp_offset_, "sp"));
+                instruction(address_load(),
+                            "$fp," + memory(saved_fp_offset_, "sp"));
             }
             if (saves_ra_) {
-                instruction("lw", "$ra," +
-                                      memory(saved_ra_offset_, "sp"));
+                instruction(address_load(),
+                            "$ra," + memory(saved_ra_offset_, "sp"));
             }
             instruction("j", assembly_symbol(callee_symbol->name));
             if (frame_size_ == 0) instruction("nop");
             else {
-                instruction("addiu", "$sp,$sp," +
-                                         std::to_string(frame_size_));
+                instruction(address_add_immediate(),
+                            "$sp,$sp," + std::to_string(frame_size_));
             }
             if (cfi) output_ << ".cfi_restore_state\n";
             return;
@@ -6296,6 +6684,8 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    bool numeric_gprs_{};
+    bool wide_addresses_{};
     std::ostringstream output_;
     std::optional<ActiveSignature> active_signature_;
     std::uint32_t frame_size_{};
@@ -6308,6 +6698,8 @@ private:
     std::uint32_t next_label_{};
     unsigned hilo_write_barrier_{};
     bool fpu_multiply_pending_{};
+    std::optional<std::string> fpu_transfer_delay_register_;
+    std::vector<FloatLiteral> float_literals_;
     std::string epilogue_label_;
     std::unordered_map<std::uint32_t, SuccessorDelayEntry>
         edge_delay_entries_;
@@ -7421,14 +7813,14 @@ void AssemblyEmitter::emit_phi_edge_copies(
     const auto save_floating_target = [&](const Copy& copy) {
         if (const auto target = assigned_fpr(function, copy.target)) {
             instruction(copy.target.mode.bits == 32 ? "mov.s" : "mov.d",
-                        "$f0," + reg_name(*target));
+                        "$f2," + reg_name(*target));
         } else {
-            load_fvreg(function, copy.target, "f0", copy.location);
+            load_fvreg(function, copy.target, "f2", copy.location);
         }
     };
     const auto emit_floating_copy = [&](const Copy& copy) {
         if (copy.source_temporary) {
-            store_fvreg(function, copy.target, "f0", copy.location);
+            store_fvreg(function, copy.target, "f2", copy.location);
             return;
         }
         if (const auto source = assigned_fpr(function, copy.source)) {
@@ -7487,7 +7879,8 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             output_ << end << ":\n" << after << ":\n";
             const auto field = end + "-" + std::to_string(bytes);
             instruction("lui", "$t0,%hi(" + field + ")");
-            instruction("addiu", "$t0,$t0,%lo(" + field + ")");
+            instruction(address_add_immediate(),
+                        "$t0,$t0,%lo(" + field + ")");
             if (legalizes_to_pair(target)) {
                 load_pair_memory("t1", "t2", 0, "t0");
                 store_vreg_pair(function, target, "t1", "t2",
@@ -7509,6 +7902,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             return;
         }
         if (opcode == Opcode::Fconstant) {
+            if (const auto destination = assigned_fpr(function, target);
+                destination && prefer_float_literal(immediate)) {
+                const auto& literal = float_literal(immediate);
+                instruction("lui", "$t0,%hi(" + literal.label + ")");
+                instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
+                            reg_name(*destination) + ",%lo(" + literal.label +
+                                ")($t0)");
+                return;
+            }
             instruction(target.mode.bits > 32 ? "dli" : "li",
                         "$t0," + std::to_string(immediate.value));
             if (const auto destination = assigned_fpr(function, target)) {
@@ -7535,9 +7937,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                             slot.offset;
         const auto target = value.defs.front();
         const auto destination = output_gpr(function, target, "t0");
-        instruction("addiu", reg_name(destination) + "," +
-                                 reg_name(frame_base()) + "," +
-                                 std::to_string(offset));
+        instruction(address_add_immediate(),
+                    reg_name(destination) + "," + reg_name(frame_base()) +
+                        "," + std::to_string(offset));
         commit_gpr(function, target, destination, value.location);
         return;
     }
@@ -7551,8 +7953,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             ? output_gpr(function, value.defs.front(), "t0")
             : std::string_view{"t0"};
         instruction("lui", reg_name(address) + ",%hi(" + name + ")");
-        instruction("addiu", reg_name(address) + "," + reg_name(address) +
-                                 ",%lo(" + name + ")");
+        instruction(address_add_immediate(),
+                    reg_name(address) + "," + reg_name(address) + ",%lo(" +
+                        name + ")");
         if (opcode == Opcode::GlobalAddress) {
             commit_gpr(function, value.defs.front(), address,
                        value.location);
@@ -7604,9 +8007,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto target = value.defs.front();
         const auto destination = output_gpr(function, target, "t0");
         instruction("lui", reg_name(destination) + ",%hi(" + label + ")");
-        instruction("addiu", reg_name(destination) + "," +
-                                 reg_name(destination) + ",%lo(" + label +
-                                 ")");
+        instruction(address_add_immediate(),
+                    reg_name(destination) + "," + reg_name(destination) +
+                        ",%lo(" + label + ")");
         commit_gpr(function, target, destination, value.location);
         return;
     }
@@ -8514,6 +8917,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     if (!active_signature_) return;
     hilo_write_barrier_ = 0;
     fpu_multiply_pending_ = false;
+    fpu_transfer_delay_register_.reset();
     // Fully allocated, non-overlapping parameter sets are captured directly.
     // Otherwise home the whole incoming register set before materialization:
     // EABI/Cross banks may overlap t0/t1 assembly scratches, so mixing direct
@@ -8547,7 +8951,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // ISA directives are scoped so llvm-mc's command-line ABI features (for
     // example +single-float) are restored before it finalizes .MIPS.abiflags.
     output_ << ".set push\n.set noreorder\n.set noat\n.option pic0\n";
-    if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
+    if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
+    else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
     else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
     else if (subtarget_.has_feature(Feature::Mips2)) output_ << ".set mips2\n";
@@ -8565,21 +8970,26 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     }
     output_ << ".type " << symbol << ",@function\n"
             << ".ent " << symbol << '\n' << symbol << ":\n"
-            << "\t.frame\t" << (function.frame.has_frame_pointer
-                                      ? "$fp," : "$sp,")
-            << frame_size_ << ",$ra\n";
+            << "\t.frame\t"
+            << respell_registers(function.frame.has_frame_pointer ? "$fp"
+                                                                  : "$sp")
+            << ',' << frame_size_ << ','
+            << respell_registers("$ra") << '\n';
     const bool cfi = (options_.unwind_tables ||
                       options_.asynchronous_unwind_tables) &&
                      assembly_uses_dwarf_cfi(format_);
     if (cfi) output_ << ".cfi_startproc\n";
     if (frame_size_ != 0) {
-        instruction("addiu", "$sp,$sp,-" + std::to_string(frame_size_));
+        instruction(address_add_immediate(),
+                    "$sp,$sp,-" + std::to_string(frame_size_));
         if (cfi) output_ << ".cfi_def_cfa_offset " << frame_size_ << '\n';
         if (saves_ra_) {
-            instruction("sw", "$ra," + memory(saved_ra_offset_, "sp"));
+            instruction(address_store(),
+                        "$ra," + memory(saved_ra_offset_, "sp"));
         }
         if (saves_fp_) {
-            instruction("sw", "$fp," + memory(saved_fp_offset_, "sp"));
+            instruction(address_store(),
+                        "$fp," + memory(saved_fp_offset_, "sp"));
         }
         if (cfi) {
             if (saves_ra_) {
@@ -8705,13 +9115,16 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             instruction("move", "$sp,$fp");
         }
         if (saves_fp_) {
-            instruction("lw", "$fp," + memory(saved_fp_offset_, "sp"));
+            instruction(address_load(),
+                        "$fp," + memory(saved_fp_offset_, "sp"));
         }
         if (saves_ra_) {
-            instruction("lw", "$ra," + memory(saved_ra_offset_, "sp"));
+            instruction(address_load(),
+                        "$ra," + memory(saved_ra_offset_, "sp"));
         }
         instruction("jr", "$ra");
-        instruction("addiu", "$sp,$sp," + std::to_string(frame_size_));
+        instruction(address_add_immediate(),
+                    "$sp,$sp," + std::to_string(frame_size_));
     }
     if (cfi) output_ << ".cfi_endproc\n";
     output_ << ".end " << symbol << "\n.size " << symbol << ",.-"

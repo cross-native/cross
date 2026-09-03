@@ -319,9 +319,9 @@ TargetInfo make_target(ByteOrder order,
 }
 
 const TargetInfo big_endian = make_target(
-    ByteOrder::Big, {"mipsallegrex", "mips"});
+    ByteOrder::Big, {"mipsallegrex", "mips64", "mips"});
 const TargetInfo little_endian = make_target(
-    ByteOrder::Little, {"mipsallegrexel", "mipsel"});
+    ByteOrder::Little, {"mipsallegrexel", "mips64el", "mipsel"});
 
 } // namespace
 

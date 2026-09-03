@@ -81,6 +81,13 @@ public:
         return "mips1";
     }
 
+    // n64 and n32 are defined on a 64-bit FPU: the 32 floating registers are
+    // independently addressable doublewords, so neither the FPXX transport
+    // rules nor the even-register restriction applies.
+    static bool wide_register_abi(const Subtarget& subtarget) {
+        return subtarget.abi() == "n64" || subtarget.abi() == "n32";
+    }
+
     std::vector<std::string> object_writer_features(
         const Subtarget& subtarget) const override {
         std::vector<std::string> result;
@@ -89,8 +96,16 @@ public:
         }
         if (subtarget.has_feature(Feature::SoftFloat)) {
             result.emplace_back("+soft-float");
+        } else if (wide_register_abi(subtarget)) {
+            result.emplace_back("+fp64");
         } else if (subtarget.has_feature(Feature::SingleFloat)) {
             result.emplace_back("+single-float");
+        } else if (!subtarget.has_feature(Feature::Mips2)) {
+            // MIPS I has no doubleword coprocessor memory access, so its
+            // f64 halves travel through odd single-precision registers.
+            // That is plain FP32 code; FPXX cannot describe it and the
+            // assembler's FP32 default with odd registers is the truthful
+            // tag.
         } else if (subtarget.has_feature(Feature::Fpxx) ||
                    subtarget.has_feature(Feature::Fp32)) {
             // The managed slice uses only the FPXX-compatible subset of the
@@ -238,6 +253,35 @@ public:
             diagnostics.command_error(
                 "the first MIPS backend slice supports ELF object targets only");
         }
+        // The ABI's address model and the triple's ELF class must agree: the
+        // assembler derives the object class from the triple, so a mismatch
+        // would silently truncate every relocation or every pointer.
+        const bool wide_triple = options.target.starts_with("mips64");
+        const bool wide_abi = subtarget.abi_info().address_bits > 32;
+        if (wide_abi && !wide_triple) {
+            diagnostics.command_error(
+                "the MIPS '" + std::string(subtarget.abi()) +
+                "' ABI has 64-bit addresses and needs a mips64/mips64el "
+                "target triple");
+        }
+        if (!wide_abi && wide_triple) {
+            diagnostics.command_error(
+                "the MIPS '" + std::string(subtarget.abi()) +
+                "' ABI has 32-bit addresses and cannot be selected for a "
+                "mips64 target triple; use -mabi=n64 or a mips/mipsel triple");
+        }
+        if (wide_abi && !subtarget.has_feature(Feature::Mips3)) {
+            diagnostics.command_error(
+                "the MIPS '" + std::string(subtarget.abi()) +
+                "' ABI needs the 64-bit MIPS III register file; select a "
+                "MIPS III or later CPU");
+        }
+        if (wide_abi && subtarget.has_feature(Feature::SingleFloat)) {
+            diagnostics.command_error(
+                "the MIPS '" + std::string(subtarget.abi()) +
+                "' ABI is defined on a 64-bit FPU; -msingle-float is not a "
+                "supported combination");
+        }
         if (subtarget.cpu() == "allegrex" &&
             (!subtarget.has_feature(Feature::Allegrex) ||
              !subtarget.has_feature(Feature::Mips2) ||
@@ -272,6 +316,18 @@ public:
             }
         }
         for (const auto& function : hir_module.functions) {
+            // A per-function [[abi(...)]] selects transport, never the data
+            // model: a 32-bit-address ABI on a 64-bit-address module would
+            // classify its pointer channels as words.
+            if (const auto* entry = find_abi(subtarget.target(), function.abi);
+                entry && entry->address_bits != hir_module.address_bits) {
+                diagnostics.error(
+                    function.location,
+                    "the MIPS '" + entry->canonical_name +
+                        "' ABI has a different address width than the "
+                        "compilation ABI; mixed address models are not "
+                        "supported");
+            }
             if (function.ownership == hir::BodyOwnership::RawMir ||
                 function.naked) {
                 diagnostics.error(

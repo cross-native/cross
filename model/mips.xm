@@ -537,6 +537,170 @@ abi "o32" {
     }
 }
 
+# MIPS n64 places every argument in one 64-bit slot sequence: slot k travels
+# in a0-a7 or f12-f19 according to the value class, so both banks share one
+# cursor.  Carriers are 64 bits wide and narrower integers arrive sign
+# extended, which is the SImode-canonical form the backend already keeps.
+# There is no caller home area; unnamed floating arguments use integer slots.
+abi "n64" {
+    architecture = "mips";
+    address_bits = 64;
+    aliases = ["64", "abi64"];
+    llvm_calling_convention = "";
+    gcc_calling_attribute = "";
+    compilation_selectable = true;
+    function_selectable = true;
+    argument_register_failure = "partial";
+    result_register_failure = "error";
+    stack_layout = "packed";
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 0;
+    stack_order = ["arguments"];
+    variadic_supported = true;
+    variadic_save_banks = ["integer"];
+    variadic_save_alignment = 8;
+    variadic_va_list_bytes = 8;
+    variadic_va_list_alignment = 8;
+    call_clobbers = [
+        "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "t8", "t9", "ra", "hi", "lo",
+        "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+        "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
+        "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23",
+        "memory"
+    ];
+
+    # t0-t3 are the architectural registers 8-11, which n64 names a4-a7.
+    bank "integer" {
+        class = "integer";
+        cursor = "argument";
+        register_bits = 64;
+        arguments = ["a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3"];
+        results = ["v0", "v1"];
+    }
+
+    bank "floating" {
+        class = "floating";
+        cursor = "argument";
+        register_bits = 64;
+        arguments = [
+            "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19"
+        ];
+        results = ["f0", "f2"];
+    }
+
+    variadic_state "overflow_arg_area" {
+        type = "void*";
+        kind = "stack_address";
+    }
+
+    variadic_state "gp_arg_area" {
+        type = "u64*";
+        kind = "register_save_address";
+        cursor = "argument";
+        stride = 8;
+    }
+
+    rule "zero" {
+        match = ["zero"];
+        action = "ignore";
+        requires_features = ["mips3"];
+    }
+
+    rule "integer-small" {
+        match = ["integer", "pointer"];
+        action = "direct";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "integer-wide" {
+        match = ["integer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 65;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+        cursor_alignment = 2;
+        requires_features = ["mips3"];
+    }
+
+    rule "variadic-floating" {
+        match = ["floating"];
+        action = "split";
+        bank = "integer";
+        min_bits = 32;
+        max_bits = 64;
+        unit_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+        applies_to = ["variadic_arguments"];
+    }
+
+    rule "floating32" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 32;
+        max_bits = 32;
+        requires_features = ["mips3", "hard-float"];
+    }
+
+    rule "floating64" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 64;
+        max_bits = 64;
+        requires_features = ["mips3", "hard-float"];
+        forbids_features = ["single-float"];
+    }
+
+    rule "floating-soft" {
+        match = ["floating"];
+        action = "split";
+        bank = "integer";
+        min_bits = 32;
+        max_bits = 64;
+        unit_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-registers" {
+        match = ["pair", "aggregate", "array"];
+        action = "flatten";
+        min_bits = 1;
+        max_bits = 128;
+        unit_bits = 64;
+        merge_banks = ["floating", "integer"];
+        require_natural_alignment = true;
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-result-memory" {
+        match = ["pair", "aggregate", "array"];
+        action = "indirect";
+        bank = "integer";
+        applies_to = ["results"];
+        requires_features = ["mips3"];
+    }
+
+    rule "argument-memory" {
+        match = ["any"];
+        action = "stack";
+        applies_to = ["arguments"];
+        requires_features = ["mips3"];
+    }
+}
+
 # MIPS EABI32 keeps integer and floating argument allocation independent.
 # This is the ABI used by the PSPDEV Allegrex toolchain.  Feature-dependent
 # rules also describe ordinary double-float EABI targets without giving the
@@ -759,6 +923,31 @@ profile "mipsel-elf" {
     abi = "cross32";
     mangling = "cross";
     m.arch = "generic";
+    m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
+}
+
+# MIPS64 ELF targets default to the n64 data model.  The 64-bit generic CPU
+# keeps the object writer honest about the ISA; -march may narrow it to any
+# MIPS III or later CPU.
+profile "mips64-n64" {
+    default_for = ["mips64", "mips64-*"];
+    target = "mips64-unknown-elf";
+    abi = "n64";
+    mangling = "cross";
+    m.arch = "mips64";
+    m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
+}
+
+profile "mips64el-n64" {
+    default_for = ["mips64el", "mips64el-*"];
+    target = "mips64el-unknown-elf";
+    abi = "n64";
+    mangling = "cross";
+    m.arch = "mips64";
     m.risc-cisc-balance = 0;
     f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
