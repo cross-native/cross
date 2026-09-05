@@ -754,6 +754,12 @@ private:
         case Statement::Kind::If:
             lower_if(statement);
             return;
+        case Statement::Kind::Switch:
+        case Statement::Kind::Case:
+        case Statement::Kind::Default:
+            diagnostics_.error(statement.location,
+                               "switch statements are not permitted in a naked function");
+            return;
         case Statement::Kind::While:
             lower_while(statement);
             return;

@@ -29,6 +29,7 @@ enum class EmitKind {
 enum class OptimizationGoal { Debug, Speed, Size, MinimumSize };
 enum class CodeModel { Small, Kernel, Medium, Large };
 enum class FpContractMode { Off, On, Fast };
+enum class UnwindModel { None, Platform };
 
 enum class OptionValueKind { Boolean, Unsigned, Enumeration, Text };
 enum class OptionCategory { Optimization, CodeGeneration, Semantic, Target };
@@ -104,8 +105,10 @@ struct CompilerOptions {
     bool use_plt{true};
     bool semantic_interposition{true};
     bool direct_external_data{};
-    bool unwind_tables{true};
-    bool asynchronous_unwind_tables{true};
+    bool unwind_tables{};
+    bool asynchronous_unwind_tables{};
+    bool elide_noreturn_saves{};
+    UnwindModel unwind_model{UnwindModel::None};
     CodeModel code_model{CodeModel::Small};
     bool fast_math{};
     FpContractMode fp_contract{FpContractMode::Off};

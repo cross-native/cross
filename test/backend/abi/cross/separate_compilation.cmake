@@ -14,21 +14,21 @@ else()
 endif()
 
 execute_process(
-    COMMAND "${CC}" -c -O2 -fno-eval-calls "${CALLEE_SOURCE}"
+    COMMAND "${CC}" -c -O2 -funwind-tables -fno-eval-calls "${CALLEE_SOURCE}"
             -o "${OUTPUT}.callee.o"
     RESULT_VARIABLE callee_status
     OUTPUT_VARIABLE callee_stdout
     ERROR_VARIABLE callee_stderr
 )
 execute_process(
-    COMMAND "${CC}" -c -O2 -fno-eval-calls "-mabi=${HOST_ABI}"
+    COMMAND "${CC}" -c -O2 -funwind-tables -fno-eval-calls "-mabi=${HOST_ABI}"
             "${CALLER_SOURCE}" -o "${OUTPUT}.caller.o"
     RESULT_VARIABLE caller_status
     OUTPUT_VARIABLE caller_stdout
     ERROR_VARIABLE caller_stderr
 )
 execute_process(
-    COMMAND "${CC}" -S -O2 -fno-eval-calls "-mabi=${HOST_ABI}"
+    COMMAND "${CC}" -S -O2 -funwind-tables -fno-eval-calls "-mabi=${HOST_ABI}"
             "${CALLER_SOURCE}" -o "${OUTPUT}.caller.s"
     RESULT_VARIABLE caller_assembly_status
     OUTPUT_VARIABLE caller_assembly_stdout

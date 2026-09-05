@@ -83,6 +83,8 @@ private:
     std::unordered_map<std::string, RecordTag> record_types_;
     std::unordered_map<std::string, TypePtr> type_aliases_;
     bool parsing_generic_argument_{};
+    unsigned switch_depth_{};
+    std::vector<bool> switch_default_seen_;
 };
 
 } // namespace cross

@@ -9,7 +9,7 @@ endforeach()
 
 function(compile_assembly level variable)
     execute_process(
-        COMMAND "${CC}" -S "-O${level}" -fno-eval-calls
+        COMMAND "${CC}" -S "-O${level}" -funwind-tables -fno-eval-calls
                 -target x86_64-unknown-linux-gnu -mabi=sysv_abi "${SOURCE}"
                 -o "${OUTPUT}.O${level}.s"
         RESULT_VARIABLE status
@@ -119,7 +119,7 @@ endif()
 # live to derive the second lane, but the remaining four-way group must not
 # introduce a late move after each count addition.
 execute_process(
-    COMMAND "${CC}" -S -O3 -fno-eval-calls -march=x86-64-v3
+    COMMAND "${CC}" -S -O3 -funwind-tables -fno-eval-calls -march=x86-64-v3
             -target x86_64-unknown-linux-gnu -mabi=sysv_abi "${SOURCE}"
             -o "${OUTPUT}.v3.O3.s"
     RESULT_VARIABLE v3_status
@@ -146,7 +146,7 @@ if(NOT variable_rotate_count EQUAL 5 OR
 endif()
 
 execute_process(
-    COMMAND "${CC}" -S -O2 -fno-eval-calls
+    COMMAND "${CC}" -S -O2 -funwind-tables -fno-eval-calls
             -target x86_64-w64-windows-gnu -mabi=ms_abi "${SOURCE}"
             -o "${OUTPUT}.win.O2.s"
     RESULT_VARIABLE win_assembly_status
@@ -154,7 +154,7 @@ execute_process(
     ERROR_VARIABLE win_assembly_stderr
 )
 execute_process(
-    COMMAND "${CC}" -c -O2 -fno-eval-calls
+    COMMAND "${CC}" -c -O2 -funwind-tables -fno-eval-calls
             -target x86_64-w64-windows-gnu -mabi=ms_abi "${SOURCE}"
             -o "${OUTPUT}.win.O2.o"
     RESULT_VARIABLE win_object_status

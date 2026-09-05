@@ -9,6 +9,42 @@
 #include <utility>
 
 namespace cross::mir {
+
+bool has_reachable_return(const ManagedFunction& function) {
+    if (function.entry.value >= function.blocks.size()) return true;
+    std::vector<bool> seen(function.blocks.size());
+    std::vector<BlockId> pending{function.entry};
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        if (id.value >= function.blocks.size()) return true;
+        if (seen[id.value]) continue;
+        seen[id.value] = true;
+        const auto& terminator = function.blocks[id.value].terminator;
+        if (terminator.kind == TerminatorKind::Return || terminator.kind == TerminatorKind::None ||
+            terminator.kind == TerminatorKind::IndirectBranch) return true;
+        pending.insert(pending.end(), terminator.successors.begin(), terminator.successors.end());
+    }
+    return false;
+}
+
+std::optional<UInt128> unsigned_upper_bound_at_exit(const ManagedFunction& function,
+                                                  ValueId value, BlockId at) {
+    const DominatorTree dominance(function);
+    std::optional<UInt128> bound;
+    for (const auto& block : function.blocks) {
+        if (!dominance.dominates(block.id, at)) continue;
+        for (const auto id : block.values) {
+            const auto& fact = function.values[id.value];
+            if (fact.kind != ValueKind::Intrinsic || fact.intrinsic != IntrinsicOperation::Assume ||
+                fact.binary != BinaryOperation::UnsignedLess || fact.operands.size() != 1 ||
+                fact.operands.front() != value) continue;
+            const UInt128 candidate{fact.integer, fact.integer_high};
+            if (!bound || candidate < *bound) bound = candidate;
+        }
+    }
+    return bound;
+}
 namespace {
 
 const std::vector<ValueUse> empty_uses;

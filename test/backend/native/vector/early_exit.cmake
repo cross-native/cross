@@ -9,7 +9,7 @@ endforeach()
 
 function(compile_assembly output)
     execute_process(
-        COMMAND "${CC}" -S ${ARGN} "${SOURCE}" -o "${output}"
+        COMMAND "${CC}" -S -funwind-tables ${ARGN} "${SOURCE}" -o "${output}"
         RESULT_VARIABLE status
         OUTPUT_VARIABLE stdout
         ERROR_VARIABLE stderr
@@ -113,7 +113,7 @@ if(NOT independent_less MATCHES "[\t ]vptest[\t ]")
 endif()
 
 execute_process(
-    COMMAND "${CC}" -c -O3 -march=x86-64-v3
+    COMMAND "${CC}" -c -O3 -funwind-tables -march=x86-64-v3
             "${SOURCE}" -o "${OUTPUT}.o"
     RESULT_VARIABLE object_status
     OUTPUT_VARIABLE object_stdout

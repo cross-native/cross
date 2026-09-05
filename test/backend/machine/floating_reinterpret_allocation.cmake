@@ -12,7 +12,7 @@ set(floating_bits_regex
 
 foreach(level O2 O3 Os Oz)
     execute_process(
-        COMMAND "${CC}" -S "-${level}" -mavx2 -target
+        COMMAND "${CC}" -S "-${level}" -funwind-tables -mavx2 -target
                 x86_64-w64-windows-gnu "${SOURCE}"
                 -o "${OUTPUT}-${level}.s"
         RESULT_VARIABLE assembly_status
@@ -20,7 +20,7 @@ foreach(level O2 O3 Os Oz)
         ERROR_VARIABLE assembly_stderr
     )
     execute_process(
-        COMMAND "${CC}" -c "-${level}" -mavx2 -target
+        COMMAND "${CC}" -c "-${level}" -funwind-tables -mavx2 -target
                 x86_64-w64-windows-gnu "${SOURCE}"
                 -o "${OUTPUT}-${level}.o"
         RESULT_VARIABLE object_status

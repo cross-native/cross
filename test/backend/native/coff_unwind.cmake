@@ -3,7 +3,7 @@
 
 function(compile_case name source)
     execute_process(
-        COMMAND "${CC}" -S -O2 -target x86_64-w64-windows-gnu
+        COMMAND "${CC}" -S -O2 -funwind-tables -target x86_64-w64-windows-gnu
                 "${source}" -o "${OUTPUT}-${name}.s"
         RESULT_VARIABLE assembly_status
         OUTPUT_VARIABLE assembly_stdout
@@ -14,7 +14,7 @@ function(compile_case name source)
             "${name} COFF assembly failed\n${assembly_stdout}\n${assembly_stderr}")
     endif()
     execute_process(
-        COMMAND "${CC}" -c -O2 -target x86_64-w64-windows-gnu
+        COMMAND "${CC}" -c -O2 -funwind-tables -target x86_64-w64-windows-gnu
                 "${source}" -o "${OUTPUT}-${name}.o"
         RESULT_VARIABLE object_status
         OUTPUT_VARIABLE object_stdout

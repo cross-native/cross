@@ -3,6 +3,7 @@
 #include "middle/mir.hpp"
 
 #include "common/floating_bits.hpp"
+#include "common/integer_semantics.hpp"
 #include "common/uint128.hpp"
 #include "middle/data_ir.hpp"
 #include "middle/mir_analysis.hpp"
@@ -440,6 +441,9 @@ std::optional<ParsedInteger> parse_integer(std::string text,
 
 std::optional<ParsedInteger> patch_initial(const Expr& expression,
                                            unsigned address_bits) {
+    if (expression.evaluated_integer)
+        return ParsedInteger{expression.evaluated_integer->value,
+                             expression.evaluated_integer->type};
     if (expression.kind == Expr::Kind::Parenthesized && expression.left) {
         return patch_initial(*expression.left, address_bits);
     }
@@ -551,8 +555,9 @@ bool eligible_expression(const Expr& expression) {
                            [](const auto& argument) {
                                return eligible_expression(*argument);
                            });
-    case Expr::Kind::String:
     case Expr::Kind::Character:
+        return decode_character_literal(expression.text).has_value();
+    case Expr::Kind::String:
         return false;
     }
     return false;
@@ -652,6 +657,7 @@ bool eligible_statement(const Statement& statement) {
     case Statement::Kind::Return:
         return !statement.expression || eligible_expression(*statement.expression);
     case Statement::Kind::If:
+    case Statement::Kind::Switch:
         return statement.condition && eligible_expression(*statement.condition) &&
                statement.first && eligible_statement(*statement.first) &&
                (!statement.second || eligible_statement(*statement.second));
@@ -670,6 +676,9 @@ bool eligible_statement(const Statement& statement) {
     case Statement::Kind::Continue:
     case Statement::Kind::Label:
         return true;
+    case Statement::Kind::Case:
+    case Statement::Kind::Default:
+        return !statement.first || eligible_statement(*statement.first);
     case Statement::Kind::Goto:
         return statement.expression && eligible_expression(*statement.expression);
     }
@@ -780,6 +789,7 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             attribute.name != "raw_inline" &&
             attribute.name != "always_inline" &&
             attribute.name != "noinline" &&
+            attribute.name != "noreturn" &&
             attribute.name != "variadic" &&
             attribute.name != "stack_cleanup") {
             return false;
@@ -828,6 +838,7 @@ private:
         BlockId break_target;
         BlockId continue_target;
         std::size_t retained_scopes{};
+        bool is_switch{};
     };
 
     struct AtomicLvalue {
@@ -854,6 +865,7 @@ private:
         current_patch_sinks_.clear();
         parameter_values_.clear();
         label_blocks_.clear();
+        case_blocks_.clear();
         scopes_.clear();
         loops_.clear();
         address_taken_names_.clear();
@@ -949,16 +961,18 @@ private:
         }
         lower_statement(*function.definition->body);
         if (current_block_) {
-            if (void_type(hir_, function.result_type)) {
+            if (void_type(hir_, function.result_type) &&
+                !function.definition->attribute("noreturn")) {
                 terminate(TerminatorKind::Return, function.location, std::nullopt, {});
             } else {
-                failed_ = true;
+                terminate(TerminatorKind::Unreachable, function.location, std::nullopt, {});
             }
         }
         if (failed_) {
             current_patch_sinks_.clear();
             return std::nullopt;
         }
+        prune_unreachable_blocks(current_);
         for (const auto sink : current_patch_sinks_) {
             patch_sinks_.insert(sink);
             result_.object_definitions.insert(sink);
@@ -1253,9 +1267,7 @@ private:
         for (const auto& parameter : function.parameters) {
             if (!call_type(parameter.type, false)) return false;
         }
-        const auto* declaration = function.definition ? function.definition
-                                                       : function.declarations.back();
-        return !declaration->attribute("noreturn");
+        return true;
     }
 
     ValueId lifetime(ValueKind kind, SlotId slot, SourceLocation location) {
@@ -1695,7 +1707,7 @@ private:
                 MemoryOrder::SeqCst, location, MemoryOrder::SeqCst,
                 hir_.type(binding.type).is_volatile);
         }
-        source = cast(source, binding.type, location);
+        source = assignment_cast(source, binding.type, location);
         const auto value = add_effectful(ValueKind::Store,
                                          *hir_.builtin(BuiltinType::Void), location);
         auto& store = current_.values[value.value];
@@ -1732,7 +1744,7 @@ private:
                 MemoryOrder::SeqCst, location, MemoryOrder::SeqCst,
                 hir_.type(object.type).is_volatile);
         }
-        source = cast(source, object.type, location);
+        source = assignment_cast(source, object.type, location);
         const auto value = add_effectful(ValueKind::GlobalStore,
                                          *hir_.builtin(BuiltinType::Void), location);
         auto& store = current_.values[value.value];
@@ -1825,7 +1837,7 @@ private:
                 {address, source}, MemoryOrder::SeqCst, location,
                 MemoryOrder::SeqCst, is_volatile);
         }
-        source = cast(source, *pointer.pointee, location);
+        source = assignment_cast(source, *pointer.pointee, location);
         const auto value = add_effectful(ValueKind::PointerStore,
                                          *hir_.builtin(BuiltinType::Void), location);
         auto& store = current_.values[value.value];
@@ -1865,8 +1877,7 @@ private:
     std::optional<hir::TypeId> infer_type(const Expr& expression) {
         switch (expression.kind) {
         case Expr::Kind::Integer: {
-            const auto parsed = parse_integer(expression.text,
-                                              hir_.address_bits);
+            const auto parsed = patch_initial(expression, hir_.address_bits);
             return parsed ? hir_.builtin(parsed->type) : std::nullopt;
         }
         case Expr::Kind::Floating: {
@@ -2123,8 +2134,10 @@ private:
                        ? std::optional<hir::TypeId>(function->result_type)
                        : std::nullopt;
         }
+        case Expr::Kind::Character: {
+            return hir_.builtin(BuiltinType::U32);
+        }
         case Expr::Kind::String:
-        case Expr::Kind::Character:
             return std::nullopt;
         }
         return std::nullopt;
@@ -2190,19 +2203,10 @@ private:
         left = *promote(left);
         right = *promote(right);
         if (left == right) return left;
-        const auto left_bits = type_bits(hir_, left);
-        const auto right_bits = type_bits(hir_, right);
-        const bool left_signed = signed_type(hir_, left);
-        const bool right_signed = signed_type(hir_, right);
-        if (left_signed == right_signed) {
-            return left_bits >= right_bits ? left : right;
-        }
-        const auto signed_value = left_signed ? left : right;
-        const auto unsigned_value = left_signed ? right : left;
-        const auto signed_bits = type_bits(hir_, signed_value);
-        const auto unsigned_bits = type_bits(hir_, unsigned_value);
-        if (signed_bits > unsigned_bits) return signed_value;
-        return unsigned_value;
+        const IntegerType lhs{type_bits(hir_, left), signed_type(hir_, left)};
+        const IntegerType rhs{type_bits(hir_, right), signed_type(hir_, right)};
+        const auto common = common_integer_type(lhs, rhs);
+        return common.bits == lhs.bits && common.is_signed == lhs.is_signed ? left : right;
     }
 
     std::optional<hir::TypeId> vector_mask_type(hir::TypeId vector) {
@@ -2226,6 +2230,11 @@ private:
         const auto source_type = current_.values[source.value].type;
         if (source_type == destination) {
             return source;
+        }
+        if (hir_.type(destination).kind == hir::Type::Kind::Builtin &&
+            hir_.type(destination).builtin == BuiltinType::Bool) {
+            source = booleanize(source, location);
+            if (current_.values[source.value].type == destination) return source;
         }
         if (representation_compatible(hir_, source_type, destination)) {
             const auto value = add_value(ValueKind::Cast, destination, location);
@@ -2342,6 +2351,44 @@ private:
         return value;
     }
 
+    bool compatible_pointer_conversion(hir::TypeId source,
+                                       hir::TypeId destination,
+                                       unsigned depth = 0,
+                                       bool intermediate_const = true) const {
+        const auto& from = hir_.type(source);
+        const auto& to = hir_.type(destination);
+        if ((from.is_const && !to.is_const) ||
+            (from.is_volatile && !to.is_volatile) ||
+            from.is_atomic != to.is_atomic) return false;
+        if (depth != 0 && !intermediate_const &&
+            ((!from.is_const && to.is_const) ||
+             (!from.is_volatile && to.is_volatile))) return false;
+        if (depth == 0 && (void_type(hir_, source) ||
+                           void_type(hir_, destination))) return true;
+        if (from.kind == hir::Type::Kind::Pointer &&
+            to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee) {
+            return compatible_pointer_conversion(
+                *from.pointee, *to.pointee, depth + 1,
+                intermediate_const && to.is_const);
+        }
+        return representation_compatible(hir_, source, destination);
+    }
+
+    ValueId assignment_cast(ValueId source, hir::TypeId destination,
+                            SourceLocation location) {
+        const auto& from = hir_.type(current_.values[source.value].type);
+        const auto& to = hir_.type(destination);
+        if (from.kind == hir::Type::Kind::Pointer &&
+            to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee &&
+            !compatible_pointer_conversion(*from.pointee, *to.pointee)) {
+            diagnostics_.error(location,
+                "implicit pointer conversion discards qualifiers or uses incompatible pointee types");
+            failed_ = true;
+            return source;
+        }
+        return cast(source, destination, location);
+    }
+
     ValueId constant(UInt128 integer, hir::TypeId type, SourceLocation location) {
         const auto value = add_value(ValueKind::ConstantInteger, type, location);
         current_.values[value.value].integer = integer.low;
@@ -2383,8 +2430,7 @@ private:
         std::optional<ValueId> result;
         switch (expression.kind) {
         case Expr::Kind::Integer: {
-            const auto parsed = parse_integer(expression.text,
-                                              hir_.address_bits);
+            const auto parsed = patch_initial(expression, hir_.address_bits);
             if (!parsed) break;
             const auto type = hir_.builtin(parsed->type);
             if (!type) break;
@@ -2712,15 +2758,19 @@ private:
         case Expr::Kind::Call:
             result = lower_call(expression);
             break;
+        case Expr::Kind::Character: {
+            const auto value = decode_character_literal(expression.text);
+            if (value) result = constant(UInt128{*value}, *hir_.builtin(BuiltinType::U32), expression.location);
+            break;
+        }
         case Expr::Kind::String:
-        case Expr::Kind::Character:
             break;
         }
         if (!result) {
             failed_ = true;
             return std::nullopt;
         }
-        return destination ? std::optional<ValueId>(cast(*result, *destination,
+        return destination ? std::optional<ValueId>(assignment_cast(*result, *destination,
                                                          expression.location))
                            : result;
     }
@@ -3573,11 +3623,47 @@ private:
                                    "$::assume requires a scalar condition");
                 return std::nullopt;
             }
+            const auto nonvolatile = [&](const auto& self, const Expr& node) -> bool {
+                const auto inferred = infer_type(node);
+                if (!inferred || hir_.type(*inferred).is_volatile || hir_.type(*inferred).is_atomic)
+                    return false;
+                return (!node.left || self(self, *node.left)) &&
+                       (!node.right || self(self, *node.right)) &&
+                       (!node.third || self(self, *node.third));
+            };
+            if (!nonvolatile(nonvolatile, condition)) {
+                diagnostics_.error(condition.location, "$::assume requires a non-volatile, non-atomic condition");
+                return std::nullopt;
+            }
             const auto result = add_effectful(
                 ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void),
                 expression.location);
             current_.values[result.value].intrinsic =
                 IntrinsicOperation::Assume;
+            const Expr* predicate = &condition;
+            while (predicate->kind == Expr::Kind::Parenthesized && predicate->left)
+                predicate = predicate->left.get();
+            if (predicate->kind == Expr::Kind::Binary && predicate->text == "<" &&
+                predicate->left && predicate->right && predicate->left->kind == Expr::Kind::Name &&
+                !find_local(predicate->left->text)) {
+                const auto parameter = parameter_values_.find(predicate->left->text);
+                const auto limit = patch_initial(*predicate->right, hir_.address_bits);
+                if (parameter != parameter_values_.end() && limit) {
+                    const auto source_type = current_.values[parameter->second.value].type;
+                    const auto common = common_type(source_type, *hir_.builtin(limit->type));
+                    if (common && !signed_type(hir_, *common) &&
+                        type_bits(hir_, *common) == type_bits(hir_, source_type)) {
+                        auto& fact = current_.values[result.value];
+                        fact.binary = BinaryOperation::UnsignedLess;
+                        fact.operands = {parameter->second};
+                        const auto bound = convert_integer(limit->value,
+                            {builtin_bits(limit->type, hir_.address_bits), builtin_signed(limit->type)},
+                            {type_bits(hir_, *common), false});
+                        fact.integer = bound.low;
+                        fact.integer_high = bound.high;
+                    }
+                }
+            }
             return result;
         }
         if (expression.left->text == "$::unreachable" ||
@@ -3724,15 +3810,15 @@ private:
                 if (manual_cell) {
                     initial = lower_expression(actual, parameter.type);
                 } else if (actual_local) {
-                    initial = cast(load_slot(*actual_local, actual.location),
+                    initial = assignment_cast(load_slot(*actual_local, actual.location),
                                    parameter.type, actual.location);
                 } else if (actual_object && global_scalar(*actual_object)) {
-                    initial = cast(load_global(*actual_object, actual.location),
+                    initial = assignment_cast(load_global(*actual_object, actual.location),
                                    parameter.type, actual.location);
                 } else if (actual_address) {
                     initial = load_pointer(*actual_address, actual.location);
                     if (initial) {
-                        initial = cast(*initial, parameter.type,
+                        initial = assignment_cast(*initial, parameter.type,
                                        actual.location);
                     }
                 } else {
@@ -3797,6 +3883,13 @@ private:
         call.call_arguments = std::move(arguments);
         for (const auto& argument : call.call_arguments) {
             if (argument.value) call.operands.push_back(*argument.value);
+        }
+        const bool noreturn = (callee->definition && callee->definition->attribute("noreturn")) ||
+            std::any_of(callee->declarations.begin(), callee->declarations.end(),
+                [](const FunctionDecl* declaration) { return declaration->attribute("noreturn") != nullptr; });
+        if (noreturn) {
+            terminate(TerminatorKind::Unreachable, expression.location, std::nullopt, {});
+            return result;
         }
         for (const auto& copyout : copyouts) {
             const LocalBinding temporary{
@@ -3947,6 +4040,8 @@ private:
             for (const auto& child : statement.statements) {
                 if (!current_block_ &&
                     child->kind != Statement::Kind::Label &&
+                    child->kind != Statement::Kind::Case &&
+                    child->kind != Statement::Kind::Default &&
                     child->kind != Statement::Kind::Compound) {
                     continue;
                 }
@@ -3959,6 +4054,19 @@ private:
             return;
         }
         case Statement::Kind::Empty:
+            return;
+        case Statement::Kind::Case:
+        case Statement::Kind::Default: {
+            const auto found = case_blocks_.find(&statement);
+            if (found == case_blocks_.end()) { failed_ = true; return; }
+            if (current_block_)
+                terminate(TerminatorKind::Branch, statement.location, std::nullopt, {found->second});
+            enter(found->second);
+            if (statement.first) lower_statement(*statement.first);
+            return;
+        }
+        case Statement::Kind::Switch:
+            lower_switch(statement);
             return;
         case Statement::Kind::Declaration: {
             if (!current_block_ || scopes_.empty()) { failed_ = true; return; }
@@ -4219,16 +4327,112 @@ private:
             terminate(TerminatorKind::Branch, statement.location, std::nullopt,
                       {loops_.back().break_target});
             return;
-        case Statement::Kind::Continue:
+        case Statement::Kind::Continue: {
             if (loops_.empty() || !current_block_) { failed_ = true; return; }
-            end_lifetimes_from(loops_.back().retained_scopes, statement.location);
+            const auto loop = std::find_if(loops_.rbegin(), loops_.rend(),
+                                          [](const LoopContext& context) { return !context.is_switch; });
+            if (loop == loops_.rend()) { failed_ = true; return; }
+            end_lifetimes_from(loop->retained_scopes, statement.location);
             terminate(TerminatorKind::Branch, statement.location, std::nullopt,
-                      {loops_.back().continue_target});
+                      {loop->continue_target});
             return;
+        }
         default:
             failed_ = true;
             return;
         }
+    }
+
+    void lower_switch(const Statement& statement) {
+        if (contains_dynamic_array(*statement.first)) {
+            diagnostics_.error(statement.location, "switch bodies with variable-length arrays are not lowerable yet");
+            failed_ = true;
+            return;
+        }
+        auto selector = lower_expression(*statement.condition);
+        if (!selector || !integer_type(hir_, current_.values[selector->value].type)) {
+            diagnostics_.error(statement.location, "switch requires an integer or enumeration selector");
+            failed_ = true;
+            return;
+        }
+        const auto type = *promote(current_.values[selector->value].type);
+        selector = cast(*selector, type, statement.location);
+        const auto end = new_block(statement.location);
+        auto fallback = end;
+        std::vector<std::pair<UInt128, BlockId>> cases;
+        const auto collect = [&](const auto& self, const Statement& node, bool nested_control) -> void {
+            if (node.kind == Statement::Kind::Switch) return;
+            if (node.kind == Statement::Kind::Case || node.kind == Statement::Kind::Default) {
+                if (nested_control) {
+                    diagnostics_.error(node.location, "case/default inside another control statement is not lowerable yet");
+                    failed_ = true;
+                    return;
+                }
+                const auto block = new_block(node.location);
+                case_blocks_.emplace(&node, block);
+                if (node.kind == Statement::Kind::Default) {
+                    fallback = block;
+                    if (node.first) self(self, *node.first, false);
+                    return;
+                }
+                const auto parsed = patch_initial(*node.expression, hir_.address_bits);
+                if (!parsed) {
+                    diagnostics_.error(node.location, "case requires a translation-time integer constant");
+                    failed_ = true;
+                    return;
+                }
+                const IntegerType source_type{builtin_bits(parsed->type, hir_.address_bits), builtin_signed(parsed->type)};
+                const IntegerType destination_type{type_bits(hir_, type), signed_type(hir_, type)};
+                const auto value = convert_integer(parsed->value, source_type, destination_type);
+                if (convert_integer(value, destination_type, source_type) != parsed->value ||
+                    integer_negative(value, destination_type) != integer_negative(parsed->value, source_type)) {
+                    diagnostics_.error(node.location, "case value is not representable in the promoted selector type");
+                    failed_ = true;
+                }
+                if (std::any_of(cases.begin(), cases.end(), [&](const auto& entry) { return entry.first == value; })) {
+                    diagnostics_.error(node.location, "duplicate case value");
+                    failed_ = true;
+                }
+                cases.emplace_back(value, block);
+                if (node.first) self(self, *node.first, false);
+                return;
+            }
+            nested_control |= node.kind != Statement::Kind::Compound;
+            for (const auto& child : node.statements) self(self, *child, nested_control);
+            if (node.first) self(self, *node.first, nested_control);
+            if (node.second) self(self, *node.second, nested_control);
+        };
+        collect(collect, *statement.first, false);
+        if (failed_) return;
+        const auto bound = unsigned_upper_bound_at_exit(current_, *selector, *current_block_);
+        if (bound && bound->high == 0 && bound->low <= cases.size()) {
+            bool covered = true;
+            for (std::uint64_t value = 0; value < bound->low; ++value)
+                covered &= std::any_of(cases.begin(), cases.end(),
+                    [&](const auto& entry) { return entry.first == UInt128{value}; });
+            if (covered) {
+                fallback = new_block(statement.location);
+                current_.blocks[fallback.value].terminator.kind = TerminatorKind::Unreachable;
+                current_.blocks[fallback.value].terminator.effect = current_.blocks[fallback.value].effect;
+                current_.blocks[fallback.value].terminator.location = statement.location;
+            }
+        }
+        for (const auto& [value, block] : cases) {
+            const auto literal = constant(value, type, statement.location);
+            const auto condition = add_value(ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), statement.location);
+            current_.values[condition.value].binary = BinaryOperation::Equal;
+            current_.values[condition.value].operands = {*selector, literal};
+            const auto next = new_block(statement.location);
+            terminate(TerminatorKind::ConditionalBranch, statement.location, condition, {block, next});
+            enter(next);
+        }
+        terminate(TerminatorKind::Branch, statement.location, std::nullopt, {fallback});
+        enter(new_block(statement.location));
+        loops_.push_back({end, {}, scopes_.size(), true});
+        lower_statement(*statement.first);
+        loops_.pop_back();
+        if (current_block_) terminate(TerminatorKind::Branch, statement.location, std::nullopt, {end});
+        enter(end);
     }
 
     void lower_while(const Statement& statement) {
@@ -4368,6 +4572,7 @@ private:
     std::unordered_map<std::string, ValueId> parameter_values_;
     std::unordered_set<std::string> address_taken_names_;
     std::unordered_map<std::uint32_t, BlockId> label_blocks_;
+    std::unordered_map<const Statement*, BlockId> case_blocks_;
     std::vector<Scope> scopes_;
     std::vector<LoopContext> loops_;
     std::unordered_set<std::uint32_t> patch_sinks_;
@@ -4859,6 +5064,10 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
             if (value.kind == ValueKind::Intrinsic) {
                 const bool expect =
                     value.intrinsic == IntrinsicOperation::Expect;
+                const bool range = value.intrinsic == IntrinsicOperation::Assume &&
+                    value.operands.size() == 1 && value.binary == BinaryOperation::UnsignedLess &&
+                    value.operands.front().value < function.values.size() &&
+                    integer_type(hir_module, function.values[value.operands.front().value].type);
                 if (expect &&
                     (value.operands.size() != 1 ||
                      !integer_type(hir_module, value.type) ||
@@ -4870,7 +5079,7 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                          type_bits(hir_module, value.type)))) {
                     fail(value.location, "invalid $::expect MIR operation");
                 } else if (!expect &&
-                           (!value.operands.empty() ||
+                           ((!value.operands.empty() && !range) ||
                             !void_type(hir_module, value.type))) {
                     fail(value.location,
                          "invalid control-intrinsic MIR operation");

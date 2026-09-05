@@ -1111,7 +1111,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         (void)parse_static_assertion();
         return statement;
     }
-    if ((current().kind == TokenKind::Identifier && current(1).is(":")) ||
+    if ((current().kind == TokenKind::Identifier && !current().is("default") && current(1).is(":")) ||
         (current().is("label") && current(1).kind == TokenKind::Identifier && current(2).is(":"))) {
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Label;
@@ -1144,6 +1144,16 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         expect("("); statement->condition = parse_expression(); expect(")");
         statement->first = parse_statement();
         if (consume("else")) statement->second = parse_statement();
+        return statement;
+    }
+    if (consume("switch")) {
+        statement->kind = Statement::Kind::Switch;
+        expect("("); statement->condition = parse_expression(); expect(")");
+        ++switch_depth_;
+        switch_default_seen_.push_back(false);
+        statement->first = parse_statement();
+        switch_default_seen_.pop_back();
+        --switch_depth_;
         return statement;
     }
     if (consume("while")) {
@@ -1188,6 +1198,30 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     }
     if (consume("continue")) {
         statement->kind = Statement::Kind::Continue; expect(";"); return statement;
+    }
+    if (consume("case")) {
+        statement->kind = Statement::Kind::Case;
+        if (switch_depth_ == 0) {
+            error_here("case label is not inside a switch");
+        }
+        statement->expression = parse_expression();
+        expect(":");
+        if (!current().is("}")) statement->first = parse_statement();
+        return statement;
+    }
+    if (consume("default")) {
+        statement->kind = Statement::Kind::Default;
+        if (switch_depth_ == 0) {
+            error_here("default label is not inside a switch");
+        } else if (!switch_default_seen_.empty() &&
+                   switch_default_seen_.back()) {
+            error_here("duplicate default label in switch");
+        } else if (!switch_default_seen_.empty()) {
+            switch_default_seen_.back() = true;
+        }
+        expect(":");
+        if (!current().is("}")) statement->first = parse_statement();
+        return statement;
     }
     statement->kind = Statement::Kind::Expression;
     statement->expression = parse_expression();

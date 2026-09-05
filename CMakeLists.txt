@@ -204,6 +204,57 @@ if(BUILD_TESTING)
     target_link_libraries(cross_options_test PRIVATE cross_targets)
     cross_component(cross_options_test)
 
+    add_executable(cross_integer_semantics_test test/common/integer_semantics_test.cpp)
+    cross_component(cross_integer_semantics_test)
+    add_test(NAME cross_integer_semantics COMMAND $<TARGET_FILE:cross_integer_semantics_test>)
+
+    add_test(NAME cross_semantic_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/language/semantics/runtime_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/semantic-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_semantic_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language/semantics
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/semantic-errors
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/errors.cmake")
+    add_test(NAME cross_semantic_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x
+        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/language/semantics/mips_start.s
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/semantic-mips
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    add_test(NAME cross_semantic_mandatory COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/mandatory_ops.x
+        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+        -DENTRY=entry -DEXPECTED=0 -DCC_FLAGS=-O2
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/semantic-mandatory
+        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_switch_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/switch/runtime.x
+        -DRUNNER=${CMAKE_SOURCE_DIR}/test/language/switch/dynamic_entry.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/switch-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/language/switch/runtime.cmake")
+    add_test(NAME cross_switch_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/switch/errors.x
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/switch-errors
+        -P "${CMAKE_SOURCE_DIR}/test/language/switch/errors.cmake")
+    add_test(NAME cross_noreturn_frames COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/noreturn/noreturn.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/noreturn
+        -P "${CMAKE_SOURCE_DIR}/test/backend/noreturn/noreturn.cmake")
+    add_test(NAME cross_noreturn_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/noreturn/mips_noreturn.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/noreturn-mips
+        -P "${CMAKE_SOURCE_DIR}/test/backend/noreturn/mips_noreturn.cmake")
+
     add_executable(cross_mir_verifier_test test/middle/mir_verifier_test.cpp)
     target_link_libraries(cross_mir_verifier_test PRIVATE cross_middle)
     cross_component(cross_mir_verifier_test)

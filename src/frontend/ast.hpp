@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common/source.hpp"
+#include "common/uint128.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -86,6 +87,11 @@ struct Expr {
     } kind{Kind::Integer};
     SourceLocation location;
     std::string text;
+    struct IntegerConstant {
+        UInt128 value;
+        BuiltinType type;
+    };
+    std::optional<IntegerConstant> evaluated_integer;
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> third;
@@ -108,8 +114,8 @@ struct VariableDecl {
 
 struct Statement {
     enum class Kind {
-        Compound, Declaration, Expression, Return, If, While, DoWhile, For,
-        Break, Continue, Label, Goto, Empty,
+        Compound, Declaration, Expression, Return, If, Switch, Case, Default,
+        While, DoWhile, For, Break, Continue, Label, Goto, Empty,
     } kind{Kind::Empty};
     SourceLocation location;
     std::vector<std::unique_ptr<Statement>> statements;
@@ -190,6 +196,7 @@ struct RecordDecl {
 };
 
 struct Program {
+    unsigned address_bits{64};
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
     std::vector<std::unique_ptr<FunctionDecl>> functions;
@@ -199,5 +206,6 @@ struct Program {
 std::string encode_link_name(std::string_view qualified_name, bool label = false,
                              std::string_view mangling_name = "default");
 std::optional<std::string> decode_string_literal(std::string_view text);
+std::optional<std::uint32_t> decode_character_literal(std::string_view text);
 
 } // namespace cross

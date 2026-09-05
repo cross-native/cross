@@ -19,7 +19,7 @@ function(compile_macho source stem)
             set(result "${object}")
         endif()
         execute_process(
-            COMMAND "${CC}" ${arguments} -target x86_64-apple-darwin
+            COMMAND "${CC}" ${arguments} -funwind-tables -target x86_64-apple-darwin
                     "${source}" -o "${result}"
             RESULT_VARIABLE status
             OUTPUT_VARIABLE stdout

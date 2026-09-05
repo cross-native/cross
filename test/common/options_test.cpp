@@ -41,6 +41,17 @@ bool expect(bool condition, const char* message) {
 
 int main() {
     bool ok = true;
+    const auto frames = parse({"cc", "-O2"});
+    const auto retained = parse({"cc", "-fno-elide-noreturn-saves", "-O3"});
+    const auto unwind = parse({"cc", "-funwind-model=platform", "-funwind-tables"});
+    const auto debug_frames = parse({"cc", "-Og"});
+    ok = expect(frames && frames->elide_noreturn_saves &&
+                frames->unwind_model == cross::UnwindModel::None &&
+                !frames->unwind_tables && !frames->asynchronous_unwind_tables &&
+                retained && !retained->elide_noreturn_saves &&
+                unwind && unwind->unwind_model == cross::UnwindModel::Platform && unwind->unwind_tables &&
+                debug_frames && !debug_frames->elide_noreturn_saves,
+                "frame option defaults, presets, or overrides failed") && ok;
     const auto gimple = parse({"cc", "-emit-gimple"});
     const auto gimple_rtl = parse({"cc", "-emit-gimple=rtl"});
     ok = expect(gimple &&

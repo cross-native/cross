@@ -49,6 +49,7 @@ optimization "O0" {
     f.inline-functions = false;
     f.inline-limit = 96;
     f.omit-frame-pointer = false;
+    f.elide-noreturn-saves = false;
     f.align-loops = false;
     f.ipa-ra = false;
     f.ipa-pure-const = false;
@@ -77,6 +78,7 @@ optimization "O1" {
     f.inline-functions = true;
     f.inline-limit = 32;
     f.omit-frame-pointer = true;
+    f.elide-noreturn-saves = true;
     f.align-loops = true;
     f.move-loop-invariants = true;
     f.tree-cfg-cleanup = true;

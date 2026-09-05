@@ -2,7 +2,8 @@ global u32 [[atomic]] atomic_cell;
 global f32 [[atomic]] atomic_float;
 
 [[noinline]]
-static u32 atomic_parameter(in volatile u32 [[atomic]] value) {
+static u32 atomic_parameter(in volatile u32 [[atomic]] input) {
+    volatile u32 [[atomic]] value = input;
     value += 2u32;
     return value;
 }

@@ -11,7 +11,6 @@ global void paired_same(inout i32 value "eax=>eax") {
 
 global void paired_input_only(in i32 value "ecx=>r8d", out i32 observed "r9d") {
     observed = value + 3;
-    value = 99;
 }
 
 global void paired_output_only(out i32 value "ecx=>r8d") {

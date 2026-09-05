@@ -472,13 +472,13 @@ int cc_main(int argc, char** argv) {
         for (auto& object : unit.objects) program.objects.push_back(std::move(object));
     }
     if (diagnostics.errors() != 0) return 1;
-    if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
-    if (!expand_semantics(program, diagnostics, options.evaluate_calls,
-                          options.mangling)) return 1;
-
     const auto* target = target_for_triple(options.target);
     auto subtarget = resolve_subtarget(*target, options, diagnostics);
     if (!subtarget) return 1;
+    program.address_bits = subtarget->abi_info().address_bits;
+    if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
+    if (!expand_semantics(program, diagnostics, options.evaluate_calls,
+                          options.mangling)) return 1;
     const auto* backend = target_backend_for(*target);
     if (!backend) {
         diagnostics.command_error(

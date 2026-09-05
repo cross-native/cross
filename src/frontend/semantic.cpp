@@ -3,6 +3,7 @@
 #include "frontend/semantic.hpp"
 
 #include "common/uint128.hpp"
+#include "common/integer_semantics.hpp"
 #include "model/model.hpp"
 
 #include <algorithm>
@@ -115,6 +116,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->kind = source.kind;
     result->location = source.location;
     result->text = source.text;
+    result->evaluated_integer = source.evaluated_integer;
     if (source.left) result->left = clone_expr(*source.left, types, values);
     if (source.right) result->right = clone_expr(*source.right, types, values);
     if (source.third) result->third = clone_expr(*source.third, types, values);
@@ -917,6 +919,9 @@ struct EvalValue {
 };
 
 std::optional<EvalValue> parse_integer_value(const Expr& expression) {
+    if (expression.evaluated_integer)
+        return EvalValue{expression.evaluated_integer->value,
+                         builtin_type(expression.evaluated_integer->type)};
     auto text = expression.text;
     BuiltinType type = BuiltinType::I32;
     bool explicit_type = false;
@@ -961,13 +966,10 @@ std::optional<EvalValue> parse_integer_value(const Expr& expression) {
         else if (fits_signed_positive(*parsed, 64)) type = BuiltinType::I64;
         else if (!decimal && fits_unsigned(*parsed, 64)) type = BuiltinType::U64;
         else if (fits_signed_positive(*parsed, 128)) type = BuiltinType::I128;
-        else type = BuiltinType::U128;
+        else if (!decimal) type = BuiltinType::U128;
+        else return std::nullopt;
     }
     return EvalValue{*parsed, builtin_type(type)};
-}
-
-unsigned value_bits(const EvalValue& value) {
-    return value.type ? type_bits(value.type) : 128;
 }
 
 bool signed_value(const EvalValue& value) {
@@ -978,11 +980,6 @@ bool signed_value(const EvalValue& value) {
            value.type->builtin == BuiltinType::I64 ||
            value.type->builtin == BuiltinType::I128 ||
            value.type->builtin == BuiltinType::Iptr;
-}
-
-bool negative(EvalValue value) {
-    const auto bits = value_bits(value);
-    return bits != 0 && bit(value.integer, bits - 1);
 }
 
 class Evaluator {
@@ -1033,15 +1030,22 @@ public:
             }
         }
         call_stack_.push_back({function.name, location});
+        const auto previous_base = frame_base_;
+        frame_base_ = scopes_.size();
         scopes_.emplace_back();
+        bool valid = true;
         for (std::size_t index = 0; index < arguments.size(); ++index) {
-            scopes_.back()[function.parameters[index].name] = arguments[index];
+            const auto& parameter = function.parameters[index];
+            auto value = convert(arguments[index], parameter.type, location);
+            if (!value) { valid = false; break; }
+            scopes_.back()[parameter.name] = {*value, true, true};
         }
         const auto previous = current_function_;
         current_function_ = &function;
-        auto flow = statement(*function.body);
+        auto flow = valid ? statement(*function.body) : Flow{Flow::Failed};
         current_function_ = previous;
         scopes_.pop_back();
+        frame_base_ = previous_base;
         if (flow.kind != Flow::Return || !flow.value) {
             fail(location,
                  "translation-time call to '" + function.name +
@@ -1050,24 +1054,32 @@ public:
             --depth_;
             return std::nullopt;
         }
+        auto result = convert(*flow.value, function.return_type, location);
         call_stack_.pop_back();
         --depth_;
-        flow.value->type = clone_type(function.return_type);
-        flow.value->integer = mask_to(flow.value->integer,
-                                      type_bits(function.return_type));
-        return flow.value;
+        return result;
     }
 
     std::optional<EvalValue> expression(const Expr& expression) {
         if (!step(expression.location)) return std::nullopt;
         switch (expression.kind) {
-        case Expr::Kind::Integer:
-            return parse_integer_value(expression);
+        case Expr::Kind::Integer: {
+            auto value = parse_integer_value(expression);
+            if (value && !expression.evaluated_integer) {
+                const auto type = integer_type(value->type);
+                if (type.is_signed ? !fits_signed_positive(value->integer, type.bits)
+                                   : !fits_unsigned(value->integer, type.bits)) value.reset();
+            }
+            if (!value) fail(expression.location, "integer literal is not representable in its type");
+            return value;
+        }
         case Expr::Kind::Character: {
-            const auto decoded = expression.text.size() >= 3
-                                     ? static_cast<unsigned char>(expression.text[1])
-                                     : 0;
-            return EvalValue{{static_cast<std::uint64_t>(decoded), 0},
+            const auto decoded = decode_character_literal(expression.text);
+            if (!decoded) {
+                fail(expression.location, "invalid character literal");
+                return std::nullopt;
+            }
+            return EvalValue{UInt128{*decoded},
                              builtin_type(BuiltinType::U32)};
         }
         case Expr::Kind::String: {
@@ -1078,7 +1090,7 @@ public:
                              std::make_shared<std::string>(std::move(*decoded)), 0};
         }
         case Expr::Kind::Name:
-            return lookup(expression.text);
+            return lookup(expression.text, expression.location);
         case Expr::Kind::Parenthesized:
             return expression.left ? this->expression(*expression.left)
                                    : std::nullopt;
@@ -1087,11 +1099,13 @@ public:
         case Expr::Kind::Binary:
             return binary(expression);
         case Expr::Kind::Conditional: {
+            const auto type = expression_type(expression);
             auto condition = this->expression(*expression.left);
-            if (!condition || condition->pointer()) return std::nullopt;
-            return this->expression(*(condition->integer == UInt128{}
+            if (!condition || condition->pointer() || !type) return std::nullopt;
+            auto value = this->expression(*(condition->integer == UInt128{}
                                           ? expression.third
                                           : expression.right));
+            return value ? convert(*value, type, expression.location) : std::nullopt;
         }
         case Expr::Kind::Assign:
             return assign(expression);
@@ -1106,6 +1120,129 @@ public:
     }
 
 private:
+    struct Cell {
+        EvalValue value;
+        bool initialized{};
+        bool read_only{};
+    };
+
+    TypePtr expression_type(const Expr& expression) {
+        switch (expression.kind) {
+        case Expr::Kind::Integer: {
+            const auto value = parse_integer_value(expression);
+            return value ? value->type : nullptr;
+        }
+        case Expr::Kind::Character: return builtin_type(BuiltinType::U32);
+        case Expr::Kind::Name:
+            if (const auto* cell = lookup_mutable(expression.text)) return cell->value.type;
+            if (const auto* object = resolve_object(program_, current_function_, expression.text)) return object->type;
+            return {};
+        case Expr::Kind::Parenthesized:
+            return expression.left ? expression_type(*expression.left) : nullptr;
+        case Expr::Kind::Assign:
+            return expression_type(*expression.left);
+        case Expr::Kind::Unary: {
+            if (expression.text == "!") return builtin_type(BuiltinType::Bool);
+            auto type = expression_type(*expression.left);
+            if (!type || !is_integer(type)) return {};
+            if (expression.text == "++" || expression.text == "--" || expression.text.starts_with("post")) return type;
+            return builtin_integer(promote_integer(integer_type(type)));
+        }
+        case Expr::Kind::Binary:
+        case Expr::Kind::Conditional: {
+            const bool conditional = expression.kind == Expr::Kind::Conditional;
+            if (!conditional && (expression.text == "==" || expression.text == "!=" ||
+                expression.text == "<" || expression.text == ">" || expression.text == "<=" ||
+                expression.text == ">=" || expression.text == "&&" || expression.text == "||"))
+                return builtin_type(BuiltinType::Bool);
+            const auto left = expression_type(*(conditional ? expression.right : expression.left));
+            const auto right = expression_type(*(conditional ? expression.third : expression.right));
+            if (!left || !right || !is_integer(left) || !is_integer(right)) return {};
+            if (!conditional && (expression.text == "<<" || expression.text == ">>"))
+                return builtin_integer(promote_integer(integer_type(left)));
+            return builtin_integer(common_integer_type(integer_type(left), integer_type(right)));
+        }
+        case Expr::Kind::Call:
+            if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
+            if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
+                expression.arguments.size() == 1) return expression_type(*expression.arguments.front());
+            if (const auto* callee = resolve_function(program_, current_function_, expression.left->text,
+                    [](const FunctionDecl&) { return true; })) return callee->return_type;
+            return {};
+        case Expr::Kind::Floating:
+        case Expr::Kind::String: return {};
+        }
+        return {};
+    }
+
+    IntegerType integer_type(const TypePtr& type) const {
+        auto bits = type_bits(type);
+        if (type && (type->kind == Type::Kind::Pointer ||
+            (type->kind == Type::Kind::Builtin &&
+             (type->builtin == BuiltinType::Iptr || type->builtin == BuiltinType::Uptr))))
+            bits = program_.address_bits;
+        return {bits, signed_value(EvalValue{{}, type}),
+                type && type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Bool};
+    }
+
+    TypePtr builtin_integer(IntegerType type) const {
+        if (type.is_bool) return builtin_type(BuiltinType::Bool);
+        const auto kind = type.bits == 8 ? (type.is_signed ? BuiltinType::I8 : BuiltinType::U8)
+                        : type.bits == 16 ? (type.is_signed ? BuiltinType::I16 : BuiltinType::U16)
+                        : type.bits == 32 ? (type.is_signed ? BuiltinType::I32 : BuiltinType::U32)
+                        : type.bits == 64 ? (type.is_signed ? BuiltinType::I64 : BuiltinType::U64)
+                                         : (type.is_signed ? BuiltinType::I128 : BuiltinType::U128);
+        return builtin_type(kind);
+    }
+
+    std::optional<EvalValue> convert(EvalValue value, const TypePtr& type,
+                                     SourceLocation location) {
+        if (!type || type->is_volatile || type->is_atomic) {
+            fail(location, "volatile or atomic access is not permitted during translation-time evaluation");
+            return std::nullopt;
+        }
+        if (value.pointer()) {
+            if (type->kind == Type::Kind::Pointer) {
+                if (!type->pointee || !value.type->pointee ||
+                    (value.type->pointee->is_const && !type->pointee->is_const) ||
+                    (value.type->pointee->is_volatile && !type->pointee->is_volatile)) {
+                    fail(location, "implicit pointer conversion discards qualifiers");
+                    return std::nullopt;
+                }
+                value.type = clone_type(type);
+                return value;
+            }
+            if (type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Bool)
+                return EvalValue{UInt128{1}, clone_type(type)};
+            return std::nullopt;
+        }
+        if (!is_integer(value.type) || !is_integer(type)) return std::nullopt;
+        value.integer = convert_integer(value.integer, integer_type(value.type), integer_type(type));
+        value.type = clone_type(type);
+        return value;
+    }
+
+    std::optional<EvalValue> calculate(IntegerOperation operation, EvalValue left,
+                                       EvalValue right, SourceLocation location) {
+        const bool shift = operation == IntegerOperation::ShiftLeft ||
+                           operation == IntegerOperation::ShiftRight;
+        const auto type = shift ? promote_integer(integer_type(left.type))
+                               : common_integer_type(integer_type(left.type), integer_type(right.type));
+        left.integer = convert_integer(left.integer, integer_type(left.type), type);
+        if (!shift) right.integer = convert_integer(right.integer, integer_type(right.type), type);
+        const auto result = checked_integer_operation(operation, left.integer, right.integer, type);
+        if (result.error != IntegerError::None) {
+            fail(location, result.error == IntegerError::ShiftCount
+                ? "invalid shift count during translation-time evaluation"
+                : result.error == IntegerError::DivisionByZero
+                ? "division by zero during translation-time evaluation"
+                : "signed overflow during translation-time evaluation");
+            return std::nullopt;
+        }
+        const bool comparison = operation >= IntegerOperation::Equal;
+        return EvalValue{result.value, comparison ? builtin_type(BuiltinType::Bool) : builtin_integer(type)};
+    }
+
     struct Flow {
         enum Kind { Normal, Return, Break, Continue, Failed } kind{Normal};
         std::optional<EvalValue> value;
@@ -1137,16 +1274,27 @@ private:
         return false;
     }
 
-    EvalValue* lookup_mutable(std::string_view name) {
-        for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
-            const auto found = scope->find(std::string(name));
-            if (found != scope->end()) return &found->second;
+    Cell* lookup_mutable(std::string_view name) {
+        for (auto index = scopes_.size(); index > frame_base_;) {
+            auto& scope = scopes_[--index];
+            const auto found = scope.find(std::string(name));
+            if (found != scope.end()) return &found->second;
         }
         return nullptr;
     }
 
-    std::optional<EvalValue> lookup(std::string_view name) {
-        if (auto* value = lookup_mutable(name)) return *value;
+    std::optional<EvalValue> lookup(std::string_view name, SourceLocation location) {
+        if (auto* cell = lookup_mutable(name)) {
+            if (!cell->initialized) {
+                fail(location, "read of uninitialized value during translation-time evaluation");
+                return std::nullopt;
+            }
+            if (cell->value.type->is_volatile || cell->value.type->is_atomic) {
+                fail(location, "volatile or atomic access is not permitted during translation-time evaluation");
+                return std::nullopt;
+            }
+            return cell->value;
+        }
         return std::nullopt;
     }
 
@@ -1155,25 +1303,33 @@ private:
         if (expression.text == "++" || expression.text == "--" ||
             expression.text == "post++" || expression.text == "post--") {
             if (expression.left->kind != Expr::Kind::Name) return std::nullopt;
-            auto* value = lookup_mutable(expression.left->text);
-            if (!value || value->pointer()) return std::nullopt;
-            const auto previous = *value;
-            value->integer = mask_to(
-                expression.text == "++" || expression.text == "post++"
-                    ? add(value->integer, {1, 0})
-                    : subtract(value->integer, {1, 0}),
-                value_bits(*value));
-            return expression.text.starts_with("post") ? previous : *value;
+            auto* cell = lookup_mutable(expression.left->text);
+            if (!cell) return std::nullopt;
+            if (cell->read_only) {
+                fail(expression.location, "cannot write an 'in' or const cell");
+                return std::nullopt;
+            }
+            const auto previous = lookup(expression.left->text, expression.location);
+            if (!previous || previous->pointer()) return std::nullopt;
+            auto value = calculate(expression.text == "++" || expression.text == "post++"
+                ? IntegerOperation::Add : IntegerOperation::Subtract,
+                *previous, EvalValue{UInt128{1}, builtin_type(BuiltinType::I32)}, expression.location);
+            if (!value) return std::nullopt;
+            value = convert(*value, previous->type, expression.location);
+            if (!value) return std::nullopt;
+            lookup_mutable(expression.left->text)->value = *value;
+            return expression.text.starts_with("post") ? previous : value;
         }
         auto value = this->expression(*expression.left);
         if (!value || value->pointer()) return std::nullopt;
+        value = convert(*value, builtin_integer(promote_integer(integer_type(value->type))), expression.location);
+        if (!value) return std::nullopt;
         if (expression.text == "+") return value;
         if (expression.text == "-") {
-            value->integer = mask_to(negate(value->integer), value_bits(*value));
-            return value;
+            return calculate(IntegerOperation::Subtract, EvalValue{{}, value->type}, *value, expression.location);
         }
         if (expression.text == "~") {
-            value->integer = mask_to(bit_not(value->integer), value_bits(*value));
+            value->integer = mask_to(bit_not(value->integer), integer_type(value->type).bits);
             return value;
         }
         if (expression.text == "!") {
@@ -1217,61 +1373,19 @@ private:
                              builtin_type(BuiltinType::U8)};
         }
         if (left->pointer() || right->pointer()) return std::nullopt;
-        const auto bits = std::max(value_bits(*left), value_bits(*right));
-        const bool sign = signed_value(*left) && signed_value(*right);
-        if (operation == "==" || operation == "!=" || operation == "<" ||
-            operation == "<=" || operation == ">" || operation == ">=") {
-            bool less;
-            if (sign && negative(*left) != negative(*right)) {
-                less = negative(*left);
-            } else {
-                less = left->integer < right->integer;
-            }
-            const bool equal = left->integer == right->integer;
-            const bool result = operation == "==" ? equal
-                              : operation == "!=" ? !equal
-                              : operation == "<" ? less
-                              : operation == "<=" ? less || equal
-                              : operation == ">" ? !less && !equal
-                                                 : !less;
-            return EvalValue{{result, 0}, builtin_type(BuiltinType::Bool)};
-        }
-        EvalValue result{{}, clone_type(left->type)};
-        if (operation == "+") result.integer = add(left->integer, right->integer);
-        else if (operation == "-") result.integer = subtract(left->integer, right->integer);
-        else if (operation == "*") result.integer = multiply(left->integer, right->integer);
-        else if (operation == "&") result.integer = bit_and(left->integer, right->integer);
-        else if (operation == "|") result.integer = bit_or(left->integer, right->integer);
-        else if (operation == "^") result.integer = bit_xor(left->integer, right->integer);
-        else if (operation == "<<") {
-            result.integer = shift_left(left->integer,
-                                        static_cast<unsigned>(right->integer.low));
-        } else if (operation == ">>") {
-            result.integer = shift_right(left->integer,
-                                         static_cast<unsigned>(right->integer.low));
-        } else if (operation == "/" || operation == "%") {
-            if (right->integer == UInt128{}) {
-                fail(expression.location,
-                     "division by zero during translation-time evaluation");
-                return std::nullopt;
-            }
-            auto dividend = left->integer;
-            auto divisor = right->integer;
-            const bool left_negative = sign && negative(*left);
-            const bool right_negative = sign && negative(*right);
-            if (left_negative) dividend = mask_to(negate(dividend), bits);
-            if (right_negative) divisor = mask_to(negate(divisor), bits);
-            auto [quotient, remainder] = divide(dividend, divisor);
-            result.integer = operation == "/" ? quotient : remainder;
-            if ((operation == "/" && left_negative != right_negative) ||
-                (operation == "%" && left_negative)) {
-                result.integer = negate(result.integer);
-            }
-        } else {
-            return std::nullopt;
-        }
-        result.integer = mask_to(result.integer, bits);
-        return result;
+        static constexpr std::pair<std::string_view, IntegerOperation> operations[] = {
+            {"+", IntegerOperation::Add}, {"-", IntegerOperation::Subtract},
+            {"*", IntegerOperation::Multiply}, {"/", IntegerOperation::Divide},
+            {"%", IntegerOperation::Remainder}, {"&", IntegerOperation::And},
+            {"|", IntegerOperation::Or}, {"^", IntegerOperation::Xor},
+            {"<<", IntegerOperation::ShiftLeft}, {">>", IntegerOperation::ShiftRight},
+            {"==", IntegerOperation::Equal}, {"!=", IntegerOperation::NotEqual},
+            {"<", IntegerOperation::Less}, {"<=", IntegerOperation::LessEqual},
+            {">", IntegerOperation::Greater}, {">=", IntegerOperation::GreaterEqual},
+        };
+        for (const auto& [token, opcode] : operations)
+            if (operation == token) return calculate(opcode, *left, *right, expression.location);
+        return std::nullopt;
     }
 
     std::optional<EvalValue> assign(const Expr& expression) {
@@ -1281,13 +1395,18 @@ private:
         }
         auto* destination = lookup_mutable(expression.left->text);
         if (!destination) return std::nullopt;
+        if (destination->read_only) {
+            fail(expression.location, "cannot write an 'in' or const cell");
+            return std::nullopt;
+        }
+        const auto destination_type = destination->value.type;
         if (expression.text == "=") {
             auto source = this->expression(*expression.right);
             if (!source) return std::nullopt;
-            source->type = destination->type;
-            source->integer = mask_to(source->integer, value_bits(*destination));
-            *destination = *source;
-            return *destination;
+            source = convert(*source, destination_type, expression.location);
+            if (!source) return std::nullopt;
+            *lookup_mutable(expression.left->text) = {*source, true, false};
+            return source;
         }
         Expr binary_expression;
         binary_expression.kind = Expr::Kind::Binary;
@@ -1300,9 +1419,9 @@ private:
         binary_expression.right = clone_expr(*expression.right);
         auto result = binary(binary_expression);
         if (!result) return std::nullopt;
-        result->type = destination->type;
-        result->integer = mask_to(result->integer, value_bits(*destination));
-        *destination = *result;
+        result = convert(*result, destination_type, expression.location);
+        if (!result) return std::nullopt;
+        *lookup_mutable(expression.left->text) = {*result, true, false};
         return result;
     }
 
@@ -1375,17 +1494,17 @@ private:
                 return {Flow::Failed};
             }
             EvalValue value{{}, clone_type(statement.declaration->type)};
+            scopes_.back()[statement.declaration->name] = {
+                value, false, statement.declaration->type->is_const};
             if (statement.declaration->initializer) {
                 auto initializer = expression(*statement.declaration->initializer);
                 if (!initializer) return {Flow::Failed};
-                value = *initializer;
-                value.type = clone_type(statement.declaration->type);
-                if (!value.pointer()) {
-                    value.integer = mask_to(value.integer,
-                                            type_bits(statement.declaration->type));
-                }
+                initializer = convert(*initializer, statement.declaration->type, statement.location);
+                if (!initializer) return {Flow::Failed};
+                auto& cell = scopes_.back()[statement.declaration->name];
+                cell.value = *initializer;
+                cell.initialized = true;
             }
-            scopes_.back()[statement.declaration->name] = std::move(value);
             return {};
         }
         case Statement::Kind::Expression:
@@ -1405,6 +1524,113 @@ private:
             }
             return statement.second ? this->statement(*statement.second) : Flow{};
         }
+        case Statement::Kind::Switch: {
+            if (!statement.condition || !statement.first)
+                return {Flow::Failed};
+            auto selector = expression(*statement.condition);
+            if (!selector || selector->pointer() || !is_integer(selector->type))
+                return {Flow::Failed};
+            const auto promoted = promote_integer(integer_type(selector->type));
+            selector = convert(*selector, builtin_integer(promoted),
+                               statement.condition->location);
+            if (!selector) return {Flow::Failed};
+
+            const Statement* body = statement.first.get();
+            std::vector<const Statement*> labels;
+            const auto collect = [&](const auto& self, const Statement* node, bool nested) -> bool {
+                    if (!node || node->kind == Statement::Kind::Switch) return true;
+                    if (node->kind == Statement::Kind::Case ||
+                        node->kind == Statement::Kind::Default) {
+                        if (nested) {
+                            fail(node->location, "case/default inside another control statement is not lowerable yet");
+                            return false;
+                        }
+                        labels.push_back(node);
+                        return self(self, node->first.get(), false);
+                    }
+                    nested |= node->kind != Statement::Kind::Compound;
+                    for (const auto& child : node->statements)
+                        if (!self(self, child.get(), nested)) return false;
+                    return self(self, node->first.get(), nested) &&
+                           self(self, node->second.get(), nested);
+                };
+            if (!collect(collect, body, false)) return {Flow::Failed};
+            if (labels.empty()) return {};
+            std::optional<std::size_t> selected;
+            std::optional<std::size_t> fallback;
+            std::vector<UInt128> values;
+            for (std::size_t index = 0; index < labels.size(); ++index) {
+                const auto* label = labels[index];
+                if (label->kind == Statement::Kind::Default) {
+                    if (fallback) {
+                        fail(label->location, "duplicate default label in switch");
+                        return {Flow::Failed};
+                    }
+                    fallback = index;
+                    continue;
+                }
+                if (!label->expression) return {Flow::Failed};
+                auto value = expression(*label->expression);
+                if (!value || value->pointer() || !is_integer(value->type)) {
+                    fail(label->location, "case requires a translation-time integer constant");
+                    return {Flow::Failed};
+                }
+                const auto case_type = integer_type(value->type);
+                const bool negative = integer_negative(value->integer, case_type);
+                const auto magnitude = negative
+                    ? mask_to(negate(value->integer), case_type.bits)
+                    : value->integer;
+                const bool representable = promoted.is_signed
+                    ? (negative ? !(shift_left(UInt128{1}, promoted.bits - 1) < magnitude)
+                                : fits_signed_positive(magnitude, promoted.bits))
+                    : (!negative && fits_unsigned(magnitude, promoted.bits));
+                if (!representable) {
+                    fail(label->location, "case value is not representable in the switch type");
+                    return {Flow::Failed};
+                }
+                value = convert(*value, builtin_integer(promoted), label->location);
+                if (!value) return {Flow::Failed};
+                for (const auto& prior : values) {
+                    if (prior == value->integer) {
+                        fail(label->location, "duplicate case value in switch");
+                        return {Flow::Failed};
+                    }
+                }
+                values.push_back(value->integer);
+                if (value->integer == selector->integer) selected = index;
+            }
+            if (!selected) selected = fallback;
+            if (!selected) return {};
+            const auto* selected_label = labels[*selected];
+            bool active = false;
+            const auto execute = [&](const auto& self, const Statement* node) -> Flow {
+                if (!node) return {};
+                if (node == selected_label) active = true;
+                if (active) return this->statement(*node);
+                if (node->kind == Statement::Kind::Compound) {
+                    scopes_.emplace_back();
+                    Flow flow;
+                    for (const auto& child : node->statements) {
+                        flow = self(self, child.get());
+                        if (flow.kind != Flow::Normal) break;
+                    }
+                    scopes_.pop_back();
+                    return flow;
+                }
+                if (node->kind == Statement::Kind::Case || node->kind == Statement::Kind::Default)
+                    return self(self, node->first.get());
+                if (node->kind == Statement::Kind::Declaration && node->declaration)
+                    scopes_.back()[node->declaration->name] = {
+                        EvalValue{{}, clone_type(node->declaration->type)}, false,
+                        node->declaration->type->is_const};
+                return {};
+            };
+            auto flow = execute(execute, body);
+            return flow.kind == Flow::Break ? Flow{} : flow;
+        }
+        case Statement::Kind::Case:
+        case Statement::Kind::Default:
+            return statement.first ? this->statement(*statement.first) : Flow{};
         case Statement::Kind::While:
             while (true) {
                 auto condition = expression(*statement.condition);
@@ -1469,7 +1695,8 @@ private:
     Program& program_;
     Diagnostics& diagnostics_;
     const FunctionDecl* current_function_{};
-    std::vector<std::unordered_map<std::string, EvalValue>> scopes_;
+    std::vector<std::unordered_map<std::string, Cell>> scopes_;
+    std::size_t frame_base_{};
     std::uint64_t steps_{};
     unsigned depth_{};
     bool budget_diagnosed_{};
@@ -1514,6 +1741,8 @@ void replace_eval_value(std::unique_ptr<Expr>& expression,
     replacement->location = expression->location;
     replacement->text =
         to_decimal(value.integer) + literal_suffix(value.type);
+    replacement->evaluated_integer = Expr::IntegerConstant{
+        value.integer, value.type->builtin};
     expression = std::move(replacement);
 }
 
@@ -1673,6 +1902,16 @@ void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
     if (statement.expression) {
         rewrite_eval_expr(statement.expression, caller, program, diagnostics,
                           opportunistic);
+        if (statement.kind == Statement::Kind::Case) {
+            Evaluator evaluator(program, diagnostics, caller);
+            const auto value = evaluator.expression(*statement.expression);
+            if (!value || value->pointer() || !is_integer(value->type)) {
+                diagnostics.error(statement.location,
+                    "case requires a translation-time integer constant");
+            } else {
+                replace_eval_value(statement.expression, *value);
+            }
+        }
     }
     if (statement.condition) {
         rewrite_eval_expr(statement.condition, caller, program, diagnostics,
@@ -1694,6 +1933,57 @@ void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
 
 bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                        bool opportunistic) {
+    for (const auto& function : program.functions) {
+        if (!function->body) continue;
+        std::vector<std::unordered_map<std::string, bool>> scopes(1);
+        for (const auto& parameter : function->parameters)
+            scopes.back()[parameter.name] = parameter.mode == ParameterMode::In || parameter.type->is_const;
+        const auto check_expression = [&](const auto& self, const Expr* expression) -> void {
+            if (!expression) return;
+            const bool write = expression->kind == Expr::Kind::Assign ||
+                (expression->kind == Expr::Kind::Unary &&
+                 (expression->text == "++" || expression->text == "--" ||
+                  expression->text == "post++" || expression->text == "post--"));
+            const Expr* destination = expression->left.get();
+            while (destination && destination->kind == Expr::Kind::Parenthesized)
+                destination = destination->left.get();
+            if (write && destination && destination->kind == Expr::Kind::Name) {
+                std::optional<bool> read_only;
+                for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
+                    const auto found = scope->find(destination->text);
+                    if (found != scope->end()) { read_only = found->second; break; }
+                }
+                if (!read_only) {
+                    if (const auto* object = resolve_object(program, function.get(), destination->text))
+                        read_only = object->type->is_const;
+                }
+                if (read_only.value_or(false))
+                    diagnostics.error(expression->location, "cannot write an 'in' or const cell");
+            }
+            self(self, expression->left.get());
+            self(self, expression->right.get());
+            self(self, expression->third.get());
+            for (const auto& argument : expression->arguments) self(self, argument.get());
+        };
+        const auto check_statement = [&](const auto& self, const Statement& statement) -> void {
+            const bool scoped = statement.kind == Statement::Kind::Compound || statement.kind == Statement::Kind::For;
+            if (scoped) scopes.emplace_back();
+            if (statement.declaration) {
+                scopes.back()[statement.declaration->name] = statement.declaration->type->is_const;
+                check_expression(check_expression, statement.declaration->initializer.get());
+                check_expression(check_expression, statement.declaration->dynamic_array_bound.get());
+            }
+            if (statement.first) self(self, *statement.first);
+            check_expression(check_expression, statement.expression.get());
+            check_expression(check_expression, statement.condition.get());
+            check_expression(check_expression, statement.increment.get());
+            for (const auto& child : statement.statements) self(self, *child);
+            if (statement.second) self(self, *statement.second);
+            if (scoped) scopes.pop_back();
+        };
+        check_statement(check_statement, *function->body);
+    }
+    if (diagnostics.errors() != 0) return false;
     for (const auto& function : program.functions) {
         if (evaluation_only(*function) && runtime_only(*function)) {
             diagnostics.error(

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-global void invalid_assume(in i32 value) {
+global void invalid_assume(inout i32 value) {
     $::assume(value = 1);
 }
 

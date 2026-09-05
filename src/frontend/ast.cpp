@@ -260,16 +260,52 @@ std::optional<std::string> decode_string_literal(std::string_view text) {
         }
         if (++i + 1 > text.size()) return std::nullopt;
         switch (text[i]) {
+        case '\'': result.push_back('\''); break;
+        case '?': result.push_back('?'); break;
+        case 'a': result.push_back('\a'); break;
+        case 'b': result.push_back('\b'); break;
+        case 'f': result.push_back('\f'); break;
+        case 'v': result.push_back('\v'); break;
         case 'n': result.push_back('\n'); break;
         case 'r': result.push_back('\r'); break;
         case 't': result.push_back('\t'); break;
         case '\\': result.push_back('\\'); break;
         case '"': result.push_back('"'); break;
-        case '0': result.push_back('\0'); break;
-        default: return std::nullopt;
+        default: {
+            const bool hexadecimal = text[i] == 'x';
+            if (!hexadecimal && (text[i] < '0' || text[i] > '7')) return std::nullopt;
+            if (hexadecimal) ++i;
+            unsigned value = 0;
+            unsigned count = 0;
+            while (i + 1 < text.size() && (hexadecimal || count < 3)) {
+                const auto character = text[i];
+                const auto digit = character >= '0' && character <= '9' ? static_cast<unsigned>(character - '0')
+                                 : character >= 'a' && character <= 'f' ? static_cast<unsigned>(character - 'a' + 10)
+                                 : character >= 'A' && character <= 'F' ? static_cast<unsigned>(character - 'A' + 10) : 16U;
+                const auto base = hexadecimal ? 16U : 8U;
+                if (digit >= base) break;
+                value = value * base + digit;
+                if (value > 255) return std::nullopt;
+                ++count;
+                ++i;
+            }
+            if (count == 0) return std::nullopt;
+            --i;
+            result.push_back(static_cast<char>(value));
+            break;
+        }
         }
     }
     return result;
+}
+
+std::optional<std::uint32_t> decode_character_literal(std::string_view text) {
+    if (text.size() < 3 || text.front() != '\'' || text.back() != '\'') return std::nullopt;
+    auto quoted = std::string(text);
+    quoted.front() = quoted.back() = '"';
+    const auto decoded = decode_string_literal(quoted);
+    if (!decoded || decoded->size() != 1) return std::nullopt;
+    return static_cast<unsigned char>(decoded->front());
 }
 
 } // namespace cross

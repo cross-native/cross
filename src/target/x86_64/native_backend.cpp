@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "target/x86_64/native_backend.hpp"
+#include "middle/mir_analysis.hpp"
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
 #include "target/abi_lowering.hpp"
@@ -759,7 +760,30 @@ private:
                names_clobber_storage(entity.clobbers, candidate);
     }
 
+    bool elide_noreturn_saves(const hir::Function& entity) const {
+        if (!options_.elide_noreturn_saves ||
+            options_.unwind_model != UnwindModel::None ||
+            options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            entity.naked || manual_plans_.find(entity.id)) {
+            return false;
+        }
+        if (entity.definition && (entity.definition->attribute("returns_twice") ||
+                                  entity.definition->attribute("interrupt"))) {
+            return false;
+        }
+        if (std::any_of(entity.declarations.begin(), entity.declarations.end(),
+                        [](const cross::FunctionDecl* declaration) {
+                            return declaration &&
+                                   (declaration->attribute("returns_twice") ||
+                                    declaration->attribute("interrupt"));
+                        })) {
+            return false;
+        }
+        return source_ && !mir::has_reachable_return(*source_);
+    }
+
     void add_preserved_storage(std::uint32_t storage) {
+        if (elide_noreturn_saves(hir_.function(current_.source))) return;
         const machine::PhysicalRegisterId physical{storage};
         if (std::find(current_.callee_saved_registers.begin(),
                       current_.callee_saved_registers.end(), physical) !=
@@ -786,6 +810,7 @@ private:
     // and makes arbitrary model pairs bridge correctly without ABI-name
     // special cases.
     void preserve_stronger_caller_contract() {
+        if (elide_noreturn_saves(hir_.function(current_.source))) return;
         std::unordered_set<std::uint16_t> explicitly_preserved;
         for (const auto& slot : current_.stack_slots) {
             if (!slot.hard_register) continue;
@@ -832,7 +857,9 @@ private:
         }
         std::vector<std::uint32_t> ordered(required.begin(), required.end());
         std::sort(ordered.begin(), ordered.end());
-        for (const auto storage : ordered) add_preserved_storage(storage);
+        if (!elide_noreturn_saves(hir_.function(current_.source))) {
+            for (const auto storage : ordered) add_preserved_storage(storage);
+        }
     }
 
     void create_registers(const mir::ManagedFunction& source) {
@@ -4007,14 +4034,22 @@ private:
                            instruction.defs.front() == first->selector;
                 });
             bool exhaustive_mask = false;
+            const auto& fallback_block = current_.blocks[fallback.value];
+            if (!fallback_block.instructions.empty() &&
+                fallback_block.instructions.back().kind == machine::InstructionKind::Unreachable &&
+                std::all_of(fallback_block.instructions.begin(), fallback_block.instructions.end() - 1,
+                    [](const machine::Instruction& instruction) {
+                        return instruction.opcode == Opcode::IntrinsicNoop ||
+                               instruction.opcode == Opcode::LifetimeStart ||
+                               instruction.opcode == Opcode::LifetimeEnd;
+                    })) exhaustive_mask = true;
             if (selector_definition != root.instructions.end() - 1 &&
                 selector_definition->opcode == Opcode::AndImm &&
                 !selector_definition->operands.empty()) {
                 if (const auto* mask =
                         std::get_if<machine::ImmediateOperand>(
                             &selector_definition->operands.back())) {
-                    exhaustive_mask = mask->high == 0 &&
-                        mask->value == cases.size();
+                    exhaustive_mask |= mask->high == 0 && mask->value <= cases.size();
                 }
             }
             std::unordered_set<std::uint32_t> distinct_targets;
@@ -21000,7 +21035,7 @@ private:
             // Darwin's compact-unwind assembly path rejects a terminal CFA
             // reset after the frame-pointer pop. The procedure ends at the
             // following return, so only ELF needs this explicit transition.
-            if (format_ == ObjectFormat::Elf) {
+            if (format_ == ObjectFormat::Elf && dwarf_cfi_enabled()) {
                 output_ << ".cfi_def_cfa %rsp, 8\n";
             }
         }

@@ -487,11 +487,17 @@ std::span<const OptionDefinition> common_option_definitions() {
          false, {}, 0, 0, OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented,
          "permit direct references to externally visible data"},
-        {"f.unwind-tables", {}, OptionValueKind::Boolean, true, {}, 0, 0,
+        {"f.elide-noreturn-saves", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "omit unobservable incoming register saves in non-returning functions"},
+        {"f.unwind-model", {}, OptionValueKind::Enumeration, std::string("none"),
+         {"none", "platform"}, 0, 0, OptionCategory::Semantic, false,
+         OptionImplementation::Implemented, "select whether frame unwinding is observable"},
+        {"f.unwind-tables", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented,
          "emit target unwind records"},
-        {"f.asynchronous-unwind-tables", {}, OptionValueKind::Boolean, true,
+        {"f.asynchronous-unwind-tables", {}, OptionValueKind::Boolean, false,
          {}, 0, 0, OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented,
          "emit unwind records valid at asynchronous instruction boundaries"},
@@ -774,9 +780,12 @@ bool resolve_registered_options(
     options.direct_external_data =
         resolved_bool(options, "f.direct-access-external-data");
     options.unwind_tables =
-        resolved_bool(options, "f.unwind-tables", true);
+        resolved_bool(options, "f.unwind-tables");
     options.asynchronous_unwind_tables =
-        resolved_bool(options, "f.asynchronous-unwind-tables", true);
+        resolved_bool(options, "f.asynchronous-unwind-tables");
+    options.elide_noreturn_saves = resolved_bool(options, "f.elide-noreturn-saves");
+    options.unwind_model = resolved_text(options, "f.unwind-model") == "platform"
+        ? UnwindModel::Platform : UnwindModel::None;
     const auto code_model = resolved_text(options, "m.cmodel", "small");
     options.code_model = code_model == "kernel"
         ? CodeModel::Kernel

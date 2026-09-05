@@ -4,6 +4,7 @@
 
 #include "common/diagnostic.hpp"
 #include "common/floating_bits.hpp"
+#include "common/integer_semantics.hpp"
 #include "frontend/ast.hpp"
 #include "target/subtarget.hpp"
 
@@ -164,6 +165,7 @@ std::optional<unsigned> object_alignment(const ObjectDecl& object,
 }
 
 std::optional<UInt128> integer_value(const Expr& expression) {
+    if (expression.evaluated_integer) return expression.evaluated_integer->value;
     if (expression.kind == Expr::Kind::Parenthesized && expression.left) {
         return integer_value(*expression.left);
     }
@@ -598,6 +600,22 @@ bool lower_initializer(Object& result, const hir::Module& module,
         }
         result.initializer = InitializerKind::Integer;
         result.bits = mask_to(*value, result.size * 8);
+        const Expr* source = &expression;
+        while (source->kind == Expr::Kind::Parenthesized && source->left)
+            source = source->left.get();
+        if (source->evaluated_integer) {
+            const auto source_type = builtin_type(source->evaluated_integer->type);
+            const auto source_bits = source_type->builtin == BuiltinType::Iptr ||
+                source_type->builtin == BuiltinType::Uptr ? subtarget.abi_info().address_bits : type_bits(source_type);
+            const bool source_signed = source_type->builtin == BuiltinType::I8 ||
+                source_type->builtin == BuiltinType::I16 || source_type->builtin == BuiltinType::I32 ||
+                source_type->builtin == BuiltinType::I64 || source_type->builtin == BuiltinType::I128 ||
+                source_type->builtin == BuiltinType::Iptr;
+            result.bits = convert_integer(*value, {source_bits, source_signed},
+                {result.size * 8, false, type.builtin == BuiltinType::Bool});
+        } else if (type.builtin == BuiltinType::Bool) {
+            result.bits = UInt128{*value != UInt128{}};
+        }
         return true;
     }
     const auto text = floating_text(expression);

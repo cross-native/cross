@@ -6,6 +6,7 @@
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
 #include "model/model.hpp"
+#include "middle/mir_analysis.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
 #include "target/mips/features.hpp"
@@ -731,6 +732,28 @@ private:
                 static_cast<std::uint32_t>(index)};
             current_.stack_slots.push_back(std::move(spill));
         }
+    }
+
+    bool elide_noreturn_saves(const hir::Function& entity) const {
+        if (!options_.elide_noreturn_saves ||
+            options_.unwind_model != UnwindModel::None ||
+            options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            entity.naked) {
+            return false;
+        }
+        if (entity.definition && (entity.definition->attribute("returns_twice") ||
+                                  entity.definition->attribute("interrupt"))) {
+            return false;
+        }
+        if (std::any_of(entity.declarations.begin(), entity.declarations.end(),
+                        [](const cross::FunctionDecl* declaration) {
+                            return declaration &&
+                                   (declaration->attribute("returns_twice") ||
+                                    declaration->attribute("interrupt"));
+                        })) {
+            return false;
+        }
+        return source_ && !mir::has_reachable_return(*source_);
     }
 
     Opcode load_opcode(hir::TypeId type, Opcode signed_opcode,
@@ -2196,6 +2219,7 @@ private:
             const bool preserved_floating = !floating_name.empty() &&
                 !function_clobbers(floating_name);
             if ((!preserved_integer && !preserved_floating) ||
+                elide_noreturn_saves(entity) ||
                 !saved.insert(assignment->value).second) {
                 continue;
             }

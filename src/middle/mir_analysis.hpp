@@ -12,6 +12,10 @@
 
 namespace cross::mir {
 
+std::optional<UInt128> unsigned_upper_bound_at_exit(const ManagedFunction& function,
+                                                  ValueId value, BlockId at);
+bool has_reachable_return(const ManagedFunction& function);
+
 enum class UseKind : std::uint8_t {
     Operand,
     CallArgument,

@@ -9,7 +9,7 @@ endforeach()
 
 function(compile_variant name)
     execute_process(
-        COMMAND "${CC}" -S -O2 -mprofile=vr4300-o32 -fno-unroll-loops
+        COMMAND "${CC}" -S -O2 -funwind-tables -mprofile=vr4300-o32 -fno-unroll-loops
                 ${ARGN} "${SOURCE}" -o "${OUTPUT}.${name}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
     if(NOT status EQUAL 0)
@@ -20,7 +20,7 @@ endfunction()
 
 function(compile_size_variant name)
     execute_process(
-        COMMAND "${CC}" -S -Oz -mprofile=vr4300-o32 -fno-unroll-loops
+        COMMAND "${CC}" -S -Oz -funwind-tables -mprofile=vr4300-o32 -fno-unroll-loops
                 ${ARGN} "${SOURCE}" -o "${OUTPUT}.${name}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
     if(NOT status EQUAL 0)
@@ -31,7 +31,7 @@ endfunction()
 
 function(compile_reassociation_variant name balance)
     execute_process(
-        COMMAND "${CC}" -S -O3 -mprofile=vr4300-o32
+        COMMAND "${CC}" -S -O3 -funwind-tables -mprofile=vr4300-o32
                 "-mrisc-cisc-balance=${balance}" ${ARGN} "${SOURCE}"
                 -o "${OUTPUT}.${name}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
@@ -43,7 +43,7 @@ endfunction()
 
 function(compile_unroll_variant name balance)
     execute_process(
-        COMMAND "${CC}" -S -O3 -mprofile=vr4300-o32 -funroll-loops
+        COMMAND "${CC}" -S -O3 -funwind-tables -mprofile=vr4300-o32 -funroll-loops
                 -funroll-factor=4 "-mrisc-cisc-balance=${balance}"
                 ${ARGN} "${SOURCE}" -o "${OUTPUT}.${name}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
@@ -110,7 +110,7 @@ compile_unroll_variant(unroll_risc_no_reorder_no_delay 0
                        -fno-reorder-blocks -fno-schedule-insns2
                        -fno-tree-loop-rotate)
 execute_process(
-    COMMAND "${CC}" -S -O2 -target mipsel-unknown-elf -mabi=o32
+    COMMAND "${CC}" -S -O2 -funwind-tables -target mipsel-unknown-elf -mabi=o32
             -march=vr4300 -fno-unroll-loops "${SOURCE}"
             -o "${OUTPUT}.little.s"
     RESULT_VARIABLE little_status

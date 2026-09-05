@@ -8,7 +8,7 @@ foreach(required CC SOURCE OUTPUT)
 endforeach()
 
 execute_process(
-    COMMAND "${CC}" -S -O2 -march=x86-64-v3
+    COMMAND "${CC}" -S -O2 -funwind-tables -march=x86-64-v3
             "${SOURCE}" -o "${OUTPUT}"
     RESULT_VARIABLE result
     OUTPUT_VARIABLE stdout
@@ -100,7 +100,7 @@ endif()
 # constant qword-multiply expansion likewise caches the invariant upper half
 # of its multiplier: only the four data vectors should need a right shift.
 execute_process(
-    COMMAND "${CC}" -S -O3 -march=x86-64-v3
+    COMMAND "${CC}" -S -O3 -funwind-tables -march=x86-64-v3
             "${SOURCE}" -o "${OUTPUT}.o3.s"
     RESULT_VARIABLE o3_status
     OUTPUT_VARIABLE o3_stdout
@@ -193,7 +193,7 @@ endif()
 # permitting the 128-bit loop body to use SSE2, and prove the emitted feature
 # combination is accepted by the target assembler.
 execute_process(
-    COMMAND "${CC}" -S -O2 -mavx -mno-avx2
+    COMMAND "${CC}" -S -O2 -funwind-tables -mavx -mno-avx2
             -mprefer-vector-width=128 "${SOURCE}"
             -o "${OUTPUT}.avx-only.s"
     RESULT_VARIABLE avx_only_status
@@ -220,7 +220,7 @@ if(avx_only_assembly MATCHES "vpaddq[\t ]+[^\n]*%ymm")
         "${avx_only_assembly}")
 endif()
 execute_process(
-    COMMAND "${CC}" -c -O2 -mavx -mno-avx2
+    COMMAND "${CC}" -c -O2 -funwind-tables -mavx -mno-avx2
             -mprefer-vector-width=128 "${SOURCE}"
             -o "${OUTPUT}.avx-only.o"
     RESULT_VARIABLE avx_only_object_status

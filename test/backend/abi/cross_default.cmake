@@ -27,7 +27,7 @@ endfunction()
 foreach(target x86_64-unknown-linux-gnu x86_64-w64-windows-gnu)
     string(REPLACE "-" "_" suffix "${target}")
     execute_process(
-        COMMAND "${CC}" -S -O0 -fno-eval-calls -target "${target}"
+        COMMAND "${CC}" -S -O0 -funwind-tables -fno-eval-calls -target "${target}"
                 "${SOURCE}" -o "${OUTPUT}-${suffix}.s"
         RESULT_VARIABLE status
         OUTPUT_VARIABLE compile_stdout
@@ -72,7 +72,7 @@ foreach(pair "sysv_abi;rdi" "ms_abi;rcx")
     list(GET pair 0 abi)
     list(GET pair 1 register)
     execute_process(
-        COMMAND "${CC}" -S -O0 -fno-eval-calls "-mabi=${abi}"
+        COMMAND "${CC}" -S -O0 -funwind-tables -fno-eval-calls "-mabi=${abi}"
                 "${SOURCE}" -o "${OUTPUT}-${abi}.s"
         RESULT_VARIABLE status
         OUTPUT_VARIABLE compile_stdout

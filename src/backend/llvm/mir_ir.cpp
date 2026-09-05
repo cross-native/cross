@@ -339,6 +339,13 @@ public:
             } else if (value.kind == mir::ValueKind::ConstantInteger) {
                 references_[value.id.value] =
                     to_decimal({value.integer, value.integer_high});
+                const auto& type = hir_.type(value.type);
+                if (type.kind == hir::Type::Kind::Pointer ||
+                    (type.kind == hir::Type::Kind::Builtin && type.builtin == BuiltinType::Label)) {
+                    references_[value.id.value] = value.integer == 0 && value.integer_high == 0
+                        ? "null" : "inttoptr (i" + std::to_string(hir_.address_bits) + " " +
+                            references_[value.id.value] + " to ptr)";
+                }
             } else if (value.kind == mir::ValueKind::ConstantFloating &&
                        hir_.type(value.type).kind == hir::Type::Kind::Builtin &&
                        hir_.type(value.type).builtin == BuiltinType::F80) {

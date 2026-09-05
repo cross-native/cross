@@ -1,0 +1,30 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set(base "${OUTPUT}")
+set(STARTUP "${CMAKE_CURRENT_LIST_DIR}/mips_startup.s")
+set(EXPECTED "1")
+foreach(mode enabled disabled)
+    set(OUTPUT "${base}-${mode}")
+    if(mode STREQUAL enabled)
+        set(CC_FLAGS -felide-noreturn-saves)
+    else()
+        set(CC_FLAGS -fno-elide-noreturn-saves)
+    endif()
+    include("${CMAKE_CURRENT_LIST_DIR}/../../language/semantics/mips.cmake")
+    foreach(cpu vr4300 r3000)
+        execute_process(COMMAND "${CC}" -target mips-unknown-elf -march=${cpu}
+            -mabi=o32 -O2 ${CC_FLAGS} -S "${SOURCE}" -o "${OUTPUT}-${cpu}.s"
+            RESULT_VARIABLE status)
+        if(NOT status EQUAL 0)
+            message(FATAL_ERROR "MIPS noreturn assembly failed")
+        endif()
+        file(READ "${OUTPUT}-${cpu}.s" assembly)
+        set(save "s[wd][\t ]+[$]s[0-7],")
+        if(mode STREQUAL enabled AND assembly MATCHES "${save}")
+            message(FATAL_ERROR "eligible MIPS noreturn retained incoming saves")
+        elseif(mode STREQUAL disabled AND NOT assembly MATCHES "${save}")
+            message(FATAL_ERROR "disabled MIPS noreturn lost incoming saves")
+        endif()
+    endforeach()
+endforeach()
