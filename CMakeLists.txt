@@ -114,6 +114,7 @@ add_library(cross_middle
     src/middle/data_ir.cpp
     src/middle/hir.cpp
     src/middle/machine_ir.cpp
+    src/middle/frame_ir.cpp
     src/middle/mir.cpp
     src/middle/mir_analysis.cpp
     src/middle/mir_pass.cpp
@@ -249,6 +250,10 @@ if(BUILD_TESTING)
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/noreturn/noreturn.x
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/noreturn
         -P "${CMAKE_SOURCE_DIR}/test/backend/noreturn/noreturn.cmake")
+    add_test(NAME cross_frame_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/frame-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/backend/frame/runtime.cmake")
     add_test(NAME cross_noreturn_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/noreturn/mips_noreturn.x
@@ -266,6 +271,11 @@ if(BUILD_TESTING)
     add_executable(cross_machine_ir_test test/middle/machine_ir_test.cpp)
     target_link_libraries(cross_machine_ir_test PRIVATE cross_middle)
     cross_component(cross_machine_ir_test)
+
+    add_executable(cross_frame_ir_test test/middle/frame_ir_test.cpp)
+    target_link_libraries(cross_frame_ir_test PRIVATE cross_middle)
+    cross_component(cross_frame_ir_test)
+    add_test(NAME cross_frame_ir COMMAND $<TARGET_FILE:cross_frame_ir_test>)
 
     add_executable(cross_machine_transform_test
         test/backend/native/machine_transform_test.cpp)

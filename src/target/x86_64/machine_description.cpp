@@ -17,7 +17,8 @@ constexpr OpcodeProperty properties(std::string_view name) {
     if (name.starts_with("x86.test.") || name.starts_with("x86.vtest.")) {
         result = result | OpcodeProperty::Test;
     }
-    if (name.starts_with("x86.f") && !name.starts_with("x86.fixed.")) {
+    if (name.starts_with("x86.f") && !name.starts_with("x86.fixed.") &&
+        !name.starts_with("x86.frame.")) {
         result = result | OpcodeProperty::Floating;
     }
     if (name.starts_with("x86.v")) result = result | OpcodeProperty::Vector;
@@ -27,7 +28,7 @@ constexpr OpcodeProperty properties(std::string_view name) {
     if (name.starts_with("x86.atomic.")) {
         result = result | OpcodeProperty::Atomic;
     }
-    if (name.starts_with("x86.stack.")) {
+    if (name.starts_with("x86.stack.") || name.starts_with("x86.frame.")) {
         result = result | OpcodeProperty::Stack;
     }
     if (name.starts_with("x86.aggregate.")) {

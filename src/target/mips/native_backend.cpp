@@ -2219,7 +2219,7 @@ private:
             const bool preserved_floating = !floating_name.empty() &&
                 !function_clobbers(floating_name);
             if ((!preserved_integer && !preserved_floating) ||
-                elide_noreturn_saves(entity) ||
+                function.frame.elide_incoming_saves ||
                 !saved.insert(assignment->value).second) {
                 continue;
             }
@@ -2227,10 +2227,12 @@ private:
             machine::StackSlot save;
             save.id = {static_cast<std::uint32_t>(
                 function.stack_slots.size())};
-            save.kind = machine::StackSlotKind::Spill;
+            save.kind = machine::StackSlotKind::CalleeSave;
             save.size = preserved_floating ||
                     subtarget_.has_feature(Feature::Mips3)
                 ? 8U : 4U;
+            save.saved_register = machine::Register::physical_register(
+                *assignment, machine::IntegerMode{static_cast<std::uint16_t>(save.size * 8U)});
             save.alignment = save.size;
             save.location = function.location;
             save.name = "$callee.save." +
@@ -3912,6 +3914,7 @@ private:
         current_.frame.outgoing_argument_alignment =
             current_.frame.stack_alignment;
         current_.frame.has_frame_pointer = true;
+        current_.frame.elide_incoming_saves = elide_noreturn_saves(entity);
         create_registers(source);
         create_stack_slots(source);
         lower_blocks(source);
@@ -3938,14 +3941,6 @@ private:
 };
 
 } // namespace
-
-machine::Module lower_managed_machine(
-    const mir::ManagedModule& managed, const hir::Module& hir_module,
-    const Subtarget& subtarget, const CompilerOptions& options,
-    Diagnostics& diagnostics) {
-    return MachineLowerer(
-        managed, hir_module, subtarget, options, diagnostics).run();
-}
 
 namespace {
 
@@ -3990,6 +3985,19 @@ public:
           numeric_gprs_(subtarget.abi() == "n64" ||
                         subtarget.abi() == "n32"),
           wide_addresses_(hir_module.address_bits > 32) {}
+
+    void prepare_frames() {
+        if (options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            options_.unwind_model != UnwindModel::None) return;
+        for (auto& function : module_.functions) {
+            active_signature_ = classify_entity(hir_.function(function.source), function.location);
+            if (!active_signature_) continue;
+            prepare_parameter_homes(function);
+            if (!finalize_frame(function)) continue;
+            prepare_fixed_frame(function);
+        }
+        active_signature_.reset();
+    }
 
     std::string run() {
         if (format_ != ObjectFormat::Elf && !module_.functions.empty()) {
@@ -4989,6 +4997,134 @@ private:
         }
     }
 
+    void prepare_fixed_frame(machine::Function& function) {
+        using namespace machine;
+        const IntegerMode address_mode{static_cast<std::uint16_t>(address_bytes() * 8U)};
+        const auto sp = Register::physical_register({29}, address_mode);
+        const auto fp = Register::physical_register({30}, address_mode);
+        const auto ra = Register::physical_register({31}, address_mode);
+        FrameProgram program;
+        program.stack_pointer = sp;
+        program.stack_size = frame_size_;
+        program.entry_alignment = function.frame.stack_alignment;
+        program.body_alignment = function.frame.stack_alignment;
+        const auto add_slot = [&](Register reg, std::uint32_t offset, std::string name) {
+            StackSlot slot;
+            slot.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
+            slot.kind = StackSlotKind::CalleeSave;
+            slot.size = reg.mode.bits / 8U;
+            slot.alignment = slot.size;
+            slot.frame_offset = static_cast<std::int32_t>(offset);
+            slot.saved_register = reg;
+            slot.location = function.location;
+            slot.name = std::move(name);
+            function.stack_slots.push_back(std::move(slot));
+        };
+        if (saves_fp_) add_slot(fp, saved_fp_offset_, "$frame.fp");
+        if (saves_ra_) add_slot(ra, saved_ra_offset_, "$frame.ra");
+        const auto adjustment = [&](std::int32_t delta) {
+            FrameEffect effect;
+            effect.operation = FrameOperation::AdjustStack;
+            effect.base = sp;
+            effect.stack_delta = delta;
+            return frame_instruction(Opcode::FrameAdjust, std::move(effect), function.location);
+        };
+        const auto copy = [&](Register destination, Register source) {
+            FrameEffect effect;
+            effect.operation = FrameOperation::CopyBase;
+            effect.base = source;
+            effect.destination = destination;
+            return frame_instruction(Opcode::FrameCopy, std::move(effect), function.location);
+        };
+        const auto transfer = [&](Register reg, Register base, bool load) {
+            const auto slot = std::find_if(function.stack_slots.begin(), function.stack_slots.end(),
+                [&](const StackSlot& item) { return item.saved_register == reg; });
+            FrameEffect effect;
+            effect.operation = load ? FrameOperation::Restore : FrameOperation::Save;
+            effect.base = base;
+            if (slot == function.stack_slots.end() || !slot->frame_offset) {
+                diagnostics_.error(function.location, "MIPS frame register has no typed save slot");
+            } else {
+                effect.transfers.push_back({reg, *slot->frame_offset, slot->id});
+            }
+            return frame_instruction(load ? Opcode::FrameRestore : Opcode::FrameSave,
+                                     std::move(effect), function.location);
+        };
+        if (frame_size_ != 0) {
+            program.prologue.push_back(adjustment(-static_cast<std::int32_t>(frame_size_)));
+        }
+        if (saves_ra_) program.prologue.push_back(transfer(ra, sp, false));
+        if (saves_fp_) program.prologue.push_back(transfer(fp, sp, false));
+        if (function.frame.has_frame_pointer) program.prologue.push_back(copy(fp, sp));
+        const auto base = function.frame.has_frame_pointer ? fp : sp;
+        for (const auto reg : function.callee_saved_registers) {
+            const auto slot = std::find_if(function.stack_slots.begin(), function.stack_slots.end(),
+                [&](const StackSlot& item) {
+                    return item.saved_register && item.saved_register->id == reg.value;
+                });
+            if (slot != function.stack_slots.end()) {
+                program.prologue.push_back(transfer(*slot->saved_register, base, false));
+            }
+        }
+        if (!function.frame.elide_incoming_saves) {
+            for (auto reg = function.callee_saved_registers.rbegin();
+                 reg != function.callee_saved_registers.rend(); ++reg) {
+                const auto slot = std::find_if(function.stack_slots.begin(), function.stack_slots.end(),
+                    [&](const StackSlot& item) {
+                        return item.saved_register && item.saved_register->id == reg->value;
+                    });
+                if (slot != function.stack_slots.end()) {
+                    program.epilogue.push_back(transfer(*slot->saved_register, base, true));
+                }
+            }
+            if (function.frame.has_frame_pointer) program.epilogue.push_back(copy(sp, fp));
+            if (saves_fp_) program.epilogue.push_back(transfer(fp, sp, true));
+            if (saves_ra_) program.epilogue.push_back(transfer(ra, sp, true));
+            if (frame_size_ != 0) {
+                program.epilogue.push_back(adjustment(static_cast<std::int32_t>(frame_size_)));
+            }
+        }
+        function.frame.program = std::move(program);
+    }
+
+    void emit_frame_instruction(const machine::Instruction& value) {
+        const auto& effect = *value.frame_effect;
+        const auto base = reg_name(gpr_name({effect.base.id}));
+        switch (decode_opcode(value.opcode)) {
+        case Opcode::FrameAdjust:
+            instruction(address_add_immediate(), base + "," + base + "," +
+                        std::to_string(effect.stack_delta));
+            break;
+        case Opcode::FrameCopy:
+            instruction("move", reg_name(gpr_name({effect.destination->id})) + "," + base);
+            break;
+        case Opcode::FrameSave:
+        case Opcode::FrameRestore:
+            for (const auto& transfer : effect.transfers) {
+                const bool load = effect.operation == machine::FrameOperation::Restore;
+                const auto floating = fpr_name({transfer.reg.id});
+                const auto reg = floating.empty() ? gpr_name({transfer.reg.id}) : floating;
+                const auto opcode = !floating.empty() ? (load ? "ldc1" : "sdc1")
+                    : transfer.reg.mode.bits > 32 ? (load ? "ld" : "sd") : (load ? "lw" : "sw");
+                instruction(opcode, reg_name(reg) + "," + std::to_string(transfer.offset) +
+                                    "(" + base + ")");
+            }
+            break;
+        default:
+            diagnostics_.error(value.location, "invalid selected MIPS frame instruction");
+            break;
+        }
+    }
+
+    const machine::Instruction* emit_prepared_epilogue(const machine::Function& function) {
+        const auto& code = function.frame.program->epilogue;
+        const bool delayed = !code.empty() && code.back().opcode == Opcode::FrameAdjust;
+        for (std::size_t index = 0; index < code.size() - static_cast<unsigned>(delayed); ++index) {
+            emit_frame_instruction(code[index]);
+        }
+        return delayed ? &code.back() : nullptr;
+    }
+
     void normalize_integer(std::string_view reg, unsigned bits,
                            bool sign) {
         if (bits >= 64) return;
@@ -5333,14 +5469,15 @@ private:
         // n64.
         const auto pointer_bytes = address_bytes();
         offset = align_up(offset, pointer_bytes);
-        saves_fp_ = function.frame.has_frame_pointer;
+        saves_fp_ = function.frame.has_frame_pointer &&
+                    !function.frame.elide_incoming_saves;
         if (saves_fp_) {
             saved_fp_offset_ = offset;
             offset += pointer_bytes;
         } else {
             saved_fp_offset_ = 0;
         }
-        saves_ra_ = has_call;
+        saves_ra_ = has_call && !function.frame.elide_incoming_saves;
         if (saves_ra_) {
             saved_ra_offset_ = offset;
             offset += pointer_bytes;
@@ -6257,17 +6394,22 @@ private:
         if (!callee_symbol) return;
         if (tail) {
             if (cfi) output_ << ".cfi_remember_state\n";
-            emit_callee_restores(function, cfi);
-            if (function.frame.has_frame_pointer) {
-                instruction("move", "$sp,$fp");
-            }
-            if (saves_fp_) {
-                instruction(address_load(),
-                            "$fp," + memory(saved_fp_offset_, "sp"));
-            }
-            if (saves_ra_) {
-                instruction(address_load(),
-                            "$ra," + memory(saved_ra_offset_, "sp"));
+            const machine::Instruction* frame_delay = nullptr;
+            if (function.frame.program) {
+                frame_delay = emit_prepared_epilogue(function);
+            } else {
+                emit_callee_restores(function, cfi);
+                if (function.frame.has_frame_pointer) {
+                    instruction("move", "$sp,$fp");
+                }
+                if (saves_fp_) {
+                    instruction(address_load(),
+                                "$fp," + memory(saved_fp_offset_, "sp"));
+                }
+                if (saves_ra_) {
+                    instruction(address_load(),
+                                "$ra," + memory(saved_ra_offset_, "sp"));
+                }
             }
             // Under the large model the callee may lie outside the 256 MB
             // region a direct jump can name.  $at is the emitter's own
@@ -6279,7 +6421,8 @@ private:
             } else {
                 instruction("j", assembly_symbol(callee_symbol->name));
             }
-            if (frame_size_ == 0) instruction("nop");
+            if (frame_delay) emit_frame_instruction(*frame_delay);
+            else if (frame_size_ == 0) instruction("nop");
             else {
                 instruction(address_add_immediate(),
                             "$sp,$sp," + std::to_string(frame_size_));
@@ -9357,8 +9500,14 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // Otherwise home the whole incoming register set before materialization:
     // EABI/Cross banks may overlap t0/t1 assembly scratches, so mixing direct
     // and fallback captures would let an early value destroy a later one.
-    prepare_parameter_homes(function);
-    if (!finalize_frame(function)) return;
+    if (function.frame.program) {
+        frame_size_ = function.frame.program->stack_size;
+        saves_fp_ = false;
+        saves_ra_ = false;
+    } else {
+        prepare_parameter_homes(function);
+        if (!finalize_frame(function)) return;
+    }
     const bool shared_epilogue =
         frame_size_ != 0 && needs_shared_epilogue(function);
     frame_pointer_active_ = function.frame.has_frame_pointer;
@@ -9414,7 +9563,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                       options_.asynchronous_unwind_tables) &&
                      assembly_uses_dwarf_cfi(format_);
     if (cfi) output_ << ".cfi_startproc\n";
-    if (frame_size_ != 0) {
+    if (function.frame.program) {
+        for (const auto& instruction : function.frame.program->prologue) {
+            emit_frame_instruction(instruction);
+        }
+    } else if (frame_size_ != 0) {
         instruction(address_add_immediate(),
                     "$sp,$sp,-" + std::to_string(frame_size_));
         if (cfi) output_ << ".cfi_def_cfa_offset " << frame_size_ << '\n';
@@ -9545,21 +9698,28 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
 
     if (shared_epilogue) {
         output_ << epilogue_label_ << ":\n";
-        emit_callee_restores(function, cfi);
-        if (function.frame.has_frame_pointer) {
-            instruction("move", "$sp,$fp");
+        if (function.frame.program) {
+            const auto* delay = emit_prepared_epilogue(function);
+            instruction("jr", "$ra");
+            if (delay) emit_frame_instruction(*delay);
+            else instruction("nop");
+        } else {
+            emit_callee_restores(function, cfi);
+            if (function.frame.has_frame_pointer) {
+                instruction("move", "$sp,$fp");
+            }
+            if (saves_fp_) {
+                instruction(address_load(),
+                            "$fp," + memory(saved_fp_offset_, "sp"));
+            }
+            if (saves_ra_) {
+                instruction(address_load(),
+                            "$ra," + memory(saved_ra_offset_, "sp"));
+            }
+            instruction("jr", "$ra");
+            instruction(address_add_immediate(),
+                        "$sp,$sp," + std::to_string(frame_size_));
         }
-        if (saves_fp_) {
-            instruction(address_load(),
-                        "$fp," + memory(saved_fp_offset_, "sp"));
-        }
-        if (saves_ra_) {
-            instruction(address_load(),
-                        "$ra," + memory(saved_ra_offset_, "sp"));
-        }
-        instruction("jr", "$ra");
-        instruction(address_add_immediate(),
-                    "$sp,$sp," + std::to_string(frame_size_));
     }
     if (cfi) output_ << ".cfi_endproc\n";
     output_ << ".end " << symbol << "\n.size " << symbol << ",.-"
@@ -9568,6 +9728,17 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
 }
 
 } // namespace
+
+machine::Module lower_managed_machine(
+    const mir::ManagedModule& managed, const hir::Module& hir_module,
+    const Subtarget& subtarget, const CompilerOptions& options,
+    Diagnostics& diagnostics) {
+    auto result = MachineLowerer(managed, hir_module, subtarget, options, diagnostics).run();
+    if (diagnostics.errors() == 0) {
+        AssemblyEmitter(result, hir_module, subtarget, options, diagnostics).prepare_frames();
+    }
+    return result;
+}
 
 std::string emit_managed_machine_assembly(
     machine::Module& module, const mir::ManagedModule& managed,

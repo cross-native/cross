@@ -402,6 +402,14 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
             ok = fail(diagnostics, slot.location,
                       "machine hard-register slot has an invalid target view");
         }
+        if ((slot.kind == StackSlotKind::CalleeSave) != slot.saved_register.has_value() ||
+            (slot.saved_register &&
+             (slot.saved_register->kind != RegisterKind::Physical ||
+              !slot.saved_register->mode.valid() ||
+              slot.saved_register->mode.bits != slot.size * 8U))) {
+            ok = fail(diagnostics, slot.location,
+                      "machine callee-save slot requires its exact physical register mode");
+        }
         const bool assigned_spill =
             slot.spill_for &&
             slot.spill_for->value <
@@ -443,6 +451,10 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
         bool saw_terminator = false;
         for (std::size_t index = 0; index < block.instructions.size(); ++index) {
             const Instruction& instruction = block.instructions[index];
+            if (instruction.frame_effect) {
+                ok = fail(diagnostics, instruction.location,
+                          "frame instructions must remain in their pinned frame program");
+            }
             if (saw_terminator) {
                 ok = fail(diagnostics, instruction.location,
                           "machine instruction follows a block terminator");
@@ -510,7 +522,16 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
             }
         }
     }
-    return ok;
+    if (function.frame.program) {
+        for (const auto* instructions : {&function.frame.program->prologue,
+                                         &function.frame.program->epilogue}) {
+            for (const auto& instruction : *instructions) {
+                ok = verify_instruction(instruction, function, block_ids, defined_virtuals,
+                                        diagnostics) && ok;
+            }
+        }
+    }
+    return verify_frame_program(function, diagnostics) && ok;
 }
 
 bool verify(const Module& module, Diagnostics& diagnostics) {

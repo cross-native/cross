@@ -10,7 +10,9 @@ _start:
         lui $sp,0x8080
         addiu $sp,$sp,-64
         lui $a0,0x1234
-        ori $a0,$a0,0x5678
+        ori $a0,$a0,0x5600
+        addiu $t0,$zero,0x78
+        sw $t0,16($sp)
         jal never
         nop
 .Lhalt:

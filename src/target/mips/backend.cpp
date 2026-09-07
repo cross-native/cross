@@ -420,13 +420,21 @@ public:
                                      options, diagnostics);
     }
 
-    bool verify_machine(const machine::Module& module, const Subtarget&,
+    bool verify_machine(const machine::Module& module, const Subtarget& subtarget,
                         const CompilerOptions&,
                         Diagnostics& diagnostics) const override {
         bool valid = true;
         for (const auto& function : module.functions) {
-            for (const auto& block : function.blocks) {
-                for (const auto& instruction : block.instructions) {
+            if (function.frame.program &&
+                function.frame.program->stack_pointer !=
+                    machine::Register::physical_register(
+                        {29}, {static_cast<std::uint16_t>(subtarget.abi_info().address_bits)})) {
+                diagnostics.error(function.location,
+                                  "MIPS frame program must use SP in the address mode");
+                valid = false;
+            }
+            machine::for_each_instruction(
+                function, [&](const machine::Instruction& instruction) {
                     if (instruction.kind == machine::InstructionKind::Target &&
                         !describe_opcode(instruction.opcode)) {
                         diagnostics.error(
@@ -435,21 +443,69 @@ public:
                                 std::to_string(instruction.opcode.value));
                         valid = false;
                     }
-                }
-            }
+                    const auto opcode = decode_opcode(instruction.opcode);
+                    const bool frame_opcode =
+                        opcode == Opcode::FrameAdjust || opcode == Opcode::FrameCopy ||
+                        opcode == Opcode::FrameSave || opcode == Opcode::FrameRestore;
+                    if (frame_opcode != instruction.frame_effect.has_value()) {
+                        diagnostics.error(instruction.location,
+                                          "MIPS frame opcode and effects disagree");
+                        valid = false;
+                        return;
+                    }
+                    if (!frame_opcode)
+                        return;
+                    const auto& effect = *instruction.frame_effect;
+                    const auto expected = opcode == Opcode::FrameAdjust
+                                              ? machine::FrameOperation::AdjustStack
+                                          : opcode == Opcode::FrameCopy
+                                              ? machine::FrameOperation::CopyBase
+                                          : opcode == Opcode::FrameSave
+                                              ? machine::FrameOperation::Save
+                                              : machine::FrameOperation::Restore;
+                    const bool transfers =
+                        opcode == Opcode::FrameSave || opcode == Opcode::FrameRestore;
+                    if (effect.operation != expected || effect.base.id >= 32 ||
+                        effect.base.mode.bits != subtarget.abi_info().address_bits ||
+                        (effect.destination && effect.destination->id >= 32) ||
+                        effect.update != machine::FrameUpdate::None ||
+                        !instruction.clobbers.empty() || effect.stack_delta < -32768 ||
+                        effect.stack_delta > 32767 ||
+                        (transfers && effect.transfers.size() != 1) ||
+                        std::any_of(
+                            effect.transfers.begin(), effect.transfers.end(),
+                            [&](const machine::FrameTransfer& transfer) {
+                                return transfer.reg.id >= 64 ||
+                                       transfer.offset < -32768 ||
+                                       transfer.offset > 32767 ||
+                                       (transfer.reg.mode.bits != 32 &&
+                                        transfer.reg.mode.bits != 64) ||
+                                       (transfer.reg.id < 32 &&
+                                        transfer.reg.mode.bits == 64 &&
+                                        !subtarget.has_feature(Feature::Mips3)) ||
+                                       (transfer.reg.id >= 32 &&
+                                        (transfer.reg.mode.bits != 64 ||
+                                         !subtarget.has_feature(Feature::Mips2) ||
+                                         !subtarget.has_feature(Feature::HardFloat) ||
+                                         subtarget.has_feature(Feature::SingleFloat)));
+                            })) {
+                        diagnostics.error(instruction.location,
+                                          "illegal selected MIPS frame instruction");
+                        valid = false;
+                    }
+                });
         }
         return valid;
     }
 
-    std::string emit_machine_assembly(
-        machine::Module& machine_module,
-        const mir::ManagedModule& managed_module,
-        const hir::Module& hir_module, const Subtarget& subtarget,
-        const CompilerOptions& options,
-        Diagnostics& diagnostics) const override {
-        return emit_managed_machine_assembly(
-            machine_module, managed_module, hir_module, subtarget, options,
-            diagnostics);
+    std::string emit_machine_assembly(machine::Module& machine_module,
+                                      const mir::ManagedModule& managed_module,
+                                      const hir::Module& hir_module,
+                                      const Subtarget& subtarget,
+                                      const CompilerOptions& options,
+                                      Diagnostics& diagnostics) const override {
+        return emit_managed_machine_assembly(machine_module, managed_module, hir_module,
+                                             subtarget, options, diagnostics);
     }
 };
 

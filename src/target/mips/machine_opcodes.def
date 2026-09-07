@@ -1,4 +1,8 @@
 // name, diagnostic spelling
+X(FrameAdjust, "mips.frame.adjust")
+X(FrameCopy, "mips.frame.copy")
+X(FrameSave, "mips.frame.save")
+X(FrameRestore, "mips.frame.restore")
 X(Parameter, "mips.parameter")
 X(Fparameter, "mips.fparameter")
 X(Constant, "mips.constant")

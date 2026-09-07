@@ -11,6 +11,8 @@
 
 namespace cross::x86_64 {
 
+inline constexpr machine::PhysicalRegisterId flags_storage{64};
+
 // This enumeration is local to the x86-64 target.  Machine IR carries only
 // TargetOpcodeId, so adding another architecture does not grow a global
 // opcode enumeration or introduce architecture checks into the middle end.

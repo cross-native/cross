@@ -1,4 +1,10 @@
 // name, diagnostic spelling
+X(FrameAdjust, "x86.frame.adjust")
+X(FrameCopy, "x86.frame.copy")
+X(FrameSave, "x86.frame.save")
+X(FrameRestore, "x86.frame.restore")
+X(FramePush, "x86.frame.push")
+X(FramePop, "x86.frame.pop")
 X(Add, "x86.add")
 X(AddImm, "x86.add.imm")
 X(AddMem, "x86.add.mem")

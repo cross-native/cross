@@ -179,7 +179,7 @@ struct StackSlotOperand {
 using Operand = std::variant<RegisterOperand, ImmediateOperand, SymbolOperand,
                              BlockOperand, StackSlotOperand>;
 
-enum class StackSlotKind { Local, Spill, OutgoingArgument, IncomingArgument };
+enum class StackSlotKind { Local, Spill, OutgoingArgument, IncomingArgument, CalleeSave };
 
 struct StackSlot {
     StackSlotId id;
@@ -190,6 +190,7 @@ struct StackSlot {
     SourceLocation location;
     std::string name;
     std::optional<TargetRegisterViewId> hard_register;
+    std::optional<Register> saved_register;
     // A target may keep an explicit fallback home for a virtual register and
     // elide it after physical assignment. Elision is represented explicitly
     // so finalized-frame verification never mistakes a missing offset for a
@@ -202,18 +203,25 @@ struct StackSlot {
     bool elided{};
 };
 
-struct FrameInfo {
-    std::uint32_t stack_alignment{1};
-    std::uint32_t local_size{};
-    std::uint32_t outgoing_argument_size{};
-    std::uint32_t outgoing_argument_alignment{1};
-    // A target may explicitly save and reserve one physical register as the
-    // stable pre-realignment CFA anchor for a frame that combines aligned
-    // fixed storage with dynamic stack allocation. It need not be preserved
-    // by the function's ABI before the target-owned save.
-    std::optional<PhysicalRegisterId> cfa_anchor_register;
-    bool has_frame_pointer{};
-    bool finalized{};
+enum class FrameOperation { AdjustStack, CopyBase, Save, Restore };
+enum class FrameUpdate { None, BeforeMemory, AfterMemory };
+
+struct FrameTransfer {
+    Register reg;
+    std::int32_t offset{};
+    // Required for selected save/restore forms; absent only during construction.
+    std::optional<StackSlotId> slot;
+    friend bool operator==(const FrameTransfer&, const FrameTransfer&) = default;
+};
+
+struct FrameEffect {
+    FrameOperation operation{FrameOperation::AdjustStack};
+    Register base;
+    std::optional<Register> destination;
+    std::int32_t stack_delta{};
+    FrameUpdate update{FrameUpdate::None};
+    // One selected instruction may transfer several independent registers.
+    std::vector<FrameTransfer> transfers;
 };
 
 // Patch metadata is carried independently from an immediate so legalization,
@@ -306,6 +314,33 @@ struct Instruction {
     bool may_load{};
     bool may_store{};
     bool has_side_effects{};
+    std::optional<FrameEffect> frame_effect;
+};
+
+struct FrameProgram {
+    Register stack_pointer;
+    std::uint32_t stack_size{};
+    std::uint32_t entry_alignment{1};
+    std::uint32_t entry_stack_residue{};
+    std::uint32_t body_alignment{1};
+    // Pinned entry/exit regions until boundary expansions have complete
+    // physical effects. The instructions themselves use the ordinary schema.
+    std::vector<Instruction> prologue;
+    std::vector<Instruction> epilogue;
+};
+
+struct FrameInfo {
+    std::uint32_t stack_alignment{1};
+    std::uint32_t local_size{};
+    std::uint32_t outgoing_argument_size{};
+    std::uint32_t outgoing_argument_alignment{1};
+    // Stable pre-realignment CFA anchor. A target may save/reserve it even
+    // when the function's ABI does not preserve that register.
+    std::optional<PhysicalRegisterId> cfa_anchor_register;
+    std::optional<FrameProgram> program;
+    bool has_frame_pointer{};
+    bool elide_incoming_saves{};
+    bool finalized{};
 };
 
 struct Block {
@@ -358,10 +393,27 @@ struct Module {
     std::vector<Function> functions;
 };
 
+template <typename Visitor>
+void for_each_instruction(const Function& function, Visitor&& visitor) {
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) visitor(instruction);
+    }
+    if (function.frame.program) {
+        for (const auto& instruction : function.frame.program->prologue) visitor(instruction);
+        for (const auto& instruction : function.frame.program->epilogue) visitor(instruction);
+    }
+}
+
 // Checks structural invariants only, so it can run before target-specific
 // register allocation or instruction-form verification. It returns false when
 // it emits one or more errors into `diagnostics`.
 bool verify(const Module& module, Diagnostics& diagnostics);
 bool verify(const Function& function, Diagnostics& diagnostics);
+
+[[nodiscard]] Instruction frame_instruction(TargetOpcodeId opcode,
+                                             FrameEffect effect,
+                                             SourceLocation location);
+[[nodiscard]] bool verify_frame_program(const Function& function,
+                                        Diagnostics& diagnostics);
 
 } // namespace cross::machine

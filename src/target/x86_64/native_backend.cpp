@@ -783,7 +783,7 @@ private:
     }
 
     void add_preserved_storage(std::uint32_t storage) {
-        if (elide_noreturn_saves(hir_.function(current_.source))) return;
+        if (current_.frame.elide_incoming_saves) return;
         const machine::PhysicalRegisterId physical{storage};
         if (std::find(current_.callee_saved_registers.begin(),
                       current_.callee_saved_registers.end(), physical) !=
@@ -796,8 +796,10 @@ private:
         machine::StackSlot save;
         save.id = {static_cast<std::uint32_t>(
             current_.stack_slots.size())};
-        save.kind = machine::StackSlotKind::Spill;
+        save.kind = machine::StackSlotKind::CalleeSave;
         save.size = view->register_class == RegisterClass::simd ? 16 : 8;
+        save.saved_register = machine::Register::physical_register(
+            physical, machine::IntegerMode{static_cast<std::uint16_t>(save.size * 8U)});
         save.alignment = save.size;
         save.location = current_.location;
         save.name = "$callee.save." + std::string(view->storage_name);
@@ -810,7 +812,7 @@ private:
     // and makes arbitrary model pairs bridge correctly without ABI-name
     // special cases.
     void preserve_stronger_caller_contract() {
-        if (elide_noreturn_saves(hir_.function(current_.source))) return;
+        if (current_.frame.elide_incoming_saves) return;
         std::unordered_set<std::uint16_t> explicitly_preserved;
         for (const auto& slot : current_.stack_slots) {
             if (!slot.hard_register) continue;
@@ -857,7 +859,7 @@ private:
         }
         std::vector<std::uint32_t> ordered(required.begin(), required.end());
         std::sort(ordered.begin(), ordered.end());
-        if (!elide_noreturn_saves(hir_.function(current_.source))) {
+        if (!current_.frame.elide_incoming_saves) {
             for (const auto storage : ordered) add_preserved_storage(storage);
         }
     }
@@ -8855,6 +8857,7 @@ private:
         current_.symbol = entity.link_symbol;
         current_.abi = entity.abi;
         current_.entry = {source.entry.value};
+        current_.frame.elide_incoming_saves = elide_noreturn_saves(entity);
         source_splat_use_counts_.assign(source.values.size(), 0);
         source_non_splat_use_counts_.assign(source.values.size(), 0);
         for (const auto& value : source.values) {
@@ -9375,6 +9378,19 @@ public:
           diagnostics_(diagnostics),
           format_(subtarget.object_format()) {}
 
+    void prepare_frames() {
+        if (unwind_enabled() || options_.unwind_model != UnwindModel::None) return;
+        for (auto& function : module_.functions) {
+            const auto& entity = hir_.function(function.source);
+            if (has_dynamic_stack(function) || function.frame.stack_alignment > 16 ||
+                function.frame.local_size >= 4096 || entity.variadic ||
+                manual_plans_.find(function.source) || !hard_register_views(function).empty()) continue;
+            const bool compact = can_push_allocated_preserved_registers(function, entity);
+            if (!compact && use_red_zone(function, entity, function.frame.local_size)) continue;
+            prepare_fixed_frame(function, compact);
+        }
+    }
+
     std::string run() {
         if (format_ == ObjectFormat::Unsupported &&
             !module_.functions.empty()) {
@@ -9393,6 +9409,139 @@ public:
     }
 
 private:
+    void prepare_fixed_frame(machine::Function& function, bool compact) {
+        using namespace machine;
+        const auto sp = Register::physical_register({find_register_view("rsp")->storage_id}, i64);
+        const auto fp = Register::physical_register({find_register_view("rbp")->storage_id}, i64);
+        const auto storage = function.frame.local_size;
+        const auto fp_save = function.frame.has_frame_pointer &&
+            !function.frame.elide_incoming_saves ? 8U : 0U;
+        const bool call = has_calls(function);
+        const bool pad = compact && call && function.callee_saved_registers.size() % 2U == 0;
+        const auto local = compact
+            ? static_cast<std::uint32_t>(function.callee_saved_registers.size() * 8U + (pad ? 8U : 0U))
+            : fp_save != 0 ? align_up(storage, 16U)
+            : storage != 0 || call ? align_up(storage + 8U, 16U) - 8U : 0U;
+        FrameProgram program;
+        program.stack_pointer = sp;
+        program.stack_size = local + fp_save;
+        program.entry_alignment = 16;
+        program.entry_stack_residue = 8;
+        program.body_alignment = compact && !call ? 8
+            : local != 0 || fp_save != 0 || call ? 16 : 1;
+        const auto adjustment = [&](std::int32_t delta) {
+            FrameEffect effect;
+            effect.operation = FrameOperation::AdjustStack;
+            effect.base = sp;
+            effect.stack_delta = delta;
+            auto result = frame_instruction(Opcode::FrameAdjust, std::move(effect), function.location);
+            result.clobbers.push_back(Register::physical_register(flags_storage, i64));
+            return result;
+        };
+        const auto transfer = [&](const StackSlot& slot, bool load, bool push_pop) {
+            FrameEffect effect;
+            effect.operation = load ? FrameOperation::Restore : FrameOperation::Save;
+            effect.base = sp;
+            effect.transfers.push_back({*slot.saved_register, push_pop ? 0 : *slot.frame_offset, slot.id});
+            if (push_pop) {
+                effect.stack_delta = load ? 8 : -8;
+                effect.update = load ? FrameUpdate::AfterMemory : FrameUpdate::BeforeMemory;
+            }
+            const auto opcode = push_pop ? (load ? Opcode::FramePop : Opcode::FramePush)
+                                         : (load ? Opcode::FrameRestore : Opcode::FrameSave);
+            return frame_instruction(opcode, std::move(effect), function.location);
+        };
+        std::optional<StackSlotId> fp_slot;
+        if (fp_save != 0) {
+            StackSlot slot;
+            slot.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
+            slot.kind = StackSlotKind::CalleeSave;
+            slot.saved_register = fp;
+            slot.size = 8;
+            slot.alignment = 8;
+            slot.frame_offset = static_cast<std::int32_t>(local);
+            slot.location = function.location;
+            slot.name = "$frame.rbp";
+            fp_slot = slot.id;
+            function.stack_slots.push_back(std::move(slot));
+            program.prologue.push_back(transfer(function.stack_slots[fp_slot->value], false, true));
+        }
+        if (function.frame.has_frame_pointer) {
+            FrameEffect effect;
+            effect.operation = FrameOperation::CopyBase;
+            effect.base = sp;
+            effect.destination = fp;
+            program.prologue.push_back(frame_instruction(Opcode::FrameCopy, std::move(effect), function.location));
+        }
+        if (!compact && local != 0) {
+            program.prologue.push_back(adjustment(-static_cast<std::int32_t>(local)));
+        }
+        std::uint32_t pushed{};
+        std::vector<StackSlotId> saves;
+        for (const auto reg : function.callee_saved_registers) {
+            const auto slot = std::find_if(function.stack_slots.begin(), function.stack_slots.end(),
+                [&](const StackSlot& item) {
+                    return item.saved_register && item.saved_register->id == reg.value;
+                });
+            if (slot == function.stack_slots.end() || !slot->frame_offset) {
+                diagnostics_.error(function.location, "x86-64 frame register has no typed save slot");
+                continue;
+            }
+            if (compact) {
+                pushed += 8;
+                slot->frame_offset = static_cast<std::int32_t>(program.stack_size - pushed);
+            }
+            saves.push_back(slot->id);
+            program.prologue.push_back(transfer(*slot, false, compact));
+        }
+        if (pad) program.prologue.push_back(adjustment(-8));
+        if (!function.frame.elide_incoming_saves) {
+            if (pad) program.epilogue.push_back(adjustment(8));
+            for (auto id = saves.rbegin(); id != saves.rend(); ++id) {
+                program.epilogue.push_back(transfer(function.stack_slots[id->value], true, compact));
+            }
+            if (!compact && local != 0) {
+                program.epilogue.push_back(adjustment(static_cast<std::int32_t>(local)));
+            }
+            if (fp_slot) program.epilogue.push_back(transfer(function.stack_slots[fp_slot->value], true, true));
+        }
+        function.frame.program = std::move(program);
+    }
+
+    void emit_frame_instruction(const machine::Instruction& value) {
+        const auto& effect = *value.frame_effect;
+        const auto base = register_name(canonical_storage_view({effect.base.id})->storage_name, 64);
+        switch (decode_opcode(value.opcode)) {
+        case Opcode::FrameAdjust:
+            instruction(effect.stack_delta < 0 ? "subq" : "addq",
+                        "$" + std::to_string(std::abs(effect.stack_delta)) + ", " + base);
+            break;
+        case Opcode::FrameCopy:
+            instruction("movq", base + ", " + register_name(
+                canonical_storage_view({effect.destination->id})->storage_name, 64));
+            break;
+        case Opcode::FramePush:
+        case Opcode::FramePop:
+            instruction(value.opcode == Opcode::FramePush ? "pushq" : "popq",
+                        register_name(canonical_storage_view({effect.transfers.front().reg.id})->storage_name, 64));
+            break;
+        case Opcode::FrameSave:
+        case Opcode::FrameRestore:
+            for (const auto& transfer : effect.transfers) {
+                const auto* view = canonical_storage_view({transfer.reg.id});
+                const bool load = effect.operation == machine::FrameOperation::Restore;
+                const auto reg = "%" + std::string(view->name);
+                const auto address = std::to_string(transfer.offset) + "(" + base + ")";
+                instruction(view->register_class == RegisterClass::simd ? "movdqu" : "movq",
+                            load ? address + ", " + reg : reg + ", " + address);
+            }
+            break;
+        default:
+            diagnostics_.error(value.location, "invalid selected x86-64 frame instruction");
+            break;
+        }
+    }
+
     bool unwind_enabled() const {
         return options_.unwind_tables ||
             options_.asynchronous_unwind_tables;
@@ -9863,16 +10012,14 @@ private:
     }
 
     std::string incoming_memory(std::size_t caller_offset) const {
-        // ABI offsets are relative to the caller's RSP immediately before
-        // `call`.  A frame pointer is established after pushing the caller's
-        // RBP, so that origin is always 16 bytes above %rbp even when %rsp is
-        // subsequently realigned or moved by a VLA.
+        // ABI offsets precede CALL's return-address word and any saved RBP.
         if (realigned_dynamic_frame_) {
             return std::to_string(caller_offset + 24U) + "(%" +
                    dynamic_frame_anchor_register_ + ")";
         }
         if (frame_pointer_active_) {
-            return std::to_string(caller_offset + 16U) + "(%rbp)";
+            return std::to_string(caller_offset + 8U + frame_pointer_save_size_) +
+                   "(%rbp)";
         }
         return memory(
             entry_delta_ + incoming_stack_base_ +
@@ -10536,6 +10683,7 @@ private:
 
     void restore_allocated_preserved_registers(
         const machine::Function& function) {
+        if (function.frame.program) return;
         if (compact_gpr_saves_) {
             if (dwarf_cfi_enabled()) {
                 output_ << ".cfi_remember_state\n";
@@ -21002,6 +21150,12 @@ private:
     }
 
     void emit_frame_teardown(const machine::Function& function) {
+        if (function.frame.program) {
+            for (const auto& instruction : function.frame.program->epilogue) {
+                emit_frame_instruction(instruction);
+            }
+            return;
+        }
         if (compact_gpr_saves_) return;
         if (realigned_dynamic_frame_) {
             instruction(
@@ -21030,7 +21184,7 @@ private:
             instruction("addq", "$" + std::to_string(frame_size_) +
                                     ", %rsp");
         }
-        if (function.frame.has_frame_pointer) {
+        if (function.frame.has_frame_pointer && frame_pointer_save_size_ != 0) {
             instruction("popq", "%rbp");
             // Darwin's compact-unwind assembly path rejects a terminal CFA
             // reset after the frame-pointer pop. The procedure ends at the
@@ -22054,6 +22208,11 @@ private:
         frame_pointer_active_ = function.frame.has_frame_pointer;
         realigned_stack_ = function.frame.stack_alignment > 16;
         realigned_dynamic_frame_ = realigned_stack_ && dynamic_stack_;
+        frame_pointer_save_size_ = function.frame.has_frame_pointer ? 8U : 0U;
+        if (function.frame.elide_incoming_saves && !dynamic_stack_ &&
+            !realigned_stack_) {
+            frame_pointer_save_size_ = 0;
+        }
         compact_gpr_saves_ =
             can_push_allocated_preserved_registers(function, entity);
         compact_gpr_call_pad_ = compact_gpr_saves_ &&
@@ -22180,170 +22339,171 @@ private:
             realigned_stack_
                 ? fixed_cfa_save_size(function)
                 : 0U;
-        if (compact_gpr_saves_) {
-            frame_size_ = static_cast<std::uint32_t>(
-                function.callee_saved_registers.size() * 8U +
-                (compact_gpr_call_pad_ ? 8U : 0U));
-        } else if (realigned_dynamic_frame_) {
-            instruction("pushq", "%rbp");
-            if (seh) output_ << ".seh_pushreg %rbp\n";
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_def_cfa_offset 16\n"
-                           ".cfi_offset %rbp, -16\n";
+        if (function.frame.program) {
+            frame_size_ = function.frame.program->stack_size - frame_pointer_save_size_;
+            for (const auto &instruction : function.frame.program->prologue) {
+                emit_frame_instruction(instruction);
             }
-            instruction("movq", "%rsp, %rbp");
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_def_cfa_register %rbp\n";
-            }
-            instruction(
-                "pushq", "%" + dynamic_frame_anchor_register_);
-            if (seh) {
-                output_ << ".seh_pushreg %"
-                        << dynamic_frame_anchor_register_ << "\n";
-            }
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_offset %"
-                        << dynamic_frame_anchor_register_
-                        << ", -24\n";
-            }
-            instruction(
-                "movq", "%rsp, %" + dynamic_frame_anchor_register_);
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_def_cfa %"
-                        << dynamic_frame_anchor_register_ << ", 24\n";
-            }
-            frame_size_ = storage;
-        } else if (function.frame.has_frame_pointer) {
-            instruction("pushq", "%rbp");
-            if (seh) output_ << ".seh_pushreg %rbp\n";
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_def_cfa_offset 16\n"
-                           ".cfi_offset %rbp, -16\n";
-            }
-            instruction("movq", "%rsp, %rbp");
-            if (seh && !realigned_stack_) {
-                output_ << ".seh_setframe %rbp, 0\n";
-            }
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_def_cfa_register %rbp\n";
-            }
-            frame_size_ = realigned_stack_
-                ? storage : align_up(storage, 16);
-        } else if (red_zone) {
-            const auto span = align_up(storage + 8U, 16U) - 8U;
-            red_zone_base_ = -static_cast<std::int32_t>(span);
-            red_zone_storage_ = storage;
-            frame_size_ = 0;
         } else {
-            const bool needs_frame = storage != 0 || has_calls(function);
-            frame_size_ = needs_frame
-                ? align_up(storage + 8U, 16U) - 8U
-                : 0U;
-        }
-        if (!compact_gpr_saves_ && !red_zone && !realigned_stack_ &&
-            frame_size_ < storage) {
-            frame_size_ = align_up(storage + 8U, 16U) - 8U;
-        }
-        const bool fixed_cfa_realign_prologue = realigned_stack_;
-        if (fixed_cfa_realign_prologue) {
-            if (fixed_cfa_storage != 0) {
-                instruction("subq", "$" + std::to_string(fixed_cfa_storage) +
-                                        ", %rsp");
-                if (seh) {
-                    output_ << ".seh_stackalloc " << fixed_cfa_storage
-                            << '\n';
+            if (compact_gpr_saves_) {
+                frame_size_ = static_cast<std::uint32_t>(
+                    function.callee_saved_registers.size() * 8U +
+                    (compact_gpr_call_pad_ ? 8U : 0U));
+            } else if (realigned_dynamic_frame_) {
+                instruction("pushq", "%rbp");
+                if (seh)
+                    output_ << ".seh_pushreg %rbp\n";
+                if (dwarf_cfi_enabled()) {
+                    output_ << ".cfi_def_cfa_offset 16\n"
+                               ".cfi_offset %rbp, -16\n";
                 }
-            }
-            if (seh) {
-                output_ << ".seh_setframe %"
-                        << (realigned_dynamic_frame_
-                                ? dynamic_frame_anchor_register_
-                                : std::string("rbp"))
-                        << ", " << fixed_cfa_storage
-                        << '\n';
-            }
-            save_allocated_preserved_registers(function, seh);
-            // Win64 cannot encode an arbitrary stack-align instruction. The
-            // stable frame-register relationship and all fixed saves are
-            // complete here; the local aligned region begins after prologue.
-            if (seh) output_ << ".seh_endprologue\n";
-        }
-        if (compact_gpr_saves_) {
-            auto cfa_offset = 8U;
-            for (const auto physical : function.callee_saved_registers) {
-                const auto* view = canonical_storage_view(physical);
-                if (!view) continue;
-                instruction("pushq", "%" +
-                                        std::string(view->storage_name));
+                instruction("movq", "%rsp, %rbp");
+                if (dwarf_cfi_enabled()) {
+                    output_ << ".cfi_def_cfa_register %rbp\n";
+                }
+                instruction("pushq", "%" + dynamic_frame_anchor_register_);
                 if (seh) {
-                    output_ << ".seh_pushreg %" << view->storage_name
-                            << '\n';
+                    output_ << ".seh_pushreg %" << dynamic_frame_anchor_register_
+                            << "\n";
                 }
                 if (dwarf_cfi_enabled()) {
-                    cfa_offset += 8U;
-                    output_ << ".cfi_def_cfa_offset " << cfa_offset
-                            << "\n.cfi_offset %" << view->storage_name
-                            << ", -" << cfa_offset << '\n';
+                    output_ << ".cfi_offset %" << dynamic_frame_anchor_register_
+                            << ", -24\n";
                 }
-            }
-            if (compact_gpr_call_pad_) {
-                instruction("subq", "$8, %rsp");
-                if (seh) output_ << ".seh_stackalloc 8\n";
+                instruction("movq", "%rsp, %" + dynamic_frame_anchor_register_);
                 if (dwarf_cfi_enabled()) {
-                    cfa_offset += 8U;
-                    output_ << ".cfi_def_cfa_offset " << cfa_offset
-                            << '\n';
+                    output_ << ".cfi_def_cfa %" << dynamic_frame_anchor_register_
+                            << ", 24\n";
+                }
+                frame_size_ = storage;
+            } else if (function.frame.has_frame_pointer) {
+                if (frame_pointer_save_size_ != 0)
+                    instruction("pushq", "%rbp");
+                if (seh)
+                    output_ << ".seh_pushreg %rbp\n";
+                if (dwarf_cfi_enabled()) {
+                    output_ << ".cfi_def_cfa_offset 16\n"
+                               ".cfi_offset %rbp, -16\n";
+                }
+                instruction("movq", "%rsp, %rbp");
+                if (seh && !realigned_stack_) {
+                    output_ << ".seh_setframe %rbp, 0\n";
+                }
+                if (dwarf_cfi_enabled()) {
+                    output_ << ".cfi_def_cfa_register %rbp\n";
+                }
+                frame_size_ = realigned_stack_                ? storage
+                              : frame_pointer_save_size_ != 0 ? align_up(storage, 16)
+                              : storage != 0 || has_calls(function)
+                                  ? align_up(storage + 8U, 16U) - 8U
+                                  : 0U;
+            } else if (red_zone) {
+                const auto span = align_up(storage + 8U, 16U) - 8U;
+                red_zone_base_ = -static_cast<std::int32_t>(span);
+                red_zone_storage_ = storage;
+                frame_size_ = 0;
+            } else {
+                const bool needs_frame = storage != 0 || has_calls(function);
+                frame_size_ = needs_frame ? align_up(storage + 8U, 16U) - 8U : 0U;
+            }
+            if (!compact_gpr_saves_ && !red_zone && !realigned_stack_ &&
+                frame_size_ < storage) {
+                frame_size_ = align_up(storage + 8U, 16U) - 8U;
+            }
+            const bool fixed_cfa_realign_prologue = realigned_stack_;
+            if (fixed_cfa_realign_prologue) {
+                if (fixed_cfa_storage != 0) {
+                    instruction("subq",
+                                "$" + std::to_string(fixed_cfa_storage) + ", %rsp");
+                    if (seh) {
+                        output_ << ".seh_stackalloc " << fixed_cfa_storage << '\n';
+                    }
+                }
+                if (seh) {
+                    output_ << ".seh_setframe %"
+                            << (realigned_dynamic_frame_
+                                    ? dynamic_frame_anchor_register_
+                                    : std::string("rbp"))
+                            << ", " << fixed_cfa_storage << '\n';
+                }
+                save_allocated_preserved_registers(function, seh);
+                // Win64 cannot encode an arbitrary stack-align instruction. The
+                // stable frame-register relationship and all fixed saves are
+                // complete here; the local aligned region begins after prologue.
+                if (seh)
+                    output_ << ".seh_endprologue\n";
+            }
+            if (compact_gpr_saves_) {
+                auto cfa_offset = 8U;
+                for (const auto physical : function.callee_saved_registers) {
+                    const auto *view = canonical_storage_view(physical);
+                    if (!view)
+                        continue;
+                    instruction("pushq", "%" + std::string(view->storage_name));
+                    if (seh) {
+                        output_ << ".seh_pushreg %" << view->storage_name << '\n';
+                    }
+                    if (dwarf_cfi_enabled()) {
+                        cfa_offset += 8U;
+                        output_ << ".cfi_def_cfa_offset " << cfa_offset
+                                << "\n.cfi_offset %" << view->storage_name << ", -"
+                                << cfa_offset << '\n';
+                    }
+                }
+                if (compact_gpr_call_pad_) {
+                    instruction("subq", "$8, %rsp");
+                    if (seh)
+                        output_ << ".seh_stackalloc 8\n";
+                    if (dwarf_cfi_enabled()) {
+                        cfa_offset += 8U;
+                        output_ << ".cfi_def_cfa_offset " << cfa_offset << '\n';
+                    }
+                }
+            } else if (!red_zone && static_frame_needs_probe(function)) {
+                emit_probed_static_frame(function, realigned_dynamic_frame_
+                                                       ? fixed_cfa_storage + 8U
+                                                       : fixed_cfa_storage);
+            } else if (realigned_stack_) {
+                if (frame_size_ != 0) {
+                    instruction("subq", "$" +
+                                            std::to_string(
+                                                frame_size_ +
+                                                (realigned_dynamic_frame_ ? 8U : 0U)) +
+                                            ", %rsp");
+                }
+                instruction("andq", "$-" +
+                                        std::to_string(function.frame.stack_alignment) +
+                                        ", %rsp");
+            } else if (frame_size_ != 0) {
+                instruction("subq", "$" + std::to_string(frame_size_) + ", %rsp");
+                if (seh) {
+                    output_ << ".seh_stackalloc " << frame_size_ << "\n";
+                }
+                if (dwarf_cfi_enabled() && !function.frame.has_frame_pointer) {
+                    output_ << ".cfi_def_cfa_offset " << frame_size_ + 8U << '\n';
                 }
             }
-        } else if (!red_zone && static_frame_needs_probe(function)) {
-            emit_probed_static_frame(
-                function, realigned_dynamic_frame_
-                    ? fixed_cfa_storage + 8U : fixed_cfa_storage);
-        } else if (realigned_stack_) {
-            if (frame_size_ != 0) {
-                instruction("subq", "$" + std::to_string(
-                                            frame_size_ +
-                                            (realigned_dynamic_frame_
-                                                 ? 8U : 0U)) +
-                                        ", %rsp");
+            if (realigned_dynamic_frame_) {
+                instruction("movq", "%rsp, %rbp");
+                const auto anchor =
+                    named_slot_offset(function, "$dynamic.frame.anchor");
+                if (!anchor) {
+                    diagnostics_.error(
+                        function.location,
+                        "realigned dynamic frame has no anchor spill slot");
+                    return;
+                }
+                instruction("movq", "%" + dynamic_frame_anchor_register_ + ", " +
+                                        memory(*anchor));
             }
-            instruction(
-                "andq",
-                "$-" + std::to_string(function.frame.stack_alignment) +
-                    ", %rsp");
-        } else if (frame_size_ != 0) {
-            instruction("subq", "$" + std::to_string(frame_size_) +
-                                    ", %rsp");
-            if (seh) {
-                output_ << ".seh_stackalloc " << frame_size_ << "\n";
-            }
-            if (dwarf_cfi_enabled() &&
-                !function.frame.has_frame_pointer) {
-                output_ << ".cfi_def_cfa_offset "
-                        << frame_size_ + 8U
-                        << '\n';
+            if (!fixed_cfa_realign_prologue) {
+                save_allocated_preserved_registers(function, seh);
+                if (seh)
+                    output_ << ".seh_endprologue\n";
             }
         }
-        if (realigned_dynamic_frame_) {
-            instruction("movq", "%rsp, %rbp");
-            const auto anchor = named_slot_offset(
-                function, "$dynamic.frame.anchor");
-            if (!anchor) {
-                diagnostics_.error(
-                    function.location,
-                    "realigned dynamic frame has no anchor spill slot");
-                return;
-            }
-            instruction(
-                "movq", "%" + dynamic_frame_anchor_register_ + ", " +
-                            memory(*anchor));
-        }
-        if (!fixed_cfa_realign_prologue) {
-            save_allocated_preserved_registers(function, seh);
-            if (seh) output_ << ".seh_endprologue\n";
-        }
-        entry_delta_ = static_cast<std::int32_t>(
-            frame_size_ + (function.frame.has_frame_pointer ? 8U : 0U));
+        entry_delta_ =
+            static_cast<std::int32_t>(frame_size_ + frame_pointer_save_size_);
         // ABI stack-piece offsets are relative to the caller's RSP
         // immediately before call. At callee entry only the return-address
         // word precedes them.
@@ -22477,6 +22637,7 @@ private:
     std::vector<DeferredEdgeStub> deferred_edge_stubs_;
     std::uint32_t next_label_{};
     std::uint32_t frame_size_{};
+    std::uint32_t frame_pointer_save_size_{};
     std::int32_t red_zone_base_{};
     std::uint32_t red_zone_storage_{};
     std::int32_t entry_delta_{};
@@ -22520,9 +22681,14 @@ machine::Module lower_managed_machine(const mir::ManagedModule& managed,
                                       const Subtarget& subtarget,
                                       const CompilerOptions& options,
                                       Diagnostics& diagnostics) {
-    return MachineLowerer(
+    auto result = MachineLowerer(
         managed, hir_module, manual_plans, dynamic_plans, subtarget, options,
         diagnostics).run();
+    if (diagnostics.errors() == 0) {
+        AssemblyEmitter(result, hir_module, manual_plans, dynamic_plans, subtarget,
+                        options, diagnostics).prepare_frames();
+    }
+    return result;
 }
 
 std::string emit_managed_machine_assembly(machine::Module& module,
