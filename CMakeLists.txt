@@ -262,6 +262,10 @@ if(BUILD_TESTING)
         -DCC=$<TARGET_FILE:cross_cc>
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-mips
         -P "${CMAKE_SOURCE_DIR}/test/backend/indirect/mips.cmake")
+    add_test(NAME cross_aggregate_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-mips
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/aggregate.cmake")
     add_test(NAME cross_indirect_errors COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-errors

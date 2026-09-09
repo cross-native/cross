@@ -633,6 +633,12 @@ private:
         value_registers_.assign(source.values.size(), std::nullopt);
         for (const auto& value : source.values) {
             if (!has_result(value)) continue;
+            if (is_aggregate(hir_, value.type) &&
+                type_bits(hir_, value.type) >
+                    std::numeric_limits<std::uint16_t>::max()) {
+                unsupported(value,
+                            "aggregate SSA values larger than 8191 bytes");
+            }
             const auto mode = mode_for(hir_, value.type);
             if (!mode.valid()) {
                 diagnostics_.error(value.location,
@@ -655,11 +661,11 @@ private:
                     value.location,
                     "the selected MIPS CPU has a single-precision-only FPU");
             }
-            if (mode.bits > 64 || is_vector(hir_, value.type) ||
-                is_aggregate(hir_, value.type)) {
+            if ((!is_aggregate(hir_, value.type) && mode.bits > 64) ||
+                is_vector(hir_, value.type)) {
                 unsupported(value, mode.bits > 64
                                        ? "scalar values wider than 64 bits"
-                                       : "aggregate or vector SSA values");
+                                       : "vector SSA values");
             }
             const machine::VirtualRegisterId id{
                 static_cast<std::uint32_t>(current_.virtual_registers.size())};
@@ -667,11 +673,27 @@ private:
             current_.virtual_register_assignments.push_back(std::nullopt);
             current_.rematerialized_immediates.push_back(std::nullopt);
             current_.virtual_register_classes.push_back(
-                is_floating(hir_, value.type)
+                is_aggregate(hir_, value.type)
+                    ? machine::VirtualRegisterClass::Memory
+                : is_floating(hir_, value.type)
                     ? machine::VirtualRegisterClass::Floating
                     : machine::VirtualRegisterClass::Integer);
             value_registers_[value.id.value] = id;
         }
+    }
+
+    bool unaligned_pointer_access(const mir::ManagedValue& value) const {
+        if ((value.kind != mir::ValueKind::PointerLoad &&
+             value.kind != mir::ValueKind::PointerStore) ||
+            value.memory_alignment == 0)
+            return false;
+        const auto type =
+            value.kind == mir::ValueKind::PointerLoad
+                ? value.type
+                : source_->values[value.operands.back().value].type;
+        return !is_aggregate(hir_, type) &&
+               value.memory_alignment <
+                   storage_size(hir_, type, subtarget_.target().data_layout);
     }
 
     void create_stack_slots(const mir::ManagedFunction& source) {
@@ -723,14 +745,53 @@ private:
             spill.id = {
                 static_cast<std::uint32_t>(current_.stack_slots.size())};
             spill.kind = machine::StackSlotKind::Spill;
-            spill.size = floating ? std::max(4U, (mode.bits + 7U) / 8U)
-                                  : mode.bits > 32 ? 8U : 4U;
+            const bool aggregate = current_.virtual_register_classes[index] ==
+                                   machine::VirtualRegisterClass::Memory;
+            spill.size = aggregate        ? (mode.bits + 7U) / 8U
+                         : floating       ? std::max(4U, (mode.bits + 7U) / 8U)
+                         : mode.bits > 32 ? 8U
+                                          : 4U;
             spill.alignment = spill.size >= 8 ? 8U : 4U;
             spill.location = source.location;
             spill.name = "$v" + std::to_string(index);
             spill.spill_for = machine::VirtualRegisterId{
                 static_cast<std::uint32_t>(index)};
             current_.stack_slots.push_back(std::move(spill));
+        }
+        // Parallel aggregate PHI copies first snapshot their sources. Each
+        // destination owns a separate cell, so cycles never overwrite a source.
+        for (const auto& value : source.values) {
+            if (value.kind != mir::ValueKind::Phi ||
+                !is_aggregate(hir_, value.type))
+                continue;
+            machine::StackSlot temporary;
+            temporary.id = {
+                static_cast<std::uint32_t>(current_.stack_slots.size())};
+            temporary.kind = machine::StackSlotKind::Local;
+            temporary.size = storage_size(hir_, value.type, layout);
+            temporary.alignment = storage_alignment(hir_, value.type, layout);
+            temporary.location = value.location;
+            temporary.name =
+                "$aggregate.phi." + std::to_string(reg(value.id).id);
+            current_.stack_slots.push_back(std::move(temporary));
+        }
+        if (std::find(current_.virtual_register_classes.begin(),
+                      current_.virtual_register_classes.end(),
+                      machine::VirtualRegisterClass::Memory) !=
+                current_.virtual_register_classes.end() ||
+            std::any_of(source.values.begin(), source.values.end(),
+                        [this](const mir::ManagedValue& value) {
+                            return unaligned_pointer_access(value);
+                        })) {
+            machine::StackSlot carrier;
+            carrier.id = {
+                static_cast<std::uint32_t>(current_.stack_slots.size())};
+            carrier.kind = machine::StackSlotKind::Local;
+            carrier.size = 8;
+            carrier.alignment = 8;
+            carrier.location = source.location;
+            carrier.name = "$aggregate.carrier";
+            current_.stack_slots.push_back(std::move(carrier));
         }
     }
 
@@ -766,6 +827,89 @@ private:
 
     machine::Instruction lower_value(const mir::ManagedValue& value) {
         using mir::ValueKind;
+        const bool aggregate_load = is_aggregate(hir_, value.type) &&
+                                    (value.kind == ValueKind::Load ||
+                                     value.kind == ValueKind::PointerLoad ||
+                                     value.kind == ValueKind::GlobalLoad ||
+                                     value.kind == ValueKind::IndexedLoad);
+        const bool store = value.kind == ValueKind::Store ||
+                           value.kind == ValueKind::PointerStore ||
+                           value.kind == ValueKind::GlobalStore;
+        const bool aggregate_store =
+            store && !value.operands.empty() &&
+            is_aggregate(hir_,
+                         source_->values[value.operands.back().value].type);
+        if (aggregate_load || aggregate_store) {
+            auto result =
+                target_instruction(aggregate_store ? Opcode::AggregateStore
+                                   : value.kind == ValueKind::IndexedLoad
+                                       ? Opcode::AggregateIndexedLoad
+                                       : Opcode::AggregateLoad,
+                                   value.location);
+            if (value.slot) {
+                result.operands.push_back(
+                    stack_operand({value.slot->value}, machine::i8));
+            } else if (value.object) {
+                result.operands.push_back(machine::SymbolOperand{
+                    hir_.object(*value.object).link_symbol, 0, false,
+                    value.object});
+            }
+            for (const auto operand : value.operands) {
+                const auto source = reg(operand);
+                result.operands.push_back(register_operand(source));
+                result.uses.push_back(source);
+            }
+            if (value.kind == ValueKind::IndexedLoad) {
+                result.operands.push_back(immediate_operand(
+                    storage_size(hir_, value.type,
+                                 subtarget_.target().data_layout),
+                    0, machine::i32));
+            }
+            if (aggregate_load) result.defs.push_back(reg(value.id));
+            // Both directions read and write storage, including the SSA home.
+            result.may_load = true;
+            result.may_store = true;
+            result.has_side_effects =
+                aggregate_store || value.is_volatile_access;
+            for (const auto id : {1U, 8U}) {
+                result.clobbers.push_back(
+                    machine::Register::physical_register({id}, machine::i64));
+            }
+            if (value.kind == ValueKind::IndexedLoad) {
+                for (const auto id : {9U, 10U, 11U}) {
+                    result.clobbers.push_back(
+                        machine::Register::physical_register({id},
+                                                             machine::i64));
+                }
+            }
+            return result;
+        }
+        if (unaligned_pointer_access(value)) {
+            const bool load = value.kind == ValueKind::PointerLoad;
+            const auto type =
+                load ? value.type
+                     : source_->values[value.operands.back().value].type;
+            auto result = target_instruction(
+                !load                           ? Opcode::UnalignedStore
+                : is_signed_integer(hir_, type) ? Opcode::UnalignedLoadSigned
+                                                : Opcode::UnalignedLoadUnsigned,
+                value.location);
+            for (const auto operand : value.operands) {
+                const auto source = reg(operand);
+                result.operands.push_back(register_operand(source));
+                result.uses.push_back(source);
+            }
+            if (load) result.defs.push_back(reg(value.id));
+            result.may_load = true;
+            result.may_store = true;
+            result.has_side_effects = !load || value.is_volatile_access;
+            for (const auto id :
+                 {1U, 8U, 9U, 10U, fpr_physical_base, fpr_physical_base + 1U}) {
+                result.clobbers.push_back(
+                    machine::Register::physical_register({id}, machine::i64));
+            }
+            return result;
+        }
         if (value.kind == ValueKind::Parameter) {
             auto result = target_instruction(
                 is_floating(hir_, value.type) ? Opcode::Fparameter
@@ -774,6 +918,10 @@ private:
             result.operands.push_back(immediate_operand(
                 value.parameter_index, 0, machine::i32));
             result.defs.push_back(reg(value.id));
+            const auto& parameters = hir_.function(source_->source).parameters;
+            result.has_side_effects =
+                value.parameter_index < parameters.size() &&
+                parameters[value.parameter_index].mode != ParameterMode::In;
             return result;
         }
         if (value.kind == ValueKind::ConstantInteger ||
@@ -1554,6 +1702,9 @@ private:
                  function_layout->call.arguments) {
                 append_endpoints(assignment.pieces);
                 append_endpoints(assignment.shadows);
+            }
+            for (const auto& result : function_layout->results) {
+                if (result.indirect) append_endpoints(result.pieces);
             }
         }
         for (const auto& block : function.blocks) {
@@ -2778,6 +2929,12 @@ private:
             return true;
         }
         switch (decode_opcode(instruction.opcode)) {
+        case Opcode::UnalignedLoadSigned:
+        case Opcode::UnalignedLoadUnsigned:
+        case Opcode::UnalignedStore:
+        case Opcode::AggregateLoad:
+        case Opcode::AggregateStore:
+        case Opcode::AggregateIndexedLoad:
         case Opcode::Parameter:
         case Opcode::Fparameter:
         case Opcode::Phi:
@@ -2859,6 +3016,7 @@ private:
         const machine::Instruction& instruction) const {
         const auto opcode = decode_opcode(instruction.opcode);
         if (opcode != Opcode::IndexedAddress &&
+            opcode != Opcode::AggregateIndexedLoad &&
             opcode != Opcode::IndexedLoadSigned &&
             opcode != Opcode::IndexedLoadUnsigned &&
             opcode != Opcode::FindexedLoad) {
@@ -3715,6 +3873,12 @@ private:
                 if (!options_.machine_cse) return false;
                 const auto eligible = [](const machine::Instruction& value) {
                     switch (decode_opcode(value.opcode)) {
+                    case Opcode::UnalignedLoadSigned:
+                    case Opcode::UnalignedLoadUnsigned:
+                    case Opcode::UnalignedStore:
+                    case Opcode::AggregateLoad:
+                    case Opcode::AggregateStore:
+                    case Opcode::AggregateIndexedLoad:
                     case Opcode::None:
                     case Opcode::Parameter:
                     case Opcode::Fparameter:
@@ -4932,6 +5096,22 @@ private:
 
     void prepare_parameter_homes(machine::Function& function) {
         if (!active_signature_) return;
+        if (!active_signature_->layout.results.empty() &&
+            active_signature_->layout.results.front().indirect) {
+            const auto& pieces =
+                active_signature_->layout.results.front().pieces;
+            for (std::size_t index = 0; index < pieces.size(); ++index) {
+                machine::StackSlot home;
+                home.id = {
+                    static_cast<std::uint32_t>(function.stack_slots.size())};
+                home.kind = machine::StackSlotKind::IncomingArgument;
+                home.size = address_bytes();
+                home.alignment = home.size;
+                home.location = function.location;
+                home.name = "$aggregate.sret." + std::to_string(index);
+                function.stack_slots.push_back(std::move(home));
+            }
+        }
         for (std::size_t index = 0;
              index < active_signature_->layout.call.arguments.size();
              ++index) {
@@ -4959,6 +5139,33 @@ private:
 
     void emit_parameter_homes(const machine::Function& function) {
         if (!active_signature_) return;
+        if (!active_signature_->layout.results.empty() &&
+            active_signature_->layout.results.front().indirect) {
+            const auto& pieces =
+                active_signature_->layout.results.front().pieces;
+            for (std::size_t index = 0; index < pieces.size(); ++index) {
+                const auto* home = named_slot(
+                    function, "$aggregate.sret." + std::to_string(index));
+                if (!home || !home->frame_offset) {
+                    diagnostics_.error(
+                        function.location,
+                        "MIPS indirect result pointer has no frame home");
+                    return;
+                }
+                const auto& piece = pieces[index];
+                if (piece.location.kind == LocationKind::Register) {
+                    instruction(address_store(),
+                                reg_name(piece.location.reg) + "," +
+                                    memory(*home->frame_offset));
+                } else {
+                    instruction(address_load(),
+                                "$at," + incoming_memory(
+                                             piece, *active_signature_->abi));
+                    instruction(address_store(),
+                                "$at," + memory(*home->frame_offset));
+                }
+            }
+        }
         std::vector<std::string> saved;
         for (std::size_t index = 0;
              index < active_signature_->layout.call.arguments.size();
@@ -5414,6 +5621,28 @@ private:
         }
     }
 
+    bool aggregate_vreg(const machine::Function& function,
+                        machine::Register value) const {
+        return value.kind == machine::RegisterKind::Virtual &&
+               value.id < function.virtual_register_classes.size() &&
+               function.virtual_register_classes[value.id] ==
+                   machine::VirtualRegisterClass::Memory &&
+               value.mode.bits >= 8;
+    }
+
+    void copy_bytes(std::string_view destination_base, std::int64_t destination,
+                    std::string_view source_base, std::int64_t source,
+                    unsigned bytes) {
+        // Homes are disjoint from source-language objects. Byte accesses also
+        // handle packed records and preserve object representation on either
+        // endian. No implicit memcpy helper or alignment assumption is needed.
+        for (unsigned index = 0; index < bytes; ++index) {
+            instruction("lbu", "$at," + memory(source + index, source_base));
+            instruction("sb",
+                        "$at," + memory(destination + index, destination_base));
+        }
+    }
+
     void copy_vreg(const machine::Function& function,
                    machine::Register target, machine::Register source,
                    SourceLocation location) {
@@ -5421,7 +5650,11 @@ private:
             target.id < function.virtual_register_classes.size() &&
             function.virtual_register_classes[target.id] ==
                 machine::VirtualRegisterClass::Floating;
-        if (floating) {
+        if (aggregate_vreg(function, target)) {
+            copy_bytes(frame_base(), vreg_offset(function, target, location),
+                       frame_base(), vreg_offset(function, source, location),
+                       target.mode.bits / 8U);
+        } else if (floating) {
             load_fvreg(function, source, "f0", location);
             store_fvreg(function, target, "f0", location);
         } else if (legalizes_to_pair(target)) {
@@ -5431,6 +5664,157 @@ private:
             load_vreg(function, source, "t0", location);
             store_vreg(function, target, "t0", location);
         }
+    }
+
+    bool valid_aggregate_piece(machine::Register value, const ValuePiece& piece,
+                               SourceLocation location) {
+        const auto bits = piece.indirect_value_bits != 0
+                              ? piece.indirect_value_bits
+                              : piece.value_bits;
+        if (piece.value_bit_offset % 8U != 0 || bits % 8U != 0 ||
+            static_cast<unsigned>(piece.value_bit_offset) + bits >
+                value.mode.bits ||
+            (piece.location.kind == LocationKind::Register &&
+             (piece.carrier_bits < piece.value_bits ||
+              piece.carrier_bits > 64 ||
+              (piece.carrier_bits > 32 && !fpr(piece.location.reg) &&
+               !subtarget_.has_feature(Feature::Mips3))))) {
+            diagnostics_.error(
+                location,
+                "MIPS aggregate ABI piece has an unsupported size or offset");
+            return false;
+        }
+        if (piece.location.kind == LocationKind::Register &&
+            fpr(piece.location.reg) &&
+            (!subtarget_.has_feature(Feature::HardFloat) ||
+             (piece.carrier_bits > 32 &&
+              subtarget_.has_feature(Feature::SingleFloat)))) {
+            diagnostics_.error(location,
+                               "MIPS aggregate ABI requires an unavailable "
+                               "floating register carrier");
+            return false;
+        }
+        return true;
+    }
+
+    std::int64_t aggregate_carrier_offset(const machine::Function& function,
+                                          SourceLocation location) {
+        const auto* slot = named_slot(function, "$aggregate.carrier");
+        if (!slot || !slot->frame_offset) {
+            diagnostics_.error(
+                location, "MIPS aggregate ABI transport has no carrier cell");
+            return 0;
+        }
+        return *slot->frame_offset;
+    }
+
+    void place_aggregate_piece(const machine::Function& function,
+                               machine::Register source,
+                               const ValuePiece& piece,
+                               SourceLocation location) {
+        if (!valid_aggregate_piece(source, piece, location)) return;
+        const auto offset =
+            static_cast<std::int64_t>(vreg_offset(function, source, location)) +
+            piece.value_bit_offset / 8U;
+        if (piece.indirect_value_bits != 0) {
+            instruction(address_add_immediate(),
+                        "$at," + reg_name(frame_base()) + "," +
+                            std::to_string(offset));
+            apply_abi_register_extension("at", piece);
+            if (piece.location.kind == LocationKind::Register) {
+                instruction("move", reg_name(piece.location.reg) + ",$at");
+            } else {
+                instruction(address_store(),
+                            "$at," + memory(static_cast<std::int64_t>(
+                                                piece.location.stack_offset),
+                                            "sp"));
+            }
+            return;
+        }
+        if (piece.location.kind == LocationKind::Stack) {
+            copy_bytes("sp",
+                       static_cast<std::int64_t>(piece.location.stack_offset),
+                       frame_base(), offset, piece.value_bits / 8U);
+            return;
+        }
+        const auto carrier = aggregate_carrier_offset(function, location);
+        for (unsigned byte = 0; byte < (piece.carrier_bits + 7U) / 8U; ++byte) {
+            instruction("sb", "$zero," + memory(carrier + byte));
+        }
+        // Aggregate offsets describe address-ordered object bytes, not scalar
+        // significance. A short piece occupies the beginning of its carrier
+        // on both endians (high bits on big endian, low bits on little endian).
+        copy_bytes(frame_base(), carrier, frame_base(), offset,
+                   piece.value_bits / 8U);
+        if (fpr(piece.location.reg)) {
+            if (piece.carrier_bits != 32 && piece.carrier_bits != 64) {
+                diagnostics_.error(
+                    location,
+                    "MIPS floating aggregate carrier must be 32 or 64 bits");
+                return;
+            }
+            instruction(piece.carrier_bits == 32 ? "lwc1" : "ldc1",
+                        reg_name(piece.location.reg) + "," + memory(carrier));
+        } else {
+            load_integer_memory(piece.location.reg, memory(carrier),
+                                piece.carrier_bits, false);
+            apply_abi_register_extension(piece.location.reg, piece);
+        }
+    }
+
+    void capture_aggregate_piece(const machine::Function& function,
+                                 machine::Register target,
+                                 const ValuePiece& piece, const AbiEntry& abi,
+                                 bool parameter_entry,
+                                 SourceLocation location) {
+        if (!valid_aggregate_piece(target, piece, location)) return;
+        const auto destination =
+            static_cast<std::int64_t>(vreg_offset(function, target, location)) +
+            piece.value_bit_offset / 8U;
+        if (piece.indirect_value_bits != 0) {
+            load_abi_piece(function, piece, abi, "t0", parameter_entry);
+            normalize_integer("t0", hir_.address_bits, true);
+            copy_bytes(frame_base(), destination, "t0", 0,
+                       piece.indirect_value_bits / 8U);
+            return;
+        }
+        std::string_view base = frame_base();
+        std::int64_t offset{};
+        if (piece.location.kind == LocationKind::Stack) {
+            offset = static_cast<std::int64_t>(piece.location.stack_offset);
+            if (parameter_entry)
+                offset += frame_size_ + abi.return_address_bytes;
+            else
+                base = "sp";
+        } else if (parameter_entry) {
+            const auto* home =
+                named_slot(function, parameter_home_name(piece.location.reg));
+            if (!home || !home->frame_offset) {
+                diagnostics_.error(
+                    location,
+                    "MIPS aggregate parameter register has no frame home");
+                return;
+            }
+            offset = *home->frame_offset;
+        } else {
+            offset = aggregate_carrier_offset(function, location);
+            if (fpr(piece.location.reg)) {
+                if (piece.carrier_bits != 32 && piece.carrier_bits != 64) {
+                    diagnostics_.error(location,
+                                       "MIPS floating aggregate carrier must "
+                                       "be 32 or 64 bits");
+                    return;
+                }
+                instruction(piece.carrier_bits == 32 ? "swc1" : "sdc1",
+                            reg_name(piece.location.reg) + "," +
+                                memory(offset));
+            } else {
+                store_integer_memory(piece.location.reg, memory(offset),
+                                     piece.carrier_bits);
+            }
+        }
+        copy_bytes(frame_base(), destination, base, offset,
+                   piece.value_bits / 8U);
     }
 
     std::uint32_t outgoing_size(const machine::Function& function) {
@@ -5664,6 +6048,43 @@ private:
         if (assignment.pieces.empty()) {
             diagnostics_.error(value.location,
                                "MIPS ABI parameter has no transport piece");
+            return;
+        }
+        if (is_aggregate(hir_, parameter.type)) {
+            if (parameter.mode != ParameterMode::In) {
+                const auto* pointer =
+                    named_slot(function, "$paramptr." + std::to_string(index));
+                if (!pointer || !pointer->frame_offset) {
+                    diagnostics_.error(
+                        value.location,
+                        "MIPS aggregate output parameter has no pointer home");
+                    return;
+                }
+                load_abi_piece(function, assignment.pieces.front(),
+                               *active_signature_->abi, "t0", true);
+                normalize_integer("t0", hir_.address_bits, true);
+                instruction(address_store(),
+                            "$t0," + memory(*pointer->frame_offset));
+                const auto home = vreg_offset(function, target, value.location);
+                if (parameter.mode == ParameterMode::Out) {
+                    for (unsigned byte = 0; byte < target.mode.bits / 8U;
+                         ++byte) {
+                        instruction(
+                            "sb",
+                            "$zero," +
+                                memory(static_cast<std::int64_t>(home) + byte));
+                    }
+                } else {
+                    copy_bytes(frame_base(), home, "t0", 0,
+                               target.mode.bits / 8U);
+                }
+            } else {
+                for (const auto& piece : assignment.pieces) {
+                    capture_aggregate_piece(function, target, piece,
+                                            *active_signature_->abi, true,
+                                            value.location);
+                }
+            }
             return;
         }
         if (value.input_projection) {
@@ -5941,7 +6362,10 @@ private:
             instruction(address_load(),
                         "$t0," + memory(*pointer->frame_offset));
             const auto bits = type_bits(hir_, parameter.type);
-            if (is_floating(hir_, parameter.type)) {
+            if (is_aggregate(hir_, parameter.type)) {
+                copy_bytes("t0", 0, frame_base(), *local->frame_offset,
+                           bits / 8U);
+            } else if (is_floating(hir_, parameter.type)) {
                 instruction(bits == 32 ? "lwc1" : "ldc1",
                             "$f0," + memory(*local->frame_offset));
                 instruction(bits == 32 ? "swc1" : "sdc1",
@@ -6140,6 +6564,18 @@ private:
                              const machine::Instruction& call,
                              const ActiveSignature& signature) {
         if (call.defs.empty()) return;
+        if (aggregate_vreg(function, call.defs.front()) &&
+            !signature.layout.results.empty()) {
+            const auto& result = signature.layout.results.front();
+            if (!result.indirect) {
+                for (const auto& piece : result.pieces) {
+                    capture_aggregate_piece(function, call.defs.front(), piece,
+                                            *signature.abi, false,
+                                            call.location);
+                }
+            }
+            return;
+        }
         if (signature.layout.results.empty() ||
             signature.layout.results.front().pieces.empty() ||
             signature.layout.results.front().indirect) {
@@ -6377,6 +6813,20 @@ private:
             return;
         }
         if (!tail) spill_call_live_registers(function, call);
+        if (!signature->layout.results.empty() &&
+            signature->layout.results.front().indirect) {
+            if (call.defs.empty() ||
+                !aggregate_vreg(function, call.defs.front())) {
+                diagnostics_.error(call.location,
+                                   "MIPS indirect call result requires an "
+                                   "aggregate destination");
+                return;
+            }
+            for (const auto& piece : signature->layout.results.front().pieces) {
+                place_aggregate_piece(function, call.defs.front(), piece,
+                                      call.location);
+            }
+        }
         for (std::size_t index = 0;
              index < signature->layout.call.arguments.size(); ++index) {
             const auto& assignment =
@@ -6394,6 +6844,17 @@ private:
                 std::get_if<machine::RegisterOperand>(&operand);
             if (!source_operand) continue;
             const auto source = source_operand->value;
+            if (aggregate_vreg(function, source)) {
+                for (const auto& piece : assignment.pieces) {
+                    place_aggregate_piece(function, source, piece,
+                                          call.location);
+                }
+                for (const auto& piece : assignment.shadows) {
+                    place_aggregate_piece(function, source, piece,
+                                          call.location);
+                }
+                continue;
+            }
             const bool floating =
                 index < call.call_argument_types.size() &&
                 is_floating(hir_, call.call_argument_types[index]);
@@ -6641,13 +7102,48 @@ private:
             } else {
                 const auto& result =
                     active_signature_->layout.results.front();
-                if (result.indirect || result.pieces.empty()) {
+                if (is_aggregate(hir_, entity.result_type)) {
+                    const auto source = value.uses.front();
+                    for (std::size_t index = 0; index < result.pieces.size();
+                         ++index) {
+                        const auto& piece = result.pieces[index];
+                        if (!result.indirect) {
+                            place_aggregate_piece(function, source, piece,
+                                                  value.location);
+                            continue;
+                        }
+                        if (!valid_aggregate_piece(source, piece,
+                                                   value.location))
+                            continue;
+                        const auto* pointer =
+                            named_slot(function, "$aggregate.sret." +
+                                                     std::to_string(index));
+                        if (!pointer || !pointer->frame_offset) {
+                            diagnostics_.error(value.location,
+                                               "MIPS aggregate result has no "
+                                               "hidden pointer home");
+                            continue;
+                        }
+                        instruction(address_load(),
+                                    "$t0," + memory(*pointer->frame_offset));
+                        normalize_integer("t0", hir_.address_bits, true);
+                        copy_bytes("t0", 0, frame_base(),
+                                   static_cast<std::int64_t>(vreg_offset(
+                                       function, source, value.location)) +
+                                       piece.value_bit_offset / 8U,
+                                   piece.indirect_value_bits / 8U);
+                        if (!result.indirect_result_reg.empty() && index == 0) {
+                            instruction("move",
+                                        reg_name(result.indirect_result_reg) +
+                                            ",$t0");
+                        }
+                    }
+                } else if (result.indirect || result.pieces.empty()) {
                     diagnostics_.error(
                         value.location,
                         "MIPS indirect function results are not implemented yet");
-                } else if (place_composed_return(
-                               function, value, result,
-                               fallthrough_epilogue)) {
+                } else if (place_composed_return(function, value, result,
+                                                 fallthrough_epilogue)) {
                     return;
                 } else {
                     const auto source = value.uses.front();
@@ -8449,16 +8945,115 @@ void AssemblyEmitter::emit_phi_edge_copies(
         copy_vreg(function, copy.target, copy.source, copy.location);
     };
     resolve(floating_copies, save_floating_target, emit_floating_copy);
+    for (const auto& copy : fallback_copies) {
+        if (!aggregate_vreg(function, copy.target)) continue;
+        const auto* temporary = named_slot(
+            function, "$aggregate.phi." + std::to_string(copy.target.id));
+        if (!temporary || !temporary->frame_offset) {
+            diagnostics_.error(copy.location,
+                               "MIPS aggregate PHI has no copy cell");
+            return;
+        }
+        copy_bytes(frame_base(), *temporary->frame_offset, frame_base(),
+                   vreg_offset(function, copy.source, copy.location),
+                   copy.target.mode.bits / 8U);
+    }
     // Pre-MIPS-III register-pair phis retain their established lowering until
     // the paired-GPR class gains a dedicated allocator.
     for (const auto& copy : fallback_copies) {
-        copy_vreg(function, copy.target, copy.source, copy.location);
+        if (aggregate_vreg(function, copy.target)) {
+            const auto* temporary = named_slot(
+                function, "$aggregate.phi." + std::to_string(copy.target.id));
+            copy_bytes(frame_base(),
+                       vreg_offset(function, copy.target, copy.location),
+                       frame_base(), *temporary->frame_offset,
+                       copy.target.mode.bits / 8U);
+        } else {
+            copy_vreg(function, copy.target, copy.source, copy.location);
+        }
     }
 }
 
 void AssemblyEmitter::emit_target(const machine::Function& function,
                                   const machine::Instruction& value) {
     const auto opcode = decode_opcode(value.opcode);
+    if (opcode == Opcode::UnalignedLoadSigned ||
+        opcode == Opcode::UnalignedLoadUnsigned ||
+        opcode == Opcode::UnalignedStore) {
+        const auto address =
+            input_gpr(function, value.uses.front(), "t0", value.location);
+        const bool load = opcode != Opcode::UnalignedStore;
+        const auto scalar = load ? value.defs.front() : value.uses.back();
+        const bool floating = scalar.kind == machine::RegisterKind::Virtual &&
+                              function.virtual_register_classes[scalar.id] ==
+                                  machine::VirtualRegisterClass::Floating;
+        const auto carrier = aggregate_carrier_offset(function, value.location);
+        if (load) {
+            copy_bytes(frame_base(), carrier, address, 0,
+                       (scalar.mode.bits + 7U) / 8U);
+            if (floating) {
+                instruction(scalar.mode.bits == 32 ? "lwc1" : "ldc1",
+                            "$f0," + memory(carrier));
+                store_fvreg(function, scalar, "f0", value.location);
+            } else if (legalizes_to_pair(scalar)) {
+                load_pair_memory("t1", "t2", carrier);
+                store_vreg_pair(function, scalar, "t1", "t2", value.location);
+            } else {
+                load_integer_memory("t1", memory(carrier), scalar.mode.bits,
+                                    opcode == Opcode::UnalignedLoadSigned);
+                store_vreg(function, scalar, "t1", value.location);
+            }
+        } else {
+            if (floating) {
+                const auto source =
+                    input_fpr(function, scalar, "f0", value.location);
+                instruction(scalar.mode.bits == 32 ? "swc1" : "sdc1",
+                            reg_name(source) + "," + memory(carrier));
+            } else if (legalizes_to_pair(scalar)) {
+                load_vreg_pair(function, scalar, "t1", "t2", value.location);
+                store_pair_memory("t1", "t2", carrier);
+            } else {
+                const auto source =
+                    input_gpr(function, scalar, "t1", value.location);
+                store_integer_memory(source, memory(carrier), scalar.mode.bits);
+            }
+            copy_bytes(address, 0, frame_base(), carrier,
+                       (scalar.mode.bits + 7U) / 8U);
+        }
+        return;
+    }
+    if (opcode == Opcode::AggregateLoad || opcode == Opcode::AggregateStore ||
+        opcode == Opcode::AggregateIndexedLoad) {
+        std::string_view base = frame_base();
+        std::int64_t offset = 0;
+        if (opcode == Opcode::AggregateIndexedLoad) {
+            form_indexed_address(function, value, "t0");
+            base = "t0";
+        } else if (const auto* slot = std::get_if<machine::StackSlotOperand>(
+                       &value.operands.front())) {
+            offset = slot_offset(function, slot->slot, value.location) +
+                     slot->offset;
+        } else if (const auto* symbol = std::get_if<machine::SymbolOperand>(
+                       &value.operands.front())) {
+            materialize_symbol_address("t0", assembly_symbol(symbol->name));
+            base = "t0";
+        } else {
+            base =
+                input_gpr(function, value.uses.front(), "t0", value.location);
+        }
+        const auto aggregate = opcode == Opcode::AggregateStore
+                                   ? value.uses.back()
+                                   : value.defs.front();
+        const auto home = vreg_offset(function, aggregate, value.location);
+        if (opcode == Opcode::AggregateStore) {
+            copy_bytes(base, offset, frame_base(), home,
+                       aggregate.mode.bits / 8U);
+        } else {
+            copy_bytes(frame_base(), home, base, offset,
+                       aggregate.mode.bits / 8U);
+        }
+        return;
+    }
     if (opcode == Opcode::Phi || opcode == Opcode::LifetimeStart ||
         opcode == Opcode::LifetimeEnd || opcode == Opcode::IntrinsicNoop) {
         return;

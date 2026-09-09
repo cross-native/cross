@@ -1,0 +1,130 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+struct pair { u32 x; u32 y; };
+struct tiny { u8 a; u8 b; u8 c; };
+struct large { u64 a; u64 b; u64 c; u64 tail[6]; };
+struct packed [[packed]] { u8 a; u64 b; };
+struct floats { f64 a; f64 b; };
+struct mixed { u64 a; f64 b; };
+union bits { u64 a; f64 b; };
+
+[[abi("@ABI@"), noinline]] global struct pair pair_step(in struct pair input, in u32 n) {
+    struct pair v = input;
+    v.x += n;
+    v.y ^= 0x12345678u32;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global struct tiny tiny_step(in struct tiny input) {
+    struct tiny v = input;
+    v.a += 1u8; v.b += 2u8; v.c += 3u8;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global struct large large_step(in struct large input, in u32 n) {
+    struct large v = input;
+    v.a += n; v.b ^= 0x123456789abcdef0u64; v.c += 0x100000003u64;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global struct packed packed_step(in struct packed input) {
+    struct packed v = input;
+    v.a += 7u8; v.b += 0x200000001u64;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global struct floats float_step(in struct floats input) {
+    struct floats v = input;
+    v.a += 1.0f64; v.b += 2.0f64;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global struct mixed mixed_step(in struct mixed input) {
+    struct mixed v = input;
+    v.a += 0x100000001u64; v.b += 3.0f64;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global union bits union_step(in union bits input) {
+    union bits v = input;
+    v.a ^= 0x123456789abcdef0u64;
+    return v;
+}
+[[abi("@ABI@"), noinline]] global u32 stack_step(
+    in u32 a, in u32 b, in u32 c, in struct tiny ti, in struct pair pi,
+    in u32 d, in u32 e, in u32 f, in struct large li) {
+    struct tiny t = ti; struct pair p = pi; struct large l = li;
+    u32 la = l.a; u32 lb = l.b; u32 lc = l.c;
+    return a + 3u32*b + 5u32*c + t.a + 7u32*t.b + 11u32*t.c +
+        p.x + 13u32*p.y + d + e + f + la + lb + lc;
+}
+[[abi("@ABI@"), noinline]] global void modes(out struct pair a, inout struct pair b) {
+    a = b;
+    a.x += 3u32;
+    b.y += 5u32;
+}
+[[abi("@ABI@")]] typedef struct pair (*callback)(in struct pair v, in u32 n);
+[[noinline]] global struct pair indirect(in callback cb, in struct pair v, in u32 n) {
+    return cb(v, n);
+}
+
+global struct large saved;
+[[noinline]] global void copy_pointer(in struct large *to, in struct large *from) {
+    *to = *from;
+}
+[[noinline]] global u32 rotate(in u32 count, in u32 seed) {
+    struct pair a; a.x = seed; a.y = seed + 1u32;
+    struct pair b; b.x = seed + 10u32; b.y = seed + 11u32;
+    for (u32 i = 0u32; i < count; i++) {
+        struct pair tmp = a; a = b; b = tmp;
+    }
+    return a.x + 3u32*a.y + 5u32*b.x + 7u32*b.y;
+}
+[[abi("@ABI@"), noinline]] global struct large select_record(
+    in u32 condition, in struct large first, in struct large second) {
+    return condition ? first : second;
+}
+
+global u32 aggregate_test(in u32 seed) {
+    struct pair p; p.x = seed; p.y = 0x11223344u32;
+    struct pair q = pair_step(p, 9u32);
+    if (q.x != seed + 9u32 || q.y != (p.y ^ 0x12345678u32) || p.x != seed) return 2u32;
+    q = indirect(pair_step, p, 13u32);
+    if (q.x != seed + 13u32 || q.y != (p.y ^ 0x12345678u32)) return 3u32;
+    struct tiny t; t.a = 17u8; t.b = 65u8; t.c = 129u8;
+    struct tiny u = tiny_step(t);
+    if (u.a != 18u8 || u.b != 67u8 || u.c != 132u8) return 4u32;
+    struct large l; l.a = 0xabcdef0100000000u64 + seed;
+    l.b = 0x9876543210fedcbau64; l.c = 0x100000002u64;
+    for (u32 i = 0u32; i < 6u32; i++) l.tail[i] = 0xabcdef1234000000u64 + i;
+    struct large m = large_step(l, 7u32);
+    if (m.a != l.a + 7u64 || m.b != (l.b ^ 0x123456789abcdef0u64) ||
+        m.c != l.c + 0x100000003u64 || m.tail[5] != l.tail[5]) return 5u32;
+    saved = m;
+    struct large cells[2]; copy_pointer(&cells[0], &saved); cells[1] = cells[0];
+    m = cells[seed & 1u32];
+    if (m.a != saved.a || m.b != saved.b || m.c != saved.c ||
+        m.tail[0] != saved.tail[0] || m.tail[5] != saved.tail[5]) return 6u32;
+    struct large selected = select_record(seed & 1u32, l, m);
+    if (selected.a != ((seed & 1u32) ? l.a : m.a) ||
+        selected.c != ((seed & 1u32) ? l.c : m.c) ||
+        selected.tail[5] != l.tail[5]) return 15u32;
+    struct packed k; k.a = 11u8; k.b = 0xaabbccddeeff0011u64;
+    struct packed j = packed_step(k);
+    if (j.a != 18u8 || j.b != k.b + 0x200000001u64) return 7u32;
+    struct floats fs; fs.a = 1.25f64; fs.b = 7.5f64;
+    struct floats ft = float_step(fs);
+    if (ft.a != 2.25f64 || ft.b != 9.5f64) return 8u32;
+    struct mixed ms; ms.a = 0xabcdef9876543210u64; ms.b = 2.5f64;
+    struct mixed mt = mixed_step(ms);
+    if (mt.a != ms.a + 0x100000001u64 || mt.b != 5.5f64) return 9u32;
+    union bits bs; bs.a = 0x9876543210fedcbau64;
+    union bits bt = union_step(bs);
+    if (bt.a != (bs.a ^ 0x123456789abcdef0u64)) return 10u32;
+    u32 total = stack_step(seed, 2u32, 3u32, t, p, 4u32, 5u32, 6u32, l);
+    u32 la = l.a; u32 lb = l.b; u32 lc = l.c;
+    u32 expected = seed + 6u32 + 15u32 + 17u32 + 7u32*65u32 + 11u32*129u32 +
+        p.x + 13u32*p.y + 4u32 + 5u32 + 6u32 + la + lb + lc;
+    if (total != expected) return 11u32;
+    modes(q, p);
+    if (q.x != seed + 3u32 || q.y != 0x11223344u32 || p.y != 0x11223349u32) return 12u32;
+    u32 even = seed + 3u32*(seed+1u32) + 5u32*(seed+10u32) + 7u32*(seed+11u32);
+    u32 odd = seed+10u32 + 3u32*(seed+11u32) + 5u32*seed + 7u32*(seed+1u32);
+    if (rotate(6u32, seed) != even || rotate(7u32, seed) != odd) return 13u32;
+    return 1u32;
+}

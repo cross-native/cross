@@ -60,8 +60,11 @@ unsigned type_bits(const hir::Module& module, hir::TypeId id) {
 
 bool unsupported_interface_type(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
-    return type.kind == hir::Type::Kind::Record ||
-           type.kind == hir::Type::Kind::Array ||
+    if (type.kind == hir::Type::Kind::Record) {
+        return !type.record || !module.record(*type.record).complete ||
+               module.record(*type.record).size > 8191U;
+    }
+    return type.kind == hir::Type::Kind::Array ||
            type.kind == hir::Type::Kind::Vector || type_bits(module, id) > 64;
 }
 
@@ -356,13 +359,15 @@ public:
                                            function.result_type)) {
                 diagnostics.error(
                     function.location,
-                    "the first MIPS native slice supports scalar function results through 64 bits");
+                    "MIPS native function results require scalars through 64 "
+                    "bits or complete records through 8191 bytes");
             }
             for (const auto& parameter : function.parameters) {
                 if (unsupported_interface_type(hir_module, parameter.type)) {
                     diagnostics.error(
                         parameter.location,
-                        "the first MIPS native slice supports scalar parameters through 64 bits");
+                        "MIPS native parameters require scalars through 64 "
+                        "bits or complete records through 8191 bytes");
                 }
                 if (parameter.physical_location &&
                     *parameter.physical_location != "auto") {
@@ -444,6 +449,44 @@ public:
                         valid = false;
                     }
                     const auto opcode = decode_opcode(instruction.opcode);
+                    const bool aggregate =
+                        opcode == Opcode::AggregateLoad ||
+                        opcode == Opcode::AggregateStore ||
+                        opcode == Opcode::AggregateIndexedLoad;
+                    const bool unaligned =
+                        opcode == Opcode::UnalignedLoadSigned ||
+                        opcode == Opcode::UnalignedLoadUnsigned ||
+                        opcode == Opcode::UnalignedStore;
+                    if (aggregate || unaligned) {
+                        const bool store = opcode == Opcode::AggregateStore ||
+                                           opcode == Opcode::UnalignedStore;
+                        const bool has_value =
+                            store ? !instruction.uses.empty()
+                                  : instruction.defs.size() == 1;
+                        const auto value = !has_value ? machine::Register{}
+                                           : store ? instruction.uses.back()
+                                                   : instruction.defs.front();
+                        const bool memory_value =
+                            value.kind == machine::RegisterKind::Virtual &&
+                            value.id <
+                                function.virtual_register_classes.size() &&
+                            function.virtual_register_classes[value.id] ==
+                                machine::VirtualRegisterClass::Memory;
+                        if (!has_value || instruction.operands.empty() ||
+                            !instruction.may_load || !instruction.may_store ||
+                            (store && (!instruction.defs.empty() ||
+                                       !instruction.has_side_effects)) ||
+                            memory_value != aggregate || value.mode.bits == 0 ||
+                            (aggregate && value.mode.bits % 8U != 0) ||
+                            (unaligned &&
+                             (value.mode.bits > 64 ||
+                              instruction.uses.size() != (store ? 2U : 1U)))) {
+                            diagnostics.error(instruction.location,
+                                              "invalid MIPS memory-transfer "
+                                              "instruction or value class");
+                            valid = false;
+                        }
+                    }
                     const bool frame_opcode =
                         opcode == Opcode::FrameAdjust || opcode == Opcode::FrameCopy ||
                         opcode == Opcode::FrameSave || opcode == Opcode::FrameRestore;
