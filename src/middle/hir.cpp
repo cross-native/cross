@@ -168,6 +168,14 @@ public:
             const TargetInfo& target, Diagnostics& diagnostics)
         : program_(program), options_(options), target_(target), diagnostics_(diagnostics) {
         const auto* abi = find_abi(target_, options_.abi, options_.target);
+        if (abi) module_.default_abi = abi->id;
+        for (const auto& entry : model_registry().abis()) {
+            if (entry.architecture != target_.architecture) continue;
+            module_.abi_names.emplace(entry.canonical_name, entry.id);
+            for (const auto& alias : entry.aliases)
+                module_.abi_names.emplace(alias, entry.id);
+        }
+        module_.abi_names["default"] = module_.default_abi;
         module_.address_bits = abi && abi->address_bits != 0
                                    ? abi->address_bits
                                    : 64U;
@@ -525,6 +533,35 @@ private:
 
     void validate_atomic_type(TypeId id, SourceLocation location) {
         const auto& type = module_.type(id);
+        if (type.kind == Type::Kind::Function) {
+            if (!type.function || !type.function->abi.valid()) {
+                diagnostics_.error(
+                    location, "function-pointer type has no registered ABI");
+                return;
+            }
+            const auto* abi = find_abi(target_, type.function->abi);
+            if (!abi || abi->address_bits != module_.address_bits ||
+                !abi->function_selectable) {
+                diagnostics_.error(location,
+                                   "function-pointer ABI is incompatible "
+                                   "with the compilation data model");
+            }
+            if (type.is_const || type.is_volatile || type.is_atomic) {
+                diagnostics_.error(
+                    location, "function type cannot have object qualifiers");
+            }
+            for (const auto& parameter : type.function->parameters) {
+                if (parameter.physical_location &&
+                    *parameter.physical_location != "auto") {
+                    diagnostics_.error(parameter.location,
+                                       "manual function-pointer endpoints are "
+                                       "not implemented yet");
+                }
+                validate_atomic_type(parameter.type, parameter.location);
+            }
+            validate_atomic_type(type.function->result_type, location);
+            return;
+        }
         if (type.kind == Type::Kind::Array) {
             if (!type.element || type.lanes == 0) {
                 diagnostics_.error(location,
@@ -1062,15 +1099,13 @@ std::optional<TypeId> Module::builtin(BuiltinType kind) const {
 TypeId Module::intern_type(const TypePtr& source) {
     Type candidate;
     if (source) {
-        candidate.kind = source->kind == cross::Type::Kind::Pointer
-                             ? Type::Kind::Pointer
-                         : source->kind == cross::Type::Kind::Vector
-                             ? Type::Kind::Vector
-                         : source->kind == cross::Type::Kind::Array
-                             ? Type::Kind::Array
-                         : source->kind == cross::Type::Kind::Record
-                             ? Type::Kind::Record
-                             : Type::Kind::Builtin;
+        candidate.kind =
+            source->kind == cross::Type::Kind::Pointer    ? Type::Kind::Pointer
+            : source->kind == cross::Type::Kind::Vector   ? Type::Kind::Vector
+            : source->kind == cross::Type::Kind::Array    ? Type::Kind::Array
+            : source->kind == cross::Type::Kind::Record   ? Type::Kind::Record
+            : source->kind == cross::Type::Kind::Function ? Type::Kind::Function
+                                                          : Type::Kind::Builtin;
         candidate.builtin = source->builtin;
         candidate.nominal_name = source->nominal_name;
         candidate.is_const = source->is_const;
@@ -1078,6 +1113,22 @@ TypeId Module::intern_type(const TypePtr& source) {
         candidate.is_atomic = source->is_atomic;
         if (source->kind == cross::Type::Kind::Pointer) {
             candidate.pointee = intern_type(source->pointee);
+        } else if (source->kind == cross::Type::Kind::Function &&
+                   source->function) {
+            FunctionSignature signature;
+            signature.result_type = intern_type(source->function->result);
+            signature.variadic = source->function->variadic;
+            const auto found = abi_names.find(source->function->abi);
+            signature.abi = source->function->abi.empty() ? default_abi
+                            : found == abi_names.end()    ? AbiId{}
+                                                          : found->second;
+            for (const auto& parameter : source->function->parameters) {
+                signature.parameters.push_back(
+                    {parameter.location, parameter.name,
+                     intern_type(parameter.type), parameter.mode,
+                     parameter.location_name});
+            }
+            candidate.function = std::move(signature);
         } else if (source->kind == cross::Type::Kind::Vector ||
                    source->kind == cross::Type::Kind::Array) {
             candidate.element = intern_type(source->element);
@@ -1086,8 +1137,7 @@ TypeId Module::intern_type(const TypePtr& source) {
         } else if (source->kind == cross::Type::Kind::Record) {
             auto found = record_ids.find(source->nominal_name);
             if (found == record_ids.end()) {
-                const RecordId id{
-                    static_cast<std::uint32_t>(records.size())};
+                const RecordId id{static_cast<std::uint32_t>(records.size())};
                 record_ids.emplace(source->nominal_name, id);
                 Record record;
                 record.id = id;
@@ -1105,6 +1155,7 @@ TypeId Module::intern_type(const TypePtr& source) {
         if (type.kind == candidate.kind && type.builtin == candidate.builtin &&
             type.pointee == candidate.pointee &&
             type.record == candidate.record &&
+            type.function == candidate.function &&
             type.element == candidate.element &&
             type.lanes == candidate.lanes &&
             type.scalable == candidate.scalable &&
@@ -1117,6 +1168,20 @@ TypeId Module::intern_type(const TypePtr& source) {
     }
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(candidate));
+    return id;
+}
+
+TypeId Module::function_type(FunctionSignature signature) {
+    for (std::uint32_t index = 0; index < types.size(); ++index) {
+        if (types[index].kind == Type::Kind::Function &&
+            types[index].function == signature)
+            return {index};
+    }
+    Type type;
+    type.kind = Type::Kind::Function;
+    type.function = std::move(signature);
+    const TypeId id{static_cast<std::uint32_t>(types.size())};
+    types.push_back(std::move(type));
     return id;
 }
 
@@ -1279,6 +1344,41 @@ Module build(const Program& program, const CompilerOptions& options,
     return Builder(program, options, target, diagnostics).run();
 }
 
+bool stabilize_function_address(Module& module, FunctionId id,
+                                SourceLocation location,
+                                Diagnostics& diagnostics) {
+    auto& function = module.function(id);
+    if ((function.result_location && *function.result_location != "auto") ||
+        !function.clobbers.empty() ||
+        std::any_of(function.parameters.begin(), function.parameters.end(),
+                    [](const Parameter& parameter) {
+                        return parameter.physical_location &&
+                               *parameter.physical_location != "auto";
+                    })) {
+        diagnostics.error(
+            location, "function-pointer adapters for manual endpoints or extra "
+                      "clobbers are not implemented yet");
+        return false;
+    }
+    function.abi_contract = AbiContract::Registered;
+    return true;
+}
+
+std::optional<FunctionSignature>
+call_signature(const Module& module, std::optional<FunctionId> direct,
+               std::optional<TypeId> indirect) {
+    if (direct.has_value() == indirect.has_value()) return std::nullopt;
+    if (direct) {
+        if (direct->value >= module.functions.size()) return std::nullopt;
+        const auto& function = module.function(*direct);
+        return FunctionSignature{function.result_type, function.parameters,
+                                 function.abi, function.variadic};
+    }
+    if (indirect->value >= module.types.size()) return std::nullopt;
+    const auto& type = module.type(*indirect);
+    return type.kind == Type::Kind::Function ? type.function : std::nullopt;
+}
+
 std::string type_name(const Module& module, TypeId id) {
     const auto& type = module.type(id);
     std::string prefix;
@@ -1287,6 +1387,20 @@ std::string type_name(const Module& module, TypeId id) {
     if (type.is_atomic) prefix += "[[atomic]] ";
     if (type.kind == Type::Kind::Pointer) {
         return prefix + type_name(module, *type.pointee) + " *";
+    }
+    if (type.kind == Type::Kind::Function && type.function) {
+        std::string result =
+            type_name(module, type.function->result_type) + " (";
+        for (std::size_t index = 0; index < type.function->parameters.size();
+             ++index) {
+            if (index) result += ", ";
+            const auto& parameter = type.function->parameters[index];
+            result += std::string(parameter_mode_name(parameter.mode)) + " " +
+                      type_name(module, parameter.type);
+        }
+        if (type.function->variadic)
+            result += type.function->parameters.empty() ? "..." : ", ...";
+        return prefix + result + ")";
     }
     if (type.kind == Type::Kind::Vector) {
         return prefix + (type.scalable ? "scalable_vector<" : "vector<") +

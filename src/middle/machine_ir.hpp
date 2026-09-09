@@ -158,6 +158,7 @@ struct SymbolOperand {
     std::int64_t addend{};
     bool is_function{};
     std::optional<hir::ObjectId> object;
+    std::optional<hir::FunctionId> function{};
     friend bool operator==(const SymbolOperand&,
                            const SymbolOperand&) = default;
 };
@@ -301,6 +302,7 @@ struct Instruction {
     // spelling so IPA and target ABI planning never reverse-map assembler
     // names. Indirect calls leave this empty.
     std::optional<hir::FunctionId> direct_callee;
+    std::optional<hir::TypeId> call_signature;
     // Logical source types remain attached to call operands after instruction
     // selection.  Width/register class alone cannot distinguish every
     // variadic floating, vector, pointer, and by-reference boundary value.

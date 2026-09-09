@@ -67,8 +67,7 @@ struct Module {
 // Lowers every static-duration object into target-resolved storage and a typed
 // scalar initializer. No backend needs to inspect source expressions or parse
 // literal text after this boundary.
-[[nodiscard]] Module lower(const hir::Module& hir_module,
-                           const Subtarget& subtarget,
+[[nodiscard]] Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                            Diagnostics& diagnostics);
 
 } // namespace data

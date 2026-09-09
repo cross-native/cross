@@ -231,10 +231,9 @@ bool representation_compatible(const hir::Module& module, hir::TypeId left,
     const auto& lhs = module.type(left);
     const auto& rhs = module.type(right);
     return lhs.kind == rhs.kind && lhs.builtin == rhs.builtin &&
-           lhs.pointee == rhs.pointee &&
-           lhs.record == rhs.record &&
-           lhs.element == rhs.element && lhs.lanes == rhs.lanes &&
-           lhs.scalable == rhs.scalable &&
+           lhs.pointee == rhs.pointee && lhs.record == rhs.record &&
+           lhs.function == rhs.function && lhs.element == rhs.element &&
+           lhs.lanes == rhs.lanes && lhs.scalable == rhs.scalable &&
            lhs.is_atomic == rhs.is_atomic &&
            lhs.nominal_name == rhs.nominal_name;
 }
@@ -246,8 +245,8 @@ bool unqualified_representation_compatible(const hir::Module& module,
     const auto& rhs = module.type(right);
     return lhs.kind == rhs.kind && lhs.builtin == rhs.builtin &&
            lhs.pointee == rhs.pointee && lhs.element == rhs.element &&
-           lhs.lanes == rhs.lanes && lhs.scalable == rhs.scalable &&
-           lhs.nominal_name == rhs.nominal_name;
+           lhs.function == rhs.function && lhs.lanes == rhs.lanes &&
+           lhs.scalable == rhs.scalable && lhs.nominal_name == rhs.nominal_name;
 }
 
 bool vector_element_compatible(const hir::Module& module,
@@ -502,7 +501,12 @@ bool eligible_expression(const Expr& expression) {
                eligible_expression(*expression.right);
     case Expr::Kind::Call:
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
-            return false;
+            return expression.left && eligible_expression(*expression.left) &&
+                   std::all_of(expression.arguments.begin(),
+                               expression.arguments.end(),
+                               [](const auto& argument) {
+                                   return eligible_expression(*argument);
+                               });
         }
         if (expression.left->text == "$::patch") {
             return !expression.arguments.empty() &&
@@ -1270,6 +1274,28 @@ private:
         return true;
     }
 
+    hir::TypeId function_pointer_type(const hir::Function& function) {
+        const auto signature =
+            hir_.function_type({function.result_type, function.parameters,
+                                function.abi, function.variadic});
+        return hir_.pointer_to(signature);
+    }
+
+    std::optional<ValueId> function_address(const hir::Function& function,
+                                            SourceLocation location) {
+        if (!hir::stabilize_function_address(hir_, function.id, location,
+                                             diagnostics_)) {
+            failed_ = true;
+            return std::nullopt;
+        }
+        const auto id = function.id;
+        const auto type = function_pointer_type(function);
+        const auto value =
+            add_value(ValueKind::FunctionAddress, type, location);
+        current_.values[value.value].callee = id;
+        return value;
+    }
+
     ValueId lifetime(ValueKind kind, SlotId slot, SourceLocation location) {
         const auto value = add_effectful(kind, *hir_.builtin(BuiltinType::Void),
                                          location);
@@ -1913,6 +1939,9 @@ private:
                                  hir_.unqualified(object->type))
                            : std::optional<hir::TypeId>(object->type);
             }
+            if (const auto* function = resolve_function(expression.text)) {
+                return function_pointer_type(*function);
+            }
             return resolve_label(expression.text)
                        ? hir_.builtin(BuiltinType::Label) : std::nullopt;
         }
@@ -1967,6 +1996,8 @@ private:
                     object && global_object(*object)) {
                     return hir_.pointer_to(object->type);
                 }
+                if (const auto* function = resolve_function(*name))
+                    return function_pointer_type(*function);
                 return std::nullopt;
             }
             if (const auto operand = infer_type(*expression.left)) {
@@ -1981,6 +2012,9 @@ private:
                         !pointer.pointee) {
                         return std::nullopt;
                     }
+                    if (hir_.type(*pointer.pointee).kind ==
+                        hir::Type::Kind::Function)
+                        return operand;
                     if (array_type(hir_, *pointer.pointee)) {
                         return hir_.pointer_to(
                             *hir_.type(*pointer.pointee).element);
@@ -2090,6 +2124,18 @@ private:
                        : std::nullopt;
         }
         case Expr::Kind::Call: {
+            if (expression.left) {
+                const auto target = infer_type(*expression.left);
+                if (target) {
+                    const auto& pointer = hir_.type(*target);
+                    if (pointer.kind == hir::Type::Kind::Pointer &&
+                        pointer.pointee &&
+                        hir_.type(*pointer.pointee).function) {
+                        return hir_.type(*pointer.pointee)
+                            .function->result_type;
+                    }
+                }
+            }
             if (!expression.left || expression.left->kind != Expr::Kind::Name) {
                 return std::nullopt;
             }
@@ -2363,8 +2409,11 @@ private:
         if (depth != 0 && !intermediate_const &&
             ((!from.is_const && to.is_const) ||
              (!from.is_volatile && to.is_volatile))) return false;
-        if (depth == 0 && (void_type(hir_, source) ||
-                           void_type(hir_, destination))) return true;
+        if (depth == 0 &&
+            (void_type(hir_, source) || void_type(hir_, destination))) {
+            return from.kind != hir::Type::Kind::Function &&
+                   to.kind != hir::Type::Kind::Function;
+        }
         if (from.kind == hir::Type::Kind::Pointer &&
             to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee) {
             return compatible_pointer_conversion(
@@ -2476,6 +2525,9 @@ private:
                 } else if (const auto* label =
                                resolve_label(expression.text)) {
                     result = label_address(*label, expression.location);
+                } else if (const auto* function =
+                               resolve_function(expression.text)) {
+                    result = function_address(*function, expression.location);
                 }
             }
             break;
@@ -2558,6 +2610,9 @@ private:
                                            hir_.pointer_to(object->type),
                                            expression.location);
                         current_.values[result->value].object = object->id;
+                    } else if (const auto* function = resolve_function(*name)) {
+                        result =
+                            function_address(*function, expression.location);
                     }
                 }
                 break;
@@ -2655,7 +2710,14 @@ private:
             auto operand = lower_expression(*expression.left);
             if (!operand) break;
             if (expression.text == "*") {
-                result = load_pointer(*operand, expression.location);
+                const auto& pointer =
+                    hir_.type(current_.values[operand->value].type);
+                result = pointer.kind == hir::Type::Kind::Pointer &&
+                                 pointer.pointee &&
+                                 hir_.type(*pointer.pointee).kind ==
+                                     hir::Type::Kind::Function
+                             ? operand
+                             : load_pointer(*operand, expression.location);
                 break;
             }
             const auto operand_type = current_.values[operand->value].type;
@@ -3521,7 +3583,7 @@ private:
 
     std::optional<ValueId> lower_call(const Expr& expression) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
-            return std::nullopt;
+            return lower_indirect_call(expression);
         }
         if (expression.left->text == "$::patch") {
             return lower_patch(expression);
@@ -3726,18 +3788,73 @@ private:
                     "managed MIR form");
             return std::nullopt;
         }
+        if (find_local(expression.left->text) ||
+            parameter_values_.contains(expression.left->text) ||
+            resolve_object(expression.left->text))
+            return lower_indirect_call(expression);
         const auto* callee = resolve_function(expression.left->text);
-        if (!callee || !callable(*callee)) {
-            return std::nullopt;
-        }
-        if (expression.arguments.size() < callee->parameters.size() ||
-            (!callee->variadic &&
-             expression.arguments.size() != callee->parameters.size())) {
+        if (!callee || !callable(*callee)) return std::nullopt;
+        return lower_resolved_call(expression,
+                                   {callee->result_type, callee->parameters,
+                                    callee->abi, callee->variadic},
+                                   callee);
+    }
+
+    std::optional<ValueId> lower_indirect_call(const Expr& expression) {
+        if (!expression.left) return std::nullopt;
+        const auto target = lower_expression(*expression.left);
+        if (!target) return std::nullopt;
+        const auto& pointer = hir_.type(current_.values[target->value].type);
+        if (pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee ||
+            hir_.type(*pointer.pointee).kind != hir::Type::Kind::Function ||
+            !hir_.type(*pointer.pointee).function) {
             diagnostics_.error(
                 expression.location,
-                "call to '" + callee->source_name + "' requires " +
-                    std::to_string(callee->parameters.size()) +
-                    (callee->variadic ? " or more arguments" : " arguments"));
+                "indirect call requires a typed function pointer");
+            failed_ = true;
+            return std::nullopt;
+        }
+        const auto type = *pointer.pointee;
+        const auto signature = *hir_.type(type).function;
+        const auto* abi = find_abi(target_, signature.abi);
+        if (!abi || !abi->function_selectable ||
+            abi->address_bits != hir_.address_bits ||
+            (signature.variadic && !abi->variadic_supported)) {
+            diagnostics_.error(
+                expression.location,
+                "indirect call has no compatible registered ABI");
+            failed_ = true;
+            return std::nullopt;
+        }
+        for (const auto& parameter : signature.parameters) {
+            if (parameter.physical_location &&
+                *parameter.physical_location != "auto") {
+                diagnostics_.error(expression.location,
+                                   "manual function-pointer endpoints are not "
+                                   "implemented yet");
+                failed_ = true;
+                return std::nullopt;
+            }
+        }
+        return lower_resolved_call(expression, signature, nullptr, *target,
+                                   type);
+    }
+
+    std::optional<ValueId> lower_resolved_call(
+        const Expr& expression, hir::FunctionSignature signature,
+        const hir::Function* callee, std::optional<ValueId> target = {},
+        std::optional<hir::TypeId> indirect_signature = {}) {
+        if (expression.arguments.size() < signature.parameters.size() ||
+            (!signature.variadic &&
+             expression.arguments.size() != signature.parameters.size())) {
+            diagnostics_.error(
+                expression.location,
+                "call to '" +
+                    (callee ? callee->source_name
+                            : std::string("function pointer")) +
+                    "' requires " +
+                    std::to_string(signature.parameters.size()) +
+                    (signature.variadic ? " or more arguments" : " arguments"));
             failed_ = true;
             return std::nullopt;
         }
@@ -3751,16 +3868,15 @@ private:
         };
         std::vector<CallArgument> arguments;
         std::vector<PendingCopyOut> copyouts;
-        for (std::size_t index = 0; index < callee->parameters.size(); ++index) {
-            const auto& parameter = callee->parameters[index];
+        for (std::size_t index = 0; index < signature.parameters.size();
+             ++index) {
+            const auto& parameter = signature.parameters[index];
             const auto& actual = *expression.arguments[index];
-            const bool manual_cell =
-                parameter.mode == ParameterMode::In &&
-                parameter.physical_location &&
-                *parameter.physical_location != "auto";
+            const bool manual_cell = parameter.mode == ParameterMode::In &&
+                                     parameter.physical_location &&
+                                     *parameter.physical_location != "auto";
             if (parameter.mode == ParameterMode::In && !manual_cell) {
-                auto argument =
-                    lower_expression(actual, parameter.type);
+                auto argument = lower_expression(actual, parameter.type);
                 if (!argument) return std::nullopt;
                 arguments.push_back(
                     {*argument, std::nullopt, parameter.type, false});
@@ -3800,8 +3916,8 @@ private:
                 static_cast<std::uint32_t>(current_.slots.size())};
             current_.slots.push_back(
                 {cell, actual.location, parameter.type,
-                 "$call." + std::to_string(current_.values.size()) +
-                     "." + std::to_string(index),
+                 "$call." + std::to_string(current_.values.size()) + "." +
+                     std::to_string(index),
                  std::nullopt, false});
             (void)lifetime(ValueKind::LifetimeStart, cell, actual.location);
             const LocalBinding temporary{cell, parameter.type, std::nullopt};
@@ -3810,38 +3926,37 @@ private:
                 if (manual_cell) {
                     initial = lower_expression(actual, parameter.type);
                 } else if (actual_local) {
-                    initial = assignment_cast(load_slot(*actual_local, actual.location),
-                                   parameter.type, actual.location);
+                    initial = assignment_cast(
+                        load_slot(*actual_local, actual.location),
+                        parameter.type, actual.location);
                 } else if (actual_object && global_scalar(*actual_object)) {
-                    initial = assignment_cast(load_global(*actual_object, actual.location),
-                                   parameter.type, actual.location);
+                    initial = assignment_cast(
+                        load_global(*actual_object, actual.location),
+                        parameter.type, actual.location);
                 } else if (actual_address) {
                     initial = load_pointer(*actual_address, actual.location);
                     if (initial) {
                         initial = assignment_cast(*initial, parameter.type,
-                                       actual.location);
+                                                  actual.location);
                     }
                 } else {
                     initial = lower_expression(actual, parameter.type);
                 }
                 if (!initial) return std::nullopt;
                 (void)store_slot(temporary, *initial, actual.location);
-            } else if (!actual_local && !actual_object &&
-                       !actual_address) {
+            } else if (!actual_local && !actual_object && !actual_address) {
                 // A non-lvalue `out` actual is still evaluated once for its
                 // source-visible effects; only its eventual copy-out is
                 // discarded.
                 if (!lower_expression(actual)) return std::nullopt;
             }
-            arguments.push_back(
-                {std::nullopt, cell, parameter.type, false});
+            arguments.push_back({std::nullopt, cell, parameter.type, false});
             PendingCopyOut copyout;
             copyout.cell = cell;
             copyout.location = actual.location;
             copyout.copy_out = !manual_cell;
             copyout.local = actual_local;
-            if (actual_object &&
-                !hir_.type(actual_object->type).is_const) {
+            if (actual_object && !hir_.type(actual_object->type).is_const) {
                 copyout.object = actual_object->id;
             }
             if (actual_address && address_modifiable) {
@@ -3849,15 +3964,13 @@ private:
             }
             copyouts.push_back(std::move(copyout));
         }
-        for (std::size_t index = callee->parameters.size();
+        for (std::size_t index = signature.parameters.size();
              index < expression.arguments.size(); ++index) {
             const auto& actual = *expression.arguments[index];
             auto type = infer_type(actual);
-            if (!type || !call_type(*type, false) ||
-                void_type(hir_, *type)) {
-                diagnostics_.error(
-                    actual.location,
-                    "unsupported variadic argument type");
+            if (!type || !call_type(*type, false) || void_type(hir_, *type)) {
+                diagnostics_.error(actual.location,
+                                   "unsupported variadic argument type");
                 failed_ = true;
                 return std::nullopt;
             }
@@ -3865,30 +3978,37 @@ private:
             if (integer_type(hir_, promoted) &&
                 type_bits(hir_, promoted) < 32) {
                 promoted = *hir_.builtin(BuiltinType::I32);
-            } else if (hir_.type(promoted).kind ==
-                           hir::Type::Kind::Builtin &&
+            } else if (hir_.type(promoted).kind == hir::Type::Kind::Builtin &&
                        hir_.type(promoted).builtin == BuiltinType::F32) {
                 promoted = *hir_.builtin(BuiltinType::F64);
             }
             auto value = lower_expression(actual, promoted);
             if (!value) return std::nullopt;
             value = cast(*value, promoted, actual.location);
-            arguments.push_back(
-                {*value, std::nullopt, promoted, true});
+            arguments.push_back({*value, std::nullopt, promoted, true});
         }
-        const auto result = add_effectful(ValueKind::Call, callee->result_type,
-                                          expression.location);
+        const auto result = add_effectful(
+            ValueKind::Call, signature.result_type, expression.location);
         auto& call = current_.values[result.value];
-        call.callee = callee->id;
+        if (callee) call.callee = callee->id;
+        call.call_signature = indirect_signature;
+        if (target) call.operands.push_back(*target);
         call.call_arguments = std::move(arguments);
         for (const auto& argument : call.call_arguments) {
             if (argument.value) call.operands.push_back(*argument.value);
         }
-        const bool noreturn = (callee->definition && callee->definition->attribute("noreturn")) ||
-            std::any_of(callee->declarations.begin(), callee->declarations.end(),
-                [](const FunctionDecl* declaration) { return declaration->attribute("noreturn") != nullptr; });
+        const bool noreturn =
+            callee &&
+            ((callee->definition &&
+              callee->definition->attribute("noreturn")) ||
+             std::any_of(
+                 callee->declarations.begin(), callee->declarations.end(),
+                 [](const FunctionDecl* declaration) {
+                     return declaration->attribute("noreturn") != nullptr;
+                 }));
         if (noreturn) {
-            terminate(TerminatorKind::Unreachable, expression.location, std::nullopt, {});
+            terminate(TerminatorKind::Unreachable, expression.location,
+                      std::nullopt, {});
             return result;
         }
         for (const auto& copyout : copyouts) {
@@ -3898,8 +4018,7 @@ private:
             if (copyout.copy_out) {
                 const auto value = load_slot(temporary, copyout.location);
                 if (copyout.local) {
-                    (void)store_slot(*copyout.local, value,
-                                     copyout.location);
+                    (void)store_slot(*copyout.local, value, copyout.location);
                 } else if (copyout.object) {
                     (void)store_global(hir_.object(*copyout.object), value,
                                        copyout.location);
@@ -5492,23 +5611,54 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                         fail(value.location, "invalid global-store operation");
                     }
                 }
+            } else if (value.kind == ValueKind::FunctionAddress) {
+                const auto signature =
+                    hir::call_signature(hir_module, value.callee, {});
+                const auto& pointer = hir_module.type(value.type);
+                if (!signature || value.slot || value.object ||
+                    value.patch_sink || value.call_signature ||
+                    !value.operands.empty() || !value.call_arguments.empty() ||
+                    pointer.kind != hir::Type::Kind::Pointer ||
+                    !pointer.pointee ||
+                    hir_module.type(*pointer.pointee).function != signature) {
+                    fail(value.location, "invalid typed function address");
+                }
             } else if (value.kind == ValueKind::Atomic) {
                 // Validated above; this branch keeps atomic volatile metadata
                 // out of the pure-value catch-all below.
             } else if (value.kind == ValueKind::Call) {
-                if (value.slot || !value.callee ||
-                    value.callee->value >= hir_module.functions.size()) {
+                const auto signature = hir::call_signature(
+                    hir_module, value.callee, value.call_signature);
+                if (value.slot || !signature) {
                     fail(value.location, "call has an invalid callee");
                 } else {
-                    const auto& callee = hir_module.function(*value.callee);
-                    const auto count_valid = callee.variadic
-                        ? value.call_arguments.size() >= callee.parameters.size()
-                        : value.call_arguments.size() == callee.parameters.size();
-                    if (!count_valid ||
-                        callee.result_type != value.type) {
+                    const auto& callee = *signature;
+                    if (value.call_signature) {
+                        if (value.operands.empty() ||
+                            value.operands.front().value >=
+                                function.values.size()) {
+                            fail(value.location,
+                                 "indirect call has no target operand");
+                        } else {
+                            const auto& pointer = hir_module.type(
+                                function.values[value.operands.front().value]
+                                    .type);
+                            if (pointer.kind != hir::Type::Kind::Pointer ||
+                                pointer.pointee != value.call_signature)
+                                fail(value.location, "indirect call target and "
+                                                     "signature disagree");
+                        }
+                    }
+                    const auto count_valid =
+                        callee.variadic ? value.call_arguments.size() >=
+                                              callee.parameters.size()
+                                        : value.call_arguments.size() ==
+                                              callee.parameters.size();
+                    if (!count_valid || callee.result_type != value.type) {
                         fail(value.location, "call signature mismatch");
                     } else {
-                        std::size_t ordinary_index = 0;
+                        std::size_t ordinary_index =
+                            value.call_signature ? 1 : 0;
                         for (std::size_t index = 0;
                              index < value.call_arguments.size(); ++index) {
                             const auto& argument = value.call_arguments[index];
@@ -5527,19 +5677,20 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                 continue;
                             }
                             if (argument.value) {
-                                const auto expected = unnamed
-                                    ? argument.type
-                                    : callee.parameters[index].type;
+                                const auto expected =
+                                    unnamed ? argument.type
+                                            : callee.parameters[index].type;
                                 if ((!unnamed &&
                                      callee.parameters[index].mode !=
                                          ParameterMode::In) ||
                                     argument.value->value >=
                                         function.values.size() ||
-                                    function.values[argument.value->value].type !=
-                                        expected ||
+                                    function.values[argument.value->value]
+                                            .type != expected ||
                                     argument.type != expected) {
                                     fail(value.location,
-                                         "call value argument type or mode mismatch");
+                                         "call value argument type or mode "
+                                         "mismatch");
                                 }
                                 if (ordinary_index >= value.operands.size() ||
                                     value.operands[ordinary_index] !=
@@ -5550,18 +5701,22 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                 }
                                 ++ordinary_index;
                             } else if (unnamed ||
-                                (callee.parameters[index].mode ==
-                                     ParameterMode::In &&
-                                 (!callee.parameters[index].physical_location ||
-                                  *callee.parameters[index].physical_location ==
-                                      "auto")) ||
-                                argument.cell->value >=
+                                       (callee.parameters[index].mode ==
+                                            ParameterMode::In &&
+                                        (!callee.parameters[index]
+                                              .physical_location ||
+                                         *callee.parameters[index]
+                                                 .physical_location ==
+                                             "auto")) ||
+                                       argument.cell->value >=
                                            function.slots.size() ||
-                                       function.slots[argument.cell->value].type !=
+                                       function.slots[argument.cell->value]
+                                               .type !=
                                            callee.parameters[index].type ||
-                                argument.type !=
-                                    callee.parameters[index].type) {
-                                fail(value.location, "call argument type mismatch");
+                                       argument.type !=
+                                           callee.parameters[index].type) {
+                                fail(value.location,
+                                     "call argument type mismatch");
                             }
                         }
                         if (ordinary_index != value.operands.size()) {
@@ -5570,24 +5725,26 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                         }
                     }
                 }
-                if (value.patch_sink || value.object || value.is_volatile_access) {
-                    fail(value.location, "call carries unrelated operation metadata");
+                if (value.patch_sink || value.object ||
+                    value.is_volatile_access) {
+                    fail(value.location,
+                         "call carries unrelated operation metadata");
                 }
             } else if (value.kind == ValueKind::PatchValue) {
                 const bool valid_type =
                     value.type.value < hir_module.types.size();
-                if (value.slot || value.callee || value.object || value.is_volatile_access ||
-                    !valid_type ||
-                    (valid_type &&
-                     (!integer_type(hir_module, value.type) ||
-                      type_bits(hir_module, value.type) > 64))) {
+                if (value.slot || value.callee || value.object ||
+                    value.is_volatile_access || !valid_type ||
+                    (valid_type && (!integer_type(hir_module, value.type) ||
+                                    type_bits(hir_module, value.type) > 64))) {
                     fail(value.location, "invalid patch-value operation");
                 }
                 const auto bits =
                     valid_type ? type_bits(hir_module, value.type) : 0;
                 if (bits == 0 ||
                     !fits_unsigned({value.integer, value.integer_high}, bits)) {
-                    fail(value.location, "patch initial bits do not fit its type");
+                    fail(value.location,
+                         "patch initial bits do not fit its type");
                 }
                 if (!patch_ids.insert(value.patch_id).second) {
                     fail(value.location, "duplicate patch-value site id");
@@ -5601,15 +5758,17 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     if (sink_type.kind != hir::Type::Kind::Builtin ||
                         sink_type.builtin != BuiltinType::Uptr ||
                         sink_type.is_const || sink_type.is_volatile ||
-                        sink_type.is_atomic ||
-                        !sink.definition || sink.definition->initializer) {
+                        sink_type.is_atomic || !sink.definition ||
+                        sink.definition->initializer) {
                         fail(value.location,
                              "patch-value sink is not an uninitialized "
                              "unqualified uptr definition");
                     }
                 }
-            } else if (value.slot || value.callee || value.object || value.patch_sink ||
-                       value.is_volatile_access || !value.call_arguments.empty()) {
+            } else if (value.slot || value.callee || value.object ||
+                       value.patch_sink || value.call_signature ||
+                       value.is_volatile_access ||
+                       !value.call_arguments.empty()) {
                 fail(value.location, "pure value carries operation metadata");
             }
         }

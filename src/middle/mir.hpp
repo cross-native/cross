@@ -37,13 +37,39 @@ struct EffectId {
 };
 
 enum class ValueKind {
-    Parameter, ConstantInteger, ConstantFloating, LabelAddress,
-    SlotAddress, GlobalAddress, IndexedAddress, VariadicState,
-    Unary, Binary, Cast, Select, Splat, ExtractElement, InsertElement, Phi,
-    LifetimeStart, LifetimeEnd, DynamicStackSave, DynamicAlloca,
-    DynamicStackRestore, Load, Store, PointerLoad, PointerStore,
-    IndexedLoad, GlobalLoad,
-    GlobalStore, Atomic, Call, PatchValue, Intrinsic,
+    Parameter,
+    ConstantInteger,
+    ConstantFloating,
+    LabelAddress,
+    FunctionAddress,
+    SlotAddress,
+    GlobalAddress,
+    IndexedAddress,
+    VariadicState,
+    Unary,
+    Binary,
+    Cast,
+    Select,
+    Splat,
+    ExtractElement,
+    InsertElement,
+    Phi,
+    LifetimeStart,
+    LifetimeEnd,
+    DynamicStackSave,
+    DynamicAlloca,
+    DynamicStackRestore,
+    Load,
+    Store,
+    PointerLoad,
+    PointerStore,
+    IndexedLoad,
+    GlobalLoad,
+    GlobalStore,
+    Atomic,
+    Call,
+    PatchValue,
+    Intrinsic,
 };
 enum class IntrinsicOperation { Expect, Assume, Unreachable, Trap };
 enum class AtomicOperation {
@@ -104,6 +130,9 @@ struct ManagedValue {
     AbiStateId variadic_state;
     std::optional<SlotId> slot;
     std::optional<hir::FunctionId> callee;
+    // Indirect calls carry their stable function TypeId and place the target
+    // value first in operands. Direct calls retain only canonical callee ID.
+    std::optional<hir::TypeId> call_signature;
     std::optional<hir::LabelId> label;
     // Direct global accesses name their HIR object. IndexedLoad obtains its
     // scale and result type from the pointer-typed first operand.

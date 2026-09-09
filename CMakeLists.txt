@@ -254,6 +254,18 @@ if(BUILD_TESTING)
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/frame-runtime
         -P "${CMAKE_SOURCE_DIR}/test/backend/frame/runtime.cmake")
+    add_test(NAME cross_indirect_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/backend/indirect/runtime.cmake")
+    add_test(NAME cross_indirect_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-mips
+        -P "${CMAKE_SOURCE_DIR}/test/backend/indirect/mips.cmake")
+    add_test(NAME cross_indirect_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-errors
+        -P "${CMAKE_SOURCE_DIR}/test/backend/indirect/errors.cmake")
     add_test(NAME cross_noreturn_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/noreturn/mips_noreturn.x

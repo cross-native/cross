@@ -79,6 +79,14 @@ TypePtr clone_type(const TypePtr& source,
                      : enum_type(source->nominal_name, source->builtin);
     } else if (source->kind == Type::Kind::Pointer) {
         result = pointer_type(clone_type(source->pointee, substitutions));
+    } else if (source->kind == Type::Kind::Function && source->function) {
+        auto parameters = source->function->parameters;
+        for (auto& parameter : parameters)
+            parameter.type = clone_type(parameter.type, substitutions);
+        result =
+            function_type(clone_type(source->function->result, substitutions),
+                          std::move(parameters), source->function->variadic,
+                          source->function->abi);
     } else if (source->kind == Type::Kind::Vector) {
         result = vector_type(clone_type(source->element, substitutions),
                              source->lanes, source->scalable);

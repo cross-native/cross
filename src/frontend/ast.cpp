@@ -41,6 +41,15 @@ TypePtr generic_type(std::string name, bool is_const, bool is_volatile,
     return type;
 }
 
+TypePtr function_type(TypePtr result, std::vector<ParameterDecl> parameters,
+                      bool variadic, std::string abi) {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::Function;
+    type->function = std::make_shared<FunctionType>(FunctionType{
+        std::move(result), std::move(parameters), variadic, std::move(abi)});
+    return type;
+}
+
 TypePtr vector_type(TypePtr element, std::uint32_t lanes, bool scalable,
                     bool is_const, bool is_volatile, bool is_atomic) {
     auto type = std::make_shared<Type>();
@@ -90,6 +99,25 @@ std::string type_name(const TypePtr& type) {
     if (type->is_volatile) prefix += "volatile ";
     if (type->is_atomic) prefix += "[[atomic]] ";
     if (type->kind == Type::Kind::Pointer) return prefix + type_name(type->pointee) + " *";
+    if (type->kind == Type::Kind::Function && type->function) {
+        const auto& signature = *type->function;
+        std::string result = type_name(signature.result) + " (";
+        for (std::size_t index = 0; index < signature.parameters.size();
+             ++index) {
+            if (index != 0) result += ", ";
+            const auto& parameter = signature.parameters[index];
+            result += parameter.mode == ParameterMode::In    ? "in "
+                      : parameter.mode == ParameterMode::Out ? "out "
+                                                             : "inout ";
+            result += type_name(parameter.type);
+        }
+        if (signature.variadic)
+            result += signature.parameters.empty() ? "..." : ", ...";
+        result += ")";
+        if (!signature.abi.empty())
+            result += " [[abi(\"" + signature.abi + "\")]]";
+        return prefix + result;
+    }
     if (type->kind == Type::Kind::Generic) return prefix + type->generic_name;
     if (type->kind == Type::Kind::Vector) {
         return prefix + (type->scalable ? "scalable_vector<" : "vector<") +
@@ -125,6 +153,25 @@ std::string canonical_type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::Pointer) {
         result += 'P';
         result += canonical_type_name(type->pointee);
+        return result;
+    }
+    if (type->kind == Type::Kind::Function && type->function) {
+        const auto& signature = *type->function;
+        result +=
+            "F" + std::to_string(signature.abi.size()) + "_" + signature.abi;
+        const auto append = [&](const TypePtr& item) {
+            const auto spelling = canonical_type_name(item);
+            result += std::to_string(spelling.size()) + "_" + spelling;
+        };
+        append(signature.result);
+        result += "_" + std::to_string(signature.parameters.size()) + "_";
+        for (const auto& parameter : signature.parameters) {
+            result += parameter.mode == ParameterMode::In    ? 'i'
+                      : parameter.mode == ParameterMode::Out ? 'o'
+                                                             : 'b';
+            append(parameter.type);
+        }
+        result += signature.variadic ? "zE" : "E";
         return result;
     }
     if (type->kind == Type::Kind::Generic) {
@@ -169,6 +216,21 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
         left->is_volatile != right->is_volatile ||
         left->is_atomic != right->is_atomic) return false;
     if (left->kind == Type::Kind::Pointer) return same_type(left->pointee, right->pointee);
+    if (left->kind == Type::Kind::Function) {
+        if (!left->function || !right->function) return false;
+        const auto& a = *left->function;
+        const auto& b = *right->function;
+        if (a.abi != b.abi || a.variadic != b.variadic ||
+            a.parameters.size() != b.parameters.size() ||
+            !same_type(a.result, b.result))
+            return false;
+        for (std::size_t index = 0; index < a.parameters.size(); ++index) {
+            if (a.parameters[index].mode != b.parameters[index].mode ||
+                !same_type(a.parameters[index].type, b.parameters[index].type))
+                return false;
+        }
+        return true;
+    }
     if (left->kind == Type::Kind::Generic) return left->generic_name == right->generic_name;
     if (left->kind == Type::Kind::Vector) {
         return left->lanes == right->lanes &&
@@ -217,7 +279,8 @@ bool is_nominal(const TypePtr& type) {
 unsigned type_bits(const TypePtr& type) {
     if (!type) return 0;
     if (type->kind == Type::Kind::Pointer) return 64;
-    if (type->kind == Type::Kind::Generic) return 0;
+    if (type->kind == Type::Kind::Generic || type->kind == Type::Kind::Function)
+        return 0;
     if (type->kind == Type::Kind::Vector) {
         return type->scalable ? 0 : type_bits(type->element) * type->lanes;
     }

@@ -447,6 +447,118 @@ TypePtr Parser::parse_type() {
     return type;
 }
 
+TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
+                                 bool parameter,
+                                 std::unique_ptr<Expr>* dynamic_outer_bound) {
+    while (consume("*")) {
+        bool is_const = false;
+        bool is_volatile = false;
+        while (current().is("const") || current().is("volatile")) {
+            if (consume("const"))
+                is_const = true;
+            else {
+                consume("volatile");
+                is_volatile = true;
+            }
+        }
+        base = pointer_type(std::move(base), is_const, is_volatile);
+    }
+    TypePtr nested;
+    TypePtr hole;
+    if (current().is("(") && (current(1).is("*") || current(1).is("("))) {
+        consume("(");
+        hole = std::make_shared<Type>();
+        nested = parse_declarator(hole, name, parameter);
+        expect(")", "after parenthesized declarator");
+    } else {
+        name = parse_qualified_name();
+    }
+    if (current().is("[")) {
+        base = parse_array_suffix(std::move(base), parameter, dynamic_outer_bound);
+    }
+    if (consume("(")) {
+        std::vector<ParameterDecl> parameters;
+        bool variadic = false;
+        if (!consume(")")) {
+            if (current().is("void") && current(1).is(")")) {
+                ++index_;
+            } else {
+                unsigned ordinal = 0;
+                for (;;) {
+                    if (consume("...")) {
+                        variadic = true;
+                        break;
+                    }
+                    const auto before = index_;
+                    parameters.push_back(parse_parameter(ordinal++));
+                    if (index_ == before || !consume(",")) break;
+                }
+            }
+            expect(")", "after function parameters");
+        }
+        base = function_type(std::move(base), std::move(parameters), variadic);
+    }
+    if (nested) {
+        // The inner declarator binds first. Fill its unique placeholder only
+        // after the outer suffix has formed the result/element type.
+        const auto fill = [&](auto&& self, TypePtr& type) -> void {
+            if (type == hole) {
+                type = base;
+                return;
+            }
+            if (!type) return;
+            if (type->kind == Type::Kind::Pointer)
+                self(self, type->pointee);
+            else if (type->kind == Type::Kind::Array)
+                self(self, type->element);
+            else if (type->kind == Type::Kind::Function && type->function)
+                self(self, type->function->result);
+        };
+        fill(fill, nested);
+        base = std::move(nested);
+    }
+    if (parameter && base) {
+        if (base->kind == Type::Kind::Array)
+            base = pointer_type(base->element);
+        else if (base->kind == Type::Kind::Function)
+            base = pointer_type(base);
+    }
+    return base;
+}
+
+void Parser::apply_callable_attributes(
+    TypePtr& type, const std::vector<Attribute>& attributes) {
+    for (const auto& attribute : attributes) {
+        if (attribute.name != "abi") continue;
+        const auto spelling =
+            attribute.arguments.size() == 1
+                ? decode_string_literal(attribute.arguments.front())
+                : std::nullopt;
+        if (!spelling || spelling->empty()) {
+            diagnostics_.error(attribute.location,
+                               "'abi' requires one nonempty string");
+            continue;
+        }
+        TypePtr* node = &type;
+        while (*node && ((*node)->kind == Type::Kind::Pointer ||
+                         (*node)->kind == Type::Kind::Array)) {
+            *node = std::make_shared<Type>(**node);
+            node = (*node)->kind == Type::Kind::Pointer ? &(*node)->pointee
+                                                        : &(*node)->element;
+        }
+        if (!*node || (*node)->kind != Type::Kind::Function ||
+            !(*node)->function) {
+            diagnostics_.error(
+                attribute.location,
+                "'abi' requires a function or function-pointer type");
+            continue;
+        }
+        *node = std::make_shared<Type>(**node);
+        (*node)->function = std::make_shared<FunctionType>(*(*node)->function);
+        (*node)->function->abi = *spelling;
+    }
+}
+
 TypePtr Parser::parse_array_suffix(
     TypePtr element, bool parameter,
     std::unique_ptr<Expr>* dynamic_outer_bound) {
@@ -578,19 +690,20 @@ void Parser::parse_typedef(const std::string& name_space,
         return;
     }
     auto type = parse_type();
-    auto name = parse_qualified_name();
+    std::optional<std::string> name;
+    type = parse_declarator(std::move(type), name);
     if (!type || !name) {
         if (!name) error_here("expected typedef name");
         synchronize_external();
         return;
     }
-    type = parse_array_suffix(std::move(type));
     *name = join_namespace(name_space, *name);
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
                       std::make_move_iterator(trailing.end()));
     expect(";", "after typedef declaration");
+    apply_callable_attributes(type, attributes);
 
     const Attribute* vector_attribute = nullptr;
     for (const auto& attribute : attributes) {
@@ -750,7 +863,8 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     }
     const auto location = current().location;
     auto type = parse_type();
-    auto name = parse_qualified_name();
+    std::optional<std::string> name;
+    type = parse_declarator(std::move(type), name);
     if (!type || !name) {
         if (!name) error_here("expected declaration name");
         synchronize_external();
@@ -758,16 +872,20 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
     *name = join_namespace(name_space, *name);
-    if (current().is("(")) {
-        auto function = parse_function(location, std::move(*name), name_space,
-                                       std::move(type), linkage, inline_hint,
-                                       std::move(attributes));
+    if (type->kind == Type::Kind::Function && type->function) {
+        auto signature = type->function;
+        auto result_type = signature->result;
+        auto function = parse_function(
+            location, std::move(*name), name_space, std::move(result_type),
+            linkage, inline_hint, std::move(attributes), std::move(signature));
         if (function) program.functions.push_back(std::move(function));
     } else {
-        type = parse_array_suffix(std::move(type));
-        if (inline_hint) diagnostics_.error(location, "'inline' is valid only on a function");
-        auto object = parse_object(location, std::move(*name), std::move(type), linkage,
-                                   std::move(attributes));
+        apply_callable_attributes(type, attributes);
+        if (inline_hint)
+            diagnostics_.error(location,
+                               "'inline' is valid only on a function");
+        auto object = parse_object(location, std::move(*name), std::move(type),
+                                   linkage, std::move(attributes));
         if (object) program.objects.push_back(std::move(object));
     }
     active_generic_types_ = saved_generic_types;
@@ -914,12 +1032,12 @@ void Parser::parse_record_declaration(
             auto base_type = parse_type();
             bool parsed_member = false;
             do {
-                const auto* member_name = consume_kind(TokenKind::Identifier);
+                std::optional<std::string> member_name;
+                auto member_type = parse_declarator(base_type, member_name);
                 if (!member_name) {
                     error_here("expected record member name");
                     break;
                 }
-                auto member_type = parse_array_suffix(base_type);
                 auto item_attributes = parse_attributes();
                 item_attributes.insert(
                     item_attributes.begin(), member_attributes.begin(),
@@ -927,12 +1045,12 @@ void Parser::parse_record_declaration(
                 if (consume(":")) {
                     (void)parse_expression();
                     diagnostics_.error(
-                        member_name->location,
+                        member_location,
                         "record bit-fields are not implemented yet");
                 } else {
                     declaration.members.push_back(
-                        {member_location, std::string(member_name->text),
-                         std::move(member_type), std::move(item_attributes)});
+                        {member_location, *member_name, std::move(member_type),
+                         std::move(item_attributes)});
                 }
                 parsed_member = true;
             } while (consume(","));
@@ -977,13 +1095,15 @@ bool Parser::parse_static_assertion() {
 ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     ParameterDecl parameter;
     parameter.location = current().location;
+    auto attributes = parse_attributes();
     if (consume("in")) { parameter.mode = ParameterMode::In; parameter.explicit_mode = true; }
     else if (consume("out")) { parameter.mode = ParameterMode::Out; parameter.explicit_mode = true; }
     else if (consume("inout")) { parameter.mode = ParameterMode::InOut; parameter.explicit_mode = true; }
     parameter.type = parse_type();
-    if (const auto name = parse_qualified_name()) parameter.name = *name;
-    else parameter.name = "_parameter" + std::to_string(ordinal);
-    parameter.type = parse_array_suffix(std::move(parameter.type), true);
+    std::optional<std::string> name;
+    parameter.type = parse_declarator(std::move(parameter.type), name, true);
+    parameter.name = name.value_or("_parameter" + std::to_string(ordinal));
+    apply_callable_attributes(parameter.type, attributes);
     if (!parameter.explicit_mode && parameter.type && parameter.type->is_const) {
         parameter.mode = ParameterMode::In;
     }
@@ -994,42 +1114,60 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     return parameter;
 }
 
-std::unique_ptr<FunctionDecl> Parser::parse_function(
-    SourceLocation location, std::string name, std::string name_space,
-    TypePtr return_type, Linkage linkage, bool inline_hint,
-    std::vector<Attribute> attributes) {
+std::unique_ptr<FunctionDecl>
+Parser::parse_function(SourceLocation location, std::string name,
+                       std::string name_space, TypePtr return_type,
+                       Linkage linkage, bool inline_hint,
+                       std::vector<Attribute> attributes,
+                       std::shared_ptr<FunctionType> signature) {
     auto function = std::make_unique<FunctionDecl>();
     function->location = location;
     function->name = std::move(name);
     function->source_namespace = std::move(name_space);
-    if (location.file) function->source_unit = location.file->path.generic_string();
+    if (location.file)
+        function->source_unit = location.file->path.generic_string();
     function->imports = active_imports_;
     function->return_type = std::move(return_type);
     function->linkage = linkage;
     function->inline_hint = inline_hint;
     function->attributes = std::move(attributes);
     function->generic_parameters = generic_parameters(function->attributes);
-    expect("(");
-    if (!consume(")")) {
-        if (current().is("void") && current(1).is(")")) {
-            ++index_;
-        } else {
-            unsigned ordinal = 0;
-            for (;;) {
-                if (consume("...")) { function->variadic = true; break; }
-                function->parameters.push_back(parse_parameter(ordinal++));
-                if (!consume(",")) break;
-            }
+    if (signature) {
+        function->parameters = signature->parameters;
+        function->variadic = signature->variadic;
+        if (!signature->abi.empty() && !function->attribute("abi")) {
+            function->attributes.push_back(
+                {"abi", {"\"" + signature->abi + "\""}, location});
         }
-        expect(")");
+    } else {
+        expect("(");
+        if (!consume(")")) {
+            if (current().is("void") && current(1).is(")")) {
+                ++index_;
+            } else {
+                unsigned ordinal = 0;
+                for (;;) {
+                    if (consume("...")) {
+                        function->variadic = true;
+                        break;
+                    }
+                    function->parameters.push_back(parse_parameter(ordinal++));
+                    if (!consume(",")) break;
+                }
+            }
+            expect(")");
+        }
     }
     if (consume("->")) {
         const auto* location_token = consume_kind(TokenKind::String);
-        if (!location_token) error_here("expected result location string after '->'");
+        if (!location_token)
+            error_here("expected result location string after '->'");
         else {
-            function->result_location = decode_string_literal(location_token->text);
+            function->result_location =
+                decode_string_literal(location_token->text);
             if (!function->result_location) {
-                diagnostics_.error(location_token->location, "invalid result location string");
+                diagnostics_.error(location_token->location,
+                                   "invalid result location string");
             }
         }
     }
@@ -1076,12 +1214,12 @@ std::unique_ptr<Statement> Parser::parse_local_declaration() {
     if (consume("register")) declaration.storage_register = true;
     else if (consume("stack")) declaration.storage_stack = true;
     declaration.type = parse_type();
-    const auto name = parse_qualified_name();
+    std::optional<std::string> name;
+    declaration.type =
+        parse_declarator(std::move(declaration.type), name, false,
+                         &declaration.dynamic_array_bound);
     if (!name) error_here("expected local variable name");
     else declaration.name = *name;
-    declaration.type = parse_array_suffix(
-        std::move(declaration.type), false,
-        &declaration.dynamic_array_bound);
     if (const auto* location = consume_kind(TokenKind::String)) {
         declaration.location_name = decode_string_literal(location->text);
     }

@@ -20,13 +20,23 @@ enum class BuiltinType {
 };
 
 struct Type;
+struct FunctionType;
 using TypePtr = std::shared_ptr<Type>;
 
 struct Type {
-    enum class Kind { Builtin, Pointer, Generic, Vector, Array, Record } kind{Kind::Builtin};
+    enum class Kind {
+        Builtin,
+        Pointer,
+        Generic,
+        Vector,
+        Array,
+        Record,
+        Function
+    } kind{Kind::Builtin};
     BuiltinType builtin{BuiltinType::Void};
     TypePtr pointee;
     TypePtr element;
+    std::shared_ptr<FunctionType> function;
     std::uint32_t lanes{};
     bool scalable{};
     std::string generic_name;
@@ -136,6 +146,18 @@ struct ParameterDecl {
     bool explicit_mode{};
     std::optional<std::string> location_name;
 };
+
+// Source-level callable identity. Names and source locations aid diagnostics;
+// parameter modes, types, variadicness, and ABI determine compatibility.
+struct FunctionType {
+    TypePtr result;
+    std::vector<ParameterDecl> parameters;
+    bool variadic{};
+    std::string abi;
+};
+
+TypePtr function_type(TypePtr result, std::vector<ParameterDecl> parameters,
+                      bool variadic = false, std::string abi = {});
 
 struct FunctionDecl {
     struct GenericParameter {

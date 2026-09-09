@@ -166,9 +166,17 @@ bool verify_instruction(const Instruction& instruction, const Function& function
                       "machine call requires a symbol or register callee as its first operand");
         }
         if (instruction.direct_callee &&
-            !symbol_operand(instruction.operands.front())) {
+            (instruction.operands.empty() ||
+             !symbol_operand(instruction.operands.front()))) {
             ok = fail(diagnostics, instruction.location,
                       "direct machine call identity requires a symbol callee");
+        }
+        if (instruction.call_signature &&
+            (instruction.direct_callee || instruction.operands.empty() ||
+             !register_operand(instruction.operands.front()))) {
+            ok = fail(diagnostics, instruction.location,
+                      "indirect machine call signature requires a register "
+                      "target and no direct identity");
         }
         if (instruction.call_argument_types.size() + 1 !=
             instruction.operands.size()) {
@@ -217,7 +225,8 @@ bool verify_instruction(const Instruction& instruction, const Function& function
                   "call-live values may appear only on a machine call");
     }
     if (instruction.kind != InstructionKind::Call &&
-        !instruction.call_argument_types.empty()) {
+        (!instruction.call_argument_types.empty() ||
+         instruction.call_signature)) {
         ok = fail(diagnostics, instruction.location,
                   "call argument types may appear only on a machine call");
     }

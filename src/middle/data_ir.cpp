@@ -579,6 +579,22 @@ bool lower_initializer(Object& result, const hir::Module& module,
                 "global pointer/label initializer is not an address constant");
             return false;
         }
+        const auto expected_function =
+            type.kind == hir::Type::Kind::Pointer && type.pointee &&
+            module.type(*type.pointee).kind == hir::Type::Kind::Function;
+        if (expected_function ||
+            result.address->kind == AddressKind::Function) {
+            const auto actual =
+                hir::call_signature(module, result.address->function, {});
+            if (!expected_function ||
+                result.address->kind != AddressKind::Function || !actual ||
+                module.type(*type.pointee).function != actual) {
+                diagnostics.error(expression.location,
+                                  "global function-pointer initializer has an "
+                                  "incompatible signature or ABI");
+                return false;
+            }
+        }
         if (result.address->kind == AddressKind::Object &&
             result.address->object &&
             module.object(*result.address->object).is_thread_local) {
@@ -684,16 +700,15 @@ const Object* Module::find(hir::ObjectId id) const {
     return found == object_indices.end() ? nullptr : &objects[found->second];
 }
 
-Module lower(const hir::Module& hir_module, const Subtarget& subtarget,
+Module lower(hir::Module& hir_module, const Subtarget& subtarget,
              Diagnostics& diagnostics) {
     Module result;
     result.address_bits = subtarget.abi_info().address_bits;
     result.byte_order = subtarget.target().data_layout.byte_order;
     result.objects.reserve(hir_module.objects.size());
     for (const auto& entity : hir_module.objects) {
-        const auto* declaration = entity.definition
-                                      ? entity.definition
-                                      : entity.declarations.back();
+        const auto* declaration =
+            entity.definition ? entity.definition : entity.declarations.back();
         for (const auto* source : entity.declarations) {
             for (const auto& item : source->attributes) {
                 if (!supported_attribute(item.name)) {
@@ -713,8 +728,8 @@ Module lower(const hir::Module& hir_module, const Subtarget& subtarget,
             diagnostics.error(declaration->location,
                               "object has incomplete storage type");
         }
-        const auto natural = natural_alignment(
-            hir_module, entity.type, object.size, subtarget);
+        const auto natural =
+            natural_alignment(hir_module, entity.type, object.size, subtarget);
         if (const auto alignment =
                 object_alignment(*declaration, natural, diagnostics)) {
             object.alignment = *alignment;
@@ -730,22 +745,21 @@ Module lower(const hir::Module& hir_module, const Subtarget& subtarget,
                 declaration->location,
                 "tls_model requires thread_local on the same object");
         }
-        if (!object.tls_model.empty() &&
-            object.tls_model != "local-exec" &&
+        if (!object.tls_model.empty() && object.tls_model != "local-exec" &&
             object.tls_model != "initial-exec" &&
             object.tls_model != "local-dynamic" &&
             object.tls_model != "global-dynamic") {
-            diagnostics.error(
-                declaration->location,
-                "tls_model must be local-exec, initial-exec, local-dynamic, or global-dynamic");
+            diagnostics.error(declaration->location,
+                              "tls_model must be local-exec, initial-exec, "
+                              "local-dynamic, or global-dynamic");
         }
         const bool noinit =
             marker_attribute(*declaration, "noinit", diagnostics);
-        const auto recursively_const = [&](auto&& self, hir::TypeId id) -> bool {
+        const auto recursively_const = [&](auto&& self,
+                                           hir::TypeId id) -> bool {
             const auto& type = hir_module.type(id);
-            return type.is_const ||
-                   (type.kind == hir::Type::Kind::Array && type.element &&
-                    self(self, *type.element));
+            return type.is_const || (type.kind == hir::Type::Kind::Array &&
+                                     type.element && self(self, *type.element));
         };
         object.read_only = !object.is_thread_local &&
                            recursively_const(recursively_const, entity.type) &&
@@ -780,8 +794,13 @@ Module lower(const hir::Module& hir_module, const Subtarget& subtarget,
             (void)lower_initializer(object, hir_module, entity, *declaration,
                                     subtarget, diagnostics);
         }
-        result.object_indices.emplace(
-            entity.id.value, result.objects.size());
+        result.object_indices.emplace(entity.id.value, result.objects.size());
+        if (object.address && object.address->kind == AddressKind::Function &&
+            object.address->function) {
+            (void)hir::stabilize_function_address(
+                hir_module, *object.address->function, declaration->location,
+                diagnostics);
+        }
         result.objects.push_back(std::move(object));
     }
     return result;

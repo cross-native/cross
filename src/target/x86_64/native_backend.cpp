@@ -1186,6 +1186,12 @@ private:
             instruction.operands.push_back(
                 immediate_operand(value.parameter_index, 0, machine::i32));
             instruction.defs.push_back(reg(value.id));
+            // Even an unread out value has an observable incoming pointer:
+            // the late return boundary copies its cell through that pointer.
+            instruction.has_side_effects =
+                hir_.function(current_.source)
+                    .parameters[value.parameter_index]
+                    .mode != ParameterMode::In;
             return instruction;
         }
         if (value.kind == ValueKind::ConstantInteger) {
@@ -1251,6 +1257,15 @@ private:
                 target_instruction(Opcode::StackAddress, value.location);
             instruction.operands.push_back(
                 stack_operand({value.slot->value}, machine::i64));
+            instruction.defs.push_back(reg(value.id));
+            return instruction;
+        }
+        if (value.kind == ValueKind::FunctionAddress) {
+            auto instruction =
+                target_instruction(Opcode::GlobalAddress, value.location);
+            instruction.operands.push_back(
+                machine::SymbolOperand{hir_.function(*value.callee).link_symbol,
+                                       0, true, std::nullopt, value.callee});
             instruction.defs.push_back(reg(value.id));
             return instruction;
         }
@@ -1357,6 +1372,11 @@ private:
             instruction.defs.push_back(reg(value.id));
             instruction.may_load = !slot.physical_location;
             instruction.has_side_effects = value.is_volatile_access;
+            if (instruction.opcode == Opcode::Load) {
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                if (reg(value.id).mode.bits > 64)
+                    append_fixed_clobber(instruction, "rdx", machine::i64);
+            }
             return instruction;
         }
         if (value.kind == ValueKind::Store) {
@@ -1383,6 +1403,11 @@ private:
             instruction.uses.push_back(source);
             instruction.may_store = !slot.physical_location;
             instruction.has_side_effects = true;
+            if (instruction.opcode == Opcode::Store) {
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                if (source.mode.bits > 64)
+                    append_fixed_clobber(instruction, "rdx", machine::i64);
+            }
             return instruction;
         }
         if (value.kind == ValueKind::PointerLoad) {
@@ -1530,11 +1555,19 @@ private:
             machine::Instruction instruction;
             instruction.kind = machine::InstructionKind::Call;
             instruction.location = value.location;
-            const auto& callee = hir_.function(*value.callee);
-            instruction.direct_callee = callee.id;
-            instruction.operands.push_back(
-                machine::SymbolOperand{callee.link_symbol, 0, true,
-                                       std::nullopt});
+            const auto callee =
+                *hir::call_signature(hir_, value.callee, value.call_signature);
+            instruction.direct_callee = value.callee;
+            instruction.call_signature = value.call_signature;
+            if (value.callee) {
+                instruction.operands.push_back(machine::SymbolOperand{
+                    hir_.function(*value.callee).link_symbol, 0, true,
+                    std::nullopt});
+            } else {
+                const auto target = reg(value.operands.front());
+                instruction.operands.push_back(register_operand(target));
+                instruction.uses.push_back(target);
+            }
             for (const auto& argument : value.call_arguments) {
                 instruction.call_argument_types.push_back(argument.type);
                 if (argument.value) {
@@ -1564,12 +1597,15 @@ private:
                                         view->bits, 128U))}));
                     }
                 };
-            if (const auto* dynamic = dynamic_plans_.find(callee.id)) {
+            if (const auto* dynamic = value.callee
+                                          ? dynamic_plans_.find(*value.callee)
+                                          : nullptr) {
                 append_clobbers(dynamic->clobbers);
             } else if (const auto* abi = abi_model(callee.abi)) {
                 append_clobbers(abi->call_clobbers);
             }
-            append_clobbers(callee.clobbers);
+            if (value.callee)
+                append_clobbers(hir_.function(*value.callee).clobbers);
             instruction.has_side_effects = true;
             return instruction;
         }
@@ -8498,42 +8534,45 @@ private:
         std::size_t largest_outgoing = 0;
         std::size_t largest_outgoing_alignment = 16;
         bool has_call = false;
+        bool has_indirect_call = false;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (instruction.kind != machine::InstructionKind::Call) continue;
                 has_call = true;
-                if (!instruction.direct_callee ||
-                    instruction.direct_callee->value >=
-                        hir_.functions.size()) {
-                    continue;
-                }
-                const auto* callee =
-                    &hir_.function(*instruction.direct_callee);
-                if (const auto* manual = manual_plans_.find(callee->id)) {
+                has_indirect_call |= !instruction.direct_callee;
+                const auto callee =
+                    hir::call_signature(hir_, instruction.direct_callee,
+                                        instruction.call_signature);
+                if (!callee) continue;
+                if (const auto* manual =
+                        instruction.direct_callee
+                            ? manual_plans_.find(*instruction.direct_callee)
+                            : nullptr) {
                     if (!manual->valid) {
                         diagnostics_.error(
                             instruction.location,
                             "invalid manual ABI plan reached frame lowering");
                         continue;
                     }
-                    largest_outgoing = std::max(
-                        largest_outgoing,
-                        static_cast<std::size_t>(
-                            manual->stack.outgoing_area_size));
-                    largest_outgoing_alignment = std::max(
-                        largest_outgoing_alignment,
-                        static_cast<std::size_t>(
-                            manual->stack.outgoing_area_alignment));
+                    largest_outgoing =
+                        std::max(largest_outgoing,
+                                 static_cast<std::size_t>(
+                                     manual->stack.outgoing_area_size));
+                    largest_outgoing_alignment =
+                        std::max(largest_outgoing_alignment,
+                                 static_cast<std::size_t>(
+                                     manual->stack.outgoing_area_alignment));
                     continue;
                 }
                 if (const auto* dynamic =
-                        dynamic_plans_.find(callee->id)) {
+                        instruction.direct_callee
+                            ? dynamic_plans_.find(*instruction.direct_callee)
+                            : nullptr) {
                     largest_outgoing = std::max(
-                        largest_outgoing,
-                        dynamic->call.outgoing_area_size);
-                    largest_outgoing_alignment = std::max(
-                        largest_outgoing_alignment,
-                        dynamic->call.outgoing_area_alignment);
+                        largest_outgoing, dynamic->call.outgoing_area_size);
+                    largest_outgoing_alignment =
+                        std::max(largest_outgoing_alignment,
+                                 dynamic->call.outgoing_area_alignment);
                     continue;
                 }
                 std::vector<AbiValue> arguments;
@@ -8622,6 +8661,7 @@ private:
         if (has_call && options_.code_model == CodeModel::Large) {
             add_dynamic_save_slot("$large.call.target");
         }
+        if (has_indirect_call) add_dynamic_save_slot("$indirect.call.target");
         const bool dynamic_realign =
             dynamic_stack && std::any_of(
                 current_.stack_slots.begin(), current_.stack_slots.end(),
@@ -9830,6 +9870,9 @@ private:
     bool global_requires_got(
         const machine::SymbolOperand& source) const {
         if (!options_.position_independent) return false;
+        if (source.function) {
+            return externally_preemptible(hir_.function(*source.function));
+        }
         const auto* object = symbol_object(source);
         return object && externally_preemptible(*object);
     }
@@ -19858,13 +19901,15 @@ private:
                 modes.push_back(machine::i64);
             }
         }
-        const auto& symbol =
-            std::get<machine::SymbolOperand>(value.operands.front());
-        const hir::Function* callee{};
+        const auto* symbol =
+            std::get_if<machine::SymbolOperand>(&value.operands.front());
+        const hir::Function* entity{};
         if (value.direct_callee &&
             value.direct_callee->value < hir_.functions.size()) {
-            callee = &hir_.function(*value.direct_callee);
+            entity = &hir_.function(*value.direct_callee);
         }
+        const auto callee = hir::call_signature(hir_, value.direct_callee,
+                                                value.call_signature);
         if (!callee) {
             diagnostics_.error(value.location,
                                "machine call has no canonical HIR callee");
@@ -19877,12 +19922,28 @@ private:
             return;
         }
         if (!tail) save_hard_registers(function, "$hard.call.");
-        if (!prepare_call_target(function, *callee, symbol, value.location)) {
+        if (entity && symbol &&
+            !prepare_call_target(function, *entity, *symbol, value.location)) {
             if (!tail) restore_hard_registers(function, "$hard.call.");
             return;
         }
-        if (const auto* manual = manual_plans_.find(callee->id);
-            manual && emit_manual_call(function, value, *callee, *manual)) {
+        if (!entity) {
+            const auto* target =
+                std::get_if<machine::RegisterOperand>(&value.operands.front());
+            const auto slot =
+                named_slot_offset(function, "$indirect.call.target");
+            if (!target || !slot || tail) {
+                diagnostics_.error(value.location,
+                                   "invalid indirect x86-64 call target");
+                if (!tail) restore_hard_registers(function, "$hard.call.");
+                return;
+            }
+            load(function, target->value, "rax");
+            instruction("movq", "%rax, " + memory(*slot));
+        }
+        if (const auto* manual =
+                entity ? manual_plans_.find(entity->id) : nullptr;
+            manual && emit_manual_call(function, value, *entity, *manual)) {
             if (!tail) restore_hard_registers(function, "$hard.call.");
             return;
         }
@@ -19895,7 +19956,8 @@ private:
             automatic.mode = modes[index];
             scalar_modes.push_back(std::move(automatic));
         }
-        const auto* dynamic = dynamic_plans_.find(callee->id);
+        const auto* dynamic =
+            entity ? dynamic_plans_.find(entity->id) : nullptr;
         std::optional<AutomaticAbiValue> result_mode;
         if (!is_void(hir_, callee->result_type)) {
             result_mode = automatic_value(
@@ -20350,7 +20412,7 @@ private:
             if (uses_wide_vectors_) instruction("vzeroupper");
             restore_allocated_preserved_registers(function);
             emit_frame_teardown(function);
-            emit_tail_call_transfer(*callee, symbol);
+            emit_tail_call_transfer(*entity, *symbol);
             if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
                 output_ << ".cfi_restore_state\n";
             }
@@ -20369,7 +20431,13 @@ private:
                 "$" + std::to_string(hidden.value) + ", " +
                     register_name(view->storage_name, hidden.bits));
         }
-        emit_call_transfer(function, *callee, symbol, value.location);
+        if (entity && symbol) {
+            emit_call_transfer(function, *entity, *symbol, value.location);
+        } else {
+            if (uses_wide_vectors_) instruction("vzeroupper");
+            instruction("call", "*" + memory(*named_slot_offset(
+                                          function, "$indirect.call.target")));
+        }
         if (!value.defs.empty()) {
             const auto target = value.defs.front();
             if (!result || !*result ||

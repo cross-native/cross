@@ -816,6 +816,15 @@ private:
             result.defs.push_back(reg(value.id));
             return result;
         }
+        if (value.kind == ValueKind::FunctionAddress) {
+            auto result =
+                target_instruction(Opcode::GlobalAddress, value.location);
+            result.operands.push_back(
+                machine::SymbolOperand{hir_.function(*value.callee).link_symbol,
+                                       0, true, std::nullopt, value.callee});
+            result.defs.push_back(reg(value.id));
+            return result;
+        }
         if (value.kind == ValueKind::GlobalAddress) {
             auto result = target_instruction(Opcode::GlobalAddress,
                                              value.location);
@@ -1019,10 +1028,19 @@ private:
             machine::Instruction result;
             result.kind = machine::InstructionKind::Call;
             result.location = value.location;
-            const auto& callee = hir_.function(*value.callee);
-            result.direct_callee = callee.id;
-            result.operands.push_back(machine::SymbolOperand{
-                callee.link_symbol, 0, true, std::nullopt});
+            const auto callee =
+                *hir::call_signature(hir_, value.callee, value.call_signature);
+            result.direct_callee = value.callee;
+            result.call_signature = value.call_signature;
+            if (value.callee) {
+                result.operands.push_back(machine::SymbolOperand{
+                    hir_.function(*value.callee).link_symbol, 0, true,
+                    std::nullopt});
+            } else {
+                const auto target = reg(value.operands.front());
+                result.operands.push_back(register_operand(target));
+                result.uses.push_back(target);
+            }
             for (const auto& argument : value.call_arguments) {
                 result.call_argument_types.push_back(argument.type);
                 if (argument.value) {
@@ -1073,12 +1091,15 @@ private:
                                 physical, machine::i64));
                     }
                 };
-            if (const auto* abi = managed_abi_model(
-                    callee, subtarget_, options_)) {
+            const auto* entity =
+                value.callee ? &hir_.function(*value.callee) : nullptr;
+            if (const auto* abi =
+                    entity ? managed_abi_model(*entity, subtarget_, options_)
+                           : abi_model(callee.abi)) {
                 const auto exact =
-                    options_.ipa_ra && options_.private_abi &&
-                            callee.abi_contract == hir::AbiContract::Dynamic
-                        ? private_clobbers_.find(callee.id.value)
+                    entity && options_.ipa_ra && options_.private_abi &&
+                            entity->abi_contract == hir::AbiContract::Dynamic
+                        ? private_clobbers_.find(entity->id.value)
                         : private_clobbers_.end();
                 if (exact != private_clobbers_.end()) {
                     append_physical_clobbers(exact->second);
@@ -1087,8 +1108,8 @@ private:
                 }
                 std::vector<AbiValue> arguments;
                 arguments.reserve(value.call_arguments.size());
-                for (std::size_t index = 0;
-                     index < value.call_arguments.size(); ++index) {
+                for (std::size_t index = 0; index < value.call_arguments.size();
+                     ++index) {
                     const auto transport =
                         index < callee.parameters.size() &&
                                 callee.parameters[index].mode !=
@@ -1101,28 +1122,26 @@ private:
                 }
                 std::vector<AbiValue> results;
                 if (!is_void(hir_, callee.result_type)) {
-                    results.push_back(abi_value_for(
-                        hir_, callee.result_type,
-                        subtarget_.target().data_layout, *abi));
+                    results.push_back(
+                        abi_value_for(hir_, callee.result_type,
+                                      subtarget_.target().data_layout, *abi));
                 }
-                const auto classified = callee.variadic
-                    ? classify_variadic_signature(
-                          *abi, arguments, results,
-                          callee.parameters.size(),
-                          subtarget_.enabled_features())
-                    : classify_signature(
-                          *abi, arguments, results,
-                          subtarget_.enabled_features());
+                const auto classified =
+                    callee.variadic
+                        ? classify_variadic_signature(
+                              *abi, arguments, results,
+                              callee.parameters.size(),
+                              subtarget_.enabled_features())
+                        : classify_signature(*abi, arguments, results,
+                                             subtarget_.enabled_features());
                 if (classified) {
-                    const auto append_pieces =
-                        [&](const auto& pieces) {
-                            for (const auto& piece : pieces) {
-                                if (piece.location.kind ==
-                                    LocationKind::Register) {
-                                    append_clobbers({piece.location.reg});
-                                }
+                    const auto append_pieces = [&](const auto& pieces) {
+                        for (const auto& piece : pieces) {
+                            if (piece.location.kind == LocationKind::Register) {
+                                append_clobbers({piece.location.reg});
                             }
-                        };
+                        }
+                    };
                     for (const auto& assignment :
                          classified.layout.call.arguments) {
                         append_pieces(assignment.pieces);
@@ -1133,7 +1152,7 @@ private:
                     }
                 }
             }
-            append_clobbers(callee.clobbers);
+            if (entity) append_clobbers(entity->clobbers);
             result.has_side_effects = true;
             return result;
         }
@@ -4755,45 +4774,70 @@ private:
         const hir::Function& entity, SourceLocation location,
         std::span<const hir::TypeId> actual_types = {}) {
         const auto* abi = managed_abi_model(entity, subtarget_, options_);
+        return classify_interface(
+            *hir::call_signature(hir_, entity.id, std::nullopt), abi, location,
+            actual_types);
+    }
+
+    std::optional<ActiveSignature>
+    classify_call(const machine::Instruction& call) {
+        if (call.direct_callee) {
+            return classify_entity(hir_.function(*call.direct_callee),
+                                   call.location, call.call_argument_types);
+        }
+        const auto signature =
+            hir::call_signature(hir_, std::nullopt, call.call_signature);
+        if (!signature) {
+            diagnostics_.error(call.location,
+                               "MIPS call has no typed interface");
+            return std::nullopt;
+        }
+        return classify_interface(*signature, abi_model(signature->abi),
+                                  call.location, call.call_argument_types);
+    }
+
+    std::optional<ActiveSignature>
+    classify_interface(const hir::FunctionSignature& entity,
+                       const AbiEntry* abi, SourceLocation location,
+                       std::span<const hir::TypeId> actual_types) {
         if (!abi) {
             diagnostics_.error(location,
                                "MIPS function has no registered ABI model");
             return std::nullopt;
         }
         std::vector<AbiValue> arguments;
-        const auto count = actual_types.empty()
-            ? entity.parameters.size() : actual_types.size();
+        const auto count = actual_types.empty() ? entity.parameters.size()
+                                                : actual_types.size();
         arguments.reserve(count);
         for (std::size_t index = 0; index < count; ++index) {
             const auto type = actual_types.empty()
-                ? entity.parameters[index].type : actual_types[index];
+                                  ? entity.parameters[index].type
+                                  : actual_types[index];
             const bool fixed = index < entity.parameters.size();
-            const auto transport = fixed &&
-                                           entity.parameters[index].mode !=
-                                               ParameterMode::In
-                                       ? ValueTransport::ByReference
-                                       : ValueTransport::Direct;
+            const auto transport =
+                fixed && entity.parameters[index].mode != ParameterMode::In
+                    ? ValueTransport::ByReference
+                    : ValueTransport::Direct;
             arguments.push_back(abi_value_for(
-                hir_, type, subtarget_.target().data_layout, *abi,
-                transport));
+                hir_, type, subtarget_.target().data_layout, *abi, transport));
         }
         std::vector<AbiValue> results;
         if (!is_void(hir_, entity.result_type)) {
-            results.push_back(abi_value_for(
-                hir_, entity.result_type, subtarget_.target().data_layout,
-                *abi));
+            results.push_back(abi_value_for(hir_, entity.result_type,
+                                            subtarget_.target().data_layout,
+                                            *abi));
         }
-        const auto classified = entity.variadic
-            ? classify_variadic_signature(
-                  *abi, arguments, results, entity.parameters.size(),
-                  subtarget_.enabled_features())
-            : classify_signature(*abi, arguments, results,
-                                 subtarget_.enabled_features());
+        const auto classified =
+            entity.variadic
+                ? classify_variadic_signature(*abi, arguments, results,
+                                              entity.parameters.size(),
+                                              subtarget_.enabled_features())
+                : classify_signature(*abi, arguments, results,
+                                     subtarget_.enabled_features());
         if (!classified) {
             diagnostics_.error(
                 location,
-                "MIPS ABI model could not classify function interface '" +
-                    entity.source_name + "'");
+                "MIPS ABI model could not classify function interface");
             return std::nullopt;
         }
         return ActiveSignature{abi, classified.layout};
@@ -5393,13 +5437,10 @@ private:
         std::uint32_t size{};
         for (const auto& block : function.blocks) {
             for (const auto& value : block.instructions) {
-                if (value.kind != machine::InstructionKind::Call ||
-                    !value.direct_callee) {
+                if (value.kind != machine::InstructionKind::Call) {
                     continue;
                 }
-                const auto& callee = hir_.function(*value.direct_callee);
-                auto classified = classify_entity(
-                    callee, value.location, value.call_argument_types);
+                auto classified = classify_call(value);
                 if (!classified) continue;
                 if (classified->layout.call.outgoing_area_size >
                     std::numeric_limits<std::uint32_t>::max()) {
@@ -6108,7 +6149,8 @@ private:
         }
         const auto target = call.defs.front();
         const auto& assignment = signature.layout.results.front();
-        const auto& callee = hir_.function(*call.direct_callee);
+        const auto callee =
+            *hir::call_signature(hir_, call.direct_callee, call.call_signature);
         const auto bits = type_bits(hir_, callee.result_type);
         if (!is_floating(hir_, callee.result_type) &&
             assignment.pieces.size() == 1 &&
@@ -6326,14 +6368,7 @@ private:
     void emit_call(const machine::Function& function,
                    const machine::Instruction& call, bool tail = false,
                    bool cfi = false) {
-        if (!call.direct_callee) {
-            diagnostics_.error(call.location,
-                               "indirect MIPS calls are not implemented yet");
-            return;
-        }
-        const auto& callee = hir_.function(*call.direct_callee);
-        auto signature = classify_entity(
-            callee, call.location, call.call_argument_types);
+        auto signature = classify_call(call);
         if (!signature) return;
         if (signature->layout.call.arguments.size() + 1 !=
             call.operands.size()) {
@@ -6391,8 +6426,15 @@ private:
         }
         const auto* callee_symbol =
             std::get_if<machine::SymbolOperand>(&call.operands.front());
-        if (!callee_symbol) return;
+        const auto* callee_register =
+            std::get_if<machine::RegisterOperand>(&call.operands.front());
+        if (!callee_symbol && !callee_register) return;
         if (tail) {
+            if (!callee_symbol) {
+                diagnostics_.error(call.location,
+                                   "indirect MIPS tail calls are not selected");
+                return;
+            }
             if (cfi) output_ << ".cfi_remember_state\n";
             const machine::Instruction* frame_delay = nullptr;
             if (function.frame.program) {
@@ -6430,9 +6472,13 @@ private:
             if (cfi) output_ << ".cfi_restore_state\n";
             return;
         }
-        if (large_code_model()) {
-            materialize_symbol_address(
-                "at", assembly_symbol(callee_symbol->name));
+        if (callee_register) {
+            const auto target = input_gpr(function, callee_register->value,
+                                          "at", call.location);
+            instruction("jalr", reg_name(target));
+        } else if (large_code_model()) {
+            materialize_symbol_address("at",
+                                       assembly_symbol(callee_symbol->name));
             instruction("jalr", "$at");
         } else {
             instruction("jal", assembly_symbol(callee_symbol->name));

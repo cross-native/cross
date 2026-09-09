@@ -490,7 +490,18 @@ DynamicAbiPlans build_dynamic_abi_plans(
             const auto* body = managed.find(plan.function);
             if (!body) continue;
             for (const auto& value : body->values) {
-                if (value.kind != mir::ValueKind::Call || !value.callee) {
+                if (value.kind != mir::ValueKind::Call) {
+                    continue;
+                }
+                if (!value.callee) {
+                    const auto signature = hir::call_signature(
+                        hir_module, std::nullopt, value.call_signature);
+                    if (const auto* abi = signature ? model_registry().find_abi(
+                                                          signature->abi)
+                                                    : nullptr) {
+                        changed |=
+                            append_unique(plan.clobbers, abi->call_clobbers);
+                    }
                     continue;
                 }
                 const auto& callee = hir_module.function(*value.callee);

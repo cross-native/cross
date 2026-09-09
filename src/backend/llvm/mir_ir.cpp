@@ -377,12 +377,17 @@ public:
                        value.slot) {
                 references_[value.id.value] =
                     "%mir.slot" + std::to_string(value.slot->value);
+            } else if (value.kind == mir::ValueKind::FunctionAddress &&
+                       value.callee) {
+                references_[value.id.value] =
+                    symbol_name(hir_.function(*value.callee).link_symbol);
             } else if (value.kind == mir::ValueKind::GlobalAddress &&
                        value.object) {
-                references_[value.id.value] = symbol_name(
-                    hir_.object(*value.object).link_symbol);
+                references_[value.id.value] =
+                    symbol_name(hir_.object(*value.object).link_symbol);
             } else {
-                references_[value.id.value] = "%mir.v" + std::to_string(value.id.value);
+                references_[value.id.value] =
+                    "%mir.v" + std::to_string(value.id.value);
             }
         }
     }
@@ -463,17 +468,20 @@ private:
     }
 
     std::string abi_name(const hir::Function& function) {
+        return abi_name(function.abi, function.location);
+    }
+
+    std::string abi_name(AbiId id, SourceLocation location) {
         const auto* target = target_for_triple(options_.target);
-        const auto* abi = target ? find_abi(*target, function.abi) : nullptr;
+        const auto* abi = target ? find_abi(*target, id) : nullptr;
         if (!target || !abi) {
-            diagnostics_.error(
-                function.location,
-                "managed MIR has unavailable ABI id " +
-                    std::to_string(function.abi.value));
+            diagnostics_.error(location, "managed MIR has unavailable ABI id " +
+                                             std::to_string(id.value));
             return {};
         }
         return abi->canonical_name == target->default_abi(options_.target)
-                   ? std::string{} : std::string(abi->llvm_calling_convention) + ' ';
+                   ? std::string{}
+                   : std::string(abi->llvm_calling_convention) + ' ';
     }
 
     std::string abi_name() { return abi_name(entity_); }
@@ -821,7 +829,9 @@ private:
             value.kind == ValueKind::LabelAddress ||
             value.kind == ValueKind::SlotAddress ||
             value.kind == ValueKind::GlobalAddress ||
-            value.kind == ValueKind::Phi) return;
+            value.kind == ValueKind::FunctionAddress ||
+            value.kind == ValueKind::Phi)
+            return;
         if (value.kind == ValueKind::IndexedAddress) {
             const auto base = value.operands[0];
             const auto index = value.operands[1];
@@ -1017,14 +1027,18 @@ private:
             return;
         }
         if (value.kind == ValueKind::Call) {
-            const auto& callee = hir_.function(*value.callee);
+            const auto callee =
+                *hir::call_signature(hir_, value.callee, value.call_signature);
             out_ << "  ";
             if (!is_void(hir_, value.type)) out_ << result << " = ";
-            out_ << "call " << abi_name(callee)
+            out_ << "call " << abi_name(callee.abi, value.location)
                  << ir_type(hir_, value.type) << ' '
-                 << symbol_name(callee.link_symbol) << '(';
-            for (std::size_t index = 0;
-                 index < value.call_arguments.size(); ++index) {
+                 << (value.callee
+                         ? symbol_name(hir_.function(*value.callee).link_symbol)
+                         : reference(value.operands.front()))
+                 << '(';
+            for (std::size_t index = 0; index < value.call_arguments.size();
+                 ++index) {
                 if (index != 0) out_ << ", ";
                 const auto& argument = value.call_arguments[index];
                 if (argument.value) {

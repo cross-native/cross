@@ -22,7 +22,7 @@ global u64 addressed_object = 11u64;
 global u64 *object_address = &addressed_object;
 
 global void addressed_function() {}
-global void *function_address = &addressed_function;
+global void (*function_address)() = &addressed_function;
 
 global i32 dispatch() {
 target:

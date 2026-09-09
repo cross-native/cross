@@ -31,6 +31,12 @@ private:
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
     TypePtr parse_type();
+    TypePtr
+    parse_declarator(TypePtr base, std::optional<std::string>& name,
+                     bool parameter = false,
+                     std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
+    void apply_callable_attributes(TypePtr& type,
+                                   const std::vector<Attribute>& attributes);
     TypePtr parse_array_suffix(
         TypePtr element, bool parameter = false,
         std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
@@ -44,10 +50,11 @@ private:
                                   const std::string& name_space,
                                   std::vector<Attribute> attributes);
     bool parse_static_assertion();
-    std::unique_ptr<FunctionDecl> parse_function(
-        SourceLocation location, std::string name, std::string name_space,
-        TypePtr return_type, Linkage linkage, bool inline_hint,
-        std::vector<Attribute> attributes);
+    std::unique_ptr<FunctionDecl>
+    parse_function(SourceLocation location, std::string name,
+                   std::string name_space, TypePtr return_type, Linkage linkage,
+                   bool inline_hint, std::vector<Attribute> attributes,
+                   std::shared_ptr<FunctionType> signature = {});
     std::unique_ptr<ObjectDecl> parse_object(
         SourceLocation location, std::string name, TypePtr type, Linkage linkage,
         std::vector<Attribute> attributes);

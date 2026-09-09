@@ -40,8 +40,45 @@ struct LabelId {
     friend bool operator==(LabelId, LabelId) = default;
 };
 
+struct Parameter {
+    SourceLocation location;
+    std::string name;
+    TypeId type;
+    ParameterMode mode{ParameterMode::InOut};
+    std::optional<std::string> physical_location;
+};
+
+struct FunctionSignature {
+    TypeId result_type;
+    std::vector<Parameter> parameters;
+    AbiId abi;
+    bool variadic{};
+    friend bool operator==(const FunctionSignature& a,
+                           const FunctionSignature& b) {
+        if (a.result_type != b.result_type || a.abi != b.abi ||
+            a.variadic != b.variadic ||
+            a.parameters.size() != b.parameters.size())
+            return false;
+        for (std::size_t index = 0; index < a.parameters.size(); ++index) {
+            if (a.parameters[index].type != b.parameters[index].type ||
+                a.parameters[index].mode != b.parameters[index].mode ||
+                a.parameters[index].physical_location !=
+                    b.parameters[index].physical_location)
+                return false;
+        }
+        return true;
+    }
+};
+
 struct Type {
-    enum class Kind { Builtin, Pointer, Vector, Array, Record } kind{Kind::Builtin};
+    enum class Kind {
+        Builtin,
+        Pointer,
+        Vector,
+        Array,
+        Record,
+        Function
+    } kind{Kind::Builtin};
     BuiltinType builtin{BuiltinType::Void};
     std::optional<TypeId> pointee;
     bool is_const{};
@@ -52,6 +89,7 @@ struct Type {
     bool scalable{};
     bool is_atomic{};
     std::optional<RecordId> record;
+    std::optional<FunctionSignature> function{};
 };
 
 struct RecordMember {
@@ -76,14 +114,6 @@ struct Record {
     std::vector<RecordMember> members;
     std::vector<const RecordDecl*> declarations;
     const RecordDecl* definition{};
-};
-
-struct Parameter {
-    SourceLocation location;
-    std::string name;
-    TypeId type;
-    ParameterMode mode{ParameterMode::InOut};
-    std::optional<std::string> physical_location;
 };
 
 struct VariadicBinding {
@@ -148,6 +178,7 @@ public:
     [[nodiscard]] const Type& type(TypeId id) const { return types.at(id.value); }
     [[nodiscard]] std::optional<TypeId> builtin(BuiltinType kind) const;
     [[nodiscard]] TypeId intern_type(const TypePtr& source);
+    [[nodiscard]] TypeId function_type(FunctionSignature signature);
     [[nodiscard]] TypeId pointer_to(TypeId pointee);
     [[nodiscard]] TypeId unqualified(TypeId type);
     [[nodiscard]] TypeId add_qualifiers(TypeId type, bool is_const,
@@ -178,6 +209,9 @@ public:
     // the selected ABI width on HIR prevents the middle end from silently
     // assuming x86-64 when a 32-bit or capability-oriented target is added.
     unsigned address_bits{64};
+    AbiId default_abi;
+    // Source spelling is resolved only at the AST-to-HIR interning boundary.
+    std::unordered_map<std::string, AbiId> abi_names;
     std::vector<Type> types;
     std::vector<Record> records;
     std::vector<Function> functions;
@@ -190,6 +224,14 @@ public:
 
 Module build(const Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics);
+[[nodiscard]] std::optional<FunctionSignature>
+call_signature(const Module& module, std::optional<FunctionId> direct,
+               std::optional<TypeId> indirect);
+// An observable entry address uses its registered interface, never a private
+// dynamically selected transport. Explicit endpoint adapters remain deferred.
+bool stabilize_function_address(Module& module, FunctionId function,
+                                SourceLocation location,
+                                Diagnostics& diagnostics);
 [[nodiscard]] std::string type_name(const Module& module, TypeId type);
 
 } // namespace cross::hir

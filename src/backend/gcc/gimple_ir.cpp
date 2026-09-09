@@ -336,6 +336,11 @@ private:
         active_[id.value] = true;
         const auto& type = hir_.type(id);
         switch (type.kind) {
+        case hir::Type::Kind::Function:
+            diagnostics_.command_error("GCC GIMPLE serialization of "
+                                       "function-pointer interfaces is not "
+                                       "implemented");
+            break;
         case hir::Type::Kind::Builtin:
             out << "typedef " << qualifiers(type) << builtin(type) << ' '
                 << name(id) << ";\n";
@@ -1014,6 +1019,13 @@ private:
             return;
         }
         if (value.kind == ValueKind::Call) {
+            if (!value.callee) {
+                diagnostics_.error(
+                    value.location,
+                    "GCC GIMPLE serialization of indirect calls is "
+                    "not implemented");
+                return;
+            }
             out_ << "  ";
             if (!types_.is_void(value.type)) {
                 out_ << reference(value.id) << " = ";

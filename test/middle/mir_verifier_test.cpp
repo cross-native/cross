@@ -28,6 +28,8 @@ hir::Module hir_fixture() {
     function.result_type = {2};
     function.ownership = hir::BodyOwnership::ManagedMir;
     module.functions.push_back(std::move(function));
+    const auto signature = module.function_type({{2}, {}, {}, false});
+    (void)module.pointer_to(signature);
     return module;
 }
 
@@ -58,6 +60,34 @@ mir::ManagedModule valid_module() {
     mir::ManagedModule module;
     module.functions.push_back(std::move(function));
     module.definitions.insert(0);
+    return module;
+}
+
+mir::ManagedModule indirect_module() {
+    auto module = valid_module();
+    auto& function = module.functions.front();
+    auto& address = function.values.front();
+    address.kind = mir::ValueKind::FunctionAddress;
+    address.type = {4};
+    address.callee = hir::FunctionId{0};
+    mir::ManagedValue call;
+    call.id = {1};
+    call.kind = mir::ValueKind::Call;
+    call.type = {2};
+    call.call_signature = hir::TypeId{3};
+    call.operands = {{0}};
+    call.effect_input = mir::EffectId{0};
+    call.effect_output = mir::EffectId{1};
+    function.values.push_back(call);
+    function.effects.push_back({{1},
+                                {},
+                                mir::EffectKind::Operation,
+                                mir::EffectId{0},
+                                mir::ValueId{1},
+                                {}});
+    function.blocks[0].values.push_back({1});
+    function.blocks[0].terminator.value = mir::ValueId{1};
+    function.blocks[0].terminator.effect = {1};
     return module;
 }
 
@@ -197,6 +227,17 @@ bool expect_invalid(mir::ManagedModule module, std::string_view expected) {
 int main() {
     {
         auto hir = hir_fixture();
+        auto module = indirect_module();
+        std::ostringstream output;
+        Diagnostics diagnostics(output);
+        if (!mir::verify(module, hir, diagnostics)) {
+            std::cerr << "verifier rejected typed indirect call:\n"
+                      << output.str();
+            return 1;
+        }
+    }
+    {
+        auto hir = hir_fixture();
         auto module = valid_module();
         std::ostringstream output;
         Diagnostics diagnostics(output);
@@ -272,6 +313,30 @@ int main() {
         auto module = effectful_module();
         module.functions[0].values[2].effect_input = mir::EffectId{0};
         failures += !expect_invalid(std::move(module), "broken operation effect chain");
+    }
+    {
+        auto module = indirect_module();
+        module.functions[0].values[1].operands.clear();
+        failures += !expect_invalid(std::move(module),
+                                    "indirect call has no target operand");
+    }
+    {
+        auto module = indirect_module();
+        module.functions[0].values[1].callee = hir::FunctionId{0};
+        failures +=
+            !expect_invalid(std::move(module), "call has an invalid callee");
+    }
+    {
+        auto module = indirect_module();
+        module.functions[0].values[0].type = {2};
+        failures += !expect_invalid(std::move(module),
+                                    "invalid typed function address");
+    }
+    {
+        auto module = indirect_module();
+        module.functions[0].values[0].callee = hir::FunctionId{99};
+        failures += !expect_invalid(std::move(module),
+                                    "invalid typed function address");
     }
     return failures == 0 ? 0 : 1;
 }

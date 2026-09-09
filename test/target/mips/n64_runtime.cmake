@@ -9,7 +9,17 @@ endforeach()
 
 find_program(LLVM_MC NAMES llvm-mc)
 find_program(LLD NAMES ld.lld)
-find_program(QEMU NAMES qemu-system-mips64)
+if(N64_ENDIAN STREQUAL "little")
+    set(n64_arch mips64el)
+    set(n64_link_emulation elf64ltsmip)
+    find_program(QEMU_N64_L NAMES qemu-system-mips64el)
+    set(QEMU "${QEMU_N64_L}")
+else()
+    set(n64_arch mips64)
+    set(n64_link_emulation elf64btsmip)
+    find_program(QEMU_N64_B NAMES qemu-system-mips64)
+    set(QEMU "${QEMU_N64_B}")
+endif()
 if(NOT LLVM_MC OR NOT LLD OR NOT QEMU)
     message(STATUS
         "skipping MIPS n64 runtime test: llvm-mc, ld.lld, and qemu-system-mips64 are required")
@@ -38,12 +48,12 @@ if(DEFINED EXTRA_FLAGS AND NOT "${EXTRA_FLAGS}" STREQUAL "")
 else()
     set(extra_flags "")
 endif()
-run_checked(cross-functions "${CC}" -c -O2 -mprofile=mips64-n64 ${extra_flags}
+run_checked(cross-functions "${CC}" -c -O2 -mprofile=${n64_arch}-n64 ${extra_flags}
             "${SOURCE}" -o "${functions}")
 run_checked(startup "${LLVM_MC}" --filetype=obj
-            --triple=mips64-unknown-elf --mcpu=mips64
+            --triple=${n64_arch}-unknown-elf --mcpu=mips64
             --mattr=+noabicalls "${STARTUP}" -o "${start}")
-run_checked(link-elf64 "${LLD}" -m elf64btsmip -T "${LINKER}"
+run_checked(link-elf64 "${LLD}" -m ${n64_link_emulation} -T "${LINKER}"
             "${start}" "${functions}" -o "${image}")
 
 execute_process(
