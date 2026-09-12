@@ -3,6 +3,7 @@
 set(base "${OUTPUT}")
 set(STARTUP "${base}-start.s")
 set(EXPECTED P)
+set(MEMBERS_SOURCE "${CMAKE_CURRENT_LIST_DIR}/../../middle/aggregate_members.x")
 foreach(kind size bank)
     execute_process(COMMAND "${CC}" -target mips-unknown-elf -march=vr4300 -mabi=o32
         -O2 -S "${CMAKE_CURRENT_LIST_DIR}/aggregate_${kind}_error.x"

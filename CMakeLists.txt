@@ -1866,6 +1866,17 @@ if(BUILD_TESTING)
         -DCC=$<TARGET_FILE:cross_cc>
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/required-constants-errors
         -P "${CMAKE_SOURCE_DIR}/test/middle/required_constants_errors.cmake")
+    add_test(NAME cross_aggregate_members COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/aggregate_members.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/aggregate_members_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-members
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_aggregate_members_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-members-errors
+        -P "${CMAKE_SOURCE_DIR}/test/middle/aggregate_members_errors.cmake")
     foreach(constants_mode O0 O3)
         add_test(NAME cross_required_constants_mips_${constants_mode} COMMAND "${CMAKE_COMMAND}"
             -DCC=$<TARGET_FILE:cross_cc>

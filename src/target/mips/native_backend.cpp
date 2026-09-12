@@ -859,7 +859,9 @@ private:
                                     (value.kind == ValueKind::Load ||
                                      value.kind == ValueKind::PointerLoad ||
                                      value.kind == ValueKind::GlobalLoad ||
-                                     value.kind == ValueKind::IndexedLoad);
+                                     value.kind == ValueKind::IndexedLoad ||
+                                     (value.kind == ValueKind::Cast &&
+                                      value.cast == mir::CastOperation::Reinterpret));
         const bool store = value.kind == ValueKind::Store ||
                            value.kind == ValueKind::PointerStore ||
                            value.kind == ValueKind::GlobalStore;
@@ -9201,6 +9203,13 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                        &value.operands.front())) {
             materialize_symbol_address("t0", assembly_symbol(symbol->name));
             base = "t0";
+        } else if (!value.uses.empty() &&
+                   value.uses.front().kind == machine::RegisterKind::Virtual &&
+                   function.virtual_register_classes[value.uses.front().id] ==
+                       machine::VirtualRegisterClass::Memory) {
+            // Qualifier-only record casts copy an SSA storage home, not a
+            // scalar register or a pointer to foreign storage.
+            offset = vreg_offset(function, value.uses.front(), value.location);
         } else {
             base =
                 input_gpr(function, value.uses.front(), "t0", value.location);

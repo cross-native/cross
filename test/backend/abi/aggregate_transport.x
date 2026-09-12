@@ -15,24 +15,24 @@ union integer_or_float { u64 integer; f64 floating; };
 [[abi("sysv_abi"), link_name("cross_sysv_pair_i32"), noinline]]
 global struct pair_i32 sysv_pair_i32(in struct pair_i32 value) {
     struct pair_i32 result = value;
-    result.left += 1;
-    result.right += 2;
+    result.left = value.left + 1;
+    result.right = value.right + 2;
     return result;
 }
 
 [[abi("sysv_abi"), link_name("cross_sysv_pair_f32"), noinline]]
 global struct pair_f32 sysv_pair_f32(in struct pair_f32 value) {
     struct pair_f32 result = value;
-    result.left += 1.0f32;
-    result.right += 2.0f32;
+    result.left = value.left + 1.0f32;
+    result.right = value.right + 2.0f32;
     return result;
 }
 
 [[abi("sysv_abi"), link_name("cross_sysv_pair_f64"), noinline]]
 global struct pair_f64 sysv_pair_f64(in struct pair_f64 value) {
     struct pair_f64 result = value;
-    result.left += 1.0f64;
-    result.right += 2.0f64;
+    result.left = value.left + 1.0f64;
+    result.right = value.right + 2.0f64;
     return result;
 }
 
@@ -64,8 +64,8 @@ global struct triple_i64 sysv_triple_i64(in struct triple_i64 value) {
 [[abi("sysv_abi"), link_name("cross_sysv_packed_i64"), noinline]]
 global struct packed_i64 sysv_packed_i64(in struct packed_i64 value) {
     struct packed_i64 result = value;
-    result.tag += 1u8;
-    result.value += 2u64;
+    result.tag = value.tag + 1u8;
+    result.value = value.value + 2u64;
     return result;
 }
 
@@ -86,8 +86,8 @@ global union integer_or_float sysv_union(in union integer_or_float value) {
 [[abi("ms_abi"), link_name("cross_ms_pair_i32"), noinline]]
 global struct pair_i32 ms_pair_i32(in struct pair_i32 value) {
     struct pair_i32 result = value;
-    result.left += 3;
-    result.right += 4;
+    result.left = value.left + 3;
+    result.right = value.right + 4;
     return result;
 }
 

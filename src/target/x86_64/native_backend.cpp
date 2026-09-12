@@ -1687,6 +1687,19 @@ private:
         if (value.kind == ValueKind::Cast) {
             const auto source_type =
                 source_->values[value.operands.front().value].type;
+            if (value.cast == mir::CastOperation::Reinterpret &&
+                is_aggregate(hir_, source_type) && is_aggregate(hir_, value.type)) {
+                auto instruction = target_instruction(Opcode::AggregateLoad, value.location);
+                const auto source = reg(value.operands.front());
+                instruction.operands.push_back(register_operand(source));
+                instruction.uses.push_back(source);
+                instruction.defs.push_back(reg(value.id));
+                instruction.may_load = true;
+                instruction.may_store = true;
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                append_fixed_clobber(instruction, "xmm0", machine::i128);
+                return instruction;
+            }
             const auto representation_only_floating_cast =
                 value.cast == mir::CastOperation::Reinterpret &&
                 is_floating(hir_, value.type) &&
@@ -18768,6 +18781,14 @@ private:
 
     void emit_aggregate_load_store(const machine::Function& function,
                                    const machine::Instruction& value) {
+        if (const auto* source = std::get_if<machine::RegisterOperand>(
+                &value.operands.front())) {
+            // Qualifier-only aggregate casts copy the complete SSA home.
+            const auto target = value.defs.front();
+            copy_frame_storage(vreg_offset(function, source->value),
+                               vreg_offset(function, target), mode_bytes(target.mode));
+            return;
+        }
         const auto& slot =
             std::get<machine::StackSlotOperand>(value.operands.front());
         const auto slot_address = slot_offset(function, slot.slot) + slot.offset;

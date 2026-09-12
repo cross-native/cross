@@ -897,12 +897,14 @@ private:
             current_.parameters.push_back(value);
             // An atomic-qualified parameter is still transported by value,
             // but source semantics require a distinct atomic callee cell.
-            // Keep ordinary immutable `in` parameters as SSA values only.
+            // Scalar immutable `in` parameters may stay in SSA. Record
+            // designators need a distinct callee cell for members/subobjects.
             if (parameter.mode == ParameterMode::In &&
                 (!parameter.physical_location ||
                  *parameter.physical_location == "auto") &&
                 !address_taken_names_.contains(parameter.name) &&
-                !hir_.type(parameter.type).is_atomic) {
+                !hir_.type(parameter.type).is_atomic &&
+                !record_value_type(hir_, parameter.type)) {
                 if (!parameter_values_.emplace(
                         parameter.name, value).second) {
                     failed_ = true;
@@ -911,12 +913,16 @@ private:
             }
             const SlotId slot{
                 static_cast<std::uint32_t>(current_.slots.size())};
+            const auto cell_type = parameter.mode == ParameterMode::In &&
+                                           record_value_type(hir_, parameter.type)
+                                       ? hir_.add_qualifiers(parameter.type, true, false)
+                                       : parameter.type;
             current_.slots.push_back(
-                {slot, parameter.location, parameter.type,
+                {slot, parameter.location, cell_type,
                  "$param." + std::to_string(index), std::nullopt, false,
                  address_taken_names_.contains(parameter.name),
                  parameter.mode != ParameterMode::In});
-            const LocalBinding binding{slot, parameter.type, std::nullopt};
+            const LocalBinding binding{slot, cell_type, std::nullopt};
             if (!scopes_.back().bindings.emplace(parameter.name, binding).second) {
                 failed_ = true;
             }
@@ -1355,10 +1361,14 @@ private:
         return value;
     }
 
+    hir::TypeId qualified_array_element(hir::TypeId array) {
+        const auto& type = hir_.type(array);
+        return hir_.add_qualifiers(*type.element, type.is_const, type.is_volatile);
+    }
+
     ValueId decay_array_address(ValueId address, hir::TypeId array,
                                 SourceLocation location) {
-        const auto& type = hir_.type(array);
-        return cast(address, hir_.pointer_to(*type.element), location);
+        return cast(address, hir_.pointer_to(qualified_array_element(array)), location);
     }
 
     const hir::RecordMember* resolve_member(hir::TypeId record_type,
@@ -1455,8 +1465,7 @@ private:
             if (auto aggregate =
                     lower_designator_address(*expression.left);
                 aggregate && array_type(hir_, aggregate->type)) {
-                const auto& array = hir_.type(aggregate->type);
-                element = *array.element;
+                element = qualified_array_element(aggregate->type);
                 base = decay_array_address(aggregate->address,
                                            aggregate->type,
                                            expression.location);
@@ -1918,7 +1927,7 @@ private:
                         return hir_.pointer_to(
                             *hir_.type(local->type).element);
                     }
-                    return hir_.pointer_to(*hir_.type(local->type).element);
+                    return hir_.pointer_to(qualified_array_element(local->type));
                 }
                 return atomic_object_type(hir_, local->type)
                            ? std::optional<hir::TypeId>(
@@ -1932,7 +1941,7 @@ private:
             const auto* object = resolve_object(expression.text);
             if (object && global_object(*object)) {
                 if (array_type(hir_, object->type)) {
-                    return hir_.pointer_to(*hir_.type(object->type).element);
+                    return hir_.pointer_to(qualified_array_element(object->type));
                 }
                 return atomic_object_type(hir_, object->type)
                            ? std::optional<hir::TypeId>(
@@ -2017,7 +2026,7 @@ private:
                         return operand;
                     if (array_type(hir_, *pointer.pointee)) {
                         return hir_.pointer_to(
-                            *hir_.type(*pointer.pointee).element);
+                            qualified_array_element(*pointer.pointee));
                     }
                     if (!managed_value_type(hir_, *pointer.pointee)) {
                         return std::nullopt;
@@ -2041,7 +2050,7 @@ private:
                 const auto& member = hir_.type(*type);
                 if (member.kind == hir::Type::Kind::Array &&
                     member.element) {
-                    return hir_.pointer_to(*member.element);
+                    return hir_.pointer_to(qualified_array_element(*type));
                 }
                 return atomic_object_type(hir_, *type)
                            ? std::optional<hir::TypeId>(
@@ -2065,7 +2074,7 @@ private:
                 }
                 if (array_type(hir_, *aggregate.pointee)) {
                     return hir_.pointer_to(
-                        *hir_.type(*aggregate.pointee).element);
+                        qualified_array_element(*aggregate.pointee));
                 }
                 return managed_value_type(hir_, *aggregate.pointee)
                            ? (atomic_object_type(hir_, *aggregate.pointee)
@@ -2650,6 +2659,11 @@ private:
                 if (!found) {
                     auto designator =
                         lower_designator_address(*expression.left);
+                    if (designator && hir_.type(designator->type).is_const) {
+                        diagnostics_.error(expression.location, "cannot write an 'in' or const subobject");
+                        failed_ = true;
+                        break;
+                    }
                     if (!designator ||
                         !managed_value_type(hir_, designator->type) ||
                         hir_.type(designator->type).is_const ||
@@ -3091,8 +3105,12 @@ private:
                     lower_designator_address(*expression.left);
             }
             if (designator) {
-                if (!managed_value_type(hir_, designator->type) ||
-                    hir_.type(designator->type).is_const) {
+                if (hir_.type(designator->type).is_const) {
+                    diagnostics_.error(expression.location, "cannot write an 'in' or const subobject");
+                    failed_ = true;
+                    return std::nullopt;
+                }
+                if (!managed_value_type(hir_, designator->type)) {
                     return std::nullopt;
                 }
             if (expression.text == "=") {
@@ -3955,7 +3973,9 @@ private:
             copyout.cell = cell;
             copyout.location = actual.location;
             copyout.copy_out = !manual_cell;
-            copyout.local = actual_local;
+            if (actual_local && !hir_.type(actual_local->type).is_const) {
+                copyout.local = actual_local;
+            }
             if (actual_object && !hir_.type(actual_object->type).is_const) {
                 copyout.object = actual_object->id;
             }

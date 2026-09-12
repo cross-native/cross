@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "@MEMBERS_SOURCE@"
+
 struct pair { u32 x; u32 y; };
 struct tiny { u8 a; u8 b; u8 c; };
 struct large { u64 a; u64 b; u64 c; u64 tail[6]; };
@@ -48,10 +50,9 @@ union bits { u64 a; f64 b; };
 [[abi("@ABI@"), noinline]] global u32 stack_step(
     in u32 a, in u32 b, in u32 c, in struct tiny ti, in struct pair pi,
     in u32 d, in u32 e, in u32 f, in struct large li) {
-    struct tiny t = ti; struct pair p = pi; struct large l = li;
-    u32 la = l.a; u32 lb = l.b; u32 lc = l.c;
-    return a + 3u32*b + 5u32*c + t.a + 7u32*t.b + 11u32*t.c +
-        p.x + 13u32*p.y + d + e + f + la + lb + lc;
+    u32 la = li.a; u32 lb = li.b; u32 lc = li.c;
+    return a + 3u32*b + 5u32*c + ti.a + 7u32*ti.b + 11u32*ti.c +
+        pi.x + 13u32*pi.y + d + e + f + la + lb + lc;
 }
 [[abi("@ABI@"), noinline]] global void modes(out struct pair a, inout struct pair b) {
     a = b;
@@ -81,6 +82,7 @@ global struct large saved;
 }
 
 global u32 aggregate_test(in u32 seed) {
+    if (aggregate_members_entry() != 1) return 16u32;
     struct pair p; p.x = seed; p.y = 0x11223344u32;
     struct pair q = pair_step(p, 9u32);
     if (q.x != seed + 9u32 || q.y != (p.y ^ 0x12345678u32) || p.x != seed) return 2u32;
