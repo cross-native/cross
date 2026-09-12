@@ -103,6 +103,7 @@ add_library(cross_frontend
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
     src/frontend/preprocessor.cpp
+    src/frontend/preprocessor_expression.cpp
     src/frontend/procedural.cpp
     src/frontend/semantic.cpp
 )
@@ -387,6 +388,35 @@ if(BUILD_TESTING)
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-n64-runtime-large
                 -DEXTRA_FLAGS=-mcmodel=large
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+    foreach(vla_mode baseline unoptimized compact)
+        if(vla_mode STREQUAL "unoptimized")
+            set(vla_flags "-O0;-fno-private-abi;-fno-omit-frame-pointer")
+        elseif(vla_mode STREQUAL "compact")
+            set(vla_flags "-Oz;-fomit-frame-pointer")
+        else()
+            set(vla_flags "-O3;-fomit-frame-pointer")
+        endif()
+        add_test(NAME cross_mips_vla_${vla_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vla.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/vla_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vla-${vla_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${vla_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        string(REPLACE ";" " " vla_n64_flags "${vla_flags}")
+        foreach(vla_endian big little)
+            add_test(NAME cross_mips_n64_vla_${vla_mode}_${vla_endian}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vla.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/vla_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vla-n64-${vla_mode}-${vla_endian}
+                    -DN64_ENDIAN=${vla_endian} "-DEXTRA_FLAGS=${vla_n64_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+        endforeach()
+    endforeach()
     add_test(NAME cross_mips_differential_int_vr4300
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1761,6 +1791,17 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/preprocessor.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/preprocessor.i
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor.cmake")
+    add_executable(cross_preprocessor_expression_test test/frontend/preprocessor_expression.cpp)
+    target_link_libraries(cross_preprocessor_expression_test PRIVATE cross_frontend)
+    cross_component(cross_preprocessor_expression_test)
+    add_test(NAME cross_preprocessor_expression COMMAND cross_preprocessor_expression_test)
+    add_test(NAME cross_preprocessor_conditions
+        COMMAND "${CMAKE_COMMAND}"
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_conditions.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/preprocessor-conditions
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_conditions.cmake")
     add_test(NAME cross_diagnostic
         COMMAND $<TARGET_FILE:cross_cc> -emit-llvm
                 "${CMAKE_SOURCE_DIR}/test/frontend/diagnostic.x"
@@ -1815,6 +1856,35 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/default_evaluation.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/default-evaluation
                 -P "${CMAKE_SOURCE_DIR}/test/middle/default_evaluation.cmake")
+    add_test(NAME cross_required_constants COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/required_constants.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/required_constants_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/required-constants
+        -P "${CMAKE_SOURCE_DIR}/test/middle/required_constants.cmake")
+    add_test(NAME cross_required_constants_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/required-constants-errors
+        -P "${CMAKE_SOURCE_DIR}/test/middle/required_constants_errors.cmake")
+    foreach(constants_mode O0 O3)
+        add_test(NAME cross_required_constants_mips_${constants_mode} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/required_constants.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/required_constants_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/required-constants-mips-${constants_mode}
+            -DEXPECTED=P "-DCC_FLAGS=-${constants_mode};-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        foreach(constants_endian big little)
+            add_test(NAME cross_required_constants_n64_${constants_mode}_${constants_endian} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/required_constants.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/required_constants_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/required-constants-n64-${constants_mode}-${constants_endian}
+                -DN64_ENDIAN=${constants_endian} "-DEXTRA_FLAGS=-${constants_mode} -fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+        endforeach()
+    endforeach()
     add_test(NAME cross_runtime_native_default_evaluation
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

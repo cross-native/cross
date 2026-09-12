@@ -3,6 +3,7 @@
 #include "frontend/preprocessor.hpp"
 
 #include "frontend/ast.hpp"
+#include "frontend/preprocessor_expression.hpp"
 #include "frontend/semantic.hpp"
 #include "model/model.hpp"
 #include "target/target.hpp"
@@ -33,6 +34,105 @@ std::string normalized(const std::filesystem::path& path) {
     std::error_code error;
     const auto canonical = std::filesystem::weakly_canonical(path, error);
     return (error ? path.lexically_normal() : canonical).generic_string();
+}
+
+struct PreprocessingLine {
+    std::string text;
+    SourceLocation location;
+};
+
+// Splicing precedes comment removal. Keep original positions even though
+// includes and continued directive lines later form one flattened stream.
+std::vector<PreprocessingLine> preprocessing_lines(const SourceFile& file,
+                                                 Diagnostics& diagnostics) {
+    std::vector<PreprocessingLine> result;
+    PreprocessingLine current{{}, {&file, 0, 1, 1}};
+    unsigned line = 1;
+    const auto& text = file.text;
+    for (std::size_t i = 0; i < text.size();) {
+        const auto ch = text[i];
+        const auto next = i + 1 < text.size() ? text[i + 1] : '\0';
+        if (ch == '\\' && (next == '\n' ||
+            (next == '\r' && i + 2 < text.size() && text[i + 2] == '\n'))) {
+            i += next == '\n' ? 2 : 3;
+            ++line;
+            continue;
+        }
+        if (ch == '\n' || (ch == '\r' && next == '\n')) {
+            i += ch == '\r' && next == '\n' ? 2 : 1;
+            result.push_back(std::move(current));
+            current = {{}, {&file, i, ++line, 1}};
+            continue;
+        }
+        current.text.push_back(ch);
+        ++i;
+    }
+    if (!current.text.empty()) result.push_back(std::move(current));
+    bool block_comment = false;
+    SourceLocation comment_location;
+    for (auto& item : result) {
+        const auto raw = std::move(item.text);
+        item.text.clear();
+        char quote = '\0';
+        for (std::size_t i = 0; i < raw.size();) {
+            const auto ch = raw[i];
+            const auto next = i + 1 < raw.size() ? raw[i + 1] : '\0';
+            if (block_comment) {
+                if (ch == '*' && next == '/') { block_comment = false; i += 2; }
+                else ++i;
+                continue;
+            }
+            if (quote != '\0') {
+                item.text.push_back(ch);
+                ++i;
+                if (ch == '\\' && i < raw.size()) item.text.push_back(raw[i++]);
+                else if (ch == quote) quote = '\0';
+                continue;
+            }
+            if (ch == '/' && (next == '/' || next == '*')) {
+                item.text.push_back(' ');
+                if (next == '/') break;
+                block_comment = true;
+                comment_location = item.location;
+                comment_location.column += static_cast<unsigned>(i);
+                comment_location.offset += i;
+                i += 2;
+                continue;
+            }
+            if (ch == '\'' || ch == '"') quote = ch;
+            item.text.push_back(ch);
+            ++i;
+        }
+    }
+    if (block_comment) diagnostics.error(comment_location, "unterminated block comment");
+    return result;
+}
+
+struct Directive {
+    std::string name;
+    std::string operand;
+};
+
+Directive directive(std::string_view text) {
+    auto body = trim(text.substr(1));
+    std::size_t end = 0;
+    while (end < body.size() && identifier_continue(body[end])) ++end;
+    return {body.substr(0, end), trim(std::string_view(body).substr(end))};
+}
+
+bool valid_macro_name(std::string_view text) {
+    if (text.starts_with("$::")) text.remove_prefix(3);
+    for (;;) {
+        if (text.empty() || !(std::isalpha(static_cast<unsigned char>(text.front())) ||
+                              text.front() == '_')) return false;
+        std::size_t end = 1;
+        while (end < text.size() &&
+               (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_')) ++end;
+        text.remove_prefix(end);
+        if (text.empty()) return true;
+        if (!text.starts_with("::")) return false;
+        text.remove_prefix(2);
+    }
 }
 
 } // namespace
@@ -82,10 +182,19 @@ void Preprocessor::install_predefined_macros() {
 void Preprocessor::define_command_line_macros() {
     for (const auto& definition : options_.macro_definitions) {
         const auto equals = definition.find('=');
-        macros_[definition.substr(0, equals)].replacement =
+        const auto name = definition.substr(0, equals);
+        if (!valid_macro_name(name) || name.starts_with("$::")) {
+            diagnostics_.command_error("-D requires a non-builtin macro name");
+            continue;
+        }
+        macros_[name].replacement =
             equals == std::string::npos ? "1" : definition.substr(equals + 1);
     }
-    for (const auto& name : options_.macro_undefinitions) macros_.erase(name);
+    for (const auto& name : options_.macro_undefinitions) {
+        if (!valid_macro_name(name) || name.starts_with("$::"))
+            diagnostics_.command_error("-U requires a non-builtin macro name");
+        else macros_.erase(name);
+    }
 }
 
 std::filesystem::path Preprocessor::find_include(const std::filesystem::path& including,
@@ -117,35 +226,33 @@ std::string Preprocessor::expand_includes(const std::filesystem::path& path,
     }
     stack.push_back(path);
     already_included_.insert(identity);
-    std::istringstream input(file->text);
     std::ostringstream output;
-    std::string line;
-    unsigned line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
-        const auto stripped = trim(line);
-        if (stripped == "#pragma once") {
+    for (const auto& line : preprocessing_lines(*file, diagnostics_)) {
+        const auto stripped = trim(line.text);
+        const auto command = stripped.starts_with('#') ? directive(stripped) : Directive{};
+        if (command.name == "pragma" && command.operand == "once") {
             pragma_once_files_.insert(identity);
             continue;
         }
-        if (stripped.starts_with("#include")) {
-            auto operand = trim(std::string_view(stripped).substr(8));
+        if (command.name == "include") {
+            auto operand = command.operand;
             const bool quoted = operand.size() >= 2 && operand.front() == '"' && operand.back() == '"';
             const bool angled = operand.size() >= 2 && operand.front() == '<' && operand.back() == '>';
             if (!quoted && !angled) {
-                diagnostics_.error({file, 0, line_number, 1}, "include operand must be a literal path");
+                diagnostics_.error(line.location, "include operand must be a literal path");
                 continue;
             }
             operand = operand.substr(1, operand.size() - 2);
             const auto included = find_include(path, operand, quoted);
             if (included.empty()) {
-                diagnostics_.error({file, 0, line_number, 1}, "include file not found: " + operand);
+                diagnostics_.error(line.location, "include file not found: " + operand);
                 continue;
             }
             output << expand_includes(included, stack);
             continue;
         }
-        output << line << '\n';
+        output << line.text << '\n';
+        line_locations_.push_back(line.location);
     }
     stack.pop_back();
     return output.str();
@@ -154,7 +261,8 @@ std::string Preprocessor::expand_includes(const std::filesystem::path& path,
 std::string Preprocessor::substitute(const Macro& macro,
                                      const std::vector<std::string>& arguments,
                                      std::unordered_set<std::string>& disabled,
-                                     unsigned depth) const {
+                                     unsigned depth,
+                                     std::optional<SourceLocation> condition) const {
     std::unordered_map<std::string, std::string> replacements;
     for (std::size_t i = 0; i < macro.parameters.size(); ++i) {
         replacements[macro.parameters[i]] = i < arguments.size() ? arguments[i] : std::string{};
@@ -197,7 +305,7 @@ std::string Preprocessor::substitute(const Macro& macro,
             const auto name = macro.replacement.substr(begin, i - begin);
             const auto found = replacements.find(name);
             if (found != replacements.end()) {
-                output += expand_text(found->second, disabled, depth + 1);
+                output += expand_text(found->second, disabled, depth + 1, condition);
             } else {
                 output += name;
             }
@@ -213,7 +321,7 @@ std::string Preprocessor::substitute(const Macro& macro,
         }
         output.push_back(macro.replacement[i++]);
     }
-    return expand_text(output, disabled, depth + 1);
+    return expand_text(output, disabled, depth + 1, condition);
 }
 
 std::string Preprocessor::evaluate_query(
@@ -385,7 +493,8 @@ std::string Preprocessor::evaluate_query(
 
 std::string Preprocessor::expand_text(std::string_view text,
                                       std::unordered_set<std::string>& disabled,
-                                      unsigned depth) const {
+                                      unsigned depth,
+                                      std::optional<SourceLocation> condition) const {
     if (depth > 100) return std::string(text);
     std::string output;
     for (std::size_t i = 0; i < text.size();) {
@@ -406,6 +515,26 @@ std::string Preprocessor::expand_text(std::string_view text,
         const auto begin = i++;
         while (i < text.size() && identifier_continue(text[i])) ++i;
         const std::string name(text.substr(begin, i - begin));
+        if (condition && name == "defined") {
+            const auto skip_space = [&] {
+                while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+            };
+            skip_space();
+            const bool parenthesized = i < text.size() && text[i] == '(';
+            if (parenthesized) { ++i; skip_space(); }
+            const auto operand_begin = i;
+            while (i < text.size() && identifier_continue(text[i])) ++i;
+            const auto operand = text.substr(operand_begin, i - operand_begin);
+            skip_space();
+            if (!valid_macro_name(operand) ||
+                (parenthesized && (i == text.size() || text[i] != ')'))) {
+                diagnostics_.error(*condition, "defined requires a macro name, optionally parenthesized");
+                return "0";
+            }
+            if (parenthesized) ++i;
+            output += macros_.contains(std::string(operand)) ? "1 " : "0 ";
+            continue;
+        }
         const auto found = macros_.find(name);
         if (found == macros_.end() || disabled.contains(name)) {
             output += name;
@@ -414,7 +543,7 @@ std::string Preprocessor::expand_text(std::string_view text,
         const auto& macro = found->second;
         disabled.insert(name);
         if (!macro.function_like) {
-            output += expand_text(macro.replacement, disabled, depth + 1);
+            output += expand_text(macro.replacement, disabled, depth + 1, condition);
             disabled.erase(name);
             continue;
         }
@@ -464,7 +593,7 @@ std::string Preprocessor::expand_text(std::string_view text,
             continue;
         }
         if (name.starts_with("$::has_")) output += evaluate_query(name, arguments);
-        else output += substitute(macro, arguments, disabled, depth + 1);
+        else output += substitute(macro, arguments, disabled, depth + 1, condition);
         disabled.erase(name);
     }
     return output;
@@ -473,24 +602,97 @@ std::string Preprocessor::expand_text(std::string_view text,
 std::string Preprocessor::expand_macros(std::string_view source, const SourceFile* file) {
     std::istringstream input{std::string(source)};
     std::ostringstream output;
-    std::vector<bool> conditions{true};
+    struct ConditionalGroup {
+        SourceLocation location;
+        bool parent_active{};
+        bool branch_taken{};
+        bool active{};
+        bool else_seen{};
+    };
+    std::vector<ConditionalGroup> conditions;
+    const auto* target = target_for_triple(options_.target);
+    const auto* abi = target ? find_abi(*target, options_.abi, options_.target) : nullptr;
+    const auto address_bits = abi && abi->address_bits ? abi->address_bits : 64U;
+    const auto evaluate = [&](std::string_view expression, SourceLocation location) {
+        std::unordered_set<std::string> disabled;
+        const auto errors = diagnostics_.errors();
+        const auto expanded = expand_text(expression, disabled, 0, location);
+        return diagnostics_.errors() == errors &&
+            evaluate_preprocessing_condition(expanded, location, diagnostics_, address_bits);
+    };
     std::string line;
     unsigned line_number = 0;
     while (std::getline(input, line)) {
         ++line_number;
         const auto stripped = trim(line);
-        if (stripped.starts_with("#define")) {
-            if (!conditions.back()) continue;
-            auto definition = trim(std::string_view(stripped).substr(7));
+        const auto location = line_number <= line_locations_.size()
+            ? line_locations_[line_number - 1] : SourceLocation{file, 0, line_number, 1};
+        const bool active = conditions.empty() || conditions.back().active;
+        if (!stripped.starts_with('#')) {
+            if (active) {
+                std::unordered_set<std::string> disabled;
+                output << expand_text(line, disabled, 0) << '\n';
+            }
+            continue;
+        }
+        const auto command = directive(stripped);
+        if (command.name == "if" || command.name == "ifdef" || command.name == "ifndef") {
+            bool selected = false;
+            if (active) {
+                if (command.name == "if") selected = evaluate(command.operand, location);
+                else if (!valid_macro_name(command.operand)) {
+                    diagnostics_.error(location, "#" + command.name + " requires exactly one macro name");
+                } else {
+                    selected = macros_.contains(command.operand);
+                    if (command.name == "ifndef") selected = !selected;
+                }
+            }
+            conditions.push_back({location, active, selected, active && selected, false});
+            continue;
+        }
+        if (command.name == "elif" || command.name == "else" || command.name == "endif") {
+            if (conditions.empty()) {
+                diagnostics_.error(location, "unmatched #" + command.name);
+                continue;
+            }
+            auto& group = conditions.back();
+            if (command.name != "elif" && !command.operand.empty())
+                diagnostics_.error(location, "unexpected tokens after #" + command.name);
+            if (command.name == "endif") {
+                conditions.pop_back();
+                continue;
+            }
+            if (group.else_seen) {
+                diagnostics_.error(location, "#" + command.name + " after #else");
+                group.active = false;
+                continue;
+            }
+            if (command.name == "else") {
+                group.else_seen = true;
+                group.active = group.parent_active && !group.branch_taken;
+            } else {
+                group.active = group.parent_active && !group.branch_taken &&
+                    evaluate(command.operand, location);
+            }
+            group.branch_taken = group.branch_taken || group.active;
+            continue;
+        }
+        if (!active) continue;
+        if (command.name == "define") {
+            const auto& definition = command.operand;
             std::size_t cursor = 0;
             while (cursor < definition.size() && identifier_continue(definition[cursor])) ++cursor;
             const auto name = definition.substr(0, cursor);
+            if (!valid_macro_name(name) || name.starts_with("$::")) {
+                diagnostics_.error(location, "#define requires a non-builtin macro name");
+                continue;
+            }
             Macro macro;
             if (cursor < definition.size() && definition[cursor] == '(') {
                 macro.function_like = true;
                 const auto close = definition.find(')', cursor + 1);
                 if (close == std::string::npos) {
-                    diagnostics_.error({file, 0, line_number, 1}, "unterminated macro parameter list");
+                    diagnostics_.error(location, "unterminated macro parameter list");
                     continue;
                 }
                 auto parameters = std::string_view(definition).substr(cursor + 1, close - cursor - 1);
@@ -505,56 +707,32 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
                 cursor = close + 1;
             }
             macro.replacement = trim(std::string_view(definition).substr(cursor));
-            if (macro.replacement.empty()) macro.replacement = "1";
             macros_[name] = std::move(macro);
             continue;
         }
-        if (stripped.starts_with("#undef")) {
-            if (conditions.back()) macros_.erase(trim(std::string_view(stripped).substr(6)));
+        if (command.name == "undef") {
+            if (!valid_macro_name(command.operand) || command.operand.starts_with("$::"))
+                diagnostics_.error(location, "#undef requires a non-builtin macro name");
+            else macros_.erase(command.operand);
             continue;
         }
-        if (stripped.starts_with("#ifdef") || stripped.starts_with("#ifndef")) {
-            const bool negative = stripped.starts_with("#ifndef");
-            const auto name = trim(std::string_view(stripped).substr(negative ? 7 : 6));
-            const bool present = macros_.contains(name);
-            conditions.push_back(conditions.back() && (negative ? !present : present));
+        if (command.name == "error") {
+            diagnostics_.error(location, "#error " + command.operand);
             continue;
         }
-        if (stripped.starts_with("#if")) {
-            auto expression = trim(std::string_view(stripped).substr(3));
-            std::unordered_set<std::string> disabled;
-            expression = expand_text(expression, disabled, 0);
-            const bool value = expression != "0" && !expression.empty();
-            conditions.push_back(conditions.back() && value);
+        if (command.name == "warning") {
+            diagnostics_.warning(location, "#warning " + command.operand);
             continue;
         }
-        if (stripped == "#else") {
-            if (conditions.size() <= 1) diagnostics_.error({file, 0, line_number, 1}, "unmatched #else");
-            else {
-                const bool parent = conditions.size() < 3 ? true : conditions[conditions.size() - 2];
-                conditions.back() = parent && !conditions.back();
-            }
-            continue;
-        }
-        if (stripped == "#endif") {
-            if (conditions.size() <= 1) diagnostics_.error({file, 0, line_number, 1}, "unmatched #endif");
-            else conditions.pop_back();
-            continue;
-        }
-        if (!stripped.empty() && stripped.front() == '#') {
-            if (conditions.back()) diagnostics_.error({file, 0, line_number, 1}, "unsupported preprocessing directive");
-            continue;
-        }
-        if (conditions.back()) {
-            std::unordered_set<std::string> disabled;
-            output << expand_text(line, disabled, 0) << '\n';
-        }
+        diagnostics_.error(location, "unsupported preprocessing directive");
     }
-    if (conditions.size() != 1) diagnostics_.error({file, 0, line_number, 1}, "unterminated conditional directive");
+    for (const auto& group : conditions)
+        diagnostics_.error(group.location, "unterminated conditional directive");
     return output.str();
 }
 
 std::string Preprocessor::process(const std::filesystem::path& input) {
+    line_locations_.clear();
     std::vector<std::filesystem::path> stack;
     auto included = expand_includes(input, stack);
     if (diagnostics_.errors() != 0) return {};

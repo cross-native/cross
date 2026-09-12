@@ -1475,6 +1475,8 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
             continue;
         }
         if (consume("(")) {
+            const bool previous = parsing_generic_argument_;
+            parsing_generic_argument_ = false;
             auto call = std::make_unique<Expr>();
             call->kind = Expr::Kind::Call;
             call->location = expression->location;
@@ -1484,10 +1486,13 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
                 do { call->arguments.push_back(parse_assignment()); } while (consume(","));
                 expect(")");
             }
+            parsing_generic_argument_ = previous;
             expression = std::move(call);
             continue;
         }
         if (consume("[")) {
+            const bool previous = parsing_generic_argument_;
+            parsing_generic_argument_ = false;
             auto index = std::make_unique<Expr>();
             index->kind = Expr::Kind::Binary;
             index->location = expression->location;
@@ -1495,6 +1500,7 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
             index->left = std::move(expression);
             index->right = parse_expression();
             expect("]");
+            parsing_generic_argument_ = previous;
             expression = std::move(index);
             continue;
         }
@@ -1538,8 +1544,11 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
 std::unique_ptr<Expr> Parser::parse_primary() {
     const auto item = current();
     if (consume("(")) {
+        const bool previous = parsing_generic_argument_;
+        parsing_generic_argument_ = false;
         auto inner = parse_expression();
         expect(")");
+        parsing_generic_argument_ = previous;
         auto result = std::make_unique<Expr>();
         result->kind = Expr::Kind::Parenthesized;
         result->location = item.location;

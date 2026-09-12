@@ -143,6 +143,17 @@ bool is_vector(const hir::Module& module, hir::TypeId id) {
     return module.type(id).kind == hir::Type::Kind::Vector;
 }
 
+bool has_dynamic_stack(const machine::Function& function) {
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (instruction.opcode == Opcode::StackSave ||
+                instruction.opcode == Opcode::StackAllocate ||
+                instruction.opcode == Opcode::StackRestore) return true;
+        }
+    }
+    return false;
+}
+
 unsigned type_bits(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
     if (type.kind == hir::Type::Kind::Pointer) return module.address_bits;
@@ -722,6 +733,23 @@ private:
         }
 
         const auto& entity = hir_.function(source.source);
+        if (std::any_of(source.values.begin(), source.values.end(),
+                        [](const mir::ManagedValue& value) {
+                            return value.kind == mir::ValueKind::DynamicAlloca;
+                        }) &&
+            std::any_of(source.values.begin(), source.values.end(),
+                        [](const mir::ManagedValue& value) {
+                            return value.kind == mir::ValueKind::Call;
+                        })) {
+            machine::StackSlot mark;
+            mark.id = {static_cast<std::uint32_t>(current_.stack_slots.size())};
+            mark.kind = machine::StackSlotKind::Local;
+            mark.size = (hir_.address_bits + 7U) / 8U;
+            mark.alignment = mark.size;
+            mark.location = source.location;
+            mark.name = "$dynamic.call.sp";
+            current_.stack_slots.push_back(std::move(mark));
+        }
         for (std::size_t index = 0; index < entity.parameters.size(); ++index) {
             if (entity.parameters[index].mode == ParameterMode::In) continue;
             machine::StackSlot pointer;
@@ -1036,7 +1064,21 @@ private:
                 result.uses.push_back(source);
             }
             if (has_result(value)) result.defs.push_back(reg(value.id));
-            unsupported(value, "dynamic stack allocation");
+            if (value.kind == ValueKind::DynamicAlloca) {
+                result.operands.push_back(immediate_operand(
+                    value.integer, 0, machine::i64,
+                    is_signed_integer(hir_, source_->values[value.operands.front().value].type)));
+                result.operands.push_back(immediate_operand(value.integer_high, 0, machine::i64));
+                result.may_store = true;
+            }
+            result.has_side_effects = true;
+            for (const auto id : {1U, 8U, 9U, 10U}) {
+                result.clobbers.push_back(machine::Register::physical_register({id}, machine::i64));
+            }
+            if (value.kind != ValueKind::DynamicStackSave) {
+                result.clobbers.push_back(machine::Register::physical_register(
+                    {29}, {static_cast<std::uint16_t>(hir_.address_bits)}));
+            }
             return result;
         }
         if (value.kind == ValueKind::Load) {
@@ -3033,7 +3075,7 @@ private:
         const auto opcode = decode_opcode(instruction.opcode);
         return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
             opcode == Opcode::Udiv || opcode == Opcode::Srem ||
-            opcode == Opcode::Urem ||
+            opcode == Opcode::Urem || opcode == Opcode::StackAllocate ||
             indexed_operation_writes_hilo(instruction);
     }
 
@@ -4173,6 +4215,10 @@ public:
         if (options_.unwind_tables || options_.asynchronous_unwind_tables ||
             options_.unwind_model != UnwindModel::None) return;
         for (auto& function : module_.functions) {
+            // Dynamic SP effects are not yet part of the pinned fixed-frame
+            // program contract. Retain the verified MIR marks and late frame
+            // emitter, with a stable FP for every fixed home.
+            if (has_dynamic_stack(function)) continue;
             active_signature_ = classify_entity(hir_.function(function.source), function.location);
             if (!active_signature_) continue;
             prepare_parameter_homes(function);
@@ -5843,6 +5889,7 @@ private:
     bool finalize_frame(machine::Function& function) {
         auto offset = outgoing_size(function);
         function.frame.outgoing_argument_size = offset;
+        if (has_dynamic_stack(function)) offset = 0;
         bool has_call = false;
         for (const auto& block : function.blocks) {
             for (std::size_t index = 0;
@@ -5876,7 +5923,7 @@ private:
             }
         }
         has_call_ = has_call;
-        if (offset == 0 && !has_call && !incoming_stack &&
+        if (!has_dynamic_stack(function) && offset == 0 && !has_call && !incoming_stack &&
             function.callee_saved_registers.empty()) {
             saved_fp_offset_ = 0;
             saved_ra_offset_ = 0;
@@ -5888,7 +5935,8 @@ private:
             function.frame.finalized = true;
             return true;
         }
-        function.frame.has_frame_pointer = !options_.omit_frame_pointer;
+        function.frame.has_frame_pointer = has_dynamic_stack(function) ||
+            !options_.omit_frame_pointer;
         // $fp and $ra carry addresses, so their homes are as wide as the
         // ABI's address model: one word under o32/EABI, a doubleword under
         // n64.
@@ -6388,10 +6436,12 @@ private:
     void place_integer_piece(const machine::Function& function,
                              machine::Register source,
                              const ValuePiece& piece, unsigned value_bits,
-                             SourceLocation location) {
+                             SourceLocation location,
+                             machine::ExtensionKind extension = machine::ExtensionKind::None) {
         const auto shift = effective_piece_offset(
             piece, value_bits, subtarget_.target().data_layout.byte_order);
-        if (!legalizes_to_pair(source) && shift == 0 &&
+        if (extension == machine::ExtensionKind::None &&
+            !legalizes_to_pair(source) && shift == 0 &&
             piece.value_bits >= value_bits &&
             piece.location.kind == LocationKind::Register &&
             internal_value_matches_extension(piece, value_bits)) {
@@ -6418,10 +6468,26 @@ private:
             }
         } else {
             load_vreg(function, source, "at", location);
+            if (extension != machine::ExtensionKind::None) {
+                // A return may absorb a MIR widening cast. Its source home
+                // still contains the narrow bits, so source extension must
+                // precede splitting and the independently specified ABI
+                // carrier extension.
+                normalize_integer("at", source.mode.bits,
+                                  extension == machine::ExtensionKind::Sign);
+            }
         }
         if (!legalizes_to_pair(source) && shift != 0) {
-            instruction(value_bits > 32 ? "dsrl" : "srl",
-                        "$at,$at," + std::to_string(shift));
+            if (extension != machine::ExtensionKind::None &&
+                shift >= source.mode.bits) {
+                if (extension == machine::ExtensionKind::Sign)
+                    instruction("sra", "$at,$at,31");
+                else
+                    instruction("move", "$at,$zero");
+            } else {
+                instruction(value_bits > 32 ? "dsrl" : "srl",
+                            "$at,$at," + std::to_string(shift));
+            }
         }
         apply_abi_register_extension("at", piece);
         if (piece.location.kind == LocationKind::Register) {
@@ -6697,7 +6763,8 @@ private:
     bool can_emit_tail_call(const machine::Function& function,
                             const machine::Instruction& call,
                             const machine::Instruction& result) {
-        if (!options_.optimize_sibling_calls || !active_signature_ ||
+        if (has_dynamic_stack(function) ||
+            !options_.optimize_sibling_calls || !active_signature_ ||
             !call.direct_callee || call.operands.empty() ||
             call.kind != machine::InstructionKind::Call ||
             result.kind != machine::InstructionKind::Return) {
@@ -6813,6 +6880,27 @@ private:
             return;
         }
         if (!tail) spill_call_live_registers(function, call);
+        const machine::StackSlot* dynamic_mark = nullptr;
+        if (has_dynamic_stack(function)) {
+            for (const auto& slot : function.stack_slots) {
+                if (slot.name == "$dynamic.call.sp") dynamic_mark = &slot;
+            }
+            if (!dynamic_mark || !dynamic_mark->frame_offset) {
+                diagnostics_.error(call.location, "missing MIPS dynamic call stack home");
+                return;
+            }
+            const auto size = signature->layout.call.outgoing_area_size;
+            const auto alignment = signature->layout.call.outgoing_area_alignment;
+            if (size > 32760 || alignment > 32768) {
+                diagnostics_.error(call.location, "MIPS dynamic outgoing call frame is too large");
+                return;
+            }
+            instruction(address_store(), "$sp," + memory(*dynamic_mark->frame_offset));
+            instruction(address_add_immediate(), "$t0,$sp,-" + std::to_string(size));
+            instruction(wide_addresses_ ? "dli" : "li", "$t1,-" + std::to_string(alignment));
+            instruction("and", "$t0,$t0,$t1");
+            emit_stack_probe(function);
+        }
         if (!signature->layout.results.empty() &&
             signature->layout.results.front().indirect) {
             if (call.defs.empty() ||
@@ -6946,7 +7034,83 @@ private:
         }
         instruction("nop");
         capture_call_result(function, call, *signature);
+        if (dynamic_mark) {
+            instruction(address_load(), "$sp," + memory(*dynamic_mark->frame_offset));
+        }
         reload_call_live_registers(function, call);
+    }
+
+    // $t0 is the aligned lower stack address. Probe each newly reserved page
+    // inline: Cross must never introduce a runtime stack-check helper.
+    void emit_stack_probe(const machine::Function& function) {
+        const auto loop = local_label(function);
+        const auto finish = local_label(function);
+        const auto done = local_label(function);
+        instruction("beq", "$sp,$t0," + done);
+        instruction("nop");
+        output_ << loop << ":\n";
+        instruction(wide_addresses_ ? "dsubu" : "subu", "$t1,$sp,$t0");
+        instruction("sltiu", "$at,$t1,4096");
+        instruction("bne", "$at,$zero," + finish);
+        instruction("nop");
+        instruction(address_add_immediate(), "$sp,$sp,-4096");
+        instruction("sw", "$zero,0($sp)");
+        instruction("b", loop);
+        instruction("nop");
+        output_ << finish << ":\n";
+        instruction("move", "$sp,$t0");
+        instruction("sw", "$zero,0($sp)");
+        output_ << done << ":\n";
+    }
+
+    void emit_dynamic_stack(const machine::Function& function,
+                            const machine::Instruction& value) {
+        if (value.opcode == Opcode::StackSave) {
+            store_vreg(function, value.defs.front(), "sp", value.location);
+            return;
+        }
+        load_vreg(function, value.uses.front(), "t0", value.location);
+        if (value.opcode == Opcode::StackRestore) {
+            instruction("move", "$sp,$t0");
+            return;
+        }
+        const auto& element = std::get<machine::ImmediateOperand>(
+            value.operands[value.operands.size() - 2]);
+        const auto& requested = std::get<machine::ImmediateOperand>(value.operands.back());
+        const auto alignment = std::max<std::uint64_t>(
+            requested.value, function.frame.stack_alignment);
+        const auto invalid = local_label(function);
+        const auto done = local_label(function);
+        normalize_integer("t0", value.uses.front().mode.bits, element.is_signed);
+        instruction("beq", "$t0,$zero," + invalid);
+        instruction("nop");
+        if (element.is_signed) {
+            instruction("bltz", "$t0," + invalid);
+            instruction("nop");
+        }
+        normalize_integer("t0", hir_.address_bits, false);
+        instruction(wide_addresses_ ? "dli" : "li", "$t1," + std::to_string(element.value));
+        instruction(wide_addresses_ ? "dmultu" : "multu", "$t0,$t1");
+        instruction("mfhi", "$t1");
+        instruction("bne", "$t1,$zero," + invalid);
+        instruction("nop");
+        instruction("mflo", "$t1");
+        normalize_integer("t1", hir_.address_bits, false);
+        instruction("move", "$t2,$sp");
+        normalize_integer("t2", hir_.address_bits, false);
+        instruction("sltu", "$at,$t2,$t1");
+        instruction("bne", "$at,$zero," + invalid);
+        instruction("nop");
+        instruction(wide_addresses_ ? "dsubu" : "subu", "$t0,$sp,$t1");
+        instruction(wide_addresses_ ? "dli" : "li", "$t1,-" + std::to_string(alignment));
+        instruction("and", "$t0,$t0,$t1");
+        emit_stack_probe(function);
+        store_vreg(function, value.defs.front(), "sp", value.location);
+        instruction("b", done);
+        instruction("nop");
+        output_ << invalid << ":\n";
+        instruction("break");
+        output_ << done << ":\n";
     }
 
     bool place_composed_return(
@@ -7262,7 +7426,7 @@ private:
                                 place_integer_piece(
                                     function, source, piece,
                                     type_bits(hir_, entity.result_type),
-                                    value.location);
+                                    value.location, value.result_extension);
                             }
                         }
                     }
@@ -9573,9 +9737,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         emit_atomic(function, value);
         return;
     }
-    if (opcode == Opcode::VariadicState || opcode == Opcode::StackSave ||
-        opcode == Opcode::StackAllocate || opcode == Opcode::StackRestore ||
-        opcode == Opcode::Invalid) {
+    if (opcode == Opcode::StackSave || opcode == Opcode::StackAllocate ||
+        opcode == Opcode::StackRestore) {
+        emit_dynamic_stack(function, value);
+        return;
+    }
+    if (opcode == Opcode::VariadicState || opcode == Opcode::Invalid) {
         diagnostics_.error(value.location,
                            "unsupported operation reached the MIPS assembly emitter");
         return;

@@ -7,6 +7,7 @@
 #include "common/source.hpp"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,10 +38,12 @@ private:
     void define_command_line_macros();
     std::string expand_text(std::string_view text,
                             std::unordered_set<std::string>& disabled,
-                            unsigned depth) const;
+                            unsigned depth,
+                            std::optional<SourceLocation> condition = {}) const;
     std::string substitute(const Macro& macro, const std::vector<std::string>& arguments,
                            std::unordered_set<std::string>& disabled,
-                           unsigned depth) const;
+                           unsigned depth,
+                           std::optional<SourceLocation> condition = {}) const;
     std::string evaluate_query(std::string_view name,
                                const std::vector<std::string>& arguments) const;
 
@@ -50,6 +53,7 @@ private:
     std::unordered_map<std::string, Macro> macros_;
     std::unordered_set<std::string> pragma_once_files_;
     std::unordered_set<std::string> already_included_;
+    std::vector<SourceLocation> line_locations_;
 };
 
 } // namespace cross

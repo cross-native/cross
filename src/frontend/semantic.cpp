@@ -277,55 +277,72 @@ std::string generic_link_name(const FunctionDecl& function,
         rendered, mangling);
 }
 
+struct GenericExpansionState {
+    std::unordered_map<std::string, std::string> instance_names;
+    std::unordered_set<const FunctionDecl*> rewritten_functions;
+    unsigned depth{};
+};
+
+bool normalize_generic_arguments(const FunctionDecl& generic,
+                                 std::vector<Expr::GenericArgument>& arguments,
+                                 const FunctionDecl* caller, Program& program,
+                                 Diagnostics& diagnostics, SourceLocation location);
+
 void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                           FunctionDecl* caller, Program& program,
                           Diagnostics& diagnostics,
-                          std::vector<std::unique_ptr<FunctionDecl>>& instances,
-                          std::unordered_map<std::string, std::string>& instance_names,
+                          GenericExpansionState& state,
                           std::string_view mangling);
 
 void rewrite_generic_statement(
     Statement& statement, FunctionDecl* caller, Program& program,
     Diagnostics& diagnostics,
-    std::vector<std::unique_ptr<FunctionDecl>>& instances,
-    std::unordered_map<std::string, std::string>& instance_names,
+    GenericExpansionState& state,
     std::string_view mangling) {
     for (auto& child : statement.statements) {
         rewrite_generic_statement(*child, caller, program, diagnostics,
-                                  instances, instance_names, mangling);
+                                  state, mangling);
     }
     if (statement.declaration) {
         if (statement.declaration->dynamic_array_bound) {
             rewrite_generic_expr(statement.declaration->dynamic_array_bound,
-                                 caller, program, diagnostics, instances,
-                                 instance_names, mangling);
+                                 caller, program, diagnostics, state, mangling);
         }
         if (statement.declaration->initializer) {
             rewrite_generic_expr(statement.declaration->initializer, caller,
-                                 program, diagnostics, instances,
-                                 instance_names, mangling);
+                                 program, diagnostics, state, mangling);
         }
     }
     if (statement.expression) {
         rewrite_generic_expr(statement.expression, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     if (statement.condition) {
         rewrite_generic_expr(statement.condition, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     if (statement.increment) {
         rewrite_generic_expr(statement.increment, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     if (statement.first) {
         rewrite_generic_statement(*statement.first, caller, program, diagnostics,
-                                  instances, instance_names, mangling);
+                                  state, mangling);
     }
     if (statement.second) {
         rewrite_generic_statement(*statement.second, caller, program, diagnostics,
-                                  instances, instance_names, mangling);
+                                  state, mangling);
     }
+}
+
+void rewrite_generic_function(FunctionDecl& function, Program& program,
+                              Diagnostics& diagnostics,
+                              GenericExpansionState& state,
+                              std::string_view mangling) {
+    if (!function.body || !function.generic_parameters.empty() ||
+        !state.rewritten_functions.insert(&function).second) return;
+    rewrite_generic_statement(*function.body, &function, program, diagnostics,
+                              state, mangling);
 }
 
 std::unique_ptr<FunctionDecl> instantiate(
@@ -386,30 +403,29 @@ std::unique_ptr<FunctionDecl> instantiate(
 void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                           FunctionDecl* caller, Program& program,
                           Diagnostics& diagnostics,
-                          std::vector<std::unique_ptr<FunctionDecl>>& instances,
-                          std::unordered_map<std::string, std::string>& instance_names,
+                          GenericExpansionState& state,
                           std::string_view mangling) {
     if (!expression) return;
     if (expression->left) {
         rewrite_generic_expr(expression->left, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     if (expression->right) {
         rewrite_generic_expr(expression->right, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     if (expression->third) {
         rewrite_generic_expr(expression->third, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     for (auto& argument : expression->arguments) {
         rewrite_generic_expr(argument, caller, program, diagnostics,
-                             instances, instance_names, mangling);
+                             state, mangling);
     }
     for (auto& argument : expression->generic_arguments) {
         if (argument.value) {
             rewrite_generic_expr(argument.value, caller, program, diagnostics,
-                                 instances, instance_names, mangling);
+                                 state, mangling);
         }
     }
     if (expression->kind != Expr::Kind::Call || !expression->left ||
@@ -427,6 +443,13 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
             diagnostics.error(expression->location,
                               "generic function '" + generic->name +
                                   "' requires explicit ::<...> arguments");
+        } else if (auto* function = resolve_function(
+                       program, caller, name,
+                       [](const FunctionDecl& candidate) { return candidate.body != nullptr; })) {
+            // An ordinary helper used by a generic constant may itself call
+            // generics. Prepare its definition before any evaluator enters it,
+            // regardless of declaration order. The visited set breaks cycles.
+            rewrite_generic_function(*function, program, diagnostics, state, mangling);
         }
         return;
     }
@@ -436,13 +459,19 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                               name + "'");
         return;
     }
+    if (!normalize_generic_arguments(*generic, expression->generic_arguments,
+                                     caller, program, diagnostics, expression->location)) return;
     const auto link_name = generic_link_name(
         *generic, expression->generic_arguments, mangling);
-    const auto found = instance_names.find(link_name);
+    const auto found = state.instance_names.find(link_name);
     std::string internal_name;
-    if (found != instance_names.end()) {
+    if (found != state.instance_names.end()) {
         internal_name = found->second;
     } else {
+        if (state.depth >= 128 || state.instance_names.size() >= 4096) {
+            diagnostics.error(expression->location, "generic instantiation budget exceeded");
+            return;
+        }
         internal_name = generic->name + "$G" +
                         std::to_string(stable_hash(link_name));
         auto instance = instantiate(*generic, expression->generic_arguments,
@@ -452,8 +481,17 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
             instance->attributes.push_back(
                 {"link_name", {'"' + link_name + '"'}, instance->location});
         }
-        instance_names.emplace(link_name, internal_name);
-        instances.push_back(std::move(instance));
+        state.instance_names.emplace(link_name, internal_name);
+        auto* concrete = instance.get();
+        program.functions.push_back(std::move(instance));
+        // Publish before walking the body so recursive identical instances
+        // resolve to the in-progress function. Nested constant generic calls
+        // can then be evaluated through the same visible definition table.
+        if (concrete->body) {
+            ++state.depth;
+            rewrite_generic_function(*concrete, program, diagnostics, state, mangling);
+            --state.depth;
+        }
     }
     expression->left->text = std::move(internal_name);
     expression->generic_arguments.clear();
@@ -461,30 +499,16 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
 
 bool expand_generics(Program& program, Diagnostics& diagnostics,
                      std::string_view mangling) {
-    std::vector<std::unique_ptr<FunctionDecl>> instances;
-    std::unordered_map<std::string, std::string> instance_names;
-    for (auto& function : program.functions) {
+    GenericExpansionState state;
+    for (std::size_t index = 0; index < program.functions.size(); ++index) {
+        auto* function = program.functions[index].get();
         if (!function->generic_parameters.empty()) continue;
-        if (function->body) {
-            rewrite_generic_statement(*function->body, function.get(), program,
-                                      diagnostics, instances, instance_names,
-                                      mangling);
-        }
+        rewrite_generic_function(*function, program, diagnostics, state, mangling);
     }
     for (auto& object : program.objects) {
         if (object->initializer) {
             rewrite_generic_expr(object->initializer, nullptr, program,
-                                 diagnostics, instances, instance_names,
-                                 mangling);
-        }
-    }
-    for (std::size_t index = 0; index < instances.size(); ++index) {
-        auto* instance = instances[index].get();
-        program.functions.push_back(std::move(instances[index]));
-        if (instance->body) {
-            rewrite_generic_statement(*instance->body, instance, program,
-                                      diagnostics, instances, instance_names,
-                                      mangling);
+                                 diagnostics, state, mangling);
         }
     }
     program.functions.erase(
@@ -997,6 +1021,37 @@ public:
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller) {}
 
+    std::optional<EvalValue> required_integer(const Expr& source,
+                                             const TypePtr& destination = {}) {
+        if (!validate_required_tree(source)) return std::nullopt;
+        auto value = expression(source);
+        if (!value) return std::nullopt;
+        if (value->pointer() || !is_integer(value->type)) {
+            fail(source.location, "required expression is not an integer translation-time value");
+            return std::nullopt;
+        }
+        if (!destination) return value;
+        const auto from = integer_type(value->type);
+        const auto to = integer_type(destination);
+        const bool negative = integer_negative(value->integer, from);
+        bool fits;
+        if (to.is_bool) {
+            fits = !negative && !(UInt128{1} < value->integer);
+        } else if (negative) {
+            const auto magnitude = mask_to(negate(value->integer), from.bits);
+            fits = to.is_signed && !(shift_left(UInt128{1}, to.bits - 1) < magnitude);
+        } else {
+            fits = to.is_signed ? fits_signed_positive(value->integer, to.bits)
+                                : fits_unsigned(value->integer, to.bits);
+        }
+        if (!fits) {
+            fail(source.location, "generic value argument is not representable in parameter type '" +
+                                  type_name(destination) + "'");
+            return std::nullopt;
+        }
+        return convert(*value, destination, source.location);
+    }
+
     void diagnose(SourceLocation fallback) const {
         diagnostics_.error(
             failure_location_.valid() ? failure_location_ : fallback,
@@ -1134,6 +1189,123 @@ private:
         bool read_only{};
     };
 
+    // Required folding must not discard malformed syntax in an untaken arm.
+    // This validates the scalar expression boundary without executing calls
+    // or arithmetic (division by zero in a short-circuited arm is permitted).
+    bool validate_required_tree(const Expr& node) {
+        if (node.kind == Expr::Kind::Call) {
+            if (!node.left || node.left->kind != Expr::Kind::Name) {
+                fail(node.location, "indirect calls in required constant expressions are not implemented yet");
+                return false;
+            }
+            if (node.left->text == "$::runtime") {
+                fail(node.location, "$::runtime is invalid where a translation-time value is required");
+                return false;
+            }
+            if (node.left->text == "$::eval") {
+                if (node.arguments.size() != 1) {
+                    fail(node.location, "$::eval requires exactly one expression");
+                    return false;
+                }
+                return validate_required_tree(*node.arguments.front());
+            }
+            const auto* function = resolve_function(program_, current_function_, node.left->text,
+                                                     [](const FunctionDecl&) { return true; });
+            if (!function || (!function->variadic && node.arguments.size() != function->parameters.size()) ||
+                (function->variadic && node.arguments.size() < function->parameters.size())) {
+                fail(node.location, "required expression has an unresolved call or invalid argument count");
+                return false;
+            }
+            for (std::size_t index = 0; index < node.arguments.size(); ++index) {
+                const auto& argument = *node.arguments[index];
+                if (!validate_required_tree(argument)) return false;
+                if (index >= function->parameters.size()) continue;
+                const auto from = expression_type(argument);
+                const auto& to = function->parameters[index].type;
+                const auto pointer_compatible = [&] {
+                    if (!from || !to || from->kind != Type::Kind::Pointer ||
+                        to->kind != Type::Kind::Pointer || !from->pointee || !to->pointee)
+                        return false;
+                    if ((from->pointee->is_const && !to->pointee->is_const) ||
+                        (from->pointee->is_volatile && !to->pointee->is_volatile) ||
+                        from->pointee->is_atomic != to->pointee->is_atomic)
+                        return false;
+                    auto source = clone_type(from->pointee);
+                    auto destination = clone_type(to->pointee);
+                    source->is_const = destination->is_const = false;
+                    source->is_volatile = destination->is_volatile = false;
+                    const auto void_type = [](const TypePtr& type) {
+                        return type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
+                    };
+                    return same_type(source, destination) ||
+                        ((void_type(source) || void_type(destination)) &&
+                         source->kind != Type::Kind::Function && destination->kind != Type::Kind::Function);
+                };
+                const bool compatible = from && to &&
+                    ((is_integer(from) && is_integer(to)) || same_type(from, to) ||
+                     pointer_compatible());
+                if (!compatible) {
+                    fail(argument.location, "unsupported or incompatible argument type in required expression");
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (node.left && !validate_required_tree(*node.left)) return false;
+        if (node.right && !validate_required_tree(*node.right)) return false;
+        if (node.third && !validate_required_tree(*node.third)) return false;
+        if (node.kind == Expr::Kind::Integer) return expression(node).has_value();
+        if (node.kind == Expr::Kind::Character) return expression(node).has_value();
+        if (node.kind == Expr::Kind::String) {
+            if (decode_string_literal(node.text)) return true;
+            fail(node.location, "invalid string in required expression");
+            return false;
+        }
+        if (!expression_type(node)) {
+            fail(node.location, "unresolved name or unsupported type in required constant expression");
+            return false;
+        }
+        if (node.kind == Expr::Kind::Unary &&
+            (!node.left || !is_integer(expression_type(*node.left)) ||
+             (node.text != "+" && node.text != "-" && node.text != "!" && node.text != "~" &&
+              node.text != "++" && node.text != "--" && node.text != "post++" && node.text != "post--"))) {
+            fail(node.location, "unsupported unary operand in required integer expression");
+            return false;
+        }
+        const bool modifying = node.kind == Expr::Kind::Assign ||
+            (node.kind == Expr::Kind::Unary &&
+             (node.text == "++" || node.text == "--" || node.text.starts_with("post")));
+        if (modifying) {
+            if (!node.left || node.left->kind != Expr::Kind::Name ||
+                (node.right && !is_integer(expression_type(*node.right)))) {
+                fail(node.location, "unsupported assignment in required integer expression");
+                return false;
+            }
+            bool read_only = expression_type(*node.left)->is_const;
+            if (current_function_) {
+                for (const auto& parameter : current_function_->parameters)
+                    if (parameter.name == node.left->text)
+                        read_only = read_only || parameter.mode == ParameterMode::In;
+            }
+            if (read_only) {
+                fail(node.location, "cannot write an 'in' or const cell");
+                return false;
+            }
+        }
+        if (node.kind == Expr::Kind::Binary || node.kind == Expr::Kind::Conditional) {
+            const auto left = node.left ? expression_type(*node.left) : nullptr;
+            const auto right = node.right ? expression_type(*node.right) : nullptr;
+            const bool indexing = node.kind == Expr::Kind::Binary && node.text == "index";
+            if (!left || !right ||
+                (indexing ? left->kind != Type::Kind::Pointer || !is_integer(right)
+                          : !is_integer(left) || !is_integer(right))) {
+                fail(node.location, "non-integer operation in required integer expression");
+                return false;
+            }
+        }
+        return true;
+    }
+
     TypePtr expression_type(const Expr& expression) {
         switch (expression.kind) {
         case Expr::Kind::Integer: {
@@ -1143,6 +1315,10 @@ private:
         case Expr::Kind::Character: return builtin_type(BuiltinType::U32);
         case Expr::Kind::Name:
             if (const auto* cell = lookup_mutable(expression.text)) return cell->value.type;
+            if (current_function_) {
+                for (const auto& parameter : current_function_->parameters)
+                    if (parameter.name == expression.text) return parameter.type;
+            }
             if (const auto* object = resolve_object(program_, current_function_, expression.text)) return object->type;
             return {};
         case Expr::Kind::Parenthesized:
@@ -1159,6 +1335,10 @@ private:
         case Expr::Kind::Binary:
         case Expr::Kind::Conditional: {
             const bool conditional = expression.kind == Expr::Kind::Conditional;
+            if (!conditional && expression.text == "index") {
+                const auto base = expression_type(*expression.left);
+                return base && base->kind == Type::Kind::Pointer ? base->pointee : nullptr;
+            }
             if (!conditional && (expression.text == "==" || expression.text == "!=" ||
                 expression.text == "<" || expression.text == ">" || expression.text == "<=" ||
                 expression.text == ">=" || expression.text == "&&" || expression.text == "||"))
@@ -1177,8 +1357,8 @@ private:
             if (const auto* callee = resolve_function(program_, current_function_, expression.left->text,
                     [](const FunctionDecl&) { return true; })) return callee->return_type;
             return {};
-        case Expr::Kind::Floating:
-        case Expr::Kind::String: return {};
+        case Expr::Kind::String: return pointer_type(builtin_type(BuiltinType::U8, true));
+        case Expr::Kind::Floating: return {};
         }
         return {};
     }
@@ -1754,6 +1934,61 @@ void replace_eval_value(std::unique_ptr<Expr>& expression,
     expression = std::move(replacement);
 }
 
+bool rewrite_required_integer(std::unique_ptr<Expr>& expression,
+                              const FunctionDecl* caller, Program& program,
+                              Diagnostics& diagnostics,
+                              const TypePtr& destination = {}) {
+    Evaluator evaluator(program, diagnostics, caller);
+    const auto value = evaluator.required_integer(*expression, destination);
+    if (!value) {
+        evaluator.diagnose(expression->location);
+        return false;
+    }
+    replace_eval_value(expression, *value);
+    // The model receives a canonical mathematical spelling, not the source
+    // spelling or the unsigned encoding of a negative signed value.
+    auto width = type_bits(value->type);
+    if (value->type->builtin == BuiltinType::Iptr ||
+        value->type->builtin == BuiltinType::Uptr) width = program.address_bits;
+    if (signed_value(*value) && bit(value->integer, width - 1)) {
+        expression->text = "-" + to_decimal(mask_to(negate(value->integer), width)) +
+                           literal_suffix(value->type);
+    }
+    return true;
+}
+
+bool normalize_generic_arguments(const FunctionDecl& generic,
+                                 std::vector<Expr::GenericArgument>& arguments,
+                                 const FunctionDecl* caller, Program& program,
+                                 Diagnostics& diagnostics, SourceLocation location) {
+    if (arguments.size() != generic.generic_parameters.size()) {
+        diagnostics.error(location, "generic argument count does not match '" + generic.name + "'");
+        return false;
+    }
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        const auto& parameter = generic.generic_parameters[index];
+        auto& argument = arguments[index];
+        if (!parameter.value_type) {
+            if (argument.type) continue;
+            diagnostics.error(location, "generic type parameter '" + parameter.name +
+                                        "' requires a type argument");
+            return false;
+        }
+        if (!is_integer(parameter.value_type)) {
+            diagnostics.error(location, "non-integer generic value parameters are not implemented yet");
+            return false;
+        }
+        if (!argument.value) {
+            diagnostics.error(location, "generic value parameter '" + parameter.name +
+                                        "' requires a value argument");
+            return false;
+        }
+        if (!rewrite_required_integer(argument.value, caller, program, diagnostics,
+                                      parameter.value_type)) return false;
+    }
+    return true;
+}
+
 void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                        FunctionDecl* caller, Program& program,
                        Diagnostics& diagnostics,
@@ -2030,8 +2265,15 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     }
     for (auto& object : program.objects) {
         if (object->initializer) {
-            rewrite_eval_expr(object->initializer, nullptr, program,
-                              diagnostics, opportunistic, true);
+            if (is_integer(object->type)) {
+                // Required initializers own the complete expression. Visiting
+                // child calls first would evaluate untaken logical/conditional
+                // arms and lose their short-circuit semantics.
+                rewrite_required_integer(object->initializer, nullptr, program, diagnostics);
+            } else {
+                rewrite_eval_expr(object->initializer, nullptr, program,
+                                  diagnostics, opportunistic, true);
+            }
         }
     }
     program.functions.erase(
