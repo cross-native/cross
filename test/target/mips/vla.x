@@ -53,6 +53,35 @@ static u32 aligned_array(in u32 count) {
     return cells[0].value + cells[count-1u32].value;
 }
 
+[[runtime_only, noinline]]
+static u32 goto_cleanup(in uptr count) {
+    u32 result = 0u32;
+    uptr previous = 0uptr;
+    for (u32 index = 0u32; index < 4u32; index += 1u32) {
+        {
+            stack u8 temporary[count];
+            uptr address = temporary;
+            if (index != 0u32 && address != previous) return 100u32;
+            previous = address;
+            temporary[0] = (u8)(index + 1u32);
+            result += temporary[0];
+            goto completed;
+        }
+        return 100u32;
+completed:
+        result += 0u32;
+    }
+    {
+        stack u8 still_active[count];
+        still_active[0] = 9u8;
+        goto same_state;
+        return 100u32;
+same_state:
+        result += still_active[0];
+    }
+    return result;
+}
+
 global u32 vla_entry(in u32 count) {
     bound_calls = 0u32;
     u8 exact[4] = "abc";
@@ -63,5 +92,6 @@ global u32 vla_entry(in u32 count) {
            exact[0] == 97u8 && exact[3] == 0u8 &&
            sizeof(inferred) == 3uptr && inferred[1] == 121u8 &&
            inferred[2] == 0u8 && padded[0] == 122u8 &&
-           padded[1] == 0u8 && padded[23] == 0u8;
+           padded[1] == 0u8 && padded[23] == 0u8 &&
+           goto_cleanup(count) == 19u32;
 }

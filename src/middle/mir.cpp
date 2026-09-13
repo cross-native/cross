@@ -785,15 +785,6 @@ bool contains_dynamic_array(const Statement& statement) {
            (statement.second && contains_dynamic_array(*statement.second));
 }
 
-bool contains_goto(const Statement& statement) {
-    if (statement.kind == Statement::Kind::Goto) return true;
-    for (const auto& child : statement.statements) {
-        if (contains_goto(*child)) return true;
-    }
-    return (statement.first && contains_goto(*statement.first)) ||
-           (statement.second && contains_goto(*statement.second));
-}
-
 bool eligible_function(const hir::Module& module, const hir::Function& function,
                        const TargetInfo& target) {
     if (!function.definition || function.naked) return false;
@@ -897,18 +888,95 @@ private:
         unsigned alignment{1};
     };
 
+    struct ActiveDynamicArray {
+        const Statement* declaration{};
+        std::size_t scope_depth{};
+
+        friend bool operator==(const ActiveDynamicArray&,
+                               const ActiveDynamicArray&) = default;
+    };
+
+    struct ControlPoint {
+        std::size_t scope_depth{};
+        std::vector<ActiveDynamicArray> dynamic_arrays;
+    };
+
+    void collect_control_points(
+        const Statement& statement, hir::FunctionId function,
+        std::size_t scope_depth,
+        std::vector<ActiveDynamicArray>& dynamic_arrays) {
+        if (statement.kind == Statement::Kind::Compound) {
+            const auto retained = dynamic_arrays.size();
+            for (const auto& child : statement.statements) {
+                collect_control_points(*child, function, scope_depth + 1,
+                                       dynamic_arrays);
+            }
+            dynamic_arrays.resize(retained);
+            return;
+        }
+        if (statement.kind == Statement::Kind::For) {
+            const auto retained = dynamic_arrays.size();
+            if (statement.first) {
+                collect_control_points(*statement.first, function,
+                                       scope_depth + 1, dynamic_arrays);
+            }
+            if (statement.second) {
+                collect_control_points(*statement.second, function,
+                                       scope_depth + 1, dynamic_arrays);
+            }
+            dynamic_arrays.resize(retained);
+            return;
+        }
+        if (statement.kind == Statement::Kind::Label) {
+            if (const auto* label =
+                    hir_.label(function, statement.label_name)) {
+                label_control_points_.emplace(
+                    label->id.value,
+                    ControlPoint{scope_depth, dynamic_arrays});
+            }
+        } else if (statement.kind == Statement::Kind::Goto) {
+            goto_control_points_.emplace(
+                &statement, ControlPoint{scope_depth, dynamic_arrays});
+        }
+        if (statement.declaration &&
+            statement.declaration->dynamic_array_bound) {
+            dynamic_arrays.push_back({&statement, scope_depth});
+        }
+        if (statement.first) {
+            collect_control_points(*statement.first, function, scope_depth,
+                                   dynamic_arrays);
+        }
+        if (statement.second) {
+            collect_control_points(*statement.second, function, scope_depth,
+                                   dynamic_arrays);
+        }
+    }
+
+    bool supports_direct_vla_transition(const Statement& statement,
+                                        hir::LabelId target) const {
+        const auto source = goto_control_points_.find(&statement);
+        const auto destination = label_control_points_.find(target.value);
+        if (source == goto_control_points_.end() ||
+            destination == label_control_points_.end() ||
+            destination->second.scope_depth > source->second.scope_depth) {
+            return false;
+        }
+        std::vector<ActiveDynamicArray> retained;
+        for (const auto& array : source->second.dynamic_arrays) {
+            if (array.scope_depth <= destination->second.scope_depth) {
+                retained.push_back(array);
+            }
+        }
+        return retained == destination->second.dynamic_arrays;
+    }
+
     std::optional<ManagedFunction> lower_function(const hir::Function& function) {
         failed_ = false;
-        if (contains_dynamic_array(*function.definition->body) &&
-            contains_goto(*function.definition->body)) {
-            diagnostics_.error(
-                function.location,
-                "goto in a function with variable-length array storage is not implemented yet");
-            return std::nullopt;
-        }
         current_patch_sinks_.clear();
         parameter_values_.clear();
         label_blocks_.clear();
+        label_control_points_.clear();
+        goto_control_points_.clear();
         case_blocks_.clear();
         scopes_.clear();
         loops_.clear();
@@ -919,6 +987,11 @@ private:
         current_.source = function.id;
         current_.location = function.location;
         current_.result_type = function.result_type;
+        has_dynamic_arrays_ =
+            contains_dynamic_array(*function.definition->body);
+        std::vector<ActiveDynamicArray> dynamic_arrays;
+        collect_control_points(*function.definition->body, function.id, 1,
+                               dynamic_arrays);
         current_.entry = new_block(function.location, true);
         for (const auto label_id : function.labels) {
             const auto& label = hir_.labels.at(label_id.value);
@@ -5164,6 +5237,36 @@ private:
                 failed_ = true;
                 return;
             }
+            if (statement.expression->kind == Expr::Kind::Name &&
+                statement.expression->text.find("::") == std::string::npos) {
+                if (const auto* label = hir_.label(
+                        current_.source, statement.expression->text)) {
+                    const auto found = label_blocks_.find(label->id.value);
+                    if (found == label_blocks_.end()) {
+                        failed_ = true;
+                        return;
+                    }
+                    if (has_dynamic_arrays_ &&
+                        !supports_direct_vla_transition(statement,
+                                                        label->id)) {
+                        diagnostics_.error(
+                            statement.location,
+                            "direct goto would enter or change variable-length array storage state");
+                        failed_ = true;
+                        return;
+                    }
+                    const auto point =
+                        label_control_points_.find(label->id.value);
+                    if (point != label_control_points_.end() &&
+                        point->second.scope_depth < scopes_.size()) {
+                        end_lifetimes_from(point->second.scope_depth,
+                                           statement.location);
+                    }
+                    terminate(TerminatorKind::Branch, statement.location,
+                              std::nullopt, {found->second});
+                    return;
+                }
+            }
             auto destination = lower_expression(*statement.expression);
             if (!destination ||
                 !label_type(hir_, current_.values[destination->value].type)) {
@@ -5431,12 +5534,15 @@ private:
     std::unordered_map<std::string, ValueId> parameter_values_;
     std::unordered_set<std::string> address_taken_names_;
     std::unordered_map<std::uint32_t, BlockId> label_blocks_;
+    std::unordered_map<std::uint32_t, ControlPoint> label_control_points_;
+    std::unordered_map<const Statement*, ControlPoint> goto_control_points_;
     std::unordered_map<const Statement*, BlockId> case_blocks_;
     std::vector<Scope> scopes_;
     std::vector<LoopContext> loops_;
     std::unordered_set<std::uint32_t> patch_sinks_;
     std::unordered_set<std::uint32_t> current_patch_sinks_;
     std::uint32_t next_patch_id_{};
+    bool has_dynamic_arrays_{};
     bool failed_{};
 };
 

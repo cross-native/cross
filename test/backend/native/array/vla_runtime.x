@@ -19,6 +19,35 @@ static void restrict_copy(in u32 * restrict source,
     *destination = *source;
 }
 
+[[runtime_only, noinline]]
+static u32 goto_vla_cleanup(in uptr count) {
+    u32 result = 0u32;
+    uptr previous = 0uptr;
+    for (u32 index = 0u32; index < 4u32; index += 1u32) {
+        {
+            stack u8 temporary[count];
+            uptr address = temporary;
+            if (index != 0u32 && address != previous) return 100u32;
+            previous = address;
+            temporary[0] = (u8)(index + 1u32);
+            result += temporary[0];
+            goto completed;
+        }
+        return 100u32;
+completed:
+        result += 0u32;
+    }
+    {
+        stack u8 still_active[count];
+        still_active[0] = 9u8;
+        goto same_state;
+        return 100u32;
+same_state:
+        result += still_active[0];
+    }
+    return result;
+}
+
 global i32 vla_entry() {
     u32 count = 5u32;
     stack u32 values[count];
@@ -53,5 +82,6 @@ global i32 vla_entry() {
     restrict_copy(values, &copied);
     sum += add_eight(1u32, 2u32, 3u32, 4u32,
                      5u32, 6u32, 7u32, 8u32);
-    return sum + (extended[4] == 3.5f80) + matrix[3][2] + tail + copied;
+    return sum + (extended[4] == 3.5f80) + matrix[3][2] + tail + copied +
+           goto_vla_cleanup(count);
 }
