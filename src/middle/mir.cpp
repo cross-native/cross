@@ -5201,17 +5201,94 @@ private:
             return;
         case Statement::Kind::Return: {
             if (!current_block_) { failed_ = true; return; }
+            const Attribute* musttail{};
+            for (const auto& attribute : statement.attributes) {
+                if (attribute.name == "musttail") musttail = &attribute;
+            }
+            if (musttail) {
+                const Expr* expression = statement.expression.get();
+                while (expression &&
+                       expression->kind == Expr::Kind::Parenthesized &&
+                       expression->left) {
+                    expression = expression->left.get();
+                }
+                if (!expression || expression->kind != Expr::Kind::Call) {
+                    diagnostics_.error(
+                        musttail->location,
+                        "musttail requires returning a call expression directly");
+                    failed_ = true;
+                    return;
+                }
+                if (has_dynamic_arrays_) {
+                    diagnostics_.error(
+                        musttail->location,
+                        "musttail cannot restore variable-length array storage before the tail transfer");
+                    failed_ = true;
+                    return;
+                }
+            }
             std::optional<ValueId> result;
             if (statement.expression) {
                 result = lower_expression(*statement.expression, current_.result_type);
             }
-            if ((!result && !void_type(hir_, current_.result_type)) ||
-                (result && void_type(hir_, current_.result_type))) {
+            if (musttail && result) {
+                auto& call = current_.values[result->value];
+                if (call.kind != ValueKind::Call) {
+                    diagnostics_.error(
+                        musttail->location,
+                        "musttail requires the returned value to be the direct result of the call");
+                    failed_ = true;
+                    return;
+                }
+                if (!current_block_) {
+                    diagnostics_.error(
+                        musttail->location,
+                        "musttail cannot target a call lowered as noreturn");
+                    failed_ = true;
+                    return;
+                }
+                const auto signature = hir::call_signature(
+                    hir_, call.callee, call.call_signature);
+                const auto& caller = hir_.function(current_.source);
+                const bool caller_outputs = std::any_of(
+                    caller.parameters.begin(), caller.parameters.end(),
+                    [](const hir::Parameter& parameter) {
+                        return parameter.mode != ParameterMode::In;
+                    });
+                const bool callee_outputs =
+                    !signature || std::any_of(
+                        signature->parameters.begin(),
+                        signature->parameters.end(),
+                        [](const hir::Parameter& parameter) {
+                            return parameter.mode != ParameterMode::In;
+                        });
+                if (caller_outputs || callee_outputs) {
+                    diagnostics_.error(
+                        musttail->location,
+                        "musttail output-parameter forwarding is not implemented");
+                    failed_ = true;
+                    return;
+                }
+                const auto& values =
+                    current_.blocks[current_block_->value].values;
+                if (values.empty() || values.back() != *result) {
+                    diagnostics_.error(
+                        musttail->location,
+                        "musttail call requires work after the call and cannot be a tail transfer");
+                    failed_ = true;
+                    return;
+                }
+                call.must_tail = true;
+            }
+            const bool void_result = void_type(hir_, current_.result_type);
+            if ((!result && !void_result) ||
+                (result && void_result && !musttail)) {
                 failed_ = true;
                 return;
             }
             end_lifetimes_from(0, statement.location);
-            terminate(TerminatorKind::Return, statement.location, result, {});
+            terminate(TerminatorKind::Return, statement.location,
+                      void_result ? std::nullopt : result, {});
             return;
         }
         case Statement::Kind::If:
@@ -5832,6 +5909,29 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
     for (const auto& block : function.blocks) {
         for (std::size_t order = 0; order < block.values.size(); ++order) {
             const auto& value = function.values[block.values[order].value];
+            if (value.must_tail) {
+                if (value.kind != ValueKind::Call) {
+                    fail(value.location,
+                         "must-tail metadata requires a managed call");
+                }
+                const bool returned =
+                    block.terminator.kind == TerminatorKind::Return &&
+                    ((void_type(hir_module, value.type) &&
+                      !block.terminator.value) ||
+                     (!void_type(hir_module, value.type) &&
+                      block.terminator.value == value.id));
+                const bool trailing_lifetimes = std::all_of(
+                    block.values.begin() +
+                        static_cast<std::ptrdiff_t>(order + 1),
+                    block.values.end(), [&](ValueId trailing) {
+                        return function.values[trailing.value].kind ==
+                               ValueKind::LifetimeEnd;
+                    });
+                if (!returned || !trailing_lifetimes) {
+                    fail(value.location,
+                         "must-tail call is not the final returned operation");
+                }
+            }
             if (value.kind == ValueKind::Phi) {
                 if (value.incoming.size() != block.predecessors.size()) {
                     fail(value.location, "phi predecessor count mismatch");
@@ -7095,6 +7195,10 @@ void inline_managed_calls(ManagedModule& module,
                 const auto call_id = values[position];
                 const auto& call = caller.values[call_id.value];
                 if (call.kind != ValueKind::Call || !call.callee) {
+                    ++position;
+                    continue;
+                }
+                if (call.must_tail) {
                     ++position;
                     continue;
                 }
@@ -14964,7 +15068,8 @@ bool specialize_surviving_calls(ManagedModule& module,
         for (const auto& block : caller.blocks) {
             for (const auto id : block.values) {
                 const auto& call = caller.values[id.value];
-                if (call.kind != ValueKind::Call || !call.callee ||
+                if (call.kind != ValueKind::Call || call.must_tail ||
+                    !call.callee ||
                     !module.owns(*call.callee)) {
                     continue;
                 }

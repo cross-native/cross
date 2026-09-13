@@ -1571,6 +1571,7 @@ private:
                 *hir::call_signature(hir_, value.callee, value.call_signature);
             instruction.direct_callee = value.callee;
             instruction.call_signature = value.call_signature;
+            instruction.must_tail = value.must_tail;
             if (value.callee) {
                 instruction.operands.push_back(machine::SymbolOperand{
                     hir_.function(*value.callee).link_symbol, 0, true,
@@ -2006,8 +2007,16 @@ private:
                 target.successors.push_back({successor.value});
             }
             for (const auto value : block.values) {
+                const auto& managed_value = source.values[value.value];
+                if (!target.instructions.empty() &&
+                    target.instructions.back().kind ==
+                        machine::InstructionKind::Call &&
+                    target.instructions.back().must_tail &&
+                    managed_value.kind == mir::ValueKind::LifetimeEnd) {
+                    continue;
+                }
                 target.instructions.push_back(
-                    lower_value(source.values[value.value]));
+                    lower_value(managed_value));
             }
             target.instructions.push_back(lower_terminator(block.terminator));
             current_.blocks.push_back(std::move(target));
@@ -20565,26 +20574,36 @@ private:
         restore_hard_registers(function, "$hard.call.");
     }
 
-    bool can_emit_dynamic_tail_call(
+    std::string_view dynamic_tail_call_failure(
         const machine::Function& function,
         const machine::Instruction& call,
         const machine::Instruction& result) const {
-        if (!options_.optimize_sibling_calls ||
-            options_.code_model == CodeModel::Large || dynamic_stack_ ||
-            function.frame.outgoing_argument_size != 0 ||
+        if (!options_.optimize_sibling_calls && !call.must_tail) {
+            return "sibling-call optimization is disabled";
+        }
+        if (options_.code_model == CodeModel::Large) {
+            return "the large code model requires an indirect transfer";
+        }
+        if (dynamic_stack_) {
+            return "the caller has dynamic stack storage";
+        }
+        if (
             call.kind != machine::InstructionKind::Call ||
             result.kind != machine::InstructionKind::Return ||
             !call.direct_callee || call.operands.empty()) {
-            return false;
+            return "the call is indirect or is not immediately returned";
         }
         const auto& caller = hir_.function(function.source);
         const auto& callee = hir_.function(*call.direct_callee);
         const auto* caller_plan = dynamic_plans_.find(caller.id);
         const auto* callee_plan = dynamic_plans_.find(callee.id);
-        if (!caller_plan || !callee_plan || callee.variadic ||
-            manual_plans_.find(caller.id) ||
-            manual_plans_.find(callee.id) ||
-            std::ranges::any_of(
+        if (callee.variadic) {
+            return "the callee is variadic";
+        }
+        if (manual_plans_.find(caller.id) || manual_plans_.find(callee.id)) {
+            return "manual ABI endpoints require a fixed call boundary";
+        }
+        if (std::ranges::any_of(
                 caller.parameters,
                 [](const hir::Parameter& parameter) {
                     return parameter.mode != ParameterMode::In;
@@ -20593,59 +20612,130 @@ private:
                 callee.parameters,
                 [](const hir::Parameter& parameter) {
                     return parameter.mode != ParameterMode::In;
-                }) ||
-            !hard_register_views(function).empty()) {
-            return false;
+                })) {
+            return "output-capable parameters are not forwarded";
+        }
+        if (!hard_register_views(function).empty()) {
+            return "hard-register values require restoration after the call";
+        }
+
+        const auto stable_signature = [&](const hir::Function& entity,
+                                          bool use_actual_types) {
+            AutomaticAbiSignature signature;
+            const auto* abi = abi_model(entity.abi);
+            if (!abi) return signature;
+            std::vector<AutomaticAbiValue> arguments;
+            const auto count = use_actual_types
+                ? call.call_argument_types.size()
+                : entity.parameters.size();
+            arguments.reserve(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                const auto type = use_actual_types
+                    ? call.call_argument_types[index]
+                    : entity.parameters[index].type;
+                const bool by_reference =
+                    index < entity.parameters.size() &&
+                    entity.parameters[index].mode != ParameterMode::In;
+                arguments.push_back(
+                    automatic_value(hir_, type, *abi, by_reference));
+            }
+            std::optional<AutomaticAbiValue> result_value;
+            if (!is_void(hir_, entity.result_type)) {
+                result_value = automatic_value(
+                    hir_, entity.result_type, *abi);
+            }
+            return classify_scalar_signature(
+                arguments, result_value, entity.abi,
+                entity.variadic
+                    ? std::optional<std::size_t>(
+                          entity.parameters.size())
+                    : std::nullopt,
+                subtarget_.enabled_features());
+        };
+        const auto caller_stable = stable_signature(caller, false);
+        const auto callee_stable = stable_signature(callee, true);
+        if ((!caller_plan && !caller_stable.valid) ||
+            (!callee_plan && !callee_stable.valid)) {
+            return "the caller or callee ABI could not be classified";
+        }
+        const auto* caller_abi = abi_model(caller.abi);
+        for (const auto& clobber : call.clobbers) {
+            if (clobber.kind != machine::RegisterKind::Physical) continue;
+            const auto* view = canonical_storage_view({clobber.id});
+            if (!view) continue;
+            const auto names_clobber = [&](const std::vector<std::string>& names) {
+                return std::any_of(
+                    names.begin(), names.end(),
+                    [&](const std::string& name) {
+                        const auto* named = find_register_view(name);
+                        return named && shares_register_storage(*view, *named);
+                    });
+            };
+            const bool caller_allows =
+                (caller_plan
+                     ? names_clobber(caller_plan->clobbers)
+                     : caller_abi && names_clobber(caller_abi->call_clobbers)) ||
+                names_clobber(caller.clobbers);
+            if (!caller_allows) {
+                return "the callee clobber contract exceeds the caller contract";
+            }
         }
 
         const bool caller_void = is_void(hir_, caller.result_type);
         const bool callee_void = is_void(hir_, callee.result_type);
-        if (caller_void != callee_void) return false;
+        if (caller_void != callee_void) return "caller and callee results differ";
         if (caller_void) {
-            if (!call.defs.empty() || !result.uses.empty()) return false;
+            if (!call.defs.empty() || !result.uses.empty()) {
+                return "a void tail transfer carries a result";
+            }
         } else {
             if (caller.result_type != callee.result_type ||
                 call.defs.size() != 1 || result.uses.size() != 1 ||
-                call.defs.front() != result.uses.front() ||
-                !caller_plan->result || !callee_plan->result) {
-                return false;
+                call.defs.front() != result.uses.front()) {
+                return "the result is not forwarded unchanged";
             }
-            const auto& caller_result = *caller_plan->result;
-            const auto& callee_result = *callee_plan->result;
-            if (!caller_result || !callee_result ||
-                caller_result.indirect || callee_result.indirect ||
-                caller_result.stack_size != 0 ||
-                callee_result.stack_size != 0 ||
-                caller_result.pieces.size() != 1 ||
-                callee_result.pieces.size() != 1 ||
-                caller_result.pieces.front().location.kind !=
+            const auto* caller_result = caller_plan && caller_plan->result
+                ? &*caller_plan->result
+                : caller_stable.result ? &*caller_stable.result : nullptr;
+            const auto* callee_result = callee_plan && callee_plan->result
+                ? &*callee_plan->result
+                : callee_stable.result ? &*callee_stable.result : nullptr;
+            if (!caller_result || !callee_result || !*caller_result ||
+                !*callee_result || caller_result->indirect ||
+                callee_result->indirect || caller_result->stack_size != 0 ||
+                callee_result->stack_size != 0 ||
+                caller_result->pieces.size() != 1 ||
+                callee_result->pieces.size() != 1 ||
+                caller_result->pieces.front().location.kind !=
                     LocationKind::Register ||
-                callee_result.pieces.front().location.kind !=
+                callee_result->pieces.front().location.kind !=
                     LocationKind::Register) {
-                return false;
+                return "the result does not use one direct register piece";
             }
             const auto* caller_view = find_register_view(
-                caller_result.pieces.front().location.reg);
+                caller_result->pieces.front().location.reg);
             const auto* callee_view = find_register_view(
-                callee_result.pieces.front().location.reg);
+                callee_result->pieces.front().location.reg);
             if (!caller_view || !callee_view ||
                 caller_view->storage_id != callee_view->storage_id ||
-                caller_result.pieces.front().value_bit_offset !=
-                    callee_result.pieces.front().value_bit_offset ||
-                caller_result.pieces.front().value_bits !=
-                    callee_result.pieces.front().value_bits ||
-                caller_result.pieces.front().carrier_bits !=
-                    callee_result.pieces.front().carrier_bits ||
-                caller_result.pieces.front().extension !=
-                    callee_result.pieces.front().extension) {
-                return false;
+                caller_result->pieces.front().value_bit_offset !=
+                    callee_result->pieces.front().value_bit_offset ||
+                caller_result->pieces.front().value_bits !=
+                    callee_result->pieces.front().value_bits ||
+                caller_result->pieces.front().carrier_bits !=
+                    callee_result->pieces.front().carrier_bits ||
+                caller_result->pieces.front().extension !=
+                    callee_result->pieces.front().extension) {
+                return "caller and callee result registers are incompatible";
             }
         }
 
-        const auto locations = dynamic_argument_locations(*callee_plan);
+        const auto locations = callee_plan
+            ? dynamic_argument_locations(*callee_plan)
+            : callee_stable.arguments;
         if (locations.size() != call.call_argument_types.size() ||
             call.operands.size() != locations.size() + 1U) {
-            return false;
+            return "call operands disagree with the callee ABI layout";
         }
         std::unordered_set<std::uint32_t> restored;
         for (const auto physical : function.callee_saved_registers) {
@@ -20661,17 +20751,24 @@ private:
                 source->value.mode.bits > 64 || location.indirect ||
                 location.pieces.size() != 1 ||
                 !location.pieces.front().in_register) {
-                return false;
+                return "a tail argument is not a direct scalar register value";
             }
             const auto* endpoint = find_register_view(
                 location.pieces.front().reg);
             if (!endpoint ||
                 endpoint->register_class != RegisterClass::integer ||
                 restored.contains(endpoint->storage_id)) {
-                return false;
+                return "a tail argument endpoint conflicts with caller restoration";
             }
         }
-        return true;
+        return {};
+    }
+
+    bool can_emit_dynamic_tail_call(
+        const machine::Function& function,
+        const machine::Instruction& call,
+        const machine::Instruction& result) const {
+        return dynamic_tail_call_failure(function, call, result).empty();
     }
 
     void emit_call(const machine::Function& function,
@@ -22295,6 +22392,17 @@ private:
                     function, instruction_value,
                     value.instructions[index + 1U])) {
                 emit_call_body(function, instruction_value, true);
+                return;
+            }
+            if (instruction_value.kind ==
+                    machine::InstructionKind::Call &&
+                instruction_value.must_tail) {
+                diagnostics_.error(
+                    instruction_value.location,
+                    "x86-64 cannot satisfy musttail: " +
+                        std::string(dynamic_tail_call_failure(
+                            function, instruction_value,
+                            value.instructions[index + 1U])));
                 return;
             }
             switch (instruction_value.kind) {

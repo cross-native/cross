@@ -140,6 +140,9 @@ struct ManagedValue {
     std::optional<hir::ObjectId> patch_sink;
     std::uint32_t patch_id{};
     bool is_volatile_access{};
+    // A source [[musttail]] return owns this call. Optimizers and targets must
+    // preserve the call boundary and either emit a tail transfer or diagnose.
+    bool must_tail{};
     // Proven minimum alignment for pointer-based memory operations. Zero
     // means the pointee type's natural alignment.
     unsigned memory_alignment{};

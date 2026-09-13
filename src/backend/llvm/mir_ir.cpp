@@ -1029,8 +1029,40 @@ private:
         if (value.kind == ValueKind::Call) {
             const auto callee =
                 *hir::call_signature(hir_, value.callee, value.call_signature);
+            bool llvm_musttail = value.must_tail;
+            if (llvm_musttail) {
+                const bool parameters_match =
+                    entity_.parameters.size() == callee.parameters.size() &&
+                    std::equal(
+                        entity_.parameters.begin(), entity_.parameters.end(),
+                        callee.parameters.begin(),
+                        [](const hir::Parameter& caller,
+                           const hir::Parameter& target) {
+                            return caller.type == target.type &&
+                                   caller.mode == ParameterMode::In &&
+                                   target.mode == ParameterMode::In &&
+                                   caller.physical_location ==
+                                       target.physical_location;
+                        });
+                const bool arguments_direct = std::all_of(
+                    value.call_arguments.begin(),
+                    value.call_arguments.end(),
+                    [](const mir::CallArgument& argument) {
+                        return argument.value.has_value();
+                    });
+                if (entity_.abi != callee.abi ||
+                    entity_.result_type != callee.result_type ||
+                    entity_.variadic != callee.variadic ||
+                    !parameters_match || !arguments_direct) {
+                    diagnostics_.error(
+                        value.location,
+                        "LLVM debug serialization cannot represent this Cross musttail ABI boundary");
+                    llvm_musttail = false;
+                }
+            }
             out_ << "  ";
             if (!is_void(hir_, value.type)) out_ << result << " = ";
+            if (llvm_musttail) out_ << "musttail ";
             out_ << "call " << abi_name(callee.abi, value.location)
                  << ir_type(hir_, value.type) << ' '
                  << (value.callee

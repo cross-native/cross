@@ -1238,6 +1238,7 @@ private:
                 *hir::call_signature(hir_, value.callee, value.call_signature);
             result.direct_callee = value.callee;
             result.call_signature = value.call_signature;
+            result.must_tail = value.must_tail;
             if (value.callee) {
                 result.operands.push_back(machine::SymbolOperand{
                     hir_.function(*value.callee).link_symbol, 0, true,
@@ -1565,8 +1566,16 @@ private:
                 target.successors.push_back({successor.value});
             }
             for (const auto value : block.values) {
+                const auto& managed_value = source.values[value.value];
+                if (!target.instructions.empty() &&
+                    target.instructions.back().kind ==
+                        machine::InstructionKind::Call &&
+                    target.instructions.back().must_tail &&
+                    managed_value.kind == mir::ValueKind::LifetimeEnd) {
+                    continue;
+                }
                 target.instructions.push_back(
-                    lower_value(source.values[value.value]));
+                    lower_value(managed_value));
             }
             target.instructions.push_back(lower_terminator(block.terminator));
             current_.blocks.push_back(std::move(target));
@@ -6868,7 +6877,8 @@ private:
                             const machine::Instruction& call,
                             const machine::Instruction& result) {
         if (has_dynamic_stack(function) ||
-            !options_.optimize_sibling_calls || !active_signature_ ||
+            (!options_.optimize_sibling_calls && !call.must_tail) ||
+            !active_signature_ ||
             !call.direct_callee || call.operands.empty() ||
             call.kind != machine::InstructionKind::Call ||
             result.kind != machine::InstructionKind::Return) {
@@ -10600,6 +10610,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                                        found->instructions[index + 1])) {
                     emit_call(function, value, true, cfi);
                     ++index;
+                } else if (value.must_tail) {
+                    diagnostics_.error(
+                        value.location,
+                        "MIPS cannot satisfy musttail for this ABI, argument layout, or frame state");
+                    return;
                 } else {
                     emit_call(function, value);
                 }

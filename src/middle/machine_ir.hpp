@@ -316,6 +316,7 @@ struct Instruction {
     bool may_load{};
     bool may_store{};
     bool has_side_effects{};
+    bool must_tail{};
     std::optional<FrameEffect> frame_effect;
 };
 

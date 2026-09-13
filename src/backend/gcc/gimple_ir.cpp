@@ -1023,6 +1023,11 @@ private:
             return;
         }
         if (value.kind == ValueKind::Call) {
+            if (value.must_tail) {
+                diagnostics_.error(
+                    value.location,
+                    "GCC GIMPLE serialization cannot guarantee a Cross musttail transfer");
+            }
             if (!value.callee) {
                 diagnostics_.error(
                     value.location,

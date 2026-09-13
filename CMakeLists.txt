@@ -1883,6 +1883,25 @@ if(BUILD_TESTING)
                 -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/language/global_label_errors.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/global-labels
                 -P "${CMAKE_SOURCE_DIR}/test/language/global_labels.cmake")
+    add_test(NAME cross_musttail
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail.x
+                -DPARSER_ERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_parser_errors.x
+                -DLOWERING_ERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_lowering_errors.x
+                -DSTACK_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_stack_error.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/musttail
+                -P "${CMAKE_SOURCE_DIR}/test/language/musttail.cmake")
+    add_test(NAME cross_musttail_runtime
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DENTRY=musttail_entry -DEXPECTED=42
+                "-DCC_FLAGS=-O2;-fno-optimize-sibling-calls;-fno-eval-calls"
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/musttail-runtime
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_preprocessor
         COMMAND "${CMAKE_COMMAND}"
                 -DCPP=$<TARGET_FILE:cross_cpp>

@@ -1377,6 +1377,32 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         if (local_declaration_start()) {
             return parse_local_declaration(std::move(attributes));
         }
+        if (current().is("return")) {
+            auto statement = parse_statement();
+            bool musttail_seen = false;
+            for (auto& attribute : attributes) {
+                if (attribute.name != "musttail") {
+                    diagnostics_.error(
+                        attribute.location,
+                        "attribute '" + attribute.name +
+                            "' is not valid on a return statement");
+                    continue;
+                }
+                if (!attribute.arguments.empty()) {
+                    diagnostics_.error(attribute.location,
+                                       "musttail does not take arguments");
+                    continue;
+                }
+                if (musttail_seen) {
+                    diagnostics_.error(attribute.location,
+                                       "a return statement has at most one musttail attribute");
+                    continue;
+                }
+                musttail_seen = true;
+                statement->attributes.push_back(std::move(attribute));
+            }
+            return statement;
+        }
         for (const auto& attribute : attributes) {
             diagnostics_.error(
                 attribute.location,

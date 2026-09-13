@@ -224,6 +224,10 @@ bool verify_instruction(const Instruction& instruction, const Function& function
         ok = fail(diagnostics, instruction.location,
                   "call-live values may appear only on a machine call");
     }
+    if (instruction.kind != InstructionKind::Call && instruction.must_tail) {
+        ok = fail(diagnostics, instruction.location,
+                  "must-tail metadata may appear only on a machine call");
+    }
     if (instruction.kind != InstructionKind::Call &&
         (!instruction.call_argument_types.empty() ||
          instruction.call_signature)) {
