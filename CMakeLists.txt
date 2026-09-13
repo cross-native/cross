@@ -1442,6 +1442,17 @@ if(BUILD_TESTING)
                 -DEXPECTED=1
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_runtime_native_expression_core_O0
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/expression_core.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-expression-core-O0
+                -DENTRY=expression_core_entry
+                -DEXPECTED=1
+                -DCC_FLAGS=-O0
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     foreach(adapter_mode O0 O2)
         add_test(NAME cross_function_pointer_adapter_${adapter_mode}
             COMMAND $<TARGET_FILE:cross_cc> -S -${adapter_mode} -mabi=ms_abi

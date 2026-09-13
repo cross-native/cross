@@ -18,12 +18,14 @@ static u32 ten(in u32 a, in u32 b, in u32 c, in u32 d, in u32 e,
 [[runtime_only, noinline]]
 static u32 nested(in u32 count) {
     u32 values[bound(count)];
+    if (sizeof(values) != (uptr)count * 4uptr) return 0u32;
     values[0] = 7u32;
     values[count-1u32] = 11u32;
     u32 sum = 0u32;
     uptr previous = 0;
     for (u32 i = 0u32; i < 20u32; i += 1u32) {
         u8 temporary[count];
+        if (sizeof(temporary) != (uptr)count) return 0u32;
         uptr address = temporary;
         if (i != 0u32 && address != previous) return 0u32;
         previous = address;
@@ -50,6 +52,13 @@ static u32 aligned_array(in u32 count) {
 
 global u32 vla_entry(in u32 count) {
     bound_calls = 0u32;
+    u8 exact[4] = "abc";
+    const u8 inferred[] = "xy";
+    u8 padded[24] = "z";
     return nested(count) == 366u32 && nested(count+1u32) == 366u32 &&
-           aligned_array(count) == 30u32 && bound_calls == 2u32;
+           aligned_array(count) == 30u32 && bound_calls == 2u32 &&
+           exact[0] == 97u8 && exact[3] == 0u8 &&
+           sizeof(inferred) == 3uptr && inferred[1] == 121u8 &&
+           inferred[2] == 0u8 && padded[0] == 122u8 &&
+           padded[1] == 0u8 && padded[23] == 0u8;
 }

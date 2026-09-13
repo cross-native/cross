@@ -66,5 +66,14 @@ global i32 expression_core_entry() {
     const u8 *literal = "x" "yz";
     if (literal[0] != 120u8 || literal[1] != 121u8 ||
         literal[2] != 122u8 || literal[3] != 0u8) return 21;
+    u8 automatic[4] = "abc";
+    const u8 inferred[] = "q" "r";
+    u8 padded[40] = "z";
+    if (automatic[0] != 97u8 || automatic[1] != 98u8 ||
+        automatic[2] != 99u8 || automatic[3] != 0u8) return 23;
+    if (sizeof(inferred) != 3uptr || inferred[0] != 113u8 ||
+        inferred[1] != 114u8 || inferred[2] != 0u8) return 24;
+    if (padded[0] != 122u8 || padded[1] != 0u8 ||
+        padded[17] != 0u8 || padded[39] != 0u8) return 25;
     return 1;
 }

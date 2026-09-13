@@ -3321,13 +3321,16 @@ public:
     }
 
 private:
+    static bool u8_array_string(const TypePtr& type,
+                                const std::unique_ptr<Expr>& initializer) {
+        return type && type->kind == Type::Kind::Array && type->element &&
+               type->element->kind == Type::Kind::Builtin &&
+               type->element->builtin == BuiltinType::U8 && initializer &&
+               initializer->kind == Expr::Kind::String;
+    }
+
     static bool u8_array_string(const ObjectDecl& object) {
-        return object.type && object.type->kind == Type::Kind::Array &&
-               object.type->element &&
-               object.type->element->kind == Type::Kind::Builtin &&
-               object.type->element->builtin == BuiltinType::U8 &&
-               object.initializer &&
-               object.initializer->kind == Expr::Kind::String;
+        return u8_array_string(object.type, object.initializer);
     }
 
     void rewrite(std::unique_ptr<Expr>& expression) {
@@ -3363,7 +3366,10 @@ private:
     void rewrite(Statement& statement) {
         if (statement.declaration) {
             rewrite(statement.declaration->dynamic_array_bound);
-            rewrite(statement.declaration->initializer);
+            if (!u8_array_string(statement.declaration->type,
+                                 statement.declaration->initializer)) {
+                rewrite(statement.declaration->initializer);
+            }
         }
         rewrite(statement.expression);
         rewrite(statement.condition);

@@ -32,6 +32,8 @@ reject(enum-overflow expression_enum_overflow_error.x
        "implicit enumerator value is not representable")
 reject(string-overflow expression_string_overflow_error.x
        "string initializer does not fit in the u8 array")
+reject(local-string-overflow expression_local_string_overflow_error.x
+       "string initializer does not fit in the u8 array")
 reject(pointer-void-mips expression_pointer_void_error.x
        "pointer arithmetic requires a complete pointed-to object type"
        -mprofile=mips64-n64)

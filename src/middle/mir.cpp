@@ -845,6 +845,7 @@ private:
         SlotId slot;
         hir::TypeId type;
         std::optional<ValueId> dynamic_address;
+        std::optional<ValueId> dynamic_size;
     };
 
     struct Scope {
@@ -937,7 +938,8 @@ private:
                  "$param." + std::to_string(index), std::nullopt, false,
                  address_taken_names_.contains(parameter.name),
                  parameter.mode != ParameterMode::In});
-            const LocalBinding binding{slot, cell_type, std::nullopt};
+            const LocalBinding binding{slot, cell_type, std::nullopt,
+                                       std::nullopt};
             if (!scopes_.back().bindings.emplace(parameter.name, binding).second) {
                 failed_ = true;
             }
@@ -969,7 +971,8 @@ private:
                                   : std::to_string(state.state.value)),
                  std::nullopt, false,
                  address_taken_names_.contains(state.name), false});
-            const LocalBinding binding{slot, state.type, std::nullopt};
+            const LocalBinding binding{slot, state.type, std::nullopt,
+                                       std::nullopt};
             if (!scopes_.back().bindings.emplace(
                     state.name, binding).second) {
                 diagnostics_.error(
@@ -1897,6 +1900,107 @@ private:
         return value;
     }
 
+    bool initialize_string_array(const LocalBinding& binding,
+                                 const Expr& initializer) {
+        const auto& array = hir_.type(binding.type);
+        if (array.kind != hir::Type::Kind::Array || !array.element ||
+            hir_.type(*array.element).kind != hir::Type::Kind::Builtin ||
+            hir_.type(*array.element).builtin != BuiltinType::U8 ||
+            initializer.kind != Expr::Kind::String || array.lanes == 0) {
+            return false;
+        }
+        const auto required = initializer.string_value.size() + 1;
+        if (required > array.lanes) {
+            diagnostics_.error(
+                initializer.location,
+                "string initializer does not fit in the u8 array");
+            failed_ = true;
+            return true;
+        }
+
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const auto source_element = hir_.type(*array.element);
+        const auto initialization_element = hir_.add_qualifiers(
+            hir_.unqualified(*array.element), false,
+            source_element.is_volatile);
+        const auto qualified_base = decay_array_address(
+            slot_address(binding, initializer.location), binding.type,
+            initializer.location);
+        const auto base = cast(
+            qualified_base, hir_.pointer_to(initialization_element),
+            initializer.location);
+        const auto store_byte = [&](std::uint64_t index,
+                                    std::uint8_t byte) {
+            const auto offset = constant(index, uptr, initializer.location);
+            const auto address = indexed_address(
+                base, offset, initialization_element,
+                initializer.location);
+            const auto value = constant(byte, initialization_element,
+                                        initializer.location);
+            if (!store_pointer(address, value, initializer.location, 1)) {
+                failed_ = true;
+            }
+        };
+        for (std::size_t index = 0;
+             index < initializer.string_value.size(); ++index) {
+            store_byte(index, static_cast<std::uint8_t>(
+                                  initializer.string_value[index]));
+        }
+        store_byte(initializer.string_value.size(), 0);
+
+        if (required == array.lanes) return true;
+        if (array.lanes - required <= 16) {
+            for (std::uint64_t index = required; index < array.lanes;
+                 ++index) {
+                store_byte(index, 0);
+            }
+            return true;
+        }
+
+        const auto initial = constant(required, uptr, initializer.location);
+        const auto preheader = *current_block_;
+        const auto test = new_block(initializer.location);
+        const auto body = new_block(initializer.location);
+        const auto end = new_block(initializer.location);
+        terminate(TerminatorKind::Branch, initializer.location,
+                  std::nullopt, {test});
+
+        enter(test);
+        const auto index = add_value(ValueKind::Phi, uptr,
+                                     initializer.location);
+        const auto limit = constant(array.lanes, uptr,
+                                    initializer.location);
+        const auto condition = add_value(ValueKind::Binary,
+                                         *hir_.builtin(BuiltinType::Bool),
+                                         initializer.location);
+        current_.values[condition.value].binary =
+            BinaryOperation::UnsignedLess;
+        current_.values[condition.value].operands = {index, limit};
+        terminate(TerminatorKind::ConditionalBranch,
+                  initializer.location, condition, {body, end});
+
+        enter(body);
+        const auto address = indexed_address(
+            base, index, initialization_element, initializer.location);
+        const auto zero = constant(0, initialization_element,
+                                   initializer.location);
+        if (!store_pointer(address, zero, initializer.location, 1)) {
+            failed_ = true;
+        }
+        const auto one = constant(1, uptr, initializer.location);
+        const auto next = add_value(ValueKind::Binary, uptr,
+                                    initializer.location);
+        current_.values[next.value].binary = BinaryOperation::Add;
+        current_.values[next.value].operands = {index, one};
+        const auto backedge = *current_block_;
+        terminate(TerminatorKind::Branch, initializer.location,
+                  std::nullopt, {test});
+        current_.values[index.value].incoming = {
+            {preheader, initial}, {backedge, next}};
+        enter(end);
+        return true;
+    }
+
     void end_lifetimes_from(std::size_t retained_scopes,
                             SourceLocation location) {
         if (!current_block_) return;
@@ -2652,6 +2756,14 @@ private:
             break;
         }
         case Expr::Kind::Sizeof: {
+            if (!expression.type && expression.left) {
+                const auto name = local_name(*expression.left);
+                const auto* local = name ? find_local(*name) : nullptr;
+                if (local && local->dynamic_size) {
+                    result = *local->dynamic_size;
+                    break;
+                }
+            }
             std::optional<hir::TypeId> queried;
             if (expression.type) {
                 queried = hir_.intern_type(expression.type);
@@ -4309,7 +4421,8 @@ private:
                      std::to_string(index),
                  std::nullopt, false});
             (void)lifetime(ValueKind::LifetimeStart, cell, actual.location);
-            const LocalBinding temporary{cell, parameter.type, std::nullopt};
+            const LocalBinding temporary{cell, parameter.type, std::nullopt,
+                                         std::nullopt};
             if (parameter.mode == ParameterMode::InOut || manual_cell) {
                 std::optional<ValueId> initial;
                 if (manual_cell) {
@@ -4405,7 +4518,7 @@ private:
         for (const auto& copyout : copyouts) {
             const LocalBinding temporary{
                 copyout.cell, current_.slots[copyout.cell.value].type,
-                std::nullopt};
+                std::nullopt, std::nullopt};
             if (copyout.copy_out) {
                 const auto value = load_slot(temporary, copyout.location);
                 if (copyout.local) {
@@ -4669,7 +4782,17 @@ private:
                 failed_ = true;
                 return;
             }
-            if (array && declaration.initializer) {
+            const bool string_array_initializer =
+                array && declaration.initializer &&
+                declaration.initializer->kind == Expr::Kind::String &&
+                hir_.type(type).lanes != 0 &&
+                hir_.type(type).element &&
+                hir_.type(*hir_.type(type).element).kind ==
+                    hir::Type::Kind::Builtin &&
+                hir_.type(*hir_.type(type).element).builtin ==
+                    BuiltinType::U8;
+            if (array && declaration.initializer &&
+                !string_array_initializer) {
                 diagnostics_.error(
                     declaration.initializer->location,
                     "aggregate array initializers are not implemented yet");
@@ -4743,7 +4866,24 @@ private:
                 const auto address = dynamic_alloca(
                     *bound, element, element_size, alignment,
                     declaration.location);
-                const LocalBinding binding{{}, type, address};
+                auto dynamic_size = cast(
+                    *bound, *hir_.builtin(BuiltinType::Uptr),
+                    declaration.location);
+                if (element_size != 1) {
+                    const auto scale = constant(
+                        element_size, *hir_.builtin(BuiltinType::Uptr),
+                        declaration.location);
+                    const auto bytes = add_value(
+                        ValueKind::Binary,
+                        *hir_.builtin(BuiltinType::Uptr),
+                        declaration.location);
+                    current_.values[bytes.value].binary =
+                        BinaryOperation::Multiply;
+                    current_.values[bytes.value].operands = {
+                        dynamic_size, scale};
+                    dynamic_size = bytes;
+                }
+                const LocalBinding binding{{}, type, address, dynamic_size};
                 scopes_.back().bindings.emplace(declaration.name, binding);
                 return;
             }
@@ -4754,11 +4894,22 @@ private:
                                       declaration.type->is_volatile,
                                       address_taken_names_.contains(
                                           declaration.name)});
-            const LocalBinding binding{slot, type, std::nullopt};
+            const LocalBinding binding{slot, type, std::nullopt,
+                                       std::nullopt};
             scopes_.back().bindings.emplace(declaration.name, binding);
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot, declaration.location);
             if (declaration.initializer) {
+                if (string_array_initializer) {
+                    if (!initialize_string_array(
+                            binding, *declaration.initializer)) {
+                        diagnostics_.error(
+                            declaration.initializer->location,
+                            "aggregate array initializers are not implemented yet");
+                        failed_ = true;
+                    }
+                    return;
+                }
                 auto initializer = lower_expression(*declaration.initializer, type);
                 if (!initializer) { failed_ = true; return; }
                 (void)store_slot(binding, *initializer, declaration.location);

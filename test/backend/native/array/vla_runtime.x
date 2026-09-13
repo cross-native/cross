@@ -20,6 +20,9 @@ global i32 vla_entry() {
     u32 matrix[count][3];
     u32 sum = 0u32;
 
+    if (sizeof(values) != (uptr)count * 4uptr) return -1;
+    if (sizeof(matrix) != (uptr)count * 12uptr) return -2;
+
     for (u32 index = 0u32; index < count; index += 1u32) {
         values[index] = index + 1u32;
         sum += values[index];
@@ -30,6 +33,7 @@ global i32 vla_entry() {
 
     {
         u8 temporary[count];
+        if (sizeof(temporary) != (uptr)count) return -3;
         temporary[4] = 2u8;
         sum += temporary[4];
     }
