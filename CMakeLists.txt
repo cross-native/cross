@@ -1271,7 +1271,7 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/array/vla_runtime.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vla.ll
                 -DENTRY=vla_entry
-                -DEXPECTED=80
+                -DEXPECTED=81
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     add_test(NAME cross_runtime_native_vla
@@ -1282,7 +1282,7 @@ if(BUILD_TESTING)
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vla
                 -DENTRY=vla_entry
-                -DEXPECTED=80
+                -DEXPECTED=81
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_array_diagnostics

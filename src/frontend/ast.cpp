@@ -97,6 +97,7 @@ std::string type_name(const TypePtr& type) {
     std::string prefix;
     if (type->is_const) prefix += "const ";
     if (type->is_volatile) prefix += "volatile ";
+    if (type->is_restrict) prefix += "restrict ";
     if (type->is_atomic) prefix += "[[atomic]] ";
     if (type->kind == Type::Kind::Pointer) return prefix + type_name(type->pointee) + " *";
     if (type->kind == Type::Kind::Function && type->function) {
@@ -149,6 +150,7 @@ std::string canonical_type_name(const TypePtr& type) {
     std::string result;
     if (type->is_const) result += 'K';
     if (type->is_volatile) result += 'V';
+    if (type->is_restrict) result += 'R';
     if (type->is_atomic) result += 'A';
     if (type->kind == Type::Kind::Pointer) {
         result += 'P';
@@ -214,6 +216,7 @@ std::string canonical_type_name(const TypePtr& type) {
 bool same_type(const TypePtr& left, const TypePtr& right) {
     if (!left || !right || left->kind != right->kind || left->is_const != right->is_const ||
         left->is_volatile != right->is_volatile ||
+        left->is_restrict != right->is_restrict ||
         left->is_atomic != right->is_atomic) return false;
     if (left->kind == Type::Kind::Pointer) return same_type(left->pointee, right->pointee);
     if (left->kind == Type::Kind::Function) {

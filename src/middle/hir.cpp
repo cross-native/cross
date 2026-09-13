@@ -1091,7 +1091,9 @@ std::optional<TypeId> Module::builtin(BuiltinType kind) const {
         const auto& candidate = types[index];
         if (candidate.kind == Type::Kind::Builtin && candidate.builtin == kind &&
             !candidate.is_const && !candidate.is_volatile &&
-            !candidate.is_atomic) return TypeId{index};
+            !candidate.is_atomic && !candidate.is_restrict) {
+            return TypeId{index};
+        }
     }
     return std::nullopt;
 }
@@ -1111,6 +1113,7 @@ TypeId Module::intern_type(const TypePtr& source) {
         candidate.is_const = source->is_const;
         candidate.is_volatile = source->is_volatile;
         candidate.is_atomic = source->is_atomic;
+        candidate.is_restrict = source->is_restrict;
         if (source->kind == cross::Type::Kind::Pointer) {
             candidate.pointee = intern_type(source->pointee);
         } else if (source->kind == cross::Type::Kind::Function &&
@@ -1162,6 +1165,7 @@ TypeId Module::intern_type(const TypePtr& source) {
             type.nominal_name == candidate.nominal_name &&
             type.is_const == candidate.is_const &&
             type.is_volatile == candidate.is_volatile &&
+            type.is_restrict == candidate.is_restrict &&
             type.is_atomic == candidate.is_atomic) {
             return {index};
         }
@@ -1191,6 +1195,7 @@ TypeId Module::pointer_to(TypeId pointee) {
         if (candidate.kind == Type::Kind::Pointer &&
             candidate.pointee == pointee && !candidate.is_const &&
             !candidate.is_volatile && !candidate.is_atomic &&
+            !candidate.is_restrict &&
             candidate.nominal_name.empty()) {
             return {index};
         }
@@ -1205,13 +1210,15 @@ TypeId Module::pointer_to(TypeId pointee) {
 
 TypeId Module::unqualified(TypeId id) {
     const auto& source = type(id);
-    if (!source.is_const && !source.is_volatile && !source.is_atomic) {
+    if (!source.is_const && !source.is_volatile && !source.is_atomic &&
+        !source.is_restrict) {
         return id;
     }
     Type candidate = source;
     candidate.is_const = false;
     candidate.is_volatile = false;
     candidate.is_atomic = false;
+    candidate.is_restrict = false;
     for (std::uint32_t index = 0; index < types.size(); ++index) {
         const auto& existing = types[index];
         if (existing.kind == candidate.kind &&
@@ -1223,7 +1230,7 @@ TypeId Module::unqualified(TypeId id) {
             existing.scalable == candidate.scalable &&
             existing.nominal_name == candidate.nominal_name &&
             !existing.is_const && !existing.is_volatile &&
-            !existing.is_atomic) {
+            !existing.is_atomic && !existing.is_restrict) {
             return {index};
         }
     }
@@ -1254,6 +1261,7 @@ TypeId Module::add_qualifiers(TypeId id, bool is_const,
             existing.nominal_name == candidate.nominal_name &&
             existing.is_const == candidate.is_const &&
             existing.is_volatile == candidate.is_volatile &&
+            existing.is_restrict == candidate.is_restrict &&
             existing.is_atomic == candidate.is_atomic) {
             return {index};
         }
@@ -1270,7 +1278,8 @@ TypeId Module::vector_of(TypeId element, std::uint32_t lanes,
         if (candidate.kind == Type::Kind::Vector &&
             candidate.element == element && candidate.lanes == lanes &&
             candidate.scalable == scalable && !candidate.is_const &&
-            !candidate.is_volatile && !candidate.is_atomic) {
+            !candidate.is_volatile && !candidate.is_atomic &&
+            !candidate.is_restrict) {
             return {index};
         }
     }
@@ -1290,7 +1299,7 @@ TypeId Module::array_of(TypeId element, std::uint32_t elements) {
         if (candidate.kind == Type::Kind::Array &&
             candidate.element == element && candidate.lanes == elements &&
             !candidate.is_const && !candidate.is_volatile &&
-            !candidate.is_atomic) {
+            !candidate.is_atomic && !candidate.is_restrict) {
             return {index};
         }
     }
@@ -1384,6 +1393,7 @@ std::string type_name(const Module& module, TypeId id) {
     std::string prefix;
     if (type.is_const) prefix += "const ";
     if (type.is_volatile) prefix += "volatile ";
+    if (type.is_restrict) prefix += "restrict ";
     if (type.is_atomic) prefix += "[[atomic]] ";
     if (type.kind == Type::Kind::Pointer) {
         return prefix + type_name(module, *type.pointee) + " *";

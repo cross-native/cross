@@ -4850,8 +4850,9 @@ private:
                 const auto element = *hir_.type(type).element;
                 const auto element_size =
                     storage_size(hir_, element, target_);
-                const auto alignment =
-                    std::max(16U, storage_alignment(hir_, element, target_));
+                const auto alignment = std::max(
+                    {16U, storage_alignment(hir_, element, target_),
+                     declaration.explicit_alignment});
                 if (element_size == 0) {
                     diagnostics_.error(
                         declaration.location,
@@ -4894,6 +4895,8 @@ private:
                                       declaration.type->is_volatile,
                                       address_taken_names_.contains(
                                           declaration.name)});
+            current_.slots.back().minimum_alignment =
+                declaration.explicit_alignment;
             const LocalBinding binding{slot, type, std::nullopt,
                                        std::nullopt};
             scopes_.back().bindings.emplace(declaration.name, binding);
@@ -5313,6 +5316,10 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
         if (slot.type.value >= hir_module.types.size() ||
             !managed_object_type(hir_module, slot.type)) {
             fail(slot.location, "invalid stack slot type");
+        }
+        if (slot.minimum_alignment == 0 ||
+            (slot.minimum_alignment & (slot.minimum_alignment - 1)) != 0) {
+            fail(slot.location, "stack slot alignment is not a power of two");
         }
     }
     std::unordered_set<std::uint32_t> label_ids;

@@ -37,3 +37,7 @@ expect_array_error(vla_wide_bound
     "variable-length array bound cannot exceed pointer width")
 expect_array_error(vla_goto
     "goto in a function with variable-length array storage is not implemented yet")
+expect_array_error(restrict_nonpointer
+    "restrict qualifier requires a pointer type")
+expect_array_error(aligned_local_invalid
+    "aligned argument must be a positive power-of-two integer constant")

@@ -652,6 +652,10 @@ private:
             out_ << "  ";
             if (slot.is_volatile) out_ << "volatile ";
             out_ << types_.name(slot.type) << ' ' << slot_name(slot.id)
+                 << (slot.minimum_alignment > 1
+                         ? " __attribute__((aligned(" +
+                               std::to_string(slot.minimum_alignment) + ")))"
+                         : "")
                  << ";\n";
         }
         for (const auto& value : function_.values) {

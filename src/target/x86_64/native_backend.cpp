@@ -901,7 +901,8 @@ private:
             target.id = {static_cast<std::uint32_t>(current_.stack_slots.size())};
             target.kind = machine::StackSlotKind::Local;
             target.size = storage_size(hir_, slot.type);
-            target.alignment = storage_alignment(hir_, slot.type);
+            target.alignment = std::max(storage_alignment(hir_, slot.type),
+                                        slot.minimum_alignment);
             if (target.size == 0) {
                 diagnostics_.error(slot.location,
                                    "managed stack object has no fixed x86-64 storage size");

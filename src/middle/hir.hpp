@@ -90,6 +90,7 @@ struct Type {
     bool is_atomic{};
     std::optional<RecordId> record;
     std::optional<FunctionSignature> function{};
+    bool is_restrict{};
 };
 
 struct RecordMember {

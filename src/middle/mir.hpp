@@ -161,6 +161,7 @@ struct ManagedSlot {
     // `out`/`inout` parameter cells are consumed by ABI copy-out after the
     // source-level body. Optimizers must model that implicit return-edge read.
     bool live_on_return{};
+    unsigned minimum_alignment{1};
 };
 
 enum class EffectKind { Entry, Phi, Operation };

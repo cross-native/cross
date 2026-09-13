@@ -45,6 +45,7 @@ struct Type {
     bool is_const{};
     bool is_volatile{};
     bool is_atomic{};
+    bool is_restrict{};
 };
 
 TypePtr builtin_type(BuiltinType kind, bool is_const = false,
@@ -124,6 +125,8 @@ struct VariableDecl {
     bool storage_register{};
     bool storage_stack{};
     bool storage_static{};
+    std::vector<Attribute> attributes;
+    unsigned explicit_alignment{1};
     std::optional<std::string> location_name;
 };
 

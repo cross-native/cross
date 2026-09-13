@@ -289,7 +289,8 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
 
 bool Parser::type_start() const {
     const auto& token = current();
-    return token.is("const") || token.is("volatile") || token.is("enum") ||
+    return token.is("const") || token.is("volatile") ||
+           token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
            builtin_kind(token.text).has_value() ||
            std::find(active_generic_types_.begin(), active_generic_types_.end(),
@@ -300,9 +301,17 @@ bool Parser::type_start() const {
 TypePtr Parser::parse_type() {
     bool is_const = false;
     bool is_volatile = false;
-    while (current().is("const") || current().is("volatile")) {
+    bool is_restrict = false;
+    std::optional<SourceLocation> restrict_location;
+    while (current().is("const") || current().is("volatile") ||
+           current().is("restrict")) {
         if (consume("const")) is_const = true;
-        else { consume("volatile"); is_volatile = true; }
+        else if (consume("volatile")) is_volatile = true;
+        else {
+            restrict_location = current().location;
+            consume("restrict");
+            is_restrict = true;
+        }
     }
     TypePtr type;
     if (current().is("struct") || current().is("union")) {
@@ -410,6 +419,12 @@ TypePtr Parser::parse_type() {
                         : generic_type(spelling, is_const, is_volatile);
         }
     }
+    type->is_restrict = type->is_restrict || is_restrict;
+    if (type->is_restrict && type->kind != Type::Kind::Pointer) {
+        diagnostics_.error(
+            restrict_location.value_or(current().location),
+            "restrict qualifier requires a pointer type");
+    }
     const auto apply_type_attributes = [&](TypePtr& target) {
         if (!current().is("[[")) return;
         for (const auto& attribute : parse_attributes()) {
@@ -437,11 +452,18 @@ TypePtr Parser::parse_type() {
     while (consume("*")) {
         bool pointer_const = false;
         bool pointer_volatile = false;
-        while (current().is("const") || current().is("volatile")) {
+        bool pointer_restrict = false;
+        while (current().is("const") || current().is("volatile") ||
+               current().is("restrict")) {
             if (consume("const")) pointer_const = true;
-            else { consume("volatile"); pointer_volatile = true; }
+            else if (consume("volatile")) pointer_volatile = true;
+            else {
+                consume("restrict");
+                pointer_restrict = true;
+            }
         }
         type = pointer_type(type, pointer_const, pointer_volatile);
+        type->is_restrict = pointer_restrict;
         apply_type_attributes(type);
     }
     return type;
@@ -453,15 +475,20 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     while (consume("*")) {
         bool is_const = false;
         bool is_volatile = false;
-        while (current().is("const") || current().is("volatile")) {
+        bool is_restrict = false;
+        while (current().is("const") || current().is("volatile") ||
+               current().is("restrict")) {
             if (consume("const"))
                 is_const = true;
-            else {
-                consume("volatile");
+            else if (consume("volatile")) {
                 is_volatile = true;
+            } else {
+                consume("restrict");
+                is_restrict = true;
             }
         }
         base = pointer_type(std::move(base), is_const, is_volatile);
+        base->is_restrict = is_restrict;
     }
     TypePtr nested;
     TypePtr hole;
@@ -1216,7 +1243,8 @@ bool Parser::local_declaration_start() const {
            current().is("static") || type_start();
 }
 
-std::unique_ptr<Statement> Parser::parse_local_declaration() {
+std::unique_ptr<Statement>
+Parser::parse_local_declaration(std::vector<Attribute> attributes) {
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Declaration;
     statement->location = current().location;
@@ -1233,6 +1261,40 @@ std::unique_ptr<Statement> Parser::parse_local_declaration() {
                          &declaration.dynamic_array_bound);
     if (!name) error_here("expected local variable name");
     else declaration.name = *name;
+    auto trailing = parse_attributes();
+    attributes.insert(attributes.end(),
+                      std::make_move_iterator(trailing.begin()),
+                      std::make_move_iterator(trailing.end()));
+    declaration.attributes = std::move(attributes);
+    for (const auto& attribute : declaration.attributes) {
+        if (attribute.name != "aligned") {
+            diagnostics_.error(
+                attribute.location,
+                "attribute '" + attribute.name +
+                    "' is not valid on a local object");
+            continue;
+        }
+        if (attribute.arguments.size() != 1) {
+            diagnostics_.error(
+                attribute.location,
+                "aligned on a local object requires one integer argument");
+            continue;
+        }
+        unsigned value{};
+        const auto& text = attribute.arguments.front();
+        const auto conversion =
+            std::from_chars(text.data(), text.data() + text.size(), value);
+        if (conversion.ec != std::errc{} ||
+            conversion.ptr != text.data() + text.size() || value == 0 ||
+            (value & (value - 1)) != 0) {
+            diagnostics_.error(
+                attribute.location,
+                "aligned argument must be a positive power-of-two integer constant");
+            continue;
+        }
+        declaration.explicit_alignment =
+            std::max(declaration.explicit_alignment, value);
+    }
     if (const auto* location = consume_kind(TokenKind::String)) {
         declaration.location_name = decode_string_literal(location->text);
     }
@@ -1269,6 +1331,19 @@ std::unique_ptr<Statement> Parser::parse_compound() {
 
 std::unique_ptr<Statement> Parser::parse_statement() {
     if (current().is("{")) return parse_compound();
+    if (current().is("[[")) {
+        auto attributes = parse_attributes();
+        if (local_declaration_start()) {
+            return parse_local_declaration(std::move(attributes));
+        }
+        for (const auto& attribute : attributes) {
+            diagnostics_.error(
+                attribute.location,
+                "attribute '" + attribute.name +
+                    "' is not valid on this statement");
+        }
+        return parse_statement();
+    }
     if (current().is("$::static_assert")) {
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Empty;
@@ -1344,6 +1419,24 @@ std::unique_ptr<Statement> Parser::parse_statement() {
             statement->first->location = location;
         } else if (local_declaration_start()) {
             statement->first = parse_local_declaration();
+        } else if (current().is("[[")) {
+            auto attributes = parse_attributes();
+            if (local_declaration_start()) {
+                statement->first =
+                    parse_local_declaration(std::move(attributes));
+            } else {
+                for (const auto& attribute : attributes) {
+                    diagnostics_.error(
+                        attribute.location,
+                        "attribute '" + attribute.name +
+                            "' is not valid on a for initializer");
+                }
+                statement->first = std::make_unique<Statement>();
+                statement->first->kind = Statement::Kind::Expression;
+                statement->first->location = current().location;
+                statement->first->expression = parse_expression();
+                expect(";");
+            }
         } else {
             statement->first = std::make_unique<Statement>();
             statement->first->kind = Statement::Kind::Expression;

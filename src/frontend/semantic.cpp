@@ -107,6 +107,7 @@ TypePtr clone_type(const TypePtr& source,
     result->is_const = source->is_const;
     result->is_volatile = source->is_volatile;
     result->is_atomic = source->is_atomic;
+    result->is_restrict = source->is_restrict;
     return result;
 }
 
@@ -160,6 +161,8 @@ std::unique_ptr<VariableDecl> clone_variable(
     result->storage_register = source.storage_register;
     result->storage_stack = source.storage_stack;
     result->storage_static = source.storage_static;
+    result->attributes = source.attributes;
+    result->explicit_alignment = source.explicit_alignment;
     result->location_name = source.location_name;
     return result;
 }
@@ -592,6 +595,7 @@ private:
                 object->type = std::move(declaration.type);
                 object->initializer = std::move(declaration.initializer);
                 object->linkage = Linkage::Static;
+                object->attributes = std::move(declaration.attributes);
                 program_.objects.push_back(std::move(object));
                 statement.declaration.reset();
                 statement.kind = Statement::Kind::Empty;
@@ -1836,6 +1840,7 @@ private:
                     auto destination = clone_type(to->pointee);
                     source->is_const = destination->is_const = false;
                     source->is_volatile = destination->is_volatile = false;
+                    source->is_restrict = destination->is_restrict = false;
                     const auto void_type = [](const TypePtr& type) {
                         return type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
                     };

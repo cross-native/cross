@@ -43,10 +43,13 @@ struct aligned_cell [[aligned(64)]] { u32 value; };
 [[runtime_only, noinline]]
 static u32 aligned_array(in u32 count) {
     struct aligned_cell cells[count];
+    [[aligned(64)]] stack u8 bytes[count];
     uptr address = cells;
+    uptr byte_address = bytes;
     cells[0].value = 12u32;
     cells[count-1u32].value = 18u32;
     if ((address & 63) != 0) return 0u32;
+    if ((byte_address & 63) != 0) return 0u32;
     return cells[0].value + cells[count-1u32].value;
 }
 

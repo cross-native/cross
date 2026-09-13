@@ -13,15 +13,25 @@ static u32 add_eight(in u32 a, in u32 b, in u32 c, in u32 d,
     return a + b + c + d + e + f + g + h;
 }
 
+[[runtime_only, noinline]]
+static void restrict_copy(in u32 * restrict source,
+                          in u32 * restrict destination) {
+    *destination = *source;
+}
+
 global i32 vla_entry() {
     u32 count = 5u32;
     stack u32 values[count];
+    [[aligned(64)]] stack u8 aligned_values[count];
+    [[aligned(64)]] stack u8 fixed_values[3];
     f80 extended[count];
     u32 matrix[count][3];
     u32 sum = 0u32;
 
     if (sizeof(values) != (uptr)count * 4uptr) return -1;
     if (sizeof(matrix) != (uptr)count * 12uptr) return -2;
+    if (((uptr)aligned_values & 63uptr) != 0uptr) return -4;
+    if (((uptr)fixed_values & 63uptr) != 0uptr) return -5;
 
     for (u32 index = 0u32; index < count; index += 1u32) {
         values[index] = index + 1u32;
@@ -39,7 +49,9 @@ global i32 vla_entry() {
     }
 
     u32 tail = 4u32;
+    u32 copied = 0u32;
+    restrict_copy(values, &copied);
     sum += add_eight(1u32, 2u32, 3u32, 4u32,
                      5u32, 6u32, 7u32, 8u32);
-    return sum + (extended[4] == 3.5f80) + matrix[3][2] + tail;
+    return sum + (extended[4] == 3.5f80) + matrix[3][2] + tail + copied;
 }

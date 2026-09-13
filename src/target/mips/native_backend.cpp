@@ -715,7 +715,9 @@ private:
                 static_cast<std::uint32_t>(current_.stack_slots.size())};
             target.kind = machine::StackSlotKind::Local;
             target.size = storage_size(hir_, slot.type, layout);
-            target.alignment = storage_alignment(hir_, slot.type, layout);
+            target.alignment =
+                std::max(storage_alignment(hir_, slot.type, layout),
+                         slot.minimum_alignment);
             target.location = slot.location;
             target.name = slot.name;
             if (target.size == 0) {

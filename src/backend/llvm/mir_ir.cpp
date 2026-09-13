@@ -1360,7 +1360,9 @@ private:
             for (const auto& slot : function_.slots) {
                 out_ << "  %mir.slot" << slot.id.value << " = alloca "
                      << ir_type(hir_, slot.type) << ", align "
-                     << ir_alignment(hir_, slot.type) << '\n';
+                     << std::max(ir_alignment(hir_, slot.type),
+                                 slot.minimum_alignment)
+                     << '\n';
             }
         }
         for (const auto id : block.values) emit_value(function_.values[id.value]);

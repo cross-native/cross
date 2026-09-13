@@ -62,7 +62,8 @@ private:
 
     std::unique_ptr<Statement> parse_statement();
     std::unique_ptr<Statement> parse_compound();
-    std::unique_ptr<Statement> parse_local_declaration();
+    std::unique_ptr<Statement>
+    parse_local_declaration(std::vector<Attribute> attributes = {});
     bool local_declaration_start() const;
 
     std::unique_ptr<Expr> parse_expression();
