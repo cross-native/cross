@@ -4520,6 +4520,26 @@ private:
                       expression.location, std::nullopt, {});
             return result;
         }
+        if (expression.left->text == "$::_nop") {
+            if (!expression.arguments.empty()) {
+                diagnostics_.error(expression.location,
+                                   "$::_nop takes no arguments");
+                return std::nullopt;
+            }
+            if (!target_has_instruction(target_, expression.left->text)) {
+                diagnostics_.error(
+                    expression.location,
+                    "target instruction '$::_nop' is not available for '" +
+                        std::string(target_.architecture) + "'");
+                return std::nullopt;
+            }
+            const auto result = add_effectful(
+                ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void),
+                expression.location);
+            current_.values[result.value].intrinsic =
+                IntrinsicOperation::MachineNop;
+            return result;
+        }
         if (expression.left->text == "$::_movabs" ||
             expression.left->text == "$::_add" ||
             expression.left->text == "$::_cmp") {
@@ -6140,6 +6160,8 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
             if (value.kind == ValueKind::Intrinsic) {
                 const bool expect =
                     value.intrinsic == IntrinsicOperation::Expect;
+                const bool machine_nop =
+                    value.intrinsic == IntrinsicOperation::MachineNop;
                 const bool range = value.intrinsic == IntrinsicOperation::Assume &&
                     value.operands.size() == 1 && value.binary == BinaryOperation::UnsignedLess &&
                     value.operands.front().value < function.values.size() &&
@@ -6154,7 +6176,13 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                          {value.integer, value.integer_high},
                          type_bits(hir_module, value.type)))) {
                     fail(value.location, "invalid $::expect MIR operation");
-                } else if (!expect &&
+                } else if (machine_nop &&
+                           (!value.operands.empty() ||
+                            !void_type(hir_module, value.type) ||
+                            value.integer != 0 || value.integer_high != 0)) {
+                    fail(value.location,
+                         "invalid managed machine-nop MIR operation");
+                } else if (!expect && !machine_nop &&
                            ((!value.operands.empty() && !range) ||
                             !void_type(hir_module, value.type))) {
                     fail(value.location,

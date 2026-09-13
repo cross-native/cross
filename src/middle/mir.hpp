@@ -71,7 +71,13 @@ enum class ValueKind {
     PatchValue,
     Intrinsic,
 };
-enum class IntrinsicOperation { Expect, Assume, Unreachable, Trap };
+enum class IntrinsicOperation {
+    Expect,
+    Assume,
+    Unreachable,
+    Trap,
+    MachineNop,
+};
 enum class AtomicOperation {
     Load, Store, Exchange, CompareExchange,
     FetchAdd, FetchSub, FetchAnd, FetchXor, FetchOr,

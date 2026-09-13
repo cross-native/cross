@@ -1,11 +1,41 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE ERROR_SOURCE OUTPUT)
+foreach(required CC SOURCE ERROR_SOURCE NOP_SOURCE OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a value")
     endif()
 endforeach()
+
+execute_process(
+    COMMAND "${CC}" -S -O0 -target x86_64-unknown-linux-gnu
+            "${NOP_SOURCE}" -o "${OUTPUT}-nop.s"
+    RESULT_VARIABLE nop_status
+    OUTPUT_VARIABLE nop_stdout
+    ERROR_VARIABLE nop_stderr
+)
+if(NOT nop_status EQUAL 0)
+    message(FATAL_ERROR
+        "global-label managed-nop probe failed\n${nop_stdout}\n${nop_stderr}")
+endif()
+file(READ "${OUTPUT}-nop.s" nop_assembly)
+if(NOT nop_assembly MATCHES "global_label_nop_owner::resume" OR
+   NOT nop_assembly MATCHES "[\t ]nop([\t\r\n ]|$)")
+    message(FATAL_ERROR
+        "global-label managed-nop output is incomplete\n${nop_assembly}")
+endif()
+execute_process(
+    COMMAND "${CC}" -c -O0 -target x86_64-unknown-linux-gnu
+            "${NOP_SOURCE}" -o "${OUTPUT}-nop.o"
+    RESULT_VARIABLE nop_object_status
+    OUTPUT_VARIABLE nop_object_stdout
+    ERROR_VARIABLE nop_object_stderr
+)
+if(NOT nop_object_status EQUAL 0)
+    message(FATAL_ERROR
+        "global-label managed-nop object assembly failed\n"
+        "${nop_object_stdout}\n${nop_object_stderr}")
+endif()
 
 function(compile output target)
     execute_process(

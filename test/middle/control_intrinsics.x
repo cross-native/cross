@@ -14,6 +14,10 @@ global void control_trap() {
     $::trap();
 }
 
+global void control_machine_nop() {
+    $::_nop();
+}
+
 global i32 control_intrinsics_entry() {
     return control_expect(7);
 }

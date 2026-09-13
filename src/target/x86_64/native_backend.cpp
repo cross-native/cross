@@ -1638,6 +1638,8 @@ private:
             auto instruction = target_instruction(
                 value.intrinsic == mir::IntrinsicOperation::Expect
                     ? Opcode::Expect
+                : value.intrinsic == mir::IntrinsicOperation::MachineNop
+                    ? Opcode::Nop
                     : Opcode::IntrinsicNoop,
                 value.location);
             if (value.intrinsic == mir::IntrinsicOperation::Expect) {
@@ -22220,6 +22222,8 @@ private:
             }
             load(function, value.uses.front(), "rax");
             store(function, value.defs.front(), "rax");
+        } else if (value.opcode == Opcode::Nop) {
+            instruction("nop");
         } else if (value.opcode == Opcode::IntrinsicNoop) {
             return;
         } else if (value.opcode == Opcode::Vselect ||

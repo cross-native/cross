@@ -12,3 +12,7 @@ global i32 invalid_expect(in i32 value) {
 global void invalid_unreachable() {
     $::unreachable(1);
 }
+
+global void invalid_machine_nop() {
+    $::_nop(1);
+}

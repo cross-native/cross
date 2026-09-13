@@ -1375,6 +1375,11 @@ private:
             return result;
         }
         if (value.kind == ValueKind::Intrinsic) {
+            if (value.intrinsic == mir::IntrinsicOperation::MachineNop) {
+                diagnostics_.error(
+                    value.location,
+                    "MIPS selection received an unavailable $::_nop operation");
+            }
             auto result = target_instruction(
                 value.intrinsic == mir::IntrinsicOperation::Expect
                     ? Opcode::Expect
@@ -6896,6 +6901,22 @@ private:
                             return parameter.mode != ParameterMode::In;
                         })) {
             return false;
+        }
+        const auto permits_clobber = [&](const std::vector<std::string>& names,
+                                         std::uint32_t physical) {
+            return std::any_of(
+                names.begin(), names.end(), [&](const std::string& name) {
+                    const auto id = physical_register_id(name);
+                    return id && id->value == physical;
+                });
+        };
+        for (const auto& clobber : call.clobbers) {
+            if (clobber.kind != machine::RegisterKind::Physical) continue;
+            if (!permits_clobber(active_signature_->abi->call_clobbers,
+                                 clobber.id) &&
+                !permits_clobber(caller.clobbers, clobber.id)) {
+                return false;
+            }
         }
         auto signature = classify_entity(
             callee, call.location, call.call_argument_types);

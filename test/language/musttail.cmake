@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE PARSER_ERRORS LOWERING_ERRORS STACK_ERROR OUTPUT)
+foreach(required CC SOURCE PARSER_ERRORS LOWERING_ERRORS STACK_ERROR CLOBBER_ERROR OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a value")
     endif()
@@ -74,6 +74,21 @@ execute_process(
 if(NOT llvm_status EQUAL 0)
     message(FATAL_ERROR
         "musttail LLVM serialization failed\n${llvm_stdout}\n${llvm_stderr}")
+endif()
+
+execute_process(
+    COMMAND "${CC}" -S -O0 -fno-optimize-sibling-calls
+            -target mips-unknown-elf "${CLOBBER_ERROR}"
+            -o "${OUTPUT}-clobber-error.s"
+    RESULT_VARIABLE clobber_status
+    OUTPUT_VARIABLE clobber_stdout
+    ERROR_VARIABLE clobber_stderr
+)
+if(clobber_status EQUAL 0 OR NOT clobber_stderr MATCHES
+   "MIPS cannot satisfy musttail for this ABI, argument layout, or frame state")
+    message(FATAL_ERROR
+        "MIPS musttail accepted a callee clobber outside the caller contract\n"
+        "${clobber_stdout}\n${clobber_stderr}")
 endif()
 file(READ "${OUTPUT}.ll" llvm)
 foreach(callee musttail_callee musttail_void_callee)

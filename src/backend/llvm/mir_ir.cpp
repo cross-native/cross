@@ -1140,6 +1140,9 @@ private:
             case mir::IntrinsicOperation::Unreachable:
             case mir::IntrinsicOperation::Trap:
                 break;
+            case mir::IntrinsicOperation::MachineNop:
+                out_ << "  call void asm sideeffect \"nop\", \"\"()\n";
+                break;
             }
             return;
         }

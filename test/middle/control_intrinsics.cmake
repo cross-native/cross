@@ -31,7 +31,8 @@ endif()
 foreach(pattern
         "assume condition must be side-effect-free"
         "expect requires an integer constant expectation"
-        "unreachable takes no arguments")
+        "unreachable takes no arguments"
+        "$::_nop takes no arguments")
     string(FIND "${error_stderr}" "${pattern}" error_position)
     if(error_position EQUAL -1)
         message(FATAL_ERROR
@@ -46,9 +47,39 @@ if(NOT trap_count EQUAL 1)
     message(FATAL_ERROR
         "trap must emit one ud2 while unreachable emits none\n${assembly}")
 endif()
+
+execute_process(
+    COMMAND "${CC}" -S -target mips-unknown-elf "${SOURCE}"
+            -o "${OUTPUT}-mips.s"
+    RESULT_VARIABLE mips_status
+    OUTPUT_VARIABLE mips_stdout
+    ERROR_VARIABLE mips_stderr
+)
+if(mips_status EQUAL 0 OR NOT mips_stderr MATCHES
+   "target instruction '\\$::_nop' is not available")
+    message(FATAL_ERROR
+        "MIPS accepted unavailable managed $::_nop\n${mips_stdout}\n${mips_stderr}")
+endif()
+
+if(GIMPLE_TEXT)
+    execute_process(
+        COMMAND "${CC}" -emit-gimple "${SOURCE}" -o "${OUTPUT}.gimple.c"
+        RESULT_VARIABLE gimple_status
+        OUTPUT_VARIABLE gimple_stdout
+        ERROR_VARIABLE gimple_stderr
+    )
+    if(gimple_status EQUAL 0 OR NOT gimple_stderr MATCHES
+       "GCC GIMPLE serialization cannot preserve managed \\$::_nop")
+        message(FATAL_ERROR
+            "GIMPLE accepted managed $::_nop\n${gimple_stdout}\n${gimple_stderr}")
+    endif()
+endif()
 if(assembly MATCHES "call[a-z]*[\t ]+[^\n]*(expect|assume|trap|unreachable)")
     message(FATAL_ERROR
         "control intrinsic introduced a runtime call\n${assembly}")
+endif()
+if(NOT assembly MATCHES "[\t ]nop([\t\r\n ]|$)")
+    message(FATAL_ERROR "managed $::_nop was not emitted\n${assembly}")
 endif()
 
 if(LLVM_TEXT)
@@ -68,6 +99,7 @@ if(LLVM_TEXT)
             "call i32 @llvm.expect.i32"
             "cross.assume (unevaluated)"
             "call void @llvm.trap()"
+            "call void asm sideeffect \"nop\", \"\"()"
             "declare i32 @llvm.expect.i32(i32, i32)"
             "declare void @llvm.trap()")
         string(FIND "${llvm}" "${pattern}" pattern_position)

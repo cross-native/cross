@@ -712,6 +712,7 @@ if(BUILD_TESTING)
                 -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/control_intrinsics_errors.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/control-intrinsics
                 -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+                -DGIMPLE_TEXT=${CROSS_ENABLE_GCC_GIMPLE_TEXT}
                 -P "${CMAKE_SOURCE_DIR}/test/middle/control_intrinsics.cmake")
     add_test(NAME cross_data_ir
         COMMAND "${CMAKE_COMMAND}"
@@ -1881,6 +1882,7 @@ if(BUILD_TESTING)
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/global_labels.x
                 -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/language/global_label_errors.x
+                -DNOP_SOURCE=${CMAKE_SOURCE_DIR}/test/language/global_label_nop.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/global-labels
                 -P "${CMAKE_SOURCE_DIR}/test/language/global_labels.cmake")
     add_test(NAME cross_musttail
@@ -1890,6 +1892,7 @@ if(BUILD_TESTING)
                 -DPARSER_ERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_parser_errors.x
                 -DLOWERING_ERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_lowering_errors.x
                 -DSTACK_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_stack_error.x
+                -DCLOBBER_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_clobber_error.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/musttail
                 -P "${CMAKE_SOURCE_DIR}/test/language/musttail.cmake")
     add_test(NAME cross_musttail_runtime

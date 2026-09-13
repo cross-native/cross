@@ -1074,6 +1074,11 @@ private:
                 break;
             case mir::IntrinsicOperation::Unreachable:
             case mir::IntrinsicOperation::Trap: break;
+            case mir::IntrinsicOperation::MachineNop:
+                diagnostics_.error(
+                    value.location,
+                    "GCC GIMPLE serialization cannot preserve managed $::_nop");
+                break;
             }
             return;
         }
