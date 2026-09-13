@@ -1219,7 +1219,7 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
     object->type = std::move(type);
     object->linkage = linkage;
     object->attributes = std::move(attributes);
-    if (consume("=")) object->initializer = parse_expression();
+    if (consume("=")) object->initializer = parse_initializer();
     if (object->type && object->type->kind == Type::Kind::Array &&
         object->type->lanes == 0 && object->initializer &&
         object->initializer->kind == Expr::Kind::String &&
@@ -1230,7 +1230,9 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
             object->initializer->string_value.size() + 1);
     }
     if (object->type && object->type->kind == Type::Kind::Array &&
-        object->type->lanes == 0) {
+        object->type->lanes == 0 &&
+        (!object->initializer ||
+         object->initializer->kind != Expr::Kind::AggregateInitializer)) {
         diagnostics_.error(location,
                            "an omitted array bound requires a u8 string initializer");
     }
@@ -1298,7 +1300,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
     if (const auto* location = consume_kind(TokenKind::String)) {
         declaration.location_name = decode_string_literal(location->text);
     }
-    if (consume("=")) declaration.initializer = parse_expression();
+    if (consume("=")) declaration.initializer = parse_initializer();
     if (declaration.type && declaration.type->kind == Type::Kind::Array &&
         declaration.type->lanes == 0 && declaration.initializer &&
         declaration.initializer->kind == Expr::Kind::String &&
@@ -1309,7 +1311,10 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
             declaration.initializer->string_value.size() + 1);
     }
     if (declaration.type && declaration.type->kind == Type::Kind::Array &&
-        declaration.type->lanes == 0 && !declaration.dynamic_array_bound) {
+        declaration.type->lanes == 0 && !declaration.dynamic_array_bound &&
+        (!declaration.initializer ||
+         declaration.initializer->kind !=
+             Expr::Kind::AggregateInitializer)) {
         diagnostics_.error(declaration.location,
                            "an omitted array bound requires a u8 string initializer");
     }
@@ -1502,6 +1507,46 @@ int Parser::precedence(std::string_view operation) {
 }
 
 std::unique_ptr<Expr> Parser::parse_expression() { return parse_assignment(); }
+
+std::unique_ptr<Expr> Parser::parse_initializer() {
+    if (!current().is("{")) return parse_assignment();
+    auto result = std::make_unique<Expr>();
+    result->kind = Expr::Kind::AggregateInitializer;
+    result->location = current().location;
+    consume("{");
+    while (!current().is("}") && current().kind != TokenKind::End) {
+        Expr::InitializerEntry entry;
+        entry.location = current().location;
+        while (current().is(".") || current().is("[")) {
+            Expr::InitializerDesignator designator;
+            designator.location = current().location;
+            if (consume(".")) {
+                designator.kind =
+                    Expr::InitializerDesignator::Kind::Member;
+                const auto* member = consume_kind(TokenKind::Identifier);
+                if (!member) {
+                    error_here("expected member name after '.' in initializer");
+                } else {
+                    designator.member = std::string(member->text);
+                }
+            } else {
+                consume("[");
+                designator.kind =
+                    Expr::InitializerDesignator::Kind::Index;
+                designator.index = parse_assignment();
+                expect("]", "after initializer designator");
+            }
+            entry.designators.push_back(std::move(designator));
+        }
+        if (!entry.designators.empty()) consume("=");
+        entry.value = parse_initializer();
+        result->initializer_entries.push_back(std::move(entry));
+        if (!consume(",")) break;
+        if (current().is("}")) break;
+    }
+    expect("}", "after initializer list");
+    return result;
+}
 
 std::unique_ptr<Expr> Parser::parse_assignment() {
     auto left = parse_conditional();

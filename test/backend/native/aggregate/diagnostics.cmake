@@ -31,6 +31,16 @@ expect_aggregate_error(unknown_member "has no member named 'y'")
 expect_aggregate_error(bit_field "record bit-fields are not implemented yet")
 expect_aggregate_error(initializer "a record value requires the same nominal record type")
 expect_aggregate_error(recursive_value "contains itself by value")
+expect_aggregate_error(initializer_duplicate
+    "duplicate destination in aggregate initializer")
+expect_aggregate_error(initializer_index
+    "array initializer designator is out of range")
+expect_aggregate_error(initializer_member
+    "record initializer has no member named 'z'")
+expect_aggregate_error(initializer_excess
+    "excess entry in aggregate initializer")
+expect_aggregate_error(initializer_scalar_braces
+    "brace initializer requires an aggregate object")
 
 execute_process(
     COMMAND "${CC}" -S "${SOURCE_DIR}/packed_address.x"

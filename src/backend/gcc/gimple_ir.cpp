@@ -1675,6 +1675,11 @@ private:
             }
             return result + '}';
         }
+        case data::InitializerKind::Aggregate:
+            diagnostics_.error(
+                object.location,
+                "GCC GIMPLE serialization does not yet encode aggregate static initializers");
+            return "{0}";
         }
         return "{0}";
     }

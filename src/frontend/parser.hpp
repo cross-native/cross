@@ -67,6 +67,7 @@ private:
     bool local_declaration_start() const;
 
     std::unique_ptr<Expr> parse_expression();
+    std::unique_ptr<Expr> parse_initializer();
     std::unique_ptr<Expr> parse_assignment();
     std::unique_ptr<Expr> parse_conditional();
     std::unique_ptr<Expr> parse_binary(int minimum_precedence);

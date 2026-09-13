@@ -254,17 +254,37 @@ private:
             }
             return;
         case data::InitializerKind::Bytes:
-            for (std::size_t offset = 0; offset < object.bytes.size();) {
-                out_ << "\t.byte ";
-                const auto end = std::min(offset + 16, object.bytes.size());
-                for (auto index = offset; index < end; ++index) {
-                    if (index != offset) out_ << ',';
-                    out_ << static_cast<unsigned>(object.bytes[index]);
+        case data::InitializerKind::Aggregate: {
+            const auto emit_bytes = [&](std::size_t begin,
+                                        std::size_t limit) {
+                for (auto offset = begin; offset < limit;) {
+                    out_ << "\t.byte ";
+                    const auto end = std::min(offset + 16, limit);
+                    for (auto index = offset; index < end; ++index) {
+                        if (index != offset) out_ << ',';
+                        out_ << static_cast<unsigned>(object.bytes[index]);
+                    }
+                    out_ << '\n';
+                    offset = end;
                 }
-                out_ << '\n';
-                offset = end;
+            };
+            std::size_t offset{};
+            for (const auto& relocation : object.relocations) {
+                emit_bytes(offset, relocation.offset);
+                if (relocation.size == 4) {
+                    out_ << "\t.long " << address(relocation.address) << '\n';
+                } else if (relocation.size == 8) {
+                    out_ << "\t.quad " << address(relocation.address) << '\n';
+                } else {
+                    diagnostics_.error(
+                        object.location,
+                        "target has no aggregate relocation directive for this address width");
+                }
+                offset = relocation.offset + relocation.size;
             }
+            emit_bytes(offset, object.bytes.size());
             return;
+        }
         }
     }
 

@@ -44,6 +44,26 @@ namespace {
 using TypeSubstitutions = std::unordered_map<std::string, TypePtr>;
 using ValueSubstitutions = std::unordered_map<std::string, const Expr*>;
 
+template <typename Visitor>
+void visit_initializer_children(Expr& expression, Visitor&& visitor) {
+    for (auto& entry : expression.initializer_entries) {
+        for (auto& designator : entry.designators) {
+            if (designator.index) visitor(designator.index);
+        }
+        if (entry.value) visitor(entry.value);
+    }
+}
+
+template <typename Visitor>
+void visit_initializer_children(const Expr& expression, Visitor&& visitor) {
+    for (const auto& entry : expression.initializer_entries) {
+        for (const auto& designator : entry.designators) {
+            if (designator.index) visitor(*designator.index);
+        }
+        if (entry.value) visitor(*entry.value);
+    }
+}
+
 bool validate_attribute_names(const Program& program,
                               Diagnostics& diagnostics) {
     const auto validate = [&](const std::vector<Attribute>& attributes) {
@@ -140,6 +160,23 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
         if (argument.type) copy.type = clone_type(argument.type, types);
         if (argument.value) copy.value = clone_expr(*argument.value, types, values);
         result->generic_arguments.push_back(std::move(copy));
+    }
+    for (const auto& entry : source.initializer_entries) {
+        Expr::InitializerEntry copy;
+        copy.location = entry.location;
+        for (const auto& designator : entry.designators) {
+            Expr::InitializerDesignator designator_copy;
+            designator_copy.kind = designator.kind;
+            designator_copy.location = designator.location;
+            designator_copy.member = designator.member;
+            if (designator.index) {
+                designator_copy.index =
+                    clone_expr(*designator.index, types, values);
+            }
+            copy.designators.push_back(std::move(designator_copy));
+        }
+        if (entry.value) copy.value = clone_expr(*entry.value, types, values);
+        result->initializer_entries.push_back(std::move(copy));
     }
     return result;
 }
@@ -435,6 +472,10 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                                  state, mangling);
         }
     }
+    visit_initializer_children(*expression, [&](std::unique_ptr<Expr>& child) {
+        rewrite_generic_expr(child, caller, program, diagnostics, state,
+                             mangling);
+    });
     if (expression->kind != Expr::Kind::Call || !expression->left ||
         expression->left->kind != Expr::Kind::Name) {
         return;
@@ -573,6 +614,9 @@ private:
         for (auto& argument : expression->generic_arguments) {
             rewrite(argument.value);
         }
+        visit_initializer_children(
+            *expression,
+            [&](std::unique_ptr<Expr>& child) { rewrite(child); });
     }
 
     void rewrite(Statement& statement) {
@@ -797,6 +841,8 @@ private:
                                                 : TypePtr{};
             return same_type(left, right) ? left : TypePtr{};
         }
+        case Expr::Kind::AggregateInitializer:
+            return {};
         case Expr::Kind::Call:
             if (expression.left &&
                 expression.left->kind == Expr::Kind::Name) {
@@ -981,6 +1027,9 @@ private:
         for (auto& argument : expression->generic_arguments) {
             rewrite(argument.value);
         }
+        visit_initializer_children(
+            *expression,
+            [&](std::unique_ptr<Expr>& child) { rewrite(child); });
     }
 
     void rewrite(Statement& statement) {
@@ -1373,6 +1422,8 @@ private:
                 expression.third ? infer(*expression.third) : TypePtr{};
             return same_type(left, right) ? left : TypePtr{};
         }
+        case Expr::Kind::AggregateInitializer:
+            return {};
         case Expr::Kind::Call:
             if (expression.left &&
                 expression.left->kind == Expr::Kind::Name) {
@@ -1398,6 +1449,10 @@ private:
         for (auto& argument : expression->generic_arguments) {
             rewrite_expression(argument.value);
         }
+        visit_initializer_children(*expression,
+            [&](std::unique_ptr<Expr>& child) {
+                rewrite_expression(child);
+            });
 
         if (expression->kind == Expr::Kind::Binary &&
             (expression->text == "member" ||
@@ -1774,6 +1829,10 @@ public:
             fail(expression.location,
                  "floating translation-time evaluation is not implemented yet");
             return std::nullopt;
+        case Expr::Kind::AggregateInitializer:
+            fail(expression.location,
+                 "an aggregate initializer is not a scalar expression");
+            return std::nullopt;
         }
         return std::nullopt;
     }
@@ -1978,6 +2037,7 @@ private:
             return {};
         case Expr::Kind::String: return pointer_type(builtin_type(BuiltinType::U8, true));
         case Expr::Kind::Floating: return {};
+        case Expr::Kind::AggregateInitializer: return {};
         }
         return {};
     }
@@ -2650,6 +2710,9 @@ private:
         for (auto& argument : expression->generic_arguments) {
             rewrite(argument.value);
         }
+        visit_initializer_children(
+            *expression,
+            [&](std::unique_ptr<Expr>& child) { rewrite(child); });
     }
 
     void rewrite(Statement& statement) {
@@ -2696,6 +2759,11 @@ bool contains_layout_query(const Expr& expression) {
             return true;
         }
     }
+    bool found = false;
+    visit_initializer_children(expression, [&](const Expr& child) {
+        found = found || contains_layout_query(child);
+    });
+    if (found) return true;
     return false;
 }
 
@@ -2804,6 +2872,22 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                        bool required_context = false,
                        bool runtime_context = false) {
     if (!expression) return;
+
+    if (expression->kind == Expr::Kind::AggregateInitializer) {
+        for (auto& entry : expression->initializer_entries) {
+            for (auto& designator : entry.designators) {
+                if (designator.index) {
+                    (void)rewrite_required_integer(
+                        designator.index, caller, program, diagnostics,
+                        builtin_type(BuiltinType::Uptr));
+                }
+            }
+            rewrite_eval_expr(entry.value, caller, program, diagnostics,
+                              opportunistic, required_context,
+                              runtime_context);
+        }
+        return;
+    }
 
     const auto direct_builtin_call = [&](std::string_view name) {
         return expression->kind == Expr::Kind::Call &&
@@ -2933,6 +3017,162 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
     replace_eval_value(expression, *value);
 }
 
+void infer_initializer_array_bound(TypePtr& type, const Expr* initializer,
+                                   Diagnostics& diagnostics) {
+    if (!type || type->kind != Type::Kind::Array || type->lanes != 0 ||
+        !initializer ||
+        initializer->kind != Expr::Kind::AggregateInitializer) {
+        return;
+    }
+    std::uint64_t cursor{};
+    std::uint64_t count{};
+    for (const auto& entry : initializer->initializer_entries) {
+        std::uint64_t selected = cursor;
+        if (!entry.designators.empty() &&
+            entry.designators.front().kind ==
+                Expr::InitializerDesignator::Kind::Index &&
+            entry.designators.front().index) {
+            const Expr* index = entry.designators.front().index.get();
+            while (index->kind == Expr::Kind::Parenthesized && index->left) {
+                index = index->left.get();
+            }
+            if (!index->evaluated_integer ||
+                index->evaluated_integer->value.high != 0) {
+                diagnostics.error(
+                    entry.location,
+                    "array initializer designator requires a nonnegative integer constant");
+                continue;
+            }
+            selected = index->evaluated_integer->value.low;
+        }
+        if (selected >= std::numeric_limits<std::uint32_t>::max()) {
+            diagnostics.error(entry.location,
+                              "inferred array bound exceeds the language limit");
+            continue;
+        }
+        cursor = selected + 1;
+        count = std::max(count, cursor);
+    }
+    if (count == 0) {
+        diagnostics.error(initializer->location,
+                          "an omitted array bound requires a nonempty initializer");
+        return;
+    }
+    type->lanes = static_cast<std::uint32_t>(count);
+}
+
+TypePtr initializer_child_type(const Program& program, const TypePtr& parent,
+                               const Expr::InitializerDesignator* designator,
+                               std::size_t position) {
+    if (!parent) return {};
+    if (parent->kind == Type::Kind::Array) {
+        if (designator && designator->kind !=
+                              Expr::InitializerDesignator::Kind::Index) {
+            return {};
+        }
+        return parent->element;
+    }
+    if (parent->kind != Type::Kind::Record) return {};
+    const auto record = std::find_if(
+        program.records.begin(), program.records.end(),
+        [&](const RecordDecl& candidate) {
+            return candidate.name == parent->nominal_name &&
+                   candidate.complete;
+        });
+    if (record == program.records.end()) return {};
+    if (designator) {
+        if (designator->kind !=
+            Expr::InitializerDesignator::Kind::Member) {
+            return {};
+        }
+        const auto member = std::find_if(
+            record->members.begin(), record->members.end(),
+            [&](const RecordMemberDecl& candidate) {
+                return candidate.name == designator->member;
+            });
+        return member == record->members.end() ? TypePtr{} : member->type;
+    }
+    return position < record->members.size() ? record->members[position].type
+                                             : TypePtr{};
+}
+
+void fold_static_initializer(Expr& initializer, TypePtr type,
+                             Program& program, Diagnostics& diagnostics,
+                             const LayoutQuery* size_of = nullptr,
+                             const LayoutQuery* align_of = nullptr,
+                             std::string_view source_namespace = {}) {
+    if (!type ||
+        initializer.kind != Expr::Kind::AggregateInitializer) {
+        return;
+    }
+    std::size_t cursor{};
+    for (auto& entry : initializer.initializer_entries) {
+        const auto* first = entry.designators.empty()
+                                ? nullptr
+                                : &entry.designators.front();
+        std::size_t selected = cursor;
+        if (first && first->kind ==
+                         Expr::InitializerDesignator::Kind::Index &&
+            first->index && first->index->evaluated_integer &&
+            first->index->evaluated_integer->value.high == 0) {
+            selected = static_cast<std::size_t>(
+                first->index->evaluated_integer->value.low);
+        } else if (first && first->kind ==
+                                Expr::InitializerDesignator::Kind::Member &&
+                   type->kind == Type::Kind::Record) {
+            const auto record = std::find_if(
+                program.records.begin(), program.records.end(),
+                [&](const RecordDecl& candidate) {
+                    return candidate.name == type->nominal_name &&
+                           candidate.complete;
+                });
+            if (record != program.records.end()) {
+                const auto member = std::find_if(
+                    record->members.begin(), record->members.end(),
+                    [&](const RecordMemberDecl& candidate) {
+                        return candidate.name == first->member;
+                    });
+                if (member != record->members.end()) {
+                    selected = static_cast<std::size_t>(
+                        std::distance(record->members.begin(), member));
+                }
+            }
+        }
+        auto destination = initializer_child_type(program, type, first,
+                                                  selected);
+        cursor = selected + 1;
+        for (std::size_t index = first ? 1 : 0;
+             destination && index < entry.designators.size(); ++index) {
+            destination = initializer_child_type(
+                program, destination, &entry.designators[index], 0);
+        }
+        if (!destination || !entry.value) continue;
+        if (entry.value->kind == Expr::Kind::AggregateInitializer) {
+            fold_static_initializer(*entry.value, destination, program,
+                                    diagnostics, size_of, align_of,
+                                    source_namespace);
+        } else if (is_integer(destination)) {
+            const bool target_dependent =
+                contains_layout_query(*entry.value);
+            if (target_dependent && (!size_of || !align_of)) continue;
+            if (!target_dependent) {
+                (void)rewrite_required_integer(entry.value, nullptr, program,
+                                               diagnostics);
+                continue;
+            }
+            Evaluator evaluator(program, diagnostics, nullptr,
+                                std::string(source_namespace), size_of,
+                                align_of);
+            const auto value = evaluator.required_integer(*entry.value);
+            if (!value) {
+                evaluator.diagnose(entry.value->location);
+                continue;
+            }
+            replace_eval_value(entry.value, *value);
+        }
+    }
+}
+
 void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
                             Program& program, Diagnostics& diagnostics,
                             bool opportunistic) {
@@ -2948,6 +3188,11 @@ void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
         if (statement.declaration->initializer) {
             rewrite_eval_expr(statement.declaration->initializer, caller,
                               program, diagnostics, opportunistic);
+            if (!statement.declaration->dynamic_array_bound) {
+                infer_initializer_array_bound(
+                    statement.declaration->type,
+                    statement.declaration->initializer.get(), diagnostics);
+            }
         }
     }
     if (statement.expression) {
@@ -3015,6 +3260,8 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
             self(self, expression->right.get());
             self(self, expression->third.get());
             for (const auto& argument : expression->arguments) self(self, argument.get());
+            visit_initializer_children(*expression,
+                [&](const Expr& child) { self(self, &child); });
         };
         const auto check_statement = [&](const auto& self, const Statement& statement) -> void {
             const bool scoped = statement.kind == Statement::Kind::Compound || statement.kind == Statement::Kind::For;
@@ -3073,7 +3320,9 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     }
     for (auto& object : program.objects) {
         if (object->initializer) {
-            if (is_integer(object->type)) {
+            if (is_integer(object->type) &&
+                object->initializer->kind !=
+                    Expr::Kind::AggregateInitializer) {
                 // Required initializers own the complete expression. Visiting
                 // child calls first would evaluate untaken logical/conditional
                 // arms and lose their short-circuit semantics.
@@ -3085,6 +3334,11 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                 rewrite_eval_expr(object->initializer, nullptr, program,
                                   diagnostics, opportunistic, true);
             }
+            infer_initializer_array_bound(object->type,
+                                          object->initializer.get(),
+                                          diagnostics);
+            fold_static_initializer(*object->initializer, object->type,
+                                    program, diagnostics);
         }
     }
     program.functions.erase(
@@ -3126,6 +3380,9 @@ void collect_patch_expressions(const Expr& expression,
     for (const auto& argument : expression.arguments) {
         collect_patch_expressions(*argument, patches);
     }
+    visit_initializer_children(expression, [&](const Expr& child) {
+        collect_patch_expressions(child, patches);
+    });
 }
 
 void collect_patch_expressions(const Statement& statement,
@@ -3180,6 +3437,11 @@ void rewrite_raw_inline_expr(std::unique_ptr<Expr>& expression,
     for (auto& argument : expression->arguments) {
         rewrite_raw_inline_expr(argument, caller, program, diagnostics, depth);
     }
+    visit_initializer_children(*expression,
+        [&](std::unique_ptr<Expr>& child) {
+            rewrite_raw_inline_expr(child, caller, program, diagnostics,
+                                    depth);
+        });
     if (expression->kind != Expr::Kind::Call || !expression->left ||
         expression->left->kind != Expr::Kind::Name) {
         return;
@@ -3313,7 +3575,7 @@ public:
         for (std::size_t index = 0; index < object_count; ++index) {
             auto* object = program_.objects[index].get();
             source_unit_ = object->source_unit;
-            if (!u8_array_string(*object)) rewrite(object->initializer);
+            rewrite(object->initializer, object->type);
         }
         for (auto& assertion : program_.static_assertions) {
             source_unit_.clear();
@@ -3334,12 +3596,60 @@ private:
                initializer->kind == Expr::Kind::String;
     }
 
-    static bool u8_array_string(const ObjectDecl& object) {
-        return u8_array_string(object.type, object.initializer);
-    }
-
-    void rewrite(std::unique_ptr<Expr>& expression) {
+    void rewrite(std::unique_ptr<Expr>& expression,
+                 const TypePtr& destination = {}) {
         if (!expression) return;
+        if (u8_array_string(destination, expression)) return;
+        if (expression->kind == Expr::Kind::AggregateInitializer) {
+            std::size_t cursor{};
+            for (auto& entry : expression->initializer_entries) {
+                for (auto& designator : entry.designators) {
+                    rewrite(designator.index);
+                }
+                const auto* first = entry.designators.empty()
+                                        ? nullptr
+                                        : &entry.designators.front();
+                std::size_t selected = cursor;
+                if (first && first->kind ==
+                                 Expr::InitializerDesignator::Kind::Index &&
+                    first->index && first->index->evaluated_integer &&
+                    first->index->evaluated_integer->value.high == 0) {
+                    selected = static_cast<std::size_t>(
+                        first->index->evaluated_integer->value.low);
+                } else if (first && first->kind ==
+                                        Expr::InitializerDesignator::Kind::Member &&
+                           destination &&
+                           destination->kind == Type::Kind::Record) {
+                    const auto record = std::find_if(
+                        program_.records.begin(), program_.records.end(),
+                        [&](const RecordDecl& candidate) {
+                            return candidate.name == destination->nominal_name &&
+                                   candidate.complete;
+                        });
+                    if (record != program_.records.end()) {
+                        const auto member = std::find_if(
+                            record->members.begin(), record->members.end(),
+                            [&](const RecordMemberDecl& candidate) {
+                                return candidate.name == first->member;
+                            });
+                        if (member != record->members.end()) {
+                            selected = static_cast<std::size_t>(
+                                std::distance(record->members.begin(), member));
+                        }
+                    }
+                }
+                auto child = initializer_child_type(program_, destination,
+                                                     first, selected);
+                cursor = selected + 1;
+                for (std::size_t index = first ? 1 : 0;
+                     child && index < entry.designators.size(); ++index) {
+                    child = initializer_child_type(
+                        program_, child, &entry.designators[index], 0);
+                }
+                rewrite(entry.value, child);
+            }
+            return;
+        }
         if (expression->kind == Expr::Kind::String) {
             const auto name = "$string." + std::to_string(ordinal_++);
             auto object = std::make_unique<ObjectDecl>();
@@ -3366,15 +3676,16 @@ private:
         for (auto& argument : expression->generic_arguments) {
             rewrite(argument.value);
         }
+        visit_initializer_children(
+            *expression,
+            [&](std::unique_ptr<Expr>& child) { rewrite(child); });
     }
 
     void rewrite(Statement& statement) {
         if (statement.declaration) {
             rewrite(statement.declaration->dynamic_array_bound);
-            if (!u8_array_string(statement.declaration->type,
-                                 statement.declaration->initializer)) {
-                rewrite(statement.declaration->initializer);
-            }
+            rewrite(statement.declaration->initializer,
+                    statement.declaration->type);
         }
         rewrite(statement.expression);
         rewrite(statement.condition);
@@ -3436,10 +3747,18 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                                const LayoutQuery& size_of,
                                const LayoutQuery& align_of) {
     for (auto& object : program.objects) {
-        if (!object->initializer || !is_integer(object->type) ||
+        if (!object->initializer ||
             !contains_layout_query(*object->initializer)) {
             continue;
         }
+        if (object->initializer->kind ==
+            Expr::Kind::AggregateInitializer) {
+            fold_static_initializer(
+                *object->initializer, object->type, program, diagnostics,
+                &size_of, &align_of, namespace_prefix(object->name));
+            continue;
+        }
+        if (!is_integer(object->type)) continue;
         Evaluator evaluator(program, diagnostics, nullptr,
                             namespace_prefix(object->name), &size_of,
                             &align_of);

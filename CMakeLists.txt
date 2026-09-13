@@ -114,6 +114,7 @@ add_library(cross_middle
     src/middle/codegen_module.cpp
     src/middle/data_ir.cpp
     src/middle/hir.cpp
+    src/middle/initializer.cpp
     src/middle/machine_ir.cpp
     src/middle/frame_ir.cpp
     src/middle/mir.cpp
@@ -1301,7 +1302,7 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/runtime.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregates.ll
                 -DENTRY=aggregate_entry
-                -DEXPECTED=77
+                -DEXPECTED=576
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     add_test(NAME cross_runtime_native_aggregates
@@ -1312,7 +1313,7 @@ if(BUILD_TESTING)
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-aggregates
                 -DENTRY=aggregate_entry
-                -DEXPECTED=77
+                -DEXPECTED=576
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_aggregate_diagnostics
@@ -1321,6 +1322,12 @@ if(BUILD_TESTING)
                 -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-errors
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/diagnostics.cmake")
+    add_test(NAME cross_aggregate_initializer_targets
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/runtime.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-initializer-targets
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/initializer_targets.cmake")
     add_test(NAME cross_atomics
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/backend/native/atomic/runtime.x"

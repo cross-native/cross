@@ -274,8 +274,77 @@ private:
             }
             return result + ']';
         }
+        case data::InitializerKind::Aggregate: {
+            const auto bytes = [&](std::size_t begin, std::size_t end) {
+                std::string result = "[";
+                for (auto index = begin; index < end; ++index) {
+                    if (index != begin) result += ", ";
+                    result += "i8 " + std::to_string(
+                        static_cast<unsigned>(object.bytes[index]));
+                }
+                return result + ']';
+            };
+            if (object.relocations.empty()) {
+                return bytes(0, object.bytes.size());
+            }
+            std::string result = "<{ ";
+            std::size_t offset{};
+            bool first = true;
+            const auto separate = [&] {
+                if (!first) result += ", ";
+                first = false;
+            };
+            for (const auto& relocation : object.relocations) {
+                if (offset != relocation.offset) {
+                    separate();
+                    const auto count = relocation.offset - offset;
+                    result += "[" + std::to_string(count) + " x i8] " +
+                              bytes(offset, relocation.offset);
+                }
+                separate();
+                data::Object scalar;
+                scalar.location = object.location;
+                scalar.address = relocation.address;
+                result += "ptr " + address_initializer(scalar);
+                offset = relocation.offset + relocation.size;
+            }
+            if (offset != object.bytes.size()) {
+                separate();
+                const auto count = object.bytes.size() - offset;
+                result += "[" + std::to_string(count) + " x i8] " +
+                          bytes(offset, object.bytes.size());
+            }
+            return result + " }>";
+        }
         }
         return "zeroinitializer";
+    }
+
+    std::string aggregate_ir_type(const data::Object& object) const {
+        if (object.relocations.empty()) {
+            return "[" + std::to_string(object.bytes.size()) + " x i8]";
+        }
+        std::string result = "<{ ";
+        std::size_t offset{};
+        bool first = true;
+        const auto append = [&](std::string value) {
+            if (!first) result += ", ";
+            first = false;
+            result += std::move(value);
+        };
+        for (const auto& relocation : object.relocations) {
+            if (offset != relocation.offset) {
+                append("[" + std::to_string(relocation.offset - offset) +
+                       " x i8]");
+            }
+            append("ptr");
+            offset = relocation.offset + relocation.size;
+        }
+        if (offset != object.bytes.size()) {
+            append("[" + std::to_string(object.bytes.size() - offset) +
+                   " x i8]");
+        }
+        return result + " }>";
     }
 
     void emit_objects(std::ostringstream& module) {
@@ -304,9 +373,13 @@ private:
                 emitted = true;
                 continue;
             }
+            const auto storage_type =
+                object.initializer == data::InitializerKind::Aggregate
+                    ? aggregate_ir_type(object)
+                    : ir_type(object.type);
             module << symbol << " = "
                    << (entity.linkage == Linkage::Global ? "" : "internal ")
-                   << tls << storage << ir_type(object.type) << ' '
+                   << tls << storage << storage_type << ' '
                    << initializer(object);
             if (entity.section) {
                 module << ", section " << llvm_string(*entity.section);

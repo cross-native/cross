@@ -28,6 +28,7 @@ enum class InitializerKind {
     Floating,
     Address,
     Bytes,
+    Aggregate,
 };
 
 enum class AddressKind { Object, Function, Label };
@@ -40,6 +41,12 @@ struct AddressConstant {
     std::int64_t addend{};
 };
 
+struct Relocation {
+    unsigned offset{};
+    unsigned size{};
+    AddressConstant address;
+};
+
 struct Object {
     hir::ObjectId source;
     SourceLocation location;
@@ -48,6 +55,7 @@ struct Object {
     UInt128 bits;
     std::optional<AddressConstant> address;
     std::vector<unsigned char> bytes;
+    std::vector<Relocation> relocations;
     unsigned size{};
     unsigned alignment{1};
     bool read_only{};

@@ -18510,20 +18510,35 @@ private:
                 : std::string("rax");
             const auto* assigned_lhs =
                 assigned_integer_register(function, lhs);
-            if (assigned_target && assigned_lhs &&
-                !same_physical_assignment(function, target, lhs)) {
+            const bool destination_holds_lhs =
+                assigned_lhs &&
+                assigned_lhs->storage_name == destination;
+            const bool destination_is_address =
+                destination == base_register ||
+                destination == index_register;
+            if (!destination_holds_lhs &&
+                ((assigned_target && assigned_lhs) ||
+                 destination_is_address)) {
                 // When the accumulator already has a distinct color, load the
                 // memory value into it and consume the invariant/register input.
                 // This has the same uop count as copy+ADD-memory, but exposes
                 // the load to the scheduler and avoids a memory-source ALU
-                // dependency on the copied destination. In-place reductions
+                // dependency on the copied destination. It is also required
+                // when the result shares a color (or emitter scratch) with an
+                // address input: the memory operand must be consumed before
+                // that address register is overwritten. In-place reductions
                 // retain the compact ADD-memory form below.
                 instruction("mov" + std::string(1, suffix(bits)),
                             memory_operand + ", " +
                                 register_name(destination, bits));
+                const auto lhs_register = assigned_lhs
+                    ? std::string(assigned_lhs->storage_name)
+                    : destination == "rax" ? std::string("rcx")
+                                             : std::string("rax");
+                if (!assigned_lhs) load(function, lhs, lhs_register);
                 instruction(std::string(opcode) +
                                 std::string(1, suffix(bits)),
-                            register_name(assigned_lhs->storage_name, bits) +
+                            register_name(lhs_register, bits) +
                                 ", " + register_name(destination, bits));
                 store(function, target, destination);
                 return;
@@ -19003,8 +19018,8 @@ private:
     void emit_pointer_access(const machine::Function& function,
                              const machine::Instruction& value) {
         const auto address = std::get<machine::RegisterOperand>(value.operands[0]).value;
-        load(function, address, "rax");
         if (value.opcode == Opcode::PointerLoad) {
+            load(function, address, "rax");
             const auto target = value.defs.front();
             if (target.mode.bits == 128) {
                 instruction("movq", "0(%rax), %rdx");
@@ -19024,13 +19039,20 @@ private:
             return;
         }
         const auto source = value.uses[1];
+        const auto* assigned_source =
+            assigned_integer_register(function, source);
+        // Calls define scalar integer results in RAX. Preserve such a value
+        // while materializing the independent pointer operand for the store.
+        const std::string address_register =
+            assigned_source && assigned_source->storage_name == "rax"
+                ? "r10"
+                : "rax";
+        load(function, address, address_register);
         if (source.mode.bits == 128) {
             load(function, source, "rdx", "rcx");
-            instruction("movq", "%rdx, 0(%rax)");
-            instruction("movq", "%rcx, 8(%rax)");
+            instruction("movq", "%rdx, 0(%" + address_register + ")");
+            instruction("movq", "%rcx, 8(%" + address_register + ")");
         } else {
-            const auto* assigned_source =
-                assigned_integer_register(function, source);
             const auto source_register = assigned_source
                 ? std::string(assigned_source->storage_name)
                 : std::string("rcx");
@@ -19039,7 +19061,7 @@ private:
             }
             instruction("mov" + std::string(1, suffix(source.mode.bits)),
                         register_name(source_register, source.mode.bits) +
-                            ", 0(%rax)");
+                            ", 0(%" + address_register + ")");
         }
     }
 

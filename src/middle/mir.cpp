@@ -6,6 +6,7 @@
 #include "common/integer_semantics.hpp"
 #include "common/uint128.hpp"
 #include "middle/data_ir.hpp"
+#include "middle/initializer.hpp"
 #include "middle/mir_analysis.hpp"
 #include "middle/mir_pass.hpp"
 #include "middle/mir_transform.hpp"
@@ -570,6 +571,24 @@ bool eligible_expression(const Expr& expression) {
         return decode_character_literal(expression.text).has_value();
     case Expr::Kind::String:
         return false;
+    case Expr::Kind::AggregateInitializer:
+        return std::all_of(
+            expression.initializer_entries.begin(),
+            expression.initializer_entries.end(),
+            [](const Expr::InitializerEntry& entry) {
+                const auto valid_value =
+                    entry.value &&
+                    (entry.value->kind == Expr::Kind::String ||
+                     eligible_expression(*entry.value));
+                return valid_value &&
+                       std::all_of(
+                           entry.designators.begin(),
+                           entry.designators.end(),
+                           [](const Expr::InitializerDesignator& designator) {
+                               return !designator.index ||
+                                      eligible_expression(*designator.index);
+                           });
+            });
     }
     return false;
 }
@@ -610,6 +629,7 @@ bool valid_assumption_expression(const Expr& expression) {
     case Expr::Kind::Assign:
     case Expr::Kind::Call:
     case Expr::Kind::String:
+    case Expr::Kind::AggregateInitializer:
         return false;
     }
     return false;
@@ -652,6 +672,11 @@ bool eligible_statement(const Statement& statement) {
                    (!dynamic || eligible_expression(
                                     *statement.declaration
                                          ->dynamic_array_bound)) &&
+                   (!statement.declaration->initializer ||
+                    statement.declaration->initializer->kind ==
+                        Expr::Kind::String ||
+                    eligible_expression(
+                        *statement.declaration->initializer)) &&
                    !statement.declaration->storage_register &&
                    !statement.declaration->location_name;
         }
@@ -664,7 +689,6 @@ bool eligible_statement(const Statement& statement) {
                 statement.declaration->type->kind == cross::Type::Kind::Record ||
                 (statement.declaration->type->kind == cross::Type::Kind::Vector &&
                  !statement.declaration->type->scalable)) &&
-               !statement.declaration->type->is_const &&
                (!statement.declaration->type->is_volatile ||
                 statement.declaration->storage_register ||
                 statement.declaration->storage_stack ||
@@ -2001,6 +2025,165 @@ private:
         return true;
     }
 
+    bool initialize_aggregate(const LocalBinding& binding,
+                              const Expr& source) {
+        const auto plan = initializer::build(
+            source, binding.type, hir_, target_, diagnostics_);
+        if (!plan.valid) {
+            failed_ = true;
+            return true;
+        }
+        const auto size = hir::layout_size(hir_, binding.type, target_);
+        if (!size || *size == 0) {
+            diagnostics_.error(source.location,
+                               "aggregate initializer has no fixed storage size");
+            failed_ = true;
+            return true;
+        }
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const bool object_volatile =
+            hir_.type(binding.type).is_volatile;
+        const auto byte = hir_.add_qualifiers(
+            *hir_.builtin(BuiltinType::U8), false, object_volatile);
+        const auto base = cast(slot_address(binding, source.location),
+                               hir_.pointer_to(byte), source.location);
+        const auto store_byte = [&](ValueId index, std::uint8_t value,
+                                    SourceLocation location) {
+            const auto address = indexed_address(base, index, byte, location);
+            const auto stored = constant(value, byte, location);
+            if (!store_pointer(address, stored, location, 1)) failed_ = true;
+        };
+
+        if (*size <= 16) {
+            for (std::uint64_t index = 0; index < *size; ++index) {
+                store_byte(constant(index, uptr, source.location), 0,
+                           source.location);
+            }
+        } else {
+            const auto initial = constant(0, uptr, source.location);
+            const auto preheader = *current_block_;
+            const auto test = new_block(source.location);
+            const auto body = new_block(source.location);
+            const auto end = new_block(source.location);
+            terminate(TerminatorKind::Branch, source.location,
+                      std::nullopt, {test});
+
+            enter(test);
+            const auto index = add_value(ValueKind::Phi, uptr,
+                                         source.location);
+            const auto limit = constant(*size, uptr, source.location);
+            const auto condition = add_value(
+                ValueKind::Binary, *hir_.builtin(BuiltinType::Bool),
+                source.location);
+            current_.values[condition.value].binary =
+                BinaryOperation::UnsignedLess;
+            current_.values[condition.value].operands = {index, limit};
+            terminate(TerminatorKind::ConditionalBranch, source.location,
+                      condition, {body, end});
+
+            enter(body);
+            store_byte(index, 0, source.location);
+            const auto one = constant(1, uptr, source.location);
+            const auto next = add_value(ValueKind::Binary, uptr,
+                                        source.location);
+            current_.values[next.value].binary = BinaryOperation::Add;
+            current_.values[next.value].operands = {index, one};
+            const auto backedge = *current_block_;
+            terminate(TerminatorKind::Branch, source.location,
+                      std::nullopt, {test});
+            current_.values[index.value].incoming = {
+                {preheader, initial}, {backedge, next}};
+            enter(end);
+        }
+
+        for (const auto& item : plan.items) {
+            if (!item.expression) {
+                failed_ = true;
+                continue;
+            }
+            const auto& type = hir_.type(item.type);
+            if (type.kind == hir::Type::Kind::Array && type.element &&
+                hir_.type(*type.element).kind == hir::Type::Kind::Builtin &&
+                hir_.type(*type.element).builtin == BuiltinType::U8 &&
+                item.expression->kind == Expr::Kind::String) {
+                const auto item_size =
+                    hir::layout_size(hir_, item.type, target_).value_or(0);
+                const auto required = item.expression->string_value.size() + 1;
+                if (required > item_size) {
+                    diagnostics_.error(
+                        item.expression->location,
+                        "string initializer does not fit in the u8 array");
+                    failed_ = true;
+                    continue;
+                }
+                for (std::size_t index = 0;
+                     index < item.expression->string_value.size(); ++index) {
+                    const auto offset = constant(
+                        item.offset + index, uptr,
+                        item.expression->location);
+                    store_byte(offset, static_cast<std::uint8_t>(
+                                           item.expression->string_value[index]),
+                               item.expression->location);
+                }
+                store_byte(constant(item.offset + required - 1, uptr,
+                                    item.expression->location),
+                           0, item.expression->location);
+                continue;
+            }
+            if (type.kind == hir::Type::Kind::Array ||
+                type.kind == hir::Type::Kind::Record) {
+                diagnostics_.error(
+                    item.expression->location,
+                    "nested aggregate initialization requires a brace list");
+                failed_ = true;
+                continue;
+            }
+            const auto initialization_type = type.is_atomic
+                ? hir_.add_qualifiers(item.type, false, object_volatile)
+                : hir_.add_qualifiers(hir_.unqualified(item.type), false,
+                                      object_volatile || type.is_volatile);
+            const auto offset = constant(item.offset, uptr,
+                                         item.expression->location);
+            const auto byte_address = indexed_address(
+                base, offset, byte, item.expression->location);
+            const auto address = cast(
+                byte_address, hir_.pointer_to(initialization_type),
+                item.expression->location);
+            // Materialize the destination before evaluating the initializer.
+            // A call result can occupy the ABI return register, so creating
+            // the address afterward would extend that fixed-register value
+            // across address arithmetic and can make both store operands
+            // alias in native lowering.
+            auto value = lower_expression(*item.expression,
+                                          initialization_type);
+            if (!value) {
+                failed_ = true;
+                continue;
+            }
+            *value = assignment_cast(*value, initialization_type,
+                                     item.expression->location);
+            if (atomic_object_type(hir_, item.type)) {
+                (void)atomic_operation(
+                    AtomicOperation::Store,
+                    *hir_.builtin(BuiltinType::Void), {address, *value},
+                    MemoryOrder::SeqCst, item.expression->location,
+                    MemoryOrder::SeqCst,
+                    hir_.type(initialization_type).is_volatile);
+                continue;
+            }
+            const auto operation = add_effectful(
+                ValueKind::PointerStore,
+                *hir_.builtin(BuiltinType::Void),
+                item.expression->location);
+            auto& store = current_.values[operation.value];
+            store.operands = {address, *value};
+            store.is_volatile_access =
+                hir_.type(initialization_type).is_volatile;
+            store.memory_alignment = item.alignment;
+        }
+        return true;
+    }
+
     void end_lifetimes_from(std::size_t retained_scopes,
                             SourceLocation location) {
         if (!current_block_) return;
@@ -2343,6 +2526,8 @@ private:
             return hir_.builtin(BuiltinType::U32);
         }
         case Expr::Kind::String:
+            return std::nullopt;
+        case Expr::Kind::AggregateInitializer:
             return std::nullopt;
         }
         return std::nullopt;
@@ -3145,6 +3330,11 @@ private:
             break;
         }
         case Expr::Kind::String:
+            break;
+        case Expr::Kind::AggregateInitializer:
+            diagnostics_.error(
+                expression.location,
+                "an aggregate initializer is not a scalar expression");
             break;
         }
         if (!result) {
@@ -4791,14 +4981,6 @@ private:
                     hir::Type::Kind::Builtin &&
                 hir_.type(*hir_.type(type).element).builtin ==
                     BuiltinType::U8;
-            if (array && declaration.initializer &&
-                !string_array_initializer) {
-                diagnostics_.error(
-                    declaration.initializer->location,
-                    "aggregate array initializers are not implemented yet");
-                failed_ = true;
-                return;
-            }
             if (hir_.type(type).is_atomic &&
                 !atomic_object_type(hir_, type)) {
                 diagnostics_.error(
@@ -4822,6 +5004,13 @@ private:
             const bool dynamic_array =
                 array && hir_.type(type).lanes == 0;
             if (dynamic_array) {
+                if (declaration.initializer) {
+                    diagnostics_.error(
+                        declaration.initializer->location,
+                        "variable-length array initialization is not implemented yet");
+                    failed_ = true;
+                    return;
+                }
                 if (!declaration.dynamic_array_bound) {
                     diagnostics_.error(
                         declaration.location,
@@ -4911,6 +5100,12 @@ private:
                             "aggregate array initializers are not implemented yet");
                         failed_ = true;
                     }
+                    return;
+                }
+                if (declaration.initializer->kind ==
+                    Expr::Kind::AggregateInitializer) {
+                    (void)initialize_aggregate(binding,
+                                               *declaration.initializer);
                     return;
                 }
                 auto initializer = lower_expression(*declaration.initializer, type);

@@ -30,7 +30,7 @@ expect_array_error(zero_bound
 expect_array_error(omitted_bound
     "an omitted array bound requires a u8 string initializer")
 expect_array_error(initializer
-    "aggregate array initializers are not implemented yet")
+    "aggregate initializer requires a brace list")
 expect_array_error(vla_inner_bound
     "only the outermost array bound may be a runtime value")
 expect_array_error(vla_wide_bound

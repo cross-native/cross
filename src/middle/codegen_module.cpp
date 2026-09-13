@@ -79,6 +79,8 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             type.kind == hir::Type::Kind::Array && type.element &&
             module.hir().type(*type.element).kind == hir::Type::Kind::Builtin &&
             module.hir().type(*type.element).builtin == BuiltinType::U8;
+        const bool aggregate = type.kind == hir::Type::Kind::Array ||
+                               type.kind == hir::Type::Kind::Record;
         const bool declaration =
             object.initializer == data::InitializerKind::Declaration;
         if (declaration != (entity.definition == nullptr) ||
@@ -90,10 +92,15 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
              !address) ||
             (object.initializer == data::InitializerKind::Bytes &&
              (!byte_array || object.bytes.size() != object.size)) ||
+            (object.initializer == data::InitializerKind::Aggregate &&
+             (!aggregate || object.bytes.size() != object.size)) ||
             (object.initializer != data::InitializerKind::Address &&
              object.address) ||
             (object.initializer != data::InitializerKind::Bytes &&
-             !object.bytes.empty())) {
+             object.initializer != data::InitializerKind::Aggregate &&
+             !object.bytes.empty()) ||
+            (object.initializer != data::InitializerKind::Aggregate &&
+             !object.relocations.empty())) {
             diagnostics.error(object.location,
                               "data IR initializer disagrees with HIR object");
             valid = false;
@@ -128,6 +135,45 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
                             module.hir().labels.size() ||
                         module.hir().labels[object.address->label->value].owner !=
                             *object.address->function)) {
+                diagnostics.error(object.location,
+                                  "data IR refers to an unknown label address");
+                valid = false;
+            }
+        }
+        for (const auto& relocation : object.relocations) {
+            if ((relocation.size != 4 && relocation.size != 8) ||
+                relocation.offset > object.size ||
+                relocation.size > object.size - relocation.offset) {
+                diagnostics.error(object.location,
+                                  "data IR aggregate relocation is out of range");
+                valid = false;
+            }
+            const auto& target_address = relocation.address;
+            if (target_address.kind == data::AddressKind::Object &&
+                (!target_address.object || target_address.function ||
+                 target_address.label ||
+                 target_address.object->value >= module.hir().objects.size())) {
+                diagnostics.error(object.location,
+                                  "data IR refers to an unknown object address");
+                valid = false;
+            } else if (target_address.kind == data::AddressKind::Function &&
+                       (!target_address.function || target_address.object ||
+                        target_address.label ||
+                        target_address.function->value >=
+                            module.hir().functions.size())) {
+                diagnostics.error(object.location,
+                                  "data IR refers to an unknown function address");
+                valid = false;
+            } else if (target_address.kind == data::AddressKind::Label &&
+                       (!target_address.function || !target_address.label ||
+                        target_address.object ||
+                        target_address.function->value >=
+                            module.hir().functions.size() ||
+                        target_address.label->value >=
+                            module.hir().labels.size() ||
+                        module.hir()
+                                .labels[target_address.label->value]
+                                .owner != *target_address.function)) {
                 diagnostics.error(object.location,
                                   "data IR refers to an unknown label address");
                 valid = false;

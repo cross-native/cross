@@ -6,6 +6,7 @@
 #include "common/floating_bits.hpp"
 #include "common/integer_semantics.hpp"
 #include "frontend/ast.hpp"
+#include "middle/initializer.hpp"
 #include "target/subtarget.hpp"
 
 #include <algorithm>
@@ -549,43 +550,12 @@ std::optional<AddressConstant> address_constant(
     return result;
 }
 
-bool lower_initializer(Object& result, const hir::Module& module,
-                       const hir::Object& entity,
-                       const ObjectDecl& declaration,
-                       const Subtarget& subtarget,
-                       Diagnostics& diagnostics) {
-    if (!declaration.initializer) return true;
-    const auto& expression = *declaration.initializer;
+bool lower_scalar_initializer(Object& result, const hir::Module& module,
+                              const hir::Object& entity,
+                              const Expr& expression,
+                              const Subtarget& subtarget,
+                              Diagnostics& diagnostics) {
     const auto& type = module.type(entity.type);
-    if (type.kind == hir::Type::Kind::Array) {
-        if (!type.element ||
-            module.type(*type.element).kind != hir::Type::Kind::Builtin ||
-            module.type(*type.element).builtin != BuiltinType::U8 ||
-            expression.kind != Expr::Kind::String) {
-            diagnostics.error(
-                expression.location,
-                "aggregate array initializers are not implemented yet");
-            return false;
-        }
-        const auto required = expression.string_value.size() + 1;
-        if (required > result.size) {
-            diagnostics.error(
-                expression.location,
-                "string initializer does not fit in the u8 array");
-            return false;
-        }
-        result.initializer = InitializerKind::Bytes;
-        result.bytes.assign(result.size, 0);
-        std::copy(expression.string_value.begin(),
-                  expression.string_value.end(), result.bytes.begin());
-        return true;
-    }
-    if (type.kind == hir::Type::Kind::Record) {
-        diagnostics.error(
-            expression.location,
-            "aggregate record initializers are not implemented yet");
-        return false;
-    }
     if (type.kind == hir::Type::Kind::Pointer ||
         (type.kind == hir::Type::Kind::Builtin &&
          type.builtin == BuiltinType::Label)) {
@@ -706,6 +676,139 @@ bool lower_initializer(Object& result, const hir::Module& module,
     return false;
 }
 
+void store_bits(std::vector<unsigned char>& bytes, unsigned offset,
+                unsigned size, UInt128 value, ByteOrder order) {
+    value = mask_to(value, size * 8);
+    for (unsigned index = 0; index < size; ++index) {
+        const auto source = order == ByteOrder::Little ? index
+                                                       : size - index - 1;
+        bytes[offset + index] = static_cast<unsigned char>(
+            source < 8 ? value.low >> (source * 8)
+                       : value.high >> ((source - 8) * 8));
+    }
+}
+
+bool lower_initializer(Object& result, const hir::Module& module,
+                       const hir::Object& entity,
+                       const ObjectDecl& declaration,
+                       const Subtarget& subtarget,
+                       Diagnostics& diagnostics) {
+    if (!declaration.initializer) return true;
+    const auto& expression = *declaration.initializer;
+    const auto& type = module.type(entity.type);
+    if (type.kind == hir::Type::Kind::Array && type.element &&
+        module.type(*type.element).kind == hir::Type::Kind::Builtin &&
+        module.type(*type.element).builtin == BuiltinType::U8 &&
+        expression.kind == Expr::Kind::String) {
+        const auto required = expression.string_value.size() + 1;
+        if (required > result.size) {
+            diagnostics.error(expression.location,
+                              "string initializer does not fit in the u8 array");
+            return false;
+        }
+        result.initializer = InitializerKind::Bytes;
+        result.bytes.assign(result.size, 0);
+        std::copy(expression.string_value.begin(),
+                  expression.string_value.end(), result.bytes.begin());
+        return true;
+    }
+    if (type.kind != hir::Type::Kind::Array &&
+        type.kind != hir::Type::Kind::Record) {
+        if (expression.kind == Expr::Kind::AggregateInitializer) {
+            diagnostics.error(expression.location,
+                              "brace initializer requires an aggregate object");
+            return false;
+        }
+        return lower_scalar_initializer(result, module, entity, expression,
+                                        subtarget, diagnostics);
+    }
+    if (expression.kind != Expr::Kind::AggregateInitializer) {
+        diagnostics.error(expression.location,
+                          "aggregate initializer requires a brace list");
+        return false;
+    }
+
+    const auto plan = initializer::build(expression, entity.type, module,
+                                         subtarget.target(), diagnostics);
+    result.initializer = InitializerKind::Aggregate;
+    result.bytes.assign(result.size, 0);
+    bool valid = plan.valid;
+    for (const auto& item : plan.items) {
+        if (!item.expression) {
+            valid = false;
+            continue;
+        }
+        const auto item_size = hir::layout_size(
+            module, item.type, subtarget.target());
+        if (!item_size || *item_size > std::numeric_limits<unsigned>::max() ||
+            item.offset > result.size ||
+            *item_size > result.size - item.offset) {
+            diagnostics.error(item.expression->location,
+                              "aggregate initializer item exceeds object storage");
+            valid = false;
+            continue;
+        }
+        const auto& item_type = module.type(item.type);
+        if (item_type.kind == hir::Type::Kind::Array && item_type.element &&
+            module.type(*item_type.element).kind == hir::Type::Kind::Builtin &&
+            module.type(*item_type.element).builtin == BuiltinType::U8 &&
+            item.expression->kind == Expr::Kind::String) {
+            const auto required = item.expression->string_value.size() + 1;
+            if (required > *item_size) {
+                diagnostics.error(
+                    item.expression->location,
+                    "string initializer does not fit in the u8 array");
+                valid = false;
+                continue;
+            }
+            std::copy(item.expression->string_value.begin(),
+                      item.expression->string_value.end(),
+                      result.bytes.begin() +
+                          static_cast<std::ptrdiff_t>(item.offset));
+            continue;
+        }
+        if (item_type.kind == hir::Type::Kind::Array ||
+            item_type.kind == hir::Type::Kind::Record) {
+            diagnostics.error(
+                item.expression->location,
+                "nested aggregate initialization requires a brace list");
+            valid = false;
+            continue;
+        }
+        Object scalar;
+        scalar.location = item.expression->location;
+        scalar.type = item.type;
+        scalar.size = static_cast<unsigned>(*item_size);
+        hir::Object scalar_entity = entity;
+        scalar_entity.type = item.type;
+        if (!lower_scalar_initializer(scalar, module, scalar_entity,
+                                      *item.expression, subtarget,
+                                      diagnostics)) {
+            valid = false;
+            continue;
+        }
+        const auto offset = static_cast<unsigned>(item.offset);
+        if (scalar.initializer == InitializerKind::Integer ||
+            scalar.initializer == InitializerKind::Floating) {
+            store_bits(result.bytes, offset, scalar.size, scalar.bits,
+                       subtarget.target().data_layout.byte_order);
+        } else if (scalar.initializer == InitializerKind::Address &&
+                   scalar.address) {
+            result.relocations.push_back(
+                {offset, scalar.size, std::move(*scalar.address)});
+        } else {
+            diagnostics.error(item.expression->location,
+                              "unsupported scalar aggregate initializer item");
+            valid = false;
+        }
+    }
+    std::sort(result.relocations.begin(), result.relocations.end(),
+              [](const Relocation& left, const Relocation& right) {
+                  return left.offset < right.offset;
+              });
+    return valid;
+}
+
 } // namespace
 
 std::optional<UInt128> parse_binary128_literal(std::string text) {
@@ -817,6 +920,14 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
             (void)hir::stabilize_function_address(
                 hir_module, *object.address->function, declaration->location,
                 diagnostics);
+        }
+        for (const auto& relocation : object.relocations) {
+            if (relocation.address.kind == AddressKind::Function &&
+                relocation.address.function) {
+                (void)hir::stabilize_function_address(
+                    hir_module, *relocation.address.function,
+                    declaration->location, diagnostics);
+            }
         }
         result.objects.push_back(std::move(object));
     }

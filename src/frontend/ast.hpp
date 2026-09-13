@@ -95,7 +95,19 @@ struct Expr {
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
         Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
+        AggregateInitializer,
     } kind{Kind::Integer};
+    struct InitializerDesignator {
+        enum class Kind { Member, Index } kind{Kind::Member};
+        SourceLocation location;
+        std::string member;
+        std::unique_ptr<Expr> index;
+    };
+    struct InitializerEntry {
+        SourceLocation location;
+        std::vector<InitializerDesignator> designators;
+        std::unique_ptr<Expr> value;
+    };
     SourceLocation location;
     std::string text;
     std::string string_value;
@@ -112,6 +124,7 @@ struct Expr {
     std::unique_ptr<Expr> third;
     std::vector<std::unique_ptr<Expr>> arguments;
     std::vector<GenericArgument> generic_arguments;
+    std::vector<InitializerEntry> initializer_entries;
 };
 
 struct VariableDecl {
