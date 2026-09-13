@@ -1220,6 +1220,14 @@ private:
                     out_ << "  " << result << " = select i1 true, "
                          << destination_type << ' ' << reference(operand)
                          << ", " << destination_type << " poison\n";
+                } else if (source_type == "ptr") {
+                    out_ << "  " << result << " = ptrtoint ptr "
+                         << reference(operand) << " to "
+                         << destination_type << '\n';
+                } else if (destination_type == "ptr") {
+                    out_ << "  " << result << " = inttoptr "
+                         << source_type << ' ' << reference(operand)
+                         << " to ptr\n";
                 } else {
                     out_ << "  " << result << " = bitcast " << source_type
                          << ' ' << reference(operand) << " to "

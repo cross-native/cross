@@ -457,13 +457,7 @@ std::string Preprocessor::evaluate_query(
     if (name == "$::has_feature") {
         if (one_of({"$::feature::runtime_free_intrinsics",
                     "$::feature::control_intrinsics",
-                     "$::feature::integer128",
-                     "$::feature::binary128_storage",
-                     "$::feature::binary128_arithmetic",
-                     "$::feature::fixed_vectors",
-                     "$::feature::atomics",
-                     "$::feature::variadics",
-                     "$::feature::evaluation",
+                    "$::feature::evaluation",
                     "$::feature::automatic_evaluation",
                     "$::feature::generics",
                     "$::feature::procedural_macros",
@@ -473,6 +467,20 @@ std::string Preprocessor::evaluate_query(
                     "$::feature::contextual_attributes",
                     "$::feature::external_models",
                     "$::feature::operator_binding"})) return "1";
+        if (target && target->architecture == "x86-64" &&
+            one_of({"$::feature::integer128",
+                    "$::feature::binary128_storage",
+                    "$::feature::binary128_arithmetic",
+                    "$::feature::fixed_vectors",
+                    "$::feature::atomics",
+                    "$::feature::variadics",
+                    "$::feature::thread_local"})) {
+            return "1";
+        }
+        if (target && target->architecture == "mips" &&
+            argument == "$::feature::atomics") {
+            return resolved_bool(options_, "m.llsc") ? "1" : "0";
+        }
         constexpr std::string_view prefix = "$::feature::";
         if (argument.starts_with(prefix)) {
             return feature_enabled(argument.substr(prefix.size())) ? "1" : "0";

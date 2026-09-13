@@ -7,6 +7,13 @@
 _start:
         lui $29,0x8080
         addiu $29,$29,-64
+        # Stable-to-private hard-float bridges may preserve o32 FPRs.
+        mfc0 $8,$12
+        lui $9,0x2000
+        or $8,$8,$9
+        mtc0 $8,$12
+        nop
+        nop
         move $16,$29
         addiu $4,$0,2301
         jal vla_entry

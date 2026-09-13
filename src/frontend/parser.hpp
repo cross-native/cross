@@ -69,6 +69,7 @@ private:
     std::unique_ptr<Expr> parse_assignment();
     std::unique_ptr<Expr> parse_conditional();
     std::unique_ptr<Expr> parse_binary(int minimum_precedence);
+    std::unique_ptr<Expr> parse_cast();
     std::unique_ptr<Expr> parse_unary();
     std::unique_ptr<Expr> parse_postfix();
     std::unique_ptr<Expr> parse_primary();
@@ -89,6 +90,7 @@ private:
     };
     std::unordered_map<std::string, RecordTag> record_types_;
     std::unordered_map<std::string, TypePtr> type_aliases_;
+    std::vector<StaticAssertDecl> static_assertions_;
     bool parsing_generic_argument_{};
     unsigned switch_depth_{};
     std::vector<bool> switch_default_seen_;

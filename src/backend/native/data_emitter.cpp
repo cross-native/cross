@@ -253,6 +253,18 @@ private:
                     "address width");
             }
             return;
+        case data::InitializerKind::Bytes:
+            for (std::size_t offset = 0; offset < object.bytes.size();) {
+                out_ << "\t.byte ";
+                const auto end = std::min(offset + 16, object.bytes.size());
+                for (auto index = offset; index < end; ++index) {
+                    if (index != offset) out_ << ',';
+                    out_ << static_cast<unsigned>(object.bytes[index]);
+                }
+                out_ << '\n';
+                offset = end;
+            }
+            return;
         }
     }
 

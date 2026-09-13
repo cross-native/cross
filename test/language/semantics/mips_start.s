@@ -9,6 +9,13 @@
 _start:
         lui $sp,0x8080
         addiu $sp,$sp,-64
+        # Stable-to-private hard-float bridges may preserve o32 FPRs.
+        mfc0 $t0,$12
+        lui $t1,0x2000
+        or $t0,$t0,$t1
+        mtc0 $t0,$12
+        nop
+        nop
         addiu $a0,$zero,256
         jal bool_integer
         nop

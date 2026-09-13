@@ -565,12 +565,14 @@ TypePtr Parser::parse_array_suffix(
     std::vector<std::uint32_t> bounds;
     while (consume("[")) {
         if (consume("]")) {
-            diagnostics_.error(
-                current().location,
-                parameter
-                    ? "an array parameter requires a positive fixed bound in the bootstrap compiler"
-                    : "an omitted array bound requires aggregate initializer inference, which is not implemented yet");
-            bounds.push_back(1);
+            if (parameter) {
+                diagnostics_.error(
+                    current().location,
+                    "an array parameter requires a positive fixed bound in the bootstrap compiler");
+                bounds.push_back(1);
+            } else {
+                bounds.push_back(0);
+            }
             continue;
         }
         const auto location = current().location;
@@ -678,6 +680,7 @@ Program Parser::parse() {
         // nested namespace, but it must not stall the outermost parse loop.
         if (index_ == before && current().kind != TokenKind::End) ++index_;
     }
+    program.static_assertions = std::move(static_assertions_);
     return program;
 }
 
@@ -938,28 +941,26 @@ void Parser::parse_enum_declaration(Program& program,
         underlying = *kind;
     }
 
+    EnumDecl declaration;
+    declaration.location = location;
+    declaration.name = *name;
+    declaration.underlying = underlying;
+    declaration.attributes = std::move(attributes);
     if (consume("{")) {
         while (!current().is("}") && current().kind != TokenKind::End) {
-            if (!consume_kind(TokenKind::Identifier)) {
+            const auto* token = consume_kind(TokenKind::Identifier);
+            if (!token) {
                 error_here("expected enumerator name");
                 while (!current().is(",") && !current().is("}") &&
                        current().kind != TokenKind::End) {
                     ++index_;
                 }
-            } else if (consume("=")) {
-                unsigned depth = 0;
-                while (current().kind != TokenKind::End) {
-                    if (depth == 0 &&
-                        (current().is(",") || current().is("}"))) {
-                        break;
-                    }
-                    if (current().is("(") || current().is("["))
-                        ++depth;
-                    else if ((current().is(")") || current().is("]")) &&
-                             depth != 0)
-                        --depth;
-                    ++index_;
-                }
+            } else {
+                EnumDecl::Enumerator enumerator;
+                enumerator.location = token->location;
+                enumerator.name = join_namespace(name_space, token->text);
+                if (consume("=")) enumerator.initializer = parse_assignment();
+                declaration.enumerators.push_back(std::move(enumerator));
             }
             if (!consume(",")) break;
         }
@@ -975,8 +976,7 @@ void Parser::parse_enum_declaration(Program& program,
     } else {
         enum_types_[*name] = underlying;
     }
-    program.enumerations.push_back(
-        {location, std::move(*name), underlying, std::move(attributes)});
+    program.enumerations.push_back(std::move(declaration));
 }
 
 void Parser::parse_record_declaration(
@@ -1078,17 +1078,14 @@ bool Parser::parse_static_assertion() {
     if (!message_token) error_here("expected diagnostic string in $::static_assert");
     expect(")");
     expect(";");
-    const auto value = condition ? constant_value(*condition) : std::nullopt;
-    if (!value) {
-        diagnostics_.error(location, "$::static_assert condition is not an integer constant expression");
-        return false;
-    }
-    if (*value == 0) {
-        const auto message = message_token ? decode_string_literal(message_token->text).value_or("static assertion failed")
-                                           : std::string("static assertion failed");
-        diagnostics_.error(location, "$::static_assert failed: " + message);
-        return false;
-    }
+    const auto message = message_token
+                             ? decode_string_literal(message_token->text)
+                                   .value_or("static assertion failed")
+                             : std::string("static assertion failed");
+    if (!condition) return false;
+    static_assertions_.push_back(
+        {location, active_namespace_, std::move(condition),
+         std::move(message)});
     return true;
 }
 
@@ -1196,12 +1193,27 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
     object->linkage = linkage;
     object->attributes = std::move(attributes);
     if (consume("=")) object->initializer = parse_expression();
+    if (object->type && object->type->kind == Type::Kind::Array &&
+        object->type->lanes == 0 && object->initializer &&
+        object->initializer->kind == Expr::Kind::String &&
+        object->type->element &&
+        object->type->element->kind == Type::Kind::Builtin &&
+        object->type->element->builtin == BuiltinType::U8) {
+        object->type->lanes = static_cast<std::uint32_t>(
+            object->initializer->string_value.size() + 1);
+    }
+    if (object->type && object->type->kind == Type::Kind::Array &&
+        object->type->lanes == 0) {
+        diagnostics_.error(location,
+                           "an omitted array bound requires a u8 string initializer");
+    }
     expect(";");
     return object;
 }
 
 bool Parser::local_declaration_start() const {
-    return current().is("register") || current().is("stack") || type_start();
+    return current().is("register") || current().is("stack") ||
+           current().is("static") || type_start();
 }
 
 std::unique_ptr<Statement> Parser::parse_local_declaration() {
@@ -1213,6 +1225,7 @@ std::unique_ptr<Statement> Parser::parse_local_declaration() {
     declaration.location = current().location;
     if (consume("register")) declaration.storage_register = true;
     else if (consume("stack")) declaration.storage_stack = true;
+    else if (consume("static")) declaration.storage_static = true;
     declaration.type = parse_type();
     std::optional<std::string> name;
     declaration.type =
@@ -1224,6 +1237,20 @@ std::unique_ptr<Statement> Parser::parse_local_declaration() {
         declaration.location_name = decode_string_literal(location->text);
     }
     if (consume("=")) declaration.initializer = parse_expression();
+    if (declaration.type && declaration.type->kind == Type::Kind::Array &&
+        declaration.type->lanes == 0 && declaration.initializer &&
+        declaration.initializer->kind == Expr::Kind::String &&
+        declaration.type->element &&
+        declaration.type->element->kind == Type::Kind::Builtin &&
+        declaration.type->element->builtin == BuiltinType::U8) {
+        declaration.type->lanes = static_cast<std::uint32_t>(
+            declaration.initializer->string_value.size() + 1);
+    }
+    if (declaration.type && declaration.type->kind == Type::Kind::Array &&
+        declaration.type->lanes == 0 && !declaration.dynamic_array_bound) {
+        diagnostics_.error(declaration.location,
+                           "an omitted array bound requires a u8 string initializer");
+    }
     expect(";");
     return statement;
 }
@@ -1416,7 +1443,7 @@ std::unique_ptr<Expr> Parser::parse_conditional() {
 }
 
 std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence) {
-    auto left = parse_unary();
+    auto left = parse_cast();
     for (;;) {
         if (parsing_generic_argument_ && current().is(">")) break;
         const int current_precedence = precedence(current().text);
@@ -1434,7 +1461,63 @@ std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence) {
     return left;
 }
 
+std::unique_ptr<Expr> Parser::parse_cast() {
+    if (current().is("(")) {
+        const auto saved = index_;
+        ++index_;
+        const bool begins_type = type_start();
+        index_ = saved;
+        if (begins_type) {
+            const auto location = current().location;
+            consume("(");
+            auto type = parse_type();
+            std::optional<std::string> name;
+            type = parse_declarator(std::move(type), name);
+            if (name) {
+                diagnostics_.error(location,
+                                   "a cast type name cannot declare an object");
+            }
+            expect(")", "after cast type");
+            auto result = std::make_unique<Expr>();
+            result->kind = Expr::Kind::Cast;
+            result->location = location;
+            result->type = std::move(type);
+            result->left = parse_cast();
+            return result;
+        }
+    }
+    return parse_unary();
+}
+
 std::unique_ptr<Expr> Parser::parse_unary() {
+    if (current().is("sizeof")) {
+        const auto location = current().location;
+        consume("sizeof");
+        auto result = std::make_unique<Expr>();
+        result->kind = Expr::Kind::Sizeof;
+        result->location = location;
+        if (current().is("(")) {
+            const auto saved = index_;
+            ++index_;
+            const bool begins_type = type_start();
+            index_ = saved;
+            if (begins_type) {
+                consume("(");
+                result->type = parse_type();
+                std::optional<std::string> name;
+                result->type = parse_declarator(std::move(result->type), name);
+                if (name) {
+                    diagnostics_.error(
+                        location,
+                        "a sizeof type name cannot declare an object");
+                }
+                expect(")", "after sizeof type");
+                return result;
+            }
+        }
+        result->left = parse_unary();
+        return result;
+    }
     if (current().is("+") || current().is("-") || current().is("!") ||
         current().is("~") || current().is("&") || current().is("*") ||
         current().is("++") || current().is("--")) {
@@ -1543,6 +1626,26 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
 
 std::unique_ptr<Expr> Parser::parse_primary() {
     const auto item = current();
+    if (current().is("$::alignof") && current(1).is("(")) {
+        index_ += 2;
+        auto result = std::make_unique<Expr>();
+        result->kind = Expr::Kind::Alignof;
+        result->location = item.location;
+        if (type_start()) {
+            result->type = parse_type();
+            std::optional<std::string> name;
+            result->type = parse_declarator(std::move(result->type), name);
+            if (name) {
+                diagnostics_.error(
+                    item.location,
+                    "an alignof type name cannot declare an object");
+            }
+        } else {
+            result->left = parse_expression();
+        }
+        expect(")", "after alignof operand");
+        return result;
+    }
     if (consume("(")) {
         const bool previous = parsing_generic_argument_;
         parsing_generic_argument_ = false;
@@ -1560,7 +1663,20 @@ std::unique_ptr<Expr> Parser::parse_primary() {
     result->text = std::string(item.text);
     if (item.kind == TokenKind::Integer) result->kind = Expr::Kind::Integer;
     else if (item.kind == TokenKind::Floating) result->kind = Expr::Kind::Floating;
-    else if (item.kind == TokenKind::String) result->kind = Expr::Kind::String;
+    else if (item.kind == TokenKind::String) {
+        result->kind = Expr::Kind::String;
+        while (current().kind == TokenKind::String) {
+            const auto decoded = decode_string_literal(current().text);
+            if (!decoded) {
+                diagnostics_.error(current().location,
+                                   "invalid UTF-8 string literal");
+            } else {
+                result->string_value += *decoded;
+            }
+            ++index_;
+        }
+        return result;
+    }
     else if (item.kind == TokenKind::Character) result->kind = Expr::Kind::Character;
     else if (item.kind == TokenKind::Identifier || item.kind == TokenKind::BuiltinName) {
         result->kind = Expr::Kind::Name;

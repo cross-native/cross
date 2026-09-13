@@ -9,6 +9,14 @@
 _start:
         lui $29,0x8080
         addiu $29,$29,-64
+        # A hard-float o32 bridge may preserve FPRs even when the source uses
+        # only integers. Bare startup owns enabling CP1 before entering it.
+        mfc0 $8,$12
+        lui $9,0x2000
+        or $8,$8,$9
+        mtc0 $8,$12
+        nop
+        nop
         jal required_constants_entry
         nop
         addiu $8,$zero,1

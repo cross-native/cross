@@ -558,10 +558,27 @@ bool lower_initializer(Object& result, const hir::Module& module,
     const auto& expression = *declaration.initializer;
     const auto& type = module.type(entity.type);
     if (type.kind == hir::Type::Kind::Array) {
-        diagnostics.error(
-            expression.location,
-            "aggregate array initializers are not implemented yet");
-        return false;
+        if (!type.element ||
+            module.type(*type.element).kind != hir::Type::Kind::Builtin ||
+            module.type(*type.element).builtin != BuiltinType::U8 ||
+            expression.kind != Expr::Kind::String) {
+            diagnostics.error(
+                expression.location,
+                "aggregate array initializers are not implemented yet");
+            return false;
+        }
+        const auto required = expression.string_value.size() + 1;
+        if (required > result.size) {
+            diagnostics.error(
+                expression.location,
+                "string initializer does not fit in the u8 array");
+            return false;
+        }
+        result.initializer = InitializerKind::Bytes;
+        result.bytes.assign(result.size, 0);
+        std::copy(expression.string_value.begin(),
+                  expression.string_value.end(), result.bytes.begin());
+        return true;
     }
     if (type.kind == hir::Type::Kind::Record) {
         diagnostics.error(

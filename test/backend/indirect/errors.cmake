@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
-foreach(case signature count mode abi object global)
+foreach(case signature count mode object global)
     execute_process(COMMAND "${CC}" -O2 -S
         "${CMAKE_CURRENT_LIST_DIR}/bad_${case}.x" -o "${OUTPUT}-${case}.s"
         RESULT_VARIABLE status ERROR_VARIABLE error)

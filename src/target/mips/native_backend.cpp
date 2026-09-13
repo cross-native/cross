@@ -1588,7 +1588,65 @@ private:
     }
 
     bool allocate_registers(machine::Function& function) {
-        if (!options_.register_allocation) return false;
+        const auto& entity = hir_.function(function.source);
+        if (!options_.register_allocation) {
+            const auto* abi = managed_abi_model(entity, subtarget_, options_);
+            bool changed = false;
+            std::unordered_set<std::uint32_t> saved;
+            const auto add_save = [&](machine::PhysicalRegisterId physical) {
+                if (physical.value > fpr_physical_base &&
+                    physical.value < fpr_physical_base + fpr_names.size() &&
+                    (physical.value - fpr_physical_base) % 2U != 0 &&
+                    subtarget_.has_feature(Feature::Mips2) &&
+                    !subtarget_.has_feature(Feature::Fp64) &&
+                    !subtarget_.has_feature(Feature::SingleFloat)) {
+                    --physical.value;
+                }
+                const auto integer_name = gpr_name(physical);
+                const auto floating_name = fpr_name(physical);
+                const auto name = floating_name.empty() ? integer_name
+                                                        : floating_name;
+                if (name.empty() || !saved.insert(physical.value).second ||
+                    (abi && std::find(
+                        abi->call_clobbers.begin(), abi->call_clobbers.end(),
+                        name) != abi->call_clobbers.end())) {
+                    return;
+                }
+                function.callee_saved_registers.push_back(physical);
+                changed = true;
+                machine::StackSlot save;
+                save.id = {static_cast<std::uint32_t>(
+                    function.stack_slots.size())};
+                save.kind = machine::StackSlotKind::CalleeSave;
+                save.size = !floating_name.empty()
+                                ? subtarget_.has_feature(Feature::Fp64) ||
+                                          (subtarget_.has_feature(Feature::Mips2) &&
+                                           !subtarget_.has_feature(Feature::SingleFloat))
+                                      ? 8U
+                                      : 4U
+                            : subtarget_.has_feature(Feature::Mips3) ? 8U
+                                                                    : 4U;
+                save.saved_register = machine::Register::physical_register(
+                    physical,
+                    machine::IntegerMode{static_cast<std::uint16_t>(
+                        save.size * 8U)});
+                save.alignment = save.size;
+                save.location = function.location;
+                save.name = "$callee.save." + std::string(name);
+                function.stack_slots.push_back(std::move(save));
+            };
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    for (const auto& clobber : instruction.clobbers) {
+                        if (clobber.kind ==
+                            machine::RegisterKind::Physical) {
+                            add_save({clobber.id});
+                        }
+                    }
+                }
+            }
+            return changed;
+        }
         const auto count = function.virtual_registers.size();
         if (count == 0) return false;
 
@@ -1720,7 +1778,6 @@ private:
         std::vector<LiveSet> hard_forbidden_colors(count);
         std::vector<std::vector<machine::PhysicalRegisterId>>
             preferred_physical_colors(count);
-        const auto& entity = hir_.function(function.source);
         const auto* function_abi = managed_abi_model(
             entity, subtarget_, options_);
         const auto function_layout = function_abi
@@ -2352,8 +2409,6 @@ private:
                 }
             }
         }
-        if (!changed) return false;
-
         // Preserve only volatile assignments that actually cross a specific
         // call. Stable colors need no traffic; volatile colors retain their
         // existing spill home for one store/reload pair around that call.
@@ -2411,6 +2466,50 @@ private:
                    contains(entity.clobbers);
         };
         std::unordered_set<std::uint32_t> saved;
+        const auto preserve_storage = [&](machine::PhysicalRegisterId physical) {
+            if (physical.value > fpr_physical_base &&
+                physical.value < fpr_physical_base + fpr_names.size() &&
+                (physical.value - fpr_physical_base) % 2U != 0 &&
+                subtarget_.has_feature(Feature::Mips2) &&
+                !subtarget_.has_feature(Feature::Fp64) &&
+                !subtarget_.has_feature(Feature::SingleFloat)) {
+                --physical.value;
+            }
+            const auto integer_name = gpr_name(physical);
+            const auto floating_name = fpr_name(physical);
+            const bool preserved_integer =
+                physical.value >= 16 && physical.value <= 23 &&
+                !function_clobbers(integer_name);
+            const bool preserved_floating = !floating_name.empty() &&
+                !function_clobbers(floating_name);
+            if ((!preserved_integer && !preserved_floating) ||
+                function.frame.elide_incoming_saves ||
+                !saved.insert(physical.value).second) {
+                return;
+            }
+            function.callee_saved_registers.push_back(physical);
+            changed = true;
+            machine::StackSlot save;
+            save.id = {static_cast<std::uint32_t>(
+                function.stack_slots.size())};
+            save.kind = machine::StackSlotKind::CalleeSave;
+            save.size = preserved_floating
+                            ? subtarget_.has_feature(Feature::Fp64) ||
+                                      (subtarget_.has_feature(Feature::Mips2) &&
+                                       !subtarget_.has_feature(Feature::SingleFloat))
+                                  ? 8U
+                                  : 4U
+                        : subtarget_.has_feature(Feature::Mips3) ? 8U : 4U;
+            save.saved_register = machine::Register::physical_register(
+                physical, machine::IntegerMode{static_cast<std::uint16_t>(
+                              save.size * 8U)});
+            save.alignment = save.size;
+            save.location = function.location;
+            save.name = "$callee.save." +
+                std::string(preserved_floating ? floating_name
+                                               : integer_name);
+            function.stack_slots.push_back(std::move(save));
+        };
         for (std::size_t id = 0; id < count; ++id) {
             const auto assignment =
                 function.virtual_register_assignments[id];
@@ -2425,36 +2524,22 @@ private:
                     break;
                 }
             }
-            const auto integer_name = gpr_name(*assignment);
-            const auto floating_name = fpr_name(*assignment);
-            const bool preserved_integer =
-                assignment->value >= 16 && assignment->value <= 23 &&
-                !function_clobbers(integer_name);
-            const bool preserved_floating = !floating_name.empty() &&
-                !function_clobbers(floating_name);
-            if ((!preserved_integer && !preserved_floating) ||
-                function.frame.elide_incoming_saves ||
-                !saved.insert(assignment->value).second) {
-                continue;
-            }
-            function.callee_saved_registers.push_back(*assignment);
-            machine::StackSlot save;
-            save.id = {static_cast<std::uint32_t>(
-                function.stack_slots.size())};
-            save.kind = machine::StackSlotKind::CalleeSave;
-            save.size = preserved_floating ||
-                    subtarget_.has_feature(Feature::Mips3)
-                ? 8U : 4U;
-            save.saved_register = machine::Register::physical_register(
-                *assignment, machine::IntegerMode{static_cast<std::uint16_t>(save.size * 8U)});
-            save.alignment = save.size;
-            save.location = function.location;
-            save.name = "$callee.save." +
-                std::string(preserved_floating ? floating_name
-                                               : integer_name);
-            function.stack_slots.push_back(std::move(save));
+            preserve_storage(*assignment);
         }
-        return true;
+        // A registered entry may call a private dynamic interface that uses
+        // registers its own ABI promises to preserve as argument or scratch
+        // storage. Those bridge clobbers need homes even when none of the
+        // caller's virtual values happens to allocate to the register.
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& clobber : instruction.clobbers) {
+                    if (clobber.kind == machine::RegisterKind::Physical) {
+                        preserve_storage({clobber.id});
+                    }
+                }
+            }
+        }
+        return changed;
     }
 
     bool fold_pointer_offsets(machine::Function& function) {
@@ -5264,7 +5349,7 @@ private:
                 continue;
             }
             instruction(!floating_name.empty()
-                            ? "sdc1"
+                            ? slot->size > 4 ? "sdc1" : "swc1"
                             : slot->size > 4 ? "sd" : "sw",
                         reg_name(name) + "," +
                             memory(*slot->frame_offset));
@@ -5288,7 +5373,7 @@ private:
                 function, "$callee.save." + std::string(name));
             if (name.empty() || !slot || !slot->frame_offset) continue;
             instruction(!floating_name.empty()
-                            ? "ldc1"
+                            ? slot->size > 4 ? "ldc1" : "lwc1"
                             : slot->size > 4 ? "ld" : "lw",
                         reg_name(name) + "," +
                             memory(*slot->frame_offset));
@@ -5403,7 +5488,10 @@ private:
                 const bool load = effect.operation == machine::FrameOperation::Restore;
                 const auto floating = fpr_name({transfer.reg.id});
                 const auto reg = floating.empty() ? gpr_name({transfer.reg.id}) : floating;
-                const auto opcode = !floating.empty() ? (load ? "ldc1" : "sdc1")
+                const auto opcode = !floating.empty()
+                    ? transfer.reg.mode.bits > 32
+                        ? (load ? "ldc1" : "sdc1")
+                        : (load ? "lwc1" : "swc1")
                     : transfer.reg.mode.bits > 32 ? (load ? "ld" : "sd") : (load ? "lw" : "sw");
                 instruction(opcode, reg_name(reg) + "," + std::to_string(transfer.offset) +
                                     "(" + base + ")");

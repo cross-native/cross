@@ -8,6 +8,14 @@
 _start:
         lui $29,0x8080
         addiu $29,$29,-64
+        # The hard-float target may legitimately preserve o32 FPRs around a
+        # private Cross call. Bare startup owns enabling CP1.
+        mfc0 $8,$12
+        lui $9,0x2000
+        or $8,$8,$9
+        mtc0 $8,$12
+        nop
+        nop
         li $16,0x12345678
         addiu $4,$0,17
         jal indirect_test

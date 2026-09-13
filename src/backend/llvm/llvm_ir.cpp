@@ -264,6 +264,16 @@ private:
             return floating_initializer(object);
         case data::InitializerKind::Address:
             return address_initializer(object);
+        case data::InitializerKind::Bytes: {
+            std::string result = "[";
+            for (std::size_t index = 0; index < object.bytes.size(); ++index) {
+                if (index != 0) result += ", ";
+                result += "i8 " +
+                          std::to_string(
+                              static_cast<unsigned>(object.bytes[index]));
+            }
+            return result + ']';
+        }
         }
         return "zeroinitializer";
     }

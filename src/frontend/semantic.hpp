@@ -5,6 +5,9 @@
 #include "common/diagnostic.hpp"
 #include "frontend/ast.hpp"
 
+#include <cstdint>
+#include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -21,6 +24,16 @@ bool is_known_attribute(std::string_view name);
 // generic call, staging wrapper, or evaluation-only function remains.
 bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls = true,
-                      std::string_view mangling = "default");
+                      std::string_view mangling = "default",
+                      std::string_view default_abi = "default");
+
+using LayoutQuery =
+    std::function<std::optional<std::uint64_t>(const TypePtr&)>;
+
+// Static assertions are retained until target HIR has established nominal
+// layouts.  The callbacks keep target layout ownership out of the frontend.
+bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
+                               const LayoutQuery& size_of,
+                               const LayoutQuery& align_of);
 
 } // namespace cross

@@ -527,10 +527,10 @@ public:
                                         transfer.reg.mode.bits == 64 &&
                                         !subtarget.has_feature(Feature::Mips3)) ||
                                        (transfer.reg.id >= 32 &&
-                                        (transfer.reg.mode.bits != 64 ||
-                                         !subtarget.has_feature(Feature::Mips2) ||
-                                         !subtarget.has_feature(Feature::HardFloat) ||
-                                         subtarget.has_feature(Feature::SingleFloat)));
+                                        (!subtarget.has_feature(Feature::HardFloat) ||
+                                         (transfer.reg.mode.bits == 64 &&
+                                          (!subtarget.has_feature(Feature::Mips2) ||
+                                           subtarget.has_feature(Feature::SingleFloat)))));
                             })) {
                         diagnostics.error(instruction.location,
                                           "illegal selected MIPS frame instruction");

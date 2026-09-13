@@ -75,6 +75,10 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             type.kind == hir::Type::Kind::Pointer ||
             (type.kind == hir::Type::Kind::Builtin &&
              type.builtin == BuiltinType::Label);
+        const bool byte_array =
+            type.kind == hir::Type::Kind::Array && type.element &&
+            module.hir().type(*type.element).kind == hir::Type::Kind::Builtin &&
+            module.hir().type(*type.element).builtin == BuiltinType::U8;
         const bool declaration =
             object.initializer == data::InitializerKind::Declaration;
         if (declaration != (entity.definition == nullptr) ||
@@ -84,8 +88,12 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
              !floating) ||
             (object.initializer == data::InitializerKind::Address &&
              !address) ||
+            (object.initializer == data::InitializerKind::Bytes &&
+             (!byte_array || object.bytes.size() != object.size)) ||
             (object.initializer != data::InitializerKind::Address &&
-             object.address)) {
+             object.address) ||
+            (object.initializer != data::InitializerKind::Bytes &&
+             !object.bytes.empty())) {
             diagnostics.error(object.location,
                               "data IR initializer disagrees with HIR object");
             valid = false;

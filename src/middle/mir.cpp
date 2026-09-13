@@ -473,6 +473,13 @@ bool eligible_expression(const Expr& expression) {
         return true;
     case Expr::Kind::Parenthesized:
         return expression.left && eligible_expression(*expression.left);
+    case Expr::Kind::Cast:
+        return expression.type && expression.left &&
+               eligible_expression(*expression.left);
+    case Expr::Kind::Sizeof:
+    case Expr::Kind::Alignof:
+        return expression.type ||
+               (expression.left && eligible_expression(*expression.left));
     case Expr::Kind::Unary:
         return expression.left &&
                (expression.text == "+" || expression.text == "-" ||
@@ -577,6 +584,14 @@ bool valid_assumption_expression(const Expr& expression) {
     case Expr::Kind::Parenthesized:
         return expression.left &&
                valid_assumption_expression(*expression.left);
+    case Expr::Kind::Cast:
+        return expression.type && expression.left &&
+               valid_assumption_expression(*expression.left);
+    case Expr::Kind::Sizeof:
+    case Expr::Kind::Alignof:
+        return expression.type ||
+               (expression.left &&
+                valid_assumption_expression(*expression.left));
     case Expr::Kind::Unary:
         return expression.left &&
                (expression.text == "+" || expression.text == "-" ||
@@ -1913,7 +1928,12 @@ private:
         switch (expression.kind) {
         case Expr::Kind::Integer: {
             const auto parsed = patch_initial(expression, hir_.address_bits);
-            return parsed ? hir_.builtin(parsed->type) : std::nullopt;
+            return parsed
+                       ? std::optional<hir::TypeId>(
+                             expression.type
+                                 ? hir_.intern_type(expression.type)
+                                 : *hir_.builtin(parsed->type))
+                       : std::nullopt;
         }
         case Expr::Kind::Floating: {
             const auto parsed = parse_floating(expression.text,
@@ -1956,6 +1976,14 @@ private:
         }
         case Expr::Kind::Parenthesized:
             return expression.left ? infer_type(*expression.left) : std::nullopt;
+        case Expr::Kind::Cast:
+            return expression.type
+                       ? std::optional<hir::TypeId>(
+                             hir_.intern_type(expression.type))
+                       : std::nullopt;
+        case Expr::Kind::Sizeof:
+        case Expr::Kind::Alignof:
+            return hir_.builtin(BuiltinType::Uptr);
         case Expr::Kind::Unary:
             if (expression.text == "++" || expression.text == "--" ||
                 expression.text == "post++" || expression.text == "post--") {
@@ -2089,6 +2117,24 @@ private:
             const auto left = infer_type(*expression.left);
             const auto right = infer_type(*expression.right);
             if (!left || !right) return std::nullopt;
+            const bool left_pointer = pointer_type(hir_, *left);
+            const bool right_pointer = pointer_type(hir_, *right);
+            if (expression.text == "+" && left_pointer &&
+                integer_type(hir_, *right)) {
+                return left;
+            }
+            if (expression.text == "+" && right_pointer &&
+                integer_type(hir_, *left)) {
+                return right;
+            }
+            if (expression.text == "-" && left_pointer &&
+                integer_type(hir_, *right)) {
+                return left;
+            }
+            if (expression.text == "-" && left_pointer && right_pointer &&
+                *left == *right) {
+                return hir_.builtin(BuiltinType::Iptr);
+            }
             if (expression.text == "==" || expression.text == "!=" ||
                 expression.text == "<" || expression.text == "<=" ||
                 expression.text == ">" || expression.text == ">=") {
@@ -2490,7 +2536,10 @@ private:
         case Expr::Kind::Integer: {
             const auto parsed = patch_initial(expression, hir_.address_bits);
             if (!parsed) break;
-            const auto type = hir_.builtin(parsed->type);
+            const auto type = expression.type
+                                  ? std::optional<hir::TypeId>(
+                                        hir_.intern_type(expression.type))
+                                  : hir_.builtin(parsed->type);
             if (!type) break;
             result = constant(parsed->value, *type, expression.location);
             break;
@@ -2544,6 +2593,119 @@ private:
         case Expr::Kind::Parenthesized:
             if (expression.left) result = lower_expression(*expression.left);
             break;
+        case Expr::Kind::Cast: {
+            if (!expression.left || !expression.type) break;
+            const auto destination_type = hir_.intern_type(expression.type);
+            auto source = lower_expression(*expression.left);
+            if (!source) break;
+            const auto source_type = current_.values[source->value].type;
+            if ((!scalar_type(hir_, source_type) ||
+                 !scalar_type(hir_, destination_type)) &&
+                !representation_compatible(hir_, source_type,
+                                           destination_type)) {
+                diagnostics_.error(
+                    expression.location,
+                    "explicit cast requires arithmetic, pointer, or compatible aggregate types");
+                break;
+            }
+            const auto source_pointer = pointer_type(hir_, source_type);
+            const auto destination_pointer =
+                pointer_type(hir_, destination_type);
+            const bool destination_bool =
+                hir_.type(destination_type).kind == hir::Type::Kind::Builtin &&
+                hir_.type(destination_type).builtin == BuiltinType::Bool;
+            if (source_pointer && destination_pointer) {
+                const auto& source_pointer_type = hir_.type(source_type);
+                const auto& destination_pointer_type =
+                    hir_.type(destination_type);
+                if (!source_pointer_type.pointee ||
+                    !destination_pointer_type.pointee ||
+                    !compatible_pointer_conversion(
+                        *source_pointer_type.pointee,
+                        *destination_pointer_type.pointee)) {
+                    diagnostics_.error(
+                        expression.location,
+                        "explicit pointer conversion discards qualifiers or "
+                        "uses incompatible pointee types");
+                    break;
+                }
+            } else if ((source_pointer || destination_pointer) &&
+                       !destination_bool &&
+                       !integer_type(hir_, source_pointer ? destination_type
+                                                         : source_type)) {
+                diagnostics_.error(
+                    expression.location,
+                    "explicit cast cannot convert between a pointer and a non-integer type");
+                break;
+            } else if (!destination_bool &&
+                       ((source_pointer &&
+                         type_bits(hir_, destination_type) <
+                             hir_.address_bits) ||
+                        (destination_pointer &&
+                         type_bits(hir_, source_type) < hir_.address_bits))) {
+                diagnostics_.error(
+                    expression.location,
+                    "pointer casts require an integer at least as wide as the target address");
+                break;
+            }
+            result = cast(*source, destination_type, expression.location);
+            break;
+        }
+        case Expr::Kind::Sizeof: {
+            std::optional<hir::TypeId> queried;
+            if (expression.type) {
+                queried = hir_.intern_type(expression.type);
+            } else if (expression.left) {
+                queried = designator_type(*expression.left);
+                if (!queried) queried = infer_type(*expression.left);
+            }
+            if (!queried) break;
+            const auto& type = hir_.type(*queried);
+            const auto invalid =
+                type.kind == hir::Type::Kind::Function ||
+                (type.kind == hir::Type::Kind::Builtin &&
+                 type.builtin == BuiltinType::Void) ||
+                (type.kind == hir::Type::Kind::Vector && type.scalable) ||
+                (type.kind == hir::Type::Kind::Record &&
+                 (!type.record || !hir_.record(*type.record).complete));
+            const auto size = storage_size(hir_, *queried, target_);
+            if (invalid || size == 0) {
+                diagnostics_.error(expression.location,
+                                   "sizeof requires a complete object type with fixed size");
+                break;
+            }
+            result = constant(UInt128{size},
+                              *hir_.builtin(BuiltinType::Uptr),
+                              expression.location);
+            break;
+        }
+        case Expr::Kind::Alignof: {
+            std::optional<hir::TypeId> queried;
+            if (expression.type) {
+                queried = hir_.intern_type(expression.type);
+            } else if (expression.left) {
+                queried = designator_type(*expression.left);
+                if (!queried) queried = infer_type(*expression.left);
+            }
+            if (!queried) break;
+            const auto& type = hir_.type(*queried);
+            const auto invalid =
+                type.kind == hir::Type::Kind::Function ||
+                (type.kind == hir::Type::Kind::Builtin &&
+                 type.builtin == BuiltinType::Void) ||
+                (type.kind == hir::Type::Kind::Record &&
+                 (!type.record || !hir_.record(*type.record).complete));
+            if (invalid) {
+                diagnostics_.error(
+                    expression.location,
+                    "$::alignof requires a complete object type");
+                break;
+            }
+            result = constant(
+                UInt128{storage_alignment(hir_, *queried, target_)},
+                *hir_.builtin(BuiltinType::Uptr), expression.location);
+            break;
+        }
         case Expr::Kind::Unary: {
             if (expression.text == "&") {
                 const Expr* operand = expression.left.get();
@@ -2676,32 +2838,63 @@ private:
                         designator->address, expression.location,
                         designator->alignment);
                     if (!old) break;
-                    const auto one = unit_value(
-                        designator->type, expression.location);
-                    const auto updated = add_value(
-                        ValueKind::Binary, designator->type,
-                        expression.location);
-                    auto& binary = current_.values[updated.value];
-                    binary.binary = expression.text == "++" ||
-                                            expression.text == "post++"
-                                        ? BinaryOperation::Add
-                                        : BinaryOperation::Subtract;
-                    binary.operands = {*old, one};
+                    std::optional<ValueId> updated;
+                    if (pointer_type(hir_, designator->type)) {
+                        const auto one = constant(
+                            UInt128{1}, *hir_.builtin(BuiltinType::Iptr),
+                            expression.location);
+                        updated = pointer_offset(
+                            *old, designator->type, one,
+                            expression.text == "++" ||
+                                expression.text == "post++",
+                            expression.location);
+                    } else {
+                        const auto one = unit_value(
+                            designator->type, expression.location);
+                        const auto value = add_value(
+                            ValueKind::Binary, designator->type,
+                            expression.location);
+                        auto& binary = current_.values[value.value];
+                        binary.binary = expression.text == "++" ||
+                                                expression.text == "post++"
+                                            ? BinaryOperation::Add
+                                            : BinaryOperation::Subtract;
+                        binary.operands = {*old, one};
+                        updated = value;
+                    }
+                    if (!updated) break;
                     if (!store_pointer(
-                            designator->address, updated,
+                            designator->address, *updated,
                             expression.location,
                             designator->alignment)) {
                         break;
                     }
                     result = expression.text.starts_with("post")
                                  ? *old
-                                 : updated;
+                                 : *updated;
                     break;
                 }
                 if (found->dynamic_address ||
                     array_type(hir_, found->type)) break;
                 const auto binding = *found;
                 const auto old = load_slot(binding, expression.location);
+                if (pointer_type(hir_, binding.type)) {
+                    const auto one = constant(
+                        UInt128{1}, *hir_.builtin(BuiltinType::Iptr),
+                        expression.location);
+                    const auto updated = pointer_offset(
+                        old, binding.type, one,
+                        expression.text == "++" ||
+                            expression.text == "post++",
+                        expression.location);
+                    if (!updated) break;
+                    (void)store_slot(binding, *updated,
+                                     expression.location);
+                    result = expression.text.starts_with("post")
+                                 ? old
+                                 : *updated;
+                    break;
+                }
                 auto one_type = binding.type;
                 if (vector_type(hir_, binding.type)) {
                     one_type = *hir_.type(binding.type).element;
@@ -2855,6 +3048,90 @@ private:
         const auto left_type = infer_type(*expression.left);
         const auto right_type = infer_type(*expression.right);
         if (!left_type || !right_type) return std::nullopt;
+        const bool left_pointer = pointer_type(hir_, *left_type);
+        const bool right_pointer = pointer_type(hir_, *right_type);
+        const bool addition = expression.text == "+";
+        const bool subtraction = expression.text == "-";
+        if ((addition || subtraction) &&
+            (left_pointer || right_pointer)) {
+            if (left_pointer && right_pointer) {
+                if (!subtraction || *left_type != *right_type) {
+                    diagnostics_.error(
+                        expression.location,
+                        "pointer subtraction requires matching pointer types");
+                    return std::nullopt;
+                }
+                const auto& pointer = hir_.type(*left_type);
+                if (!pointer.pointee ||
+                    storage_size(hir_, *pointer.pointee, target_) == 0) {
+                    diagnostics_.error(
+                        expression.location,
+                        "pointer subtraction requires a complete pointed-to object type");
+                    return std::nullopt;
+                }
+                auto left = lower_expression(*expression.left);
+                auto right = lower_expression(*expression.right);
+                if (!left || !right) return std::nullopt;
+                const auto iptr = *hir_.builtin(BuiltinType::Iptr);
+                left = cast(*left, iptr, expression.left->location);
+                right = cast(*right, iptr, expression.right->location);
+                const auto bytes = add_value(ValueKind::Binary, iptr,
+                                             expression.location);
+                auto& difference = current_.values[bytes.value];
+                difference.binary = BinaryOperation::Subtract;
+                difference.operands = {*left, *right};
+                const auto element_size =
+                    storage_size(hir_, *pointer.pointee, target_);
+                if (element_size == 1) return bytes;
+                const auto divisor = constant(UInt128{element_size}, iptr,
+                                              expression.location);
+                const auto result = add_value(ValueKind::Binary, iptr,
+                                              expression.location);
+                auto& quotient = current_.values[result.value];
+                quotient.binary = BinaryOperation::SignedDivide;
+                quotient.operands = {bytes, divisor};
+                return result;
+            }
+
+            const bool pointer_on_left = left_pointer;
+            if ((!pointer_on_left && !addition) ||
+                !integer_type(hir_, pointer_on_left ? *right_type
+                                                   : *left_type)) {
+                diagnostics_.error(
+                    expression.location,
+                    "pointer arithmetic requires one pointer and one integer operand");
+                return std::nullopt;
+            }
+            const auto pointer_type_id =
+                pointer_on_left ? *left_type : *right_type;
+            const auto& pointer = hir_.type(pointer_type_id);
+            if (!pointer.pointee ||
+                storage_size(hir_, *pointer.pointee, target_) == 0) {
+                diagnostics_.error(
+                    expression.location,
+                    "pointer arithmetic requires a complete pointed-to object type");
+                return std::nullopt;
+            }
+            auto base = lower_expression(
+                *(pointer_on_left ? expression.left : expression.right));
+            auto index = lower_expression(
+                *(pointer_on_left ? expression.right : expression.left));
+            if (!base || !index) return std::nullopt;
+            const auto iptr = *hir_.builtin(BuiltinType::Iptr);
+            index = cast(*index, iptr,
+                         pointer_on_left ? expression.right->location
+                                         : expression.left->location);
+            if (subtraction) {
+                const auto negated = add_value(ValueKind::Unary, iptr,
+                                               expression.location);
+                auto& unary = current_.values[negated.value];
+                unary.unary = UnaryOperation::Negate;
+                unary.operands.push_back(*index);
+                index = negated;
+            }
+            return indexed_address(*base, *index, *pointer.pointee,
+                                   expression.location);
+        }
         const bool shift = expression.text == "<<" || expression.text == ">>";
         const bool floating = floating_type(hir_, *left_type) ||
                               floating_type(hir_, *right_type) ||
@@ -3012,6 +3289,31 @@ private:
         return constant(1, type, location);
     }
 
+    std::optional<ValueId> pointer_offset(ValueId base,
+                                          hir::TypeId pointer_type_id,
+                                          ValueId index, bool addition,
+                                          SourceLocation location) {
+        const auto& pointer = hir_.type(pointer_type_id);
+        if (pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee ||
+            storage_size(hir_, *pointer.pointee, target_) == 0 ||
+            !integer_type(hir_, current_.values[index.value].type)) {
+            diagnostics_.error(
+                location,
+                "pointer arithmetic requires an integer offset and a complete pointed-to object type");
+            return std::nullopt;
+        }
+        const auto iptr = *hir_.builtin(BuiltinType::Iptr);
+        index = cast(index, iptr, location);
+        if (!addition) {
+            const auto negated = add_value(ValueKind::Unary, iptr, location);
+            auto& unary = current_.values[negated.value];
+            unary.unary = UnaryOperation::Negate;
+            unary.operands.push_back(index);
+            index = negated;
+        }
+        return indexed_address(base, index, *pointer.pointee, location);
+    }
+
     std::optional<ValueId> atomic_update(
         const AtomicLvalue& lvalue, ValueId right, BinaryOperation operation,
         SourceLocation location, bool return_old = false) {
@@ -3127,6 +3429,23 @@ private:
             auto left = load_pointer(designator->address,
                                      expression.location,
                                      designator->alignment);
+            if (left && pointer_type(hir_, designator->type)) {
+                if (expression.text != "+=" && expression.text != "-=") {
+                    return std::nullopt;
+                }
+                auto right = lower_expression(*expression.right);
+                if (!right) return std::nullopt;
+                const auto result = pointer_offset(
+                    *left, designator->type, *right,
+                    expression.text == "+=", expression.location);
+                if (!result ||
+                    !store_pointer(designator->address, *result,
+                                   expression.location,
+                                   designator->alignment)) {
+                    return std::nullopt;
+                }
+                return result;
+            }
             auto right = lower_expression(*expression.right,
                                           designator->type);
             const auto operation = compound_operation(
@@ -3179,6 +3498,23 @@ private:
                     return source;
                 }
                 auto left = load_pointer(address, expression.location);
+                if (left && pointer_type(hir_, *element_type)) {
+                    if (expression.text != "+=" &&
+                        expression.text != "-=") {
+                        return std::nullopt;
+                    }
+                    auto right = lower_expression(*expression.right);
+                    if (!right) return std::nullopt;
+                    const auto pointer_result = pointer_offset(
+                        *left, *element_type, *right,
+                        expression.text == "+=", expression.location);
+                    if (!pointer_result ||
+                        !store_pointer(address, *pointer_result,
+                                       expression.location)) {
+                        return std::nullopt;
+                    }
+                    return pointer_result;
+                }
                 auto right = lower_expression(*expression.right,
                                               *element_type);
                 const auto operation = compound_operation(
@@ -3265,6 +3601,22 @@ private:
                 return source;
             }
             auto left = load_pointer(*address, expression.location);
+            if (left && pointer_type(hir_, *type)) {
+                if (expression.text != "+=" && expression.text != "-=") {
+                    return std::nullopt;
+                }
+                auto right = lower_expression(*expression.right);
+                if (!right) return std::nullopt;
+                const auto result = pointer_offset(
+                    *left, *type, *right, expression.text == "+=",
+                    expression.location);
+                if (!result ||
+                    !store_pointer(*address, *result,
+                                   expression.location)) {
+                    return std::nullopt;
+                }
+                return result;
+            }
             auto right = lower_expression(*expression.right, *type);
             const auto operation = compound_operation(
                 expression.text, *type, expression.location);
@@ -3304,6 +3656,25 @@ private:
         } else {
             const auto left = found ? load_slot(*found, expression.location)
                                     : load_global(*object, expression.location);
+            if (pointer_type(hir_, type)) {
+                if (expression.text != "+=" && expression.text != "-=") {
+                    return std::nullopt;
+                }
+                auto right = lower_expression(*expression.right);
+                if (!right) return std::nullopt;
+                const auto updated = pointer_offset(
+                    left, type, *right, expression.text == "+=",
+                    expression.location);
+                if (!updated) return std::nullopt;
+                result = *updated;
+                if (found) {
+                    (void)store_slot(*found, result, expression.location);
+                } else {
+                    (void)store_global(*object, result,
+                                       expression.location);
+                }
+                return result;
+            }
             auto right = lower_expression(*expression.right, type);
             if (!right) return std::nullopt;
             if (!integer_type(hir_, type) && !floating_type(hir_, type) &&

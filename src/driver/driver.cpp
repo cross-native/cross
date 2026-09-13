@@ -276,12 +276,6 @@ void print_instructions(const CompilerOptions& options) {
 void print_features(const CompilerOptions& options) {
     std::cout << "$::feature::runtime_free_intrinsics\n"
                  "$::feature::control_intrinsics\n"
-                  "$::feature::integer128\n"
-                  "$::feature::binary128_storage\n"
-                  "$::feature::binary128_arithmetic\n"
-                  "$::feature::fixed_vectors\n"
-                  "$::feature::atomics\n"
-                  "$::feature::variadics\n"
                   "$::feature::evaluation\n"
                  "$::feature::automatic_evaluation\n"
                  "$::feature::generics\n"
@@ -293,6 +287,18 @@ void print_features(const CompilerOptions& options) {
                  "$::feature::external_models\n"
                  "$::feature::operator_binding\n";
     if (const auto* target = target_for_triple(options.target)) {
+        if (target->architecture == "x86-64") {
+            std::cout << "$::feature::integer128\n"
+                         "$::feature::binary128_storage\n"
+                         "$::feature::binary128_arithmetic\n"
+                         "$::feature::fixed_vectors\n"
+                         "$::feature::atomics\n"
+                         "$::feature::variadics\n"
+                         "$::feature::thread_local\n";
+        } else if (target->architecture == "mips" &&
+                   resolved_bool(options, "m.llsc")) {
+            std::cout << "$::feature::atomics\n";
+        }
         if (const auto* table = subtarget_table_for(*target)) {
             for (const auto& feature : table->features) {
                 if (!feature.selectable) continue;
@@ -468,6 +474,9 @@ int cc_main(int argc, char** argv) {
         for (auto& enumeration : unit.enumerations) {
             program.enumerations.push_back(std::move(enumeration));
         }
+        for (auto& assertion : unit.static_assertions) {
+            program.static_assertions.push_back(std::move(assertion));
+        }
         for (auto& function : unit.functions) program.functions.push_back(std::move(function));
         for (auto& object : unit.objects) program.objects.push_back(std::move(object));
     }
@@ -478,7 +487,7 @@ int cc_main(int argc, char** argv) {
     program.address_bits = subtarget->abi_info().address_bits;
     if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
-                          options.mangling)) return 1;
+                          options.mangling, options.abi)) return 1;
     const auto* backend = target_backend_for(*target);
     if (!backend) {
         diagnostics.command_error(
@@ -489,6 +498,17 @@ int cc_main(int argc, char** argv) {
     if (options.verbose) std::cerr << "cc: building HIR\n";
     auto hir_module = hir::build(program, options, *target, diagnostics);
     if (diagnostics.errors() != 0) return 1;
+    const LayoutQuery size_of = [&](const TypePtr& type) {
+        return hir::layout_size(hir_module, hir_module.intern_type(type),
+                                *target);
+    };
+    const LayoutQuery align_of = [&](const TypePtr& type) {
+        return hir::layout_alignment(
+            hir_module, hir_module.intern_type(type), *target);
+    };
+    if (!finalize_target_constants(program, diagnostics, size_of, align_of)) {
+        return 1;
+    }
     if (options.verbose) {
         std::cerr << "cc: validating target HIR and ABI contracts\n";
     }

@@ -233,5 +233,10 @@ bool stabilize_function_address(Module& module, FunctionId function,
                                 SourceLocation location,
                                 Diagnostics& diagnostics);
 [[nodiscard]] std::string type_name(const Module& module, TypeId type);
+[[nodiscard]] std::optional<std::uint64_t>
+layout_size(const Module& module, TypeId type, const TargetInfo& target);
+[[nodiscard]] std::optional<std::uint64_t>
+layout_alignment(const Module& module, TypeId type,
+                 const TargetInfo& target);
 
 } // namespace cross::hir

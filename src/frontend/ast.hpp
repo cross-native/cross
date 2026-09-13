@@ -93,15 +93,19 @@ struct Expr {
 
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
-        Conditional, Call, Parenthesized,
+        Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
     } kind{Kind::Integer};
     SourceLocation location;
     std::string text;
+    std::string string_value;
     struct IntegerConstant {
         UInt128 value;
         BuiltinType type;
     };
     std::optional<IntegerConstant> evaluated_integer;
+    // A source type operand retained for casts and type-form sizeof.  Keeping
+    // this structured avoids reparsing a textual type in HIR/MIR lowering.
+    TypePtr type;
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> third;
@@ -119,6 +123,7 @@ struct VariableDecl {
     std::unique_ptr<Expr> initializer;
     bool storage_register{};
     bool storage_stack{};
+    bool storage_static{};
     std::optional<std::string> location_name;
 };
 
@@ -195,10 +200,18 @@ struct ObjectDecl {
 };
 
 struct EnumDecl {
+    struct Enumerator {
+        SourceLocation location;
+        std::string name;
+        std::unique_ptr<Expr> initializer;
+        std::optional<Expr::IntegerConstant> value;
+    };
+
     SourceLocation location;
     std::string name;
     BuiltinType underlying{BuiltinType::I32};
     std::vector<Attribute> attributes;
+    std::vector<Enumerator> enumerators;
 };
 
 struct RecordMemberDecl {
@@ -217,10 +230,18 @@ struct RecordDecl {
     std::vector<RecordMemberDecl> members;
 };
 
+struct StaticAssertDecl {
+    SourceLocation location;
+    std::string source_namespace;
+    std::unique_ptr<Expr> condition;
+    std::string message;
+};
+
 struct Program {
     unsigned address_bits{64};
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
+    std::vector<StaticAssertDecl> static_assertions;
     std::vector<std::unique_ptr<FunctionDecl>> functions;
     std::vector<std::unique_ptr<ObjectDecl>> objects;
 };

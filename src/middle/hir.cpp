@@ -1429,4 +1429,93 @@ std::string type_name(const Module& module, TypeId id) {
     return prefix + std::string(names[static_cast<unsigned>(type.builtin)]);
 }
 
+std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,
+                                         const TargetInfo& target) {
+    const auto& type = module.type(id);
+    if (type.kind == Type::Kind::Pointer) {
+        return (module.address_bits + 7U) / 8U;
+    }
+    if (type.kind == Type::Kind::Record) {
+        if (!type.record || !module.record(*type.record).complete ||
+            module.record(*type.record).size == 0) {
+            return std::nullopt;
+        }
+        return module.record(*type.record).size;
+    }
+    if (type.kind == Type::Kind::Array) {
+        if (!type.element || type.lanes == 0) return std::nullopt;
+        const auto element = layout_size(module, *type.element, target);
+        if (!element || *element == 0 ||
+            type.lanes > std::numeric_limits<std::uint64_t>::max() /
+                             *element) {
+            return std::nullopt;
+        }
+        return *element * type.lanes;
+    }
+    if (type.kind == Type::Kind::Vector) {
+        if (type.scalable || !type.element || type.lanes == 0) {
+            return std::nullopt;
+        }
+        const auto element = layout_size(module, *type.element, target);
+        if (!element ||
+            type.lanes > std::numeric_limits<std::uint64_t>::max() /
+                             *element) {
+            return std::nullopt;
+        }
+        return *element * type.lanes;
+    }
+    if (type.kind != Type::Kind::Builtin ||
+        type.builtin == BuiltinType::Void) {
+        return std::nullopt;
+    }
+    if (type.builtin == BuiltinType::F80) {
+        return target.data_layout.f80_storage_bytes;
+    }
+    const auto bits = type.builtin == BuiltinType::Bool ||
+                              type.builtin == BuiltinType::I8 ||
+                              type.builtin == BuiltinType::U8
+                          ? 8U
+                      : type.builtin == BuiltinType::I16 ||
+                                type.builtin == BuiltinType::U16
+                          ? 16U
+                      : type.builtin == BuiltinType::I32 ||
+                                type.builtin == BuiltinType::U32 ||
+                                type.builtin == BuiltinType::F32
+                          ? 32U
+                      : type.builtin == BuiltinType::I64 ||
+                                type.builtin == BuiltinType::U64 ||
+                                type.builtin == BuiltinType::F64
+                          ? 64U
+                      : type.builtin == BuiltinType::Iptr ||
+                                type.builtin == BuiltinType::Uptr ||
+                                type.builtin == BuiltinType::Fptr ||
+                                type.builtin == BuiltinType::Label
+                          ? module.address_bits
+                          : 128U;
+    return (bits + 7U) / 8U;
+}
+
+std::optional<std::uint64_t> layout_alignment(
+    const Module& module, TypeId id, const TargetInfo& target) {
+    const auto& type = module.type(id);
+    if (type.kind == Type::Kind::Record) {
+        if (!type.record || !module.record(*type.record).complete) {
+            return std::nullopt;
+        }
+        return module.record(*type.record).alignment;
+    }
+    if (type.kind == Type::Kind::Array && type.element) {
+        return layout_alignment(module, *type.element, target);
+    }
+    if (type.kind == Type::Kind::Builtin &&
+        type.builtin == BuiltinType::F80) {
+        return target.data_layout.f80_alignment;
+    }
+    const auto size = layout_size(module, id, target);
+    if (!size) return std::nullopt;
+    return std::max<std::uint64_t>(
+        1, std::min<std::uint64_t>(
+               *size, target.data_layout.natural_alignment_limit));
+}
+
 } // namespace cross::hir

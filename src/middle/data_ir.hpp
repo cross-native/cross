@@ -27,6 +27,7 @@ enum class InitializerKind {
     Integer,
     Floating,
     Address,
+    Bytes,
 };
 
 enum class AddressKind { Object, Function, Label };
@@ -46,6 +47,7 @@ struct Object {
     InitializerKind initializer{InitializerKind::Declaration};
     UInt128 bits;
     std::optional<AddressConstant> address;
+    std::vector<unsigned char> bytes;
     unsigned size{};
     unsigned alignment{1};
     bool read_only{};
@@ -65,8 +67,8 @@ struct Module {
 };
 
 // Lowers every static-duration object into target-resolved storage and a typed
-// scalar initializer. No backend needs to inspect source expressions or parse
-// literal text after this boundary.
+// target-resolved initializer. No backend needs to inspect source expressions
+// or parse literal text after this boundary.
 [[nodiscard]] Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                            Diagnostics& diagnostics);
 

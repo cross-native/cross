@@ -235,6 +235,11 @@ if(BUILD_TESTING)
         -DENTRY=entry -DEXPECTED=0 -DCC_FLAGS=-O2
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/semantic-mandatory
         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_feature_consistency COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/frontend
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/feature-consistency
+        -P "${CMAKE_SOURCE_DIR}/test/frontend/feature_consistency.cmake")
     add_test(NAME cross_switch_runtime COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/switch/runtime.x
@@ -715,6 +720,14 @@ if(BUILD_TESTING)
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/static-objects
                 -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
                 -P "${CMAKE_SOURCE_DIR}/test/middle/data/static_objects.cmake")
+    add_test(NAME cross_data_ir_string_bytes
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/string_bytes.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/string-bytes
+                -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+                -DGIMPLE_TEXT=${CROSS_ENABLE_GCC_GIMPLE_TEXT}
+                -P "${CMAKE_SOURCE_DIR}/test/middle/data/string_bytes.cmake")
     add_test(NAME cross_managed_inlining
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1390,6 +1403,66 @@ if(BUILD_TESTING)
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/language/pointers.x"
                 -o "${CMAKE_CURRENT_BINARY_DIR}/pointers.s")
+    add_test(NAME cross_expression_core_x86_64
+        COMMAND $<TARGET_FILE:cross_cc> -S -O2
+                "${CMAKE_SOURCE_DIR}/test/language/expression_core.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/expression-core-x86_64.s")
+    add_test(NAME cross_expression_core_x86_64_O0
+        COMMAND $<TARGET_FILE:cross_cc> -S -O0
+                "${CMAKE_SOURCE_DIR}/test/language/expression_core.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/expression-core-x86_64-O0.s")
+    add_test(NAME cross_expression_core_mips64
+        COMMAND $<TARGET_FILE:cross_cc> -S -O2 -mprofile=mips64-n64
+                "${CMAKE_SOURCE_DIR}/test/language/expression_core.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/expression-core-mips64.s")
+    add_test(NAME cross_expression_core_mips64_O0
+        COMMAND $<TARGET_FILE:cross_cc> -S -O0 -mprofile=mips64-n64
+                "${CMAKE_SOURCE_DIR}/test/language/expression_core.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/expression-core-mips64-O0.s")
+    add_test(NAME cross_expression_core_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/expression-core-error
+                -P "${CMAKE_SOURCE_DIR}/test/language/expression_core_errors.cmake")
+    add_test(NAME cross_expression_core_llvm
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/expression_core.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/expression-core.ll
+                -P "${CMAKE_SOURCE_DIR}/test/language/expression_core_llvm.cmake")
+    add_test(NAME cross_runtime_native_expression_core
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/expression_core.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-expression-core
+                -DENTRY=expression_core_entry
+                -DEXPECTED=1
+                -DCC_FLAGS=-O2
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    foreach(adapter_mode O0 O2)
+        add_test(NAME cross_function_pointer_adapter_${adapter_mode}
+            COMMAND $<TARGET_FILE:cross_cc> -S -${adapter_mode} -mabi=ms_abi
+                    "${CMAKE_SOURCE_DIR}/test/language/function_pointer_adapter.x"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/function-pointer-adapter-${adapter_mode}.s")
+    endforeach()
+    add_test(NAME cross_function_pointer_adapter_mips64
+        COMMAND $<TARGET_FILE:cross_cc> -S -O2 -mprofile=mips64-n64
+                "${CMAKE_SOURCE_DIR}/test/language/function_pointer_adapter_mips.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/function-pointer-adapter-mips64.s")
+    add_test(NAME cross_runtime_native_function_pointer_adapter
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/function_pointer_adapter.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-function-pointer-adapter
+                -DENTRY=function_pointer_adapter_entry
+                -DEXPECTED=1
+                -DCC_FLAGS=-O2
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     add_test(NAME cross_runtime_native_addresses
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
