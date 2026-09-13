@@ -85,7 +85,16 @@ bool validate_attribute_names(const Program& program,
     }
     for (const auto& function : program.functions) {
         validate(function->attributes);
+        const auto visit_statement = [&](const auto& self,
+                                         const Statement& statement) -> void {
+            validate(statement.attributes);
+            for (const auto& child : statement.statements) self(self, *child);
+            if (statement.first) self(self, *statement.first);
+            if (statement.second) self(self, *statement.second);
+        };
+        if (function->body) visit_statement(visit_statement, *function->body);
     }
+    for (const auto& label : program.global_labels) validate(label.attributes);
     for (const auto& object : program.objects) validate(object->attributes);
     return diagnostics.errors() == 0;
 }
@@ -211,6 +220,8 @@ std::unique_ptr<Statement> clone_statement(
     result->kind = source.kind;
     result->location = source.location;
     result->label_name = source.label_name;
+    result->attributes = source.attributes;
+    result->global_label = source.global_label;
     for (const auto& child : source.statements) {
         result->statements.push_back(clone_statement(*child, types, values));
     }

@@ -970,8 +970,20 @@ private:
             return result;
         }
         if (value.kind == ValueKind::LabelAddress) {
-            auto result = target_instruction(Opcode::LabelAddress,
-                                             value.location);
+            const auto* entity = value.label
+                ? &hir_.labels.at(value.label->value)
+                : nullptr;
+            auto result = target_instruction(
+                entity && entity->is_global ? Opcode::GlobalAddress
+                                            : Opcode::LabelAddress,
+                value.location);
+            if (entity && entity->is_global) {
+                result.operands.push_back(machine::SymbolOperand{
+                    entity->link_symbol, 0, true, std::nullopt,
+                    entity->owner});
+                result.defs.push_back(reg(value.id));
+                return result;
+            }
             const auto found = std::find_if(
                 source_->labels.begin(), source_->labels.end(),
                 [&](const mir::ManagedLabel& label) {
@@ -10521,6 +10533,14 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             if (label.block == found->id) {
                 output_ << ".Lcross.label." << function.source.value << '.'
                         << label.label.value << ":\n";
+                const auto& label_entity =
+                    hir_.labels.at(label.label.value);
+                if (!label_entity.is_global) continue;
+                const auto label_symbol =
+                    assembly_symbol(label_entity.link_symbol);
+                output_ << ".globl " << label_symbol << '\n'
+                        << ".type " << label_symbol << ",@function\n"
+                        << label_symbol << ":\n";
             }
         }
         const auto delay_plan = delay_slot_plan(function, *found);

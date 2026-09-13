@@ -157,6 +157,10 @@ struct Label {
     SourceLocation location;
     std::string source_name;
     std::string qualified_name;
+    std::string link_symbol;
+    std::vector<const GlobalLabelDecl*> declarations;
+    const Statement* definition{};
+    bool is_global{};
 };
 
 struct Object {
@@ -204,6 +208,7 @@ public:
         return objects.at(id.value);
     }
     [[nodiscard]] const Label* label(FunctionId function, std::string_view name) const;
+    [[nodiscard]] const Label* global_label(std::string_view qualified_name) const;
     [[nodiscard]] bool raw_owned(const FunctionDecl& declaration) const;
 
     // Canonical pointer-sized language modes for this compilation.  Keeping

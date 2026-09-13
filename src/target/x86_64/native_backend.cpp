@@ -1236,8 +1236,19 @@ private:
             return instruction;
         }
         if (value.kind == ValueKind::LabelAddress) {
-            auto instruction =
-                target_instruction(Opcode::LabelAddress, value.location);
+            const auto* label = value.label
+                ? &hir_.labels.at(value.label->value)
+                : nullptr;
+            auto instruction = target_instruction(
+                label && label->is_global ? Opcode::GlobalAddress
+                                          : Opcode::LabelAddress,
+                value.location);
+            if (label && label->is_global) {
+                instruction.operands.push_back(machine::SymbolOperand{
+                    label->link_symbol, 0, true, std::nullopt, label->owner});
+                instruction.defs.push_back(reg(value.id));
+                return instruction;
+            }
             const auto found = std::find_if(
                 source_->labels.begin(), source_->labels.end(),
                 [&](const mir::ManagedLabel& binding) {
@@ -22187,6 +22198,17 @@ private:
             if (label.block == value.id) {
                 output_ << ".Lcross.label." << function.source.value << '.'
                         << label.label.value << ":\n";
+                const auto& entity = hir_.labels.at(label.label.value);
+                if (!entity.is_global) continue;
+                const auto symbol = assembly_symbol(entity.link_symbol);
+                output_ << ".globl " << symbol << "\n";
+                if (format_ == ObjectFormat::Elf) {
+                    output_ << ".type " << symbol << ",@function\n";
+                } else if (format_ == ObjectFormat::Coff) {
+                    output_ << ".def " << symbol
+                            << "; .scl 2; .type 32; .endef\n";
+                }
+                output_ << symbol << ":\n";
             }
         }
         early_select_tests_.clear();

@@ -875,6 +875,17 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         linkage_seen = true;
     }
 
+    if (linkage == Linkage::Global && current().is("label") &&
+        current(1).kind == TokenKind::Identifier && current(2).is("::")) {
+        if (inline_hint) {
+            diagnostics_.error(current().location,
+                               "'inline' is valid only on a function");
+        }
+        parse_global_label_declaration(program, name_space,
+                                       std::move(attributes));
+        return;
+    }
+
     const auto parameters = generic_parameters(attributes);
     const auto saved_generic_types = active_generic_types_;
     active_generic_types_.clear();
@@ -919,6 +930,27 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         if (object) program.objects.push_back(std::move(object));
     }
     active_generic_types_ = saved_generic_types;
+}
+
+void Parser::parse_global_label_declaration(
+    Program& program, const std::string& name_space,
+    std::vector<Attribute> attributes) {
+    const auto location = current().location;
+    consume("label");
+    auto name = parse_qualified_name();
+    if (!name || name->find("::") == std::string::npos) {
+        diagnostics_.error(location,
+                           "a global label declaration requires a qualified label name");
+        synchronize_external();
+        return;
+    }
+    auto trailing = parse_attributes();
+    attributes.insert(attributes.end(),
+                      std::make_move_iterator(trailing.begin()),
+                      std::make_move_iterator(trailing.end()));
+    expect(";", "after global label declaration");
+    program.global_labels.push_back(
+        {location, join_namespace(name_space, *name), std::move(attributes)});
 }
 
 void Parser::parse_enum_declaration(Program& program,
@@ -1338,6 +1370,10 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     if (current().is("{")) return parse_compound();
     if (current().is("[[")) {
         auto attributes = parse_attributes();
+        if (current().is("global") && current(1).is("label") &&
+            current(2).kind == TokenKind::Identifier && current(3).is(":")) {
+            return parse_global_label_statement(std::move(attributes));
+        }
         if (local_declaration_start()) {
             return parse_local_declaration(std::move(attributes));
         }
@@ -1355,6 +1391,10 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         statement->location = current().location;
         (void)parse_static_assertion();
         return statement;
+    }
+    if (current().is("global") && current(1).is("label") &&
+        current(2).kind == TokenKind::Identifier && current(3).is(":")) {
+        return parse_global_label_statement();
     }
     if ((current().kind == TokenKind::Identifier && !current().is("default") && current(1).is(":")) ||
         (current().is("label") && current(1).kind == TokenKind::Identifier && current(2).is(":"))) {
@@ -1489,6 +1529,25 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     statement->kind = Statement::Kind::Expression;
     statement->expression = parse_expression();
     expect(";");
+    return statement;
+}
+
+std::unique_ptr<Statement> Parser::parse_global_label_statement(
+    std::vector<Attribute> attributes) {
+    auto statement = std::make_unique<Statement>();
+    statement->kind = Statement::Kind::Label;
+    statement->location = current().location;
+    statement->global_label = true;
+    statement->attributes = std::move(attributes);
+    consume("global");
+    consume("label");
+    const auto* name = consume_kind(TokenKind::Identifier);
+    if (!name) {
+        error_here("expected label name after 'global label'");
+    } else {
+        statement->label_name = std::string(name->text);
+    }
+    expect(":", "after global label name");
     return statement;
 }
 

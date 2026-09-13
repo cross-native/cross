@@ -200,9 +200,13 @@ private:
         } else if (address.kind == data::AddressKind::Function) {
             result = symbol(module_.hir().function(*address.function).link_symbol);
         } else {
-            result = ".Lcross.label." +
-                     std::to_string(address.function->value) + '.' +
-                     std::to_string(address.label->value);
+            const auto& label =
+                module_.hir().labels.at(address.label->value);
+            result = label.is_global
+                         ? symbol(label.link_symbol)
+                         : ".Lcross.label." +
+                               std::to_string(address.function->value) + '.' +
+                               std::to_string(address.label->value);
         }
         if (address.addend > 0) {
             result += '+' + std::to_string(address.addend);

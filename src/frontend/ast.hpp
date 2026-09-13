@@ -157,6 +157,8 @@ struct Statement {
     std::unique_ptr<Statement> first;
     std::unique_ptr<Statement> second;
     std::string label_name;
+    std::vector<Attribute> attributes;
+    bool global_label{};
 };
 
 struct ParameterDecl {
@@ -253,11 +255,18 @@ struct StaticAssertDecl {
     std::string message;
 };
 
+struct GlobalLabelDecl {
+    SourceLocation location;
+    std::string qualified_name;
+    std::vector<Attribute> attributes;
+};
+
 struct Program {
     unsigned address_bits{64};
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
     std::vector<StaticAssertDecl> static_assertions;
+    std::vector<GlobalLabelDecl> global_labels;
     std::vector<std::unique_ptr<FunctionDecl>> functions;
     std::vector<std::unique_ptr<ObjectDecl>> objects;
 };

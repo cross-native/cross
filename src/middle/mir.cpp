@@ -1320,11 +1320,18 @@ private:
     }
 
     const hir::Label* resolve_label(std::string_view name) const {
-        return hir_.label(current_.source, name);
+        if (const auto* local = hir_.label(current_.source, name)) {
+            return local;
+        }
+        return name.find("::") == std::string_view::npos
+                   ? nullptr
+                   : hir_.global_label(name);
     }
 
     ValueId label_address(const hir::Label& label,
                           SourceLocation location) {
+        (void)hir::stabilize_function_address(
+            hir_, label.owner, location, diagnostics_);
         const auto value = add_value(
             ValueKind::LabelAddress, *hir_.builtin(BuiltinType::Label),
             location);
@@ -6251,10 +6258,11 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
             if (value.kind == ValueKind::LabelAddress) {
                 if (!value.label ||
                     value.label->value >= hir_module.labels.size() ||
-                    hir_module.labels[value.label->value].owner !=
-                        function.source ||
+                    (hir_module.labels[value.label->value].owner !=
+                         function.source &&
+                     !hir_module.labels[value.label->value].is_global) ||
                     !label_type(hir_module, value.type)) {
-                    fail(value.location, "invalid local-label address");
+                    fail(value.location, "invalid label address");
                 }
             } else if (value.label) {
                 fail(value.location, "non-label value carries label metadata");

@@ -1316,6 +1316,16 @@ public:
           start_(start) {}
 
     std::string run() {
+        for (const auto& label : hir_.labels) {
+            if (!label.is_global || !label.definition ||
+                raw_assembly_.owns(label.owner)) {
+                continue;
+            }
+            diagnostics_.error(
+                label.location,
+                "GIMPLE serialization cannot define an externally named global label");
+            return {};
+        }
         std::ostringstream out;
         out << "/* Cross language 0.8: experimental GCC __GIMPLE bridge.\n"
                "   Compile this file with GCC -fgimple. */\n\n";

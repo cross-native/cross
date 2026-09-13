@@ -49,6 +49,9 @@ private:
     void parse_record_declaration(Program& program,
                                   const std::string& name_space,
                                   std::vector<Attribute> attributes);
+    void parse_global_label_declaration(
+        Program& program, const std::string& name_space,
+        std::vector<Attribute> attributes);
     bool parse_static_assertion();
     std::unique_ptr<FunctionDecl>
     parse_function(SourceLocation location, std::string name,
@@ -61,6 +64,8 @@ private:
     ParameterDecl parse_parameter(unsigned ordinal);
 
     std::unique_ptr<Statement> parse_statement();
+    std::unique_ptr<Statement>
+    parse_global_label_statement(std::vector<Attribute> attributes = {});
     std::unique_ptr<Statement> parse_compound();
     std::unique_ptr<Statement>
     parse_local_declaration(std::vector<Attribute> attributes = {});

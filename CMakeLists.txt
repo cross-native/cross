@@ -1876,6 +1876,13 @@ if(BUILD_TESTING)
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/language/labels.x"
                 -o "${CMAKE_CURRENT_BINARY_DIR}/labels.s")
+    add_test(NAME cross_global_labels
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/global_labels.x
+                -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/language/global_label_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/global-labels
+                -P "${CMAKE_SOURCE_DIR}/test/language/global_labels.cmake")
     add_test(NAME cross_preprocessor
         COMMAND "${CMAKE_COMMAND}"
                 -DCPP=$<TARGET_FILE:cross_cpp>

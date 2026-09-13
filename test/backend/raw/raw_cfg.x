@@ -25,9 +25,13 @@ join:
 [[naked, link_name("raw_goto")]]
 global void raw_goto() {
     goto done;
-done:
+    [[link_name("raw_goto_done")]]
+    global label done:
     $::_ret();
 }
+
+[[link_name("raw_goto_done")]]
+global label raw_goto::done;
 
 [[naked, link_name("raw_computed_goto")]]
 global void raw_computed_goto(in label destination "rax") {

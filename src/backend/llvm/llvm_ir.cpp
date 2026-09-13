@@ -70,6 +70,16 @@ public:
           raw_assembly_(module.raw_assembly()) {}
 
     std::string run() {
+        for (const auto& label : hir_.labels) {
+            if (!label.is_global || !label.definition ||
+                raw_assembly_.owns(label.owner)) {
+                continue;
+            }
+            diagnostics_.error(
+                label.location,
+                "LLVM debug serialization cannot define an externally named global label");
+            return {};
+        }
         std::ostringstream module;
         module << "; Cross language 0.8\n"
                   "source_filename = \"cross compilation group\"\n"

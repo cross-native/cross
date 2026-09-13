@@ -22,7 +22,13 @@ bool audit_standalone(const machine::Module& machine_module,
                     const auto* symbol =
                         std::get_if<machine::SymbolOperand>(&operand);
                     if (!symbol) continue;
-                    const bool declared = symbol->is_function
+                    const bool declared_label = std::any_of(
+                        hir_module.labels.begin(), hir_module.labels.end(),
+                        [&](const hir::Label& candidate) {
+                            return candidate.is_global &&
+                                   candidate.link_symbol == symbol->name;
+                        });
+                    const bool declared = declared_label || (symbol->is_function
                         ? std::any_of(
                               hir_module.functions.begin(),
                               hir_module.functions.end(),
@@ -34,7 +40,7 @@ bool audit_standalone(const machine::Module& machine_module,
                               hir_module.objects.end(),
                               [&](const hir::Object& candidate) {
                                   return candidate.link_symbol == symbol->name;
-                              });
+                              }));
                     if (declared) continue;
                     diagnostics.error(
                         instruction.location,

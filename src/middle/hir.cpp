@@ -192,6 +192,7 @@ public:
         collect_functions();
         collect_objects();
         finish_functions();
+        finish_global_labels();
         finish_objects();
         diagnose_symbol_collisions();
         return std::move(module_);
@@ -947,15 +948,161 @@ private:
                                    "duplicate label '" + statement.label_name + "'");
             } else {
                 const LabelId id{static_cast<std::uint32_t>(module_.labels.size())};
-                module_.labels.push_back({id, function.id, statement.location,
-                                          statement.label_name,
-                                          function.source_name + "::" + statement.label_name});
+                const auto qualified =
+                    function.source_name + "::" + statement.label_name;
+                std::string symbol;
+                if (statement.global_label) {
+                    symbol = resolved_label_link_name(
+                        qualified, statement.attributes, statement.location);
+                    if (function.linkage != Linkage::Global ||
+                        function.abi_contract != AbiContract::Registered) {
+                        diagnostics_.error(
+                            statement.location,
+                            "a global label definition requires a global stable-ABI function");
+                    }
+                    if (function.definition &&
+                        function.definition->attribute("always_inline")) {
+                        diagnostics_.error(
+                            statement.location,
+                            "a function containing a global label cannot be always_inline");
+                    }
+                } else if (!statement.attributes.empty()) {
+                    diagnostics_.error(statement.location,
+                                       "attributes are not valid on a local label");
+                }
+                module_.labels.push_back(
+                    {id, function.id, statement.location,
+                     statement.label_name, qualified, std::move(symbol), {},
+                     &statement, statement.global_label});
                 function.labels.push_back(id);
             }
         }
         for (const auto& child : statement.statements) collect_labels(function, *child);
         if (statement.first) collect_labels(function, *statement.first);
         if (statement.second) collect_labels(function, *statement.second);
+    }
+
+    std::string resolved_label_link_name(
+        std::string_view qualified_name,
+        const std::vector<Attribute>& attributes,
+        SourceLocation location) {
+        const Attribute* link_name{};
+        for (const auto& attribute : attributes) {
+            if (attribute.name != "link_name") {
+                diagnostics_.error(
+                    attribute.location,
+                    "attribute '" + attribute.name +
+                        "' is not valid on a global label");
+                continue;
+            }
+            if (link_name) {
+                diagnostics_.error(attribute.location,
+                                   "global label has more than one link_name attribute");
+                continue;
+            }
+            link_name = &attribute;
+        }
+        std::string result;
+        if (link_name) {
+            result = decode_attribute_string(link_name);
+            if (link_name->arguments.size() != 1 || result.empty()) {
+                diagnostics_.error(
+                    link_name->location,
+                    "global-label link_name requires one nonempty string literal");
+            }
+        } else {
+            result = encode_model_link_name(qualified_name, true,
+                                            options_.mangling);
+        }
+        if (result.empty()) {
+            diagnostics_.error(
+                location,
+                "selected mangling model produced an empty global-label link name");
+        }
+        return result;
+    }
+
+    Function* find_global_label_function(std::string_view name,
+                                         SourceLocation location) {
+        Function* result{};
+        for (auto& function : module_.functions) {
+            if (function.source_name != name) continue;
+            if (result) {
+                diagnostics_.error(
+                    location,
+                    "global label owner '" + std::string(name) +
+                        "' is ambiguous");
+                return nullptr;
+            }
+            result = &function;
+        }
+        if (!result) {
+            diagnostics_.error(
+                location,
+                "global label refers to unknown function '" +
+                    std::string(name) + "'");
+        }
+        return result;
+    }
+
+    void finish_global_labels() {
+        for (const auto& declaration : program_.global_labels) {
+            const auto split = declaration.qualified_name.rfind("::");
+            if (split == std::string::npos) {
+                diagnostics_.error(
+                    declaration.location,
+                    "a global label declaration requires a qualified label name");
+                continue;
+            }
+            const auto function_name =
+                std::string_view(declaration.qualified_name).substr(0, split);
+            auto* function =
+                find_global_label_function(function_name, declaration.location);
+            if (!function) continue;
+            if (function->linkage != Linkage::Global ||
+                function->abi_contract != AbiContract::Registered) {
+                diagnostics_.error(
+                    declaration.location,
+                    "a global label declaration requires a global stable-ABI function");
+            }
+            const auto symbol = resolved_label_link_name(
+                declaration.qualified_name, declaration.attributes,
+                declaration.location);
+            auto found = std::find_if(
+                module_.labels.begin(), module_.labels.end(),
+                [&](const Label& label) {
+                    return label.owner == function->id &&
+                           label.qualified_name == declaration.qualified_name;
+                });
+            if (found != module_.labels.end()) {
+                if (!found->is_global) {
+                    diagnostics_.error(
+                        declaration.location,
+                        "global label declaration disagrees with a local label definition");
+                } else if (found->link_symbol != symbol) {
+                    diagnostics_.error(
+                        declaration.location,
+                        "global label declarations use different link names for '" +
+                            declaration.qualified_name + "'");
+                }
+                found->declarations.push_back(&declaration);
+                continue;
+            }
+            if (function->definition) {
+                diagnostics_.error(
+                    declaration.location,
+                    "global label declaration has no matching definition in function '" +
+                        function->source_name + "'");
+                continue;
+            }
+            const LabelId id{
+                static_cast<std::uint32_t>(module_.labels.size())};
+            module_.labels.push_back(
+                {id, function->id, declaration.location,
+                 declaration.qualified_name.substr(split + 2),
+                 declaration.qualified_name, symbol, {&declaration}, nullptr,
+                 true});
+        }
     }
 
     void validate_naked_interface(const Function& function) {
@@ -1065,6 +1212,11 @@ private:
         }
         for (const auto& object : module_.objects) {
             add(object.link_symbol, object.location, object.source_name);
+        }
+        for (const auto& label : module_.labels) {
+            if (label.is_global) {
+                add(label.link_symbol, label.location, label.qualified_name);
+            }
         }
     }
 
@@ -1336,6 +1488,23 @@ const Label* Module::label(FunctionId function, std::string_view name) const {
     for (const auto id : functions.at(function.value).labels) {
         const auto& candidate = labels.at(id.value);
         if (candidate.source_name == name || candidate.qualified_name == name) {
+            return &candidate;
+        }
+    }
+    for (const auto& candidate : labels) {
+        if (candidate.owner == function && candidate.is_global &&
+            (candidate.source_name == name ||
+             candidate.qualified_name == name)) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+const Label* Module::global_label(std::string_view qualified_name) const {
+    for (const auto& candidate : labels) {
+        if (candidate.is_global &&
+            candidate.qualified_name == qualified_name) {
             return &candidate;
         }
     }

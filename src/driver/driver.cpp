@@ -477,6 +477,9 @@ int cc_main(int argc, char** argv) {
         for (auto& assertion : unit.static_assertions) {
             program.static_assertions.push_back(std::move(assertion));
         }
+        for (auto& label : unit.global_labels) {
+            program.global_labels.push_back(std::move(label));
+        }
         for (auto& function : unit.functions) program.functions.push_back(std::move(function));
         for (auto& object : unit.objects) program.objects.push_back(std::move(object));
     }

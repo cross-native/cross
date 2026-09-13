@@ -915,14 +915,17 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                                     subtarget, diagnostics);
         }
         result.object_indices.emplace(entity.id.value, result.objects.size());
-        if (object.address && object.address->kind == AddressKind::Function &&
+        if (object.address &&
+            (object.address->kind == AddressKind::Function ||
+             object.address->kind == AddressKind::Label) &&
             object.address->function) {
             (void)hir::stabilize_function_address(
                 hir_module, *object.address->function, declaration->location,
                 diagnostics);
         }
         for (const auto& relocation : object.relocations) {
-            if (relocation.address.kind == AddressKind::Function &&
+            if ((relocation.address.kind == AddressKind::Function ||
+                 relocation.address.kind == AddressKind::Label) &&
                 relocation.address.function) {
                 (void)hir::stabilize_function_address(
                     hir_module, *relocation.address.function,

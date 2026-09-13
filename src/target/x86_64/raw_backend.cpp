@@ -1932,6 +1932,27 @@ private:
             const auto id = function.layout[layout_index];
             if (id != function.entry) output_ << block_symbol(function, id) << ":\n";
             const auto& candidate = function.blocks[id.value];
+            if (!candidate.source_label.empty()) {
+                const auto* label =
+                    hir_.label(function.source, candidate.source_label);
+                if (label) {
+                    output_ << ".Lcross.label." << function.source.value
+                            << '.' << label->id.value << ":\n";
+                    if (label->is_global) {
+                        const auto label_symbol =
+                            assembly_symbol(label->link_symbol);
+                        output_ << ".globl " << label_symbol << "\n";
+                        if (format_ == ObjectFormat::Elf) {
+                            output_ << ".type " << label_symbol
+                                    << ",@function\n";
+                        } else if (format_ == ObjectFormat::Coff) {
+                            output_ << ".def " << label_symbol
+                                    << "; .scl 2; .type 32; .endef\n";
+                        }
+                        output_ << label_symbol << ":\n";
+                    }
+                }
+            }
             for (const auto& instruction : candidate.instructions) {
                 emit_instruction(function, instruction);
             }
