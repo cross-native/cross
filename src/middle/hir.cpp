@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "middle/hir.hpp"
 
+#include "frontend/semantic.hpp"
 #include "model/model.hpp"
 
 #include <algorithm>
@@ -162,9 +163,16 @@ bool source_identifier(std::string_view spelling) {
            std::all_of(spelling.begin() + 1, spelling.end(), continuation);
 }
 
+std::string source_namespace(std::string_view name) {
+    const auto separator = name.rfind("::");
+    return separator == std::string_view::npos
+               ? std::string{}
+               : std::string(name.substr(0, separator));
+}
+
 class Builder {
 public:
-    Builder(const Program& program, const CompilerOptions& options,
+    Builder(Program& program, const CompilerOptions& options,
             const TargetInfo& target, Diagnostics& diagnostics)
         : program_(program), options_(options), target_(target), diagnostics_(diagnostics) {
         const auto* abi = find_abi(target_, options_.abi, options_.target);
@@ -412,6 +420,82 @@ private:
         return {size, alignment};
     }
 
+    bool set_bit_field_width(RecordMember& member,
+                             const Expr::IntegerConstant& width,
+                             SourceLocation location) {
+        const auto width_type = width.type;
+        const bool signed_width =
+            width_type == BuiltinType::I8 ||
+            width_type == BuiltinType::I16 ||
+            width_type == BuiltinType::I32 ||
+            width_type == BuiltinType::I64 ||
+            width_type == BuiltinType::I128 ||
+            width_type == BuiltinType::Iptr;
+        auto width_bits = type_bits(builtin_type(width_type));
+        if (width_type == BuiltinType::Iptr ||
+            width_type == BuiltinType::Uptr) {
+            width_bits = module_.address_bits;
+        }
+        const bool negative =
+            signed_width && width_bits != 0 &&
+            (shift_right(width.value, width_bits - 1).low & 1U) != 0;
+        const auto storage_bits = static_cast<unsigned>(
+            storage_layout(member.type, location).first * 8U);
+        if (negative || width.value.high != 0) {
+            diagnostics_.error(location,
+                               "bit-field width must be nonnegative");
+            return false;
+        }
+        if (width.value.low > storage_bits) {
+            diagnostics_.error(location,
+                               "bit-field width exceeds its base type");
+            return false;
+        }
+        member.bit_width = static_cast<unsigned>(width.value.low);
+        if (*member.bit_width == 0 && !member.name.empty()) {
+            diagnostics_.error(location,
+                               "a zero-width bit-field must be unnamed");
+            return false;
+        }
+        return true;
+    }
+
+    bool resolve_bit_field_width(RecordMember& member,
+                                 std::string_view source_namespace) {
+        if (!member.pending_bit_width) return member.bit_width.has_value();
+        const auto* expression = member.pending_bit_width;
+        member.pending_bit_width = nullptr;
+        const auto layout = [&](const TypePtr& source)
+            -> std::optional<std::pair<std::uint64_t, unsigned>> {
+            const auto id = intern_type(source);
+            const auto& type = module_.type(id);
+            if (type.kind == Type::Kind::Record &&
+                (!type.record ||
+                 !layout_record(*type.record, expression->location))) {
+                return std::nullopt;
+            }
+            const auto result = storage_layout(id, expression->location);
+            return result.first == 0 ? std::nullopt
+                                     : std::optional(result);
+        };
+        const LayoutQuery size_of = [&](const TypePtr& source)
+            -> std::optional<std::uint64_t> {
+            const auto result = layout(source);
+            return result ? std::optional(result->first) : std::nullopt;
+        };
+        const LayoutQuery align_of = [&](const TypePtr& source)
+            -> std::optional<std::uint64_t> {
+            const auto result = layout(source);
+            return result ? std::optional<std::uint64_t>(result->second)
+                          : std::nullopt;
+        };
+        const auto evaluated = evaluate_target_integer_constant(
+            program_, *expression, diagnostics_, size_of, align_of,
+            source_namespace);
+        return evaluated &&
+               set_bit_field_width(member, *evaluated, member.location);
+    }
+
     bool layout_record(RecordId id, SourceLocation use_location) {
         if (id.value >= layout_state_.size()) {
             layout_state_.resize(module_.records.size());
@@ -436,7 +520,20 @@ private:
         std::uint64_t extent{};
         unsigned record_alignment = 1;
         bool valid = true;
+        struct ActiveBitFieldUnit {
+            TypeId type;
+            std::uint64_t offset{};
+            unsigned bits{};
+            unsigned used{};
+            unsigned alignment{1};
+        };
+        std::optional<ActiveBitFieldUnit> active_bit_field;
+        const auto current_namespace = source_namespace(record.source_name);
         for (auto& member : record.members) {
+            if (member.pending_bit_width &&
+                !resolve_bit_field_width(member, current_namespace)) {
+                valid = false;
+            }
             const auto [size, natural_alignment] =
                 storage_layout(member.type, member.location);
             if (size == 0) valid = false;
@@ -448,6 +545,81 @@ private:
             member.alignment = placement_alignment;
             record_alignment = std::max(record_alignment,
                                         placement_alignment);
+            if (member.bit_width) {
+                const auto unit_bits = size <=
+                                               std::numeric_limits<unsigned>::max() /
+                                                   8U
+                                           ? static_cast<unsigned>(size * 8U)
+                                           : 0U;
+                const auto width = *member.bit_width;
+                if (width == 0) {
+                    active_bit_field.reset();
+                    if (record.is_union) {
+                        member.offset = 0;
+                    } else if (const auto offset =
+                                   align_up(extent, placement_alignment)) {
+                        member.offset = *offset;
+                        extent = *offset;
+                    } else {
+                        diagnostics_.error(
+                            member.location,
+                            "record layout overflows target storage");
+                        valid = false;
+                    }
+                    continue;
+                }
+                if (unit_bits == 0 || width > unit_bits) {
+                    valid = false;
+                    continue;
+                }
+                if (record.is_union) {
+                    member.offset = 0;
+                    member.bit_offset =
+                        target_.data_layout.bit_field_order ==
+                                BitFieldOrder::LeastSignificantFirst
+                            ? 0U
+                            : unit_bits - width;
+                    extent = std::max(extent, size);
+                    continue;
+                }
+                const auto unqualified = module_.unqualified(member.type);
+                const bool shares =
+                    active_bit_field &&
+                    active_bit_field->type == unqualified &&
+                    active_bit_field->alignment == placement_alignment &&
+                    width <= active_bit_field->bits -
+                                 active_bit_field->used;
+                if (!shares) {
+                    const auto offset = align_up(extent, placement_alignment);
+                    if (!offset || *offset >
+                                       std::numeric_limits<std::uint64_t>::max() -
+                                           size) {
+                        diagnostics_.error(
+                            member.location,
+                            "record layout overflows target storage");
+                        valid = false;
+                        active_bit_field.reset();
+                        continue;
+                    }
+                    active_bit_field = ActiveBitFieldUnit{
+                        unqualified, *offset, unit_bits, 0,
+                        placement_alignment};
+                    extent = *offset + size;
+                }
+                member.offset = active_bit_field->offset;
+                member.bit_offset =
+                    target_.data_layout.bit_field_order ==
+                            BitFieldOrder::LeastSignificantFirst
+                        ? active_bit_field->used
+                        : active_bit_field->bits -
+                              active_bit_field->used - width;
+                active_bit_field->used += width;
+                if (active_bit_field->used == active_bit_field->bits) {
+                    active_bit_field.reset();
+                }
+                continue;
+            }
+            active_bit_field.reset();
             if (record.is_union) {
                 member.offset = 0;
                 extent = std::max(extent, size);
@@ -504,7 +676,8 @@ private:
             }
             std::unordered_set<std::string> names;
             for (const auto& source : definition->members) {
-                if (!names.insert(source.name).second) {
+                if (!source.name.empty() &&
+                    !names.insert(source.name).second) {
                     diagnostics_.error(
                         source.location,
                         "duplicate record member '" + source.name + "'");
@@ -515,6 +688,40 @@ private:
                 member.name = source.name;
                 member.type = intern_type(source.type);
                 validate_atomic_type(member.type, source.location);
+                if (source.bit_width) {
+                    const auto& type = module_.type(member.type);
+                    bool valid_base = true;
+                    if (type.kind != Type::Kind::Builtin ||
+                        type.builtin < BuiltinType::Bool ||
+                        type.builtin > BuiltinType::Uptr) {
+                        diagnostics_.error(
+                            source.location,
+                            "bit-field base type must be bool, an integer, or an enumeration");
+                        valid_base = false;
+                    } else if (type.is_atomic) {
+                        diagnostics_.error(
+                            source.location,
+                            "a bit-field cannot have atomic type");
+                        valid_base = false;
+                    }
+                    const auto* width = source.bit_width.get();
+                    while (width &&
+                           width->kind == Expr::Kind::Parenthesized &&
+                           width->left) {
+                        width = width->left.get();
+                    }
+                    if (!width) {
+                        diagnostics_.error(
+                            source.location,
+                            "bit-field width must be a nonnegative integer constant expression");
+                    } else if (valid_base && width->evaluated_integer) {
+                        (void)set_bit_field_width(
+                            member, *width->evaluated_integer,
+                            source.location);
+                    } else if (valid_base) {
+                        member.pending_bit_width = width;
+                    }
+                }
                 member.packed = parse_packed(source.attributes,
                                              "a record member");
                 member.alignment = parse_alignment(source.attributes,
@@ -1220,7 +1427,7 @@ private:
         }
     }
 
-    const Program& program_;
+    Program& program_;
     const CompilerOptions& options_;
     const TargetInfo& target_;
     Diagnostics& diagnostics_;
@@ -1517,7 +1724,7 @@ bool Module::raw_owned(const FunctionDecl& declaration) const {
            entity->ownership == BodyOwnership::RawMir;
 }
 
-Module build(const Program& program, const CompilerOptions& options,
+Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics) {
     return Builder(program, options, target, diagnostics).run();
 }

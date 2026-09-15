@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "@MEMBERS_SOURCE@"
+#include "@BITFIELD_SOURCE@"
 
 struct pair { u32 x; u32 y; };
 struct tiny { u8 a; u8 b; u8 c; };
@@ -83,6 +84,8 @@ global struct large saved;
 
 global u32 aggregate_test(in u32 seed) {
     if (aggregate_members_entry() != 1) return 16u32;
+    i32 bitfield_result = bitfield_entry();
+    if (bitfield_result != 36) return (u32)bitfield_result - 100u32;
     struct pair p; p.x = seed; p.y = 0x11223344u32;
     struct pair q = pair_step(p, 9u32);
     if (q.x != seed + 9u32 || q.y != (p.y ^ 0x12345678u32) || p.x != seed) return 2u32;

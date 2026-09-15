@@ -290,7 +290,17 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
         const auto& record = module.record(*type.record);
         result.elements.reserve(record.members.size());
         result.element_offsets_bits.reserve(record.members.size());
+        std::optional<std::pair<std::uint64_t, unsigned>> bit_field_unit;
         for (const auto& member : record.members) {
+            if (member.bit_width && *member.bit_width == 0) continue;
+            if (member.bit_width && !record.is_union) {
+                const auto unit = std::pair{
+                    member.offset, type_bits(module, member.type)};
+                if (bit_field_unit == unit) continue;
+                bit_field_unit = unit;
+            } else {
+                bit_field_unit.reset();
+            }
             result.elements.push_back(
                 abi_value_for(module, member.type, layout, abi));
             result.element_offsets_bits.push_back(

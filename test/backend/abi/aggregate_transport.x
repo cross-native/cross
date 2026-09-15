@@ -10,7 +10,26 @@ struct triple_i64 { i64 first; i64 second; i64 third; };
 struct packed_i64 [[packed]] { u8 tag; u64 value; };
 struct three_bytes { u8 first; u8 second; u8 third; };
 struct wrapped_f80 { f80 value; };
+struct bitfield_u32 { u32 ready : 1; u32 mode : 3; };
 union integer_or_float { u64 integer; f64 floating; };
+
+[[abi("sysv_abi"), link_name("cross_sysv_bitfield_u32"), noinline]]
+global struct bitfield_u32 sysv_bitfield_u32(
+    in struct bitfield_u32 value) {
+    struct bitfield_u32 result = value;
+    result.ready = 0u32;
+    result.mode += 2u32;
+    return result;
+}
+
+[[abi("ms_abi"), link_name("cross_ms_bitfield_u32"), noinline]]
+global struct bitfield_u32 ms_bitfield_u32(
+    in struct bitfield_u32 value) {
+    struct bitfield_u32 result = value;
+    result.ready = 0u32;
+    result.mode += 2u32;
+    return result;
+}
 
 [[abi("sysv_abi"), link_name("cross_sysv_pair_i32"), noinline]]
 global struct pair_i32 sysv_pair_i32(in struct pair_i32 value) {

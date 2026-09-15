@@ -688,6 +688,23 @@ void store_bits(std::vector<unsigned char>& bytes, unsigned offset,
     }
 }
 
+UInt128 load_bits(const std::vector<unsigned char>& bytes, unsigned offset,
+                  unsigned size, ByteOrder order) {
+    UInt128 value{};
+    for (unsigned index = 0; index < size; ++index) {
+        const auto destination = order == ByteOrder::Little
+                                     ? index
+                                     : size - index - 1;
+        const auto byte = static_cast<std::uint64_t>(bytes[offset + index]);
+        if (destination < 8) {
+            value.low |= byte << (destination * 8);
+        } else {
+            value.high |= byte << ((destination - 8) * 8);
+        }
+    }
+    return value;
+}
+
 bool lower_initializer(Object& result, const hir::Module& module,
                        const hir::Object& entity,
                        const ObjectDecl& declaration,
@@ -790,8 +807,24 @@ bool lower_initializer(Object& result, const hir::Module& module,
         const auto offset = static_cast<unsigned>(item.offset);
         if (scalar.initializer == InitializerKind::Integer ||
             scalar.initializer == InitializerKind::Floating) {
-            store_bits(result.bytes, offset, scalar.size, scalar.bits,
-                       subtarget.target().data_layout.byte_order);
+            const auto order = subtarget.target().data_layout.byte_order;
+            if (item.bit_width) {
+                const auto value_mask = mask_to(
+                    bit_not(UInt128{}), *item.bit_width);
+                const auto field_mask = shift_left(
+                    value_mask, item.bit_offset);
+                auto storage = load_bits(result.bytes, offset, scalar.size,
+                                         order);
+                storage = bit_or(
+                    bit_and(storage, bit_not(field_mask)),
+                    shift_left(bit_and(scalar.bits, value_mask),
+                               item.bit_offset));
+                store_bits(result.bytes, offset, scalar.size, storage,
+                           order);
+            } else {
+                store_bits(result.bytes, offset, scalar.size, scalar.bits,
+                           order);
+            }
         } else if (scalar.initializer == InitializerKind::Address &&
                    scalar.address) {
             result.relocations.push_back(

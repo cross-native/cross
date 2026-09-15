@@ -236,6 +236,7 @@ struct RecordMemberDecl {
     SourceLocation location;
     std::string name;
     TypePtr type;
+    std::unique_ptr<Expr> bit_width;
     std::vector<Attribute> attributes;
 };
 

@@ -36,4 +36,12 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                                const LayoutQuery& size_of,
                                const LayoutQuery& align_of);
 
+// Evaluates one required integer expression once target layout callbacks are
+// available. HIR uses this for bit-field widths because record layout itself
+// owns the allocation policy and can resolve dependent records lazily.
+std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(
+    Program& program, const Expr& expression, Diagnostics& diagnostics,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::string_view source_namespace = {});
+
 } // namespace cross

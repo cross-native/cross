@@ -63,6 +63,8 @@ private:
         std::uint64_t offset{};
         Path path;
         std::size_t direct_index{};
+        std::optional<unsigned> bit_width;
+        unsigned bit_offset{};
     };
 
     std::optional<std::uint64_t> index_value(const Expr& expression) {
@@ -105,21 +107,34 @@ private:
             path.push_back(static_cast<std::uint32_t>(index));
             return Selection{*type.element,
                              parent_offset + index * *size,
-                             std::move(path), index};
+                             std::move(path), index, std::nullopt, 0};
         }
         if (type.kind == hir::Type::Kind::Record && type.record) {
             const auto& record = module_.record(*type.record);
-            if (index >= record.members.size() ||
+            auto member = record.members.end();
+            std::size_t logical_index{};
+            for (auto candidate = record.members.begin();
+                 candidate != record.members.end(); ++candidate) {
+                if (candidate->name.empty()) continue;
+                if (logical_index++ == index) {
+                    member = candidate;
+                    break;
+                }
+            }
+            if (member == record.members.end() ||
                 (record.is_union && index != 0)) {
                 diagnostics_.error(location,
                                    "excess entry in aggregate initializer");
                 result_.valid = false;
                 return std::nullopt;
             }
-            const auto& member = record.members[index];
-            path.push_back(static_cast<std::uint32_t>(index));
-            return Selection{member.type, parent_offset + member.offset,
-                             std::move(path), index};
+            const auto raw_index = static_cast<std::size_t>(
+                std::distance(record.members.begin(), member));
+            path.push_back(static_cast<std::uint32_t>(raw_index));
+            return Selection{member->type,
+                             parent_offset + member->offset,
+                             std::move(path), index, member->bit_width,
+                             member->bit_offset};
         }
         diagnostics_.error(location,
                            "initializer designator requires an aggregate destination");
@@ -170,8 +185,14 @@ private:
         const auto index = static_cast<std::size_t>(
             std::distance(record.members.begin(), member));
         path.push_back(static_cast<std::uint32_t>(index));
+        const auto logical_index = static_cast<std::size_t>(std::count_if(
+            record.members.begin(), member,
+            [](const hir::RecordMember& candidate) {
+                return !candidate.name.empty();
+            }));
         return Selection{member->type, parent_offset + member->offset,
-                         std::move(path), index};
+                         std::move(path), logical_index,
+                         member->bit_width, member->bit_offset};
     }
 
     bool occupied(const Path& path, SourceLocation location) {
@@ -245,7 +266,8 @@ private:
                                      : 1U;
             result_.items.push_back(
                 {entry.value.get(), selection->type, selection->offset,
-                 offset_alignment(natural, selection->offset)});
+                 offset_alignment(natural, selection->offset),
+                 selection->bit_width, selection->bit_offset});
         }
     }
 

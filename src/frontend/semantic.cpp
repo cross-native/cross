@@ -1855,6 +1855,45 @@ private:
         bool read_only{};
     };
 
+    const RecordMemberDecl* selected_record_member(
+        const Expr& expression, TypePtr* owner_type = nullptr) {
+        if (expression.kind == Expr::Kind::Parenthesized &&
+            expression.left) {
+            return selected_record_member(*expression.left, owner_type);
+        }
+        if (expression.kind != Expr::Kind::Binary ||
+            (expression.text != "member" &&
+             expression.text != "pointer_member") ||
+            !expression.left || !expression.right ||
+            expression.right->kind != Expr::Kind::Name) {
+            return nullptr;
+        }
+        auto owner = expression_type(*expression.left);
+        if (expression.text == "pointer_member") {
+            if (!owner || owner->kind != Type::Kind::Pointer ||
+                !owner->pointee) {
+                return nullptr;
+            }
+            owner = owner->pointee;
+        }
+        if (!owner || owner->kind != Type::Kind::Record) return nullptr;
+        const auto record = std::find_if(
+            program_.records.begin(), program_.records.end(),
+            [&](const RecordDecl& candidate) {
+                return candidate.name == owner->nominal_name &&
+                       candidate.complete;
+            });
+        if (record == program_.records.end()) return nullptr;
+        const auto member = std::find_if(
+            record->members.begin(), record->members.end(),
+            [&](const RecordMemberDecl& candidate) {
+                return candidate.name == expression.right->text;
+            });
+        if (member == record->members.end()) return nullptr;
+        if (owner_type) *owner_type = std::move(owner);
+        return &*member;
+    }
+
     // Required folding must not discard malformed syntax in an untaken arm.
     // This validates the scalar expression boundary without executing calls
     // or arithmetic (division by zero in a short-circuited arm is permitted).
@@ -1862,6 +1901,17 @@ private:
         if (node.kind == Expr::Kind::Sizeof ||
             node.kind == Expr::Kind::Alignof) {
             if (node.type) return true;
+            if (node.left) {
+                if (const auto* member =
+                        selected_record_member(*node.left);
+                    member && member->bit_width) {
+                    fail(node.location,
+                         node.kind == Expr::Kind::Sizeof
+                             ? "sizeof cannot be applied to a bit-field"
+                             : "$::alignof cannot be applied to a bit-field");
+                    return false;
+                }
+            }
             if (!node.left || !expression_type(*node.left)) {
                 fail(node.location,
                      "layout query has an unresolved expression type");
@@ -2024,6 +2074,19 @@ private:
         case Expr::Kind::Binary:
         case Expr::Kind::Conditional: {
             const bool conditional = expression.kind == Expr::Kind::Conditional;
+            if (!conditional &&
+                (expression.text == "member" ||
+                 expression.text == "pointer_member")) {
+                TypePtr owner;
+                const auto* member = selected_record_member(expression,
+                                                            &owner);
+                if (!member || !owner) return {};
+                auto result = clone_type(member->type);
+                result->is_const = result->is_const || owner->is_const;
+                result->is_volatile = result->is_volatile ||
+                                      owner->is_volatile;
+                return result;
+            }
             if (!conditional && expression.text == "index") {
                 const auto base = expression_type(*expression.left);
                 return base && base->kind == Type::Kind::Pointer ? base->pointee : nullptr;
@@ -2662,6 +2725,13 @@ public:
     explicit EnumeratorMaterializer(Program& program) : program_(program) {}
 
     void run() {
+        for (auto& record : program_.records) {
+            caller_ = nullptr;
+            current_namespace_ = namespace_prefix(record.name);
+            for (auto& member : record.members) {
+                rewrite(member.bit_width);
+            }
+        }
         for (auto& assertion : program_.static_assertions) {
             caller_ = nullptr;
             current_namespace_ = assertion.source_namespace;
@@ -3103,8 +3173,12 @@ TypePtr initializer_child_type(const Program& program, const TypePtr& parent,
             });
         return member == record->members.end() ? TypePtr{} : member->type;
     }
-    return position < record->members.size() ? record->members[position].type
-                                             : TypePtr{};
+    std::size_t index{};
+    for (const auto& member : record->members) {
+        if (member.name.empty()) continue;
+        if (index++ == position) return member.type;
+    }
+    return {};
 }
 
 void fold_static_initializer(Expr& initializer, TypePtr type,
@@ -3145,7 +3219,11 @@ void fold_static_initializer(Expr& initializer, TypePtr type,
                     });
                 if (member != record->members.end()) {
                     selected = static_cast<std::size_t>(
-                        std::distance(record->members.begin(), member));
+                        std::count_if(
+                            record->members.begin(), member,
+                            [](const RecordMemberDecl& candidate) {
+                                return !candidate.name.empty();
+                            }));
                 }
             }
         }
@@ -3240,6 +3318,16 @@ void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
 
 bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                        bool opportunistic) {
+    for (auto& record : program.records) {
+        for (auto& member : record.members) {
+            if (!member.bit_width) continue;
+            if (contains_layout_query(*member.bit_width)) {
+                continue;
+            }
+            (void)rewrite_required_integer(member.bit_width, nullptr,
+                                           program, diagnostics);
+        }
+    }
     for (const auto& function : program.functions) {
         if (!function->body) continue;
         std::vector<std::unordered_map<std::string, bool>> scopes(1);
@@ -3645,7 +3733,11 @@ private:
                             });
                         if (member != record->members.end()) {
                             selected = static_cast<std::size_t>(
-                                std::distance(record->members.begin(), member));
+                                std::count_if(
+                                    record->members.begin(), member,
+                                    [](const RecordMemberDecl& candidate) {
+                                        return !candidate.name.empty();
+                                    }));
                         }
                     }
                 }
@@ -3798,6 +3890,20 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
         }
     }
     return diagnostics.errors() == 0;
+}
+
+std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(
+    Program& program, const Expr& expression, Diagnostics& diagnostics,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::string_view source_namespace) {
+    Evaluator evaluator(program, diagnostics, nullptr,
+                        std::string(source_namespace), &size_of, &align_of);
+    const auto value = evaluator.required_integer(expression);
+    if (!value) {
+        evaluator.diagnose(expression.location);
+        return std::nullopt;
+    }
+    return Expr::IntegerConstant{value->integer, value->type->builtin};
 }
 
 } // namespace cross

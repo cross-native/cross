@@ -25,6 +25,7 @@ struct packed_i64 { std::uint8_t tag; std::uint64_t value; };
 
 struct three_bytes { std::uint8_t first, second, third; };
 struct wrapped_f80 { long double value; };
+struct bitfield_u32 { std::uint32_t ready : 1; std::uint32_t mode : 3; };
 union integer_or_float { std::uint64_t integer; double floating; };
 
 extern "C" CROSS_SYSV pair_i32 cross_sysv_pair_i32(pair_i32);
@@ -36,12 +37,17 @@ extern "C" CROSS_SYSV triple_i64 cross_sysv_triple_i64(triple_i64);
 extern "C" CROSS_SYSV packed_i64 cross_sysv_packed_i64(packed_i64);
 extern "C" CROSS_SYSV wrapped_f80 cross_sysv_wrapped_f80(wrapped_f80);
 extern "C" CROSS_SYSV integer_or_float cross_sysv_union(integer_or_float);
+extern "C" CROSS_SYSV bitfield_u32 cross_sysv_bitfield_u32(bitfield_u32);
 extern "C" CROSS_MS pair_i32 cross_ms_pair_i32(pair_i32);
 extern "C" CROSS_MS three_bytes cross_ms_three_bytes(three_bytes);
 extern "C" CROSS_MS triple_i64 cross_ms_triple_i64(triple_i64);
+extern "C" CROSS_MS bitfield_u32 cross_ms_bitfield_u32(bitfield_u32);
 extern "C" int cross_aggregate_calls();
 
 int main() {
+    static_assert(sizeof(bitfield_u32) == 4);
+    const auto sysv_bitfields = cross_sysv_bitfield_u32({1, 3});
+    const auto ms_bitfields = cross_ms_bitfield_u32({1, 3});
     const auto i32 = cross_sysv_pair_i32({10, 20});
     const auto f32 = cross_sysv_pair_f32({1.5f, 2.5f});
     const auto f64 = cross_sysv_pair_f64({3.5, 4.5});
@@ -65,6 +71,10 @@ int main() {
             ++failures;
         }
     };
+    check(sysv_bitfields.ready == 0 && sysv_bitfields.mode == 5,
+          "SysV u32 bit-field carrier");
+    check(ms_bitfields.ready == 0 && ms_bitfields.mode == 5,
+          "Win64 u32 bit-field carrier");
     check(i32.left == 11 && i32.right == 22, "SysV two i32");
     check(f32.left == 2.5f && f32.right == 4.5f, "SysV two f32");
     check(f64.left == 4.5 && f64.right == 6.5, "SysV two f64");

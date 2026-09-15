@@ -882,10 +882,16 @@ private:
         bool is_volatile{};
     };
 
+    struct BitFieldAccess {
+        unsigned width{};
+        unsigned offset{};
+    };
+
     struct DesignatorAddress {
         ValueId address;
         hir::TypeId type;
         unsigned alignment{1};
+        std::optional<BitFieldAccess> bit_field{};
     };
 
     struct ActiveDynamicArray {
@@ -1533,6 +1539,26 @@ private:
                                    owner.is_volatile);
     }
 
+    hir::TypeId bit_field_storage_type(hir::TypeId member_type) {
+        const auto& source = hir_.type(member_type);
+        BuiltinType storage = BuiltinType::U8;
+        switch (type_bits(hir_, member_type)) {
+        case 8: storage = BuiltinType::U8; break;
+        case 16: storage = BuiltinType::U16; break;
+        case 32: storage = BuiltinType::U32; break;
+        case 64:
+            storage = source.builtin == BuiltinType::Iptr ||
+                              source.builtin == BuiltinType::Uptr
+                          ? BuiltinType::Uptr
+                          : BuiltinType::U64;
+            break;
+        case 128: storage = BuiltinType::U128; break;
+        default: break;
+        }
+        return hir_.add_qualifiers(*hir_.builtin(storage), false,
+                                   source.is_volatile);
+    }
+
     std::optional<DesignatorAddress> lower_designator_address(
         const Expr& expression) {
         if (expression.kind == Expr::Kind::Parenthesized &&
@@ -1658,20 +1684,29 @@ private:
                     address, offset, *hir_.builtin(BuiltinType::U8),
                     expression.location);
             }
-            address = cast(address, hir_.pointer_to(member_type),
+            const auto address_type = member->bit_width
+                                          ? bit_field_storage_type(member_type)
+                                          : member_type;
+            address = cast(address, hir_.pointer_to(address_type),
                            expression.location);
             return DesignatorAddress{
                 address, member_type,
                 std::max(1U, std::min(base->alignment,
-                                     member->alignment))};
+                                     member->alignment)),
+                member->bit_width
+                    ? std::optional<BitFieldAccess>(BitFieldAccess{
+                          *member->bit_width, member->bit_offset})
+                    : std::nullopt};
         }
         return std::nullopt;
     }
 
-    std::optional<hir::TypeId> designator_type(const Expr& expression) {
+    std::optional<hir::TypeId> designator_type(
+        const Expr& expression, bool* is_bit_field = nullptr) {
+        if (is_bit_field) *is_bit_field = false;
         if (expression.kind == Expr::Kind::Parenthesized &&
             expression.left) {
-            return designator_type(*expression.left);
+            return designator_type(*expression.left, is_bit_field);
         }
         if (expression.kind == Expr::Kind::Name) {
             if (const auto* local = find_local(expression.text)) {
@@ -1723,6 +1758,9 @@ private:
             const auto* member = resolve_member(
                 *owner, expression.right->text,
                 expression.right->location, false);
+            if (member && is_bit_field) {
+                *is_bit_field = member->bit_width.has_value();
+            }
             return member ? std::optional<hir::TypeId>(
                                 qualified_member_type(*owner, *member))
                           : std::nullopt;
@@ -2004,6 +2042,135 @@ private:
         return value;
     }
 
+    ValueId integer_binary(BinaryOperation operation, hir::TypeId type,
+                           ValueId left, ValueId right,
+                           SourceLocation location) {
+        const auto result = add_value(ValueKind::Binary, type, location);
+        auto& binary = current_.values[result.value];
+        binary.binary = operation;
+        binary.operands = {left, right};
+        return result;
+    }
+
+    ValueId extract_bit_field(ValueId storage, hir::TypeId logical_type,
+                              BitFieldAccess field,
+                              SourceLocation location) {
+        const auto storage_type =
+            hir_.unqualified(current_.values[storage.value].type);
+        storage = cast(storage, storage_type, location);
+        const auto bits = type_bits(hir_, storage_type);
+        if (field.offset != 0) {
+            const auto amount = constant(field.offset, storage_type,
+                                         location);
+            storage = integer_binary(BinaryOperation::ShiftRightLogical,
+                                     storage_type, storage, amount,
+                                     location);
+        }
+        if (field.width < bits) {
+            const auto mask = constant(
+                mask_to(bit_not(UInt128{}), field.width), storage_type,
+                location);
+            storage = integer_binary(BinaryOperation::BitAnd, storage_type,
+                                     storage, mask, location);
+        }
+        if (!signed_type(hir_, logical_type) || field.width == bits) {
+            return cast(storage, logical_type, location);
+        }
+        const auto shift = bits - field.width;
+        const auto amount = constant(shift, storage_type, location);
+        storage = integer_binary(BinaryOperation::ShiftLeft, storage_type,
+                                 storage, amount, location);
+        auto signed_value = cast(storage, logical_type, location);
+        // Narrow integers can live in wider physical registers. Widening the
+        // signed, shifted value first makes its sign bit observable before the
+        // arithmetic shift on targets such as MIPS32.
+        const auto arithmetic_type = bits < 32
+                                         ? *hir_.builtin(BuiltinType::I32)
+                                         : logical_type;
+        signed_value = cast(signed_value, arithmetic_type, location);
+        const auto signed_amount = constant(shift, arithmetic_type, location);
+        return cast(integer_binary(BinaryOperation::ShiftRightArithmetic,
+                                   arithmetic_type, signed_value,
+                                   signed_amount, location),
+                    logical_type, location);
+    }
+
+    struct LoadedBitField {
+        ValueId value;
+        ValueId storage;
+    };
+
+    std::optional<LoadedBitField> load_bit_field(
+        const DesignatorAddress& designator, SourceLocation location) {
+        if (!designator.bit_field) return std::nullopt;
+        auto storage = load_pointer(designator.address, location,
+                                    designator.alignment);
+        if (!storage) return std::nullopt;
+        return LoadedBitField{
+            extract_bit_field(*storage, designator.type,
+                              *designator.bit_field, location),
+            *storage};
+    }
+
+    std::optional<ValueId> store_bit_field(
+        const DesignatorAddress& designator, ValueId source,
+        SourceLocation location,
+        std::optional<ValueId> loaded_storage = std::nullopt) {
+        if (!designator.bit_field) return std::nullopt;
+        source = assignment_cast(source, designator.type, location);
+        const auto& pointer =
+            hir_.type(current_.values[designator.address.value].type);
+        if (pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee) {
+            return std::nullopt;
+        }
+        const auto storage_type = hir_.unqualified(*pointer.pointee);
+        auto source_bits = cast(source, storage_type, location);
+        const auto storage_bits = type_bits(hir_, storage_type);
+        const auto field = *designator.bit_field;
+        const auto value_mask_bits =
+            mask_to(bit_not(UInt128{}), field.width);
+        if (field.width < storage_bits) {
+            const auto value_mask = constant(value_mask_bits, storage_type,
+                                             location);
+            source_bits = integer_binary(BinaryOperation::BitAnd,
+                                         storage_type, source_bits,
+                                         value_mask, location);
+        }
+        auto inserted = source_bits;
+        if (field.offset != 0) {
+            const auto amount = constant(field.offset, storage_type,
+                                         location);
+            inserted = integer_binary(BinaryOperation::ShiftLeft,
+                                      storage_type, inserted, amount,
+                                      location);
+        }
+        if (field.width != storage_bits || field.offset != 0) {
+            auto previous = loaded_storage;
+            if (!previous) {
+                previous = load_pointer(designator.address, location,
+                                        designator.alignment);
+            }
+            if (!previous) return std::nullopt;
+            *previous = cast(*previous, storage_type, location);
+            const auto field_mask = shift_left(value_mask_bits,
+                                               field.offset);
+            const auto clear_mask = constant(
+                mask_to(bit_not(field_mask), storage_bits), storage_type,
+                location);
+            const auto cleared = integer_binary(
+                BinaryOperation::BitAnd, storage_type, *previous,
+                clear_mask, location);
+            inserted = integer_binary(BinaryOperation::BitOr, storage_type,
+                                      cleared, inserted, location);
+        }
+        if (!store_pointer(designator.address, inserted, location,
+                           designator.alignment)) {
+            return std::nullopt;
+        }
+        return extract_bit_field(source_bits, designator.type,
+                                 BitFieldAccess{field.width, 0}, location);
+    }
+
     bool initialize_string_array(const LocalBinding& binding,
                                  const Expr& initializer) {
         const auto& array = hir_.type(binding.type);
@@ -2222,12 +2389,16 @@ private:
                 ? hir_.add_qualifiers(item.type, false, object_volatile)
                 : hir_.add_qualifiers(hir_.unqualified(item.type), false,
                                       object_volatile || type.is_volatile);
+            const auto address_type = item.bit_width
+                                          ? bit_field_storage_type(
+                                                initialization_type)
+                                          : initialization_type;
             const auto offset = constant(item.offset, uptr,
                                          item.expression->location);
             const auto byte_address = indexed_address(
                 base, offset, byte, item.expression->location);
             const auto address = cast(
-                byte_address, hir_.pointer_to(initialization_type),
+                byte_address, hir_.pointer_to(address_type),
                 item.expression->location);
             // Materialize the destination before evaluating the initializer.
             // A call result can occupy the ABI return register, so creating
@@ -2242,6 +2413,16 @@ private:
             }
             *value = assignment_cast(*value, initialization_type,
                                      item.expression->location);
+            if (item.bit_width) {
+                const DesignatorAddress designator{
+                    address, initialization_type, item.alignment,
+                    BitFieldAccess{*item.bit_width, item.bit_offset}};
+                if (!store_bit_field(designator, *value,
+                                     item.expression->location)) {
+                    failed_ = true;
+                }
+                continue;
+            }
             if (atomic_object_type(hir_, item.type)) {
                 (void)atomic_operation(
                     AtomicOperation::Store,
@@ -3030,13 +3211,19 @@ private:
                 }
             }
             std::optional<hir::TypeId> queried;
+            bool bit_field{};
             if (expression.type) {
                 queried = hir_.intern_type(expression.type);
             } else if (expression.left) {
-                queried = designator_type(*expression.left);
+                queried = designator_type(*expression.left, &bit_field);
                 if (!queried) queried = infer_type(*expression.left);
             }
             if (!queried) break;
+            if (bit_field) {
+                diagnostics_.error(expression.location,
+                                   "sizeof cannot be applied to a bit-field");
+                break;
+            }
             const auto& type = hir_.type(*queried);
             const auto invalid =
                 type.kind == hir::Type::Kind::Function ||
@@ -3058,13 +3245,20 @@ private:
         }
         case Expr::Kind::Alignof: {
             std::optional<hir::TypeId> queried;
+            bool bit_field{};
             if (expression.type) {
                 queried = hir_.intern_type(expression.type);
             } else if (expression.left) {
-                queried = designator_type(*expression.left);
+                queried = designator_type(*expression.left, &bit_field);
                 if (!queried) queried = infer_type(*expression.left);
             }
             if (!queried) break;
+            if (bit_field) {
+                diagnostics_.error(
+                    expression.location,
+                    "$::alignof cannot be applied to a bit-field");
+                break;
+            }
             const auto& type = hir_.type(*queried);
             const auto invalid =
                 type.kind == hir::Type::Kind::Function ||
@@ -3099,6 +3293,13 @@ private:
                 if (operand) {
                     if (auto designator =
                             lower_designator_address(*operand)) {
+                        if (designator->bit_field) {
+                            diagnostics_.error(
+                                expression.location,
+                                "cannot take the address of a bit-field");
+                            failed_ = true;
+                            break;
+                        }
                         const auto natural = storage_alignment(
                             hir_, designator->type, target_);
                         if (designator->alignment < natural) {
@@ -3211,9 +3412,19 @@ private:
                          !pointer_type(hir_, designator->type))) {
                         break;
                     }
-                    auto old = load_pointer(
-                        designator->address, expression.location,
-                        designator->alignment);
+                    std::optional<ValueId> old;
+                    std::optional<ValueId> loaded_storage;
+                    if (designator->bit_field) {
+                        auto loaded = load_bit_field(*designator,
+                                                     expression.location);
+                        if (!loaded) break;
+                        old = loaded->value;
+                        loaded_storage = loaded->storage;
+                    } else {
+                        old = load_pointer(
+                            designator->address, expression.location,
+                            designator->alignment);
+                    }
                     if (!old) break;
                     std::optional<ValueId> updated;
                     if (pointer_type(hir_, designator->type)) {
@@ -3240,15 +3451,23 @@ private:
                         updated = value;
                     }
                     if (!updated) break;
-                    if (!store_pointer(
-                            designator->address, *updated,
-                            expression.location,
-                            designator->alignment)) {
+                    const auto stored = designator->bit_field
+                                            ? store_bit_field(
+                                                  *designator, *updated,
+                                                  expression.location,
+                                                  loaded_storage)
+                                            : store_pointer(
+                                                  designator->address,
+                                                  *updated,
+                                                  expression.location,
+                                                  designator->alignment);
+                    if (!stored) {
                         break;
                     }
                     result = expression.text.starts_with("post")
                                  ? *old
-                                 : *updated;
+                                 : (designator->bit_field ? *stored
+                                                          : *updated);
                     break;
                 }
                 if (found->dynamic_address ||
@@ -3346,9 +3565,15 @@ private:
                             expression.location);
                     } else if (managed_value_type(hir_,
                                                   designator->type)) {
-                        result = load_pointer(
-                            designator->address, expression.location,
-                            designator->alignment);
+                        if (designator->bit_field) {
+                            const auto loaded = load_bit_field(
+                                *designator, expression.location);
+                            if (loaded) result = loaded->value;
+                        } else {
+                            result = load_pointer(
+                                designator->address, expression.location,
+                                designator->alignment);
+                        }
                     }
                 }
             } else if (expression.text == "index") {
@@ -3800,17 +4025,34 @@ private:
             if (expression.text == "=") {
                 auto source = lower_expression(*expression.right,
                                                designator->type);
-                if (!source ||
-                    !store_pointer(designator->address, *source,
+                if (!source) {
+                    return std::nullopt;
+                }
+                if (designator->bit_field) {
+                    return store_bit_field(*designator, *source,
+                                           expression.location);
+                }
+                if (!store_pointer(designator->address, *source,
                                    expression.location,
                                    designator->alignment)) {
                     return std::nullopt;
                 }
                 return source;
             }
-            auto left = load_pointer(designator->address,
-                                     expression.location,
-                                     designator->alignment);
+            std::optional<ValueId> left;
+            std::optional<ValueId> loaded_storage;
+            if (designator->bit_field) {
+                const auto loaded = load_bit_field(*designator,
+                                                   expression.location);
+                if (loaded) {
+                    left = loaded->value;
+                    loaded_storage = loaded->storage;
+                }
+            } else {
+                left = load_pointer(designator->address,
+                                    expression.location,
+                                    designator->alignment);
+            }
             if (left && pointer_type(hir_, designator->type)) {
                 if (expression.text != "+=" && expression.text != "-=") {
                     return std::nullopt;
@@ -3845,12 +4087,20 @@ private:
             auto& binary = current_.values[result.value];
             binary.operands = {*left, *right};
             binary.binary = *operation;
-            if (!store_pointer(designator->address, result,
-                               expression.location,
-                               designator->alignment)) {
+            const auto stored = designator->bit_field
+                                    ? store_bit_field(
+                                          *designator, result,
+                                          expression.location,
+                                          loaded_storage)
+                                    : store_pointer(
+                                          designator->address, result,
+                                          expression.location,
+                                          designator->alignment);
+            if (!stored) {
                 return std::nullopt;
             }
-            return result;
+            return designator->bit_field ? stored
+                                         : std::optional<ValueId>(result);
             }
         }
         if (expression.left &&

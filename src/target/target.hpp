@@ -337,6 +337,7 @@ struct VectorWidthEntry {
 };
 
 enum class ByteOrder { Little, Big };
+enum class BitFieldOrder { LeastSignificantFirst, MostSignificantFirst };
 
 // Target storage facts used before instruction selection. Pointer width comes
 // from the selected ABI because architectures such as MIPS may expose more
@@ -346,6 +347,7 @@ struct TargetDataLayout {
     unsigned natural_alignment_limit{1};
     unsigned f80_storage_bytes{10};
     unsigned f80_alignment{1};
+    BitFieldOrder bit_field_order{BitFieldOrder::LeastSignificantFirst};
 };
 
 // Target-independent optimizations describe the value they need priced;

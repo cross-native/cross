@@ -28,7 +28,28 @@ endfunction()
 expect_aggregate_error(incomplete "object has incomplete type")
 expect_aggregate_error(duplicate_member "duplicate record member 'value'")
 expect_aggregate_error(unknown_member "has no member named 'y'")
-expect_aggregate_error(bit_field "record bit-fields are not implemented yet")
+expect_aggregate_error(bit_field_base
+    "bit-field base type must be bool, an integer, or an enumeration")
+expect_aggregate_error(bit_field_too_wide
+    "bit-field width exceeds its base type")
+expect_aggregate_error(bit_field_negative
+    "bit-field width must be nonnegative")
+expect_aggregate_error(bit_field_named_zero
+    "a zero-width bit-field must be unnamed")
+expect_aggregate_error(bit_field_atomic
+    "a bit-field cannot have atomic type")
+expect_aggregate_error(bit_field_address
+    "cannot take the address of a bit-field")
+expect_aggregate_error(bit_field_sizeof
+    "sizeof cannot be applied to a bit-field")
+expect_aggregate_error(bit_field_alignof
+    "$::alignof cannot be applied to a bit-field")
+expect_aggregate_error(bit_field_layout_cycle
+    "record contains itself by value through a member cycle")
+expect_aggregate_error(bit_field_static_sizeof
+    "sizeof cannot be applied to a bit-field")
+expect_aggregate_error(bit_field_static_alignof
+    "$::alignof cannot be applied to a bit-field")
 expect_aggregate_error(initializer "a record value requires the same nominal record type")
 expect_aggregate_error(recursive_value "contains itself by value")
 expect_aggregate_error(initializer_duplicate

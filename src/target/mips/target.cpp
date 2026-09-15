@@ -305,7 +305,10 @@ TargetInfo make_target(ByteOrder order,
                        std::vector<std::string_view> prefixes) {
     return {
         "mips", std::move(prefixes),
-        {order, 8, 16, 8},
+        {order, 8, 16, 8,
+         order == ByteOrder::Big
+             ? BitFieldOrder::MostSignificantFirst
+             : BitFieldOrder::LeastSignificantFirst},
         target_registers(),
         {
             {"i8", 8, "mips1"}, {"u8", 8, "mips1"},

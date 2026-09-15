@@ -99,6 +99,9 @@ struct RecordMember {
     TypeId type;
     std::uint64_t offset{};
     unsigned alignment{1};
+    std::optional<unsigned> bit_width;
+    unsigned bit_offset{};
+    const Expr* pending_bit_width{};
     bool packed{};
 };
 
@@ -228,7 +231,7 @@ public:
     std::unordered_map<std::string, RecordId> record_ids;
 };
 
-Module build(const Program& program, const CompilerOptions& options,
+Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics);
 [[nodiscard]] std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,

@@ -875,7 +875,8 @@ const SubtargetTable subtargets{
 const TargetInfo target{
     "x86-64",
     {"x86_64", "amd64"},
-    {ByteOrder::Little, 16, 16, 16},
+    {ByteOrder::Little, 16, 16, 16,
+     BitFieldOrder::LeastSignificantFirst},
     target_registers(),
     {
         {"i8", 8, "x86-64"}, {"u8", 8, "x86-64"},

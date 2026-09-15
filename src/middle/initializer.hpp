@@ -20,6 +20,8 @@ struct Item {
     hir::TypeId type;
     std::uint64_t offset{};
     unsigned alignment{1};
+    std::optional<unsigned> bit_width;
+    unsigned bit_offset{};
 };
 
 struct Plan {

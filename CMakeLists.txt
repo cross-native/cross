@@ -1317,6 +1317,42 @@ if(BUILD_TESTING)
                 -DEXPECTED=576
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    add_test(NAME cross_bitfields
+        COMMAND $<TARGET_FILE:cross_cc> -S -O2
+                "${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/bit_field.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/bitfields.s")
+    add_test(NAME cross_bitfields_gimple_debug
+        COMMAND $<TARGET_FILE:cross_cc> -emit-gimple -O2
+                "${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/bit_field.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/bitfields.gimple.c")
+    add_test(NAME cross_runtime_bitfields_llvm_debug
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/bitfield_runtime.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/bitfields.ll
+                -DENTRY=bitfield_entry
+                -DEXPECTED=36
+                -DCC_FLAGS=-O2
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_bitfields_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/bitfield_runtime.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-bitfields-${level}
+                    -DENTRY=bitfield_entry
+                    -DEXPECTED=36
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
+    add_test(NAME cross_bitfield_targets
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/bitfield_runtime.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/bitfield-targets
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/bitfield_targets.cmake")
     add_test(NAME cross_aggregate_diagnostics
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

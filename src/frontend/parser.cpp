@@ -1093,24 +1093,26 @@ void Parser::parse_record_declaration(
             do {
                 std::optional<std::string> member_name;
                 auto member_type = parse_declarator(base_type, member_name);
-                if (!member_name) {
-                    error_here("expected record member name");
-                    break;
-                }
                 auto item_attributes = parse_attributes();
                 item_attributes.insert(
                     item_attributes.begin(), member_attributes.begin(),
                     member_attributes.end());
+                std::unique_ptr<Expr> bit_width;
                 if (consume(":")) {
-                    (void)parse_expression();
-                    diagnostics_.error(
-                        member_location,
-                        "record bit-fields are not implemented yet");
-                } else {
-                    declaration.members.push_back(
-                        {member_location, *member_name, std::move(member_type),
-                         std::move(item_attributes)});
+                    bit_width = parse_expression();
+                    auto trailing_attributes = parse_attributes();
+                    item_attributes.insert(
+                        item_attributes.end(),
+                        std::make_move_iterator(trailing_attributes.begin()),
+                        std::make_move_iterator(trailing_attributes.end()));
+                } else if (!member_name) {
+                    error_here("expected record member name");
+                    break;
                 }
+                declaration.members.push_back(
+                    {member_location, member_name.value_or(std::string{}),
+                     std::move(member_type), std::move(bit_width),
+                     std::move(item_attributes)});
                 parsed_member = true;
             } while (consume(","));
             if (!parsed_member) {
