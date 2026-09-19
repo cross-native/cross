@@ -1316,6 +1316,15 @@ private:
             instruction.operands.push_back(
                 immediate_operand(scale, 0, machine::i64));
             instruction.defs.push_back(reg(value.id));
+            // emit_indexed_address materializes through these fixed scratch
+            // registers even when the virtual result has another color.
+            // A call result or loop-carried value may still be live in RAX.
+            append_fixed_clobber(instruction, "rax", machine::i64);
+            append_fixed_clobber(instruction, "rcx", machine::i64);
+            if (scale > static_cast<std::uint64_t>(
+                            std::numeric_limits<std::int32_t>::max())) {
+                append_fixed_clobber(instruction, "rdx", machine::i64);
+            }
             return instruction;
         }
         if (value.kind == ValueKind::DynamicStackSave) {
