@@ -58,7 +58,7 @@ foreach(target x86_64-unknown-linux-gnu mips64el-unknown-elf)
     endif()
 endforeach()
 
-foreach(case bad_argument duplicate nonpointer)
+foreach(case bad_argument duplicate grouped_duplicate nonpointer)
     execute_process(
         COMMAND "${CC}" -S
                 "${SOURCE_DIR}/address_space_${case}.x"
@@ -66,7 +66,8 @@ foreach(case bad_argument duplicate nonpointer)
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
     if(case STREQUAL "bad_argument")
         set(expected "address_space requires a nonnegative target registry number")
-    elseif(case STREQUAL "duplicate")
+    elseif(case STREQUAL "duplicate" OR
+           case STREQUAL "grouped_duplicate")
         set(expected "duplicate address_space type qualifier")
     else()
         set(expected "address_space requires a pointer type")

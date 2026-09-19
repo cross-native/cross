@@ -214,6 +214,10 @@ public:
         const auto type = [&](const auto& self, const TypePtr& source,
                               SourceLocation fallback) -> void {
             if (!source || !visited.insert(source.get()).second) return;
+            if (source->pending_address_space) {
+                diagnostics_.error(source->pending_address_space->second,
+                                   "address_space requires a pointer declarator");
+            }
             if (source->kind == cross::Type::Kind::Pointer) {
                 const auto* entry =
                     find_address_space(target_, source->address_space);

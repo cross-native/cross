@@ -140,6 +140,7 @@ TypePtr clone_type(const TypePtr& source,
     result->is_restrict = source->is_restrict;
     result->address_space = source->address_space;
     result->address_space_location = source->address_space_location;
+    result->pending_address_space = source->pending_address_space;
     return result;
 }
 

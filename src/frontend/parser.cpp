@@ -544,7 +544,10 @@ TypePtr Parser::parse_type() {
         apply_type_attributes(type);
     }
     if (pending_address_space) {
-        if (type->kind != Type::Kind::Pointer) {
+        if (current().is("(") &&
+            (current(1).is("*") || current(1).is("("))) {
+            type->pending_address_space = pending_address_space;
+        } else if (type->kind != Type::Kind::Pointer) {
             diagnostics_.error(pending_address_space->second,
                                "address_space requires a pointer type");
         } else if (type->address_space_location.valid()) {
@@ -618,20 +621,53 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     if (nested) {
         // The inner declarator binds first. Fill its unique placeholder only
         // after the outer suffix has formed the result/element type.
+        TypePtr* attributed_base = &base;
+        while (*attributed_base) {
+            if ((*attributed_base)->kind == Type::Kind::Array) {
+                attributed_base = &(*attributed_base)->element;
+            } else if ((*attributed_base)->kind == Type::Kind::Function &&
+                       (*attributed_base)->function) {
+                attributed_base = &(*attributed_base)->function->result;
+            } else {
+                break;
+            }
+        }
+        auto pending_address_space = *attributed_base
+            ? (*attributed_base)->pending_address_space
+            : std::optional<std::pair<std::uint32_t, SourceLocation>>{};
+        if (*attributed_base) {
+            (*attributed_base)->pending_address_space.reset();
+        }
         const auto fill = [&](auto&& self, TypePtr& type) -> void {
             if (type == hole) {
                 type = base;
                 return;
             }
             if (!type) return;
-            if (type->kind == Type::Kind::Pointer)
+            if (type->kind == Type::Kind::Pointer) {
+                if (type->pointee == hole && pending_address_space) {
+                    if (type->address_space_location.valid()) {
+                        diagnostics_.error(
+                            pending_address_space->second,
+                            "duplicate address_space type qualifier");
+                    } else {
+                        type->address_space = pending_address_space->first;
+                        type->address_space_location =
+                            pending_address_space->second;
+                    }
+                    pending_address_space.reset();
+                }
                 self(self, type->pointee);
-            else if (type->kind == Type::Kind::Array)
+            } else if (type->kind == Type::Kind::Array)
                 self(self, type->element);
             else if (type->kind == Type::Kind::Function && type->function)
                 self(self, type->function->result);
         };
         fill(fill, nested);
+        if (pending_address_space) {
+            diagnostics_.error(pending_address_space->second,
+                               "address_space requires a pointer type");
+        }
         base = std::move(nested);
     }
     if (parameter && base) {

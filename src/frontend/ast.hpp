@@ -50,6 +50,9 @@ struct Type {
     // generic address space; the source location supports target diagnostics.
     std::uint32_t address_space{};
     SourceLocation address_space_location;
+    // Parser-only qualifier waiting for a grouped pointer declarator's `*`.
+    std::optional<std::pair<std::uint32_t, SourceLocation>>
+        pending_address_space;
 };
 
 TypePtr builtin_type(BuiltinType kind, bool is_const = false,
