@@ -19,5 +19,12 @@ namespace native {
                                               const CompilerOptions& options,
                                               Diagnostics& diagnostics);
 
+// Emits data objects owned by raw assembly because one or more exact
+// subobjects receive patch-cell-address relocations. The result is suitable
+// for native concatenation and for LLVM/GIMPLE module-level assembly.
+[[nodiscard]] std::string emit_patch_data_assembly(
+    const codegen::ModuleView& module, const Subtarget& subtarget,
+    const CompilerOptions& options, Diagnostics& diagnostics);
+
 } // namespace native
 } // namespace cross

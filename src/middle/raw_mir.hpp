@@ -23,10 +23,7 @@ struct ImmediateOperand {
     std::uint64_t value{};
     unsigned bits{};
     bool patch{};
-    std::optional<hir::ObjectId> patch_sink;
-    std::string patch_sink_symbol;
-    Linkage patch_sink_linkage{Linkage::Group};
-    std::optional<std::string> patch_sink_section;
+    std::optional<PatchSink> patch_sink;
     std::uint32_t patch_id{};
 };
 
@@ -95,6 +92,12 @@ struct RawModule {
 };
 
 struct AssemblyBundle {
+    struct PatchRelocation {
+        PatchSink sink;
+        std::string end_label;
+        unsigned field_bytes{};
+    };
+
     [[nodiscard]] bool owns(hir::FunctionId id) const {
         return definitions.contains(id.value);
     }
@@ -104,6 +107,7 @@ struct AssemblyBundle {
 
     std::unordered_set<std::uint32_t> definitions;
     std::unordered_set<std::uint32_t> object_definitions;
+    std::vector<PatchRelocation> patch_relocations;
     std::string module_assembly;
 };
 

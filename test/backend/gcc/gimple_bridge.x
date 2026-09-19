@@ -37,3 +37,21 @@ global u64 gimple_bridge_select(in const u64 *values, in uptr count) {
 global u64 gimple_bridge_rotate(in u64 value, in u64 count) {
     return (value << count) | (value >> (64u64 - count));
 }
+
+struct gimple_patch_slot {
+    u32 tag;
+    uptr cell;
+};
+
+[[link_name("gimple_patch_record")]]
+global struct gimple_patch_slot gimple_patch_record = {
+    .tag = 77u32,
+};
+
+[[naked]]
+global void gimple_patch_raw(out u64 value "rax") {
+    $::_movabs(value,
+               $::patch(0x1122334455667788u64,
+                        gimple_patch_record.cell));
+    $::_ret();
+}

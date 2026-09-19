@@ -118,6 +118,13 @@ struct CallArgument {
     bool unnamed{};
 };
 
+struct PatchSink {
+    hir::ObjectId object;
+    std::uint64_t offset{};
+
+    friend bool operator==(const PatchSink&, const PatchSink&) = default;
+};
+
 struct ManagedValue {
     ValueId id;
     SourceLocation location;
@@ -143,7 +150,7 @@ struct ManagedValue {
     // Direct global accesses name their HIR object. IndexedLoad obtains its
     // scale and result type from the pointer-typed first operand.
     std::optional<hir::ObjectId> object;
-    std::optional<hir::ObjectId> patch_sink;
+    std::optional<PatchSink> patch_sink;
     std::uint32_t patch_id{};
     bool is_volatile_access{};
     // A source [[musttail]] return owns this call. Optimizers and targets must

@@ -233,7 +233,7 @@ struct FrameEffect {
 struct PatchSite {
     std::uint32_t identity{};
     unsigned field_bits{};
-    std::optional<hir::ObjectId> sink;
+    std::optional<mir::PatchSink> sink;
 };
 
 enum class InstructionKind {

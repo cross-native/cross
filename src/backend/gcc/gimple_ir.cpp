@@ -1562,10 +1562,13 @@ private:
 
     std::string object_prefix(const data::Object& object,
                               const hir::Object& entity,
-                              bool declaration) const {
+                              bool declaration,
+                              bool assembly_owned = false) const {
         std::string result;
         if (declaration) {
-            result += entity.linkage == Linkage::Global ? "extern " : "static ";
+            result += assembly_owned || entity.linkage == Linkage::Global
+                          ? "extern "
+                          : "static ";
         } else if (entity.linkage != Linkage::Global) {
             result += "static ";
         }
@@ -1604,9 +1607,10 @@ private:
 
     void emit_object_declarations(std::ostringstream& out) const {
         for (const auto& object : data_.objects) {
-            if (raw_assembly_.owns(object.source)) continue;
             const auto& entity = hir_.object(object.source);
-            out << object_prefix(object, entity, true)
+            out << object_prefix(
+                       object, entity, true,
+                       raw_assembly_.owns(object.source))
                 << types_.name(object.type) << ' '
                 << object_identifier(object.source) << " __asm__("
                 << c_string(entity.link_symbol) << ')'

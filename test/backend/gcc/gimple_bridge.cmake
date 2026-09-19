@@ -40,6 +40,11 @@ foreach(mode gimple rtl)
        NOT text MATCHES "gimple_bridge_rotate")
         message(FATAL_ERROR "MIR rotate helper was not emitted")
     endif()
+    if(NOT text MATCHES
+       "extern [^\n]+ __asm__\\(\"gimple_patch_record\"\\)")
+        message(FATAL_ERROR
+            "assembly-owned structured patch object lacks a GIMPLE declaration")
+    endif()
     if(text MATCHES "typedef (unsigned )?__int128" OR
        text MATCHES "typedef __float128")
         message(FATAL_ERROR

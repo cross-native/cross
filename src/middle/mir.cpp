@@ -9,6 +9,7 @@
 #include "middle/initializer.hpp"
 #include "middle/mir_analysis.hpp"
 #include "middle/mir_pass.hpp"
+#include "middle/patch_sink.hpp"
 #include "middle/mir_transform.hpp"
 #include "target/subtarget.hpp"
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <set>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -1104,9 +1106,9 @@ private:
             return std::nullopt;
         }
         prune_unreachable_blocks(current_);
-        for (const auto sink : current_patch_sinks_) {
+        for (const auto& sink : current_patch_sinks_) {
             patch_sinks_.insert(sink);
-            result_.object_definitions.insert(sink);
+            result_.object_definitions.insert(sink.first);
         }
         current_patch_sinks_.clear();
         return std::move(current_);
@@ -1345,52 +1347,23 @@ private:
         return value;
     }
 
-    const hir::Object* resolve_patch_sink(const Expr& expression) {
-        const Expr* source = &expression;
-        while (source->kind == Expr::Kind::Parenthesized && source->left) {
-            source = source->left.get();
-        }
-        if (source->kind != Expr::Kind::Name) {
-            diagnostics_.error(
-                expression.location,
-                "bootstrap $::patch address sink must be one named "
-                "static-duration uptr object");
-            failed_ = true;
-            return nullptr;
-        }
-        const auto* result = resolve_object(source->text);
+    std::optional<PatchSink> resolve_patch_sink(const Expr& expression) {
+        auto result = resolve_patch_sink_designator(
+            expression, hir_, target_,
+            [&](std::string_view name) { return resolve_object(name); },
+            diagnostics_);
         if (!result) {
-            diagnostics_.error(expression.location,
-                               "unknown $::patch address sink '" +
-                                   source->text + "'");
             failed_ = true;
-            return nullptr;
+            return std::nullopt;
         }
-        const auto& type = hir_.type(result->type);
-        if (type.kind != hir::Type::Kind::Builtin ||
-            type.builtin != BuiltinType::Uptr || type.is_const ||
-            type.is_volatile || type.is_atomic) {
-            diagnostics_.error(
-                expression.location,
-                "$::patch address sink must have unqualified type uptr");
-            failed_ = true;
-            return nullptr;
-        }
-        if (!result->definition || result->definition->initializer) {
-            diagnostics_.error(
-                expression.location,
-                "$::patch address sink must be an uninitialized "
-                "static-duration definition");
-            failed_ = true;
-            return nullptr;
-        }
-        if (patch_sinks_.contains(result->id.value) ||
-            !current_patch_sinks_.insert(result->id.value).second) {
+        const auto key = std::pair{result->object.value, result->offset};
+        if (patch_sinks_.contains(key) ||
+            !current_patch_sinks_.insert(key).second) {
             diagnostics_.error(
                 expression.location,
                 "$::patch address sink is used by more than one site");
             failed_ = true;
-            return nullptr;
+            return std::nullopt;
         }
         return result;
     }
@@ -5162,8 +5135,15 @@ private:
             failed_ = true;
             return std::nullopt;
         }
-        const hir::Object* sink = nullptr;
+        std::optional<PatchSink> sink;
         if (expression.arguments.size() == 2) {
+            if (!materializer->supports_address_sink) {
+                diagnostics_.error(
+                    expression.arguments[1]->location,
+                    "selected target does not support a $::patch address sink for this materializer");
+                failed_ = true;
+                return std::nullopt;
+            }
             sink = resolve_patch_sink(*expression.arguments[1]);
             if (!sink) return std::nullopt;
         }
@@ -5173,7 +5153,7 @@ private:
         patch.integer = initial->value.low;
         patch.integer_high = initial->value.high;
         patch.patch_id = next_patch_id_++;
-        if (sink) patch.patch_sink = sink->id;
+        if (sink) patch.patch_sink = *sink;
         return result;
     }
 
@@ -5958,8 +5938,8 @@ private:
     std::unordered_map<const Statement*, BlockId> case_blocks_;
     std::vector<Scope> scopes_;
     std::vector<LoopContext> loops_;
-    std::unordered_set<std::uint32_t> patch_sinks_;
-    std::unordered_set<std::uint32_t> current_patch_sinks_;
+    std::set<std::pair<std::uint32_t, std::uint64_t>> patch_sinks_;
+    std::set<std::pair<std::uint32_t, std::uint64_t>> current_patch_sinks_;
     std::uint32_t next_patch_id_{};
     bool has_dynamic_arrays_{};
     bool failed_{};
@@ -7051,19 +7031,15 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     fail(value.location, "duplicate patch-value site id");
                 }
                 if (value.patch_sink &&
-                    value.patch_sink->value >= hir_module.objects.size()) {
+                    value.patch_sink->object.value >=
+                        hir_module.objects.size()) {
                     fail(value.location, "patch-value sink is out of range");
                 } else if (value.patch_sink) {
-                    const auto& sink = hir_module.object(*value.patch_sink);
-                    const auto& sink_type = hir_module.type(sink.type);
-                    if (sink_type.kind != hir::Type::Kind::Builtin ||
-                        sink_type.builtin != BuiltinType::Uptr ||
-                        sink_type.is_const || sink_type.is_volatile ||
-                        sink_type.is_atomic || !sink.definition ||
-                        sink.definition->initializer) {
+                    const auto& sink = hir_module.object(
+                        value.patch_sink->object);
+                    if (!sink.definition) {
                         fail(value.location,
-                             "patch-value sink is not an uninitialized "
-                             "unqualified uptr definition");
+                             "patch-value sink object is not a definition");
                     }
                 }
             } else if (value.slot || value.callee || value.object ||
@@ -7151,7 +7127,8 @@ bool verify(const ManagedModule& module, const hir::Module& hir_module,
             Diagnostics& diagnostics) {
     bool valid = true;
     std::unordered_set<std::uint32_t> seen;
-    std::unordered_set<std::uint32_t> seen_patch_sinks;
+    std::set<std::pair<std::uint32_t, std::uint64_t>> seen_patch_sinks;
+    std::unordered_set<std::uint32_t> seen_patch_sink_objects;
     for (const auto& function : module.functions) {
         if (function.source.value >= hir_module.functions.size()) {
             diagnostics.error(function.location,
@@ -7180,14 +7157,16 @@ bool verify(const ManagedModule& module, const hir::Module& hir_module,
             if (value.kind != ValueKind::PatchValue || !value.patch_sink) {
                 continue;
             }
-            const auto sink = value.patch_sink->value;
+            const auto sink = std::pair{
+                value.patch_sink->object.value, value.patch_sink->offset};
+            seen_patch_sink_objects.insert(sink.first);
             if (!seen_patch_sinks.insert(sink).second) {
                 diagnostics.error(
                     value.location,
                     "invalid managed MIR: patch sink is used by multiple sites");
                 valid = false;
             }
-            if (!module.object_definitions.contains(sink)) {
+            if (!module.object_definitions.contains(sink.first)) {
                 diagnostics.error(
                     value.location,
                     "invalid managed MIR: patch sink definition is not owned");
@@ -7218,7 +7197,7 @@ bool verify(const ManagedModule& module, const hir::Module& hir_module,
             diagnostics.error(
                 {}, "invalid managed MIR: patch sink definition is out of range");
             valid = false;
-        } else if (!seen_patch_sinks.contains(source)) {
+        } else if (!seen_patch_sink_objects.contains(source)) {
             diagnostics.error(
                 hir_module.objects[source].location,
                 "invalid managed MIR: owned patch sink has no patch-value site");

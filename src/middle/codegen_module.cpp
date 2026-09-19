@@ -5,6 +5,7 @@
 #include "common/diagnostic.hpp"
 
 #include <algorithm>
+#include <set>
 #include <unordered_set>
 
 namespace cross::codegen {
@@ -283,6 +284,29 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
         if (id >= module.hir().objects.size() || !data_ids.contains(id)) {
             diagnostics.command_error(
                 "raw assembly owns an unknown data IR object");
+            valid = false;
+        }
+    }
+    std::set<std::pair<std::uint32_t, std::uint64_t>> patch_sinks;
+    const auto patch_address_size =
+        (module.hir().address_bits + 7U) / 8U;
+    for (const auto& relocation :
+         module.raw_assembly().patch_relocations) {
+        const auto object_id = relocation.sink.object.value;
+        const auto* object = module.data().find(relocation.sink.object);
+        if (!object ||
+            !module.raw_assembly().object_definitions.contains(object_id) ||
+            relocation.end_label.empty() || relocation.field_bytes == 0 ||
+            relocation.sink.offset > object->size ||
+            patch_address_size > object->size - relocation.sink.offset) {
+            diagnostics.command_error(
+                "raw assembly contains an invalid patch sink relocation");
+            valid = false;
+            continue;
+        }
+        if (!patch_sinks.emplace(object_id, relocation.sink.offset).second) {
+            diagnostics.command_error(
+                "raw assembly contains a duplicate patch sink relocation");
             valid = false;
         }
     }

@@ -2946,6 +2946,33 @@ bool normalize_generic_arguments(const FunctionDecl& generic,
     return true;
 }
 
+void rewrite_patch_sink_indices(std::unique_ptr<Expr>& expression,
+                                const FunctionDecl* caller,
+                                Program& program,
+                                Diagnostics& diagnostics) {
+    if (!expression) return;
+    if (expression->kind == Expr::Kind::Parenthesized) {
+        rewrite_patch_sink_indices(expression->left, caller, program,
+                                   diagnostics);
+        return;
+    }
+    if (expression->kind != Expr::Kind::Binary) return;
+    if (expression->text == "member") {
+        rewrite_patch_sink_indices(expression->left, caller, program,
+                                   diagnostics);
+        return;
+    }
+    if (expression->text != "index") return;
+    rewrite_patch_sink_indices(expression->left, caller, program,
+                               diagnostics);
+    if (expression->right) {
+        if (contains_layout_query(*expression->right)) return;
+        (void)rewrite_required_integer(
+            expression->right, caller, program, diagnostics,
+            builtin_type(BuiltinType::Uptr));
+    }
+}
+
 void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                        FunctionDecl* caller, Program& program,
                        Diagnostics& diagnostics,
@@ -2953,6 +2980,14 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                        bool required_context = false,
                        bool runtime_context = false) {
     if (!expression) return;
+
+    if (expression->kind == Expr::Kind::Call && expression->left &&
+        expression->left->kind == Expr::Kind::Name &&
+        expression->left->text == "$::patch" &&
+        expression->arguments.size() == 2) {
+        rewrite_patch_sink_indices(expression->arguments[1], caller, program,
+                                   diagnostics);
+    }
 
     if (expression->kind == Expr::Kind::AggregateInitializer) {
         for (auto& entry : expression->initializer_entries) {

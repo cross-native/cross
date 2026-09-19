@@ -542,6 +542,11 @@ int cc_main(int argc, char** argv) {
     auto raw_assembly = backend->emit_raw_assembly(
         raw_mir, managed_mir, hir_module, *subtarget, options, diagnostics);
     if (diagnostics.errors() != 0) return 1;
+    const codegen::ModuleView patch_data_module{
+        hir_module, data_module, managed_mir, raw_mir, raw_assembly};
+    raw_assembly.module_assembly += native::emit_patch_data_assembly(
+        patch_data_module, *subtarget, options, diagnostics);
+    if (diagnostics.errors() != 0) return 1;
     const codegen::ModuleView codegen_module{
         hir_module, data_module, managed_mir, raw_mir, raw_assembly};
     if (!codegen::verify(codegen_module, diagnostics)) return 1;

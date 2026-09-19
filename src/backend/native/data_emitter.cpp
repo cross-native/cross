@@ -69,14 +69,15 @@ class Emitter {
 public:
     Emitter(const codegen::ModuleView& module,
             const Subtarget& subtarget, const CompilerOptions& options,
-            Diagnostics& diagnostics)
+            Diagnostics& diagnostics, bool patch_owned = false)
         : module_(module), options_(options), diagnostics_(diagnostics),
-          format_(subtarget.object_format()) {}
+          format_(subtarget.object_format()), patch_owned_(patch_owned) {}
 
     std::string run() {
         if (format_ == ObjectFormat::Unsupported) {
             for (const auto& object : module_.data().objects) {
-                if (!module_.raw_assembly().owns(object.source)) {
+                if (patch_owned_ ==
+                    module_.raw_assembly().owns(object.source)) {
                     diagnostics_.error(
                         object.location,
                         "native data emission is not implemented for this "
@@ -85,10 +86,19 @@ public:
             }
             return {};
         }
+        bool emitted_object = false;
         for (const auto& object : module_.data().objects) {
-            if (!module_.raw_assembly().owns(object.source)) emit_object(object);
+            if (patch_owned_ ==
+                module_.raw_assembly().owns(object.source)) {
+                emit_object(object);
+                emitted_object = true;
+            }
         }
-        if (format_ == ObjectFormat::Coff &&
+        // GCC's top-level assembly is emitted before its generated functions
+        // and inherits the final section. Leave embedded patch data in the
+        // ordinary text section so subsequent compiler output remains code.
+        if (patch_owned_ && emitted_object) out_ << ".text\n";
+        if (!patch_owned_ && format_ == ObjectFormat::Coff &&
             std::any_of(module_.data().objects.begin(),
                         module_.data().objects.end(),
                         [&](const data::Object& object) {
@@ -132,8 +142,13 @@ private:
 
     bool select_section(const hir::Object& entity,
                         const data::Object& object) {
+        const bool patched = std::ranges::any_of(
+            module_.raw_assembly().patch_relocations,
+            [&](const mir::AssemblyBundle::PatchRelocation& relocation) {
+                return relocation.sink.object == object.source;
+            });
         const bool zero = object.initializer == data::InitializerKind::Zero &&
-                          !object.read_only;
+                          !object.read_only && !patched;
         const bool uninitialized =
             object.initializer == data::InitializerKind::Uninitialized;
         const bool split_section = options_.data_sections || object.retain;
@@ -217,6 +232,15 @@ private:
     }
 
     void emit_initializer(const data::Object& object) {
+        std::vector<const mir::AssemblyBundle::PatchRelocation*> patches;
+        for (const auto& patch :
+             module_.raw_assembly().patch_relocations) {
+            if (patch.sink.object == object.source) patches.push_back(&patch);
+        }
+        if (!patches.empty()) {
+            emit_patched_initializer(object, std::move(patches));
+            return;
+        }
         switch (object.initializer) {
         case data::InitializerKind::Declaration: return;
         case data::InitializerKind::Zero:
@@ -292,6 +316,97 @@ private:
         }
     }
 
+    void emit_patched_initializer(
+        const data::Object& object,
+        std::vector<const mir::AssemblyBundle::PatchRelocation*> patches) {
+        if (object.initializer != data::InitializerKind::Zero &&
+            object.initializer != data::InitializerKind::Bytes &&
+            object.initializer != data::InitializerKind::Aggregate) {
+            diagnostics_.error(
+                object.location,
+                "$::patch sink container has an incompatible static initializer");
+            return;
+        }
+        std::ranges::sort(
+            patches, {},
+            [](const mir::AssemblyBundle::PatchRelocation* patch) {
+                return patch->sink.offset;
+            });
+        const auto emit_bytes = [&](std::size_t begin, std::size_t limit) {
+            if (begin == limit) return;
+            if (object.initializer == data::InitializerKind::Zero) {
+                out_ << "\t.zero " << limit - begin << '\n';
+                return;
+            }
+            for (auto offset = begin; offset < limit;) {
+                out_ << "\t.byte ";
+                const auto end = std::min(offset + 16, limit);
+                for (auto index = offset; index < end; ++index) {
+                    if (index != offset) out_ << ',';
+                    out_ << static_cast<unsigned>(object.bytes[index]);
+                }
+                out_ << '\n';
+                offset = end;
+            }
+        };
+        struct Event {
+            std::uint64_t offset{};
+            unsigned size{};
+            const data::Relocation* data{};
+            const mir::AssemblyBundle::PatchRelocation* patch{};
+        };
+        std::vector<Event> events;
+        events.reserve(object.relocations.size() + patches.size());
+        for (const auto& relocation : object.relocations) {
+            events.push_back(
+                {relocation.offset, relocation.size, &relocation, nullptr});
+        }
+        const auto address_bytes =
+            (module_.data().address_bits + 7U) / 8U;
+        for (const auto* patch : patches) {
+            events.push_back(
+                {patch->sink.offset, address_bytes, nullptr, patch});
+        }
+        std::ranges::sort(events, {}, &Event::offset);
+        std::uint64_t offset{};
+        for (const auto& event : events) {
+            if (event.offset < offset || event.offset > object.size ||
+                event.size > object.size - event.offset) {
+                diagnostics_.error(
+                    object.location,
+                    "$::patch sink relocation overlaps initialized data or exceeds its object");
+                return;
+            }
+            emit_bytes(static_cast<std::size_t>(offset),
+                       static_cast<std::size_t>(event.offset));
+            if (event.patch) {
+                if (event.size == 4) {
+                    out_ << "\t.long ";
+                } else if (event.size == 8) {
+                    out_ << "\t.quad ";
+                } else {
+                    diagnostics_.error(
+                        object.location,
+                        "target has no $::patch sink relocation directive for this address width");
+                    return;
+                }
+                out_ << event.patch->end_label << '-'
+                     << event.patch->field_bytes << '\n';
+            } else if (event.size == 4) {
+                out_ << "\t.long " << address(event.data->address) << '\n';
+            } else if (event.size == 8) {
+                out_ << "\t.quad " << address(event.data->address) << '\n';
+            } else {
+                diagnostics_.error(
+                    object.location,
+                    "target has no aggregate relocation directive for this address width");
+                return;
+            }
+            offset = event.offset + event.size;
+        }
+        emit_bytes(static_cast<std::size_t>(offset), object.size);
+    }
+
     void emit_object(const data::Object& object) {
         const auto& entity = module_.hir().object(object.source);
         const auto name = symbol(entity.link_symbol);
@@ -329,6 +444,7 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    bool patch_owned_{};
     std::ostringstream out_;
 };
 
@@ -339,6 +455,13 @@ std::string emit_data_assembly(const codegen::ModuleView& module,
                                const CompilerOptions& options,
                                Diagnostics& diagnostics) {
     return Emitter(module, subtarget, options, diagnostics).run();
+}
+
+std::string emit_patch_data_assembly(const codegen::ModuleView& module,
+                                     const Subtarget& subtarget,
+                                     const CompilerOptions& options,
+                                     Diagnostics& diagnostics) {
+    return Emitter(module, subtarget, options, diagnostics, true).run();
 }
 
 } // namespace cross::native

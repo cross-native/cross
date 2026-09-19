@@ -360,7 +360,6 @@ private:
     void emit_objects(std::ostringstream& module) {
         bool emitted = false;
         for (const auto& object : data_.objects) {
-            if (raw_assembly_.owns(object.source)) continue;
             const auto& entity = hir_.object(object.source);
             const auto symbol = symbol_name(entity.link_symbol);
             const auto storage = object.read_only ? "constant " : "global ";
@@ -376,6 +375,13 @@ private:
                                                          : "initialexec") +
                        ") ";
             }();
+            if (raw_assembly_.owns(object.source)) {
+                module << symbol << " = external " << tls << storage
+                       << ir_type(object.type) << ", align "
+                       << object.alignment << '\n';
+                emitted = true;
+                continue;
+            }
             if (object.initializer == data::InitializerKind::Declaration) {
                 module << symbol << " = external " << tls << storage
                        << ir_type(object.type) << ", align "

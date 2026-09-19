@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "target/x86_64/raw_backend.hpp"
 
+#include "middle/patch_sink.hpp"
 #include "target/assembly_format.hpp"
 
 #include "target/x86_64/features.hpp"
@@ -13,6 +14,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -919,72 +921,55 @@ private:
         return operand;
     }
 
-    const hir::Object* resolve_patch_sink(const Expr& expression) {
-        if (!current_function_ || expression.kind != Expr::Kind::Name) {
-            diagnostics_.error(
-                expression.location,
-                "bootstrap $::patch address sink must be one named static-duration uptr object");
-            return nullptr;
-        }
+    std::optional<mir::PatchSink> resolve_patch_sink(
+        const Expr& expression) {
+        if (!current_function_) return std::nullopt;
         const hir::Object* result = nullptr;
+        std::string_view candidate_name;
         const auto consider = [&](const hir::Object& object) {
-            if (object.source_name != expression.text) return;
+            if (object.source_name != candidate_name) return;
             if (object.linkage == Linkage::Static &&
                 object.source_unit != current_function_->source_unit) {
                 return;
             }
             result = &object;
         };
-        for (const auto& object : hir_.objects) consider(object);
-        if (!result && expression.text.find("::") == std::string::npos) {
-            const auto separator = current_function_->source_name.rfind("::");
-            if (separator != std::string::npos) {
-                const auto qualified =
-                    current_function_->source_name.substr(0, separator + 2) +
-                    expression.text;
-                for (const auto& object : hir_.objects) {
-                    if (object.source_name == qualified &&
-                        (object.linkage != Linkage::Static ||
-                         object.source_unit == current_function_->source_unit)) {
-                        result = &object;
+        auto resolve = [&](std::string_view name) -> const hir::Object* {
+            candidate_name = name;
+            result = nullptr;
+            for (const auto& object : hir_.objects) consider(object);
+            if (!result && name.find("::") == std::string::npos) {
+                const auto separator =
+                    current_function_->source_name.rfind("::");
+                if (separator != std::string::npos) {
+                    const auto qualified = current_function_->source_name.substr(
+                                               0, separator + 2) +
+                                           std::string(name);
+                    candidate_name = qualified;
+                    for (const auto& object : hir_.objects) {
+                        consider(object);
                     }
                 }
             }
-        }
-        if (!result) {
-            diagnostics_.error(expression.location,
-                               "unknown $::patch address sink '" +
-                                   expression.text + "'");
-            return nullptr;
-        }
-        const auto& type = hir_.type(result->type);
-        if (type.kind != hir::Type::Kind::Builtin ||
-            type.builtin != BuiltinType::Uptr || type.is_const ||
-            type.is_volatile || type.is_atomic) {
-            diagnostics_.error(
-                expression.location,
-                "$::patch address sink must have unqualified type uptr");
-            return nullptr;
-        }
-        if (!result->definition || result->definition->initializer) {
-            diagnostics_.error(
-                expression.location,
-                "$::patch address sink must be an uninitialized static-duration definition");
-            return nullptr;
-        }
-        if (!patch_sinks_.insert(result->id.value).second) {
+            return result;
+        };
+        auto sink = mir::resolve_patch_sink_designator(
+            expression, hir_, target_, resolve, diagnostics_);
+        if (!sink) return std::nullopt;
+        const auto key = std::pair{sink->object.value, sink->offset};
+        if (!patch_sinks_.insert(key).second) {
             diagnostics_.error(expression.location,
                                "$::patch address sink is used by more than one site");
-            return nullptr;
+            return std::nullopt;
         }
-        module_.object_definitions.insert(result->id.value);
-        return result;
+        module_.object_definitions.insert(sink->object.value);
+        return sink;
     }
 
     std::optional<mir::Operand> lower_operand(const Expr& expression,
                                              const InstructionOperandEntry& specification) {
         const Expr* source = &expression;
-        const hir::Object* patch_sink = nullptr;
+        std::optional<mir::PatchSink> patch_sink;
         bool patch = false;
         if (expression.kind == Expr::Kind::Call && expression.left &&
             expression.left->kind == Expr::Kind::Name &&
@@ -1096,10 +1081,7 @@ private:
                     operand.immediate.patch = true;
                     operand.immediate.patch_id = next_patch_id_++;
                     if (patch_sink) {
-                        operand.immediate.patch_sink = patch_sink->id;
-                        operand.immediate.patch_sink_symbol = patch_sink->link_symbol;
-                        operand.immediate.patch_sink_linkage = patch_sink->linkage;
-                        operand.immediate.patch_sink_section = patch_sink->section;
+                        operand.immediate.patch_sink = *patch_sink;
                     }
                 }
                 return operand;
@@ -1739,7 +1721,7 @@ private:
     std::unordered_map<std::uint32_t, mir::BlockId> label_blocks_;
     std::unordered_set<std::uint32_t> laid_out_;
     std::vector<LoopContext> loops_;
-    std::unordered_set<std::uint32_t> patch_sinks_;
+    std::set<std::pair<std::uint32_t, std::uint64_t>> patch_sinks_;
     std::uint32_t next_patch_id_{};
     unsigned entry_ordered_depth_{};
     unsigned return_ordered_depth_{};
@@ -1792,7 +1774,10 @@ public:
         bundle_.object_definitions = module_.object_definitions;
         for (const auto& function : module_.functions) emit_function(function);
         collect_managed_patch_sinks();
-        emit_patch_sinks();
+        for (const auto& patch : patches_) {
+            bundle_.patch_relocations.push_back(
+                {patch.sink, patch.end_label, patch.field_bytes});
+        }
         bundle_.definitions = module_.definitions;
         bundle_.module_assembly = output_.str();
         return std::move(bundle_);
@@ -1847,8 +1832,12 @@ private:
                     !value.patch_sink) {
                     continue;
                 }
-                const auto& object = hir_.object(*value.patch_sink);
-                if (!bundle_.object_definitions.insert(object.id.value).second) {
+                const auto& object = hir_.object(value.patch_sink->object);
+                bundle_.object_definitions.insert(object.id.value);
+                if (std::ranges::any_of(
+                        patches_, [&](const PatchEmission& patch) {
+                            return patch.sink == *value.patch_sink;
+                        })) {
                     diagnostics_.error(
                         value.location,
                         "$::patch address sink is used by more than one site");
@@ -1864,8 +1853,7 @@ private:
                 patches_.push_back(
                     {".Lcross.patch.value." +
                          std::to_string(value.patch_id) + ".end",
-                     bits / 8, object.link_symbol, object.linkage,
-                     object.section});
+                     bits / 8, *value.patch_sink});
             }
         }
     }
@@ -2062,62 +2050,14 @@ private:
             output_ << label << ":\n";
             patches_.push_back(
                 {label, operand_value.immediate.bits / 8,
-                 operand_value.immediate.patch_sink_symbol,
-                 operand_value.immediate.patch_sink_linkage,
-                 operand_value.immediate.patch_sink_section});
-        }
-    }
-
-    void emit_patch_sinks() {
-        for (const auto& patch : patches_) {
-            if (!safe_assembly_text(patch.symbol) ||
-                (patch.section && !safe_assembly_text(*patch.section))) {
-                diagnostics_.error({},
-                                   "$::patch sink symbol or section cannot be "
-                                   "represented by the selected assembler");
-                continue;
-            }
-            const auto symbol = assembly_symbol(patch.symbol);
-            const auto section = patch.section
-                ? *patch.section
-                : options_.data_sections
-                      ? std::string(format_ == ObjectFormat::Coff ? ".data$" : ".data.") +
-                            patch.symbol
-                      : std::string(".data");
-            std::string section_error;
-            const auto directive = assembly_section_directive(
-                format_, {section, AssemblySectionKind::WritableData,
-                          patch.section.has_value(), false},
-                section_error);
-            if (!directive) {
-                diagnostics_.error({}, section_error);
-                continue;
-            }
-            output_ << *directive << '\n';
-            output_ << ".p2align 3\n";
-            if (patch.linkage == Linkage::Global) output_ << ".globl " << symbol << "\n";
-            else if (format_ == ObjectFormat::Elf) output_ << ".local " << symbol << "\n";
-            if (format_ == ObjectFormat::Elf) {
-                output_ << ".type " << symbol << ",@object\n";
-            } else if (format_ == ObjectFormat::Coff) {
-                output_ << ".def " << symbol << "; .scl "
-                        << (patch.linkage == Linkage::Global ? "2" : "3")
-                        << "; .type 0; .endef\n";
-            }
-            output_ << symbol << ":\n\t.quad " << patch.end_label << '-'
-                    << patch.field_bytes << "\n";
-            if (format_ == ObjectFormat::Elf) {
-                output_ << ".size " << symbol << ", 8\n";
-            }
+                 *operand_value.immediate.patch_sink});
         }
     }
 
     struct PatchEmission {
         std::string end_label;
         unsigned field_bytes{};
-        std::string symbol;
-        Linkage linkage{Linkage::Group};
-        std::optional<std::string> section;
+        mir::PatchSink sink;
     };
 
     const mir::RawModule& module_;

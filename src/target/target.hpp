@@ -319,6 +319,7 @@ struct PatchValueMaterializerEntry {
     std::string_view type_name;
     unsigned bits{};
     std::string_view feature;
+    bool supports_address_sink{};
 };
 
 struct AtomicWidthEntry {

@@ -15,6 +15,13 @@ extern CROSS_MS_ABI double gimple_bridge_divide(double, double);
 extern CROSS_MS_ABI uint64_t gimple_bridge_select(const uint64_t *, size_t);
 extern CROSS_MS_ABI uint64_t gimple_bridge_rotate(uint64_t, uint64_t);
 
+struct gimple_patch_slot {
+    uint32_t tag;
+    uintptr_t cell;
+};
+
+extern struct gimple_patch_slot gimple_patch_record;
+
 static uint64_t reference_select(const uint64_t *values, size_t count) {
     uint64_t total = 0;
     for (size_t index = 0; index < count; ++index) {
@@ -47,5 +54,7 @@ int main(void) {
         (rotate_value << rotate_count) |
         (rotate_value >> (64 - rotate_count));
     if (gimple_bridge_rotate(rotate_value, rotate_count) != rotated) return 4;
+    if (gimple_patch_record.tag != UINT32_C(77)) return 5;
+    if (gimple_patch_record.cell == 0) return 6;
     return 0;
 }

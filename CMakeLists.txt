@@ -115,6 +115,7 @@ add_library(cross_middle
     src/middle/data_ir.cpp
     src/middle/hir.cpp
     src/middle/initializer.cpp
+    src/middle/patch_sink.cpp
     src/middle/machine_ir.cpp
     src/middle/frame_ir.cpp
     src/middle/mir.cpp
@@ -2167,4 +2168,26 @@ if(BUILD_TESTING)
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/patch-value-errors
                 -P "${CMAKE_SOURCE_DIR}/test/middle/patch_value_errors.cmake")
     set_tests_properties(cross_patch_value_diagnostics PROPERTIES TIMEOUT 10)
+    add_test(NAME cross_patch_structured_sinks
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_sinks.x
+                -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_errors.x
+                -DINDEX_ERROR=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_runtime_index_error.x
+                -DUNSUPPORTED_TARGET=${CMAKE_SOURCE_DIR}/test/middle/patch_sink_unsupported_target.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/patch-structured-sinks
+                -P "${CMAKE_SOURCE_DIR}/test/middle/patch_structured_sinks.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_patch_structured_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_sinks.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-patch-structured-${level}
+                    -DENTRY=patch_structured_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
 endif()

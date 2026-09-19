@@ -202,6 +202,7 @@ public:
         finish_functions();
         finish_global_labels();
         finish_objects();
+        finish_patch_sink_indices();
         diagnose_symbol_collisions();
         return std::move(module_);
     }
@@ -223,6 +224,141 @@ private:
             return std::nullopt;
         }
         return (value + mask) & ~mask;
+    }
+
+    void finish_patch_sink_designator(Expr& expression,
+                                      std::string_view source_namespace) {
+        if (expression.kind == Expr::Kind::Parenthesized &&
+            expression.left) {
+            finish_patch_sink_designator(*expression.left,
+                                         source_namespace);
+            return;
+        }
+        if (expression.kind != Expr::Kind::Binary || !expression.left) {
+            return;
+        }
+        finish_patch_sink_designator(*expression.left, source_namespace);
+        if (expression.text != "index" || !expression.right ||
+            expression.right->evaluated_integer) {
+            return;
+        }
+        const auto layout = [&](const TypePtr& source)
+            -> std::optional<std::pair<std::uint64_t, unsigned>> {
+            const auto id = intern_type(source);
+            const auto& type = module_.type(id);
+            if (type.kind == Type::Kind::Record &&
+                (!type.record ||
+                 !layout_record(*type.record, expression.location))) {
+                return std::nullopt;
+            }
+            const auto result = storage_layout(id, expression.location);
+            return result.first == 0 ? std::nullopt
+                                     : std::optional(result);
+        };
+        const LayoutQuery size_of = [&](const TypePtr& source)
+            -> std::optional<std::uint64_t> {
+            const auto result = layout(source);
+            return result ? std::optional(result->first) : std::nullopt;
+        };
+        const LayoutQuery align_of = [&](const TypePtr& source)
+            -> std::optional<std::uint64_t> {
+            const auto result = layout(source);
+            return result ? std::optional<std::uint64_t>(result->second)
+                          : std::nullopt;
+        };
+        expression.right->evaluated_integer =
+            evaluate_target_integer_constant(
+                program_, *expression.right, diagnostics_, size_of, align_of,
+                source_namespace);
+    }
+
+    void finish_patch_sink_expression(Expr& expression,
+                                      std::string_view source_namespace) {
+        if (expression.kind == Expr::Kind::Call && expression.left &&
+            expression.left->kind == Expr::Kind::Name &&
+            expression.left->text == "$::patch" &&
+            expression.arguments.size() == 2) {
+            finish_patch_sink_designator(*expression.arguments[1],
+                                         source_namespace);
+        }
+        if (expression.left) {
+            finish_patch_sink_expression(*expression.left,
+                                         source_namespace);
+        }
+        if (expression.right) {
+            finish_patch_sink_expression(*expression.right,
+                                         source_namespace);
+        }
+        if (expression.third) {
+            finish_patch_sink_expression(*expression.third,
+                                         source_namespace);
+        }
+        for (auto& argument : expression.arguments) {
+            finish_patch_sink_expression(*argument, source_namespace);
+        }
+        for (auto& argument : expression.generic_arguments) {
+            if (argument.value) {
+                finish_patch_sink_expression(*argument.value,
+                                             source_namespace);
+            }
+        }
+        for (auto& entry : expression.initializer_entries) {
+            for (auto& designator : entry.designators) {
+                if (designator.index) {
+                    finish_patch_sink_expression(*designator.index,
+                                                 source_namespace);
+                }
+            }
+            if (entry.value) {
+                finish_patch_sink_expression(*entry.value,
+                                             source_namespace);
+            }
+        }
+    }
+
+    void finish_patch_sink_statement(Statement& statement,
+                                     std::string_view source_namespace) {
+        for (auto& child : statement.statements) {
+            finish_patch_sink_statement(*child, source_namespace);
+        }
+        if (statement.declaration) {
+            if (statement.declaration->dynamic_array_bound) {
+                finish_patch_sink_expression(
+                    *statement.declaration->dynamic_array_bound,
+                    source_namespace);
+            }
+            if (statement.declaration->initializer) {
+                finish_patch_sink_expression(
+                    *statement.declaration->initializer, source_namespace);
+            }
+        }
+        if (statement.expression) {
+            finish_patch_sink_expression(*statement.expression,
+                                         source_namespace);
+        }
+        if (statement.condition) {
+            finish_patch_sink_expression(*statement.condition,
+                                         source_namespace);
+        }
+        if (statement.increment) {
+            finish_patch_sink_expression(*statement.increment,
+                                         source_namespace);
+        }
+        if (statement.first) {
+            finish_patch_sink_statement(*statement.first, source_namespace);
+        }
+        if (statement.second) {
+            finish_patch_sink_statement(*statement.second, source_namespace);
+        }
+    }
+
+    void finish_patch_sink_indices() {
+        for (auto& function : program_.functions) {
+            if (function->body) {
+                finish_patch_sink_statement(*function->body,
+                                            function->source_namespace);
+            }
+        }
     }
 
     unsigned parse_alignment(const std::vector<Attribute>& attributes,
