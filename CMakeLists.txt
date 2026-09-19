@@ -957,6 +957,28 @@ if(BUILD_TESTING)
                     -DEXPECTED=1
                     "-DCC_FLAGS=--model=${CMAKE_SOURCE_DIR}/test/model/custom.y;-${level}"
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        add_test(NAME cross_runtime_native_musttail_custom_result_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail_custom_result.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-musttail-custom-result-${level}
+                    -DENTRY=musttail_custom_result_entry
+                    -DEXPECTED=1
+                    "-DCC_FLAGS=--model=${CMAKE_SOURCE_DIR}/test/model/custom.y;-${level};-fno-optimize-sibling-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        add_test(NAME cross_runtime_native_musttail_reuse_home_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail_reuse_home.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-musttail-reuse-home-${level}
+                    -DENTRY=musttail_reuse_home_entry
+                    -DEXPECTED=1
+                    "-DCC_FLAGS=-${level};-fno-optimize-sibling-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     endforeach()
     add_test(NAME cross_runtime_native_loop_rotation
         COMMAND "${CMAKE_COMMAND}"
@@ -1978,6 +2000,11 @@ if(BUILD_TESTING)
                 -DPARSER_ERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_parser_errors.x
                 -DLOWERING_ERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_lowering_errors.x
                 -DSTACK_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_stack_error.x
+                -DHOME_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_home_error.x
+                -DREUSE_HOME_SOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail_reuse_home.x
+                -DCUSTOM_RESULT_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_custom_result_error.x
+                -DCUSTOM_RESULT_SOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail_custom_result.x
+                -DCUSTOM_MODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
                 -DCLOBBER_ERROR=${CMAKE_SOURCE_DIR}/test/language/musttail_clobber_error.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/musttail
                 -P "${CMAKE_SOURCE_DIR}/test/language/musttail.cmake")

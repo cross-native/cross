@@ -1,7 +1,9 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE PARSER_ERRORS LOWERING_ERRORS STACK_ERROR CLOBBER_ERROR OUTPUT)
+foreach(required CC SOURCE PARSER_ERRORS LOWERING_ERRORS STACK_ERROR HOME_ERROR
+                 REUSE_HOME_SOURCE CUSTOM_RESULT_ERROR CUSTOM_RESULT_SOURCE
+                 CUSTOM_MODEL CLOBBER_ERROR OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a value")
     endif()
@@ -179,4 +181,77 @@ if(stack_status EQUAL 0 OR NOT stack_stderr MATCHES
    "x86-64 cannot satisfy musttail: a tail argument is not a direct scalar register value")
     message(FATAL_ERROR
         "x86 stack musttail boundary was not diagnosed\n${stack_stdout}\n${stack_stderr}")
+endif()
+
+execute_process(
+    COMMAND "${CC}" -S -O0 -fno-optimize-sibling-calls
+            -target x86_64-unknown-linux-gnu "${HOME_ERROR}"
+            -o "${OUTPUT}-home-error.s"
+    RESULT_VARIABLE home_status
+    OUTPUT_VARIABLE home_stdout
+    ERROR_VARIABLE home_stderr
+)
+if(home_status EQUAL 0 OR NOT home_stderr MATCHES
+   "x86-64 cannot satisfy musttail: the callee requires more incoming stack space than the caller provides")
+    message(FATAL_ERROR
+        "x86 cross-ABI home-space boundary was not diagnosed\n${home_stdout}\n${home_stderr}")
+endif()
+
+execute_process(
+    COMMAND "${CC}" -S -O0 -fno-optimize-sibling-calls
+            -target x86_64-unknown-linux-gnu "${REUSE_HOME_SOURCE}"
+            -o "${OUTPUT}-reuse-home.s"
+    RESULT_VARIABLE reuse_home_status
+    OUTPUT_VARIABLE reuse_home_stdout
+    ERROR_VARIABLE reuse_home_stderr
+)
+if(NOT reuse_home_status EQUAL 0)
+    message(FATAL_ERROR
+        "x86 tail transfer with reusable incoming home space failed\n"
+        "${reuse_home_stdout}\n${reuse_home_stderr}")
+endif()
+file(READ "${OUTPUT}-reuse-home.s" reuse_home_assembly)
+if(NOT reuse_home_assembly MATCHES
+       "jmp[\t ]+[^\r\n]*musttail_reuse_home_callee" OR
+   reuse_home_assembly MATCHES
+       "call[\t ]+[^\r\n]*musttail_reuse_home_callee")
+    message(FATAL_ERROR
+        "x86 did not reuse caller incoming space for a cross-ABI tail jump\n"
+        "${reuse_home_assembly}")
+endif()
+
+execute_process(
+    COMMAND "${CC}" -S -O0 -fno-optimize-sibling-calls
+            "--model=${CUSTOM_MODEL}" -target x86_64-unknown-linux-gnu
+            "${CUSTOM_RESULT_ERROR}" -o "${OUTPUT}-custom-result-error.s"
+    RESULT_VARIABLE custom_result_status
+    OUTPUT_VARIABLE custom_result_stdout
+    ERROR_VARIABLE custom_result_stderr
+)
+if(custom_result_status EQUAL 0 OR NOT custom_result_stderr MATCHES
+   "x86-64 cannot satisfy musttail: caller and callee result registers are incompatible")
+    message(FATAL_ERROR
+        "model-defined result-register boundary was not diagnosed\n"
+        "${custom_result_stdout}\n${custom_result_stderr}")
+endif()
+
+execute_process(
+    COMMAND "${CC}" -S -O0 -fno-optimize-sibling-calls
+            "--model=${CUSTOM_MODEL}" -target x86_64-unknown-linux-gnu
+            "${CUSTOM_RESULT_SOURCE}" -o "${OUTPUT}-custom-result.s"
+    RESULT_VARIABLE custom_tail_status
+    OUTPUT_VARIABLE custom_tail_stdout
+    ERROR_VARIABLE custom_tail_stderr
+)
+if(NOT custom_tail_status EQUAL 0)
+    message(FATAL_ERROR
+        "model-defined result-register tail call failed to compile\n"
+        "${custom_tail_stdout}\n${custom_tail_stderr}")
+endif()
+file(READ "${OUTPUT}-custom-result.s" custom_tail_assembly)
+if(NOT custom_tail_assembly MATCHES "jmp[\t ]+[^\r\n]*musttail_odd_callee" OR
+   custom_tail_assembly MATCHES "call[\t ]+[^\r\n]*musttail_odd_callee")
+    message(FATAL_ERROR
+        "model-defined result-register tail call was not a jump\n"
+        "${custom_tail_assembly}")
 endif()

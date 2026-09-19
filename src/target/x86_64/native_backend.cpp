@@ -20680,6 +20680,32 @@ private:
             return "the caller or callee ABI could not be classified";
         }
         const auto* caller_abi = abi_model(caller.abi);
+        const auto* callee_abi = abi_model(callee.abi);
+        if (!caller_abi || !callee_abi) {
+            return "the caller or callee ABI model is unavailable";
+        }
+        // A tail jump reuses the caller's incoming stack region.  In
+        // particular, a register-only Microsoft x64 call still needs its
+        // 32-byte home area; register transport alone cannot prove that the
+        // region exists.  Compare classified extents so user-defined ABI
+        // models follow the same rule as shipped ones.
+        const auto caller_incoming_size = caller_plan
+            ? caller_plan->call.outgoing_area_size
+            : caller_stable.outgoing_area_size;
+        const auto callee_incoming_size = callee_plan
+            ? callee_plan->call.outgoing_area_size
+            : callee_stable.outgoing_area_size;
+        if (callee_incoming_size > caller_incoming_size) {
+            return "the callee requires more incoming stack space than the caller provides";
+        }
+        if (caller_abi->return_address_bytes !=
+            callee_abi->return_address_bytes) {
+            return "caller and callee return-address layouts differ";
+        }
+        if (callee_abi->stack_alignment == 0 ||
+            caller_abi->stack_alignment % callee_abi->stack_alignment != 0) {
+            return "caller and callee stack alignments are incompatible";
+        }
         for (const auto& clobber : call.clobbers) {
             if (clobber.kind != machine::RegisterKind::Physical) continue;
             const auto* view = canonical_storage_view({clobber.id});
