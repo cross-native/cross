@@ -847,6 +847,18 @@ if(BUILD_TESTING)
                 -DERRORS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_metadata_errors.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/symbol-metadata
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/symbol_metadata.cmake")
+    add_test(NAME cross_symbol_indirection
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DALIAS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_alias.x
+                -DWEAK_ALIAS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_weak_alias.x
+                -DWEAKREF=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_weakref.x
+                -DWEAKREF_DECLS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_weakref_declarations.x
+                -DERRORS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_indirection_errors.x
+                -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_alias_harness.cpp
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/symbol-indirection
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/symbol_indirection.cmake")
     foreach(level O0 O2)
         add_test(NAME cross_runtime_alignment_expressions_${level}
             COMMAND "${CMAKE_COMMAND}"

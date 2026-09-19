@@ -149,6 +149,8 @@ struct Function {
     unsigned minimum_alignment{1};
     SymbolVisibility visibility{SymbolVisibility::Default};
     bool weak{};
+    std::optional<std::string> alias_target;
+    std::optional<std::string> weakref_target;
     FunctionTemperature temperature{FunctionTemperature::Normal};
     bool used{};
     bool retain{};
@@ -188,6 +190,8 @@ struct Object {
     unsigned minimum_alignment{1};
     SymbolVisibility visibility{SymbolVisibility::Default};
     bool weak{};
+    std::optional<std::string> alias_target;
+    std::optional<std::string> weakref_target;
     bool is_thread_local{};
     std::string tls_model;
     std::vector<const ObjectDecl*> declarations;

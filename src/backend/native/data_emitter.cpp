@@ -109,6 +109,7 @@ public:
                 emitted_object = true;
             }
         }
+        if (!patch_owned_) emit_symbol_indirections();
         // GCC's top-level assembly is emitted before its generated functions
         // and inherits the final section. Leave embedded patch data in the
         // ordinary text section so subsequent compiler output remains code.
@@ -126,6 +127,99 @@ public:
     }
 
 private:
+    void emit_alias(std::string_view alias_name,
+                    std::string_view target_name, bool weak,
+                    hir::SymbolVisibility visibility, bool function,
+                    unsigned object_size, bool retain,
+                    SourceLocation location) {
+        if (weak && format_ == ObjectFormat::MachO) {
+            diagnostics_.error(
+                location,
+                "weak aliases are not representable in Mach-O");
+            return;
+        }
+        if (!safe_assembly_text(alias_name) ||
+            !safe_assembly_text(target_name)) {
+            diagnostics_.error(
+                location,
+                "alias link name cannot be represented by the selected assembler");
+            return;
+        }
+        const auto alias = symbol(alias_name);
+        const auto target = symbol(target_name);
+        std::string error;
+        const auto directives = assembly_symbol_directives(
+            format_, {alias, true, true, weak,
+                      assembly_visibility(visibility)},
+            error);
+        if (!directives) {
+            diagnostics_.error(location, error);
+            return;
+        }
+        if (!directives->empty()) out_ << *directives << '\n';
+        out_ << ".set " << alias << ',' << target << '\n';
+        if (format_ == ObjectFormat::Elf) {
+            out_ << ".type " << alias
+                 << (function ? ",@function\n" : ",@object\n");
+            if (!function) {
+                out_ << ".size " << alias << ", " << object_size << '\n';
+            }
+        } else if (format_ == ObjectFormat::Coff) {
+            out_ << ".def " << alias << "; .scl 2; .type "
+                 << (function ? "32" : "0") << "; .endef\n";
+        }
+        if (retain && format_ == ObjectFormat::Coff) {
+            out_ << ".section .drectve\n.ascii \" -include:"
+                 << alias_name << "\"\n";
+        } else if (retain && format_ == ObjectFormat::MachO) {
+            out_ << ".no_dead_strip " << alias << '\n';
+        }
+    }
+
+    void emit_weak_reference(std::string_view target,
+                             SourceLocation location) {
+        if (!safe_assembly_text(target)) {
+            diagnostics_.error(
+                location,
+                "weakref link name cannot be represented by the selected assembler");
+            return;
+        }
+        const auto name = symbol(target);
+        std::string error;
+        const auto directives = assembly_symbol_directives(
+            format_, {name, true, false, true,
+                      AssemblySymbolVisibility::Default},
+            error);
+        if (!directives) {
+            diagnostics_.error(location, error);
+        } else if (!directives->empty()) {
+            out_ << *directives << '\n';
+        }
+    }
+
+    void emit_symbol_indirections() {
+        for (const auto& function : module_.hir().functions) {
+            if (function.alias_target) {
+                emit_alias(
+                    function.link_symbol, *function.alias_target,
+                    function.weak, function.visibility, true, 0,
+                    function.retain, function.location);
+            } else if (function.weakref_target) {
+                emit_weak_reference(*function.weakref_target,
+                                    function.location);
+            }
+        }
+        for (const auto& object : module_.data().objects) {
+            const auto& entity = module_.hir().object(object.source);
+            if (entity.alias_target) {
+                emit_alias(
+                    entity.link_symbol, *entity.alias_target, entity.weak,
+                    entity.visibility, false, object.size, object.retain,
+                    entity.location);
+            }
+        }
+    }
+
     void emit_coff_tls_support() {
         // PE static TLS needs an image-local index and IMAGE_TLS_DIRECTORY.
         // Emit them as discardable COMDATs so separately compiled Cross
@@ -426,10 +520,12 @@ private:
         const auto& entity = module_.hir().object(object.source);
         const auto name = symbol(entity.link_symbol);
         if (object.initializer == data::InitializerKind::Declaration) {
+            if (entity.alias_target) return;
             out_ << ".extern " << name << '\n';
             std::string symbol_error;
             const auto directives = assembly_symbol_directives(
-                format_, {name, true, false, false,
+                format_, {name, true, false,
+                          entity.weakref_target.has_value(),
                           assembly_visibility(entity.visibility)},
                 symbol_error);
             if (!directives) {

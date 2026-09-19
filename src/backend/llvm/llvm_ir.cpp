@@ -103,6 +103,7 @@ public:
         emit_objects(module);
         emit_declarations(module);
         emit_definitions(module);
+        emit_aliases(module);
         emit_retention(module);
         emit_intrinsic_declarations(module);
         return module.str();
@@ -172,8 +173,11 @@ private:
     void emit_declarations(std::ostringstream& module) const {
         for (const auto& function : hir_.functions) {
             const bool raw = raw_assembly_.owns(function.id);
-            if (function.definition && !raw) continue;
+            if ((function.definition && !raw) || function.alias_target) {
+                continue;
+            }
             module << "declare ";
+            if (function.weakref_target) module << "extern_weak ";
             if (raw) module << "dso_local ";
             module << llvm_visibility(function.visibility)
                    << abi_prefix(function) << ir_type(function.result_type)
@@ -214,6 +218,49 @@ private:
             module << emit_managed_mir_function(
                 hir_, *managed, options_, diagnostics_);
         }
+    }
+
+    std::string function_alias_type(const hir::Function& function) const {
+        std::string result = ir_type(function.result_type) + " (";
+        for (std::size_t index = 0; index < function.parameters.size(); ++index) {
+            if (index != 0) result += ", ";
+            const auto& parameter = function.parameters[index];
+            const bool manual_cell =
+                parameter.physical_location &&
+                *parameter.physical_location != "auto";
+            result += parameter.mode == ParameterMode::In && !manual_cell
+                ? ir_type(parameter.type)
+                : std::string("ptr");
+        }
+        if (function.variadic) {
+            if (!function.parameters.empty()) result += ", ";
+            result += "...";
+        }
+        return result + ')';
+    }
+
+    void emit_aliases(std::ostringstream& module) const {
+        bool emitted{};
+        for (const auto& function : hir_.functions) {
+            if (!function.alias_target) continue;
+            module << symbol_name(function.link_symbol) << " = "
+                   << (function.weak ? "weak " : "")
+                   << llvm_visibility(function.visibility) << "alias "
+                   << function_alias_type(function) << ", ptr "
+                   << symbol_name(*function.alias_target) << '\n';
+            emitted = true;
+        }
+        for (const auto& object : data_.objects) {
+            const auto& entity = hir_.object(object.source);
+            if (!entity.alias_target) continue;
+            module << symbol_name(entity.link_symbol) << " = "
+                   << (entity.weak ? "weak " : "")
+                   << llvm_visibility(entity.visibility) << "alias "
+                   << ir_type(object.type) << ", ptr "
+                   << symbol_name(*entity.alias_target) << '\n';
+            emitted = true;
+        }
+        if (emitted) module << '\n';
     }
 
     std::string floating_initializer(const data::Object& object) const {
@@ -372,6 +419,7 @@ private:
         bool emitted = false;
         for (const auto& object : data_.objects) {
             const auto& entity = hir_.object(object.source);
+            if (entity.alias_target) continue;
             const auto symbol = symbol_name(entity.link_symbol);
             const auto storage = object.read_only ? "constant " : "global ";
             const auto tls = [&]() -> std::string {
@@ -395,7 +443,9 @@ private:
                 continue;
             }
             if (object.initializer == data::InitializerKind::Declaration) {
-                module << symbol << " = external "
+                module << symbol << " = "
+                       << (entity.weakref_target ? "extern_weak "
+                                                 : "external ")
                        << llvm_visibility(entity.visibility) << tls << storage
                        << ir_type(object.type) << ", align "
                        << object.alignment << '\n';
@@ -439,12 +489,14 @@ private:
             }
         };
         for (const auto& object : data_.objects) {
-            if (object.initializer == data::InitializerKind::Declaration ||
+            const auto& entity = hir_.object(object.source);
+            if ((object.initializer == data::InitializerKind::Declaration &&
+                 !entity.alias_target) ||
                 raw_assembly_.owns(object.source)) {
                 continue;
             }
             const auto symbol =
-                symbol_name(hir_.object(object.source).link_symbol);
+                symbol_name(entity.link_symbol);
             if (object.retain) {
                 append_unique(linker_symbols, linker_seen, symbol);
             } else if (object.used) {
@@ -452,7 +504,7 @@ private:
             }
         }
         for (const auto& function : hir_.functions) {
-            if (!function.definition) continue;
+            if (!function.definition && !function.alias_target) continue;
             const auto symbol = symbol_name(function.link_symbol);
             if (function.retain) {
                 append_unique(linker_symbols, linker_seen, symbol);

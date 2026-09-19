@@ -90,6 +90,15 @@ if(NOT read_status EQUAL 0 OR NOT binding_symbols MATCHES "Binding: Weak")
     message(FATAL_ERROR "ELF weak binding missing\n${binding_symbols}\n${read_stderr}")
 endif()
 execute_process(
+    COMMAND "${LLVM_READOBJ}" --symbols
+            "${OUTPUT}-binding-x86_64-apple-darwin.o"
+    RESULT_VARIABLE read_status OUTPUT_VARIABLE macho_symbols
+    ERROR_VARIABLE read_stderr)
+if(NOT read_status EQUAL 0 OR NOT macho_symbols MATCHES "WeakDef")
+    message(FATAL_ERROR
+        "Mach-O weak definitions are missing\n${macho_symbols}\n${read_stderr}")
+endif()
+execute_process(
     COMMAND "${LLVM_READOBJ}" --symbols "${OUTPUT}-visibility-elf.o"
     RESULT_VARIABLE read_status OUTPUT_VARIABLE visibility_symbols
     ERROR_VARIABLE read_stderr)

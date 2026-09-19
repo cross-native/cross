@@ -201,6 +201,7 @@ public:
         finish_functions();
         finish_global_labels();
         finish_objects();
+        finish_symbol_indirections();
         finish_patch_sink_indices();
         diagnose_symbol_collisions();
         return std::move(module_);
@@ -462,6 +463,39 @@ private:
         if (has_visibility && linkage != Linkage::Global) {
             diagnostics_.error(location,
                                "visibility requires global linkage");
+        }
+    }
+
+    void parse_symbol_indirection_attributes(
+        const std::vector<const Attribute*>& attributes,
+        std::optional<std::string>& alias_target,
+        std::optional<std::string>& weakref_target) {
+        for (const auto* attribute : attributes) {
+            auto* destination = attribute->name == "alias"
+                ? &alias_target
+                : attribute->name == "weakref" ? &weakref_target : nullptr;
+            if (!destination) continue;
+            if (attribute->arguments.size() != 1) {
+                diagnostics_.error(
+                    attribute->location,
+                    attribute->name + " requires one link-name string");
+                continue;
+            }
+            const auto spelling =
+                decode_string_literal(attribute->arguments.front());
+            if (!spelling || spelling->empty()) {
+                diagnostics_.error(
+                    attribute->location,
+                    attribute->name + " requires one nonempty link-name string");
+                continue;
+            }
+            if (*destination && **destination != *spelling) {
+                diagnostics_.error(attribute->location,
+                                   "conflicting " + attribute->name +
+                                       " attributes");
+            } else {
+                *destination = *spelling;
+            }
         }
     }
 
@@ -1323,16 +1357,26 @@ private:
                     function.definition->source_namespace);
             }
             std::vector<const Attribute*> symbol_attributes;
+            std::vector<const Attribute*> indirection_attributes;
             for (const auto* declaration : function.declarations) {
                 for (const auto& attribute : declaration->attributes) {
                     if (attribute.name == "weak" ||
                         attribute.name == "visibility") {
                         symbol_attributes.push_back(&attribute);
                     }
+                    if (attribute.name == "alias" ||
+                        attribute.name == "weakref") {
+                        indirection_attributes.push_back(&attribute);
+                    }
                 }
             }
+            parse_symbol_indirection_attributes(
+                indirection_attributes, function.alias_target,
+                function.weakref_target);
             parse_symbol_attributes(
-                symbol_attributes, function.definition != nullptr,
+                symbol_attributes,
+                function.definition != nullptr || function.alias_target ||
+                    function.weakref_target,
                 function.linkage, representative->location, function.weak,
                 function.visibility);
             bool hot{};
@@ -1378,7 +1422,8 @@ private:
             } else if (cold) {
                 function.temperature = FunctionTemperature::Cold;
             }
-            if ((function.used || function.retain) && !function.definition) {
+            if ((function.used || function.retain) && !function.definition &&
+                !function.alias_target) {
                 diagnostics_.error(
                     representative->location,
                     std::string(function.retain ? "retain" : "used") +
@@ -1657,7 +1702,11 @@ private:
             auto& canonical = module_.objects[id.value];
             canonical.declarations.push_back(source.get());
             module_.object_ids.emplace(source.get(), id);
-            if (source->initializer || source->linkage != Linkage::Group) {
+            const bool indirection =
+                object_attribute(*source, "alias") != nullptr ||
+                object_attribute(*source, "weakref") != nullptr;
+            if (source->initializer ||
+                (source->linkage != Linkage::Group && !indirection)) {
                 if (canonical.definition) {
                     diagnostics_.error(source->location,
                                        "duplicate definition of object '" + source->name + "'");
@@ -1692,22 +1741,207 @@ private:
                 representative->attributes, "an object definition",
                 source_namespace(object.source_name));
             std::vector<const Attribute*> symbol_attributes;
+            std::vector<const Attribute*> indirection_attributes;
             for (const auto* declaration : object.declarations) {
                 for (const auto& attribute : declaration->attributes) {
                     if (attribute.name == "weak" ||
                         attribute.name == "visibility") {
                         symbol_attributes.push_back(&attribute);
                     }
+                    if (attribute.name == "alias" ||
+                        attribute.name == "weakref") {
+                        indirection_attributes.push_back(&attribute);
+                    }
                 }
             }
+            parse_symbol_indirection_attributes(
+                indirection_attributes, object.alias_target,
+                object.weakref_target);
             parse_symbol_attributes(
-                symbol_attributes, object.definition != nullptr,
+                symbol_attributes,
+                object.definition != nullptr || object.alias_target ||
+                    object.weakref_target,
                 object.linkage, representative->location, object.weak,
                 object.visibility);
             object.is_thread_local =
                 object_attribute(*representative, "thread_local") != nullptr;
             object.tls_model = decode_attribute_string(
                 object_attribute(*representative, "tls_model"));
+        }
+    }
+
+    static bool alias_compatible(const Function& alias,
+                                 const Function& target) {
+        if (alias.result_type != target.result_type ||
+            alias.parameters.size() != target.parameters.size() ||
+            alias.result_location != target.result_location ||
+            alias.abi != target.abi || alias.variadic != target.variadic ||
+            alias.clobbers != target.clobbers) {
+            return false;
+        }
+        for (std::size_t index = 0; index < alias.parameters.size(); ++index) {
+            const auto& left = alias.parameters[index];
+            const auto& right = target.parameters[index];
+            if (left.type != right.type || left.mode != right.mode ||
+                left.physical_location != right.physical_location) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void finish_symbol_indirections() {
+        for (auto& function : module_.functions) {
+            if (function.alias_target && function.weakref_target) {
+                diagnostics_.error(
+                    function.location,
+                    "alias and weakref cannot be combined on one function");
+            }
+            if (function.alias_target) {
+                if (function.definition) {
+                    diagnostics_.error(function.location,
+                                       "alias function cannot have a body");
+                }
+                if (function.linkage != Linkage::Global) {
+                    diagnostics_.error(function.location,
+                                       "alias requires global linkage");
+                }
+                const auto target = std::find_if(
+                    module_.functions.begin(), module_.functions.end(),
+                    [&](const Function& candidate) {
+                        return candidate.id != function.id &&
+                               candidate.link_symbol == *function.alias_target;
+                    });
+                if (target == module_.functions.end() || !target->definition) {
+                    diagnostics_.error(
+                        function.location,
+                        "function alias target '" + *function.alias_target +
+                            "' is not a definition in this compilation group");
+                } else if (!alias_compatible(function, *target)) {
+                    diagnostics_.error(
+                        function.location,
+                        "function alias target '" + *function.alias_target +
+                            "' has an incompatible type or ABI");
+                } else {
+                    target->used = target->used || function.used;
+                    target->retain = target->retain || function.retain;
+                }
+            }
+            if (function.weakref_target) {
+                if (function.definition) {
+                    diagnostics_.error(function.location,
+                                       "weakref function cannot have a body");
+                }
+                if (function.weak) {
+                    diagnostics_.error(
+                        function.location,
+                        "weakref already supplies weak binding and cannot be combined with weak");
+                }
+                if (function.visibility != SymbolVisibility::Default) {
+                    diagnostics_.error(
+                        function.location,
+                        "weakref cannot have non-default visibility");
+                }
+                const auto existing_function = std::any_of(
+                    module_.functions.begin(), module_.functions.end(),
+                    [&](const Function& candidate) {
+                        return candidate.id != function.id &&
+                               !candidate.weakref_target &&
+                               candidate.link_symbol ==
+                                   *function.weakref_target;
+                    });
+                const auto existing_object = std::any_of(
+                    module_.objects.begin(), module_.objects.end(),
+                    [&](const Object& candidate) {
+                        return !candidate.weakref_target &&
+                               candidate.link_symbol ==
+                                   *function.weakref_target;
+                    });
+                if (existing_function || existing_object) {
+                    diagnostics_.error(
+                        function.location,
+                        "weakref target '" + *function.weakref_target +
+                            "' is already declared in this compilation group");
+                }
+                function.link_symbol = *function.weakref_target;
+            }
+        }
+
+        for (auto& object : module_.objects) {
+            if (object.alias_target && object.weakref_target) {
+                diagnostics_.error(
+                    object.location,
+                    "alias and weakref cannot be combined on one object");
+            }
+            if (object.alias_target) {
+                if (object.definition) {
+                    diagnostics_.error(object.location,
+                                       "alias object cannot have an initializer");
+                }
+                if (object.linkage != Linkage::Global) {
+                    diagnostics_.error(object.location,
+                                       "alias requires global linkage");
+                }
+                const auto target = std::find_if(
+                    module_.objects.begin(), module_.objects.end(),
+                    [&](const Object& candidate) {
+                        return candidate.id != object.id &&
+                               candidate.link_symbol == *object.alias_target;
+                    });
+                if (target == module_.objects.end() || !target->definition) {
+                    diagnostics_.error(
+                        object.location,
+                        "object alias target '" + *object.alias_target +
+                            "' is not a definition in this compilation group");
+                } else if (object.type != target->type ||
+                           object.minimum_alignment !=
+                               target->minimum_alignment ||
+                           object.is_thread_local != target->is_thread_local ||
+                           object.tls_model != target->tls_model) {
+                    diagnostics_.error(
+                        object.location,
+                        "object alias target '" + *object.alias_target +
+                            "' has an incompatible type, alignment, or storage contract");
+                }
+            }
+            if (object.weakref_target) {
+                if (object.definition) {
+                    diagnostics_.error(object.location,
+                                       "weakref object cannot have an initializer");
+                }
+                if (object.weak) {
+                    diagnostics_.error(
+                        object.location,
+                        "weakref already supplies weak binding and cannot be combined with weak");
+                }
+                if (object.visibility != SymbolVisibility::Default) {
+                    diagnostics_.error(
+                        object.location,
+                        "weakref cannot have non-default visibility");
+                }
+                const auto existing_function = std::any_of(
+                    module_.functions.begin(), module_.functions.end(),
+                    [&](const Function& candidate) {
+                        return !candidate.weakref_target &&
+                               candidate.link_symbol ==
+                                   *object.weakref_target;
+                    });
+                const auto existing_object = std::any_of(
+                    module_.objects.begin(), module_.objects.end(),
+                    [&](const Object& candidate) {
+                        return candidate.id != object.id &&
+                               !candidate.weakref_target &&
+                               candidate.link_symbol ==
+                                   *object.weakref_target;
+                    });
+                if (existing_function || existing_object) {
+                    diagnostics_.error(
+                        object.location,
+                        "weakref target '" + *object.weakref_target +
+                            "' is already declared in this compilation group");
+                }
+                object.link_symbol = *object.weakref_target;
+            }
         }
     }
 
@@ -1723,10 +1957,15 @@ private:
             }
         };
         for (const auto& function : module_.functions) {
-            add(function.link_symbol, function.location, function.source_name);
+            if (!function.weakref_target) {
+                add(function.link_symbol, function.location,
+                    function.source_name);
+            }
         }
         for (const auto& object : module_.objects) {
-            add(object.link_symbol, object.location, object.source_name);
+            if (!object.weakref_target) {
+                add(object.link_symbol, object.location, object.source_name);
+            }
         }
         for (const auto& label : module_.labels) {
             if (label.is_global) {

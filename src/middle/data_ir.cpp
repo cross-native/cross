@@ -34,6 +34,7 @@ bool supported_attribute(std::string_view name) {
     return name == "link_name" || name == "section" || name == "aligned" ||
            name == "noinit" || name == "retain" || name == "used" ||
            name == "weak" || name == "visibility" ||
+           name == "alias" || name == "weakref" ||
            name == "thread_local" || name == "tls_model";
 }
 
@@ -892,11 +893,11 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                 diagnostics.error(declaration->location,
                                   "noinit requires an object definition");
             }
-            if (object.used) {
+            if (object.used && !entity.alias_target) {
                 diagnostics.error(declaration->location,
                                   "used requires an object definition");
             }
-            if (object.retain) {
+            if (object.retain && !entity.alias_target) {
                 diagnostics.error(declaration->location,
                                   "retain requires an object definition");
             }
@@ -935,6 +936,25 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
             }
         }
         result.objects.push_back(std::move(object));
+    }
+    for (const auto& entity : hir_module.objects) {
+        if (!entity.alias_target) continue;
+        const auto alias_index = result.object_indices.find(entity.id.value);
+        const auto target = std::find_if(
+            hir_module.objects.begin(), hir_module.objects.end(),
+            [&](const hir::Object& candidate) {
+                return candidate.link_symbol == *entity.alias_target;
+            });
+        if (alias_index == result.object_indices.end() ||
+            target == hir_module.objects.end()) {
+            continue;
+        }
+        const auto target_index = result.object_indices.find(target->id.value);
+        if (target_index == result.object_indices.end()) continue;
+        auto& alias = result.objects[alias_index->second];
+        auto& storage = result.objects[target_index->second];
+        storage.used = storage.used || alias.used;
+        storage.retain = storage.retain || alias.retain;
     }
     return result;
 }

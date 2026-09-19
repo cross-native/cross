@@ -184,9 +184,14 @@ std::optional<std::string> assembly_symbol_directives(
     };
     if (request.external && (request.definition || request.weak)) {
         if (request.weak) {
-            append(std::string(format == ObjectFormat::MachO
-                                   ? ".weak_definition "
-                                   : ".weak ") +
+            if (format == ObjectFormat::MachO && request.definition) {
+                append(".globl " + std::string(request.name));
+            }
+            append(std::string(
+                       format == ObjectFormat::MachO
+                           ? request.definition ? ".weak_definition "
+                                                : ".weak_reference "
+                           : ".weak ") +
                    std::string(request.name));
         } else {
             append(".globl " + std::string(request.name));

@@ -1525,6 +1525,11 @@ private:
                                  ')');
         }
         if (function.weak) attributes.emplace_back("weak");
+        if (function.alias_target) {
+            attributes.push_back("alias(" +
+                                 c_string(*function.alias_target) + ')');
+        }
+        if (function.weakref_target) attributes.emplace_back("weak");
         if (function.visibility != hir::SymbolVisibility::Default) {
             attributes.push_back(
                 "visibility(" +
@@ -1614,6 +1619,11 @@ private:
         if (object.used) attributes.emplace_back("used");
         if (object.retain) attributes.emplace_back("retain");
         if (entity.weak) attributes.emplace_back("weak");
+        if (entity.alias_target) {
+            attributes.push_back("alias(" +
+                                 c_string(*entity.alias_target) + ')');
+        }
+        if (entity.weakref_target) attributes.emplace_back("weak");
         if (entity.visibility != hir::SymbolVisibility::Default) {
             attributes.push_back(
                 "visibility(" +
