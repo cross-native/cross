@@ -945,6 +945,19 @@ if(BUILD_TESTING)
                 -DEXPECTED=1
                 "-DCC_FLAGS=-O2;-fno-register-allocation"
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_custom_result_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/model/custom_result_runtime.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-custom-result-${level}
+                    -DENTRY=custom_result_entry
+                    -DEXPECTED=1
+                    "-DCC_FLAGS=--model=${CMAKE_SOURCE_DIR}/test/model/custom.y;-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_test(NAME cross_runtime_native_loop_rotation
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

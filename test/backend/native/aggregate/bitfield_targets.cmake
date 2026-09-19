@@ -33,6 +33,10 @@ function(check_target name bytes padding)
     endforeach()
 endfunction()
 
+check_target(x86-64
+    "11,0,0,0,61,1,0,0"
+    "163"
+    -target x86_64-unknown-linux-gnu)
 check_target(mips32-big
     "208,0,0,0,232,0,0,0,144,0,0,0"
     "197"

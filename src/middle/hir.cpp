@@ -585,8 +585,11 @@ private:
                 const auto unqualified = module_.unqualified(member.type);
                 const bool shares =
                     active_bit_field &&
-                    active_bit_field->type == unqualified &&
                     active_bit_field->alignment == placement_alignment &&
+                    (target_.data_layout.bit_field_unit_sharing ==
+                             BitFieldUnitSharing::SameStorageSize
+                         ? active_bit_field->bits == unit_bits
+                         : active_bit_field->type == unqualified) &&
                     width <= active_bit_field->bits -
                                  active_bit_field->used;
                 if (!shares) {

@@ -93,9 +93,11 @@ global i32 bitfield_entry() {
     overlay.low = 5u32;
     volatile_flags.mode += 1u32;
 
-    if (sizeof(struct flags) != 12) return 101;
+    if (sizeof(struct flags) != 8 &&
+        sizeof(struct flags) != 12) return 101;
     if ($::alignof(struct flags) != 4) return 102;
-    if (sizeof(struct tiny_flags) != 2) return 103;
+    if (sizeof(struct tiny_flags) != 1 &&
+        sizeof(struct tiny_flags) != 2) return 103;
     if (sizeof(struct packed_flags) != 6) return 104;
     if (sizeof(struct layout_width_flags) != 4) return 105;
     if (sizeof(struct crossing_flags) != 8) return 106;

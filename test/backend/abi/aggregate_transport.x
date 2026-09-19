@@ -11,7 +11,13 @@ struct packed_i64 [[packed]] { u8 tag; u64 value; };
 struct three_bytes { u8 first; u8 second; u8 third; };
 struct wrapped_f80 { f80 value; };
 struct bitfield_u32 { u32 ready : 1; u32 mode : 3; };
+struct bitfield_mixed { u32 a : 3; i32 b : 5; u32 c : 6; };
 union integer_or_float { u64 integer; f64 floating; };
+
+[[abi("sysv_abi"), link_name("cross_bitfield_mixed_size")]]
+global i32 bitfield_mixed_size() {
+    return sizeof(struct bitfield_mixed);
+}
 
 [[abi("sysv_abi"), link_name("cross_sysv_bitfield_u32"), noinline]]
 global struct bitfield_u32 sysv_bitfield_u32(
@@ -29,6 +35,16 @@ global struct bitfield_u32 ms_bitfield_u32(
     result.ready = 0u32;
     result.mode += 2u32;
     return result;
+}
+
+[[abi("sysv_abi"), link_name("cross_sysv_bitfield_mixed"), noinline]]
+global i32 sysv_bitfield_mixed(in struct bitfield_mixed value) {
+    return value.a == 5u32 && value.b == -3 && value.c == 33u32;
+}
+
+[[abi("ms_abi"), link_name("cross_ms_bitfield_mixed"), noinline]]
+global i32 ms_bitfield_mixed(in struct bitfield_mixed value) {
+    return value.a == 5u32 && value.b == -3 && value.c == 33u32;
 }
 
 [[abi("sysv_abi"), link_name("cross_sysv_pair_i32"), noinline]]
