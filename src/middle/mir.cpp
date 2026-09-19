@@ -2272,6 +2272,51 @@ private:
         return true;
     }
 
+    bool initialize_empty_dynamic_array(const LocalBinding& binding,
+                                        SourceLocation location) {
+        if (!binding.dynamic_address || !binding.dynamic_size) return false;
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const auto& array = hir_.type(binding.type);
+        const bool is_volatile = array.is_volatile ||
+                                 (array.element &&
+                                  hir_.type(*array.element).is_volatile);
+        const auto byte = hir_.add_qualifiers(
+            *hir_.builtin(BuiltinType::U8), false, is_volatile);
+        const auto base = cast(*binding.dynamic_address,
+                               hir_.pointer_to(byte), location);
+        const auto initial = constant(0, uptr, location);
+        const auto preheader = *current_block_;
+        const auto test = new_block(location);
+        const auto body = new_block(location);
+        const auto end = new_block(location);
+        terminate(TerminatorKind::Branch, location, std::nullopt, {test});
+
+        enter(test);
+        const auto index = add_value(ValueKind::Phi, uptr, location);
+        const auto condition = add_value(
+            ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), location);
+        current_.values[condition.value].binary =
+            BinaryOperation::UnsignedLess;
+        current_.values[condition.value].operands = {
+            index, *binding.dynamic_size};
+        terminate(TerminatorKind::ConditionalBranch, location,
+                  condition, {body, end});
+
+        enter(body);
+        const auto address = indexed_address(base, index, byte, location);
+        const auto zero = constant(0, byte, location);
+        if (!store_pointer(address, zero, location, 1)) return false;
+        const auto one = constant(1, uptr, location);
+        const auto next = integer_binary(BinaryOperation::Add, uptr,
+                                         index, one, location);
+        const auto backedge = *current_block_;
+        terminate(TerminatorKind::Branch, location, std::nullopt, {test});
+        current_.values[index.value].incoming = {
+            {preheader, initial}, {backedge, next}};
+        enter(end);
+        return true;
+    }
+
     bool initialize_aggregate(const LocalBinding& binding,
                               const Expr& source) {
         const auto plan = initializer::build(
@@ -5354,10 +5399,15 @@ private:
             const bool dynamic_array =
                 array && hir_.type(type).lanes == 0;
             if (dynamic_array) {
-                if (declaration.initializer) {
+                const bool empty_initializer =
+                    declaration.initializer &&
+                    declaration.initializer->kind ==
+                        Expr::Kind::AggregateInitializer &&
+                    declaration.initializer->initializer_entries.empty();
+                if (declaration.initializer && !empty_initializer) {
                     diagnostics_.error(
                         declaration.initializer->location,
-                        "variable-length array initialization is not implemented yet");
+                        "nonempty variable-length array initialization is not implemented yet");
                     failed_ = true;
                     return;
                 }
@@ -5403,9 +5453,6 @@ private:
                     scopes_.back().dynamic_stack_mark =
                         dynamic_stack_save(declaration.location);
                 }
-                const auto address = dynamic_alloca(
-                    *bound, element, element_size, alignment,
-                    declaration.location);
                 auto dynamic_size = cast(
                     *bound, *hir_.builtin(BuiltinType::Uptr),
                     declaration.location);
@@ -5423,7 +5470,18 @@ private:
                         dynamic_size, scale};
                     dynamic_size = bytes;
                 }
+                // Capture the extent before allocation's address result can
+                // overwrite the register carrying the narrow bound.
+                const auto address = dynamic_alloca(
+                    *bound, element, element_size, alignment,
+                    declaration.location);
                 const LocalBinding binding{{}, type, address, dynamic_size};
+                if (empty_initializer && !initialize_empty_dynamic_array(
+                                             binding,
+                                             declaration.initializer->location)) {
+                    failed_ = true;
+                    return;
+                }
                 scopes_.back().bindings.emplace(declaration.name, binding);
                 return;
             }

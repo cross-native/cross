@@ -51,6 +51,8 @@ same_state:
 global i32 vla_entry() {
     u32 count = 5u32;
     stack u32 values[count];
+    const u32 zero_words[count] = {};
+    stack volatile u8 zero_bytes[count] = {};
     [[aligned(64)]] stack u8 aligned_values[count];
     [[aligned(64)]] stack u8 fixed_values[3];
     f80 extended[count];
@@ -58,6 +60,11 @@ global i32 vla_entry() {
     u32 sum = 0u32;
 
     if (sizeof(values) != (uptr)count * 4uptr) return -1;
+    if (sizeof(zero_words) != (uptr)count * 4uptr) return -6;
+    for (u32 index = 0u32; index < count; index += 1u32) {
+        if (zero_words[index] != 0u32 || zero_bytes[index] != 0u8)
+            return -7;
+    }
     if (sizeof(matrix) != (uptr)count * 12uptr) return -2;
     if (((uptr)aligned_values & 63uptr) != 0uptr) return -4;
     if (((uptr)fixed_values & 63uptr) != 0uptr) return -5;

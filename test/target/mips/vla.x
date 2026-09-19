@@ -82,12 +82,25 @@ same_state:
     return result;
 }
 
+[[runtime_only, noinline]]
+static u32 zero_vla(in u32 count) {
+    const u32 zero_words[count] = {};
+    stack volatile u8 zero_bytes[count] = {};
+    if (sizeof(zero_words) != (uptr)count * 4uptr) return 0u32;
+    for (u32 index = 0u32; index < count; index += 1u32) {
+        if (zero_words[index] != 0u32 || zero_bytes[index] != 0u8)
+            return 0u32;
+    }
+    return 1u32;
+}
+
 global u32 vla_entry(in u32 count) {
     bound_calls = 0u32;
     u8 exact[4] = "abc";
     const u8 inferred[] = "xy";
     u8 padded[24] = "z";
     return nested(count) == 366u32 && nested(count+1u32) == 366u32 &&
+           zero_vla(count) == 1u32 &&
            aligned_array(count) == 30u32 && bound_calls == 2u32 &&
            exact[0] == 97u8 && exact[3] == 0u8 &&
            sizeof(inferred) == 3uptr && inferred[1] == 121u8 &&

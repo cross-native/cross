@@ -1287,6 +1287,19 @@ if(BUILD_TESTING)
                 -DEXPECTED=100
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_vla_empty_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/array/vla_empty_runtime.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vla-empty-${level}
+                    -DENTRY=vla_empty_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_test(NAME cross_array_diagnostics
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
