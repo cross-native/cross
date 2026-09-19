@@ -1509,6 +1509,11 @@ private:
             attributes.push_back("section(" + c_string(*function.section) +
                                  ')');
         }
+        if (function.minimum_alignment > 1) {
+            attributes.push_back("aligned(" +
+                                 std::to_string(function.minimum_alignment) +
+                                 ')');
+        }
         constexpr std::string_view markers[] = {
             "always_inline", "cold", "hot",    "noinline",           "noreturn",
             "returns_twice", "used", "retain", "no_stack_protector",

@@ -820,7 +820,8 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             void_type(module, parameter.type)) return false;
     }
     for (const auto& attribute : function.definition->attributes) {
-        if (attribute.name != "abi" && attribute.name != "link_name" &&
+        if (attribute.name != "abi" && attribute.name != "aligned" &&
+            attribute.name != "link_name" &&
             attribute.name != "section" &&
             attribute.name != "raw_inline" &&
             attribute.name != "always_inline" &&

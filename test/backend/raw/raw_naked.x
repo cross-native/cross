@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-[[naked, abi("sysv_abi"), link_name("raw_const"), section(".boot"),
+[[naked, abi("sysv_abi"), link_name("raw_const"), section(".boot"), aligned(128),
   clobber("memory", "flags")]]
 global u64 raw_const() -> "rax" {
     register u64 result "rax";

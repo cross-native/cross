@@ -420,6 +420,9 @@ public:
         if (!features.empty()) {
             out_ << " \"target-features\"=" << llvm_string(features);
         }
+        if (entity_.minimum_alignment > 1) {
+            out_ << " align " << entity_.minimum_alignment;
+        }
         if (contains_patch) out_ << " noinline";
         if (entity_.section) {
             out_ << " section " << llvm_string(*entity_.section);

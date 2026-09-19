@@ -144,6 +144,7 @@ struct Function {
     AbiContract abi_contract{AbiContract::Registered};
     bool abi_explicit{};
     std::optional<std::string> section;
+    unsigned minimum_alignment{1};
     std::vector<std::string> clobbers;
     bool variadic{};
     std::vector<VariadicBinding> variadic_bindings;

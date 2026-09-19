@@ -76,6 +76,7 @@ struct RawFunction {
     std::string symbol;
     Linkage linkage{Linkage::Group};
     std::optional<std::string> section;
+    unsigned minimum_alignment{1};
     BlockId entry;
     std::vector<RawBlock> blocks;
     std::vector<BlockId> layout;

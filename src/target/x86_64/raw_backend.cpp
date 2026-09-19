@@ -9,6 +9,7 @@
 #include "target/x86_64/manual_endpoint.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cstdint>
 #include <deque>
@@ -535,6 +536,7 @@ private:
         current_.symbol = function.link_symbol;
         current_.linkage = function.linkage;
         current_.section = function.section;
+        current_.minimum_alignment = function.minimum_alignment;
         current_.entry = new_block(function.location, "entry");
         current_block_ = current_.entry;
         append_layout(current_.entry);
@@ -1904,6 +1906,9 @@ private:
                    options_.tune == "znver3") {
             alignment_power = 5;
         }
+        alignment_power = std::max(
+            alignment_power,
+            static_cast<unsigned>(std::countr_zero(function.minimum_alignment)));
         output_ << ".p2align " << alignment_power << "\n";
         if (function.linkage == Linkage::Global) output_ << ".globl " << symbol << "\n";
         else if (format_ == ObjectFormat::Elf) output_ << ".local " << symbol << "\n";

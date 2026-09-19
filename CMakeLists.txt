@@ -821,6 +821,15 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/stack_alignment.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/stack-alignment
                 -P "${CMAKE_SOURCE_DIR}/test/backend/machine/stack_alignment.cmake")
+    add_test(NAME cross_function_alignment
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/function_alignment.x
+                -DERRORS=${CMAKE_SOURCE_DIR}/test/backend/native/function_alignment_errors.x
+                -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/native/function_alignment_harness.cpp
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/function-alignment
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/function_alignment.cmake")
     add_test(NAME cross_x86_64_dynamic_call_alignment
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

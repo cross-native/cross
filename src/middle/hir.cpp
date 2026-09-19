@@ -1073,6 +1073,15 @@ private:
 
     void finish_functions() {
         for (auto& function : module_.functions) {
+            for (const auto* declaration : function.declarations) {
+                if (declaration->definition()) continue;
+                for (const auto& attribute : declaration->attributes) {
+                    if (attribute.name == "aligned") {
+                        diagnostics_.error(attribute.location,
+                                           "aligned requires a function definition");
+                    }
+                }
+            }
             const auto* representative = function.definition
                                              ? function.definition
                                              : function.declarations.back();
@@ -1230,6 +1239,10 @@ private:
             if (const auto section = decode_attribute_string(
                     representative->attribute("section")); !section.empty()) {
                 function.section = section;
+            }
+            if (function.definition) {
+                function.minimum_alignment = parse_alignment(
+                    function.definition->attributes, "function definition");
             }
             function.naked = representative->attribute("naked") != nullptr;
             for (const auto& attribute : representative->attributes) {

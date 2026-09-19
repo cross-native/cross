@@ -22612,6 +22612,9 @@ private:
                    options_.tune == "znver3") {
             alignment_power = 5;
         }
+        alignment_power = std::max(
+            alignment_power,
+            static_cast<unsigned>(std::countr_zero(entity.minimum_alignment)));
         output_ << ".p2align " << alignment_power << "\n";
         if (entity.linkage == Linkage::Global) {
             output_ << ".globl " << symbol << "\n";
