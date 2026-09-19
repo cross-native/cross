@@ -35,6 +35,19 @@ std::string llvm_string(std::string_view text) {
 
 std::string symbol_name(std::string_view text) { return "@" + llvm_string(text); }
 
+std::string llvm_visibility(hir::SymbolVisibility visibility) {
+    switch (visibility) {
+    case hir::SymbolVisibility::Default: return {};
+    case hir::SymbolVisibility::Hidden: return "hidden ";
+    case hir::SymbolVisibility::Protected: return "protected ";
+    case hir::SymbolVisibility::Internal:
+        // LLVM has no STV_INTERNAL spelling; hidden is its closest semantic
+        // representation while native ELF preserves the exact visibility.
+        return "hidden ";
+    }
+    return {};
+}
+
 std::string hexadecimal(std::uint64_t value, unsigned width) {
     std::ostringstream out;
     out << std::uppercase << std::hex << std::setfill('0')
@@ -398,8 +411,11 @@ public:
             [](const mir::ManagedValue& value) {
                 return value.kind == mir::ValueKind::PatchValue;
             });
-        const auto linkage = entity_.linkage == Linkage::Global ? "" : "internal ";
-        out_ << "define " << linkage << abi_name()
+        const auto linkage = entity_.weak
+            ? "weak "
+            : entity_.linkage == Linkage::Global ? "" : "internal ";
+        out_ << "define " << linkage << llvm_visibility(entity_.visibility)
+             << abi_name()
              << ir_type(hir_, entity_.result_type) << ' '
              << symbol_name(entity_.link_symbol) << '(';
         for (std::size_t index = 0; index < entity_.parameters.size(); ++index) {

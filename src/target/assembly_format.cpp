@@ -164,6 +164,68 @@ std::optional<std::string> assembly_section_directive(
     return std::nullopt;
 }
 
+std::optional<std::string> assembly_symbol_directives(
+    ObjectFormat format, const AssemblySymbolRequest& request,
+    std::string& error) {
+    error.clear();
+    if (request.name.empty()) {
+        error = "symbol name cannot be empty";
+        return std::nullopt;
+    }
+    if (request.weak && !request.external) {
+        error = "weak binding requires an external symbol";
+        return std::nullopt;
+    }
+
+    std::string result;
+    const auto append = [&](std::string directive) {
+        if (!result.empty()) result += '\n';
+        result += std::move(directive);
+    };
+    if (request.external && (request.definition || request.weak)) {
+        if (request.weak) {
+            append(std::string(format == ObjectFormat::MachO
+                                   ? ".weak_definition "
+                                   : ".weak ") +
+                   std::string(request.name));
+        } else {
+            append(".globl " + std::string(request.name));
+        }
+    } else if (!request.external && request.definition &&
+               format == ObjectFormat::Elf) {
+        append(".local " + std::string(request.name));
+    }
+
+    switch (request.visibility) {
+    case AssemblySymbolVisibility::Default: break;
+    case AssemblySymbolVisibility::Hidden:
+        if (format == ObjectFormat::Elf) {
+            append(".hidden " + std::string(request.name));
+        } else if (format == ObjectFormat::MachO) {
+            append(".private_extern " + std::string(request.name));
+        } else {
+            error = "hidden visibility is not representable in COFF";
+            return std::nullopt;
+        }
+        break;
+    case AssemblySymbolVisibility::Protected:
+        if (format != ObjectFormat::Elf) {
+            error = "protected visibility is only representable in ELF";
+            return std::nullopt;
+        }
+        append(".protected " + std::string(request.name));
+        break;
+    case AssemblySymbolVisibility::Internal:
+        if (format != ObjectFormat::Elf) {
+            error = "internal visibility is only representable in ELF";
+            return std::nullopt;
+        }
+        append(".internal " + std::string(request.name));
+        break;
+    }
+    return result;
+}
+
 bool assembly_uses_dwarf_cfi(ObjectFormat format) {
     return format == ObjectFormat::Elf || format == ObjectFormat::MachO;
 }

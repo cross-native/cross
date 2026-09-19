@@ -38,6 +38,16 @@ std::string symbol_name(std::string_view text) {
     return "@" + llvm_string(text);
 }
 
+std::string llvm_visibility(hir::SymbolVisibility visibility) {
+    switch (visibility) {
+    case hir::SymbolVisibility::Default: return {};
+    case hir::SymbolVisibility::Hidden: return "hidden ";
+    case hir::SymbolVisibility::Protected: return "protected ";
+    case hir::SymbolVisibility::Internal: return "hidden ";
+    }
+    return {};
+}
+
 std::string sanitize_identifier(std::string_view text) {
     std::string result;
     result.reserve(text.size());
@@ -165,7 +175,8 @@ private:
             if (function.definition && !raw) continue;
             module << "declare ";
             if (raw) module << "dso_local ";
-            module << abi_prefix(function) << ir_type(function.result_type)
+            module << llvm_visibility(function.visibility)
+                   << abi_prefix(function) << ir_type(function.result_type)
                    << ' ' << symbol_name(function.link_symbol) << '(';
             for (std::size_t index = 0;
                  index < function.parameters.size(); ++index) {
@@ -376,14 +387,16 @@ private:
                        ") ";
             }();
             if (raw_assembly_.owns(object.source)) {
-                module << symbol << " = external " << tls << storage
+                module << symbol << " = external "
+                       << llvm_visibility(entity.visibility) << tls << storage
                        << ir_type(object.type) << ", align "
                        << object.alignment << '\n';
                 emitted = true;
                 continue;
             }
             if (object.initializer == data::InitializerKind::Declaration) {
-                module << symbol << " = external " << tls << storage
+                module << symbol << " = external "
+                       << llvm_visibility(entity.visibility) << tls << storage
                        << ir_type(object.type) << ", align "
                        << object.alignment << '\n';
                 emitted = true;
@@ -394,7 +407,11 @@ private:
                     ? aggregate_ir_type(object)
                     : ir_type(object.type);
             module << symbol << " = "
-                   << (entity.linkage == Linkage::Global ? "" : "internal ")
+                   << (entity.weak
+                           ? "weak "
+                           : entity.linkage == Linkage::Global ? ""
+                                                               : "internal ")
+                   << llvm_visibility(entity.visibility)
                    << tls << storage << storage_type << ' '
                    << initializer(object);
             if (entity.section) {

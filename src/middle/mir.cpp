@@ -829,6 +829,8 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             attribute.name != "hot" &&
             attribute.name != "used" &&
             attribute.name != "retain" &&
+            attribute.name != "weak" &&
+            attribute.name != "visibility" &&
             attribute.name != "no_stack_protector" &&
             attribute.name != "no_sanitize" &&
             attribute.name != "noinline" &&

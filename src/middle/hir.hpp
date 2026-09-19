@@ -130,6 +130,7 @@ struct VariadicBinding {
 enum class BodyOwnership { None, ManagedAst, ManagedMir, RawMir };
 enum class AbiContract { Dynamic, Registered };
 enum class FunctionTemperature { Normal, Hot, Cold };
+enum class SymbolVisibility { Default, Hidden, Protected, Internal };
 
 struct Function {
     FunctionId id;
@@ -146,6 +147,8 @@ struct Function {
     bool abi_explicit{};
     std::optional<std::string> section;
     unsigned minimum_alignment{1};
+    SymbolVisibility visibility{SymbolVisibility::Default};
+    bool weak{};
     FunctionTemperature temperature{FunctionTemperature::Normal};
     bool used{};
     bool retain{};
@@ -183,6 +186,8 @@ struct Object {
     TypeId type;
     std::optional<std::string> section;
     unsigned minimum_alignment{1};
+    SymbolVisibility visibility{SymbolVisibility::Default};
+    bool weak{};
     bool is_thread_local{};
     std::string tls_model;
     std::vector<const ObjectDecl*> declarations;

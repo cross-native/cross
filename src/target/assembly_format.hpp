@@ -29,6 +29,16 @@ struct AssemblySectionRequest {
     bool retain{};
 };
 
+enum class AssemblySymbolVisibility { Default, Hidden, Protected, Internal };
+
+struct AssemblySymbolRequest {
+    std::string_view name;
+    bool external{};
+    bool definition{true};
+    bool weak{};
+    AssemblySymbolVisibility visibility{AssemblySymbolVisibility::Default};
+};
+
 // Returns one complete assembler directive without a trailing newline.  The
 // logical name uses Cross/ELF-style defaults (for example `.text` or
 // `.rodata.foo`); Mach-O translation is performed here.  A custom Mach-O name
@@ -36,6 +46,13 @@ struct AssemblySectionRequest {
 // spelling.
 [[nodiscard]] std::optional<std::string> assembly_section_directive(
     ObjectFormat format, const AssemblySectionRequest& request,
+    std::string& error);
+
+// Returns complete binding/visibility directives without a trailing newline.
+// An empty result is valid for a local symbol on formats without a local
+// directive. Type metadata remains the responsibility of the target emitter.
+[[nodiscard]] std::optional<std::string> assembly_symbol_directives(
+    ObjectFormat format, const AssemblySymbolRequest& request,
     std::string& error);
 
 [[nodiscard]] bool assembly_uses_dwarf_cfi(ObjectFormat format);

@@ -33,6 +33,7 @@ const Attribute* attribute(const ObjectDecl& object, std::string_view name) {
 bool supported_attribute(std::string_view name) {
     return name == "link_name" || name == "section" || name == "aligned" ||
            name == "noinit" || name == "retain" || name == "used" ||
+           name == "weak" || name == "visibility" ||
            name == "thread_local" || name == "tls_model";
 }
 

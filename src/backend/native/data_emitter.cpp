@@ -41,6 +41,21 @@ std::string symbol(std::string_view name) {
     return simple ? std::string(name) : quoted(name);
 }
 
+AssemblySymbolVisibility assembly_visibility(
+    hir::SymbolVisibility visibility) {
+    switch (visibility) {
+    case hir::SymbolVisibility::Default:
+        return AssemblySymbolVisibility::Default;
+    case hir::SymbolVisibility::Hidden:
+        return AssemblySymbolVisibility::Hidden;
+    case hir::SymbolVisibility::Protected:
+        return AssemblySymbolVisibility::Protected;
+    case hir::SymbolVisibility::Internal:
+        return AssemblySymbolVisibility::Internal;
+    }
+    return AssemblySymbolVisibility::Default;
+}
+
 void emit_bits(std::ostringstream& out, UInt128 value, unsigned bytes,
                ByteOrder byte_order) {
     value = mask_to(value, bytes * 8);
@@ -412,12 +427,30 @@ private:
         const auto name = symbol(entity.link_symbol);
         if (object.initializer == data::InitializerKind::Declaration) {
             out_ << ".extern " << name << '\n';
+            std::string symbol_error;
+            const auto directives = assembly_symbol_directives(
+                format_, {name, true, false, false,
+                          assembly_visibility(entity.visibility)},
+                symbol_error);
+            if (!directives) {
+                diagnostics_.error(object.location, symbol_error);
+            } else if (!directives->empty()) {
+                out_ << *directives << '\n';
+            }
             return;
         }
         if (!select_section(entity, object)) return;
         out_ << ".p2align " << std::countr_zero(object.alignment) << '\n';
-        if (entity.linkage == Linkage::Global) out_ << ".globl " << name << '\n';
-        else if (format_ == ObjectFormat::Elf) out_ << ".local " << name << '\n';
+        std::string symbol_error;
+        const auto directives = assembly_symbol_directives(
+            format_, {name, entity.linkage == Linkage::Global, true,
+                      entity.weak, assembly_visibility(entity.visibility)},
+            symbol_error);
+        if (!directives) {
+            diagnostics_.error(object.location, symbol_error);
+            return;
+        }
+        if (!directives->empty()) out_ << *directives << '\n';
         if (format_ == ObjectFormat::Elf) {
             out_ << ".type " << name
                  << (object.is_thread_local ? ",@tls_object\n" : ",@object\n");

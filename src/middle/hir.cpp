@@ -398,6 +398,73 @@ private:
         return result;
     }
 
+    void parse_symbol_attributes(
+        const std::vector<const Attribute*>& attributes,
+        bool has_definition, Linkage linkage, SourceLocation location,
+        bool& weak, SymbolVisibility& visibility) {
+        bool has_visibility{};
+        for (const auto* attribute : attributes) {
+            if (attribute->name == "weak") {
+                weak = true;
+                if (!attribute->arguments.empty()) {
+                    diagnostics_.error(attribute->location,
+                                       "weak does not take arguments");
+                }
+                continue;
+            }
+            if (attribute->name != "visibility") continue;
+            if (attribute->arguments.size() != 1) {
+                diagnostics_.error(
+                    attribute->location,
+                    "visibility requires one visibility-kind string");
+                continue;
+            }
+            const auto spelling =
+                decode_string_literal(attribute->arguments.front());
+            if (!spelling) {
+                diagnostics_.error(
+                    attribute->location,
+                    "visibility requires one visibility-kind string");
+                continue;
+            }
+            const auto parsed = *spelling == "default"
+                ? SymbolVisibility::Default
+                : *spelling == "hidden"
+                      ? SymbolVisibility::Hidden
+                      : *spelling == "protected"
+                            ? SymbolVisibility::Protected
+                            : *spelling == "internal"
+                                  ? SymbolVisibility::Internal
+                                  : SymbolVisibility::Default;
+            if (*spelling != "default" && *spelling != "hidden" &&
+                *spelling != "protected" && *spelling != "internal") {
+                diagnostics_.error(
+                    attribute->location,
+                    "visibility must be default, hidden, protected, or internal");
+                continue;
+            }
+            if (has_visibility && visibility != parsed) {
+                diagnostics_.error(attribute->location,
+                                   "conflicting visibility attributes");
+            } else {
+                visibility = parsed;
+                has_visibility = true;
+            }
+        }
+        if (weak && !has_definition) {
+            diagnostics_.error(location,
+                               "weak requires an external definition");
+        }
+        if (weak && linkage != Linkage::Global) {
+            diagnostics_.error(location,
+                               "weak requires global linkage");
+        }
+        if (has_visibility && linkage != Linkage::Global) {
+            diagnostics_.error(location,
+                               "visibility requires global linkage");
+        }
+    }
+
     bool parse_packed(const std::vector<Attribute>& attributes,
                       std::string_view subject) {
         bool result = false;
@@ -1255,6 +1322,19 @@ private:
                     function.definition->attributes, "function definition",
                     function.definition->source_namespace);
             }
+            std::vector<const Attribute*> symbol_attributes;
+            for (const auto* declaration : function.declarations) {
+                for (const auto& attribute : declaration->attributes) {
+                    if (attribute.name == "weak" ||
+                        attribute.name == "visibility") {
+                        symbol_attributes.push_back(&attribute);
+                    }
+                }
+            }
+            parse_symbol_attributes(
+                symbol_attributes, function.definition != nullptr,
+                function.linkage, representative->location, function.weak,
+                function.visibility);
             bool hot{};
             bool cold{};
             for (const auto& attribute : representative->attributes) {
@@ -1611,6 +1691,19 @@ private:
             object.minimum_alignment = parse_alignment(
                 representative->attributes, "an object definition",
                 source_namespace(object.source_name));
+            std::vector<const Attribute*> symbol_attributes;
+            for (const auto* declaration : object.declarations) {
+                for (const auto& attribute : declaration->attributes) {
+                    if (attribute.name == "weak" ||
+                        attribute.name == "visibility") {
+                        symbol_attributes.push_back(&attribute);
+                    }
+                }
+            }
+            parse_symbol_attributes(
+                symbol_attributes, object.definition != nullptr,
+                object.linkage, representative->location, object.weak,
+                object.visibility);
             object.is_thread_local =
                 object_attribute(*representative, "thread_local") != nullptr;
             object.tls_model = decode_attribute_string(

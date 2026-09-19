@@ -838,6 +838,15 @@ if(BUILD_TESTING)
                 -DERRORS=${CMAKE_SOURCE_DIR}/test/backend/native/function_metadata_errors.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/function-metadata
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/function_metadata.cmake")
+    add_test(NAME cross_symbol_metadata
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DBINDING=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_binding.x
+                -DHIDDEN=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_hidden.x
+                -DVISIBILITY=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_visibility.x
+                -DERRORS=${CMAKE_SOURCE_DIR}/test/backend/native/symbol_metadata_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/symbol-metadata
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/symbol_metadata.cmake")
     foreach(level O0 O2)
         add_test(NAME cross_runtime_alignment_expressions_${level}
             COMMAND "${CMAKE_COMMAND}"

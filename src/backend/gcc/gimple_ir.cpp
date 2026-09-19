@@ -134,6 +134,16 @@ bool has_attribute(const hir::Function& function, std::string_view name) {
     return false;
 }
 
+std::string_view visibility_name(hir::SymbolVisibility visibility) {
+    switch (visibility) {
+    case hir::SymbolVisibility::Default: return "default";
+    case hir::SymbolVisibility::Hidden: return "hidden";
+    case hir::SymbolVisibility::Protected: return "protected";
+    case hir::SymbolVisibility::Internal: return "internal";
+    }
+    return "default";
+}
+
 class TypeEmitter {
 public:
     TypeEmitter(const hir::Module& hir_module, Diagnostics& diagnostics)
@@ -1514,6 +1524,12 @@ private:
                                  std::to_string(function.minimum_alignment) +
                                  ')');
         }
+        if (function.weak) attributes.emplace_back("weak");
+        if (function.visibility != hir::SymbolVisibility::Default) {
+            attributes.push_back(
+                "visibility(" +
+                c_string(visibility_name(function.visibility)) + ')');
+        }
         constexpr std::string_view markers[] = {
             "always_inline", "cold", "hot",    "noinline",           "noreturn",
             "returns_twice", "used", "retain", "no_stack_protector",
@@ -1597,6 +1613,12 @@ private:
                              ')');
         if (object.used) attributes.emplace_back("used");
         if (object.retain) attributes.emplace_back("retain");
+        if (entity.weak) attributes.emplace_back("weak");
+        if (entity.visibility != hir::SymbolVisibility::Default) {
+            attributes.push_back(
+                "visibility(" +
+                c_string(visibility_name(entity.visibility)) + ')');
+        }
         if (object.is_thread_local) {
             const auto model =
                 object.tls_model.empty()

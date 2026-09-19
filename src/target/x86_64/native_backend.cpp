@@ -29,6 +29,21 @@
 namespace cross::x86_64 {
 namespace {
 
+AssemblySymbolVisibility assembly_visibility(
+    hir::SymbolVisibility visibility) {
+    switch (visibility) {
+    case hir::SymbolVisibility::Default:
+        return AssemblySymbolVisibility::Default;
+    case hir::SymbolVisibility::Hidden:
+        return AssemblySymbolVisibility::Hidden;
+    case hir::SymbolVisibility::Protected:
+        return AssemblySymbolVisibility::Protected;
+    case hir::SymbolVisibility::Internal:
+        return AssemblySymbolVisibility::Internal;
+    }
+    return AssemblySymbolVisibility::Default;
+}
+
 enum class LoweringPass : std::uint16_t {
     HoistParameterCaptures,
     PropagateCopiesInitial,
@@ -22632,10 +22647,17 @@ private:
             alignment_power,
             static_cast<unsigned>(std::countr_zero(entity.minimum_alignment)));
         output_ << ".p2align " << alignment_power << "\n";
-        if (entity.linkage == Linkage::Global) {
-            output_ << ".globl " << symbol << "\n";
-        } else if (format_ == ObjectFormat::Elf) {
-            output_ << ".local " << symbol << "\n";
+        std::string symbol_error;
+        const auto symbol_directives = assembly_symbol_directives(
+            format_, {symbol, entity.linkage == Linkage::Global, true,
+                      entity.weak, assembly_visibility(entity.visibility)},
+            symbol_error);
+        if (!symbol_directives) {
+            diagnostics_.error(function.location, symbol_error);
+            return;
+        }
+        if (!symbol_directives->empty()) {
+            output_ << *symbol_directives << '\n';
         }
         if (format_ == ObjectFormat::Elf) {
             output_ << ".type " << symbol << ",@function\n";
