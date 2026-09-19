@@ -325,6 +325,7 @@ TargetInfo make_target(ByteOrder order,
         target_options(),
         &subtargets,
         {integer_constant_materialization_cost},
+        {{0, 0, 0, 0, true, true, true, true, false, true, true}},
     };
 }
 

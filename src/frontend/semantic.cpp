@@ -138,6 +138,8 @@ TypePtr clone_type(const TypePtr& source,
     result->is_volatile = source->is_volatile;
     result->is_atomic = source->is_atomic;
     result->is_restrict = source->is_restrict;
+    result->address_space = source->address_space;
+    result->address_space_location = source->address_space_location;
     return result;
 }
 
@@ -1973,6 +1975,7 @@ private:
                     if (!from || !to || from->kind != Type::Kind::Pointer ||
                         to->kind != Type::Kind::Pointer || !from->pointee || !to->pointee)
                         return false;
+                    if (from->address_space != to->address_space) return false;
                     if ((from->pointee->is_const && !to->pointee->is_const) ||
                         (from->pointee->is_volatile && !to->pointee->is_volatile) ||
                         from->pointee->is_atomic != to->pointee->is_atomic)
@@ -2165,6 +2168,10 @@ private:
         }
         if (value.pointer()) {
             if (type->kind == Type::Kind::Pointer) {
+                if (value.type->address_space != type->address_space) {
+                    fail(location, "implicit pointer conversion changes address space");
+                    return std::nullopt;
+                }
                 if (!type->pointee || !value.type->pointee ||
                     (value.type->pointee->is_const && !type->pointee->is_const) ||
                     (value.type->pointee->is_volatile && !type->pointee->is_volatile)) {

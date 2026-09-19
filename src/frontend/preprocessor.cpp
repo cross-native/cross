@@ -455,6 +455,15 @@ std::string Preprocessor::evaluate_query(
         return is_known_attribute(argument) ? "1" : "0";
     }
     if (name == "$::has_feature") {
+        if (argument == "$::feature::address_spaces") {
+            return target && std::any_of(
+                       target->address_spaces.begin(),
+                       target->address_spaces.end(),
+                       [](const AddressSpaceEntry& entry) {
+                           return entry.number != 0 && entry.native_lowering;
+                       })
+                       ? "1" : "0";
+        }
         if (one_of({"$::feature::runtime_free_intrinsics",
                     "$::feature::control_intrinsics",
                     "$::feature::evaluation",

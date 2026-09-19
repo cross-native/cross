@@ -257,6 +257,76 @@ std::vector<Attribute> Parser::parse_attributes() {
     return result;
 }
 
+void Parser::apply_type_attributes(
+    TypePtr& type,
+    std::optional<std::pair<std::uint32_t, SourceLocation>>*
+        pending_address_space) {
+    if (!current().is("[[")) return;
+    for (const auto& attribute : parse_attributes()) {
+        if (attribute.name == "atomic") {
+            if (!attribute.arguments.empty()) {
+                diagnostics_.error(attribute.location,
+                                   "'atomic' takes no arguments");
+            } else if (type->is_atomic) {
+                diagnostics_.error(attribute.location,
+                                   "duplicate 'atomic' type qualifier");
+            } else {
+                type->is_atomic = true;
+            }
+            continue;
+        }
+        if (attribute.name == "address_space") {
+            if (attribute.arguments.size() != 1) {
+                diagnostics_.error(attribute.location,
+                                   "address_space requires one target registry number");
+                continue;
+            }
+            auto digits = attribute.arguments.front();
+            digits.erase(std::remove(digits.begin(), digits.end(), '_'),
+                         digits.end());
+            int base = 10;
+            if (digits.starts_with("0x") || digits.starts_with("0X")) {
+                digits.erase(0, 2);
+                base = 16;
+            } else if (digits.starts_with("0b") || digits.starts_with("0B")) {
+                digits.erase(0, 2);
+                base = 2;
+            }
+            std::uint32_t number{};
+            const auto parsed = std::from_chars(
+                digits.data(), digits.data() + digits.size(), number, base);
+            if (digits.empty() || parsed.ec != std::errc{} ||
+                parsed.ptr != digits.data() + digits.size()) {
+                diagnostics_.error(attribute.location,
+                                   "address_space requires a nonnegative target registry number");
+                continue;
+            }
+            if (pending_address_space) {
+                if (*pending_address_space) {
+                    diagnostics_.error(attribute.location,
+                                       "duplicate address_space type qualifier");
+                } else {
+                    *pending_address_space =
+                        std::pair{number, attribute.location};
+                }
+            } else if (type->kind != Type::Kind::Pointer) {
+                diagnostics_.error(attribute.location,
+                                   "address_space requires a pointer type");
+            } else if (type->address_space_location.valid()) {
+                diagnostics_.error(attribute.location,
+                                   "duplicate address_space type qualifier");
+            } else {
+                type->address_space = number;
+                type->address_space_location = attribute.location;
+            }
+            continue;
+        }
+        diagnostics_.error(attribute.location,
+                           "attribute '" + attribute.name +
+                               "' is not valid as a type qualifier here");
+    }
+}
+
 std::optional<std::string> Parser::parse_qualified_name() {
     const auto* first = consume_kind(TokenKind::Identifier);
     if (!first) return std::nullopt;
@@ -448,30 +518,9 @@ TypePtr Parser::parse_type() {
             restrict_location.value_or(current().location),
             "restrict qualifier requires a pointer type");
     }
-    const auto apply_type_attributes = [&](TypePtr& target) {
-        if (!current().is("[[")) return;
-        for (const auto& attribute : parse_attributes()) {
-            if (attribute.name != "atomic") {
-                diagnostics_.error(
-                    attribute.location,
-                    "attribute '" + attribute.name +
-                        "' is not valid as a type qualifier here");
-                continue;
-            }
-            if (!attribute.arguments.empty()) {
-                diagnostics_.error(attribute.location,
-                                   "'atomic' takes no arguments");
-                continue;
-            }
-            if (target->is_atomic) {
-                diagnostics_.error(attribute.location,
-                                   "duplicate 'atomic' type qualifier");
-                continue;
-            }
-            target->is_atomic = true;
-        }
-    };
-    apply_type_attributes(type);
+    std::optional<std::pair<std::uint32_t, SourceLocation>>
+        pending_address_space;
+    apply_type_attributes(type, &pending_address_space);
     while (consume("*")) {
         bool pointer_const = false;
         bool pointer_volatile = false;
@@ -487,7 +536,24 @@ TypePtr Parser::parse_type() {
         }
         type = pointer_type(type, pointer_const, pointer_volatile);
         type->is_restrict = pointer_restrict;
+        if (pending_address_space) {
+            type->address_space = pending_address_space->first;
+            type->address_space_location = pending_address_space->second;
+            pending_address_space.reset();
+        }
         apply_type_attributes(type);
+    }
+    if (pending_address_space) {
+        if (type->kind != Type::Kind::Pointer) {
+            diagnostics_.error(pending_address_space->second,
+                               "address_space requires a pointer type");
+        } else if (type->address_space_location.valid()) {
+            diagnostics_.error(pending_address_space->second,
+                               "duplicate address_space type qualifier");
+        } else {
+            type->address_space = pending_address_space->first;
+            type->address_space_location = pending_address_space->second;
+        }
     }
     return type;
 }
@@ -512,6 +578,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         }
         base = pointer_type(std::move(base), is_const, is_volatile);
         base->is_restrict = is_restrict;
+        apply_type_attributes(base);
     }
     TypePtr nested;
     TypePtr hole;

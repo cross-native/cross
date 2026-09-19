@@ -287,6 +287,13 @@ void print_features(const CompilerOptions& options) {
                  "$::feature::external_models\n"
                  "$::feature::operator_binding\n";
     if (const auto* target = target_for_triple(options.target)) {
+        if (std::any_of(target->address_spaces.begin(),
+                        target->address_spaces.end(),
+                        [](const AddressSpaceEntry& entry) {
+                            return entry.number != 0 && entry.native_lowering;
+                        })) {
+            std::cout << "$::feature::address_spaces\n";
+        }
         if (target->architecture == "x86-64") {
             std::cout << "$::feature::integer128\n"
                          "$::feature::binary128_storage\n"
@@ -488,6 +495,8 @@ int cc_main(int argc, char** argv) {
     auto subtarget = resolve_subtarget(*target, options, diagnostics);
     if (!subtarget) return 1;
     program.address_bits = subtarget->abi_info().address_bits;
+    if (!hir::validate_source_address_spaces(
+            program, options, *target, diagnostics)) return 1;
     if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
                           options.mangling, options.abi)) return 1;

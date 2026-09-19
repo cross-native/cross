@@ -16,5 +16,8 @@
 #if !$::has_feature($::feature::variadics)
 #error x86-64 must advertise variadics
 #endif
+#if $::has_feature($::feature::address_spaces)
+#error x86-64 does not lower alternate address spaces yet
+#endif
 
 global i32 x86_features_consistent = 1;

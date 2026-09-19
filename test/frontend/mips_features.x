@@ -22,5 +22,8 @@
 #if $::has_feature($::feature::thread_local)
 #error MIPS must not advertise unavailable thread-local lowering
 #endif
+#if $::has_feature($::feature::address_spaces)
+#error MIPS does not lower alternate address spaces yet
+#endif
 
 global i32 mips_features_consistent = 1;

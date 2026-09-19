@@ -91,6 +91,7 @@ struct Type {
     std::optional<RecordId> record;
     std::optional<FunctionSignature> function{};
     bool is_restrict{};
+    std::uint32_t address_space{};
 };
 
 struct RecordMember {
@@ -250,6 +251,10 @@ public:
 
 Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics);
+bool validate_source_address_spaces(Program& program,
+                                    const CompilerOptions& options,
+                                    const TargetInfo& target,
+                                    Diagnostics& diagnostics);
 [[nodiscard]] std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,
                std::optional<TypeId> indirect);

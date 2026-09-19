@@ -204,6 +204,13 @@ cross_tool(cross_cpp)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(cross_address_space_types_test
+                   test/frontend/address_space_types_test.cpp)
+    target_link_libraries(cross_address_space_types_test PRIVATE cross_middle)
+    cross_component(cross_address_space_types_test)
+    add_test(NAME cross_address_space_types
+             COMMAND $<TARGET_FILE:cross_address_space_types_test>)
+
     add_executable(cross_options_test test/common/options_test.cpp)
     target_link_libraries(cross_options_test PRIVATE cross_targets)
     cross_component(cross_options_test)
@@ -242,6 +249,24 @@ if(BUILD_TESTING)
         -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/frontend
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/feature-consistency
         -P "${CMAKE_SOURCE_DIR}/test/frontend/feature_consistency.cmake")
+    add_test(NAME cross_address_spaces COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/frontend
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/address-spaces
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/address_spaces.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_address_spaces_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/address_spaces.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/address-spaces-${level}
+                    -DENTRY=address_space_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_test(NAME cross_switch_runtime COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/switch/runtime.x

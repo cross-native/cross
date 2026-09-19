@@ -46,6 +46,10 @@ struct Type {
     bool is_volatile{};
     bool is_atomic{};
     bool is_restrict{};
+    // Only pointer types carry an address-space number. Zero is the ordinary
+    // generic address space; the source location supports target diagnostics.
+    std::uint32_t address_space{};
+    SourceLocation address_space_location;
 };
 
 TypePtr builtin_type(BuiltinType kind, bool is_const = false,

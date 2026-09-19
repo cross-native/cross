@@ -194,6 +194,7 @@ public:
     }
 
     Module run() {
+        validate_address_spaces();
         collect_record_shells();
         finish_records();
         collect_functions();
@@ -205,6 +206,124 @@ public:
         finish_patch_sink_indices();
         diagnose_symbol_collisions();
         return std::move(module_);
+    }
+
+    void validate_address_spaces() {
+        std::unordered_set<const cross::Type*> visited;
+        std::unordered_set<std::string> reported;
+        const auto type = [&](const auto& self, const TypePtr& source,
+                              SourceLocation fallback) -> void {
+            if (!source || !visited.insert(source.get()).second) return;
+            if (source->kind == cross::Type::Kind::Pointer) {
+                const auto* entry =
+                    find_address_space(target_, source->address_space);
+                if (!entry || !entry->native_lowering) {
+                    const auto location =
+                        source->address_space_location.valid()
+                            ? source->address_space_location
+                            : fallback;
+                    const auto key =
+                        std::to_string(reinterpret_cast<std::uintptr_t>(
+                            location.file)) + ':' +
+                        std::to_string(location.offset) + ':' +
+                        std::to_string(source->address_space);
+                    if (reported.insert(key).second) {
+                        diagnostics_.error(
+                            location,
+                            "address space " +
+                                std::to_string(source->address_space) +
+                                (entry ? " has no native lowering on target '"
+                                       : " is not registered for target '") +
+                                std::string(target_.architecture) + "'");
+                    }
+                }
+                self(self, source->pointee, fallback);
+            } else if (source->kind == cross::Type::Kind::Array ||
+                       source->kind == cross::Type::Kind::Vector) {
+                self(self, source->element, fallback);
+            } else if (source->kind == cross::Type::Kind::Function &&
+                       source->function) {
+                self(self, source->function->result, fallback);
+                for (const auto& parameter : source->function->parameters)
+                    self(self, parameter.type, parameter.location);
+            }
+        };
+        const auto expression = [&](const auto& self,
+                                    const Expr* source) -> void {
+            if (!source) return;
+            type(type, source->type, source->location);
+            self(self, source->left.get());
+            self(self, source->right.get());
+            self(self, source->third.get());
+            for (const auto& argument : source->arguments)
+                self(self, argument.get());
+            for (const auto& argument : source->generic_arguments) {
+                type(type, argument.type, source->location);
+                self(self, argument.value.get());
+            }
+            for (const auto& entry : source->initializer_entries) {
+                for (const auto& designator : entry.designators)
+                    self(self, designator.index.get());
+                self(self, entry.value.get());
+            }
+        };
+        const auto attributes = [&](const std::vector<Attribute>& values) {
+            for (const auto& attribute : values)
+                expression(expression,
+                           attribute.expression_argument.get());
+        };
+        const auto statement = [&](const auto& self,
+                                   const Statement* source) -> void {
+            if (!source) return;
+            attributes(source->attributes);
+            if (source->declaration) {
+                type(type, source->declaration->type,
+                     source->declaration->location);
+                attributes(source->declaration->attributes);
+                expression(expression,
+                           source->declaration->dynamic_array_bound.get());
+                expression(expression,
+                           source->declaration->initializer.get());
+            }
+            expression(expression, source->expression.get());
+            expression(expression, source->condition.get());
+            expression(expression, source->increment.get());
+            self(self, source->first.get());
+            self(self, source->second.get());
+            for (const auto& child : source->statements)
+                self(self, child.get());
+        };
+        for (const auto& record : program_.records) {
+            attributes(record.attributes);
+            for (const auto& member : record.members) {
+                type(type, member.type, member.location);
+                attributes(member.attributes);
+                expression(expression, member.bit_width.get());
+            }
+        }
+        for (const auto& enumeration : program_.enumerations) {
+            attributes(enumeration.attributes);
+            for (const auto& item : enumeration.enumerators)
+                expression(expression, item.initializer.get());
+        }
+        for (const auto& assertion : program_.static_assertions)
+            expression(expression, assertion.condition.get());
+        for (const auto& label : program_.global_labels)
+            attributes(label.attributes);
+        for (const auto& function : program_.functions) {
+            type(type, function->return_type, function->location);
+            for (const auto& parameter : function->parameters)
+                type(type, parameter.type, parameter.location);
+            for (const auto& parameter : function->generic_parameters)
+                type(type, parameter.value_type, function->location);
+            attributes(function->attributes);
+            statement(statement, function->body.get());
+        }
+        for (const auto& object : program_.objects) {
+            type(type, object->type, object->location);
+            attributes(object->attributes);
+            expression(expression, object->initializer.get());
+        }
     }
 
 private:
@@ -2020,6 +2139,7 @@ TypeId Module::intern_type(const TypePtr& source) {
         candidate.is_volatile = source->is_volatile;
         candidate.is_atomic = source->is_atomic;
         candidate.is_restrict = source->is_restrict;
+        candidate.address_space = source->address_space;
         if (source->kind == cross::Type::Kind::Pointer) {
             candidate.pointee = intern_type(source->pointee);
         } else if (source->kind == cross::Type::Kind::Function &&
@@ -2072,7 +2192,8 @@ TypeId Module::intern_type(const TypePtr& source) {
             type.is_const == candidate.is_const &&
             type.is_volatile == candidate.is_volatile &&
             type.is_restrict == candidate.is_restrict &&
-            type.is_atomic == candidate.is_atomic) {
+            type.is_atomic == candidate.is_atomic &&
+            type.address_space == candidate.address_space) {
             return {index};
         }
     }
@@ -2101,7 +2222,7 @@ TypeId Module::pointer_to(TypeId pointee) {
         if (candidate.kind == Type::Kind::Pointer &&
             candidate.pointee == pointee && !candidate.is_const &&
             !candidate.is_volatile && !candidate.is_atomic &&
-            !candidate.is_restrict &&
+            !candidate.is_restrict && candidate.address_space == 0 &&
             candidate.nominal_name.empty()) {
             return {index};
         }
@@ -2135,6 +2256,7 @@ TypeId Module::unqualified(TypeId id) {
             existing.lanes == candidate.lanes &&
             existing.scalable == candidate.scalable &&
             existing.nominal_name == candidate.nominal_name &&
+            existing.address_space == candidate.address_space &&
             !existing.is_const && !existing.is_volatile &&
             !existing.is_atomic && !existing.is_restrict) {
             return {index};
@@ -2168,7 +2290,8 @@ TypeId Module::add_qualifiers(TypeId id, bool is_const,
             existing.is_const == candidate.is_const &&
             existing.is_volatile == candidate.is_volatile &&
             existing.is_restrict == candidate.is_restrict &&
-            existing.is_atomic == candidate.is_atomic) {
+            existing.is_atomic == candidate.is_atomic &&
+            existing.address_space == candidate.address_space) {
             return {index};
         }
     }
@@ -2276,6 +2399,14 @@ Module build(Program& program, const CompilerOptions& options,
     return Builder(program, options, target, diagnostics).run();
 }
 
+bool validate_source_address_spaces(Program& program,
+                                    const CompilerOptions& options,
+                                    const TargetInfo& target,
+                                    Diagnostics& diagnostics) {
+    Builder(program, options, target, diagnostics).validate_address_spaces();
+    return diagnostics.errors() == 0;
+}
+
 bool stabilize_function_address(Module& module, FunctionId id,
                                 SourceLocation location,
                                 Diagnostics& diagnostics) {
@@ -2319,7 +2450,11 @@ std::string type_name(const Module& module, TypeId id) {
     if (type.is_restrict) prefix += "restrict ";
     if (type.is_atomic) prefix += "[[atomic]] ";
     if (type.kind == Type::Kind::Pointer) {
-        return prefix + type_name(module, *type.pointee) + " *";
+        return prefix + type_name(module, *type.pointee) +
+               (type.address_space == 0
+                    ? " *"
+                    : " [[address_space(" +
+                          std::to_string(type.address_space) + ")]] *");
     }
     if (type.kind == Type::Kind::Function && type.function) {
         std::string result =

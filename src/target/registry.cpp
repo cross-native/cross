@@ -82,4 +82,12 @@ bool target_has_instruction(const TargetInfo& target, std::string_view name) {
     return find_instruction(target, name) != nullptr;
 }
 
+const AddressSpaceEntry* find_address_space(const TargetInfo& target,
+                                            std::uint32_t number) {
+    for (const auto& entry : target.address_spaces) {
+        if (entry.number == number) return &entry;
+    }
+    return nullptr;
+}
+
 } // namespace cross

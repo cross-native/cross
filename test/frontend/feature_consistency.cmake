@@ -28,7 +28,7 @@ if(NOT status EQUAL 0)
     message(FATAL_ERROR "MIPS --print-features failed\n${stderr}")
 endif()
 foreach(feature integer128 binary128_storage binary128_arithmetic fixed_vectors
-                atomics variadics thread_local)
+                atomics variadics thread_local address_spaces)
     if(features MATCHES "[$]::feature::${feature}([\r\n]|$)")
         message(FATAL_ERROR
             "MIPS --print-features over-reports ${feature}\n${features}")

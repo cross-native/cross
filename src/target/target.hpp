@@ -337,6 +337,23 @@ struct VectorWidthEntry {
     std::string_view floating_feature;
 };
 
+// Source-level pointer spaces are distinct from Machine IR frame/outgoing
+// memory regions. A zero width uses the selected ABI's address width. A
+// target must opt into native lowering before a numbered space is accepted.
+struct AddressSpaceEntry {
+    std::uint32_t number{};
+    unsigned pointer_bits{};
+    std::uint64_t null_low{};
+    std::uint64_t null_high{};
+    bool generic{};
+    bool readable{};
+    bool writable{};
+    bool executable{};
+    bool volatile_by_default{};
+    bool abi_transport{};
+    bool native_lowering{};
+};
+
 enum class ByteOrder { Little, Big };
 enum class BitFieldOrder { LeastSignificantFirst, MostSignificantFirst };
 enum class BitFieldUnitSharing { SameUnqualifiedBase, SameStorageSize };
@@ -388,6 +405,7 @@ struct TargetInfo {
     std::vector<OptionDefinition> options;
     const SubtargetTable* subtargets{};
     TargetCostModel cost_model;
+    std::vector<AddressSpaceEntry> address_spaces;
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;
@@ -408,5 +426,7 @@ const InstructionEntry* find_instruction(const TargetInfo& target, std::string_v
 std::vector<const InstructionEntry*> find_instruction_forms(
     const TargetInfo& target, std::string_view name);
 bool target_has_instruction(const TargetInfo& target, std::string_view name);
+const AddressSpaceEntry* find_address_space(const TargetInfo& target,
+                                            std::uint32_t number);
 
 } // namespace cross

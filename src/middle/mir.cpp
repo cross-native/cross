@@ -235,6 +235,7 @@ bool representation_compatible(const hir::Module& module, hir::TypeId left,
     const auto& rhs = module.type(right);
     return lhs.kind == rhs.kind && lhs.builtin == rhs.builtin &&
            lhs.pointee == rhs.pointee && lhs.record == rhs.record &&
+           lhs.address_space == rhs.address_space &&
            lhs.function == rhs.function && lhs.element == rhs.element &&
            lhs.lanes == rhs.lanes && lhs.scalable == rhs.scalable &&
            lhs.is_atomic == rhs.is_atomic &&
@@ -248,6 +249,7 @@ bool unqualified_representation_compatible(const hir::Module& module,
     const auto& rhs = module.type(right);
     return lhs.kind == rhs.kind && lhs.builtin == rhs.builtin &&
            lhs.pointee == rhs.pointee && lhs.element == rhs.element &&
+           lhs.address_space == rhs.address_space &&
            lhs.function == rhs.function && lhs.lanes == rhs.lanes &&
            lhs.scalable == rhs.scalable && lhs.nominal_name == rhs.nominal_name;
 }
@@ -3152,6 +3154,7 @@ private:
         }
         if (from.kind == hir::Type::Kind::Pointer &&
             to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee) {
+            if (from.address_space != to.address_space) return false;
             return compatible_pointer_conversion(
                 *from.pointee, *to.pointee, depth + 1,
                 intermediate_const && to.is_const);
@@ -3165,9 +3168,10 @@ private:
         const auto& to = hir_.type(destination);
         if (from.kind == hir::Type::Kind::Pointer &&
             to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee &&
-            !compatible_pointer_conversion(*from.pointee, *to.pointee)) {
+            (from.address_space != to.address_space ||
+             !compatible_pointer_conversion(*from.pointee, *to.pointee))) {
             diagnostics_.error(location,
-                "implicit pointer conversion discards qualifiers or uses incompatible pointee types");
+                "implicit pointer conversion changes address space, discards qualifiers, or uses incompatible pointee types");
             failed_ = true;
             return source;
         }
@@ -3301,6 +3305,8 @@ private:
                     hir_.type(destination_type);
                 if (!source_pointer_type.pointee ||
                     !destination_pointer_type.pointee ||
+                    source_pointer_type.address_space !=
+                        destination_pointer_type.address_space ||
                     !compatible_pointer_conversion(
                         *source_pointer_type.pointee,
                         *destination_pointer_type.pointee)) {

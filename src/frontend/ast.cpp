@@ -99,7 +99,13 @@ std::string type_name(const TypePtr& type) {
     if (type->is_volatile) prefix += "volatile ";
     if (type->is_restrict) prefix += "restrict ";
     if (type->is_atomic) prefix += "[[atomic]] ";
-    if (type->kind == Type::Kind::Pointer) return prefix + type_name(type->pointee) + " *";
+    if (type->kind == Type::Kind::Pointer) {
+        return prefix + type_name(type->pointee) +
+               (type->address_space == 0
+                    ? " *"
+                    : " [[address_space(" +
+                          std::to_string(type->address_space) + ")]] *");
+    }
     if (type->kind == Type::Kind::Function && type->function) {
         const auto& signature = *type->function;
         std::string result = type_name(signature.result) + " (";
@@ -154,6 +160,9 @@ std::string canonical_type_name(const TypePtr& type) {
     if (type->is_atomic) result += 'A';
     if (type->kind == Type::Kind::Pointer) {
         result += 'P';
+        if (type->address_space != 0) {
+            result += "U" + std::to_string(type->address_space) + '_';
+        }
         result += canonical_type_name(type->pointee);
         return result;
     }
@@ -218,7 +227,9 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
         left->is_volatile != right->is_volatile ||
         left->is_restrict != right->is_restrict ||
         left->is_atomic != right->is_atomic) return false;
-    if (left->kind == Type::Kind::Pointer) return same_type(left->pointee, right->pointee);
+    if (left->kind == Type::Kind::Pointer)
+        return left->address_space == right->address_space &&
+               same_type(left->pointee, right->pointee);
     if (left->kind == Type::Kind::Function) {
         if (!left->function || !right->function) return false;
         const auto& a = *left->function;

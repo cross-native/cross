@@ -27,6 +27,10 @@ private:
     void synchronize_external();
 
     std::vector<Attribute> parse_attributes();
+    void apply_type_attributes(
+        TypePtr& type,
+        std::optional<std::pair<std::uint32_t, SourceLocation>>*
+            pending_address_space = nullptr);
     std::optional<std::string> parse_qualified_name();
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
