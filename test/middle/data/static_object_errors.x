@@ -1,6 +1,3 @@
-[[aligned(3)]]
-global u64 bad_alignment = 1u64;
-
 [[noinit]]
 global const u64 const_noinit;
 

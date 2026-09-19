@@ -204,27 +204,50 @@ std::vector<Attribute> Parser::parse_attributes() {
             }
             Attribute attribute{std::move(name), {}, first->location};
             if (consume("(")) {
-                unsigned depth = 1;
-                std::string argument;
-                while (depth != 0 && current().kind != TokenKind::End) {
-                    if (current().is("(") ) { ++depth; argument += current().text; ++index_; continue; }
-                    if (current().is(")")) {
-                        --depth;
-                        if (depth == 0) {
-                            if (!argument.empty()) attribute.arguments.push_back(argument);
-                            ++index_;
+                if (attribute.name == "aligned") {
+                    while (!current().is(")") &&
+                           current().kind != TokenKind::End) {
+                        const auto start = index_;
+                        auto expression = parse_expression();
+                        if (index_ == start) {
+                            error_here("expected alignment expression");
                             break;
                         }
-                        argument += current().text; ++index_; continue;
+                        std::string argument;
+                        for (auto index = start; index < index_; ++index) {
+                            argument += tokens_[index].text;
+                        }
+                        attribute.arguments.push_back(std::move(argument));
+                        if (attribute.arguments.size() == 1) {
+                            attribute.expression_argument =
+                                std::move(expression);
+                        }
+                        if (!consume(",")) break;
                     }
-                    if (depth == 1 && current().is(",")) {
-                        attribute.arguments.push_back(argument);
-                        argument.clear();
+                    expect(")", "after alignment expression");
+                } else {
+                    unsigned depth = 1;
+                    std::string argument;
+                    while (depth != 0 && current().kind != TokenKind::End) {
+                        if (current().is("(") ) { ++depth; argument += current().text; ++index_; continue; }
+                        if (current().is(")")) {
+                            --depth;
+                            if (depth == 0) {
+                                if (!argument.empty()) attribute.arguments.push_back(argument);
+                                ++index_;
+                                break;
+                            }
+                            argument += current().text; ++index_; continue;
+                        }
+                        if (depth == 1 && current().is(",")) {
+                            attribute.arguments.push_back(argument);
+                            argument.clear();
+                            ++index_;
+                            continue;
+                        }
+                        argument += current().text;
                         ++index_;
-                        continue;
                     }
-                    argument += current().text;
-                    ++index_;
                 }
             }
             result.push_back(std::move(attribute));
@@ -1310,26 +1333,8 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
                     "' is not valid on a local object");
             continue;
         }
-        if (attribute.arguments.size() != 1) {
-            diagnostics_.error(
-                attribute.location,
-                "aligned on a local object requires one integer argument");
-            continue;
-        }
-        unsigned value{};
-        const auto& text = attribute.arguments.front();
-        const auto conversion =
-            std::from_chars(text.data(), text.data() + text.size(), value);
-        if (conversion.ec != std::errc{} ||
-            conversion.ptr != text.data() + text.size() || value == 0 ||
-            (value & (value - 1)) != 0) {
-            diagnostics_.error(
-                attribute.location,
-                "aligned argument must be a positive power-of-two integer constant");
-            continue;
-        }
-        declaration.explicit_alignment =
-            std::max(declaration.explicit_alignment, value);
+        // Target-dependent constants are resolved after HIR has completed
+        // nominal layouts and before this local is lowered to MIR.
     }
     if (const auto* location = consume_kind(TokenKind::String)) {
         declaration.location_name = decode_string_literal(location->text);

@@ -80,10 +80,14 @@ unsigned type_bits(const TypePtr& type);
 enum class Linkage { Group, Static, Global };
 enum class ParameterMode { In, Out, InOut };
 
+struct Expr;
 struct Attribute {
     std::string name;
     std::vector<std::string> arguments;
     SourceLocation location;
+    // Structured when an attribute argument is a required constant
+    // expression. Other attributes retain their original token spelling.
+    std::shared_ptr<Expr> expression_argument{};
 };
 
 struct Expr {

@@ -176,6 +176,7 @@ struct Object {
     Linkage linkage{Linkage::Group};
     TypeId type;
     std::optional<std::string> section;
+    unsigned minimum_alignment{1};
     bool is_thread_local{};
     std::string tls_model;
     std::vector<const ObjectDecl*> declarations;

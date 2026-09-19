@@ -720,6 +720,7 @@ if(BUILD_TESTING)
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/static_objects.x
                 -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/static_object_errors.x
+                -DALIGN_ERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/static_object_alignment_error.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/static-objects
                 -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
                 -P "${CMAKE_SOURCE_DIR}/test/middle/data/static_objects.cmake")
@@ -830,6 +831,25 @@ if(BUILD_TESTING)
                 -DHOST_CXX=${CMAKE_CXX_COMPILER}
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/function-alignment
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/function_alignment.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_alignment_expressions_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/alignment_expressions.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/alignment-expressions-${level}
+                    -DENTRY=alignment_expression_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
+    add_test(NAME cross_alignment_expressions_mips
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/alignment_expressions.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/alignment-expressions-mips
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/alignment_expressions_mips.cmake")
     add_test(NAME cross_x86_64_dynamic_call_alignment
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

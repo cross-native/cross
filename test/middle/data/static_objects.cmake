@@ -61,7 +61,6 @@ if(error_status EQUAL 0)
     message(FATAL_ERROR "invalid static Data IR input unexpectedly compiled")
 endif()
 foreach(pattern
-        "aligned argument must be a nonzero power of two"
         "noinit object cannot be const"
         "noinit object cannot have an initializer"
         "used requires an object definition"
@@ -71,6 +70,18 @@ foreach(pattern
         message(FATAL_ERROR "static Data IR diagnostics are missing '${pattern}'\n${error_stderr}")
     endif()
 endforeach()
+
+execute_process(
+    COMMAND "${CC}" -S "${ALIGN_ERROR_SOURCE}"
+            -o "${OUTPUT}-alignment-error.s"
+    RESULT_VARIABLE alignment_status
+    OUTPUT_VARIABLE alignment_stdout
+    ERROR_VARIABLE alignment_stderr)
+if(alignment_status EQUAL 0 OR NOT alignment_stderr MATCHES
+   "aligned argument must be a positive power-of-two integer constant")
+    message(FATAL_ERROR
+        "static object alignment diagnostic missing\n${alignment_stdout}\n${alignment_stderr}")
+endif()
 
 file(READ "${windows_assembly}" windows)
 foreach(pattern

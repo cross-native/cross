@@ -5,3 +5,4 @@
 [[aligned(0)]] global u32 zero_alignment() { return 1u32; }
 [[aligned]] global u32 missing_alignment() { return 1u32; }
 [[aligned(64)]] global u32 declaration_alignment();
+[[aligned(3u32 << 1u32)]] global u32 nonpower_expression() { return 1u32; }

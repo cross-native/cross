@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -190,6 +191,19 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     return result;
 }
 
+std::vector<Attribute> clone_attributes(
+    const std::vector<Attribute>& source, const TypeSubstitutions& types,
+    const ValueSubstitutions& values) {
+    auto result = source;
+    for (auto& attribute : result) {
+        if (attribute.expression_argument) {
+            attribute.expression_argument = std::shared_ptr<Expr>(
+                clone_expr(*attribute.expression_argument, types, values));
+        }
+    }
+    return result;
+}
+
 std::unique_ptr<VariableDecl> clone_variable(
     const VariableDecl& source, const TypeSubstitutions& types,
     const ValueSubstitutions& values) {
@@ -207,7 +221,7 @@ std::unique_ptr<VariableDecl> clone_variable(
     result->storage_register = source.storage_register;
     result->storage_stack = source.storage_stack;
     result->storage_static = source.storage_static;
-    result->attributes = source.attributes;
+    result->attributes = clone_attributes(source.attributes, types, values);
     result->explicit_alignment = source.explicit_alignment;
     result->location_name = source.location_name;
     return result;
@@ -445,7 +459,14 @@ std::unique_ptr<FunctionDecl> instantiate(
              parameter.mode, parameter.explicit_mode, parameter.location_name});
     }
     for (const auto& attribute : source.attributes) {
-        if (attribute.name != "generic") result->attributes.push_back(attribute);
+        if (attribute.name != "generic") {
+            auto copy = attribute;
+            if (attribute.expression_argument) {
+                copy.expression_argument = std::shared_ptr<Expr>(
+                    clone_expr(*attribute.expression_argument, types, values));
+            }
+            result->attributes.push_back(std::move(copy));
+        }
     }
     result->result_location = source.result_location;
     if (source.body) result->body = clone_statement(*source.body, types, values);
@@ -3924,6 +3945,34 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                                   assertion.message);
         }
     }
+    const auto align_locals = [&](auto&& self, Statement& statement,
+                                  std::string_view source_namespace) -> void {
+        if (statement.declaration) {
+            for (const auto& attribute :
+                 statement.declaration->attributes) {
+                if (attribute.name != "aligned") continue;
+                const auto alignment = evaluate_alignment_attribute(
+                    program, attribute, diagnostics, size_of, align_of,
+                    "a local object", source_namespace);
+                if (alignment) {
+                    statement.declaration->explicit_alignment = std::max(
+                        statement.declaration->explicit_alignment,
+                        *alignment);
+                }
+            }
+        }
+        if (statement.first) self(self, *statement.first, source_namespace);
+        if (statement.second) self(self, *statement.second, source_namespace);
+        for (auto& child : statement.statements) {
+            self(self, *child, source_namespace);
+        }
+    };
+    for (auto& function : program.functions) {
+        if (function->body) {
+            align_locals(align_locals, *function->body,
+                         function->source_namespace);
+        }
+    }
     return diagnostics.errors() == 0;
 }
 
@@ -3939,6 +3988,33 @@ std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(
         return std::nullopt;
     }
     return Expr::IntegerConstant{value->integer, value->type->builtin};
+}
+
+std::optional<unsigned> evaluate_alignment_attribute(
+    Program& program, const Attribute& attribute, Diagnostics& diagnostics,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::string_view subject, std::string_view source_namespace) {
+    if (attribute.arguments.size() != 1 ||
+        !attribute.expression_argument) {
+        diagnostics.error(attribute.location,
+                          "aligned on " + std::string(subject) +
+                              " requires one integer argument");
+        return std::nullopt;
+    }
+    const auto value = evaluate_target_integer_constant(
+        program, *attribute.expression_argument, diagnostics, size_of,
+        align_of, source_namespace);
+    if (!value) return std::nullopt;
+    if (value->value.high != 0 ||
+        value->value.low > std::numeric_limits<unsigned>::max() ||
+        value->value.low == 0 ||
+        (value->value.low & (value->value.low - 1U)) != 0) {
+        diagnostics.error(
+            attribute.location,
+            "aligned argument must be a positive power-of-two integer constant");
+        return std::nullopt;
+    }
+    return static_cast<unsigned>(value->value.low);
 }
 
 } // namespace cross

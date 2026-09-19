@@ -136,35 +136,6 @@ unsigned natural_alignment(const hir::Module& module, hir::TypeId id,
                      subtarget.target().data_layout.natural_alignment_limit));
 }
 
-bool power_of_two(unsigned value) {
-    return value != 0 && (value & (value - 1)) == 0;
-}
-
-std::optional<unsigned> object_alignment(const ObjectDecl& object,
-                                         unsigned natural,
-                                         Diagnostics& diagnostics) {
-    const auto* item = attribute(object, "aligned");
-    if (!item) return natural;
-    if (item->arguments.size() != 1) {
-        diagnostics.error(item->location,
-                          "aligned requires one integer argument");
-        return std::nullopt;
-    }
-    unsigned parsed{};
-    const auto& text = item->arguments.front();
-    const auto conversion =
-        std::from_chars(text.data(), text.data() + text.size(), parsed);
-    if (conversion.ec != std::errc{} ||
-        conversion.ptr != text.data() + text.size() ||
-        !power_of_two(parsed)) {
-        diagnostics.error(
-            item->location,
-            "aligned argument must be a nonzero power of two");
-        return std::nullopt;
-    }
-    return std::max(natural, parsed);
-}
-
 std::optional<UInt128> integer_value(const Expr& expression) {
     if (expression.evaluated_integer) return expression.evaluated_integer->value;
     if (expression.kind == Expr::Kind::Parenthesized && expression.left) {
@@ -883,10 +854,7 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
         }
         const auto natural =
             natural_alignment(hir_module, entity.type, object.size, subtarget);
-        if (const auto alignment =
-                object_alignment(*declaration, natural, diagnostics)) {
-            object.alignment = *alignment;
-        }
+        object.alignment = std::max(natural, entity.minimum_alignment);
         object.retain = marker_attribute(*declaration, "retain", diagnostics);
         object.used = marker_attribute(*declaration, "used", diagnostics);
         object.is_thread_local =

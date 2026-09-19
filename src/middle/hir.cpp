@@ -6,7 +6,6 @@
 #include "model/model.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <string_view>
@@ -362,30 +361,39 @@ private:
     }
 
     unsigned parse_alignment(const std::vector<Attribute>& attributes,
-                             std::string_view subject) {
+                             std::string_view subject,
+                             std::string_view source_namespace) {
         unsigned result = 1;
         for (const auto& attribute : attributes) {
             if (attribute.name != "aligned") continue;
-            if (attribute.arguments.size() != 1) {
-                diagnostics_.error(
-                    attribute.location,
-                    "aligned on " + std::string(subject) +
-                        " requires one integer argument");
-                continue;
-            }
-            unsigned value{};
-            const auto& text = attribute.arguments.front();
-            const auto conversion =
-                std::from_chars(text.data(), text.data() + text.size(), value);
-            if (conversion.ec != std::errc{} ||
-                conversion.ptr != text.data() + text.size() ||
-                !power_of_two(value)) {
-                diagnostics_.error(
-                    attribute.location,
-                    "aligned argument must be a positive power-of-two integer constant");
-                continue;
-            }
-            result = std::max(result, value);
+            const auto layout = [&](const TypePtr& source)
+                -> std::optional<std::pair<std::uint64_t, unsigned>> {
+                const auto id = intern_type(source);
+                const auto& type = module_.type(id);
+                if (type.kind == Type::Kind::Record &&
+                    (!type.record ||
+                     !layout_record(*type.record, attribute.location))) {
+                    return std::nullopt;
+                }
+                const auto resolved = storage_layout(id, attribute.location);
+                return resolved.first == 0 ? std::nullopt
+                                           : std::optional(resolved);
+            };
+            const LayoutQuery size_of = [&](const TypePtr& source)
+                -> std::optional<std::uint64_t> {
+                const auto resolved = layout(source);
+                return resolved ? std::optional(resolved->first) : std::nullopt;
+            };
+            const LayoutQuery align_of = [&](const TypePtr& source)
+                -> std::optional<std::uint64_t> {
+                const auto resolved = layout(source);
+                return resolved ? std::optional<std::uint64_t>(resolved->second)
+                                : std::nullopt;
+            };
+            const auto value = evaluate_alignment_attribute(
+                program_, attribute, diagnostics_, size_of, align_of,
+                subject, source_namespace);
+            if (value) result = std::max(result, *value);
         }
         return result;
     }
@@ -808,7 +816,8 @@ private:
                                          "a record definition");
             record.explicit_alignment =
                 parse_alignment(definition->attributes,
-                                "a record definition");
+                                "a record definition",
+                                source_namespace(record.source_name));
             if (definition->members.empty()) {
                 diagnostics_.error(definition->location,
                                    "a complete record requires at least one member");
@@ -864,7 +873,8 @@ private:
                 member.packed = parse_packed(source.attributes,
                                              "a record member");
                 member.alignment = parse_alignment(source.attributes,
-                                                   "a record member");
+                                                   "a record member",
+                                                   source_namespace(record.source_name));
                 record.members.push_back(std::move(member));
             }
         }
@@ -1242,7 +1252,8 @@ private:
             }
             if (function.definition) {
                 function.minimum_alignment = parse_alignment(
-                    function.definition->attributes, "function definition");
+                    function.definition->attributes, "function definition",
+                    function.definition->source_namespace);
             }
             function.naked = representative->attribute("naked") != nullptr;
             for (const auto& attribute : representative->attributes) {
@@ -1548,6 +1559,9 @@ private:
                 !section.empty()) {
                 object.section = section;
             }
+            object.minimum_alignment = parse_alignment(
+                representative->attributes, "an object definition",
+                source_namespace(object.source_name));
             object.is_thread_local =
                 object_attribute(*representative, "thread_local") != nullptr;
             object.tls_model = decode_attribute_string(
