@@ -50,6 +50,11 @@ global i32 expression_core_entry() {
     uptr address = (uptr)(base);
     if ((u64 *)(address) != base) return 8;
     if ((bool)(base) != 1) return 22;
+    u64 *null_pointer = (u64 *)0uptr;
+    if (!null_pointer != 1) return 26;
+    if (!base != 0) return 27;
+    if (!!base != 1 || !!null_pointer != 0) return 28;
+    if (!expression_static_counter != 0) return 29;
     if (sizeof(u64) != 8uptr) return 9;
     if ($::alignof(u64) != 8uptr) return 14;
     if (sizeof(values) != 40uptr) return 10;

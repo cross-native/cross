@@ -3570,7 +3570,14 @@ private:
             }
             const auto operand_type = current_.values[operand->value].type;
             const bool operand_vector = vector_type(hir_, operand_type);
-            if (!floating_type(hir_, operand_type) && !operand_vector) {
+            if (expression.text == "!" &&
+                pointer_type(hir_, operand_type)) {
+                // Pointer truth uses the target-width null representation;
+                // integer promotion does not apply to pointer operands.
+                operand = cast(*operand, *hir_.builtin(BuiltinType::Uptr),
+                               expression.location);
+            } else if (!floating_type(hir_, operand_type) &&
+                       !operand_vector) {
                 const auto promoted = promote(operand_type);
                 if (!promoted) break;
                 operand = cast(*operand, *promoted, expression.location);
