@@ -1336,7 +1336,8 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
     }
     if (consume("=")) declaration.initializer = parse_initializer();
     if (declaration.type && declaration.type->kind == Type::Kind::Array &&
-        declaration.type->lanes == 0 && declaration.initializer &&
+        declaration.type->lanes == 0 && !declaration.dynamic_array_bound &&
+        declaration.initializer &&
         declaration.initializer->kind == Expr::Kind::String &&
         declaration.type->element &&
         declaration.type->element->kind == Type::Kind::Builtin &&

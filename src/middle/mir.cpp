@@ -2290,76 +2290,42 @@ private:
         return true;
     }
 
-    bool initialize_aggregate(const LocalBinding& binding,
-                              const Expr& source) {
-        const auto plan = initializer::build(
-            source, binding.type, hir_, target_, diagnostics_);
-        if (!plan.valid) {
-            failed_ = true;
-            return true;
-        }
-        const auto size = hir::layout_size(hir_, binding.type, target_);
-        if (!size || *size == 0) {
-            diagnostics_.error(source.location,
-                               "aggregate initializer has no fixed storage size");
-            failed_ = true;
-            return true;
-        }
+    bool require_dynamic_array_extent(ValueId count,
+                                      std::uint64_t minimum,
+                                      SourceLocation location) {
+        if (minimum == 0) return true;
         const auto uptr = *hir_.builtin(BuiltinType::Uptr);
-        const bool object_volatile =
-            hir_.type(binding.type).is_volatile;
-        const auto byte = hir_.add_qualifiers(
-            *hir_.builtin(BuiltinType::U8), false, object_volatile);
-        const auto base = cast(slot_address(binding, source.location),
-                               hir_.pointer_to(byte), source.location);
+        const auto required = constant(minimum, uptr, location);
+        const auto too_small = add_value(
+            ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), location);
+        current_.values[too_small.value].binary =
+            BinaryOperation::UnsignedLess;
+        current_.values[too_small.value].operands = {count, required};
+        const auto trap = new_block(location);
+        const auto ready = new_block(location);
+        terminate(TerminatorKind::ConditionalBranch, location, too_small,
+                  {trap, ready});
+
+        enter(trap);
+        const auto operation = add_effectful(
+            ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void), location);
+        current_.values[operation.value].intrinsic =
+            IntrinsicOperation::Trap;
+        terminate(TerminatorKind::Trap, location, std::nullopt, {});
+        enter(ready);
+        return true;
+    }
+
+    bool initialize_aggregate_items(
+        ValueId base, hir::TypeId byte, bool object_volatile,
+        const initializer::Plan& plan) {
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
         const auto store_byte = [&](ValueId index, std::uint8_t value,
                                     SourceLocation location) {
             const auto address = indexed_address(base, index, byte, location);
             const auto stored = constant(value, byte, location);
             if (!store_pointer(address, stored, location, 1)) failed_ = true;
         };
-
-        if (*size <= 16) {
-            for (std::uint64_t index = 0; index < *size; ++index) {
-                store_byte(constant(index, uptr, source.location), 0,
-                           source.location);
-            }
-        } else {
-            const auto initial = constant(0, uptr, source.location);
-            const auto preheader = *current_block_;
-            const auto test = new_block(source.location);
-            const auto body = new_block(source.location);
-            const auto end = new_block(source.location);
-            terminate(TerminatorKind::Branch, source.location,
-                      std::nullopt, {test});
-
-            enter(test);
-            const auto index = add_value(ValueKind::Phi, uptr,
-                                         source.location);
-            const auto limit = constant(*size, uptr, source.location);
-            const auto condition = add_value(
-                ValueKind::Binary, *hir_.builtin(BuiltinType::Bool),
-                source.location);
-            current_.values[condition.value].binary =
-                BinaryOperation::UnsignedLess;
-            current_.values[condition.value].operands = {index, limit};
-            terminate(TerminatorKind::ConditionalBranch, source.location,
-                      condition, {body, end});
-
-            enter(body);
-            store_byte(index, 0, source.location);
-            const auto one = constant(1, uptr, source.location);
-            const auto next = add_value(ValueKind::Binary, uptr,
-                                        source.location);
-            current_.values[next.value].binary = BinaryOperation::Add;
-            current_.values[next.value].operands = {index, one};
-            const auto backedge = *current_block_;
-            terminate(TerminatorKind::Branch, source.location,
-                      std::nullopt, {test});
-            current_.values[index.value].incoming = {
-                {preheader, initial}, {backedge, next}};
-            enter(end);
-        }
 
         for (const auto& item : plan.items) {
             if (!item.expression) {
@@ -2460,7 +2426,143 @@ private:
                 hir_.type(initialization_type).is_volatile;
             store.memory_alignment = item.alignment;
         }
-        return true;
+        return !failed_;
+    }
+
+    bool initialize_dynamic_array(const LocalBinding& binding,
+                                  const Expr& source, ValueId count) {
+        if (!binding.dynamic_address || !binding.dynamic_size) return false;
+        const auto& array = hir_.type(binding.type);
+        if (array.kind != hir::Type::Kind::Array || !array.element) {
+            return false;
+        }
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const bool object_volatile =
+            array.is_volatile || hir_.type(*array.element).is_volatile;
+        const auto byte = hir_.add_qualifiers(
+            *hir_.builtin(BuiltinType::U8), false, object_volatile);
+        const auto base = cast(*binding.dynamic_address,
+                               hir_.pointer_to(byte), source.location);
+
+        if (source.kind == Expr::Kind::String &&
+            hir_.type(*array.element).kind == hir::Type::Kind::Builtin &&
+            hir_.type(*array.element).builtin == BuiltinType::U8) {
+            const auto required = source.string_value.size() + 1U;
+            if (!require_dynamic_array_extent(count, required,
+                                              source.location) ||
+                !initialize_empty_dynamic_array(binding, source.location)) {
+                return false;
+            }
+            for (std::size_t index = 0;
+                 index < source.string_value.size(); ++index) {
+                const auto address = indexed_address(
+                    base, constant(index, uptr, source.location), byte,
+                    source.location);
+                const auto value = constant(
+                    static_cast<std::uint8_t>(source.string_value[index]),
+                    byte, source.location);
+                if (!store_pointer(address, value, source.location, 1)) {
+                    return false;
+                }
+            }
+            const auto terminator = indexed_address(
+                base, constant(source.string_value.size(), uptr,
+                               source.location),
+                byte, source.location);
+            if (!store_pointer(
+                    terminator, constant(0, byte, source.location),
+                    source.location, 1)) {
+                return false;
+            }
+            return true;
+        }
+
+        const auto plan = initializer::build_dynamic_array(
+            source, binding.type, hir_, target_, diagnostics_);
+        if (!plan.valid) {
+            failed_ = true;
+            return true;
+        }
+        if (!require_dynamic_array_extent(count, plan.minimum_elements,
+                                          source.location) ||
+            !initialize_empty_dynamic_array(binding, source.location)) {
+            return false;
+        }
+        return initialize_aggregate_items(base, byte, object_volatile, plan);
+    }
+
+    bool initialize_aggregate(const LocalBinding& binding,
+                              const Expr& source) {
+        const auto plan = initializer::build(
+            source, binding.type, hir_, target_, diagnostics_);
+        if (!plan.valid) {
+            failed_ = true;
+            return true;
+        }
+        const auto size = hir::layout_size(hir_, binding.type, target_);
+        if (!size || *size == 0) {
+            diagnostics_.error(source.location,
+                               "aggregate initializer has no fixed storage size");
+            failed_ = true;
+            return true;
+        }
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const bool object_volatile =
+            hir_.type(binding.type).is_volatile;
+        const auto byte = hir_.add_qualifiers(
+            *hir_.builtin(BuiltinType::U8), false, object_volatile);
+        const auto base = cast(slot_address(binding, source.location),
+                               hir_.pointer_to(byte), source.location);
+        const auto store_byte = [&](ValueId index, std::uint8_t value,
+                                    SourceLocation location) {
+            const auto address = indexed_address(base, index, byte, location);
+            const auto stored = constant(value, byte, location);
+            if (!store_pointer(address, stored, location, 1)) failed_ = true;
+        };
+
+        if (*size <= 16) {
+            for (std::uint64_t index = 0; index < *size; ++index) {
+                store_byte(constant(index, uptr, source.location), 0,
+                           source.location);
+            }
+        } else {
+            const auto initial = constant(0, uptr, source.location);
+            const auto preheader = *current_block_;
+            const auto test = new_block(source.location);
+            const auto body = new_block(source.location);
+            const auto end = new_block(source.location);
+            terminate(TerminatorKind::Branch, source.location,
+                      std::nullopt, {test});
+
+            enter(test);
+            const auto index = add_value(ValueKind::Phi, uptr,
+                                         source.location);
+            const auto limit = constant(*size, uptr, source.location);
+            const auto condition = add_value(
+                ValueKind::Binary, *hir_.builtin(BuiltinType::Bool),
+                source.location);
+            current_.values[condition.value].binary =
+                BinaryOperation::UnsignedLess;
+            current_.values[condition.value].operands = {index, limit};
+            terminate(TerminatorKind::ConditionalBranch, source.location,
+                      condition, {body, end});
+
+            enter(body);
+            store_byte(index, 0, source.location);
+            const auto one = constant(1, uptr, source.location);
+            const auto next = add_value(ValueKind::Binary, uptr,
+                                        source.location);
+            current_.values[next.value].binary = BinaryOperation::Add;
+            current_.values[next.value].operands = {index, one};
+            const auto backedge = *current_block_;
+            terminate(TerminatorKind::Branch, source.location,
+                      std::nullopt, {test});
+            current_.values[index.value].incoming = {
+                {preheader, initial}, {backedge, next}};
+            enter(end);
+        }
+
+        return initialize_aggregate_items(base, byte, object_volatile, plan);
     }
 
     void end_lifetimes_from(std::size_t retained_scopes,
@@ -5386,18 +5488,6 @@ private:
             const bool dynamic_array =
                 array && hir_.type(type).lanes == 0;
             if (dynamic_array) {
-                const bool empty_initializer =
-                    declaration.initializer &&
-                    declaration.initializer->kind ==
-                        Expr::Kind::AggregateInitializer &&
-                    declaration.initializer->initializer_entries.empty();
-                if (declaration.initializer && !empty_initializer) {
-                    diagnostics_.error(
-                        declaration.initializer->location,
-                        "nonempty variable-length array initialization is not implemented yet");
-                    failed_ = true;
-                    return;
-                }
                 if (!declaration.dynamic_array_bound) {
                     diagnostics_.error(
                         declaration.location,
@@ -5440,9 +5530,10 @@ private:
                     scopes_.back().dynamic_stack_mark =
                         dynamic_stack_save(declaration.location);
                 }
-                auto dynamic_size = cast(
+                const auto dynamic_count = cast(
                     *bound, *hir_.builtin(BuiltinType::Uptr),
                     declaration.location);
+                auto dynamic_size = dynamic_count;
                 if (element_size != 1) {
                     const auto scale = constant(
                         element_size, *hir_.builtin(BuiltinType::Uptr),
@@ -5463,9 +5554,9 @@ private:
                     *bound, element, element_size, alignment,
                     declaration.location);
                 const LocalBinding binding{{}, type, address, dynamic_size};
-                if (empty_initializer && !initialize_empty_dynamic_array(
-                                             binding,
-                                             declaration.initializer->location)) {
+                if (declaration.initializer &&
+                    !initialize_dynamic_array(
+                        binding, *declaration.initializer, dynamic_count)) {
                     failed_ = true;
                     return;
                 }

@@ -26,6 +26,9 @@ struct Item {
 
 struct Plan {
     std::vector<Item> items;
+    // Runtime-sized outer arrays require at least this many elements for all
+    // explicit positional/designated destinations to exist.
+    std::uint64_t minimum_elements{};
     bool valid{true};
 };
 
@@ -36,6 +39,15 @@ struct Plan {
                          const hir::Module& module,
                          const TargetInfo& target,
                          Diagnostics& diagnostics);
+
+// Resolves one runtime-sized outer array. Nested aggregate dimensions remain
+// fixed, and minimum_elements records the runtime extent required by the
+// furthest explicit destination.
+[[nodiscard]] Plan build_dynamic_array(const Expr& initializer,
+                                       hir::TypeId type,
+                                       const hir::Module& module,
+                                       const TargetInfo& target,
+                                       Diagnostics& diagnostics);
 
 } // namespace initializer
 } // namespace cross

@@ -94,6 +94,32 @@ static u32 zero_vla(in u32 count) {
     return 1u32;
 }
 
+struct initialized_vla_pair {
+    u32 first;
+    u32 second;
+};
+
+[[runtime_only, noinline]]
+static u32 initialized_vla(in u32 count) {
+    u32 values[count] = { 4u32, [3] = 9u32 };
+    struct initialized_vla_pair pairs[count] = {
+        { .first = 5u32 },
+        [2] = { .second = 7u32 },
+    };
+    u8 text[count] = "xy";
+    if (sizeof(values) != (uptr)count * 4uptr ||
+        values[0] != 4u32 || values[1] != 0u32 ||
+        values[3] != 9u32 || values[count - 1u32] != 0u32 ||
+        pairs[0].first != 5u32 || pairs[0].second != 0u32 ||
+        pairs[1].first != 0u32 || pairs[2].second != 7u32 ||
+        pairs[count - 1u32].second != 0u32 ||
+        text[0] != 120u8 || text[1] != 121u8 ||
+        text[2] != 0u8 || text[count - 1u32] != 0u8) {
+        return 0u32;
+    }
+    return 1u32;
+}
+
 global u32 vla_entry(in u32 count) {
     bound_calls = 0u32;
     u8 exact[4] = "abc";
@@ -101,6 +127,7 @@ global u32 vla_entry(in u32 count) {
     u8 padded[24] = "z";
     return nested(count) == 366u32 && nested(count+1u32) == 366u32 &&
            zero_vla(count) == 1u32 &&
+           initialized_vla(7u32) == 1u32 &&
            aligned_array(count) == 30u32 && bound_calls == 2u32 &&
            exact[0] == 97u8 && exact[3] == 0u8 &&
            sizeof(inferred) == 3uptr && inferred[1] == 121u8 &&

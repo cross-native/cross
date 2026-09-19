@@ -17,7 +17,7 @@
 namespace cross::initializer {
 namespace {
 
-using Path = std::vector<std::uint32_t>;
+using Path = std::vector<std::uint64_t>;
 
 bool aggregate(const hir::Module& module, hir::TypeId type) {
     const auto kind = module.type(type).kind;
@@ -43,8 +43,9 @@ unsigned offset_alignment(unsigned natural, std::uint64_t offset) {
 class Planner {
 public:
     Planner(const hir::Module& module, const TargetInfo& target,
-            Diagnostics& diagnostics)
-        : module_(module), target_(target), diagnostics_(diagnostics) {}
+            Diagnostics& diagnostics, bool dynamic_outer = false)
+        : module_(module), target_(target), diagnostics_(diagnostics),
+          dynamic_outer_(dynamic_outer) {}
 
     Plan run(const Expr& source, hir::TypeId type) {
         if (source.kind != Expr::Kind::AggregateInitializer) {
@@ -89,7 +90,13 @@ private:
                                    SourceLocation location) {
         const auto& type = module_.type(parent);
         if (type.kind == hir::Type::Kind::Array && type.element) {
-            if (type.lanes == 0 || index >= type.lanes) {
+            const bool dynamic = dynamic_outer_ && path.empty() &&
+                                 type.lanes == 0;
+            const auto maximum_count = module_.address_bits >= 64
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (std::uint64_t{1} << module_.address_bits) - 1U;
+            if ((!dynamic && (type.lanes == 0 || index >= type.lanes)) ||
+                (dynamic && index >= maximum_count)) {
                 diagnostics_.error(location,
                                    "array initializer designator is out of range");
                 result_.valid = false;
@@ -98,13 +105,21 @@ private:
             const auto size = hir::layout_size(module_, *type.element, target_);
             if (!size || index >
                              std::numeric_limits<std::uint64_t>::max() /
-                                 *size) {
+                                 *size ||
+                parent_offset >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        index * *size) {
                 diagnostics_.error(location,
                                    "array initializer offset overflows target storage");
                 result_.valid = false;
                 return std::nullopt;
             }
-            path.push_back(static_cast<std::uint32_t>(index));
+            if (dynamic) {
+                result_.minimum_elements = std::max<std::uint64_t>(
+                    result_.minimum_elements,
+                    static_cast<std::uint64_t>(index) + 1U);
+            }
+            path.push_back(static_cast<std::uint64_t>(index));
             return Selection{*type.element,
                              parent_offset + index * *size,
                              std::move(path), index, std::nullopt, 0};
@@ -130,7 +145,7 @@ private:
             }
             const auto raw_index = static_cast<std::size_t>(
                 std::distance(record.members.begin(), member));
-            path.push_back(static_cast<std::uint32_t>(raw_index));
+            path.push_back(static_cast<std::uint64_t>(raw_index));
             return Selection{member->type,
                              parent_offset + member->offset,
                              std::move(path), index, member->bit_width,
@@ -184,7 +199,7 @@ private:
         }
         const auto index = static_cast<std::size_t>(
             std::distance(record.members.begin(), member));
-        path.push_back(static_cast<std::uint32_t>(index));
+        path.push_back(static_cast<std::uint64_t>(index));
         const auto logical_index = static_cast<std::size_t>(std::count_if(
             record.members.begin(), member,
             [](const hir::RecordMember& candidate) {
@@ -276,6 +291,7 @@ private:
     Diagnostics& diagnostics_;
     Plan result_;
     std::vector<Path> paths_;
+    bool dynamic_outer_{};
 };
 
 } // namespace
@@ -283,6 +299,13 @@ private:
 Plan build(const Expr& source, hir::TypeId type, const hir::Module& module,
            const TargetInfo& target, Diagnostics& diagnostics) {
     return Planner(module, target, diagnostics).run(source, type);
+}
+
+Plan build_dynamic_array(const Expr& source, hir::TypeId type,
+                         const hir::Module& module,
+                         const TargetInfo& target,
+                         Diagnostics& diagnostics) {
+    return Planner(module, target, diagnostics, true).run(source, type);
 }
 
 } // namespace cross::initializer

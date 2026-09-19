@@ -1332,6 +1332,9 @@ private:
                 target_instruction(Opcode::StackSave, value.location);
             instruction.defs.push_back(reg(value.id));
             instruction.has_side_effects = true;
+            // The printer uses RAX when the saved mark has no direct color.
+            // The VLA bound can still be live across this instruction.
+            append_fixed_clobber(instruction, "rax", machine::i64);
             return instruction;
         }
         if (value.kind == ValueKind::DynamicAlloca) {
@@ -1348,6 +1351,9 @@ private:
             instruction.uses.push_back(bound);
             instruction.defs.push_back(reg(value.id));
             instruction.has_side_effects = true;
+            append_fixed_clobber(instruction, "rax", machine::i64);
+            append_fixed_clobber(instruction, "rcx", machine::i64);
+            append_fixed_clobber(instruction, "rdx", machine::i64);
             return instruction;
         }
         if (value.kind == ValueKind::DynamicStackRestore) {
@@ -1357,6 +1363,7 @@ private:
             instruction.operands.push_back(register_operand(mark));
             instruction.uses.push_back(mark);
             instruction.has_side_effects = true;
+            append_fixed_clobber(instruction, "rax", machine::i64);
             return instruction;
         }
         if (value.kind == ValueKind::Phi) {

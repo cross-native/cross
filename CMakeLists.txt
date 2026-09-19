@@ -1359,7 +1359,35 @@ if(BUILD_TESTING)
                     -DEXPECTED=1
                     -DCC_FLAGS=-${level}
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        add_test(NAME cross_runtime_native_vla_nonempty_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/array/vla_nonempty_initializer.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vla-nonempty-${level}
+                    -DENTRY=vla_nonempty_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     endforeach()
+    add_test(NAME cross_runtime_vla_nonempty_llvm_debug
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/array/vla_nonempty_initializer.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vla-nonempty.ll
+                -DENTRY=vla_nonempty_entry
+                -DEXPECTED=1
+                -DCC_FLAGS=-O2
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+    add_test(NAME cross_runtime_vla_nonempty_bounds
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/array/vla_nonempty_bounds.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vla-nonempty-bounds
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/array/vla_nonempty_bounds.cmake")
     add_test(NAME cross_array_diagnostics
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
