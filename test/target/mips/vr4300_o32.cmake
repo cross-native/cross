@@ -29,6 +29,7 @@ set(big_object "${OUTPUT}.be.o")
 set(little_object "${OUTPUT}.le.o")
 set(memory_assembly "${OUTPUT}.memory.s")
 set(memory_object "${OUTPUT}.memory.o")
+set(memory_little_object "${OUTPUT}.memory.le.o")
 
 run_cc(big-assembly -S -O2 -mprofile=vr4300-o32 "${SOURCE}"
        -o "${big_assembly}")
@@ -42,6 +43,9 @@ run_cc(memory-assembly -S -O2 -mprofile=vr4300-o32
        "${MEMORY_SOURCE}" -o "${memory_assembly}")
 run_cc(memory-object -c -O2 -mprofile=vr4300-o32
        "${MEMORY_SOURCE}" -o "${memory_object}")
+run_cc(memory-little-object -c -O2 -target mipsel-unknown-elf
+       -mabi=o32 -march=vr4300 "${MEMORY_SOURCE}"
+       -o "${memory_little_object}")
 
 file(READ "${big_assembly}" assembly)
 foreach(pattern
@@ -82,7 +86,11 @@ foreach(pattern
         "[\t ]ll[\t ]"
         "[\t ]sc[\t ]"
         "[\t ]sync"
+        "\\.text\\.cross\\.patch\\."
         "\\.Lcross\\.patch\\.value\\.[0-9]+\\.end:"
+        "\\.long \\.Lcross\\.patch\\.value\\.[0-9]+\\.end-4"
+        "\\.long \\.Lcross\\.patch\\.value\\.[0-9]+\\.end-1"
+        "\\.long \\.Lcross\\.patch\\.value\\.[0-9]+\\.end-2"
         "%hi\\(mips_global\\)"
         "%hi\\(mips_atomic\\)")
     if(NOT memory MATCHES "${pattern}")

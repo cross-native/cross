@@ -73,7 +73,8 @@ foreach(pattern
         "[\t ]ld[\t ][$][0-9]+,8[(][$]29[)]"
         "[\t ]mov\.d[\t ][^\n]*[$]f13"
         "[\t ]mov\.s[\t ][^\n]*[$]f14"
-        "\n\t\.quad n64_object\n")
+        "\n\t\.quad n64_object\n"
+        "\\.quad \\.Lcross\\.patch\\.value\\.[0-9]+\\.end-8")
     if(NOT text MATCHES "${pattern}")
         message(FATAL_ERROR
             "MIPS n64 assembly is missing '${pattern}'\n${text}")

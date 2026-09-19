@@ -8,6 +8,12 @@
 global u64 n64_object = 0x0123456789abcdefu64;
 global u64 *n64_object_address = &n64_object;
 global u64 n64_sink;
+global uptr n64_patch_address;
+
+[[noinline]]
+global u64 n64_patch_value() {
+    return $::patch(0x123456789abcdef0u64, n64_patch_address);
+}
 
 // u32/i32/u64 arithmetic in one function: the 32-bit results must stay
 // sign-canonical in their 64-bit registers, and the u64 add is native.

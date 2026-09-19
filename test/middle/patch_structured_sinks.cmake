@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE ERROR_SOURCE INDEX_ERROR UNSUPPORTED_TARGET OUTPUT)
+foreach(required CC SOURCE ERROR_SOURCE INDEX_ERROR MIPS_SOURCE OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -77,18 +77,10 @@ if(LLVM_AS)
     endif()
 endif()
 
-execute_process(
-    COMMAND "${CC}" -S -target mips-unknown-elf
-            "${UNSUPPORTED_TARGET}" -o "${OUTPUT}-unsupported-target.s"
-    RESULT_VARIABLE unsupported_status
-    OUTPUT_VARIABLE unsupported_stdout
-    ERROR_VARIABLE unsupported_stderr)
-if(unsupported_status EQUAL 0 OR NOT unsupported_stderr MATCHES
-   "selected target does not support a \\$::patch address sink for this materializer")
-    message(FATAL_ERROR
-        "unsupported target patch sink was not diagnosed\n"
-        "${unsupported_stdout}\n${unsupported_stderr}")
-endif()
+run_cc(mips-structured-big -c -target mips-unknown-elf
+       "${MIPS_SOURCE}" -o "${OUTPUT}-mips.o")
+run_cc(mips-structured-little -c -target mipsel-unknown-elf
+       "${MIPS_SOURCE}" -o "${OUTPUT}-mipsel.o")
 
 execute_process(
     COMMAND "${CC}" -S "${ERROR_SOURCE}" -o "${OUTPUT}-errors.s"

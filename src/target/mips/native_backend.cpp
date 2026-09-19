@@ -9414,10 +9414,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             output_ << ".p2align " << std::countr_zero(std::bit_ceil(bytes))
                     << '\n';
             if (bytes == 1) output_ << "\t.byte " << immediate.value << '\n';
-            else if (bytes == 2) output_ << "\t.half " << immediate.value << '\n';
+            else if (bytes == 2) output_ << "\t.short " << immediate.value << '\n';
             else if (bytes == 4) output_ << "\t.word " << immediate.value << '\n';
             else output_ << "\t.dword " << immediate.value << '\n';
-            output_ << end << ":\n" << after << ":\n";
+            // Keep end at the exact cell boundary, but branch only to an
+            // instruction-aligned continuation after subword cells.
+            output_ << end << ":\n.p2align 2\n" << after << ":\n";
             const auto field = end + "-" + std::to_string(bytes);
             materialize_symbol_address("t0", field);
             if (legalizes_to_pair(target)) {
@@ -10493,11 +10495,21 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         return;
     }
     const auto symbol = assembly_symbol(function.symbol);
+    const bool patch_function = std::ranges::any_of(
+        function.blocks, [](const machine::Block& block) {
+            return std::ranges::any_of(
+                block.instructions, [](const machine::Instruction& instruction) {
+                    return instruction.patch.has_value();
+                });
+        });
     const auto split_function = options_.function_sections || entity.retain ||
                                 entity.temperature !=
                                     hir::FunctionTemperature::Normal;
     const auto section = entity.section
         ? *entity.section
+        : patch_function
+              ? ".text.cross.patch." +
+                    std::to_string(function.source.value)
         : split_function
               ? std::string(
                     entity.temperature == hir::FunctionTemperature::Hot

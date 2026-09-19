@@ -386,10 +386,33 @@ public:
     }
 
     mir::AssemblyBundle emit_raw_assembly(
-        const mir::RawModule&, const mir::ManagedModule&,
-        const hir::Module&, const Subtarget&, const CompilerOptions&,
-        Diagnostics&) const override {
-        return {};
+        const mir::RawModule&, const mir::ManagedModule& managed,
+        const hir::Module& hir_module, const Subtarget&,
+        const CompilerOptions&, Diagnostics& diagnostics) const override {
+        mir::AssemblyBundle result;
+        // The shared data emitter owns sink objects through this bundle,
+        // including when the patch value itself is managed Machine IR.
+        for (const auto& function : managed.functions) {
+            for (const auto& value : function.values) {
+                if (value.kind != mir::ValueKind::PatchValue ||
+                    !value.patch_sink) continue;
+                const auto bits = type_bits(hir_module, value.type);
+                if (bits != 8 && bits != 16 && bits != 32 && bits != 64) {
+                    diagnostics.error(value.location,
+                                      "MIPS patch sink has no contiguous "
+                                      "scalar field");
+                    continue;
+                }
+                result.object_definitions.insert(
+                    value.patch_sink->object.value);
+                result.patch_relocations.push_back({
+                    *value.patch_sink,
+                    ".Lcross.patch.value." +
+                        std::to_string(value.patch_id) + ".end",
+                    bits / 8});
+            }
+        }
+        return result;
     }
 
     bool prepare_managed(mir::ManagedModule& managed_module,

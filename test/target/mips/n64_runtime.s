@@ -167,6 +167,21 @@ _start:
         bne     $2,$12,.Lfail
         nop
 
+        # The n64 sink stores a full eight-byte address of the patch cell.
+        daddiu  $26,$0,'A'
+        jal     n64_patch_value
+        nop
+        dli     $12,0x123456789abcdef0
+        bne     $2,$12,.Lfail
+        nop
+        lui     $12,%hi(n64_patch_address)
+        daddiu  $12,$12,%lo(n64_patch_address)
+        ld      $12,0($12)
+        ld      $13,0($12)
+        dli     $14,0x123456789abcdef0
+        bne     $13,$14,.Lfail
+        nop
+
         daddiu  $4,$0,'P'
         b       .Lreport
         nop

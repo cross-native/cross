@@ -2284,7 +2284,7 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_sinks.x
                 -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_errors.x
                 -DINDEX_ERROR=${CMAKE_SOURCE_DIR}/test/middle/patch_structured_runtime_index_error.x
-                -DUNSUPPORTED_TARGET=${CMAKE_SOURCE_DIR}/test/middle/patch_sink_unsupported_target.x
+                -DMIPS_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_sink_mips.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/patch-structured-sinks
                 -P "${CMAKE_SOURCE_DIR}/test/middle/patch_structured_sinks.cmake")
     foreach(level O0 O2)

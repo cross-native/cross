@@ -200,6 +200,35 @@ _start:
         ori     $t0,$t0,0x03d2
         bne     $v0,$t0,.Lfail
         nop
+        lui     $t0,%hi(mips_patch_address)
+        lw      $t0,%lo(mips_patch_address)($t0)
+        lw      $t1,0($t0)
+        lui     $t0,0x1234
+        ori     $t0,$t0,0x5678
+        bne     $t1,$t0,.Lfail
+        nop
+        jal     mips_patch_byte
+        nop
+        addiu   $t0,$zero,0xa5
+        bne     $v0,$t0,.Lfail
+        nop
+        lui     $t0,%hi(mips_patch_byte_address)
+        lw      $t0,%lo(mips_patch_byte_address)($t0)
+        lbu     $t1,0($t0)
+        addiu   $t0,$zero,0xa5
+        bne     $t1,$t0,.Lfail
+        nop
+        jal     mips_patch_half
+        nop
+        ori     $t0,$zero,0x6bcd
+        bne     $v0,$t0,.Lfail
+        nop
+        lui     $t0,%hi(mips_patch_half_address)
+        lw      $t0,%lo(mips_patch_half_address)($t0)
+        lhu     $t1,0($t0)
+        ori     $t0,$zero,0x6bcd
+        bne     $t1,$t0,.Lfail
+        nop
 
         # Execute the MIPS-I word-pair legalization on a big-endian target.
         # The same source is also run little-endian on Allegrex/PPSSPP.
