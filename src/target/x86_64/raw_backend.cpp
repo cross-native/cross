@@ -1861,6 +1861,7 @@ private:
     }
 
     void emit_function(const mir::RawFunction& function) {
+        const auto& entity = hir_.function(function.source);
         if (!safe_assembly_text(function.symbol) ||
             (function.section && !safe_assembly_text(*function.section))) {
             diagnostics_.error(function.location,
@@ -1869,6 +1870,24 @@ private:
         }
         const auto symbol = assembly_symbol(function.symbol);
         const auto patch_function = function_has_patch(function);
+        const auto split_function = options_.function_sections ||
+                                    entity.retain ||
+                                    entity.temperature !=
+                                        hir::FunctionTemperature::Normal;
+        const auto section_prefix = [&]() -> std::string {
+            if (format_ == ObjectFormat::Coff) {
+                if (entity.temperature == hir::FunctionTemperature::Hot)
+                    return ".text$hot.";
+                if (entity.temperature == hir::FunctionTemperature::Cold)
+                    return ".text$cold.";
+                return ".text$";
+            }
+            if (entity.temperature == hir::FunctionTemperature::Hot)
+                return ".text.hot.";
+            if (entity.temperature == hir::FunctionTemperature::Cold)
+                return ".text.unlikely.";
+            return ".text.";
+        };
         const auto section = function.section
             ? *function.section
             : patch_function
@@ -1876,14 +1895,13 @@ private:
                                     ? ".text$cross.patch."
                                     : ".text.cross.patch.") +
                         std::to_string(function.source.value)
-            : options_.function_sections
-                  ? std::string(format_ == ObjectFormat::Coff ? ".text$" : ".text.") +
-                        function.symbol
+            : split_function
+                  ? section_prefix() + function.symbol
                   : std::string(".text");
         std::string section_error;
         const auto directive = assembly_section_directive(
             format_, {section, AssemblySectionKind::Code,
-                      function.section.has_value(), false},
+                      function.section.has_value(), entity.retain},
             section_error);
         if (!directive) {
             diagnostics_.error(function.location, section_error);
@@ -1966,6 +1984,13 @@ private:
         }
         if (format_ == ObjectFormat::Elf) {
             output_ << ".size " << symbol << ", .-" << symbol << "\n";
+        }
+        if (entity.retain && format_ == ObjectFormat::Coff &&
+            entity.linkage == Linkage::Global) {
+            output_ << ".section .drectve\n.ascii \" -include:"
+                    << entity.link_symbol << "\"\n";
+        } else if (entity.retain && format_ == ObjectFormat::MachO) {
+            output_ << ".no_dead_strip " << symbol << '\n';
         }
     }
 

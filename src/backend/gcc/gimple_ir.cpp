@@ -1523,6 +1523,9 @@ private:
                 attributes.emplace_back(marker);
             }
         }
+        for (const auto& name : function.no_sanitize) {
+            attributes.push_back("no_sanitize(" + c_string(name) + ')');
+        }
         if (attributes.empty()) return {};
         std::string result = " __attribute__((";
         for (std::size_t index = 0; index < attributes.size(); ++index) {

@@ -13,7 +13,8 @@ global u64 raw_const() -> "rax" {
     $::_ret();
 }
 
-[[naked, link_name("raw_frame")]]
+[[naked, link_name("raw_frame"), cold, retain, no_stack_protector,
+  no_sanitize("address")]]
 global void raw_frame(in uptr frame "rsp") {
     $::_ret();
 }

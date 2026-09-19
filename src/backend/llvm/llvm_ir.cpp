@@ -434,6 +434,15 @@ private:
                 append_unique(compiler_symbols, compiler_seen, symbol);
             }
         }
+        for (const auto& function : hir_.functions) {
+            if (!function.definition) continue;
+            const auto symbol = symbol_name(function.link_symbol);
+            if (function.retain) {
+                append_unique(linker_symbols, linker_seen, symbol);
+            } else if (function.used) {
+                append_unique(compiler_symbols, compiler_seen, symbol);
+            }
+        }
         const auto emit = [&](std::string_view name,
                               const std::vector<std::string>& symbols) {
             if (symbols.empty()) return;

@@ -423,6 +423,11 @@ public:
         if (entity_.minimum_alignment > 1) {
             out_ << " align " << entity_.minimum_alignment;
         }
+        if (entity_.temperature == hir::FunctionTemperature::Hot) {
+            out_ << " hot";
+        } else if (entity_.temperature == hir::FunctionTemperature::Cold) {
+            out_ << " cold";
+        }
         if (contains_patch) out_ << " noinline";
         if (entity_.section) {
             out_ << " section " << llvm_string(*entity_.section);

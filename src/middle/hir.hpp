@@ -129,6 +129,7 @@ struct VariadicBinding {
 
 enum class BodyOwnership { None, ManagedAst, ManagedMir, RawMir };
 enum class AbiContract { Dynamic, Registered };
+enum class FunctionTemperature { Normal, Hot, Cold };
 
 struct Function {
     FunctionId id;
@@ -145,6 +146,11 @@ struct Function {
     bool abi_explicit{};
     std::optional<std::string> section;
     unsigned minimum_alignment{1};
+    FunctionTemperature temperature{FunctionTemperature::Normal};
+    bool used{};
+    bool retain{};
+    bool no_stack_protector{};
+    std::vector<std::string> no_sanitize;
     std::vector<std::string> clobbers;
     bool variadic{};
     std::vector<VariadicBinding> variadic_bindings;

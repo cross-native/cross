@@ -1255,6 +1255,55 @@ private:
                     function.definition->attributes, "function definition",
                     function.definition->source_namespace);
             }
+            bool hot{};
+            bool cold{};
+            for (const auto& attribute : representative->attributes) {
+                const auto marker = [&](std::string_view name) {
+                    if (attribute.name != name) return false;
+                    if (!attribute.arguments.empty()) {
+                        diagnostics_.error(
+                            attribute.location,
+                            std::string(name) + " does not take arguments");
+                    }
+                    return true;
+                };
+                hot = marker("hot") || hot;
+                cold = marker("cold") || cold;
+                function.used = marker("used") || function.used;
+                function.retain = marker("retain") || function.retain;
+                function.no_stack_protector =
+                    marker("no_stack_protector") ||
+                    function.no_stack_protector;
+                if (attribute.name == "no_sanitize") {
+                    if (attribute.arguments.size() != 1) {
+                        diagnostics_.error(
+                            attribute.location,
+                            "no_sanitize requires one instrumentation-name string");
+                    } else if (const auto name = decode_string_literal(
+                                   attribute.arguments.front());
+                               !name || name->empty()) {
+                        diagnostics_.error(
+                            attribute.location,
+                            "no_sanitize requires one nonempty instrumentation-name string");
+                    } else {
+                        function.no_sanitize.push_back(*name);
+                    }
+                }
+            }
+            if (hot && cold) {
+                diagnostics_.error(representative->location,
+                                   "a function cannot be both hot and cold");
+            } else if (hot) {
+                function.temperature = FunctionTemperature::Hot;
+            } else if (cold) {
+                function.temperature = FunctionTemperature::Cold;
+            }
+            if ((function.used || function.retain) && !function.definition) {
+                diagnostics_.error(
+                    representative->location,
+                    std::string(function.retain ? "retain" : "used") +
+                        " requires a function definition");
+            }
             function.naked = representative->attribute("naked") != nullptr;
             for (const auto& attribute : representative->attributes) {
                 if (attribute.name == "naked" && !attribute.arguments.empty()) {

@@ -10478,14 +10478,23 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         return;
     }
     const auto symbol = assembly_symbol(function.symbol);
+    const auto split_function = options_.function_sections || entity.retain ||
+                                entity.temperature !=
+                                    hir::FunctionTemperature::Normal;
     const auto section = entity.section
         ? *entity.section
-        : options_.function_sections ? ".text." + function.symbol
-                                     : ".text";
+        : split_function
+              ? std::string(
+                    entity.temperature == hir::FunctionTemperature::Hot
+                        ? ".text.hot."
+                        : entity.temperature == hir::FunctionTemperature::Cold
+                              ? ".text.unlikely."
+                              : ".text.") + function.symbol
+              : ".text";
     std::string section_error;
     const auto directive = assembly_section_directive(
         format_, {section, AssemblySectionKind::Code,
-                  entity.section.has_value(), false},
+                  entity.section.has_value(), entity.retain},
         section_error);
     if (!directive) {
         diagnostics_.error(function.location, section_error);

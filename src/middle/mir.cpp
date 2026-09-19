@@ -825,6 +825,12 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             attribute.name != "section" &&
             attribute.name != "raw_inline" &&
             attribute.name != "always_inline" &&
+            attribute.name != "cold" &&
+            attribute.name != "hot" &&
+            attribute.name != "used" &&
+            attribute.name != "retain" &&
+            attribute.name != "no_stack_protector" &&
+            attribute.name != "no_sanitize" &&
             attribute.name != "noinline" &&
             attribute.name != "noreturn" &&
             attribute.name != "variadic" &&

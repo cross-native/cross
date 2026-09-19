@@ -831,6 +831,13 @@ if(BUILD_TESTING)
                 -DHOST_CXX=${CMAKE_CXX_COMPILER}
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/function-alignment
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/function_alignment.cmake")
+    add_test(NAME cross_function_metadata
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/function_metadata.x
+                -DERRORS=${CMAKE_SOURCE_DIR}/test/backend/native/function_metadata_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/function-metadata
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/function_metadata.cmake")
     foreach(level O0 O2)
         add_test(NAME cross_runtime_alignment_expressions_${level}
             COMMAND "${CMAKE_COMMAND}"

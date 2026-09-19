@@ -66,6 +66,12 @@ std::optional<std::string> macho_directive(
     if (!request.custom) {
         switch (request.kind) {
         case AssemblySectionKind::Code:
+            if (request.name.starts_with(".text.hot.")) {
+                return ".section __TEXT,__text_hot,regular,pure_instructions";
+            }
+            if (request.name.starts_with(".text.unlikely.")) {
+                return ".section __TEXT,__text_cold,regular,pure_instructions";
+            }
             return ".section __TEXT,__text,regular,pure_instructions";
         case AssemblySectionKind::ReadOnlyData:
             return ".section __TEXT,__const";
