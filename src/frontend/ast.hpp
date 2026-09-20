@@ -127,6 +127,11 @@ struct Expr {
         BuiltinType type;
     };
     std::optional<IntegerConstant> evaluated_integer;
+    struct FloatingConstant {
+        UInt128 bits;
+        BuiltinType type;
+    };
+    std::optional<FloatingConstant> evaluated_floating;
     // A source type operand retained for casts and type-form sizeof.  Keeping
     // this structured avoids reparsing a textual type in HIR/MIR lowering.
     TypePtr type;

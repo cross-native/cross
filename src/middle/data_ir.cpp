@@ -4,6 +4,7 @@
 
 #include "common/diagnostic.hpp"
 #include "common/floating_bits.hpp"
+#include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
 #include "frontend/ast.hpp"
 #include "middle/initializer.hpp"
@@ -897,58 +898,43 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
         return true;
     }
     const auto text = floating_text(expression);
-    if (!text || type.kind != hir::Type::Kind::Builtin) {
+    const Expr* source = &expression;
+    while (source->kind == Expr::Kind::Parenthesized && source->left)
+        source = source->left.get();
+    if ((!text && !source->evaluated_floating) ||
+        type.kind != hir::Type::Kind::Builtin) {
         diagnostics.error(
             expression.location,
             "global initializer is not a supported scalar constant");
         return false;
     }
     result.initializer = InitializerKind::Floating;
-    if (type.builtin == BuiltinType::F32 ||
+    const auto format = type.builtin == BuiltinType::F32 ||
         (type.builtin == BuiltinType::Fptr &&
-         subtarget.abi_info().address_bits == 32)) {
-        char* end{};
-        const auto value = std::strtof(text->c_str(), &end);
-        if (!end || *end != '\0') {
-            diagnostics.error(expression.location, "invalid f32 literal");
-            return false;
-        }
-        result.bits = {std::bit_cast<std::uint32_t>(value)};
+         subtarget.abi_info().address_bits == 32)
+        ? floating::Format::Binary32
+        : type.builtin == BuiltinType::F64 || type.builtin == BuiltinType::Fptr
+        ? floating::Format::Binary64
+        : type.builtin == BuiltinType::F80
+        ? floating::Format::Extended80 : floating::Format::Binary128;
+    if (type.builtin != BuiltinType::F32 && type.builtin != BuiltinType::F64 &&
+        type.builtin != BuiltinType::F80 && type.builtin != BuiltinType::F128 &&
+        type.builtin != BuiltinType::Fptr) {
+        diagnostics.error(expression.location,
+                          "global initializer has incompatible floating type");
+        return false;
+    }
+    if (source->evaluated_floating) {
+        result.bits = source->evaluated_floating->bits;
         return true;
     }
-    if (type.builtin == BuiltinType::F64 ||
-        (type.builtin == BuiltinType::Fptr &&
-         subtarget.abi_info().address_bits == 64)) {
-        char* end{};
-        const auto value = std::strtod(text->c_str(), &end);
-        if (!end || *end != '\0') {
-            diagnostics.error(expression.location, "invalid f64 literal");
-            return false;
-        }
-        result.bits = {std::bit_cast<std::uint64_t>(value)};
-        return true;
+    const auto parsed = floating::parse(*text, format);
+    if (!parsed) {
+        diagnostics.error(expression.location, "invalid floating literal");
+        return false;
     }
-    if (type.builtin == BuiltinType::F80) {
-        const auto value = parse_extended80(*text);
-        if (!value) {
-            diagnostics.error(expression.location, "invalid f80 literal");
-            return false;
-        }
-        result.bits = {value->significand, value->exponent_sign};
-        return true;
-    }
-    if (type.builtin == BuiltinType::F128) {
-        const auto value = parse_binary128_literal(*text);
-        if (!value) {
-            diagnostics.error(expression.location, "invalid f128 literal");
-            return false;
-        }
-        result.bits = *value;
-        return true;
-    }
-    diagnostics.error(expression.location,
-                      "global initializer has incompatible floating type");
-    return false;
+    result.bits = parsed->bits;
+    return true;
 }
 
 void store_bits(std::vector<unsigned char>& bytes, unsigned offset,

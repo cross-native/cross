@@ -3,6 +3,7 @@
 #include "middle/mir.hpp"
 
 #include "common/floating_bits.hpp"
+#include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
 #include "common/uint128.hpp"
 #include "middle/data_ir.hpp"
@@ -308,43 +309,31 @@ std::optional<ParsedFloating> parse_floating(std::string text,
         type = BuiltinType::Fptr;
         text.resize(text.size() - 4);
     } else if (text.ends_with("f80")) {
-        const auto parsed = parse_extended80(std::move(text));
-        if (!parsed) return std::nullopt;
-        return ParsedFloating{
-            parsed->significand, parsed->exponent_sign, BuiltinType::F80};
+        type = BuiltinType::F80;
+        text.resize(text.size() - 3);
     } else if (text.ends_with("f128")) {
+        type = BuiltinType::F128;
         text.resize(text.size() - 4);
-        const auto parsed =
-            data::parse_binary128_literal(std::move(text));
-        if (!parsed) return std::nullopt;
-        return ParsedFloating{
-            parsed->low, parsed->high, BuiltinType::F128};
     }
-    text.erase(std::remove(text.begin(), text.end(), '_'), text.end());
-    auto format = std::chars_format::general;
-    if (text.starts_with("0x") || text.starts_with("0X")) {
-        text.erase(0, 2);
-        format = std::chars_format::hex;
+    const auto format = type == BuiltinType::F32 ||
+        (type == BuiltinType::Fptr && address_bits <= 32)
+        ? floating::Format::Binary32
+        : type == BuiltinType::F80 ? floating::Format::Extended80
+        : type == BuiltinType::F128 ? floating::Format::Binary128
+                                    : floating::Format::Binary64;
+    const auto parsed = floating::parse(std::move(text), format);
+    return parsed ? std::optional<ParsedFloating>{
+                        ParsedFloating{parsed->bits.low, parsed->bits.high, type}}
+                  : std::nullopt;
+}
+
+std::optional<ParsedFloating> parse_floating(const Expr& expression,
+                                             unsigned address_bits) {
+    if (expression.evaluated_floating) {
+        const auto& value = *expression.evaluated_floating;
+        return ParsedFloating{value.bits.low, value.bits.high, value.type};
     }
-    if (type == BuiltinType::F32 ||
-        (type == BuiltinType::Fptr && address_bits <= 32)) {
-        float value{};
-        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value,
-                                            format);
-        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
-            return std::nullopt;
-        }
-        return ParsedFloating{
-            std::bit_cast<std::uint32_t>(value), 0, type};
-    }
-    double value{};
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value,
-                                        format);
-    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
-        return std::nullopt;
-    }
-    return ParsedFloating{
-        std::bit_cast<std::uint64_t>(value), 0, type};
+    return parse_floating(expression.text, address_bits);
 }
 
 unsigned builtin_bits(BuiltinType type, unsigned address_bits) {
@@ -2628,7 +2617,7 @@ private:
                        : std::nullopt;
         }
         case Expr::Kind::Floating: {
-            const auto parsed = parse_floating(expression.text,
+            const auto parsed = parse_floating(expression,
                                                hir_.address_bits);
             return parsed ? hir_.builtin(parsed->type) : std::nullopt;
         }
@@ -3241,7 +3230,7 @@ private:
             break;
         }
         case Expr::Kind::Floating: {
-            const auto parsed = parse_floating(expression.text,
+            const auto parsed = parse_floating(expression,
                                                hir_.address_bits);
             if (!parsed) break;
             const auto type = hir_.builtin(parsed->type);

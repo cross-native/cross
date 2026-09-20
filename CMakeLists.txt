@@ -62,6 +62,7 @@ endfunction()
 add_library(cross_common
     src/common/diagnostic.cpp
     src/common/floating_bits.cpp
+    src/common/floating_semantics.cpp
     src/common/options.cpp
     src/common/source.cpp
 )
@@ -218,6 +219,11 @@ if(BUILD_TESTING)
     add_executable(cross_integer_semantics_test test/common/integer_semantics_test.cpp)
     cross_component(cross_integer_semantics_test)
     add_test(NAME cross_integer_semantics COMMAND $<TARGET_FILE:cross_integer_semantics_test>)
+
+    add_executable(cross_floating_semantics_test test/common/floating_semantics_test.cpp)
+    target_link_libraries(cross_floating_semantics_test PRIVATE cross_common)
+    cross_component(cross_floating_semantics_test)
+    add_test(NAME cross_floating_semantics COMMAND $<TARGET_FILE:cross_floating_semantics_test>)
 
     add_test(NAME cross_semantic_runtime COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
@@ -2262,6 +2268,17 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/default_evaluation.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/default-evaluation
                 -P "${CMAKE_SOURCE_DIR}/test/middle/default_evaluation.cmake")
+    add_test(NAME cross_floating_evaluation COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-evaluation
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_floating_evaluation_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation_mips.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-evaluation-mips
+        -P "${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation_mips.cmake")
     add_test(NAME cross_required_constants COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/required_constants.x

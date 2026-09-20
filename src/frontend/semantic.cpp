@@ -3,6 +3,7 @@
 #include "frontend/semantic.hpp"
 
 #include "common/uint128.hpp"
+#include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
 #include "model/model.hpp"
 
@@ -161,6 +162,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->text = source.text;
     result->string_value = source.string_value;
     result->evaluated_integer = source.evaluated_integer;
+    result->evaluated_floating = source.evaluated_floating;
     if (source.type) result->type = clone_type(source.type, types);
     if (source.left) result->left = clone_expr(*source.left, types, values);
     if (source.right) result->right = clone_expr(*source.right, types, values);
@@ -1578,6 +1580,7 @@ bool bind_operators(Program& program, Diagnostics& diagnostics) {
 struct EvalValue {
     UInt128 integer{};
     TypePtr type;
+    std::optional<floating::Value> floating;
     std::shared_ptr<std::string> string{};
     std::size_t offset{};
 
@@ -1587,9 +1590,55 @@ struct EvalValue {
               std::size_t string_offset = 0)
         : integer(integer_value), type(std::move(value_type)),
           string(std::move(string_value)), offset(string_offset) {}
+    EvalValue(floating::Value floating_value, TypePtr value_type)
+        : type(std::move(value_type)), floating(floating_value) {}
 
     [[nodiscard]] bool pointer() const { return string != nullptr; }
+    [[nodiscard]] bool truthy() const {
+        return floating ? floating::nonzero(*floating) : integer != UInt128{};
+    }
 };
+
+BuiltinType floating_literal_type(std::string_view text) {
+    if (text.ends_with("f32")) return BuiltinType::F32;
+    if (text.ends_with("f80")) return BuiltinType::F80;
+    if (text.ends_with("f128")) return BuiltinType::F128;
+    if (text.ends_with("fptr")) return BuiltinType::Fptr;
+    return BuiltinType::F64;
+}
+
+floating::Format floating_format(BuiltinType type, unsigned address_bits) {
+    switch (type) {
+    case BuiltinType::F32: return floating::Format::Binary32;
+    case BuiltinType::F80: return floating::Format::Extended80;
+    case BuiltinType::F128: return floating::Format::Binary128;
+    case BuiltinType::Fptr:
+        return address_bits == 32 ? floating::Format::Binary32
+                                  : floating::Format::Binary64;
+    default: return floating::Format::Binary64;
+    }
+}
+
+std::optional<EvalValue> parse_floating_value(const Expr& expression,
+                                             unsigned address_bits) {
+    if (expression.evaluated_floating) {
+        const auto& value = *expression.evaluated_floating;
+        return EvalValue{floating::Value{value.bits,
+                floating_format(value.type, address_bits)},
+            builtin_type(value.type)};
+    }
+    auto text = expression.text;
+    const auto type = floating_literal_type(text);
+    const auto suffix = type == BuiltinType::Fptr || type == BuiltinType::F128
+        ? 4U : 3U;
+    if (text.ends_with("f32") || text.ends_with("f64") ||
+        text.ends_with("f80") || text.ends_with("f128") ||
+        text.ends_with("fptr")) text.resize(text.size() - suffix);
+    const auto value = floating::parse(std::move(text),
+                                      floating_format(type, address_bits));
+    return value ? std::optional<EvalValue>{EvalValue{*value, builtin_type(type)}}
+                 : std::nullopt;
+}
 
 std::optional<EvalValue> parse_integer_value(const Expr& expression) {
     if (expression.evaluated_integer)
@@ -1701,6 +1750,34 @@ public:
         return convert(*value, destination, source.location);
     }
 
+    std::optional<EvalValue> required_floating(const Expr& source,
+                                               const TypePtr& destination) {
+        if (!validate_required_tree(source)) return std::nullopt;
+        auto value = expression(source);
+        if (!value || value->pointer() ||
+            (!is_integer(value->type) && !is_floating(value->type))) {
+            fail(source.location,
+                 "required expression is not a scalar translation-time value");
+            return std::nullopt;
+        }
+        value = convert(*value, destination, source.location);
+        if (!value) fail(source.location,
+                         "floating initializer cannot be converted to its type");
+        return value;
+    }
+
+    std::optional<EvalValue> required_scalar(const Expr& source) {
+        if (!validate_required_tree(source)) return std::nullopt;
+        auto value = expression(source);
+        if (!value || value->pointer() ||
+            (!is_integer(value->type) && !is_floating(value->type))) {
+            fail(source.location,
+                 "required expression is not a scalar translation-time value");
+            return std::nullopt;
+        }
+        return value;
+    }
+
     void diagnose(SourceLocation fallback) const {
         diagnostics_.error(
             failure_location_.valid() ? failure_location_ : fallback,
@@ -1785,6 +1862,12 @@ public:
             if (!value) fail(expression.location, "integer literal is not representable in its type");
             return value;
         }
+        case Expr::Kind::Floating: {
+            auto value = parse_floating_value(expression, program_.address_bits);
+            if (!value) fail(expression.location,
+                             "floating literal is invalid or not representable");
+            return value;
+        }
         case Expr::Kind::Character: {
             const auto decoded = decode_character_literal(expression.text);
             if (!decoded) {
@@ -1851,19 +1934,15 @@ public:
             const auto type = expression_type(expression);
             auto condition = this->expression(*expression.left);
             if (!condition || condition->pointer() || !type) return std::nullopt;
-            auto value = this->expression(*(condition->integer == UInt128{}
-                                          ? expression.third
-                                          : expression.right));
+            auto value = this->expression(*(condition->truthy()
+                                          ? expression.right
+                                          : expression.third));
             return value ? convert(*value, type, expression.location) : std::nullopt;
         }
         case Expr::Kind::Assign:
             return assign(expression);
         case Expr::Kind::Call:
             return call_expression(expression);
-        case Expr::Kind::Floating:
-            fail(expression.location,
-                 "floating translation-time evaluation is not implemented yet");
-            return std::nullopt;
         case Expr::Kind::AggregateInitializer:
             fail(expression.location,
                  "an aggregate initializer is not a scalar expression");
@@ -1994,8 +2073,9 @@ private:
                          source->kind != Type::Kind::Function && destination->kind != Type::Kind::Function);
                 };
                 const bool compatible = from && to &&
-                    ((is_integer(from) && is_integer(to)) || same_type(from, to) ||
-                     pointer_compatible());
+                    (((is_integer(from) || is_floating(from)) &&
+                      (is_integer(to) || is_floating(to))) ||
+                     same_type(from, to) || pointer_compatible());
                 if (!compatible) {
                     fail(argument.location, "unsupported or incompatible argument type in required expression");
                     return false;
@@ -2007,6 +2087,7 @@ private:
         if (node.right && !validate_required_tree(*node.right)) return false;
         if (node.third && !validate_required_tree(*node.third)) return false;
         if (node.kind == Expr::Kind::Integer) return expression(node).has_value();
+        if (node.kind == Expr::Kind::Floating) return expression(node).has_value();
         if (node.kind == Expr::Kind::Character) return expression(node).has_value();
         if (node.kind == Expr::Kind::String) {
             if (decode_string_literal(node.text)) return true;
@@ -2018,10 +2099,17 @@ private:
             return false;
         }
         if (node.kind == Expr::Kind::Unary &&
-            (!node.left || !is_integer(expression_type(*node.left)) ||
-             (node.text != "+" && node.text != "-" && node.text != "!" && node.text != "~" &&
-              node.text != "++" && node.text != "--" && node.text != "post++" && node.text != "post--"))) {
-            fail(node.location, "unsupported unary operand in required integer expression");
+            (!node.left ||
+             !(is_integer(expression_type(*node.left)) ||
+               is_floating(expression_type(*node.left))) ||
+             (is_floating(expression_type(*node.left))
+                  ? node.text != "+" && node.text != "-" && node.text != "!" &&
+                    node.text != "++" && node.text != "--" &&
+                    node.text != "post++" && node.text != "post--"
+                  : node.text != "+" && node.text != "-" && node.text != "!" &&
+                    node.text != "~" && node.text != "++" && node.text != "--" &&
+                    node.text != "post++" && node.text != "post--"))) {
+            fail(node.location, "unsupported unary operand in required scalar expression");
             return false;
         }
         const bool modifying = node.kind == Expr::Kind::Assign ||
@@ -2029,8 +2117,9 @@ private:
              (node.text == "++" || node.text == "--" || node.text.starts_with("post")));
         if (modifying) {
             if (!node.left || node.left->kind != Expr::Kind::Name ||
-                (node.right && !is_integer(expression_type(*node.right)))) {
-                fail(node.location, "unsupported assignment in required integer expression");
+                (node.right && !(is_integer(expression_type(*node.right)) ||
+                                 is_floating(expression_type(*node.right))))) {
+                fail(node.location, "unsupported assignment in required scalar expression");
                 return false;
             }
             bool read_only = expression_type(*node.left)->is_const;
@@ -2048,10 +2137,25 @@ private:
             const auto left = node.left ? expression_type(*node.left) : nullptr;
             const auto right = node.right ? expression_type(*node.right) : nullptr;
             const bool indexing = node.kind == Expr::Kind::Binary && node.text == "index";
-            if (!left || !right ||
-                (indexing ? left->kind != Type::Kind::Pointer || !is_integer(right)
-                          : !is_integer(left) || !is_integer(right))) {
-                fail(node.location, "non-integer operation in required integer expression");
+            const bool scalar = left && right &&
+                (is_integer(left) || is_floating(left)) &&
+                (is_integer(right) || is_floating(right));
+            const bool floating_operands = scalar &&
+                (is_floating(left) || is_floating(right));
+            const bool floating_operator = node.kind == Expr::Kind::Conditional ||
+                node.text == "+" || node.text == "-" || node.text == "*" ||
+                node.text == "/" || node.text == "==" || node.text == "!=" ||
+                node.text == "<" || node.text == "<=" || node.text == ">" ||
+                node.text == ">=" || node.text == "&&" || node.text == "||";
+            if (indexing ? (!left || left->kind != Type::Kind::Pointer ||
+                            !right || !is_integer(right))
+                         : (!scalar || (floating_operands && !floating_operator))) {
+                fail(node.location, "unsupported operation in required scalar expression");
+                return false;
+            }
+            if (node.kind == Expr::Kind::Conditional &&
+                (!node.third || !expression_type(*node.third))) {
+                fail(node.location, "unresolved conditional operand in required expression");
                 return false;
             }
         }
@@ -2092,7 +2196,9 @@ private:
         case Expr::Kind::Unary: {
             if (expression.text == "!") return builtin_type(BuiltinType::Bool);
             auto type = expression_type(*expression.left);
-            if (!type || !is_integer(type)) return {};
+            if (!type) return {};
+            if (is_floating(type)) return type;
+            if (!is_integer(type)) return {};
             if (expression.text == "++" || expression.text == "--" || expression.text.starts_with("post")) return type;
             return builtin_integer(promote_integer(integer_type(type)));
         }
@@ -2122,7 +2228,19 @@ private:
                 return builtin_type(BuiltinType::Bool);
             const auto left = expression_type(*(conditional ? expression.right : expression.left));
             const auto right = expression_type(*(conditional ? expression.third : expression.right));
-            if (!left || !right || !is_integer(left) || !is_integer(right)) return {};
+            if (!left || !right) return {};
+            if (is_floating(left) || is_floating(right)) {
+                if ((!is_integer(left) && !is_floating(left)) ||
+                    (!is_integer(right) && !is_floating(right))) return {};
+                if (!is_floating(left)) return right;
+                if (!is_floating(right)) return left;
+                const auto left_bits = left->builtin == BuiltinType::Fptr
+                    ? program_.address_bits : type_bits(left);
+                const auto right_bits = right->builtin == BuiltinType::Fptr
+                    ? program_.address_bits : type_bits(right);
+                return left_bits >= right_bits ? left : right;
+            }
+            if (!is_integer(left) || !is_integer(right)) return {};
             if (!conditional && (expression.text == "<<" || expression.text == ">>"))
                 return builtin_integer(promote_integer(integer_type(left)));
             return builtin_integer(common_integer_type(integer_type(left), integer_type(right)));
@@ -2135,7 +2253,10 @@ private:
                     [](const FunctionDecl&) { return true; })) return callee->return_type;
             return {};
         case Expr::Kind::String: return pointer_type(builtin_type(BuiltinType::U8, true));
-        case Expr::Kind::Floating: return {};
+        case Expr::Kind::Floating:
+            return builtin_type(expression.evaluated_floating
+                ? expression.evaluated_floating->type
+                : floating_literal_type(expression.text));
         case Expr::Kind::AggregateInitializer: return {};
         }
         return {};
@@ -2147,7 +2268,7 @@ private:
             (type->kind == Type::Kind::Builtin &&
              (type->builtin == BuiltinType::Iptr || type->builtin == BuiltinType::Uptr))))
             bits = program_.address_bits;
-        return {bits, signed_value(EvalValue{{}, type}),
+        return {bits, signed_value(EvalValue{UInt128{}, type}),
                 type && type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Bool};
     }
 
@@ -2159,6 +2280,17 @@ private:
                         : type.bits == 64 ? (type.is_signed ? BuiltinType::I64 : BuiltinType::U64)
                                          : (type.is_signed ? BuiltinType::I128 : BuiltinType::U128);
         return builtin_type(kind);
+    }
+
+    TypePtr common_floating_type(const TypePtr& left,
+                                  const TypePtr& right) const {
+        if (!is_floating(left)) return right;
+        if (!is_floating(right)) return left;
+        const auto left_bits = left->builtin == BuiltinType::Fptr
+            ? program_.address_bits : type_bits(left);
+        const auto right_bits = right->builtin == BuiltinType::Fptr
+            ? program_.address_bits : type_bits(right);
+        return left_bits >= right_bits ? left : right;
     }
 
     std::optional<EvalValue> convert(EvalValue value, const TypePtr& type,
@@ -2186,6 +2318,34 @@ private:
                 return EvalValue{UInt128{1}, clone_type(type)};
             return std::nullopt;
         }
+        if (is_floating(type)) {
+            const auto format = floating_format(type->builtin,
+                                                program_.address_bits);
+            if (value.floating) {
+                value.floating = floating::convert(*value.floating, format);
+            } else if (is_integer(value.type)) {
+                const auto source = integer_type(value.type);
+                value.floating = floating::from_integer(value.integer,
+                    source.bits, source.is_signed, format);
+            } else return std::nullopt;
+            value.type = clone_type(type);
+            return value;
+        }
+        if (value.floating) {
+            if (!is_integer(type)) return std::nullopt;
+            const auto target = integer_type(type);
+            if (target.is_bool) {
+                return EvalValue{UInt128{floating::nonzero(*value.floating)},
+                                 clone_type(type)};
+            }
+            const auto integer = floating::to_integer(*value.floating,
+                                                      target.bits, target.is_signed);
+            if (!integer) {
+                fail(location, "floating-to-integer conversion is out of range during translation-time evaluation");
+                return std::nullopt;
+            }
+            return EvalValue{*integer, clone_type(type)};
+        }
         if (!is_integer(value.type) || !is_integer(type)) return std::nullopt;
         value.integer = convert_integer(value.integer, integer_type(value.type), integer_type(type));
         value.type = clone_type(type);
@@ -2211,6 +2371,37 @@ private:
         }
         const bool comparison = operation >= IntegerOperation::Equal;
         return EvalValue{result.value, comparison ? builtin_type(BuiltinType::Bool) : builtin_integer(type)};
+    }
+
+    std::optional<EvalValue> calculate_floating(std::string_view operation,
+                                                EvalValue left, EvalValue right,
+                                                SourceLocation location) {
+        const auto result_type = common_floating_type(left.type, right.type);
+        auto converted_left = convert(std::move(left), result_type, location);
+        auto converted_right = convert(std::move(right), result_type, location);
+        if (!converted_left || !converted_right) return std::nullopt;
+        left = std::move(*converted_left);
+        right = std::move(*converted_right);
+        if (operation == "==" || operation == "!=" || operation == "<" ||
+            operation == "<=" || operation == ">" || operation == ">=") {
+            const auto comparison = operation == "==" ? floating::Comparison::Equal
+                : operation == "!=" ? floating::Comparison::NotEqual
+                : operation == "<" ? floating::Comparison::Less
+                : operation == "<=" ? floating::Comparison::LessEqual
+                : operation == ">" ? floating::Comparison::Greater
+                                   : floating::Comparison::GreaterEqual;
+            return EvalValue{UInt128{floating::compare(comparison,
+                *left.floating, *right.floating)}, builtin_type(BuiltinType::Bool)};
+        }
+        if (operation != "+" && operation != "-" && operation != "*" &&
+            operation != "/") return std::nullopt;
+        const auto opcode = operation == "+" ? floating::Operation::Add
+            : operation == "-" ? floating::Operation::Subtract
+            : operation == "*" ? floating::Operation::Multiply
+                                : floating::Operation::Divide;
+        return EvalValue{floating::binary(opcode, *left.floating,
+            *right.floating, floating_format(result_type->builtin,
+                                              program_.address_bits)), result_type};
     }
 
     struct Flow {
@@ -2289,9 +2480,15 @@ private:
             }
             const auto previous = lookup(expression.left->text, expression.location);
             if (!previous || previous->pointer()) return std::nullopt;
-            auto value = calculate(expression.text == "++" || expression.text == "post++"
-                ? IntegerOperation::Add : IntegerOperation::Subtract,
-                *previous, EvalValue{UInt128{1}, builtin_type(BuiltinType::I32)}, expression.location);
+            auto value = previous->floating
+                ? calculate_floating(expression.text == "++" || expression.text == "post++"
+                                         ? "+" : "-", *previous,
+                                     EvalValue{UInt128{1}, builtin_type(BuiltinType::I32)},
+                                     expression.location)
+                : calculate(expression.text == "++" || expression.text == "post++"
+                                ? IntegerOperation::Add : IntegerOperation::Subtract,
+                            *previous, EvalValue{UInt128{1}, builtin_type(BuiltinType::I32)},
+                            expression.location);
             if (!value) return std::nullopt;
             value = convert(*value, previous->type, expression.location);
             if (!value) return std::nullopt;
@@ -2300,11 +2497,23 @@ private:
         }
         auto value = this->expression(*expression.left);
         if (!value || value->pointer()) return std::nullopt;
+        if (value->floating) {
+            if (expression.text == "+") return value;
+            if (expression.text == "-") {
+                value->floating = floating::negate(*value->floating);
+                return value;
+            }
+            if (expression.text == "!") {
+                return EvalValue{UInt128{!value->truthy()},
+                                 builtin_type(BuiltinType::Bool)};
+            }
+            return std::nullopt;
+        }
         value = convert(*value, builtin_integer(promote_integer(integer_type(value->type))), expression.location);
         if (!value) return std::nullopt;
         if (expression.text == "+") return value;
         if (expression.text == "-") {
-            return calculate(IntegerOperation::Subtract, EvalValue{{}, value->type}, *value, expression.location);
+            return calculate(IntegerOperation::Subtract, EvalValue{UInt128{}, value->type}, *value, expression.location);
         }
         if (expression.text == "~") {
             value->integer = mask_to(bit_not(value->integer), integer_type(value->type).bits);
@@ -2323,7 +2532,7 @@ private:
         const auto operation = expression.text;
         if (operation == "&&" || operation == "||") {
             if (left->pointer()) return std::nullopt;
-            const bool lhs = !(left->integer == UInt128{});
+            const bool lhs = left->truthy();
             if ((operation == "&&" && !lhs) ||
                 (operation == "||" && lhs)) {
                 return EvalValue{{operation == "||", 0},
@@ -2331,7 +2540,7 @@ private:
             }
             auto right = this->expression(*expression.right);
             if (!right || right->pointer()) return std::nullopt;
-            return EvalValue{{!(right->integer == UInt128{}), 0},
+            return EvalValue{{right->truthy(), 0},
                              builtin_type(BuiltinType::Bool)};
         }
         auto right = this->expression(*expression.right);
@@ -2351,6 +2560,10 @@ private:
                              builtin_type(BuiltinType::U8)};
         }
         if (left->pointer() || right->pointer()) return std::nullopt;
+        if (left->floating || right->floating) {
+            return calculate_floating(operation, *left, *right,
+                                      expression.location);
+        }
         static constexpr std::pair<std::string_view, IntegerOperation> operations[] = {
             {"+", IntegerOperation::Add}, {"-", IntegerOperation::Subtract},
             {"*", IntegerOperation::Multiply}, {"/", IntegerOperation::Divide},
@@ -2471,7 +2684,7 @@ private:
             if (statement.declaration->dynamic_array_bound) {
                 return {Flow::Failed};
             }
-            EvalValue value{{}, clone_type(statement.declaration->type)};
+            EvalValue value{UInt128{}, clone_type(statement.declaration->type)};
             scopes_.back()[statement.declaration->name] = {
                 value, false, statement.declaration->type->is_const};
             if (statement.declaration->initializer) {
@@ -2497,7 +2710,7 @@ private:
         case Statement::Kind::If: {
             auto condition = expression(*statement.condition);
             if (!condition || condition->pointer()) return {Flow::Failed};
-            if (!(condition->integer == UInt128{})) {
+            if (condition->truthy()) {
                 return this->statement(*statement.first);
             }
             return statement.second ? this->statement(*statement.second) : Flow{};
@@ -2599,7 +2812,7 @@ private:
                     return self(self, node->first.get());
                 if (node->kind == Statement::Kind::Declaration && node->declaration)
                     scopes_.back()[node->declaration->name] = {
-                        EvalValue{{}, clone_type(node->declaration->type)}, false,
+                        EvalValue{UInt128{}, clone_type(node->declaration->type)}, false,
                         node->declaration->type->is_const};
                 return {};
             };
@@ -2613,7 +2826,7 @@ private:
             while (true) {
                 auto condition = expression(*statement.condition);
                 if (!condition || condition->pointer()) return {Flow::Failed};
-                if (condition->integer == UInt128{}) return {};
+                if (!condition->truthy()) return {};
                 auto flow = this->statement(*statement.first);
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
                 if (flow.kind == Flow::Break) return {};
@@ -2625,7 +2838,7 @@ private:
                 if (flow.kind == Flow::Break) return {};
                 auto condition = expression(*statement.condition);
                 if (!condition || condition->pointer()) return {Flow::Failed};
-                if (condition->integer == UInt128{}) return {};
+                if (!condition->truthy()) return {};
             } while (true);
         case Statement::Kind::For: {
             scopes_.emplace_back();
@@ -2641,7 +2854,7 @@ private:
                         scopes_.pop_back();
                         return {Flow::Failed};
                     }
-                    if (condition->integer == UInt128{}) break;
+                    if (!condition->truthy()) break;
                 }
                 auto flow = this->statement(*statement.second);
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) {
@@ -2943,8 +3156,16 @@ bool runtime_only(const FunctionDecl& function) {
 void replace_eval_value(std::unique_ptr<Expr>& expression,
                         const EvalValue& value) {
     auto replacement = std::make_unique<Expr>();
-    replacement->kind = Expr::Kind::Integer;
     replacement->location = expression->location;
+    if (value.floating) {
+        replacement->kind = Expr::Kind::Floating;
+        replacement->text = "0.0" + literal_suffix(value.type);
+        replacement->evaluated_floating = Expr::FloatingConstant{
+            value.floating->bits, value.type->builtin};
+        expression = std::move(replacement);
+        return;
+    }
+    replacement->kind = Expr::Kind::Integer;
     replacement->text =
         to_decimal(value.integer) + literal_suffix(value.type);
     replacement->evaluated_integer = Expr::IntegerConstant{
@@ -2975,6 +3196,24 @@ bool rewrite_required_integer(std::unique_ptr<Expr>& expression,
         expression->text = "-" + to_decimal(mask_to(negate(value->integer), width)) +
                            literal_suffix(value->type);
     }
+    return true;
+}
+
+bool rewrite_required_floating(std::unique_ptr<Expr>& expression,
+                               const FunctionDecl* caller, Program& program,
+                               Diagnostics& diagnostics,
+                               const TypePtr& destination,
+                               const LayoutQuery* size_of = nullptr,
+                               const LayoutQuery* align_of = nullptr,
+                               std::string_view source_namespace = {}) {
+    Evaluator evaluator(program, diagnostics, caller,
+                        std::string(source_namespace), size_of, align_of);
+    const auto value = evaluator.required_floating(*expression, destination);
+    if (!value) {
+        evaluator.diagnose(expression->location);
+        return false;
+    }
+    replace_eval_value(expression, *value);
     return true;
 }
 
@@ -3471,6 +3710,13 @@ void fold_static_initializer(Expr& initializer, TypePtr type,
                 continue;
             }
             replace_eval_value(entry.value, *value);
+        } else if (is_floating(destination)) {
+            if (!contains_layout_query(*entry.value) ||
+                (size_of && align_of)) {
+                (void)rewrite_required_floating(entry.value, nullptr,
+                    program, diagnostics, destination, size_of, align_of,
+                    source_namespace);
+            }
         }
     }
 }
@@ -3632,7 +3878,7 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     }
     for (auto& object : program.objects) {
         if (object->initializer) {
-            if (is_integer(object->type) &&
+            if ((is_integer(object->type) || is_floating(object->type)) &&
                 object->initializer->kind !=
                     Expr::Kind::AggregateInitializer &&
                 !contains_relocation_candidate(
@@ -3642,8 +3888,14 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                 // child calls first would evaluate untaken logical/conditional
                 // arms and lose their short-circuit semantics.
                 if (!contains_layout_query(*object->initializer)) {
-                    rewrite_required_integer(object->initializer, nullptr,
-                                             program, diagnostics);
+                    if (is_floating(object->type)) {
+                        rewrite_required_floating(object->initializer, nullptr,
+                                                  program, diagnostics,
+                                                  object->type);
+                    } else {
+                        rewrite_required_integer(object->initializer, nullptr,
+                                                 program, diagnostics);
+                    }
                 }
             } else {
                 rewrite_eval_expr(object->initializer, nullptr, program,
@@ -4085,6 +4337,12 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                 &size_of, &align_of, namespace_prefix(object->name));
             continue;
         }
+        if (is_floating(object->type) && !relocation) {
+            (void)rewrite_required_floating(object->initializer, nullptr,
+                program, diagnostics, object->type, &size_of, &align_of,
+                namespace_prefix(object->name));
+            continue;
+        }
         if (!is_integer(object->type) || relocation) continue;
         Evaluator evaluator(program, diagnostics, nullptr,
                             namespace_prefix(object->name), &size_of,
@@ -4099,15 +4357,15 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
     for (const auto& assertion : program.static_assertions) {
         Evaluator evaluator(program, diagnostics, nullptr,
                             assertion.source_namespace, &size_of, &align_of);
-        const auto value = evaluator.required_integer(*assertion.condition);
+        const auto value = evaluator.required_scalar(*assertion.condition);
         if (!value) {
             diagnostics.error(
                 assertion.location,
-                "$::static_assert condition is not an integer constant expression");
+                "$::static_assert condition is not a scalar constant expression");
             evaluator.diagnose(assertion.location);
             continue;
         }
-        if (value->integer == UInt128{}) {
+        if (!value->truthy()) {
             diagnostics.error(assertion.location,
                               "$::static_assert failed: " +
                                   assertion.message);

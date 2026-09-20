@@ -64,7 +64,9 @@ global u64 mips_private_entry(in u32 seed) {
 
 global i64 mips_entry(in i64 left, in i64 right, in i32 selector) {
     i64 integer = mips_add64(left, right);
-    f64 floating = mips_fma_shape(2.0f64, 3.0f64, 4.0f64);
+    // This fixture checks o32 runtime floating transport. Keep the otherwise
+    // constant stage-polymorphic call out of translation-time evaluation.
+    f64 floating = $::runtime(mips_fma_shape(2.0f64, 3.0f64, 4.0f64));
     return integer + mips_choose(selector, floating == 10.0f64, 0);
 }
 
