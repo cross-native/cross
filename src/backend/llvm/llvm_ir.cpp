@@ -330,8 +330,16 @@ private:
         case data::InitializerKind::Integer: return to_decimal(object.bits);
         case data::InitializerKind::Floating:
             return floating_initializer(object);
-        case data::InitializerKind::Address:
-            return address_initializer(object);
+        case data::InitializerKind::Address: {
+            const auto address = address_initializer(object);
+            const auto& type = hir_.type(object.type);
+            if (type.kind == hir::Type::Kind::Builtin &&
+                type.builtin != BuiltinType::Label) {
+                return "ptrtoint (ptr " + address + " to " +
+                       ir_type(object.type) + ')';
+            }
+            return address;
+        }
         case data::InitializerKind::Bytes: {
             std::string result = "[";
             for (std::size_t index = 0; index < object.bytes.size(); ++index) {

@@ -2877,6 +2877,41 @@ bool contains_layout_query(const Expr& expression) {
     return false;
 }
 
+bool contains_relocation_candidate(const Expr& expression,
+                                   const Program& program,
+                                   std::string_view source_namespace) {
+    if (expression.kind == Expr::Kind::Unary && expression.text == "&")
+        return true;
+    if (expression.kind == Expr::Kind::Name) {
+        const auto is_array = [&](std::string_view name) {
+            return std::any_of(
+                program.objects.begin(), program.objects.end(),
+                [&](const auto& candidate) {
+                    return candidate->name == name && candidate->type &&
+                           candidate->type->kind == Type::Kind::Array;
+                });
+        };
+        if (is_array(expression.text)) return true;
+        if (!source_namespace.empty() &&
+            expression.text.find("::") == std::string::npos &&
+            is_array(std::string(source_namespace) + "::" +
+                     expression.text)) return true;
+    }
+    if (expression.left &&
+        contains_relocation_candidate(*expression.left, program,
+                                      source_namespace)) return true;
+    if (expression.right &&
+        contains_relocation_candidate(*expression.right, program,
+                                      source_namespace)) return true;
+    if (expression.third &&
+        contains_relocation_candidate(*expression.third, program,
+                                      source_namespace)) return true;
+    for (const auto& argument : expression.arguments)
+        if (contains_relocation_candidate(*argument, program,
+                                          source_namespace)) return true;
+    return false;
+}
+
 std::string literal_suffix(const TypePtr& type) {
     if (!type || type->kind != Type::Kind::Builtin) return "u128";
     switch (type->builtin) {
@@ -2941,6 +2976,58 @@ bool rewrite_required_integer(std::unique_ptr<Expr>& expression,
                            literal_suffix(value->type);
     }
     return true;
+}
+
+void fold_relocation_offsets(std::unique_ptr<Expr>& expression,
+                             Program& program, Diagnostics& diagnostics,
+                             const LayoutQuery& size_of,
+                             const LayoutQuery& align_of,
+                             std::string_view source_namespace) {
+    if (!expression) return;
+    if (expression->kind == Expr::Kind::AggregateInitializer) {
+        for (auto& entry : expression->initializer_entries)
+            fold_relocation_offsets(entry.value, program, diagnostics,
+                                    size_of, align_of, source_namespace);
+        return;
+    }
+    fold_relocation_offsets(expression->left, program, diagnostics,
+                            size_of, align_of, source_namespace);
+    fold_relocation_offsets(expression->right, program, diagnostics,
+                            size_of, align_of, source_namespace);
+    fold_relocation_offsets(expression->third, program, diagnostics,
+                            size_of, align_of, source_namespace);
+    for (auto& argument : expression->arguments)
+        fold_relocation_offsets(argument, program, diagnostics,
+                                size_of, align_of, source_namespace);
+    if (expression->kind != Expr::Kind::Binary) return;
+    const auto fold_integer = [&](std::unique_ptr<Expr>& operand) {
+        Evaluator evaluator(program, diagnostics, nullptr,
+                            std::string(source_namespace), &size_of,
+                            &align_of);
+        const auto value = evaluator.required_integer(*operand);
+        if (value) replace_eval_value(operand, *value);
+        else evaluator.diagnose(operand->location);
+    };
+    if (expression->text == "index" && expression->left &&
+        expression->right &&
+        contains_relocation_candidate(*expression->left, program,
+                                      source_namespace)) {
+        fold_integer(expression->right);
+    } else if ((expression->text == "+" || expression->text == "-") &&
+               expression->left && expression->right) {
+        if (contains_relocation_candidate(*expression->left, program,
+                                          source_namespace) &&
+            !contains_relocation_candidate(*expression->right, program,
+                                           source_namespace)) {
+            fold_integer(expression->right);
+        } else if (expression->text == "+" &&
+                   contains_relocation_candidate(*expression->right, program,
+                                                 source_namespace) &&
+                   !contains_relocation_candidate(*expression->left, program,
+                                                  source_namespace)) {
+            fold_integer(expression->left);
+        }
+    }
 }
 
 bool normalize_generic_arguments(const FunctionDecl& generic,
@@ -3305,6 +3392,8 @@ void fold_static_initializer(Expr& initializer, TypePtr type,
                                     diagnostics, size_of, align_of,
                                     source_namespace);
         } else if (is_integer(destination)) {
+            if (contains_relocation_candidate(*entry.value, program,
+                                              source_namespace)) continue;
             const bool target_dependent =
                 contains_layout_query(*entry.value);
             if (target_dependent && (!size_of || !align_of)) continue;
@@ -3485,7 +3574,10 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
         if (object->initializer) {
             if (is_integer(object->type) &&
                 object->initializer->kind !=
-                    Expr::Kind::AggregateInitializer) {
+                    Expr::Kind::AggregateInitializer &&
+                !contains_relocation_candidate(
+                    *object->initializer, program,
+                    namespace_prefix(object->name))) {
                 // Required initializers own the complete expression. Visiting
                 // child calls first would evaluate untaken logical/conditional
                 // arms and lose their short-circuit semantics.
@@ -3914,10 +4006,18 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                                const LayoutQuery& size_of,
                                const LayoutQuery& align_of) {
     for (auto& object : program.objects) {
-        if (!object->initializer ||
-            !contains_layout_query(*object->initializer)) {
+        if (!object->initializer) {
             continue;
         }
+        const bool relocation = contains_relocation_candidate(
+            *object->initializer, program,
+            namespace_prefix(object->name));
+        if (relocation) {
+            fold_relocation_offsets(object->initializer, program,
+                                    diagnostics, size_of, align_of,
+                                    namespace_prefix(object->name));
+        }
+        if (!contains_layout_query(*object->initializer)) continue;
         if (object->initializer->kind ==
             Expr::Kind::AggregateInitializer) {
             fold_static_initializer(
@@ -3925,7 +4025,7 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                 &size_of, &align_of, namespace_prefix(object->name));
             continue;
         }
-        if (!is_integer(object->type)) continue;
+        if (!is_integer(object->type) || relocation) continue;
         Evaluator evaluator(program, diagnostics, nullptr,
                             namespace_prefix(object->name), &size_of,
                             &align_of);

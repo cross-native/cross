@@ -478,49 +478,330 @@ const hir::Function* find_function(const hir::Module& module,
     return nullptr;
 }
 
-const Expr* unwrapped_address(const Expr& expression) {
-    if (expression.kind == Expr::Kind::Parenthesized && expression.left) {
-        return unwrapped_address(*expression.left);
-    }
-    if (expression.kind == Expr::Kind::Unary && expression.text == "&" &&
-        expression.left) {
-        return unwrapped_address(*expression.left);
-    }
-    return &expression;
+std::optional<std::string> qualified_owner_name(std::string_view name,
+                                                const hir::Object& owner) {
+    if (name.find("::") != std::string_view::npos) return std::nullopt;
+    const auto separator = owner.source_name.rfind("::");
+    if (separator == std::string::npos) return std::nullopt;
+    return owner.source_name.substr(0, separator + 2) + std::string(name);
 }
 
-std::optional<AddressConstant> address_constant(
+const hir::Object* find_object(const hir::Module& module,
+                               std::string_view name,
+                               const hir::Object& owner) {
+    if (const auto qualified = qualified_owner_name(name, owner)) {
+        if (const auto* object = find_object(module, *qualified,
+                                             owner.source_unit)) return object;
+    }
+    return find_object(module, name, owner.source_unit);
+}
+
+const hir::Function* find_function(const hir::Module& module,
+                                   std::string_view name,
+                                   const hir::Object& owner) {
+    if (const auto qualified = qualified_owner_name(name, owner)) {
+        if (const auto* function = find_function(module, *qualified,
+                                                 owner.source_unit))
+            return function;
+    }
+    return find_function(module, name, owner.source_unit);
+}
+
+struct AddressValue {
+    AddressConstant address;
+    std::optional<hir::TypeId> pointee;
+    TypePtr cast_pointee;
+    bool integer{};
+};
+
+std::uint64_t source_storage_size(const hir::Module& module,
+                                  const TypePtr& type,
+                                  const Subtarget& subtarget) {
+    if (!type) return 0;
+    if (type->kind == Type::Kind::Pointer)
+        return (module.address_bits + 7U) / 8U;
+    if (type->kind == Type::Kind::Record) {
+        const auto* record = module.record(type->nominal_name);
+        return record && record->complete ? record->size : 0;
+    }
+    if (type->kind == Type::Kind::Array && type->element) {
+        const auto element = source_storage_size(module, type->element,
+                                                 subtarget);
+        return element && type->lanes <=
+                std::numeric_limits<std::uint64_t>::max() / element
+            ? element * type->lanes : 0;
+    }
+    if (type->kind == Type::Kind::Vector)
+        return type->scalable ? 0 : (type_bits(type) + 7U) / 8U;
+    if (type->kind != Type::Kind::Builtin) return 0;
+    const auto builtin = module.builtin(type->builtin);
+    return builtin ? type_size(module, *builtin, subtarget) : 0;
+}
+
+bool add_address_addend(AddressConstant& address, std::uint64_t bytes) {
+    if (bytes > static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max())) return false;
+    const auto amount = static_cast<std::int64_t>(bytes);
+    if (address.addend > std::numeric_limits<std::int64_t>::max() - amount)
+        return false;
+    address.addend += amount;
+    return true;
+}
+
+bool compatible_static_pointee(const hir::Module& module, hir::TypeId source,
+                               const TypePtr& destination,
+                               unsigned depth = 0) {
+    if (!destination || depth >= 32) return false;
+    const auto& from = module.type(source);
+    if ((from.is_const && !destination->is_const) ||
+        (from.is_volatile && !destination->is_volatile) ||
+        from.is_atomic != destination->is_atomic) return false;
+    if (depth == 0 && destination->kind == Type::Kind::Builtin &&
+        destination->builtin == BuiltinType::Void)
+        return from.kind != hir::Type::Kind::Function;
+    switch (destination->kind) {
+    case Type::Kind::Builtin:
+        return from.kind == hir::Type::Kind::Builtin &&
+               from.builtin == destination->builtin;
+    case Type::Kind::Pointer:
+        return from.kind == hir::Type::Kind::Pointer && from.pointee &&
+               from.address_space == destination->address_space &&
+               compatible_static_pointee(module, *from.pointee,
+                                          destination->pointee, depth + 1);
+    case Type::Kind::Array:
+        return from.kind == hir::Type::Kind::Array && from.element &&
+               from.lanes == destination->lanes &&
+               compatible_static_pointee(module, *from.element,
+                                          destination->element, depth + 1);
+    case Type::Kind::Record:
+        return from.kind == hir::Type::Kind::Record &&
+               from.nominal_name == destination->nominal_name;
+    case Type::Kind::Vector:
+        return from.kind == hir::Type::Kind::Vector && from.element &&
+               from.lanes == destination->lanes &&
+               from.scalable == destination->scalable &&
+               compatible_static_pointee(module, *from.element,
+                                          destination->element, depth + 1);
+    default:
+        return false;
+    }
+}
+
+std::optional<AddressValue> address_value(
     const hir::Module& module, const hir::Object& owner,
-    const Expr& source) {
-    const auto& expression = *unwrapped_address(source);
-    if (expression.kind != Expr::Kind::Name) return std::nullopt;
-    if (const auto* object =
-            find_object(module, expression.text, owner.source_unit)) {
-        AddressConstant result;
-        result.kind = AddressKind::Object;
-        result.object = object->id;
+    const Expr& expression, const Subtarget& subtarget);
+
+std::optional<AddressValue> address_designator(
+    const hir::Module& module, const hir::Object& owner,
+    const Expr& expression, const Subtarget& subtarget) {
+    if (expression.kind == Expr::Kind::Parenthesized && expression.left)
+        return address_designator(module, owner, *expression.left, subtarget);
+    if (expression.kind == Expr::Kind::Name) {
+        if (const auto* object =
+                find_object(module, expression.text, owner)) {
+            AddressValue result;
+            result.address.kind = AddressKind::Object;
+            result.address.object = object->id;
+            result.pointee = object->type;
+            return result;
+        }
+        if (const auto* function =
+                find_function(module, expression.text, owner)) {
+            AddressValue result;
+            result.address.kind = AddressKind::Function;
+            result.address.function = function->id;
+            return result;
+        }
+        return std::nullopt;
+    }
+    if (expression.kind != Expr::Kind::Binary || !expression.left ||
+        !expression.right) return std::nullopt;
+    if (expression.text == "member" &&
+        expression.right->kind == Expr::Kind::Name) {
+        auto base = address_designator(module, owner, *expression.left,
+                                       subtarget);
+        if (!base) return std::nullopt;
+        const hir::Record* record{};
+        if (base->pointee) {
+            const auto& type = module.type(*base->pointee);
+            if (type.kind == hir::Type::Kind::Record && type.record)
+                record = &module.record(*type.record);
+        } else if (base->cast_pointee &&
+                   base->cast_pointee->kind == Type::Kind::Record) {
+            record = module.record(base->cast_pointee->nominal_name);
+        }
+        if (!record) return std::nullopt;
+        const auto* member = module.member(record->id,
+                                            expression.right->text);
+        if (!member || member->bit_width ||
+            !add_address_addend(base->address, member->offset))
+            return std::nullopt;
+        base->pointee = member->type;
+        base->cast_pointee.reset();
+        return base;
+    }
+    if (expression.text == "index") {
+        auto base = address_designator(module, owner, *expression.left,
+                                       subtarget);
+        if (base && base->pointee) {
+            const auto& selected = module.type(*base->pointee);
+            if (selected.kind == hir::Type::Kind::Array && selected.element) {
+                base->pointee = *selected.element;
+            } else {
+                base.reset();
+            }
+        }
+        if (!base)
+            base = address_value(module, owner, *expression.left, subtarget);
+        if (!base || (!base->pointee && !base->cast_pointee) ||
+            base->integer) return std::nullopt;
+        const auto offset = integer_value(*expression.right);
+        if (!offset || offset->high != 0 ||
+            offset->low > std::numeric_limits<std::int64_t>::max())
+            return std::nullopt;
+        const auto size = base->cast_pointee
+            ? source_storage_size(module, base->cast_pointee, subtarget)
+            : type_size(module, *base->pointee, subtarget);
+        if (size == 0 || offset->low >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max()) / size ||
+            !add_address_addend(base->address, offset->low * size))
+            return std::nullopt;
+        return base;
+    }
+    return std::nullopt;
+}
+
+std::optional<AddressValue> address_value(
+    const hir::Module& module, const hir::Object& owner,
+    const Expr& expression, const Subtarget& subtarget) {
+    if (expression.kind == Expr::Kind::Parenthesized && expression.left)
+        return address_value(module, owner, *expression.left, subtarget);
+    if (expression.kind == Expr::Kind::Unary && expression.text == "&" &&
+        expression.left)
+        return address_designator(module, owner, *expression.left, subtarget);
+    if (expression.kind == Expr::Kind::Name) {
+        if (const auto* object =
+                find_object(module, expression.text, owner)) {
+            const auto& type = module.type(object->type);
+            if (type.kind != hir::Type::Kind::Array || !type.element)
+                return std::nullopt;
+            AddressValue result;
+            result.address.kind = AddressKind::Object;
+            result.address.object = object->id;
+            result.pointee = *type.element;
+            return result;
+        }
+        if (const auto* function =
+                find_function(module, expression.text, owner)) {
+            AddressValue result;
+            result.address.kind = AddressKind::Function;
+            result.address.function = function->id;
+            return result;
+        }
+        const auto split = expression.text.rfind("::");
+        if (split == std::string::npos) return std::nullopt;
+        const auto* function = find_function(
+            module, expression.text.substr(0, split), owner);
+        if (!function) return std::nullopt;
+        const auto* label = module.label(
+            function->id, expression.text.substr(split + 2));
+        if (!label) return std::nullopt;
+        AddressValue result;
+        result.address.kind = AddressKind::Label;
+        result.address.function = function->id;
+        result.address.label = label->id;
         return result;
     }
-    if (const auto* function =
-            find_function(module, expression.text, owner.source_unit)) {
-        AddressConstant result;
-        result.kind = AddressKind::Function;
-        result.function = function->id;
-        return result;
+    if (expression.kind == Expr::Kind::Binary &&
+        expression.text == "member") {
+        auto value = address_designator(module, owner, expression,
+                                         subtarget);
+        if (!value || !value->pointee) return std::nullopt;
+        const auto& selected = module.type(*value->pointee);
+        if (selected.kind != hir::Type::Kind::Array || !selected.element)
+            return std::nullopt;
+        value->pointee = *selected.element;
+        return value;
     }
-    const auto split = expression.text.rfind("::");
-    if (split == std::string::npos) return std::nullopt;
-    const auto* function = find_function(
-        module, expression.text.substr(0, split), owner.source_unit);
-    if (!function) return std::nullopt;
-    const auto* label =
-        module.label(function->id, expression.text.substr(split + 2));
-    if (!label) return std::nullopt;
-    AddressConstant result;
-    result.kind = AddressKind::Label;
-    result.function = function->id;
-    result.label = label->id;
-    return result;
+    if (expression.kind == Expr::Kind::Cast && expression.left &&
+        expression.type) {
+        auto value = address_value(module, owner, *expression.left,
+                                   subtarget);
+        if (!value) return std::nullopt;
+        if (expression.type->kind == Type::Kind::Builtin) {
+            const auto kind = expression.type->builtin;
+            if ((kind != BuiltinType::Uptr && kind != BuiltinType::Iptr &&
+                 kind != BuiltinType::U32 && kind != BuiltinType::I32 &&
+                 kind != BuiltinType::U64 && kind != BuiltinType::I64) ||
+                (kind == BuiltinType::Uptr || kind == BuiltinType::Iptr
+                    ? module.address_bits
+                    : type_bits(expression.type)) != module.address_bits) {
+                return std::nullopt;
+            }
+            value->integer = true;
+            value->pointee.reset();
+            value->cast_pointee.reset();
+            return value;
+        }
+        if (expression.type->kind == Type::Kind::Pointer) {
+            if (!expression.type->pointee ||
+                (value->pointee &&
+                 !compatible_static_pointee(
+                     module, *value->pointee,
+                     expression.type->pointee)) ||
+                (value->cast_pointee &&
+                 !same_type(value->cast_pointee,
+                            expression.type->pointee))) {
+                return std::nullopt;
+            }
+            value->integer = false;
+            value->pointee.reset();
+            value->cast_pointee = expression.type->pointee;
+            return value;
+        }
+        return std::nullopt;
+    }
+    if (expression.kind == Expr::Kind::Binary && expression.left &&
+        expression.right &&
+        (expression.text == "+" || expression.text == "-")) {
+        auto value = address_value(module, owner, *expression.left,
+                                   subtarget);
+        const Expr* offset_expression = expression.right.get();
+        if (!value && expression.text == "+") {
+            value = address_value(module, owner, *expression.right,
+                                  subtarget);
+            offset_expression = expression.left.get();
+        }
+        if (!value) return std::nullopt;
+        const auto offset = integer_value(*offset_expression);
+        if (!offset || offset->high != 0 ||
+            offset->low > std::numeric_limits<std::int64_t>::max())
+            return std::nullopt;
+        const auto scale = value->integer ? std::uint64_t{1}
+            : value->cast_pointee
+                ? source_storage_size(module, value->cast_pointee, subtarget)
+            : value->pointee
+                ? type_size(module, *value->pointee, subtarget)
+                : std::uint64_t{0};
+        if (scale == 0 || offset->low >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max()) / scale)
+            return std::nullopt;
+        const auto amount = static_cast<std::int64_t>(offset->low * scale);
+        if (expression.text == "+") {
+            if (!add_address_addend(value->address,
+                                    static_cast<std::uint64_t>(amount)))
+                return std::nullopt;
+        } else {
+            if (value->address.addend <
+                std::numeric_limits<std::int64_t>::min() + amount)
+                return std::nullopt;
+            value->address.addend -= amount;
+        }
+        return value;
+    }
+    return std::nullopt;
 }
 
 bool lower_scalar_initializer(Object& result, const hir::Module& module,
@@ -532,13 +813,15 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
     if (type.kind == hir::Type::Kind::Pointer ||
         (type.kind == hir::Type::Kind::Builtin &&
          type.builtin == BuiltinType::Label)) {
-        result.address = address_constant(module, entity, expression);
-        if (!result.address) {
+        const auto address = address_value(module, entity, expression,
+                                           subtarget);
+        if (!address || address->integer) {
             diagnostics.error(
                 expression.location,
                 "global pointer/label initializer is not an address constant");
             return false;
         }
+        result.address = address->address;
         const auto expected_function =
             type.kind == hir::Type::Kind::Pointer && type.pointee &&
             module.type(*type.pointee).kind == hir::Type::Kind::Function;
@@ -568,6 +851,22 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
     }
     if (type.kind == hir::Type::Kind::Builtin &&
         type.builtin <= BuiltinType::Uptr) {
+        if (result.size == (module.address_bits + 7U) / 8U) {
+            const auto address = address_value(module, entity, expression,
+                                               subtarget);
+            if (address && address->integer) {
+                if (address->address.kind == AddressKind::Object &&
+                    address->address.object &&
+                    module.object(*address->address.object).is_thread_local) {
+                    diagnostics.error(expression.location,
+                        "a thread-local address is not an ordinary static relocation");
+                    return false;
+                }
+                result.initializer = InitializerKind::Address;
+                result.address = address->address;
+                return true;
+            }
+        }
         const auto value = integer_value(expression);
         if (!value) {
             diagnostics.error(expression.location,

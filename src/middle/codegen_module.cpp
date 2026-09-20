@@ -75,7 +75,9 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
         const bool address =
             type.kind == hir::Type::Kind::Pointer ||
             (type.kind == hir::Type::Kind::Builtin &&
-             type.builtin == BuiltinType::Label);
+             (type.builtin == BuiltinType::Label ||
+              (integer && type.builtin != BuiltinType::Bool &&
+               object.size * 8 == module.hir().address_bits)));
         const bool byte_array =
             type.kind == hir::Type::Kind::Array && type.element &&
             module.hir().type(*type.element).kind == hir::Type::Kind::Builtin &&

@@ -249,6 +249,28 @@ if(BUILD_TESTING)
                 -DCC_FLAGS=-${level}
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     endforeach()
+    foreach(level IN ITEMS O0 O2)
+        add_test(NAME cross_runtime_relocatable_addresses_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/relocatable-addresses-${level}
+                -DENTRY=relocatable_address_entry
+                -DEXPECTED=0
+                -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
+    add_test(NAME cross_relocatable_addresses_targets
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses.x
+            -DBAD_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses_bad.x
+            -DBAD_CAST_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses_bad_cast.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/relocatable-addresses
+            -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+            -P "${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses.cmake")
     add_test(NAME cross_semantic_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x
