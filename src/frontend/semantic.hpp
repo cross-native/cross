@@ -18,6 +18,10 @@ namespace cross {
 std::span<const std::string_view> core_attribute_names();
 bool is_known_attribute(std::string_view name);
 
+using GenericPointerResolver = std::function<bool(
+    std::unique_ptr<Expr>&, const TypePtr&, const FunctionDecl*,
+    std::span<const std::string>)>;
+
 // Expands explicit generic instances and deterministic translation-time calls.
 // Ordinary visible functions are evaluated opportunistically when requested;
 // forced evaluation is independent of that option. On success no generic type,
@@ -25,7 +29,8 @@ bool is_known_attribute(std::string_view name);
 bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls = true,
                       std::string_view mangling = "default",
-                      std::string_view default_abi = "default");
+                      std::string_view default_abi = "default",
+                      const GenericPointerResolver& pointer_resolver = {});
 
 using LayoutQuery =
     std::function<std::optional<std::uint64_t>(const TypePtr&)>;

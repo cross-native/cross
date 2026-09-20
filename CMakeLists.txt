@@ -2303,6 +2303,22 @@ if(BUILD_TESTING)
         -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/generic_enum_value_driver.cpp
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-enum-runtime
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_generic_pointer_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_value.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-pointer-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_generic_pointer_checks COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_value.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_driver.cpp
+        -DERRORS=${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_errors.x
+        -DMODEL=${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_models.y
+        -DCUSTOM_MODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-pointer-checks
+        -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+        -P "${CMAKE_SOURCE_DIR}/test/middle/generic_pointer_checks.cmake")
     add_test(NAME cross_generic_enum_errors COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_enum_errors.x

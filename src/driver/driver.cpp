@@ -498,8 +498,14 @@ int cc_main(int argc, char** argv) {
     if (!hir::validate_source_address_spaces(
             program, options, *target, diagnostics)) return 1;
     if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
+    const GenericPointerResolver pointer_resolver =
+        [&](std::unique_ptr<Expr>& expression, const TypePtr& destination,
+            const FunctionDecl* caller, std::span<const std::string> locals) {
+            return data::normalize_generic_pointer(program, expression, destination,
+                caller, locals, options, *subtarget, diagnostics);
+        };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
-                          options.mangling, options.abi)) return 1;
+                          options.mangling, options.abi, pointer_resolver)) return 1;
     const auto* backend = target_backend_for(*target);
     if (!backend) {
         diagnostics.command_error(

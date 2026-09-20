@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -15,6 +16,7 @@
 namespace cross {
 class Diagnostics;
 class Subtarget;
+struct CompilerOptions;
 struct Expr;
 
 namespace data {
@@ -26,7 +28,7 @@ enum class InitializerKind {
     Declaration,
     Zero,
     Uninitialized,
-    Integer,
+    Integer, // Fixed bits, including a normalized absolute pointer value.
     Floating,
     Address,
     Bytes,
@@ -53,6 +55,14 @@ struct AddressScope {
 [[nodiscard]] std::optional<AddressConstant> relocatable_address(
     const hir::Module& module, AddressScope scope, const Expr& expression,
     const Subtarget& subtarget, bool integer);
+
+bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expression,
+                               const TypePtr& destination,
+                               const FunctionDecl* caller,
+                               std::span<const std::string> locals,
+                               const CompilerOptions& options,
+                               const Subtarget& subtarget,
+                               Diagnostics& diagnostics);
 
 struct Relocation {
     unsigned offset{};

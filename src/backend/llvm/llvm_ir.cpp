@@ -327,7 +327,11 @@ private:
         case data::InitializerKind::Declaration: return {};
         case data::InitializerKind::Zero: return "zeroinitializer";
         case data::InitializerKind::Uninitialized: return "undef";
-        case data::InitializerKind::Integer: return to_decimal(object.bits);
+        case data::InitializerKind::Integer:
+            if (hir_.type(object.type).kind == hir::Type::Kind::Pointer)
+                return "inttoptr (i" + std::to_string(object.size * 8) + ' ' +
+                       to_decimal(object.bits) + " to " + ir_type(object.type) + ')';
+            return to_decimal(object.bits);
         case data::InitializerKind::Floating:
             return floating_initializer(object);
         case data::InitializerKind::Address: {

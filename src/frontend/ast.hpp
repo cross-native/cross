@@ -88,6 +88,19 @@ enum class Linkage { Group, Static, Global };
 enum class ParameterMode { In, Out, InOut };
 
 struct Expr;
+struct ObjectDecl;
+struct FunctionDecl;
+// A compile-time address names source entities until HIR assigns their IDs.
+// Keeping declaration identity prevents substitution from rebinding a static
+// object in the generic definition's namespace or source unit.
+struct AddressConstant {
+    enum class Kind { Absolute, Object, Function } kind{Kind::Absolute};
+    UInt128 absolute;
+    const ObjectDecl* object{};
+    const FunctionDecl* function{};
+    std::int64_t addend{};
+    bool operator==(const AddressConstant&) const = default;
+};
 struct GenericParameter {
     std::string name;
     TypePtr value_type;
@@ -114,7 +127,7 @@ struct Expr {
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
         Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
-        AggregateInitializer,
+        AggregateInitializer, Address,
     } kind{Kind::Integer};
     struct InitializerDesignator {
         enum class Kind { Member, Index } kind{Kind::Member};
@@ -140,6 +153,7 @@ struct Expr {
         BuiltinType type;
     };
     std::optional<FloatingConstant> evaluated_floating;
+    std::optional<AddressConstant> evaluated_address;
     // A source type operand retained for casts and type-form sizeof.  Keeping
     // this structured avoids reparsing a textual type in HIR/MIR lowering.
     TypePtr type;

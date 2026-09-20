@@ -251,6 +251,10 @@ public:
 
 Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics);
+// Target layout and entity metadata for required constants before generic
+// bodies have been instantiated. Template declarations are deliberately absent.
+Module build_constant_context(Program& program, const CompilerOptions& options,
+                              const TargetInfo& target, Diagnostics& diagnostics);
 bool validate_source_address_spaces(Program& program,
                                     const CompilerOptions& options,
                                     const TargetInfo& target,

@@ -461,6 +461,8 @@ std::optional<ParsedInteger> patch_initial(const Expr& expression,
 
 bool eligible_expression(const Expr& expression) {
     switch (expression.kind) {
+    case Expr::Kind::Address:
+        return expression.type && expression.evaluated_address;
     case Expr::Kind::Integer:
     case Expr::Kind::Floating:
     case Expr::Kind::Name:
@@ -588,6 +590,8 @@ bool eligible_expression(const Expr& expression) {
 
 bool valid_assumption_expression(const Expr& expression) {
     switch (expression.kind) {
+    case Expr::Kind::Address:
+        return expression.type && expression.evaluated_address;
     case Expr::Kind::Integer:
     case Expr::Kind::Floating:
     case Expr::Kind::Name:
@@ -2608,6 +2612,9 @@ private:
 
     std::optional<hir::TypeId> infer_type(const Expr& expression) {
         switch (expression.kind) {
+        case Expr::Kind::Address:
+            return expression.type ? std::optional<hir::TypeId>(hir_.intern_type(expression.type))
+                                   : std::nullopt;
         case Expr::Kind::Integer: {
             const auto parsed = patch_initial(expression, hir_.address_bits);
             return parsed
@@ -3219,6 +3226,32 @@ private:
         if (!current_block_) return std::nullopt;
         std::optional<ValueId> result;
         switch (expression.kind) {
+        case Expr::Kind::Address: {
+            if (!expression.type || !expression.evaluated_address) break;
+            const auto type = hir_.intern_type(expression.type);
+            const auto& address = *expression.evaluated_address;
+            if (address.kind == AddressConstant::Kind::Absolute) {
+                result = constant(address.absolute, type, expression.location);
+                break;
+            }
+            if (address.kind == AddressConstant::Kind::Object && address.object) {
+                if (const auto* object = hir_.object(*address.object))
+                    result = global_address(*object, expression.location);
+            } else if (address.kind == AddressConstant::Kind::Function && address.function) {
+                if (const auto* function = hir_.function(*address.function))
+                    result = function_address(*function, expression.location);
+            }
+            if (!result) break;
+            if (address.addend != 0) {
+                const auto byte = *hir_.builtin(BuiltinType::U8);
+                const auto base = cast(*result, hir_.pointer_to(byte), expression.location);
+                const auto offset = constant(static_cast<std::uint64_t>(address.addend),
+                                             *hir_.builtin(BuiltinType::Iptr), expression.location);
+                result = indexed_address(base, offset, byte, expression.location);
+            }
+            result = cast(*result, type, expression.location);
+            break;
+        }
         case Expr::Kind::Integer: {
             const auto parsed = patch_initial(expression, hir_.address_bits);
             if (!parsed) break;

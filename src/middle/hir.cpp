@@ -208,6 +208,16 @@ public:
         return std::move(module_);
     }
 
+    Module constant_context() {
+        collect_record_shells();
+        finish_records();
+        collect_functions(true);
+        collect_objects();
+        finish_functions();
+        finish_objects();
+        return std::move(module_);
+    }
+
     void validate_address_spaces() {
         std::unordered_set<const cross::Type*> visited;
         std::unordered_set<std::string> reported;
@@ -1373,8 +1383,9 @@ private:
         return function;
     }
 
-    void collect_functions() {
+    void collect_functions(bool skip_templates = false) {
         for (const auto& source : program_.functions) {
+            if (skip_templates && !source->generic_parameters.empty()) continue;
             const auto key = entity_key(source->linkage, source->source_unit, source->name);
             const auto found = function_keys_.find(key);
             FunctionId id;
@@ -2501,6 +2512,11 @@ bool Module::raw_owned(const FunctionDecl& declaration) const {
 Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics) {
     return Builder(program, options, target, diagnostics).run();
+}
+
+Module build_constant_context(Program& program, const CompilerOptions& options,
+                              const TargetInfo& target, Diagnostics& diagnostics) {
+    return Builder(program, options, target, diagnostics).constant_context();
 }
 
 bool validate_source_address_spaces(Program& program,

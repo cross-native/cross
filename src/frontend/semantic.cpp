@@ -163,6 +163,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->string_value = source.string_value;
     result->evaluated_integer = source.evaluated_integer;
     result->evaluated_floating = source.evaluated_floating;
+    result->evaluated_address = source.evaluated_address;
     if (source.type) result->type = clone_type(source.type, types);
     if (source.left) result->left = clone_expr(*source.left, types, values);
     if (source.right) result->right = clone_expr(*source.right, types, values);
@@ -271,34 +272,30 @@ std::string namespace_prefix(std::string_view name) {
 template <typename Predicate>
 FunctionDecl* resolve_function(Program& program, const FunctionDecl* caller,
                                std::string_view name, Predicate predicate) {
-    const auto exact = std::find_if(program.functions.begin(), program.functions.end(),
-                                    [&](const auto& candidate) {
-                                        return candidate->name == name &&
-                                               predicate(*candidate);
-                                    });
-    if (exact != program.functions.end()) return exact->get();
+    const auto exact = [&](std::string_view qualified) -> FunctionDecl* {
+        FunctionDecl* shared = nullptr;
+        for (const auto& candidate : program.functions) {
+            if (candidate->name != qualified || !predicate(*candidate)) continue;
+            if (candidate->linkage == Linkage::Static) {
+                if (!caller || candidate->source_unit == caller->source_unit)
+                    return candidate.get();
+            } else if (!shared) {
+                shared = candidate.get();
+            }
+        }
+        return shared;
+    };
     if (caller && name.find("::") == std::string_view::npos) {
-        const auto prefix = namespace_prefix(caller->name);
-        if (!prefix.empty()) {
-            const auto qualified = prefix + "::" + std::string(name);
-            const auto local = std::find_if(
-                program.functions.begin(), program.functions.end(),
-                [&](const auto& candidate) {
-                    return candidate->name == qualified && predicate(*candidate);
-                });
-            if (local != program.functions.end()) return local->get();
+        auto prefix = caller->source_namespace;
+        while (!prefix.empty()) {
+            if (auto* local = exact(prefix + "::" + std::string(name))) return local;
+            prefix = namespace_prefix(prefix);
         }
         for (const auto& imported : caller->imports) {
-            const auto qualified = imported + "::" + std::string(name);
-            const auto found = std::find_if(
-                program.functions.begin(), program.functions.end(),
-                [&](const auto& candidate) {
-                    return candidate->name == qualified && predicate(*candidate);
-                });
-            if (found != program.functions.end()) return found->get();
+            if (auto* found = exact(imported + "::" + std::string(name))) return found;
         }
     }
-    return nullptr;
+    return exact(name);
 }
 
 std::uint64_t stable_hash(std::string_view text) {
@@ -319,9 +316,8 @@ std::string_view parameter_mode_name(ParameterMode mode) {
     return {};
 }
 
-std::string generic_link_name(const FunctionDecl& function,
-                              const std::vector<Expr::GenericArgument>& arguments,
-                              std::string_view mangling) {
+std::vector<ManglingArgument> generic_argument_descriptors(
+    const std::vector<Expr::GenericArgument>& arguments) {
     std::vector<ManglingArgument> rendered;
     rendered.reserve(arguments.size());
     for (const auto& argument : arguments) {
@@ -331,6 +327,25 @@ std::string generic_link_name(const FunctionDecl& function,
                  canonical_type_name(argument.type)});
         } else {
             std::string spelling = argument.value ? argument.value->text : "<invalid>";
+            if (argument.value && argument.value->evaluated_address) {
+                const auto& address = *argument.value->evaluated_address;
+                spelling = canonical_type_name(argument.value->type) + "=";
+                if (address.kind == AddressConstant::Kind::Absolute) {
+                    spelling += to_decimal(address.absolute);
+                } else {
+                    const auto& name = address.object ? address.object->name
+                                                      : address.function->name;
+                    const auto& unit = address.object ? address.object->source_unit
+                                                      : address.function->source_unit;
+                    const auto linkage = address.object ? address.object->linkage
+                                                         : address.function->linkage;
+                    spelling += '&';
+                    if (linkage == Linkage::Static)
+                        spelling += std::to_string(stable_hash(unit)) + ':';
+                    spelling += name + (address.addend < 0 ? "" : "+") +
+                                std::to_string(address.addend);
+                }
+            }
             if (argument.value && argument.value->type &&
                 !argument.value->type->nominal_name.empty()) {
                 spelling = canonical_type_name(argument.value->type) + "=" + spelling;
@@ -339,6 +354,13 @@ std::string generic_link_name(const FunctionDecl& function,
                 {ManglingArgument::Kind::Value, std::move(spelling)});
         }
     }
+    return rendered;
+}
+
+std::string generic_link_name(const FunctionDecl& function,
+                              const std::vector<Expr::GenericArgument>& arguments,
+                              std::string_view mangling) {
+    const auto rendered = generic_argument_descriptors(arguments);
     std::vector<ManglingParameter> parameters;
     parameters.reserve(function.parameters.size());
     for (const auto& parameter : function.parameters) {
@@ -355,16 +377,67 @@ std::string generic_link_name(const FunctionDecl& function,
         rendered, mangling);
 }
 
+struct GenericArgumentKey {
+    enum class Kind { Type, Integer, Address, Label } kind{Kind::Type};
+    TypePtr type;
+    UInt128 integer;
+    AddressConstant address;
+    std::string label;
+
+    bool operator==(const GenericArgumentKey& other) const {
+        return kind == other.kind &&
+            ((!type && !other.type) || same_type(type, other.type)) &&
+            integer == other.integer && address == other.address && label == other.label;
+    }
+};
+
+std::vector<GenericArgumentKey> generic_argument_keys(
+    const std::vector<Expr::GenericArgument>& arguments) {
+    std::vector<GenericArgumentKey> result;
+    for (const auto& argument : arguments) {
+        GenericArgumentKey key;
+        key.type = argument.type;
+        if (argument.value) {
+            key.type = argument.value->type;
+            if (argument.value->evaluated_address) {
+                key.kind = GenericArgumentKey::Kind::Address;
+                key.address = *argument.value->evaluated_address;
+            } else if (argument.value->evaluated_integer) {
+                key.kind = GenericArgumentKey::Kind::Integer;
+                key.integer = argument.value->evaluated_integer->value;
+                if (!key.type) key.type = builtin_type(argument.value->evaluated_integer->type);
+            } else {
+                key.kind = GenericArgumentKey::Kind::Label;
+                key.label = argument.value->text;
+            }
+        }
+        result.push_back(std::move(key));
+    }
+    return result;
+}
+
 struct GenericExpansionState {
-    std::unordered_map<std::string, std::string> instance_names;
+    struct Instance {
+        const FunctionDecl* generic{};
+        std::vector<GenericArgumentKey> arguments;
+        std::string name;
+    };
+    std::vector<Instance> instances;
     std::unordered_set<const FunctionDecl*> rewritten_functions;
     unsigned depth{};
+    GenericPointerResolver pointer_resolver;
+    std::vector<std::string> locals;
 };
+
+void lift_static_locals(Program& program, FunctionDecl& function);
+void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expression,
+                                   const FunctionDecl* caller);
 
 bool normalize_generic_arguments(const FunctionDecl& generic,
                                  std::vector<Expr::GenericArgument>& arguments,
                                  const FunctionDecl* caller, Program& program,
-                                 Diagnostics& diagnostics, SourceLocation location);
+                                 Diagnostics& diagnostics, SourceLocation location,
+                                 const GenericExpansionState& state);
 
 void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                           FunctionDecl* caller, Program& program,
@@ -377,11 +450,19 @@ void rewrite_generic_statement(
     Diagnostics& diagnostics,
     GenericExpansionState& state,
     std::string_view mangling) {
+    const auto saved_locals = state.locals.size();
+    const bool scoped = statement.kind == Statement::Kind::Compound ||
+                        statement.kind == Statement::Kind::For;
+    if (statement.kind == Statement::Kind::For && statement.first) {
+        rewrite_generic_statement(*statement.first, caller, program, diagnostics,
+                                  state, mangling);
+    }
     for (auto& child : statement.statements) {
         rewrite_generic_statement(*child, caller, program, diagnostics,
                                   state, mangling);
     }
     if (statement.declaration) {
+        state.locals.push_back(statement.declaration->name);
         if (statement.declaration->dynamic_array_bound) {
             rewrite_generic_expr(statement.declaration->dynamic_array_bound,
                                  caller, program, diagnostics, state, mangling);
@@ -403,7 +484,7 @@ void rewrite_generic_statement(
         rewrite_generic_expr(statement.increment, caller, program, diagnostics,
                              state, mangling);
     }
-    if (statement.first) {
+    if (statement.first && statement.kind != Statement::Kind::For) {
         rewrite_generic_statement(*statement.first, caller, program, diagnostics,
                                   state, mangling);
     }
@@ -411,6 +492,7 @@ void rewrite_generic_statement(
         rewrite_generic_statement(*statement.second, caller, program, diagnostics,
                                   state, mangling);
     }
+    if (scoped) state.locals.resize(saved_locals);
 }
 
 void rewrite_generic_function(FunctionDecl& function, Program& program,
@@ -419,8 +501,14 @@ void rewrite_generic_function(FunctionDecl& function, Program& program,
                               std::string_view mangling) {
     if (!function.body || !function.generic_parameters.empty() ||
         !state.rewritten_functions.insert(&function).second) return;
+    lift_static_locals(program, function);
+    auto saved_locals = std::move(state.locals);
+    state.locals.clear();
+    for (const auto& parameter : function.parameters)
+        state.locals.push_back(parameter.name);
     rewrite_generic_statement(*function.body, &function, program, diagnostics,
                               state, mangling);
+    state.locals = std::move(saved_locals);
 }
 
 std::unique_ptr<FunctionDecl> instantiate(
@@ -447,6 +535,7 @@ std::unique_ptr<FunctionDecl> instantiate(
         } else {
             if (!argument.value ||
                 (argument.value->kind != Expr::Kind::Integer &&
+                 argument.value->kind != Expr::Kind::Address &&
                  !(argument.value->type &&
                    argument.value->type->kind == Type::Kind::Builtin &&
                    argument.value->type->builtin == BuiltinType::Label &&
@@ -554,28 +643,47 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
         return;
     }
     if (!normalize_generic_arguments(*generic, expression->generic_arguments,
-                                     caller, program, diagnostics, expression->location)) return;
+                                     caller, program, diagnostics, expression->location,
+                                     state)) return;
     const auto link_name = generic_link_name(
         *generic, expression->generic_arguments, mangling);
-    const auto found = state.instance_names.find(link_name);
+    // A user mangler controls external spelling, never semantic equivalence.
+    std::string identity;
+    const auto append_identity = [&](std::string_view text) {
+        identity += std::to_string(text.size()) + ':' + std::string(text);
+    };
+    append_identity(generic->name);
+    append_identity(generic->linkage == Linkage::Static ? generic->source_unit : "");
+    for (const auto& argument : generic_argument_descriptors(expression->generic_arguments)) {
+        identity += argument.kind == ManglingArgument::Kind::Type ? 'T' : 'V';
+        append_identity(argument.spelling);
+    }
+    auto keys = generic_argument_keys(expression->generic_arguments);
+    const auto found = std::find_if(state.instances.begin(), state.instances.end(),
+        [&](const GenericExpansionState::Instance& instance) {
+            return instance.generic == generic && instance.arguments == keys;
+        });
     std::string internal_name;
-    if (found != state.instance_names.end()) {
-        internal_name = found->second;
+    if (found != state.instances.end()) {
+        internal_name = found->name;
     } else {
-        if (state.depth >= 128 || state.instance_names.size() >= 4096) {
+        if (state.depth >= 128 || state.instances.size() >= 4096) {
             diagnostics.error(expression->location, "generic instantiation budget exceeded");
             return;
         }
         internal_name = generic->name + "$G" +
-                        std::to_string(stable_hash(link_name));
+                        std::to_string(stable_hash(identity));
+        while (std::any_of(state.instances.begin(), state.instances.end(),
+                          [&](const auto& instance) { return instance.name == internal_name; }))
+            internal_name += '$';
         auto instance = instantiate(*generic, expression->generic_arguments,
                                     internal_name, diagnostics);
         if (!instance) return;
-        if (instance->linkage == Linkage::Global) {
+        if (instance->linkage == Linkage::Global && !instance->attribute("link_name")) {
             instance->attributes.push_back(
                 {"link_name", {'"' + link_name + '"'}, instance->location});
         }
-        state.instance_names.emplace(link_name, internal_name);
+        state.instances.push_back({generic, std::move(keys), internal_name});
         auto* concrete = instance.get();
         program.functions.push_back(std::move(instance));
         // Publish before walking the body so recursive identical instances
@@ -592,16 +700,23 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
 }
 
 bool expand_generics(Program& program, Diagnostics& diagnostics,
-                     std::string_view mangling) {
+                     std::string_view mangling,
+                     const GenericPointerResolver& pointer_resolver) {
     GenericExpansionState state;
+    state.pointer_resolver = pointer_resolver;
     for (std::size_t index = 0; index < program.functions.size(); ++index) {
         auto* function = program.functions[index].get();
         if (!function->generic_parameters.empty()) continue;
         rewrite_generic_function(*function, program, diagnostics, state, mangling);
     }
-    for (auto& object : program.objects) {
+    for (std::size_t index = 0; index < program.objects.size(); ++index) {
+        auto* object = program.objects[index].get();
         if (object->initializer) {
-            rewrite_generic_expr(object->initializer, nullptr, program,
+            FunctionDecl context;
+            context.name = object->name;
+            context.source_namespace = namespace_prefix(object->name);
+            context.source_unit = object->source_unit;
+            rewrite_generic_expr(object->initializer, &context, program,
                                  diagnostics, state, mangling);
         }
     }
@@ -618,22 +733,14 @@ class StaticLocalLifter {
 public:
     explicit StaticLocalLifter(Program& program) : program_(program) {}
 
-    void run() {
-        const auto initial_count = program_.functions.size();
-        for (std::size_t index = 0; index < initial_count; ++index) {
-            auto& function = *program_.functions[index];
-            if (!function.body) continue;
-            function_ = &function;
-            ordinal_ = 0;
-            scopes_.clear();
-            scopes_.emplace_back();
-            for (const auto& parameter : function.parameters) {
-                scopes_.back()[parameter.name] = {};
-            }
-            rewrite(*function.body);
+    void run(FunctionDecl& function) {
+        if (!function.body) return;
+        function_ = &function;
+        scopes_.emplace_back();
+        for (const auto& parameter : function.parameters) {
+            scopes_.back()[parameter.name] = {};
         }
-        function_ = nullptr;
-        scopes_.clear();
+        rewrite(*function.body);
     }
 
 private:
@@ -669,6 +776,8 @@ private:
         const bool scoped = statement.kind == Statement::Kind::Compound ||
                             statement.kind == Statement::Kind::For;
         if (scoped) scopes_.emplace_back();
+        if (statement.kind == Statement::Kind::For && statement.first)
+            rewrite(*statement.first);
         if (statement.declaration) {
             auto& declaration = *statement.declaration;
             if (declaration.storage_static) {
@@ -698,7 +807,8 @@ private:
         rewrite(statement.expression);
         rewrite(statement.condition);
         rewrite(statement.increment);
-        if (statement.first) rewrite(*statement.first);
+        if (statement.first && statement.kind != Statement::Kind::For)
+            rewrite(*statement.first);
         for (auto& child : statement.statements) rewrite(*child);
         if (statement.second) rewrite(*statement.second);
         if (scoped) scopes_.pop_back();
@@ -710,8 +820,8 @@ private:
     std::vector<std::unordered_map<std::string, std::string>> scopes_;
 };
 
-void lift_static_locals(Program& program) {
-    StaticLocalLifter(program).run();
+void lift_static_locals(Program& program, FunctionDecl& function) {
+    StaticLocalLifter(program).run(function);
 }
 
 class FunctionPointerAdapterLifter {
@@ -822,6 +932,8 @@ private:
 
     TypePtr infer(const Expr& expression) const {
         switch (expression.kind) {
+        case Expr::Kind::Address:
+            return expression.type;
         case Expr::Kind::Integer:
             return expression.evaluated_integer
                        ? builtin_type(expression.evaluated_integer->type)
@@ -912,6 +1024,7 @@ private:
                              const FunctionType& signature,
                              SourceLocation location) {
         const auto key = source.name + '#' +
+                         (source.linkage == Linkage::Static ? source.source_unit : "") + '#' +
                          canonical_type_name(function_type(
                              clone_type(signature.result),
                              signature.parameters, signature.variadic,
@@ -923,7 +1036,7 @@ private:
         auto adapter = std::make_unique<FunctionDecl>();
         adapter->location = location;
         adapter->name = "$adapter." + std::to_string(ordinal_++);
-        adapter->source_unit = source_unit_;
+        adapter->source_unit = source.source_unit;
         adapter->return_type = clone_type(signature.result);
         adapter->linkage = Linkage::Static;
         adapter->variadic = signature.variadic;
@@ -996,22 +1109,31 @@ private:
             expression->left) {
             return adapt(expression->left, destination);
         }
-        if (expression->kind != Expr::Kind::Name) return false;
-        const auto* source = resolve_function(
-            program_, caller_, expression->text,
-            [](const FunctionDecl&) { return true; });
+        const bool address = expression->kind == Expr::Kind::Address &&
+                             expression->evaluated_address;
+        if (expression->kind != Expr::Kind::Name && !address) return false;
+        const auto* source = address ? expression->evaluated_address->function
+            : resolve_function(program_, caller_, expression->text,
+                               [](const FunctionDecl&) { return true; });
         if (!source || !same_shape(*source, *signature) ||
             already_stable(*source, signature->abi) || source->variadic) {
             return false;
         }
         expression->text = make_adapter(*source, *signature,
                                         expression->location);
+        if (address) {
+            expression->evaluated_address->function = resolve_function(
+                program_, nullptr, expression->text,
+                [](const FunctionDecl&) { return true; });
+        }
         return true;
     }
 
     void rewrite(std::unique_ptr<Expr>& expression,
                  const TypePtr& destination = {}) {
         if (!expression) return;
+        if (expression->kind == Expr::Kind::Address)
+            (void)adapt(expression, expression->type);
         (void)adapt(expression, destination);
         switch (expression->kind) {
         case Expr::Kind::Assign: {
@@ -1422,6 +1544,8 @@ private:
                 builtin_type(BuiltinType::U8, true));
         case Expr::Kind::Name:
             return find_name(expression.text);
+        case Expr::Kind::Address:
+            return expression.type;
         case Expr::Kind::Parenthesized:
             return expression.left ? infer(*expression.left) : TypePtr{};
         case Expr::Kind::Cast:
@@ -1898,6 +2022,10 @@ public:
         }
         case Expr::Kind::Name:
             return lookup(expression.text, expression.location);
+        case Expr::Kind::Address:
+            fail(expression.location,
+                 "a runtime address cannot be inspected during translation-time execution");
+            return std::nullopt;
         case Expr::Kind::Parenthesized:
             return expression.left ? this->expression(*expression.left)
                                    : std::nullopt;
@@ -2195,6 +2323,8 @@ private:
             return {};
         case Expr::Kind::Parenthesized:
             return expression.left ? expression_type(*expression.left) : nullptr;
+        case Expr::Kind::Address:
+            return expression.type;
         case Expr::Kind::Cast:
             return expression.type;
         case Expr::Kind::Sizeof:
@@ -3102,6 +3232,8 @@ bool contains_layout_query(const Expr& expression) {
 bool contains_relocation_candidate(const Expr& expression,
                                    const Program& program,
                                    std::string_view source_namespace) {
+    if (expression.kind == Expr::Kind::Address && expression.evaluated_address)
+        return expression.evaluated_address->kind != AddressConstant::Kind::Absolute;
     if (expression.kind == Expr::Kind::Unary && expression.text == "&")
         return true;
     if (expression.kind == Expr::Kind::Name) {
@@ -3403,7 +3535,8 @@ bool normalize_generic_label(std::unique_ptr<Expr>& value,
 bool normalize_generic_arguments(const FunctionDecl& generic,
                                  std::vector<Expr::GenericArgument>& arguments,
                                  const FunctionDecl* caller, Program& program,
-                                 Diagnostics& diagnostics, SourceLocation location) {
+                                 Diagnostics& diagnostics, SourceLocation location,
+                                 const GenericExpansionState& state) {
     if (arguments.size() != generic.generic_parameters.size()) {
         diagnostics.error(location, "generic argument count does not match '" + generic.name + "'");
         return false;
@@ -3427,6 +3560,12 @@ bool normalize_generic_arguments(const FunctionDecl& generic,
             return false;
         }
         const auto value_type = clone_type(parameter.value_type, types);
+        if (value_type->kind == Type::Kind::Pointer && state.pointer_resolver) {
+            lift_pointer_argument_strings(program, argument.value, caller);
+            if (!state.pointer_resolver(argument.value, value_type, caller,
+                                         state.locals)) return false;
+            continue;
+        }
         if (value_type->kind == Type::Kind::Builtin &&
             value_type->builtin == BuiltinType::Label) {
             if (!normalize_generic_label(argument.value, caller, program,
@@ -4194,7 +4333,14 @@ bool expand_raw_inline(Program& program, Diagnostics& diagnostics) {
 
 class StringPoolLifter {
 public:
-    explicit StringPoolLifter(Program& program) : program_(program) {}
+    explicit StringPoolLifter(Program& program)
+        : program_(program), ordinal_(program.objects.size()) {}
+
+    void pointer_argument(std::unique_ptr<Expr>& expression,
+                          const FunctionDecl* caller) {
+        source_unit_ = caller ? caller->source_unit : std::string{};
+        rewrite(expression);
+    }
 
     void run() {
         const auto object_count = program_.objects.size();
@@ -4334,21 +4480,26 @@ void lift_string_literals(Program& program) {
     StringPoolLifter(program).run();
 }
 
+void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expression,
+                                   const FunctionDecl* caller) {
+    StringPoolLifter(program).pointer_argument(expression, caller);
+}
+
 } // namespace
 
 bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls, std::string_view mangling,
-                      std::string_view default_abi) {
+                      std::string_view default_abi,
+                      const GenericPointerResolver& pointer_resolver) {
     if (!validate_attribute_names(program, diagnostics)) return false;
     if (!evaluate_enumerations(program, diagnostics)) return false;
     materialize_enumerators(program);
-    if (!expand_generics(program, diagnostics, mangling)) {
+    if (!expand_generics(program, diagnostics, mangling, pointer_resolver)) {
         if (diagnostics.errors() == 0) {
             diagnostics.command_error("generic expansion failed without a diagnostic");
         }
         return false;
     }
-    lift_static_locals(program);
     lift_function_pointer_adapters(program, default_abi);
     if (!bind_operators(program, diagnostics)) {
         if (diagnostics.errors() == 0) {

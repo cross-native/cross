@@ -88,7 +88,7 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             object.initializer == data::InitializerKind::Declaration;
         if (declaration != (entity.definition == nullptr) ||
             (object.initializer == data::InitializerKind::Integer &&
-             !integer) ||
+             !integer && type.kind != hir::Type::Kind::Pointer) ||
             (object.initializer == data::InitializerKind::Floating &&
              !floating) ||
             (object.initializer == data::InitializerKind::Address &&
