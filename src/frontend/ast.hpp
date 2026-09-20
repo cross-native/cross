@@ -88,6 +88,11 @@ enum class Linkage { Group, Static, Global };
 enum class ParameterMode { In, Out, InOut };
 
 struct Expr;
+struct GenericParameter {
+    std::string name;
+    TypePtr value_type;
+};
+
 struct Attribute {
     std::string name;
     std::vector<std::string> arguments;
@@ -95,6 +100,9 @@ struct Attribute {
     // Structured when an attribute argument is a required constant
     // expression. Other attributes retain their original token spelling.
     std::shared_ptr<Expr> expression_argument{};
+    // Parameter declarations are parsed with the ordinary type/declarator
+    // grammar; their spelling is never reparsed by semantic expansion.
+    std::vector<GenericParameter> generic_parameters{};
 };
 
 struct Expr {
@@ -199,10 +207,7 @@ TypePtr function_type(TypePtr result, std::vector<ParameterDecl> parameters,
                       bool variadic = false, std::string abi = {});
 
 struct FunctionDecl {
-    struct GenericParameter {
-        std::string name;
-        TypePtr value_type;
-    };
+    using GenericParameter = cross::GenericParameter;
 
     SourceLocation location;
     std::string name;

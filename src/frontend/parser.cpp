@@ -204,7 +204,69 @@ std::vector<Attribute> Parser::parse_attributes() {
             }
             Attribute attribute{std::move(name), {}, first->location};
             if (consume("(")) {
-                if (attribute.name == "aligned") {
+                if (attribute.name == "generic") {
+                    const auto saved_generic_types = active_generic_types_;
+                    while (!current().is(")") &&
+                           current().kind != TokenKind::End) {
+                        const auto start = index_;
+                        std::optional<std::string> parameter_name;
+                        TypePtr value_type;
+                        if (current().kind == TokenKind::Identifier &&
+                            (current(1).is(",") || current(1).is(")"))) {
+                            parameter_name = std::string(current().text);
+                            ++index_;
+                            active_generic_types_.push_back(*parameter_name);
+                        } else {
+                            value_type = parse_type();
+                            if (value_type) {
+                                value_type = parse_declarator(
+                                    std::move(value_type), parameter_name);
+                            }
+                            if (value_type && !is_integer(value_type) &&
+                                value_type->kind != Type::Kind::Pointer &&
+                                value_type->kind != Type::Kind::Generic &&
+                                !(value_type->kind == Type::Kind::Builtin &&
+                                  value_type->builtin == BuiltinType::Label)) {
+                                diagnostics_.error(tokens_[start].location,
+                                    "generic value parameter requires an integer, enumeration, bool, label, or pointer type");
+                            }
+                        }
+                        if (!parameter_name ||
+                            parameter_name->find("::") != std::string::npos) {
+                            diagnostics_.error(tokens_[start].location,
+                                               "expected an unqualified generic parameter name");
+                        } else if (std::any_of(
+                                       attribute.generic_parameters.begin(),
+                                       attribute.generic_parameters.end(),
+                                       [&](const auto& parameter) {
+                                           return parameter.name == *parameter_name;
+                                       })) {
+                            diagnostics_.error(tokens_[start].location,
+                                               "duplicate 'generic' parameter '" +
+                                                   *parameter_name + "'");
+                        } else {
+                            attribute.generic_parameters.push_back(
+                                {std::move(*parameter_name), std::move(value_type)});
+                        }
+                        std::string spelling;
+                        for (auto token = start; token < index_; ++token) {
+                            if (!spelling.empty()) spelling += ' ';
+                            spelling += tokens_[token].text;
+                        }
+                        attribute.arguments.push_back(std::move(spelling));
+                        if (index_ == start || !consume(",")) break;
+                        if (current().is(")")) {
+                            error_here("empty 'generic' parameter");
+                            break;
+                        }
+                    }
+                    if (attribute.generic_parameters.empty()) {
+                        diagnostics_.error(attribute.location,
+                                           "'generic' requires at least one parameter");
+                    }
+                    expect(")", "after generic parameters");
+                    active_generic_types_ = saved_generic_types;
+                } else if (attribute.name == "aligned") {
                     while (!current().is(")") &&
                            current().kind != TokenKind::End) {
                         const auto start = index_;
@@ -762,64 +824,16 @@ TypePtr Parser::parse_array_suffix(
 std::vector<FunctionDecl::GenericParameter> Parser::generic_parameters(
     const std::vector<Attribute>& attributes) {
     std::vector<FunctionDecl::GenericParameter> result;
+    bool seen = false;
     for (const auto& attribute : attributes) {
         if (attribute.name != "generic") continue;
-        if (!result.empty()) {
+        if (seen) {
             diagnostics_.error(attribute.location,
                                "a function has at most one 'generic' attribute");
             continue;
         }
-        for (auto argument : attribute.arguments) {
-            argument.erase(std::remove_if(argument.begin(), argument.end(),
-                                          [](unsigned char character) {
-                                              return std::isspace(character) != 0;
-                                          }),
-                           argument.end());
-            if (argument.empty()) {
-                diagnostics_.error(attribute.location,
-                                   "empty 'generic' parameter");
-                continue;
-            }
-            TypePtr value_type;
-            std::string name = argument;
-            static constexpr std::string_view value_types[] = {
-                "i128", "u128", "iptr", "uptr", "i64", "u64", "i32", "u32",
-                "i16", "u16", "i8", "u8", "bool", "label",
-            };
-            for (const auto prefix : value_types) {
-                if (argument.size() <= prefix.size() ||
-                    !std::string_view(argument).starts_with(prefix)) {
-                    continue;
-                }
-                const auto kind = builtin_kind(prefix);
-                value_type = kind ? builtin_type(*kind) : TypePtr{};
-                name = argument.substr(prefix.size());
-                break;
-            }
-            const bool valid_name = !name.empty() &&
-                ((name.front() >= 'A' && name.front() <= 'Z') ||
-                 (name.front() >= 'a' && name.front() <= 'z') ||
-                 name.front() == '_') &&
-                std::all_of(name.begin() + 1, name.end(), [](unsigned char character) {
-                    return (character >= 'A' && character <= 'Z') ||
-                           (character >= 'a' && character <= 'z') ||
-                           (character >= '0' && character <= '9') ||
-                           character == '_';
-                });
-            if (!valid_name) {
-                diagnostics_.error(attribute.location,
-                                   "invalid 'generic' parameter '" + argument + "'");
-                continue;
-            }
-            if (std::any_of(result.begin(), result.end(), [&](const auto& parameter) {
-                    return parameter.name == name;
-                })) {
-                diagnostics_.error(attribute.location,
-                                   "duplicate 'generic' parameter '" + name + "'");
-                continue;
-            }
-            result.push_back({std::move(name), std::move(value_type)});
-        }
+        seen = true;
+        result = attribute.generic_parameters;
     }
     return result;
 }

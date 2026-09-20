@@ -2285,6 +2285,30 @@ if(BUILD_TESTING)
         -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/raw_inline_runtime_driver.cpp
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/raw-inline-runtime
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_generic_label_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_label_value.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/generic_label_value_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-label-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_generic_label_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_label_errors.x
+        -DPOSITIVE_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_label_value.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-label-errors.o
+        -P "${CMAKE_SOURCE_DIR}/test/middle/generic_label_errors.cmake")
+    add_test(NAME cross_generic_enum_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_enum_value.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/generic_enum_value_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-enum-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_generic_enum_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_enum_errors.x
+        -DPOSITIVE_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/generic_enum_value.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-enum-errors.o
+        -P "${CMAKE_SOURCE_DIR}/test/middle/generic_enum_errors.cmake")
     add_test(NAME cross_floating_evaluation_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation_mips.x

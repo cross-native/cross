@@ -1236,7 +1236,8 @@ private:
         return value.kind == hir::Type::Kind::Builtin &&
                qualifiers_supported &&
                ((allow_void && value.builtin == BuiltinType::Void) ||
-                integer_type(hir_, type) || floating_type(hir_, type));
+                integer_type(hir_, type) || floating_type(hir_, type) ||
+                label_type(hir_, type));
     }
 
     bool global_scalar(const hir::Object& object) const {

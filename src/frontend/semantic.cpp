@@ -330,9 +330,13 @@ std::string generic_link_name(const FunctionDecl& function,
                 {ManglingArgument::Kind::Type,
                  canonical_type_name(argument.type)});
         } else {
+            std::string spelling = argument.value ? argument.value->text : "<invalid>";
+            if (argument.value && argument.value->type &&
+                !argument.value->type->nominal_name.empty()) {
+                spelling = canonical_type_name(argument.value->type) + "=" + spelling;
+            }
             rendered.push_back(
-                {ManglingArgument::Kind::Value,
-                 argument.value ? argument.value->text : "<invalid>"});
+                {ManglingArgument::Kind::Value, std::move(spelling)});
         }
     }
     std::vector<ManglingParameter> parameters;
@@ -441,10 +445,15 @@ std::unique_ptr<FunctionDecl> instantiate(
             }
             types.emplace(parameter.name, argument.type);
         } else {
-            if (!argument.value || argument.value->kind != Expr::Kind::Integer) {
+            if (!argument.value ||
+                (argument.value->kind != Expr::Kind::Integer &&
+                 !(argument.value->type &&
+                   argument.value->type->kind == Type::Kind::Builtin &&
+                   argument.value->type->builtin == BuiltinType::Label &&
+                   argument.value->kind == Expr::Kind::Name))) {
                 diagnostics.error(source.location,
                                   "generic value parameter '" + parameter.name +
-                                      "' requires an integer constant argument");
+                                      "' requires a normalized constant argument");
                 return {};
             }
             values.emplace(parameter.name, argument.value.get());
@@ -3329,6 +3338,68 @@ void fold_patch_initial_offsets(Statement& statement, Program& program,
                                    size_of, align_of, source_namespace);
 }
 
+bool contains_global_label(const Statement& statement,
+                           std::string_view name) {
+    if (statement.kind == Statement::Kind::Label &&
+        statement.global_label && statement.label_name == name) {
+        return true;
+    }
+    for (const auto& child : statement.statements) {
+        if (contains_global_label(*child, name)) return true;
+    }
+    return (statement.first && contains_global_label(*statement.first, name)) ||
+           (statement.second && contains_global_label(*statement.second, name));
+}
+
+bool normalize_generic_label(std::unique_ptr<Expr>& value,
+                             const FunctionDecl* caller, Program& program,
+                             Diagnostics& diagnostics) {
+    while (value && value->kind == Expr::Kind::Parenthesized && value->left) {
+        auto inner = std::move(value->left);
+        value = std::move(inner);
+    }
+    if (!value || value->kind != Expr::Kind::Name) {
+        diagnostics.error(value ? value->location : SourceLocation{},
+                          "generic label argument requires a visible label address constant");
+        return false;
+    }
+    const auto separator = value->text.rfind("::");
+    const auto owner_name = separator == std::string::npos
+        ? caller ? caller->name : std::string{}
+        : value->text.substr(0, separator);
+    const auto label_name = separator == std::string::npos
+        ? value->text : value->text.substr(separator + 2);
+    auto* owner = resolve_function(
+        program, caller, owner_name,
+        [](const FunctionDecl& candidate) { return candidate.body != nullptr; });
+    if (!owner) {
+        owner = resolve_function(
+            program, caller, owner_name,
+            [](const FunctionDecl&) { return true; });
+    }
+    if (!owner || label_name.empty()) {
+        diagnostics.error(value->location,
+                          "generic label argument does not name a visible function label");
+        return false;
+    }
+    const auto qualified = owner->name + "::" + label_name;
+    const bool declared = std::any_of(
+        program.global_labels.begin(), program.global_labels.end(),
+        [&](const GlobalLabelDecl& label) {
+            return label.qualified_name == qualified;
+        });
+    const bool defined = owner->body &&
+        contains_global_label(*owner->body, label_name);
+    if (!declared && !defined) {
+        diagnostics.error(value->location,
+                          "generic label argument requires a visible global label; local labels cannot be transported into an instance");
+        return false;
+    }
+    value->text = qualified;
+    value->type = builtin_type(BuiltinType::Label);
+    return true;
+}
+
 bool normalize_generic_arguments(const FunctionDecl& generic,
                                  std::vector<Expr::GenericArgument>& arguments,
                                  const FunctionDecl* caller, Program& program,
@@ -3337,17 +3408,17 @@ bool normalize_generic_arguments(const FunctionDecl& generic,
         diagnostics.error(location, "generic argument count does not match '" + generic.name + "'");
         return false;
     }
+    TypeSubstitutions types;
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         const auto& parameter = generic.generic_parameters[index];
         auto& argument = arguments[index];
         if (!parameter.value_type) {
-            if (argument.type) continue;
+            if (argument.type) {
+                types.emplace(parameter.name, argument.type);
+                continue;
+            }
             diagnostics.error(location, "generic type parameter '" + parameter.name +
                                         "' requires a type argument");
-            return false;
-        }
-        if (!is_integer(parameter.value_type)) {
-            diagnostics.error(location, "non-integer generic value parameters are not implemented yet");
             return false;
         }
         if (!argument.value) {
@@ -3355,8 +3426,22 @@ bool normalize_generic_arguments(const FunctionDecl& generic,
                                         "' requires a value argument");
             return false;
         }
+        const auto value_type = clone_type(parameter.value_type, types);
+        if (value_type->kind == Type::Kind::Builtin &&
+            value_type->builtin == BuiltinType::Label) {
+            if (!normalize_generic_label(argument.value, caller, program,
+                                         diagnostics)) return false;
+            continue;
+        }
+        if (!is_integer(value_type)) {
+            diagnostics.error(location,
+                value_type->kind == Type::Kind::Pointer
+                    ? "pointer-valued generic argument normalization is not implemented yet"
+                    : "generic value parameter requires an integer, enumeration, bool, label, or pointer type");
+            return false;
+        }
         if (!rewrite_required_integer(argument.value, caller, program, diagnostics,
-                                      parameter.value_type)) return false;
+                                      value_type)) return false;
     }
     return true;
 }
