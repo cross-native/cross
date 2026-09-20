@@ -77,8 +77,72 @@ static u64 add_seven(in u64 value) {
     return value + 7u64;
 }
 
+[[raw_inline]]
+static u64 mix(in u64 value) {
+    u64 x = value;
+    x ^= x >> 17;
+    return x * 0x9e3779b97f4a7c15u64;
+}
+
+static u64 raw_inline_dead_call(in u64 value) {
+    return value + 999u64;
+}
+
+[[raw_inline]]
+static u64 structured_add(in u64 value) {
+    u64 x = value;
+    u64 iteration = 0;
+    if (x < 4) {
+        x += 10;
+    } else {
+        x ^= 3;
+    }
+    while (iteration < 3) {
+        x += iteration;
+        ++iteration;
+    }
+    if (0) {
+        return raw_inline_dead_call(x);
+    }
+    return add_seven(x);
+}
+
+[[raw_inline]]
+static u64 load_add(in u64 *source) {
+    u64 x = *source;
+    return x + 5u64;
+}
+
 [[naked, link_name("raw_inline_entry"), clobber("flags")]]
 global void raw_inline_entry(inout u64 value "rax") {
     value = add_seven(value);
+    $::_ret();
+}
+
+[[naked, link_name("raw_inline_complex"),
+  clobber("r10", "r11", "flags")]]
+global void raw_inline_complex(in u64 value "r9", out u64 result "r8") {
+    result = mix(value);
+    $::_ret();
+}
+
+[[naked, link_name("raw_inline_structured"),
+  clobber("r10", "r11", "flags")]]
+global void raw_inline_structured(in u64 value "r9", out u64 result "r8") {
+    result = structured_add(value);
+    $::_ret();
+}
+
+[[naked, link_name("raw_inline_memory"),
+  clobber("r10", "flags", "memory")]]
+global void raw_inline_memory(in u64 *source "r9", out u64 result "r8") {
+    result = load_add(source);
+    $::_ret();
+}
+
+[[naked, link_name("raw_inline_store"),
+  clobber("r10", "r11", "rdx", "flags", "memory")]]
+global void raw_inline_store(in u64 value "r9", in u64 *destination "r8") {
+    destination[0] = mix(value);
     $::_ret();
 }

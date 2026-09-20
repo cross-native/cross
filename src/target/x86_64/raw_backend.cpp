@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "target/x86_64/raw_backend.hpp"
 
+#include "common/floating_semantics.hpp"
 #include "middle/patch_sink.hpp"
 #include "target/assembly_format.hpp"
 
@@ -497,6 +498,106 @@ private:
                type_bits(type) == entry.bits;
     }
 
+    const hir::Function* raw_inline_function(std::string_view name) const {
+        const hir::Function* result = nullptr;
+        for (const auto& candidate : hir_.functions) {
+            if (candidate.source_name != name || !candidate.definition ||
+                !candidate.definition->attribute("raw_inline")) {
+                continue;
+            }
+            if (result && result->definition != candidate.definition) {
+                return nullptr;
+            }
+            result = &candidate;
+        }
+        return result;
+    }
+
+    const RegisterEntry* storage_view(std::string_view storage,
+                                      const TypePtr& type) const {
+        const auto found = std::find_if(
+            target_.registers.begin(), target_.registers.end(),
+            [&](const RegisterEntry& candidate) {
+                return candidate.storage == storage &&
+                       feature_enabled(candidate.feature) &&
+                       raw_binding_type(candidate, type);
+            });
+        return found == target_.registers.end() ? nullptr : &*found;
+    }
+
+    const RegisterEntry* integer_storage_view(std::string_view storage,
+                                              unsigned bits) const {
+        const auto found = std::find_if(
+            target_.registers.begin(), target_.registers.end(),
+            [&](const RegisterEntry& candidate) {
+                return candidate.storage == storage &&
+                       candidate.register_class == "integer" &&
+                       candidate.bits == bits &&
+                       feature_enabled(candidate.feature);
+            });
+        return found == target_.registers.end() ? nullptr : &*found;
+    }
+
+    void initialize_raw_inline_resources(const hir::Function& function) {
+        raw_inline_scratch_.clear();
+        scratch_in_use_.clear();
+        protected_storages_.clear();
+        for (const auto& [name, binding] : bindings_) {
+            (void)name;
+            protected_storages_.insert(std::string(binding->storage));
+        }
+        if (function.result_location) {
+            const auto endpoint = parse_manual_endpoint(*function.result_location);
+            if (endpoint && endpoint.endpoint.register_view) {
+                protected_storages_.insert(
+                    std::string(endpoint.endpoint.register_view->storage_name));
+            }
+        }
+        for (const auto& clobber : function.clobbers) {
+            const auto* entry = find_register(target_, clobber);
+            if (!entry || entry->compiler_owned) continue;
+            const auto storage = std::string(entry->storage);
+            if (std::find(raw_inline_scratch_.begin(), raw_inline_scratch_.end(),
+                          storage) == raw_inline_scratch_.end()) {
+                raw_inline_scratch_.push_back(storage);
+            }
+        }
+    }
+
+    const RegisterEntry* acquire_scratch(const TypePtr& type,
+                                         SourceLocation location,
+                                         std::string_view purpose) {
+        if (!type || !is_scalar(type) || type->is_atomic || type->is_volatile ||
+            type->is_const) {
+            diagnostics_.error(
+                location,
+                "raw-compatible " + std::string(purpose) +
+                    " requires an unqualified scalar value");
+            return nullptr;
+        }
+        for (const auto& storage : raw_inline_scratch_) {
+            if (scratch_in_use_.contains(storage) ||
+                protected_storages_.contains(storage)) {
+                continue;
+            }
+            if (const auto* view = storage_view(storage, type)) {
+                scratch_in_use_.insert(storage);
+                return view;
+            }
+        }
+        diagnostics_.error(
+            location,
+            "raw-compatible " + std::string(purpose) + " of type '" +
+                type_name(type) +
+                "' requires another matching register in the naked caller's "
+                "clobber contract");
+        return nullptr;
+    }
+
+    void release_scratch(const RegisterEntry* entry) {
+        if (entry) scratch_in_use_.erase(std::string(entry->storage));
+    }
+
     void bind_parameters(const hir::Function& function) {
         for (const auto& parameter : function.parameters) {
             if (!parameter.physical_location || *parameter.physical_location == "auto") continue;
@@ -540,9 +641,12 @@ private:
         binding_types_.clear();
         binding_signed_.clear();
         label_bindings_.clear();
+        inline_frames_.clear();
+        inline_call_stack_.clear();
         label_blocks_.clear();
         laid_out_.clear();
         loops_.clear();
+        break_targets_.clear();
         entry_ordered_depth_ = 0;
         return_ordered_depth_ = 0;
         current_ = {};
@@ -561,6 +665,7 @@ private:
                                   new_block(label.location, label.source_name));
         }
         bind_parameters(function);
+        initialize_raw_inline_resources(function);
         if (function.result_location) {
             const auto endpoint = parse_manual_endpoint(*function.result_location);
             if (endpoint && endpoint.endpoint.register_view) {
@@ -577,6 +682,9 @@ private:
         verify_cfg(function);
         module_.definitions.insert(function.id.value);
         module_.functions.push_back(std::move(current_));
+        raw_inline_scratch_.clear();
+        scratch_in_use_.clear();
+        protected_storages_.clear();
         current_function_ = nullptr;
     }
 
@@ -746,12 +854,44 @@ private:
 
     void lower_statement(const Statement& statement) {
         if (statement.kind == Statement::Kind::Label) {
-            activate_label(statement);
+            if (!inline_frames_.empty()) {
+                diagnostics_.error(statement.location,
+                                   "labels are not raw-compatible managed control flow");
+            } else {
+                activate_label(statement);
+            }
             return;
         }
         switch (statement.kind) {
         case Statement::Kind::Compound:
-            for (const auto& child : statement.statements) lower_statement(*child);
+            if (inline_frames_.empty()) {
+                for (const auto& child : statement.statements) {
+                    lower_statement(*child);
+                }
+                return;
+            }
+            {
+                auto saved_bindings = bindings_;
+                auto saved_types = binding_types_;
+                auto saved_signed = binding_signed_;
+                auto saved_labels = label_bindings_;
+                auto saved_readonly = inline_frames_.back().readonly_names;
+                const auto owned_size = inline_frames_.back().owned.size();
+                for (const auto& child : statement.statements) {
+                    if (!current_block_) break;
+                    lower_statement(*child);
+                }
+                while (inline_frames_.back().owned.size() > owned_size) {
+                    release_scratch(inline_frames_.back().owned.back());
+                    inline_frames_.back().owned.pop_back();
+                }
+                bindings_ = std::move(saved_bindings);
+                binding_types_ = std::move(saved_types);
+                binding_signed_ = std::move(saved_signed);
+                label_bindings_ = std::move(saved_labels);
+                inline_frames_.back().readonly_names =
+                    std::move(saved_readonly);
+            }
             return;
         case Statement::Kind::Declaration:
             if (require_current(statement.location)) lower_declaration(*statement.declaration);
@@ -762,22 +902,33 @@ private:
             }
             return;
         case Statement::Kind::Goto:
-            if (require_current(statement.location)) lower_goto(statement);
+            if (!inline_frames_.empty()) {
+                diagnostics_.error(statement.location,
+                                   "goto is not raw-compatible managed control flow");
+            } else if (require_current(statement.location)) {
+                lower_goto(statement);
+            }
             return;
         case Statement::Kind::Empty:
             return;
         case Statement::Kind::Return:
-            diagnostics_.error(statement.location,
-                               "ordinary return is not permitted in a naked function; use an explicit target control-transfer built-in");
+            if (!inline_frames_.empty()) {
+                lower_inline_return(statement);
+            } else {
+                diagnostics_.error(statement.location,
+                                   "ordinary return is not permitted in a naked function; use an explicit target control-transfer built-in");
+            }
             return;
         case Statement::Kind::If:
             lower_if(statement);
             return;
         case Statement::Kind::Switch:
+            lower_switch(statement);
+            return;
         case Statement::Kind::Case:
         case Statement::Kind::Default:
             diagnostics_.error(statement.location,
-                               "switch statements are not permitted in a naked function");
+                               "case/default label is not inside a raw-compatible switch");
             return;
         case Statement::Kind::While:
             lower_while(statement);
@@ -789,16 +940,21 @@ private:
             lower_for(statement);
             return;
         case Statement::Kind::Break:
-            if (loops_.empty()) {
+            if (break_targets_.empty() ||
+                (!inline_frames_.empty() &&
+                 break_targets_.size() <=
+                     inline_frames_.back().break_base)) {
                 diagnostics_.error(statement.location,
-                                   "raw break is not inside a loop");
+                                   "raw break is not inside a loop or switch");
             } else if (require_current(statement.location)) {
-                (void)terminate_jump(loops_.back().break_target,
+                (void)terminate_jump(break_targets_.back(),
                                      statement.location);
             }
             return;
         case Statement::Kind::Continue:
-            if (loops_.empty()) {
+            if (loops_.empty() ||
+                (!inline_frames_.empty() &&
+                 loops_.size() <= inline_frames_.back().loop_base)) {
                 diagnostics_.error(statement.location,
                                    "raw continue is not inside a loop");
             } else if (require_current(statement.location)) {
@@ -807,6 +963,10 @@ private:
             }
             return;
         case Statement::Kind::Label:
+            if (!inline_frames_.empty()) {
+                diagnostics_.error(statement.location,
+                                   "labels are not raw-compatible managed control flow");
+            }
             return;
         }
     }
@@ -848,6 +1008,37 @@ private:
     }
 
     void lower_declaration(const VariableDecl& declaration) {
+        if (!inline_frames_.empty() && !declaration.storage_register &&
+            !declaration.storage_stack && !declaration.storage_static &&
+            !declaration.location_name) {
+            if (declaration.dynamic_array_bound || !is_scalar(declaration.type)) {
+                diagnostics_.error(
+                    declaration.location,
+                    "raw_inline automatic objects must be fixed-size non-address-taken scalars");
+                return;
+            }
+            const auto* entry = acquire_scratch(
+                declaration.type, declaration.location, "local '" +
+                    declaration.name + "'");
+            if (!entry) return;
+            inline_frames_.back().owned.push_back(entry);
+            bindings_[declaration.name] = entry;
+            binding_types_[declaration.name] = declaration.type;
+            binding_signed_[declaration.name] =
+                signed_integer_type(declaration.type);
+            inline_frames_.back().readonly_names.erase(declaration.name);
+            if (declaration.initializer) {
+                (void)lower_inline_value(*declaration.initializer, *entry,
+                                         declaration.type);
+            }
+            return;
+        }
+        if (!inline_frames_.empty()) {
+            diagnostics_.error(
+                declaration.location,
+                "raw_inline local requires automatic scalar storage; explicit register, stack, static, and VLA storage are not compatible");
+            return;
+        }
         if (!declaration.storage_register || declaration.storage_stack ||
             !declaration.location_name || *declaration.location_name == "auto") {
             diagnostics_.error(declaration.location,
@@ -876,6 +1067,7 @@ private:
             return;
         }
         bindings_[declaration.name] = entry;
+        protected_storages_.insert(std::string(entry->storage));
         binding_types_[declaration.name] = declaration.type;
         binding_signed_[declaration.name] = signed_integer_type(declaration.type);
         if (declaration.type->kind == Type::Kind::Builtin &&
@@ -883,19 +1075,14 @@ private:
             label_bindings_.insert(declaration.name);
         }
         if (!declaration.initializer) return;
-        const auto value = integer_literal(*declaration.initializer);
-        if (!value) {
+        if (!raw_integer_type(declaration.type) &&
+            !raw_scalar_float_type(declaration.type)) {
             diagnostics_.error(declaration.initializer->location,
-                               "raw register initializer must be an integer constant");
+                               "raw register initializer requires a supported scalar register value");
             return;
         }
-        const auto* form = find_instruction(target_, "$::_movabs");
-        if (!form) return;
-        mir::Instruction instruction{declaration.location, form, {}};
-        instruction.operands.push_back(register_operand(*entry, declaration.location));
-        instruction.operands.push_back(immediate_operand(*value, 64,
-                                                         declaration.initializer->location));
-        append_instruction(std::move(instruction));
+        (void)lower_inline_value(*declaration.initializer, *entry,
+                                 declaration.type);
     }
 
     static mir::Operand register_operand(const RegisterEntry& entry,
@@ -1109,10 +1296,1391 @@ private:
         return std::nullopt;
     }
 
+    static bool register_matches(const RegisterEntry& entry,
+                                 const InstructionOperandEntry& operand) {
+        return operand.allow_register && entry.bits == operand.register_bits &&
+               (operand.register_class.empty() ||
+                entry.register_class == operand.register_class) &&
+               (operand.register_storage.empty() ||
+                entry.storage == operand.register_storage);
+    }
+
+    const InstructionEntry* unary_register_form(
+        std::string_view name, const RegisterEntry& destination) const {
+        for (const auto* form : find_instruction_forms(target_, name)) {
+            if (!missing_feature(*form) && form->operands.size() == 1 &&
+                register_matches(destination, form->operands[0])) {
+                return form;
+            }
+        }
+        return nullptr;
+    }
+
+    const InstructionEntry* binary_register_form(
+        std::string_view name, const RegisterEntry& destination,
+        const RegisterEntry& source) const {
+        for (const auto* form : find_instruction_forms(target_, name)) {
+            if (!missing_feature(*form) && form->operands.size() == 2 &&
+                register_matches(destination, form->operands[0]) &&
+                register_matches(source, form->operands[1])) {
+                return form;
+            }
+        }
+        return nullptr;
+    }
+
+    const InstructionEntry* binary_immediate_form(
+        std::string_view name, const RegisterEntry& destination,
+        std::uint64_t value) const {
+        for (const auto* form : find_instruction_forms(target_, name)) {
+            if (!missing_feature(*form) && form->operands.size() == 2 &&
+                register_matches(destination, form->operands[0]) &&
+                form->operands[1].allow_immediate &&
+                fits_instruction_immediate(value, form->operands[1])) {
+                return form;
+            }
+        }
+        return nullptr;
+    }
+
+    const InstructionEntry* register_memory_form(
+        std::string_view name, const RegisterEntry& destination,
+        const RawMemoryAddress& source) const {
+        const auto bits = type_bits(source.pointee);
+        for (const auto* form : find_instruction_forms(target_, name)) {
+            if (!missing_feature(*form) && form->operands.size() == 2 &&
+                register_matches(destination, form->operands[0]) &&
+                form->operands[1].allow_memory &&
+                (form->operands[1].memory_bits == 0 ||
+                 form->operands[1].memory_bits == bits) &&
+                (!source.pointee->is_atomic ||
+                 form->operands[1].allow_atomic_memory)) {
+                return form;
+            }
+        }
+        return nullptr;
+    }
+
+    const InstructionEntry* memory_register_form(
+        std::string_view name, const RawMemoryAddress& destination,
+        const RegisterEntry& source) const {
+        const auto bits = type_bits(destination.pointee);
+        for (const auto* form : find_instruction_forms(target_, name)) {
+            if (!missing_feature(*form) && form->operands.size() == 2 &&
+                form->operands[0].allow_memory &&
+                (form->operands[0].memory_bits == 0 ||
+                 form->operands[0].memory_bits == bits) &&
+                (!destination.pointee->is_atomic ||
+                 form->operands[0].allow_atomic_memory) &&
+                register_matches(source, form->operands[1])) {
+                return form;
+            }
+        }
+        return nullptr;
+    }
+
+    bool emit_register_move(const RegisterEntry& destination,
+                            const RegisterEntry& source,
+                            SourceLocation location) {
+        if (destination.storage == source.storage &&
+            destination.bits == source.bits) {
+            return true;
+        }
+        const auto* form = binary_register_form("$::_mov", destination, source);
+        if (!form) {
+            diagnostics_.error(
+                location,
+                "raw-compatible value move has no legal target register form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    static bool raw_scalar_float_type(const TypePtr& type) {
+        return type && type->kind == Type::Kind::Builtin &&
+               (type->builtin == BuiltinType::F32 ||
+                type->builtin == BuiltinType::F64);
+    }
+
+    static std::string_view scalar_float_name(const TypePtr& type,
+                                              std::string_view f32,
+                                              std::string_view f64) {
+        return type && type->kind == Type::Kind::Builtin &&
+                       type->builtin == BuiltinType::F32
+                   ? f32
+                   : f64;
+    }
+
+    bool emit_float_move(const RegisterEntry& destination,
+                         const RegisterEntry& source,
+                         const TypePtr& type, SourceLocation location) {
+        if (destination.storage == source.storage) return true;
+        const auto* form = binary_register_form(
+            scalar_float_name(type, "$::_movss", "$::_movsd"),
+            destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible floating move has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_value_move(const RegisterEntry& destination,
+                         const RegisterEntry& source, const TypePtr& type,
+                         SourceLocation location) {
+        return raw_scalar_float_type(type)
+                   ? emit_float_move(destination, source, type, location)
+                   : emit_register_move(destination, source, location);
+    }
+
+    bool emit_cross_class_move(std::string_view name,
+                               const RegisterEntry& destination,
+                               const RegisterEntry& source,
+                               SourceLocation location) {
+        const auto* form = binary_register_form(name, destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible bit move has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_integer_constant(const RegisterEntry& destination,
+                               std::uint64_t value,
+                               SourceLocation location) {
+        if (destination.register_class != "integer") {
+            diagnostics_.error(location,
+                               "raw-compatible integer constant requires an integer register");
+            return false;
+        }
+        const auto* full = integer_storage_view(destination.storage, 64);
+        const auto* form = find_instruction(target_, "$::_movabs");
+        if (!full || !form || form->operands.size() != 2 ||
+            !register_matches(*full, form->operands[0])) {
+            diagnostics_.error(location,
+                               "selected target cannot materialize a raw integer constant without a spill");
+            return false;
+        }
+        if (destination.bits < 64) {
+            value &= (std::uint64_t{1} << destination.bits) - 1;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(*full, location));
+        instruction.operands.push_back(immediate_operand(value, 64, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_unary(std::string_view name, const RegisterEntry& destination,
+                    SourceLocation location) {
+        const auto* form = unary_register_form(name, destination);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible unary operation has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_binary_register(std::string_view name,
+                              const RegisterEntry& destination,
+                              const RegisterEntry& source,
+                              SourceLocation location) {
+        const auto* form = binary_register_form(name, destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible binary operation has no legal target register form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_binary_immediate(std::string_view name,
+                               const RegisterEntry& destination,
+                               std::uint64_t value,
+                               SourceLocation location) {
+        const auto* form = binary_immediate_form(name, destination, value);
+        if (!form) return false;
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(
+            immediate_operand(value, form->operands[1].immediate_bits, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_load(const RegisterEntry& destination,
+                   const RawMemoryAddress& source,
+                   SourceLocation location) {
+        const auto* form = register_memory_form("$::_mov", destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible load has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(memory_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_store(const RawMemoryAddress& destination,
+                    const RegisterEntry& source,
+                    SourceLocation location) {
+        if (destination.pointee->is_const) {
+            diagnostics_.error(location,
+                               "raw-compatible assignment cannot write a const-qualified lvalue");
+            return false;
+        }
+        const auto* form = memory_register_form("$::_mov", destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible store has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(memory_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_float_load(const RegisterEntry& destination,
+                         const RawMemoryAddress& source,
+                         const TypePtr& type, SourceLocation location) {
+        const auto* form = register_memory_form(
+            scalar_float_name(type, "$::_movss", "$::_movsd"),
+            destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible floating load has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(memory_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_float_store(const RawMemoryAddress& destination,
+                          const RegisterEntry& source,
+                          const TypePtr& type, SourceLocation location) {
+        if (destination.pointee->is_const) {
+            diagnostics_.error(location,
+                               "raw-compatible assignment cannot write a const-qualified lvalue");
+            return false;
+        }
+        const auto* form = memory_register_form(
+            scalar_float_name(type, "$::_movss", "$::_movsd"),
+            destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible floating store has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(memory_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_integer_extension(const RegisterEntry& destination,
+                                const RegisterEntry& source,
+                                bool signed_source,
+                                SourceLocation location) {
+        if (destination.bits <= source.bits) {
+            diagnostics_.error(location,
+                               "internal raw extension requires a wider destination");
+            return false;
+        }
+        if (!signed_source && source.bits == 32 && destination.bits == 64) {
+            const auto* narrow_destination =
+                integer_storage_view(destination.storage, 32);
+            return narrow_destination &&
+                   emit_register_move(*narrow_destination, source, location);
+        }
+        const auto* form = binary_register_form(
+            signed_source ? "$::_movsx" : "$::_movzx", destination, source);
+        if (!form) {
+            diagnostics_.error(
+                location,
+                "selected target has no spill-free integer extension form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool lower_integer_cast(const Expr& expression,
+                            const RegisterEntry& destination,
+                            const TypePtr& destination_type,
+                            const TypePtr& source_type) {
+        if (!source_type || !raw_integer_type(source_type)) {
+            diagnostics_.error(expression.location,
+                               "raw-compatible cast requires an integer or pointer source");
+            return false;
+        }
+        if (const auto immediate = integer_literal(expression)) {
+            return emit_integer_constant(destination, *immediate,
+                                         expression.location);
+        }
+        const RegisterEntry* source = nullptr;
+        const RegisterEntry* scratch = nullptr;
+        const auto& value = unparenthesized(expression);
+        if (value.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(value.text);
+            if (found != bindings_.end()) {
+                source = integer_storage_view(found->second->storage,
+                                              type_bits(source_type));
+            }
+        }
+        if (!source) {
+            scratch = acquire_scratch(source_type, expression.location,
+                                      "cast temporary");
+            source = scratch;
+            if (!source ||
+                !lower_inline_value(expression, *source, source_type)) {
+                release_scratch(scratch);
+                return false;
+            }
+        }
+        bool result{};
+        if (destination.bits == source->bits) {
+            result = emit_register_move(destination, *source,
+                                        expression.location);
+        } else if (destination.bits < source->bits) {
+            const auto* narrowed = integer_storage_view(source->storage,
+                                                        destination.bits);
+            result = narrowed && emit_register_move(destination, *narrowed,
+                                                    expression.location);
+        } else {
+            result = emit_integer_extension(destination, *source,
+                                            signed_integer_type(source_type),
+                                            expression.location);
+        }
+        release_scratch(scratch);
+        (void)destination_type;
+        return result;
+    }
+
+    static bool raw_integer_type(const TypePtr& type) {
+        return type &&
+               ((type->kind == Type::Kind::Builtin && is_integer(type)) ||
+                type->kind == Type::Kind::Pointer) &&
+               type_bits(type) <= 64;
+    }
+
+    TypePtr expression_type(const Expr& expression,
+                            const TypePtr& fallback = {}) const {
+        const auto& source = unparenthesized(expression);
+        if (source.kind == Expr::Kind::Floating) {
+            if (source.evaluated_floating) {
+                return builtin_type(source.evaluated_floating->type);
+            }
+            return builtin_type(source.text.ends_with("f32")
+                                    ? BuiltinType::F32 : BuiltinType::F64);
+        }
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = binding_types_.find(source.text);
+            if (found != binding_types_.end()) return found->second;
+        }
+        if (source.kind == Expr::Kind::Cast && source.type) return source.type;
+        if (source.kind == Expr::Kind::Unary && source.left &&
+            (source.text == "+" || source.text == "-" ||
+             source.text == "~")) {
+            return expression_type(*source.left, fallback);
+        }
+        if (source.kind == Expr::Kind::Call && source.left &&
+            source.left->kind == Expr::Kind::Name) {
+            if (const auto* callee = raw_inline_function(source.left->text);
+                callee && callee->definition) {
+                return callee->definition->return_type;
+            }
+        }
+        if (source.kind == Expr::Kind::Unary && source.text == "*" &&
+            source.left) {
+            const auto pointer = expression_type(*source.left);
+            if (pointer && pointer->kind == Type::Kind::Pointer) {
+                return pointer->pointee;
+            }
+        }
+        if (source.kind == Expr::Kind::Binary && source.text == "index" &&
+            source.left) {
+            const auto pointer = expression_type(*source.left);
+            if (pointer && pointer->kind == Type::Kind::Pointer) {
+                return pointer->pointee;
+            }
+        }
+        if (source.kind == Expr::Kind::Binary && source.left &&
+            !comparison_operator(source.text) && source.text != "&&" &&
+            source.text != "||") {
+            return expression_type(*source.left, fallback);
+        }
+        return fallback;
+    }
+
+    static std::optional<std::string_view> binary_instruction(
+        std::string_view operation, bool signed_value) {
+        if (operation == "+" || operation == "+=") return "$::_add";
+        if (operation == "-" || operation == "-=") return "$::_sub";
+        if (operation == "^" || operation == "^=") return "$::_xor";
+        if (operation == "&" || operation == "&=") return "$::_and";
+        if (operation == "|" || operation == "|=") return "$::_or";
+        if (operation == "*" || operation == "*=") return "$::_imul";
+        if (operation == "<<" || operation == "<<=") return "$::_shl";
+        if (operation == ">>" || operation == ">>=") {
+            return signed_value ? "$::_sar" : "$::_shr";
+        }
+        return std::nullopt;
+    }
+
+    const RegisterEntry* acquire_fixed_scratch(
+        std::string_view storage, const TypePtr& type,
+        const RegisterEntry& destination, SourceLocation location,
+        bool& owned) {
+        owned = false;
+        const auto* view = storage_view(storage, type);
+        if (!view) {
+            diagnostics_.error(location,
+                               "selected target has no required fixed-register view");
+            return nullptr;
+        }
+        if (destination.storage == storage) return view;
+        if (std::find(raw_inline_scratch_.begin(), raw_inline_scratch_.end(),
+                      storage) == raw_inline_scratch_.end() ||
+            protected_storages_.contains(std::string(storage)) ||
+            scratch_in_use_.contains(std::string(storage))) {
+            diagnostics_.error(
+                location,
+                "raw-compatible division requires '" + std::string(storage) +
+                    "' in the naked caller's available clobber contract");
+            return nullptr;
+        }
+        scratch_in_use_.insert(std::string(storage));
+        owned = true;
+        return view;
+    }
+
+    bool apply_division_rhs(std::string_view operation,
+                            const RegisterEntry& destination,
+                            const TypePtr& type, const Expr& right,
+                            SourceLocation location,
+                            const RegisterEntry* prepared_divisor = nullptr) {
+        if (destination.bits < 16 || destination.bits > 64) {
+            diagnostics_.error(
+                location,
+                "raw-compatible division currently requires a 16-, 32-, or 64-bit integer value");
+            return false;
+        }
+        bool accumulator_owned{};
+        bool high_owned{};
+        const auto* accumulator = acquire_fixed_scratch(
+            "rax", type, destination, location, accumulator_owned);
+        if (!accumulator) return false;
+        const auto* high = acquire_fixed_scratch(
+            "rdx", type, destination, location, high_owned);
+        if (!high) {
+            if (accumulator_owned) release_scratch(accumulator);
+            return false;
+        }
+
+        const auto& divisor_expression = unparenthesized(right);
+        const RegisterEntry* divisor = prepared_divisor;
+        const RegisterEntry* divisor_scratch = nullptr;
+        if (divisor && (divisor->storage == "rax" ||
+                        divisor->storage == "rdx")) {
+            diagnostics_.error(right.location,
+                               "raw-compatible preserved division operand requires a non-fixed clobber register");
+            if (high_owned) release_scratch(high);
+            if (accumulator_owned) release_scratch(accumulator);
+            return false;
+        }
+        if (!divisor && divisor_expression.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(divisor_expression.text);
+            if (found != bindings_.end()) {
+                divisor = integer_storage_view(found->second->storage,
+                                               destination.bits);
+                if (divisor && (divisor->storage == "rax" ||
+                                divisor->storage == "rdx")) {
+                    divisor = nullptr;
+                }
+            }
+        }
+        if (!divisor) {
+            divisor_scratch = acquire_scratch(type, right.location,
+                                              "division operand");
+            divisor = divisor_scratch;
+            if (!divisor ||
+                !lower_inline_value(right, *divisor, type)) {
+                release_scratch(divisor_scratch);
+                if (high_owned) release_scratch(high);
+                if (accumulator_owned) release_scratch(accumulator);
+                return false;
+            }
+        }
+
+        bool result = emit_register_move(*accumulator, destination, location);
+        const bool signed_division = signed_integer_type(type);
+        if (result && signed_division) {
+            const auto name = destination.bits == 16 ? "$::_cwd" :
+                              destination.bits == 32 ? "$::_cdq" : "$::_cqo";
+            const auto* extend = find_instruction(target_, name);
+            if (!extend || missing_feature(*extend)) {
+                diagnostics_.error(
+                    location,
+                    "selected target has no fixed-register signed-division setup");
+                result = false;
+            } else {
+                append_instruction({location, extend, {}});
+            }
+        } else if (result) {
+            result = emit_integer_constant(*high, 0, location);
+        }
+        if (result) {
+            const auto* divide = unary_register_form(
+                signed_division ? "$::_idiv" : "$::_div", *divisor);
+            if (!divide) {
+                diagnostics_.error(location,
+                                   "selected target has no fixed-register division form");
+                result = false;
+            } else {
+                mir::Instruction instruction{location, divide, {}};
+                instruction.operands.push_back(
+                    register_operand(*divisor, right.location));
+                append_instruction(std::move(instruction));
+            }
+        }
+        if (result) {
+            const bool remainder = operation == "%" || operation == "%=";
+            result = emit_register_move(destination,
+                                        remainder ? *high : *accumulator,
+                                        location);
+        }
+        release_scratch(divisor_scratch);
+        if (high_owned) release_scratch(high);
+        if (accumulator_owned) release_scratch(accumulator);
+        return result;
+    }
+
+    bool apply_binary_rhs(std::string_view operation,
+                          const RegisterEntry& destination,
+                          const TypePtr& type, const Expr& right,
+                          SourceLocation location,
+                          const RegisterEntry* prepared_source = nullptr) {
+        if (operation == "/" || operation == "/=" || operation == "%" ||
+            operation == "%=") {
+            return apply_division_rhs(operation, destination, type, right,
+                                      location, prepared_source);
+        }
+        const auto instruction_name =
+            binary_instruction(operation, signed_integer_type(type));
+        if (!instruction_name) {
+            diagnostics_.error(location,
+                               "raw-compatible operator '" +
+                                   std::string(operation) +
+                                   "' has no spill-free target legalization");
+            return false;
+        }
+        if (prepared_source) {
+            return emit_binary_register(*instruction_name, destination,
+                                        *prepared_source, location);
+        }
+        const auto& source = unparenthesized(right);
+        if (const auto immediate = integer_literal(source)) {
+            if (emit_binary_immediate(*instruction_name, destination,
+                                      *immediate, location)) {
+                return true;
+            }
+            if (operation == "<<" || operation == "<<=" ||
+                operation == ">>" || operation == ">>=") {
+                diagnostics_.error(
+                    source.location,
+                    "raw-compatible shift count does not fit the target's immediate form");
+                return false;
+            }
+        }
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(source.text);
+            if (found != bindings_.end() &&
+                found->second->bits == destination.bits &&
+                found->second->register_class == destination.register_class) {
+                return emit_binary_register(*instruction_name, destination,
+                                            *found->second, location);
+            }
+        }
+        if (operation == "<<" || operation == "<<=" ||
+            operation == ">>" || operation == ">>=") {
+            diagnostics_.error(
+                source.location,
+                "raw-compatible variable shifts require an explicitly modeled count-register form");
+            return false;
+        }
+        const auto* scratch = acquire_scratch(type, source.location,
+                                              "expression temporary");
+        if (!scratch) return false;
+        const bool lowered = lower_inline_value(source, *scratch, type);
+        const bool emitted = lowered &&
+            emit_binary_register(*instruction_name, destination, *scratch,
+                                 location);
+        release_scratch(scratch);
+        return emitted;
+    }
+
+    bool lower_inline_boolean(const Expr& expression,
+                              const RegisterEntry& destination,
+                              const TypePtr& type) {
+        const auto yes = new_block(expression.location);
+        const auto no = new_block(expression.location);
+        const auto merge = new_block(expression.location);
+        if (!lower_raw_condition(expression, yes, no)) return false;
+        enter_block(yes);
+        const bool yes_ok = emit_integer_constant(destination, 1,
+                                                  expression.location);
+        if (current_block_) (void)terminate_jump(merge, expression.location);
+        enter_block(no);
+        const bool no_ok = emit_integer_constant(destination, 0,
+                                                 expression.location);
+        if (current_block_) (void)terminate_jump(merge, expression.location);
+        enter_block(merge);
+        (void)type;
+        return yes_ok && no_ok;
+    }
+
+    bool emit_float_constant(const Expr& expression,
+                             const RegisterEntry& destination,
+                             const TypePtr& type) {
+        const auto format = type->builtin == BuiltinType::F32
+                                ? floating::Format::Binary32
+                                : floating::Format::Binary64;
+        floating::Value value;
+        if (expression.evaluated_floating) {
+            const auto& evaluated = *expression.evaluated_floating;
+            const auto source_format = evaluated.type == BuiltinType::F32
+                ? floating::Format::Binary32
+                : evaluated.type == BuiltinType::F80
+                    ? floating::Format::Extended80
+                    : evaluated.type == BuiltinType::F128
+                        ? floating::Format::Binary128
+                        : floating::Format::Binary64;
+            value = {evaluated.bits, source_format};
+        } else {
+            auto literal = expression.text;
+            auto source_format = floating::Format::Binary64;
+            if (literal.ends_with("f32")) {
+                source_format = floating::Format::Binary32;
+                literal.resize(literal.size() - 3);
+            } else if (literal.ends_with("f80")) {
+                source_format = floating::Format::Extended80;
+                literal.resize(literal.size() - 3);
+            } else if (literal.ends_with("f128")) {
+                source_format = floating::Format::Binary128;
+                literal.resize(literal.size() - 4);
+            } else if (literal.ends_with("f64")) {
+                literal.resize(literal.size() - 3);
+            } else if (literal.ends_with("fptr")) {
+                literal.resize(literal.size() - 4);
+            }
+            const auto parsed = floating::parse(std::move(literal),
+                                                source_format);
+            if (!parsed) {
+                diagnostics_.error(expression.location,
+                                   "invalid raw-compatible floating literal");
+                return false;
+            }
+            value = *parsed;
+        }
+        value = floating::convert(value, format);
+        const auto* bits = acquire_scratch(
+            builtin_type(type->builtin == BuiltinType::F32
+                             ? BuiltinType::U32 : BuiltinType::U64),
+            expression.location, "floating constant bits");
+        if (!bits) return false;
+        const bool emitted =
+            emit_integer_constant(*bits, value.bits.low, expression.location) &&
+            emit_cross_class_move(type->builtin == BuiltinType::F32
+                                      ? "$::_movd" : "$::_movq",
+                                  destination, *bits, expression.location);
+        release_scratch(bits);
+        return emitted;
+    }
+
+    bool apply_float_binary_rhs(std::string_view operation,
+                                const RegisterEntry& destination,
+                                const TypePtr& type, const Expr& right,
+                                SourceLocation location,
+                                const RegisterEntry* prepared_source = nullptr) {
+        std::string_view instruction;
+        if (operation == "+" || operation == "+=") {
+            instruction = scalar_float_name(type, "$::_addss", "$::_addsd");
+        } else if (operation == "-" || operation == "-=") {
+            instruction = scalar_float_name(type, "$::_subss", "$::_subsd");
+        } else if (operation == "*" || operation == "*=") {
+            instruction = scalar_float_name(type, "$::_mulss", "$::_mulsd");
+        } else if (operation == "/" || operation == "/=") {
+            instruction = scalar_float_name(type, "$::_divss", "$::_divsd");
+        } else {
+            diagnostics_.error(location,
+                               "raw-compatible floating operator '" +
+                                   std::string(operation) +
+                                   "' has no spill-free target legalization");
+            return false;
+        }
+        if (prepared_source) {
+            return emit_binary_register(instruction, destination,
+                                        *prepared_source, location);
+        }
+        const auto& source = unparenthesized(right);
+        const auto source_type = expression_type(source, type);
+        if (is_floating(source_type) &&
+            (!raw_scalar_float_type(source_type) ||
+             source_type->builtin != type->builtin)) {
+            diagnostics_.error(source.location,
+                               "raw-compatible mixed floating arithmetic requires a legalized conversion");
+            return false;
+        }
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(source.text);
+            const auto found_type = binding_types_.find(source.text);
+            if (found != bindings_.end() &&
+                found_type != binding_types_.end() &&
+                raw_scalar_float_type(found_type->second) &&
+                found_type->second->builtin == type->builtin &&
+                found->second->register_class == "simd") {
+                return emit_binary_register(instruction, destination,
+                                            *found->second, location);
+            }
+        }
+        const auto* scratch = acquire_scratch(type, source.location,
+                                              "floating expression temporary");
+        if (!scratch) return false;
+        const bool emitted = lower_inline_value(source, *scratch, type) &&
+            emit_binary_register(instruction, destination, *scratch, location);
+        release_scratch(scratch);
+        return emitted;
+    }
+
+    bool expression_reads_storage(const Expr& expression,
+                                  std::string_view storage) const {
+        const auto& source = unparenthesized(expression);
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(source.text);
+            return found != bindings_.end() &&
+                   found->second->storage == storage;
+        }
+        for (const auto* child : {source.left.get(), source.right.get(),
+                                  source.third.get()}) {
+            if (child && expression_reads_storage(*child, storage)) return true;
+        }
+        for (const auto& argument : source.arguments) {
+            if (argument && expression_reads_storage(*argument, storage)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool direct_name_uses_storage(const Expr& expression,
+                                  std::string_view storage) const {
+        const auto& source = unparenthesized(expression);
+        if (source.kind != Expr::Kind::Name) return false;
+        const auto found = bindings_.find(source.text);
+        return found != bindings_.end() &&
+               found->second->storage == storage;
+    }
+
+    bool lower_inline_float_value(const Expr& expression,
+                                  const RegisterEntry& destination,
+                                  const TypePtr& type) {
+        const auto& source = unparenthesized(expression);
+        if (destination.register_class != "simd" || destination.bits != 128) {
+            diagnostics_.error(source.location,
+                               "raw-compatible f32/f64 value requires a SIMD register");
+            return false;
+        }
+        if (source.kind == Expr::Kind::Floating) {
+            return emit_float_constant(source, destination, type);
+        }
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(source.text);
+            const auto found_type = binding_types_.find(source.text);
+            if (found == bindings_.end() ||
+                found_type == binding_types_.end() ||
+                !raw_scalar_float_type(found_type->second) ||
+                found_type->second->builtin != type->builtin ||
+                found->second->register_class != "simd") {
+                diagnostics_.error(source.location,
+                                   "raw-compatible floating value requires a matching f32/f64 SIMD register; conversion is not yet legalized");
+                return false;
+            }
+            return emit_float_move(destination, *found->second, type,
+                                   source.location);
+        }
+        if ((source.kind == Expr::Kind::Unary && source.text == "*") ||
+            (source.kind == Expr::Kind::Binary && source.text == "index")) {
+            const auto address = memory_address(source, true);
+            return address && emit_float_load(destination, *address, type,
+                                              source.location);
+        }
+        if (source.kind == Expr::Kind::Unary && source.left &&
+            source.text == "+") {
+            return lower_inline_value(*source.left, destination, type);
+        }
+        if (source.kind == Expr::Kind::Unary && source.left &&
+            source.text == "-") {
+            if (!lower_inline_value(*source.left, destination, type)) {
+                return false;
+            }
+            const auto* sign = acquire_scratch(type, source.location,
+                                               "floating sign mask");
+            if (!sign) return false;
+            const auto* bits = acquire_scratch(
+                builtin_type(type->builtin == BuiltinType::F32
+                                 ? BuiltinType::U32 : BuiltinType::U64),
+                source.location, "floating sign bits");
+            if (!bits) {
+                release_scratch(sign);
+                return false;
+            }
+            const bool emitted =
+                emit_integer_constant(*bits,
+                    type->builtin == BuiltinType::F32
+                        ? UINT64_C(0x80000000)
+                        : UINT64_C(0x8000000000000000),
+                    source.location) &&
+                emit_cross_class_move(type->builtin == BuiltinType::F32
+                                          ? "$::_movd" : "$::_movq",
+                                      *sign, *bits, source.location) &&
+                emit_binary_register(type->builtin == BuiltinType::F32
+                                         ? "$::_xorps" : "$::_xorpd",
+                                     destination, *sign, source.location);
+            release_scratch(bits);
+            release_scratch(sign);
+            return emitted;
+        }
+        if (source.kind == Expr::Kind::Binary && source.left && source.right) {
+            const auto left_type = expression_type(*source.left, type);
+            if (is_floating(left_type) &&
+                (!raw_scalar_float_type(left_type) ||
+                 left_type->builtin != type->builtin)) {
+                diagnostics_.error(source.left->location,
+                                   "raw-compatible mixed floating arithmetic requires a legalized conversion");
+                return false;
+            }
+            const RegisterEntry* preserved = nullptr;
+            if (expression_reads_storage(*source.right, destination.storage) &&
+                !direct_name_uses_storage(*source.left,
+                                          destination.storage)) {
+                preserved = acquire_scratch(type, source.right->location,
+                                            "preserved floating operand");
+                if (!preserved) return false;
+                if (!lower_inline_value(*source.right, *preserved, type)) {
+                    release_scratch(preserved);
+                    return false;
+                }
+            }
+            const bool emitted =
+                lower_inline_value(*source.left, destination, type) &&
+                apply_float_binary_rhs(source.text, destination, type,
+                                       *source.right, source.location,
+                                       preserved);
+            release_scratch(preserved);
+            return emitted;
+        }
+        if (source.kind == Expr::Kind::Conditional && source.left &&
+            source.right && source.third) {
+            if (const auto condition = raw_constant_condition(*source.left)) {
+                return lower_inline_value(
+                    *(*condition ? source.right : source.third), destination,
+                    type);
+            }
+            const auto yes = new_block(source.right->location);
+            const auto no = new_block(source.third->location);
+            const auto merge = new_block(source.location);
+            if (!lower_raw_condition(*source.left, yes, no)) return false;
+            enter_block(yes);
+            const bool yes_ok = lower_inline_value(*source.right, destination,
+                                                   type);
+            if (current_block_) (void)terminate_jump(merge, source.location);
+            enter_block(no);
+            const bool no_ok = lower_inline_value(*source.third, destination,
+                                                  type);
+            if (current_block_) (void)terminate_jump(merge, source.location);
+            enter_block(merge);
+            return yes_ok && no_ok;
+        }
+        if (source.kind == Expr::Kind::Assign) {
+            const auto assigned_type = source.left
+                ? expression_type(*source.left) : TypePtr{};
+            if (!raw_scalar_float_type(assigned_type) ||
+                assigned_type->builtin != type->builtin) {
+                diagnostics_.error(source.location,
+                                   "raw-compatible floating assignment value requires a matching f32/f64 type");
+                return false;
+            }
+            return lower_inline_assignment(source, &destination);
+        }
+        if (source.kind == Expr::Kind::Call) {
+            const auto call_type = expression_type(source);
+            if (!raw_scalar_float_type(call_type) ||
+                call_type->builtin != type->builtin) {
+                diagnostics_.error(source.location,
+                                   "raw-compatible floating call result requires a matching f32/f64 type");
+                return false;
+            }
+            return lower_raw_inline_call(source, &destination);
+        }
+        diagnostics_.error(source.location,
+                           "raw-compatible floating expression cannot be legalized without a call, stack object, or spill");
+        return false;
+    }
+
+    bool lower_inline_value(const Expr& expression,
+                            const RegisterEntry& destination,
+                            const TypePtr& type) {
+        const auto& source = unparenthesized(expression);
+        if (raw_scalar_float_type(type)) {
+            return lower_inline_float_value(source, destination, type);
+        }
+        if (!raw_integer_type(type) || destination.register_class != "integer" ||
+            destination.bits != type_bits(type)) {
+            diagnostics_.error(
+                source.location,
+                "raw-compatible scalar lowering currently requires an integer or pointer value of at most 64 bits in a matching GPR");
+            return false;
+        }
+        if (const auto immediate = integer_literal(source)) {
+            return emit_integer_constant(destination, *immediate,
+                                         source.location);
+        }
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(source.text);
+            if (found == bindings_.end()) {
+                diagnostics_.error(source.location,
+                                   "raw-compatible value refers to unavailable object '" +
+                                       source.text + "'");
+                return false;
+            }
+            const auto* view = integer_storage_view(found->second->storage,
+                                                    destination.bits);
+            if (!view) {
+                diagnostics_.error(source.location,
+                                   "raw-compatible value has no matching physical register view");
+                return false;
+            }
+            return emit_register_move(destination, *view, source.location);
+        }
+        if ((source.kind == Expr::Kind::Unary && source.text == "*") ||
+            (source.kind == Expr::Kind::Binary && source.text == "index")) {
+            const auto address = memory_address(source, true);
+            return address && emit_load(destination, *address, source.location);
+        }
+        if (source.kind == Expr::Kind::Cast && source.left) {
+            const auto source_type = expression_type(*source.left, type);
+            return lower_integer_cast(*source.left, destination, type,
+                                      source_type);
+        }
+        if (source.kind == Expr::Kind::Unary && source.left) {
+            if (source.text == "&") {
+                diagnostics_.error(
+                    source.location,
+                    "raw_inline cannot take the address of an automatic scalar local");
+                return false;
+            }
+            if (source.text == "+") {
+                return lower_inline_value(*source.left, destination, type);
+            }
+            if (source.text == "-" || source.text == "~") {
+                if (!lower_inline_value(*source.left, destination, type)) {
+                    return false;
+                }
+                return emit_unary(source.text == "-" ? "$::_neg" : "$::_not",
+                                  destination, source.location);
+            }
+            if (source.text == "!") {
+                return lower_inline_boolean(source, destination, type);
+            }
+        }
+        if (source.kind == Expr::Kind::Binary && source.left && source.right) {
+            if (comparison_operator(source.text) || source.text == "&&" ||
+                source.text == "||") {
+                return lower_inline_boolean(source, destination, type);
+            }
+            const RegisterEntry* preserved = nullptr;
+            if (expression_reads_storage(*source.right, destination.storage) &&
+                !direct_name_uses_storage(*source.left,
+                                          destination.storage)) {
+                preserved = acquire_scratch(type, source.right->location,
+                                            "preserved expression operand");
+                if (!preserved) return false;
+                if (!lower_inline_value(*source.right, *preserved, type)) {
+                    release_scratch(preserved);
+                    return false;
+                }
+            }
+            const bool emitted =
+                lower_inline_value(*source.left, destination, type) &&
+                apply_binary_rhs(source.text, destination, type,
+                                 *source.right, source.location, preserved);
+            release_scratch(preserved);
+            return emitted;
+        }
+        if (source.kind == Expr::Kind::Conditional && source.left &&
+            source.right && source.third) {
+            if (const auto condition = raw_constant_condition(*source.left)) {
+                return lower_inline_value(
+                    *(*condition ? source.right : source.third), destination,
+                    type);
+            }
+            const auto yes = new_block(source.right->location);
+            const auto no = new_block(source.third->location);
+            const auto merge = new_block(source.location);
+            if (!lower_raw_condition(*source.left, yes, no)) return false;
+            enter_block(yes);
+            const bool yes_ok =
+                lower_inline_value(*source.right, destination, type);
+            if (current_block_) (void)terminate_jump(merge, source.location);
+            enter_block(no);
+            const bool no_ok =
+                lower_inline_value(*source.third, destination, type);
+            if (current_block_) (void)terminate_jump(merge, source.location);
+            enter_block(merge);
+            return yes_ok && no_ok;
+        }
+        if (source.kind == Expr::Kind::Assign) {
+            return lower_inline_assignment(source, &destination);
+        }
+        if (source.kind == Expr::Kind::Call) {
+            return lower_raw_inline_call(source, &destination);
+        }
+        diagnostics_.error(
+            source.location,
+            "raw-compatible expression cannot be legalized without a call, stack object, or spill");
+        return false;
+    }
+
+    bool lower_inline_assignment(const Expr& expression,
+                                 const RegisterEntry* value_destination) {
+        if (!expression.left || !expression.right) {
+            diagnostics_.error(expression.location,
+                               "raw-compatible assignment is incomplete");
+            return false;
+        }
+        const auto& destination_expression =
+            unparenthesized(*expression.left);
+        if (destination_expression.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(destination_expression.text);
+            const auto type_found =
+                binding_types_.find(destination_expression.text);
+            if (found == bindings_.end() || type_found == binding_types_.end()) {
+                diagnostics_.error(
+                    destination_expression.location,
+                    "raw assignment destination is not an available scalar register");
+                return false;
+            }
+            if (!inline_frames_.empty() &&
+                inline_frames_.back().readonly_names.contains(
+                    destination_expression.text)) {
+                diagnostics_.error(
+                    destination_expression.location,
+                    "raw_inline cannot modify an 'in' parameter; copy it to a local first");
+                return false;
+            }
+            bool lowered{};
+            if (expression.text == "=") {
+                lowered = lower_inline_value(*expression.right, *found->second,
+                                             type_found->second);
+            } else {
+                lowered = raw_scalar_float_type(type_found->second)
+                    ? apply_float_binary_rhs(expression.text, *found->second,
+                                             type_found->second,
+                                             *expression.right,
+                                             expression.location)
+                    : apply_binary_rhs(expression.text, *found->second,
+                                       type_found->second, *expression.right,
+                                       expression.location);
+            }
+            if (!lowered || !value_destination) return lowered;
+            const auto* view = raw_scalar_float_type(type_found->second)
+                ? storage_view(found->second->storage, type_found->second)
+                : integer_storage_view(found->second->storage,
+                                       value_destination->bits);
+            if (!view) {
+                diagnostics_.error(
+                    expression.location,
+                    "raw-compatible assignment result has no matching register view");
+                return false;
+            }
+            return emit_value_move(*value_destination, *view,
+                                   type_found->second, expression.location);
+        }
+        if (expression.text != "=" ||
+            !((destination_expression.kind == Expr::Kind::Unary &&
+               destination_expression.text == "*") ||
+              (destination_expression.kind == Expr::Kind::Binary &&
+               destination_expression.text == "index"))) {
+            diagnostics_.error(
+                destination_expression.location,
+                "raw-compatible assignment requires a scalar local/register or pointer lvalue");
+            return false;
+        }
+        const auto address = memory_address(destination_expression, true);
+        if (!address) return false;
+        const auto* scratch = acquire_scratch(address->pointee,
+                                              expression.location,
+                                              "store value");
+        if (!scratch) return false;
+        bool lowered = lower_inline_value(*expression.right, *scratch,
+                                          address->pointee);
+        if (lowered && value_destination) {
+            const auto* view = raw_scalar_float_type(address->pointee)
+                ? storage_view(scratch->storage, address->pointee)
+                : integer_storage_view(scratch->storage,
+                                       value_destination->bits);
+            lowered = view && emit_value_move(*value_destination, *view,
+                                              address->pointee,
+                                              expression.location);
+        }
+        if (lowered) {
+            lowered = raw_scalar_float_type(address->pointee)
+                ? emit_float_store(*address, *scratch, address->pointee,
+                                   expression.location)
+                : emit_store(*address, *scratch, expression.location);
+        }
+        release_scratch(scratch);
+        return lowered;
+    }
+
+    bool lower_raw_inline_call(const Expr& expression,
+                               const RegisterEntry* destination) {
+        if (!expression.left || expression.left->kind != Expr::Kind::Name) {
+            diagnostics_.error(expression.location,
+                               "raw-compatible call must name a direct raw_inline function");
+            return false;
+        }
+        const auto* callee = raw_inline_function(expression.left->text);
+        if (!callee || !callee->definition || !callee->definition->body) {
+            diagnostics_.error(
+                expression.location,
+                "ordinary or indirect calls are not permitted in a naked function");
+            return false;
+        }
+        if (expression.arguments.size() != callee->definition->parameters.size()) {
+            diagnostics_.error(expression.location,
+                               "raw_inline argument count does not match '" +
+                                   callee->source_name + "'");
+            return false;
+        }
+        if (inline_call_stack_.size() >= 128 ||
+            std::find(inline_call_stack_.begin(), inline_call_stack_.end(),
+                      callee->id.value) != inline_call_stack_.end()) {
+            diagnostics_.error(
+                expression.location,
+                "recursive raw_inline call cannot be completely eliminated");
+            return false;
+        }
+        const auto& result_type = callee->definition->return_type;
+        const bool returns_void =
+            result_type && result_type->kind == Type::Kind::Builtin &&
+            result_type->builtin == BuiltinType::Void;
+        if (returns_void == (destination != nullptr)) {
+            diagnostics_.error(
+                expression.location,
+                returns_void
+                    ? "void raw_inline call cannot produce a scalar value"
+                    : "non-void raw_inline call requires a destination");
+            return false;
+        }
+        if (destination && !raw_binding_type(*destination, result_type)) {
+            diagnostics_.error(
+                expression.location,
+                "raw_inline result type does not match the physical destination register");
+            return false;
+        }
+
+        auto saved_bindings = bindings_;
+        auto saved_types = binding_types_;
+        auto saved_signed = binding_signed_;
+        auto saved_labels = label_bindings_;
+        std::vector<const RegisterEntry*> owned;
+        std::unordered_set<std::string> readonly_names;
+        const auto cleanup = [&] {
+            for (const auto* entry : owned) release_scratch(entry);
+            bindings_ = std::move(saved_bindings);
+            binding_types_ = std::move(saved_types);
+            binding_signed_ = std::move(saved_signed);
+            label_bindings_ = std::move(saved_labels);
+        };
+
+        std::vector<const RegisterEntry*> parameter_bindings;
+        parameter_bindings.reserve(callee->definition->parameters.size());
+        for (std::size_t index = 0;
+             index < callee->definition->parameters.size(); ++index) {
+            const auto& parameter = callee->definition->parameters[index];
+            const auto& argument =
+                unparenthesized(*expression.arguments[index]);
+            const RegisterEntry* binding = nullptr;
+            if (argument.kind == Expr::Kind::Name) {
+                const auto found = saved_bindings.find(argument.text);
+                const auto found_type = saved_types.find(argument.text);
+                const bool floating_mismatch =
+                    raw_scalar_float_type(parameter.type) &&
+                    (found_type == saved_types.end() ||
+                     !raw_scalar_float_type(found_type->second) ||
+                     found_type->second->builtin != parameter.type->builtin);
+                if (found != saved_bindings.end() && !floating_mismatch) {
+                    binding = storage_view(found->second->storage,
+                                           parameter.type);
+                }
+            }
+            if (!binding) {
+                binding = acquire_scratch(parameter.type, argument.location,
+                                          "raw_inline argument");
+                if (!binding) {
+                    cleanup();
+                    return false;
+                }
+                owned.push_back(binding);
+                if (!lower_inline_value(argument, *binding, parameter.type)) {
+                    cleanup();
+                    return false;
+                }
+            }
+            parameter_bindings.push_back(binding);
+        }
+        for (std::size_t index = 0;
+             index < callee->definition->parameters.size(); ++index) {
+            const auto& parameter = callee->definition->parameters[index];
+            const auto* binding = parameter_bindings[index];
+            bindings_[parameter.name] = binding;
+            binding_types_[parameter.name] = parameter.type;
+            binding_signed_[parameter.name] =
+                signed_integer_type(parameter.type);
+            readonly_names.insert(parameter.name);
+        }
+
+        const auto continuation = new_block(expression.location);
+        inline_call_stack_.push_back(callee->id.value);
+        inline_frames_.push_back(
+            {callee, destination, result_type, continuation,
+             std::move(owned), std::move(readonly_names), loops_.size(),
+             break_targets_.size(), false});
+        lower_statement(*callee->definition->body);
+        auto frame = std::move(inline_frames_.back());
+        inline_frames_.pop_back();
+        inline_call_stack_.pop_back();
+        owned = std::move(frame.owned);
+        if (current_block_) {
+            if (!returns_void) {
+                diagnostics_.error(
+                    callee->location,
+                    "raw_inline function can reach the end without returning a value");
+            }
+            (void)terminate_jump(continuation, expression.location);
+        }
+        cleanup();
+        enter_block(continuation);
+        return frame.saw_return || returns_void;
+    }
+
+    void lower_inline_return(const Statement& statement) {
+        const auto* result = inline_frames_.back().result;
+        const auto result_type = inline_frames_.back().result_type;
+        const auto return_target = inline_frames_.back().return_target;
+        const bool returns_void =
+            result_type && result_type->kind == Type::Kind::Builtin &&
+            result_type->builtin == BuiltinType::Void;
+        if (returns_void) {
+            if (statement.expression) {
+                diagnostics_.error(statement.location,
+                                   "void raw_inline function cannot return a value");
+            }
+        } else if (!statement.expression || !result) {
+            diagnostics_.error(statement.location,
+                               "non-void raw_inline function must return a value");
+        } else {
+            (void)lower_inline_value(*statement.expression, *result,
+                                     result_type);
+        }
+        inline_frames_.back().saw_return = true;
+        if (current_block_) {
+            (void)terminate_jump(return_target, statement.location);
+        }
+    }
+
     void lower_expression_statement(const Expr& expression) {
         if (expression.kind == Expr::Kind::Assign) {
             lower_raw_assignment(expression);
             return;
+        }
+        if (!inline_frames_.empty() &&
+            expression.kind == Expr::Kind::Unary && expression.left &&
+            (expression.text == "++" || expression.text == "--" ||
+             expression.text == "post++" || expression.text == "post--")) {
+            const auto& subject = unparenthesized(*expression.left);
+            if (subject.kind != Expr::Kind::Name) {
+                diagnostics_.error(expression.location,
+                                   "raw-compatible increment requires a scalar local");
+                return;
+            }
+            const auto found = bindings_.find(subject.text);
+            if (found == bindings_.end()) {
+                diagnostics_.error(subject.location,
+                                   "raw-compatible increment refers to an unavailable local");
+                return;
+            }
+            (void)emit_unary((expression.text == "++" ||
+                              expression.text == "post++")
+                                 ? "$::_inc"
+                                 : "$::_dec",
+                             *found->second, expression.location);
+            return;
+        }
+        if (expression.kind == Expr::Kind::Call && expression.left &&
+            expression.left->kind == Expr::Kind::Name) {
+            if (const auto* callee =
+                    raw_inline_function(expression.left->text)) {
+                const auto& result_type = callee->definition->return_type;
+                const bool returns_void =
+                    result_type && result_type->kind == Type::Kind::Builtin &&
+                    result_type->builtin == BuiltinType::Void;
+                const RegisterEntry* discarded = nullptr;
+                if (!returns_void) {
+                    discarded = acquire_scratch(result_type,
+                                                expression.location,
+                                                "discarded raw_inline result");
+                    if (!discarded) return;
+                }
+                (void)lower_raw_inline_call(expression, discarded);
+                release_scratch(discarded);
+                return;
+            }
         }
         if (expression.kind != Expr::Kind::Call || !expression.left ||
             expression.left->kind != Expr::Kind::Name) {
@@ -1129,6 +2697,15 @@ private:
         const auto* form = select_instruction(name, expression.arguments,
                                               expression.location);
         if (!form) return;
+        if (!inline_frames_.empty() &&
+            (form->control != InstructionControlEffect::None ||
+             form->stack_delta != 0 || form->ordered_stack_delta != 0 ||
+             form->ordered_stack_reset)) {
+            diagnostics_.error(
+                expression.location,
+                "raw_inline body cannot perform a raw control transfer or alter machine stack state");
+            return;
+        }
         mir::Instruction instruction{expression.location, form, {}};
         for (std::size_t index = 0; index < form->operands.size(); ++index) {
             auto operand = lower_operand(*expression.arguments[index], form->operands[index]);
@@ -1205,12 +2782,144 @@ private:
         return left >= right;
     }
 
+    static std::optional<bool> raw_constant_condition(
+        const Expr& expression) {
+        const auto& source = unparenthesized(expression);
+        if (const auto value = integer_literal(source)) return *value != 0;
+        if (source.kind == Expr::Kind::Unary && source.left &&
+            source.text == "!") {
+            const auto value = raw_constant_condition(*source.left);
+            return value ? std::optional<bool>{!*value} : std::nullopt;
+        }
+        if (source.kind == Expr::Kind::Binary && source.left && source.right) {
+            if (source.text == "&&") {
+                const auto left = raw_constant_condition(*source.left);
+                if (left && !*left) return false;
+                const auto right = raw_constant_condition(*source.right);
+                if (left && right) return *left && *right;
+                return std::nullopt;
+            }
+            if (source.text == "||") {
+                const auto left = raw_constant_condition(*source.left);
+                if (left && *left) return true;
+                const auto right = raw_constant_condition(*source.right);
+                if (left && right) return *left || *right;
+                return std::nullopt;
+            }
+            if (comparison_operator(source.text)) {
+                const auto left = integer_literal(*source.left);
+                const auto right = integer_literal(*source.right);
+                if (left && right) {
+                    return evaluate_constant_comparison(
+                        source.text, *left, *right,
+                        !explicitly_unsigned_literal(*source.left) &&
+                            !explicitly_unsigned_literal(*source.right));
+                }
+            }
+        }
+        if (source.kind == Expr::Kind::Conditional && source.left &&
+            source.right && source.third) {
+            const auto condition = raw_constant_condition(*source.left);
+            if (condition) {
+                return raw_constant_condition(
+                    *(*condition ? source.right : source.third));
+            }
+        }
+        return std::nullopt;
+    }
+
     bool lower_raw_comparison(const Expr& expression,
                               mir::BlockId true_target,
                               mir::BlockId false_target) {
         const Expr* left = &unparenthesized(*expression.left);
         const Expr* right = &unparenthesized(*expression.right);
         auto operation = std::string_view(expression.text);
+        auto comparison_type = expression_type(*left, expression_type(*right));
+        if (raw_scalar_float_type(comparison_type)) {
+            const auto right_type = expression_type(*right);
+            if (is_floating(right_type) &&
+                right_type->builtin != comparison_type->builtin) {
+                diagnostics_.error(expression.location,
+                                   "raw-compatible mixed f32/f64 comparison requires an explicit legalized conversion");
+                return false;
+            }
+            const RegisterEntry* left_register = nullptr;
+            const RegisterEntry* left_scratch = nullptr;
+            if (left->kind == Expr::Kind::Name) {
+                const auto found = bindings_.find(left->text);
+                if (found != bindings_.end()) left_register = found->second;
+            }
+            if (!left_register) {
+                left_scratch = acquire_scratch(comparison_type, left->location,
+                                               "floating comparison value");
+                left_register = left_scratch;
+                if (!left_register ||
+                    !lower_inline_value(*left, *left_register,
+                                        comparison_type)) {
+                    release_scratch(left_scratch);
+                    return false;
+                }
+            }
+            const RegisterEntry* right_register = nullptr;
+            const RegisterEntry* right_scratch = nullptr;
+            if (right->kind == Expr::Kind::Name) {
+                const auto found = bindings_.find(right->text);
+                if (found != bindings_.end()) right_register = found->second;
+            }
+            if (!right_register) {
+                right_scratch = acquire_scratch(comparison_type,
+                                                right->location,
+                                                "floating comparison temporary");
+                right_register = right_scratch;
+                if (!right_register ||
+                    !lower_inline_value(*right, *right_register,
+                                        comparison_type)) {
+                    release_scratch(right_scratch);
+                    release_scratch(left_scratch);
+                    return false;
+                }
+            }
+            const auto* compare = binary_register_form(
+                scalar_float_name(comparison_type, "$::_ucomiss",
+                                  "$::_ucomisd"),
+                *left_register, *right_register);
+            if (!compare) {
+                diagnostics_.error(expression.location,
+                                   "selected target has no spill-free floating comparison form");
+                release_scratch(right_scratch);
+                release_scratch(left_scratch);
+                return false;
+            }
+            mir::Instruction instruction{expression.location, compare, {}};
+            instruction.operands.push_back(
+                register_operand(*left_register, left->location));
+            instruction.operands.push_back(
+                register_operand(*right_register, right->location));
+            append_instruction(std::move(instruction));
+            release_scratch(right_scratch);
+            release_scratch(left_scratch);
+
+            std::string_view branch;
+            if (operation == "==") branch = "$::_je";
+            else if (operation == "!=") branch = "$::_jne";
+            else if (operation == "<") branch = "$::_jb";
+            else if (operation == "<=") branch = "$::_jbe";
+            else if (operation == ">") branch = "$::_ja";
+            else branch = "$::_jae";
+            if (operation == "==" || operation == "!=" ||
+                operation == "<" || operation == "<=") {
+                const auto ordered = new_block(expression.location);
+                if (!terminate_condition("$::_jp",
+                                         operation == "!=" ? true_target
+                                                           : false_target,
+                                         ordered, expression.location)) {
+                    return false;
+                }
+                enter_block(ordered);
+            }
+            return terminate_condition(branch, true_target, false_target,
+                                       expression.location);
+        }
         const auto left_constant = integer_literal(*left);
         const auto right_constant = integer_literal(*right);
         if (left_constant && right_constant) {
@@ -1229,36 +2938,88 @@ private:
             std::swap(left, right);
             operation = swapped_comparison(operation);
         }
-        if (left->kind != Expr::Kind::Name) {
+        const RegisterEntry* left_register = nullptr;
+        const RegisterEntry* left_scratch = nullptr;
+        TypePtr left_type = expression_type(*left);
+        if (left->kind == Expr::Kind::Name) {
+            const auto binding = bindings_.find(left->text);
+            if (binding != bindings_.end()) left_register = binding->second;
+        }
+        if (!left_register && !inline_frames_.empty()) {
+            left_type = expression_type(*left, expression_type(*right));
+            left_scratch = acquire_scratch(left_type, left->location,
+                                           "comparison value");
+            left_register = left_scratch;
+            if (left_register &&
+                !lower_inline_value(*left, *left_register, left_type)) {
+                release_scratch(left_scratch);
+                return false;
+            }
+        }
+        if (!left_register || left_register->register_class != "integer" ||
+            left_register->bits > 64) {
             diagnostics_.error(
                 left->location,
-                "raw condition comparison requires a hard-bound register on one side");
+                "raw condition comparison requires an integer or pointer GPR value");
+            release_scratch(left_scratch);
             return false;
         }
-        const auto left_binding = bindings_.find(left->text);
-        if (left_binding == bindings_.end() ||
-            left_binding->second->register_class != "integer" ||
-            left_binding->second->bits != 64) {
-            diagnostics_.error(
-                left->location,
-                "raw structured conditions currently require a 64-bit hard-bound GPR");
-            return false;
+
+        const InstructionEntry* compare = nullptr;
+        mir::Operand right_operand;
+        const RegisterEntry* right_scratch = nullptr;
+        if (const auto immediate = integer_literal(*right)) {
+            compare = binary_immediate_form("$::_cmp", *left_register,
+                                            *immediate);
+            if (compare) {
+                right_operand = immediate_operand(
+                    *immediate, compare->operands[1].immediate_bits,
+                    right->location);
+            }
         }
-        const auto* compare = find_instruction(target_, "$::_cmp");
-        if (!compare || compare->operands.size() != 2) {
+        if (!compare && right->kind == Expr::Kind::Name) {
+            const auto binding = bindings_.find(right->text);
+            if (binding != bindings_.end()) {
+                const auto* view = integer_storage_view(
+                    binding->second->storage, left_register->bits);
+                if (view) {
+                    compare = binary_register_form("$::_cmp", *left_register,
+                                                   *view);
+                    if (compare) {
+                        right_operand = register_operand(*view,
+                                                         right->location);
+                    }
+                }
+            }
+        }
+        if (!compare && !inline_frames_.empty()) {
+            if (!left_type) left_type = expression_type(*right);
+            right_scratch = acquire_scratch(left_type, right->location,
+                                            "comparison temporary");
+            if (right_scratch &&
+                lower_inline_value(*right, *right_scratch, left_type)) {
+                compare = binary_register_form("$::_cmp", *left_register,
+                                               *right_scratch);
+                if (compare) {
+                    right_operand = register_operand(*right_scratch,
+                                                     right->location);
+                }
+            }
+        }
+        if (!compare) {
             diagnostics_.error(expression.location,
-                               "selected target has no raw integer comparison form");
+                               "selected target has no spill-free integer comparison form");
+            release_scratch(right_scratch);
+            release_scratch(left_scratch);
             return false;
         }
-        auto left_operand = lower_operand(*left, compare->operands[0]);
-        auto right_operand = lower_operand(*right, compare->operands[1]);
-        if (!left_operand || !right_operand) return false;
         mir::Instruction instruction{expression.location, compare, {}};
-        instruction.operands.push_back(std::move(*left_operand));
-        instruction.operands.push_back(std::move(*right_operand));
+        instruction.operands.push_back(
+            register_operand(*left_register, left->location));
+        instruction.operands.push_back(std::move(right_operand));
         append_instruction(std::move(instruction));
 
-        bool signed_comparison = binding_signed_.at(left->text);
+        bool signed_comparison = signed_integer_type(left_type);
         if (right->kind == Expr::Kind::Name) {
             const auto found = binding_signed_.find(right->text);
             signed_comparison = signed_comparison &&
@@ -1266,6 +3027,9 @@ private:
         } else if (explicitly_unsigned_literal(*right)) {
             signed_comparison = false;
         }
+
+        release_scratch(right_scratch);
+        release_scratch(left_scratch);
 
         std::string_view branch;
         if (operation == "==") branch = "$::_je";
@@ -1283,8 +3047,8 @@ private:
                              mir::BlockId false_target) {
         if (!current_block_) return false;
         const auto& source = unparenthesized(expression);
-        if (const auto constant = integer_literal(source)) {
-            return terminate_jump(*constant != 0 ? true_target : false_target,
+        if (const auto constant = raw_constant_condition(source)) {
+            return terminate_jump(*constant ? true_target : false_target,
                                   source.location);
         }
         if (source.kind == Expr::Kind::Unary && source.left &&
@@ -1321,6 +3085,11 @@ private:
         }
         if (source.kind == Expr::Kind::Conditional && source.left &&
             source.right && source.third) {
+            if (const auto condition = raw_constant_condition(*source.left)) {
+                return lower_raw_condition(
+                    *(*condition ? source.right : source.third), true_target,
+                    false_target);
+            }
             const auto yes = new_block(source.right->location);
             const auto no = new_block(source.third->location);
             if (!lower_raw_condition(*source.left, yes, no)) return false;
@@ -1332,30 +3101,75 @@ private:
                                                    false_target);
             return yes_ok && no_ok;
         }
-        if (source.kind != Expr::Kind::Name) {
+        const RegisterEntry* condition_register = nullptr;
+        const RegisterEntry* condition_scratch = nullptr;
+        const auto condition_type = expression_type(source);
+        if (source.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(source.text);
+            if (found != bindings_.end()) condition_register = found->second;
+        } else {
+            condition_scratch = acquire_scratch(condition_type, source.location,
+                                                "condition value");
+            condition_register = condition_scratch;
+            if (condition_register &&
+                !lower_inline_value(source, *condition_register,
+                                    condition_type)) {
+                release_scratch(condition_scratch);
+                return false;
+            }
+        }
+        if (condition_register && raw_scalar_float_type(condition_type)) {
+            const auto* zero = acquire_scratch(condition_type,
+                                               source.location,
+                                               "floating condition zero");
+            if (!zero) {
+                release_scratch(condition_scratch);
+                return false;
+            }
+            Expr zero_literal;
+            zero_literal.kind = Expr::Kind::Floating;
+            zero_literal.location = source.location;
+            zero_literal.text = condition_type->builtin == BuiltinType::F32
+                ? "0.0f32" : "0.0f64";
+            const bool compared =
+                emit_float_constant(zero_literal, *zero, condition_type) &&
+                emit_binary_register(scalar_float_name(condition_type,
+                    "$::_ucomiss", "$::_ucomisd"),
+                    *condition_register, *zero, source.location);
+            release_scratch(zero);
+            release_scratch(condition_scratch);
+            if (!compared) return false;
+            const auto ordered = new_block(source.location);
+            if (!terminate_condition("$::_jp", true_target, ordered,
+                                     source.location)) {
+                return false;
+            }
+            enter_block(ordered);
+            return terminate_condition("$::_jne", true_target, false_target,
+                                       source.location);
+        }
+        if (!condition_register ||
+            condition_register->register_class != "integer" ||
+            condition_register->bits > 64) {
             diagnostics_.error(
                 source.location,
-                "raw structured condition must be a constant, hard-bound register, comparison, or short-circuit expression");
+                "raw structured condition requires an integer or pointer GPR value");
+            release_scratch(condition_scratch);
             return false;
         }
-        const auto found = bindings_.find(source.text);
-        if (found == bindings_.end() ||
-            found->second->register_class != "integer" ||
-            found->second->bits != 64) {
-            diagnostics_.error(
-                source.location,
-                "raw structured conditions currently require a 64-bit hard-bound GPR");
+        const auto* compare = binary_immediate_form("$::_cmp", *condition_register,
+                                                    0);
+        if (!compare) {
+            release_scratch(condition_scratch);
             return false;
         }
-        const auto* compare = find_instruction(target_, "$::_cmp");
-        if (!compare || compare->operands.size() != 2) return false;
-        auto register_value = lower_operand(source, compare->operands[0]);
-        auto zero = immediate_operand(0, 32, source.location);
-        if (!register_value) return false;
         mir::Instruction instruction{source.location, compare, {}};
-        instruction.operands.push_back(std::move(*register_value));
-        instruction.operands.push_back(std::move(zero));
+        instruction.operands.push_back(
+            register_operand(*condition_register, source.location));
+        instruction.operands.push_back(immediate_operand(
+            0, compare->operands[1].immediate_bits, source.location));
         append_instruction(std::move(instruction));
+        release_scratch(condition_scratch);
         return terminate_condition("$::_jne", true_target, false_target,
                                    source.location);
     }
@@ -1363,6 +3177,14 @@ private:
     void lower_if(const Statement& statement) {
         if (!statement.condition || !statement.first ||
             !require_current(statement.location)) return;
+        if (const auto condition = raw_constant_condition(*statement.condition)) {
+            if (*condition) {
+                lower_statement(*statement.first);
+            } else if (statement.second) {
+                lower_statement(*statement.second);
+            }
+            return;
+        }
         const auto then_block = new_block(statement.first->location);
         const auto else_block = new_block(
             statement.second ? statement.second->location : statement.location);
@@ -1382,9 +3204,225 @@ private:
         if (then_reaches || else_reaches) enter_block(merge_block);
     }
 
+    static void flatten_switch_body(const Statement& statement,
+                                    std::vector<const Statement*>& sequence) {
+        if (statement.kind == Statement::Kind::Compound) {
+            for (const auto& child : statement.statements) {
+                flatten_switch_body(*child, sequence);
+            }
+            return;
+        }
+        sequence.push_back(&statement);
+        if ((statement.kind == Statement::Kind::Case ||
+             statement.kind == Statement::Kind::Default) &&
+            statement.first) {
+            flatten_switch_body(*statement.first, sequence);
+        }
+    }
+
+    bool emit_switch_compare(const RegisterEntry& selector,
+                             const TypePtr& selector_type,
+                             std::uint64_t value, mir::BlockId match,
+                             mir::BlockId next, SourceLocation location) {
+        const InstructionEntry* compare =
+            binary_immediate_form("$::_cmp", selector, value);
+        const RegisterEntry* temporary = nullptr;
+        mir::Operand right;
+        if (compare) {
+            right = immediate_operand(value,
+                                      compare->operands[1].immediate_bits,
+                                      location);
+        } else {
+            temporary = acquire_scratch(selector_type, location,
+                                        "switch case value");
+            if (!temporary ||
+                !emit_integer_constant(*temporary, value, location)) {
+                release_scratch(temporary);
+                return false;
+            }
+            compare = binary_register_form("$::_cmp", selector, *temporary);
+            if (!compare) {
+                diagnostics_.error(
+                    location,
+                    "selected target has no spill-free switch comparison form");
+                release_scratch(temporary);
+                return false;
+            }
+            right = register_operand(*temporary, location);
+        }
+        mir::Instruction instruction{location, compare, {}};
+        instruction.operands.push_back(register_operand(selector, location));
+        instruction.operands.push_back(std::move(right));
+        append_instruction(std::move(instruction));
+        release_scratch(temporary);
+        return terminate_condition("$::_je", match, next, location);
+    }
+
+    void lower_switch(const Statement& statement) {
+        if (!statement.condition || !statement.first ||
+            !require_current(statement.location)) {
+            return;
+        }
+        std::vector<const Statement*> sequence;
+        flatten_switch_body(*statement.first, sequence);
+        std::vector<const Statement*> labels;
+        const Statement* fallback = nullptr;
+        std::unordered_set<std::uint64_t> values;
+        for (const auto* item : sequence) {
+            if (item->kind == Statement::Kind::Default) {
+                if (fallback) {
+                    diagnostics_.error(item->location,
+                                       "raw-compatible switch has more than one default label");
+                }
+                fallback = item;
+            } else if (item->kind == Statement::Kind::Case) {
+                const auto value = item->expression
+                    ? integer_literal(*item->expression)
+                    : std::nullopt;
+                if (!value) {
+                    diagnostics_.error(item->location,
+                                       "raw-compatible case requires an integer constant");
+                    continue;
+                }
+                if (!values.insert(*value).second) {
+                    diagnostics_.error(item->location,
+                                       "duplicate raw-compatible case value");
+                }
+                labels.push_back(item);
+            }
+        }
+        if (fallback) labels.push_back(fallback);
+
+        const auto end = new_block(statement.location);
+        auto saved_bindings = bindings_;
+        auto saved_types = binding_types_;
+        auto saved_signed = binding_signed_;
+        auto saved_labels = label_bindings_;
+        const auto owned_size = inline_frames_.empty()
+            ? std::size_t{0}
+            : inline_frames_.back().owned.size();
+        const auto restore_scope = [&] {
+            if (!inline_frames_.empty()) {
+                while (inline_frames_.back().owned.size() > owned_size) {
+                    release_scratch(inline_frames_.back().owned.back());
+                    inline_frames_.back().owned.pop_back();
+                }
+            }
+            bindings_ = std::move(saved_bindings);
+            binding_types_ = std::move(saved_types);
+            binding_signed_ = std::move(saved_signed);
+            label_bindings_ = std::move(saved_labels);
+        };
+
+        if (const auto selector = integer_literal(*statement.condition)) {
+            const Statement* selected = fallback;
+            for (const auto* label : labels) {
+                if (label->kind == Statement::Kind::Case && label->expression &&
+                    integer_literal(*label->expression) == selector) {
+                    selected = label;
+                    break;
+                }
+            }
+            if (!selected) {
+                restore_scope();
+                return;
+            }
+            bool active = false;
+            break_targets_.push_back(end);
+            for (const auto* item : sequence) {
+                if (item == selected) active = true;
+                if (!active || item->kind == Statement::Kind::Case ||
+                    item->kind == Statement::Kind::Default ||
+                    !current_block_) {
+                    continue;
+                }
+                lower_statement(*item);
+            }
+            break_targets_.pop_back();
+            if (current_block_) (void)terminate_jump(end, statement.location);
+            restore_scope();
+            enter_block(end);
+            return;
+        }
+
+        TypePtr selector_type = expression_type(*statement.condition);
+        const RegisterEntry* selector_register = nullptr;
+        const RegisterEntry* selector_scratch = nullptr;
+        const auto& selector_expression =
+            unparenthesized(*statement.condition);
+        if (selector_expression.kind == Expr::Kind::Name) {
+            const auto found = bindings_.find(selector_expression.text);
+            if (found != bindings_.end()) selector_register = found->second;
+        }
+        if (!selector_register) {
+            selector_scratch = acquire_scratch(
+                selector_type, statement.condition->location,
+                "switch selector");
+            selector_register = selector_scratch;
+            if (!selector_register ||
+                !lower_inline_value(*statement.condition, *selector_register,
+                                    selector_type)) {
+                release_scratch(selector_scratch);
+                restore_scope();
+                return;
+            }
+        }
+        if (!selector_type) {
+            selector_type = expression_type(selector_expression);
+        }
+
+        std::unordered_map<const Statement*, mir::BlockId> blocks;
+        for (const auto* label : labels) {
+            blocks.emplace(label, new_block(label->location));
+        }
+        std::vector<const Statement*> cases;
+        for (const auto* label : labels) {
+            if (label->kind == Statement::Kind::Case) cases.push_back(label);
+        }
+        for (std::size_t index = 0; index < cases.size(); ++index) {
+            const auto next = new_block(cases[index]->location);
+            const auto value = integer_literal(*cases[index]->expression);
+            if (!value || !emit_switch_compare(
+                              *selector_register, selector_type, *value,
+                              blocks.at(cases[index]), next,
+                              cases[index]->location)) {
+                release_scratch(selector_scratch);
+                restore_scope();
+                return;
+            }
+            enter_block(next);
+        }
+        (void)terminate_jump(fallback ? blocks.at(fallback) : end,
+                             statement.location);
+        release_scratch(selector_scratch);
+
+        bool saw_label = false;
+        break_targets_.push_back(end);
+        for (const auto* item : sequence) {
+            if (item->kind == Statement::Kind::Case ||
+                item->kind == Statement::Kind::Default) {
+                saw_label = true;
+                if (current_block_) {
+                    (void)terminate_jump(blocks.at(item), item->location);
+                }
+                enter_block(blocks.at(item));
+                continue;
+            }
+            if (saw_label && current_block_) lower_statement(*item);
+        }
+        break_targets_.pop_back();
+        if (current_block_) (void)terminate_jump(end, statement.location);
+        restore_scope();
+        enter_block(end);
+    }
+
     void lower_while(const Statement& statement) {
         if (!statement.condition || !statement.first ||
             !require_current(statement.location)) return;
+        if (const auto condition = raw_constant_condition(*statement.condition);
+            condition && !*condition) {
+            return;
+        }
         const auto test = new_block(statement.condition->location);
         const auto body = new_block(statement.first->location);
         const auto end = new_block(statement.location);
@@ -1393,7 +3431,9 @@ private:
         if (!lower_raw_condition(*statement.condition, body, end)) return;
         enter_block(body);
         loops_.push_back({end, test});
+        break_targets_.push_back(end);
         lower_statement(*statement.first);
+        break_targets_.pop_back();
         loops_.pop_back();
         if (current_block_) (void)terminate_jump(test, statement.location);
         enter_block(end);
@@ -1408,7 +3448,9 @@ private:
         (void)terminate_jump(body, statement.location);
         enter_block(body);
         loops_.push_back({end, test});
+        break_targets_.push_back(end);
         lower_statement(*statement.first);
+        break_targets_.pop_back();
         loops_.pop_back();
         if (current_block_) (void)terminate_jump(test, statement.location);
         enter_block(test);
@@ -1421,6 +3463,13 @@ private:
             !require_current(statement.location)) return;
         lower_statement(*statement.first);
         if (!current_block_) return;
+        if (statement.condition) {
+            if (const auto condition =
+                    raw_constant_condition(*statement.condition);
+                condition && !*condition) {
+                return;
+            }
+        }
         const auto test = new_block(statement.location);
         const auto body = new_block(statement.second->location);
         const auto increment = new_block(statement.location);
@@ -1434,7 +3483,9 @@ private:
         }
         enter_block(body);
         loops_.push_back({end, increment});
+        break_targets_.push_back(end);
         lower_statement(*statement.second);
+        break_targets_.pop_back();
         loops_.pop_back();
         if (current_block_) (void)terminate_jump(increment, statement.location);
         enter_block(increment);
@@ -1444,91 +3495,24 @@ private:
     }
 
     void lower_raw_assignment(const Expr& expression) {
-        if (expression.text != "=" || !expression.left || !expression.right ||
-            expression.left->kind != Expr::Kind::Name) {
-            diagnostics_.error(
-                expression.location,
-                "raw-compatible inlining requires a simple register assignment");
-            return;
-        }
-        const auto destination_found = bindings_.find(expression.left->text);
-        if (destination_found == bindings_.end()) {
-            diagnostics_.error(expression.left->location,
-                               "raw assignment destination is not a hard-bound register");
-            return;
-        }
-        const auto* destination = destination_found->second;
-        const auto& source = unparenthesized(*expression.right);
-        if (const auto immediate = integer_literal(source)) {
-            const auto* form = find_instruction(target_, "$::_movabs");
-            if (!form) return;
-            mir::Instruction instruction{expression.location, form, {}};
-            instruction.operands.push_back(
-                register_operand(*destination, expression.left->location));
-            instruction.operands.push_back(
-                immediate_operand(*immediate, 64, source.location));
-            append_instruction(std::move(instruction));
-            return;
-        }
-        if (source.kind != Expr::Kind::Binary || !source.left || !source.right) {
-            diagnostics_.error(
-                source.location,
-                "raw-inline result requires an expression legalizable without "
-                "a call, stack slot, or spill");
-            return;
-        }
-        const auto& binary_left = unparenthesized(*source.left);
-        if (binary_left.kind != Expr::Kind::Name) {
-            diagnostics_.error(
-                binary_left.location,
-                "raw-inline binary expression requires the destination register "
-                "as its left operand");
-            return;
-        }
-        const auto left_found = bindings_.find(binary_left.text);
-        if (left_found == bindings_.end() ||
-            left_found->second->storage != destination->storage) {
-            diagnostics_.error(
-                binary_left.location,
-                "raw-inline binary expression would require an undeclared "
-                "scratch register or spill");
-            return;
-        }
-        std::string_view instruction_name;
-        if (source.text == "+") instruction_name = "$::_add";
-        else if (source.text == "-") instruction_name = "$::_sub";
-        else if (source.text == "^") instruction_name = "$::_xor";
-        else if (source.text == "&") instruction_name = "$::_and";
-        else if (source.text == "|") instruction_name = "$::_or";
-        else if (source.text == "*") instruction_name = "$::_imul";
-        else if (source.text == "<<") instruction_name = "$::_shl";
-        else if (source.text == ">>") instruction_name = "$::_shr";
-        else {
-            diagnostics_.error(source.location,
-                               "raw-inline operator '" + source.text +
-                                   "' has no spill-free x86-64 legalization");
-            return;
-        }
-        const auto* form = find_instruction(target_, instruction_name);
-        if (!form) return;
-        mir::Instruction instruction{expression.location, form, {}};
-        instruction.operands.push_back(
-            register_operand(*destination, expression.left->location));
-        auto operand = lower_operand(unparenthesized(*source.right),
-                                     form->operands[1]);
-        if (!operand) {
-            diagnostics_.error(
-                source.right->location,
-                "raw-inline operand requires an unavailable scratch resource");
-            return;
-        }
-        instruction.operands.push_back(std::move(*operand));
-        append_instruction(std::move(instruction));
+        (void)lower_inline_assignment(expression, nullptr);
     }
 
     struct LoopContext {
         mir::BlockId break_target;
         mir::BlockId continue_target;
+    };
+
+    struct InlineFrame {
+        const hir::Function* function{};
+        const RegisterEntry* result{};
+        TypePtr result_type;
+        mir::BlockId return_target;
+        std::vector<const RegisterEntry*> owned;
+        std::unordered_set<std::string> readonly_names;
+        std::size_t loop_base{};
+        std::size_t break_base{};
+        bool saw_return{};
     };
 
     struct RawState {
@@ -1585,7 +3569,26 @@ private:
             auto& candidate = block(id);
             candidate.reachable = true;
             for (const auto& instruction : candidate.instructions) {
-                for (const auto& operand : instruction.operands) {
+                const auto diagnose_undefined = [&](std::string_view resource,
+                                                    SourceLocation location) {
+                    if (!tracked_resource(resource) ||
+                        state.defined_resources.contains(
+                            std::string(resource))) {
+                        return;
+                    }
+                    const auto key = std::to_string(location.offset) + ':' +
+                                     std::string(resource);
+                    if (undefined_resource_diagnostics.insert(key).second) {
+                        diagnostics_.error(
+                            location,
+                            "raw instruction reads undefined machine resource '" +
+                                std::string(resource) + "'");
+                    }
+                };
+                for (std::size_t operand_index = 0;
+                     operand_index < instruction.operands.size();
+                     ++operand_index) {
+                    const auto& operand = instruction.operands[operand_index];
                     if (operand.kind != mir::Operand::Kind::Register) continue;
                     const auto position = x87_position(operand.reg.storage);
                     if (position && *position >= state.ordered_depth) {
@@ -1594,6 +3597,25 @@ private:
                             "raw x87 operand st" + std::to_string(*position) +
                                 " is above the current dense stack depth " +
                                 std::to_string(state.ordered_depth));
+                    }
+                    if (!position &&
+                        operand_index < instruction.form->operands.size()) {
+                        const auto role =
+                            instruction.form->operands[operand_index].role;
+                        if (role == InstructionOperandRole::Input ||
+                            role == InstructionOperandRole::InOut) {
+                            diagnose_undefined(operand.reg.storage,
+                                               operand.location);
+                        }
+                    }
+                }
+                for (const auto& operand : instruction.operands) {
+                    if (operand.kind != mir::Operand::Kind::Memory) continue;
+                    diagnose_undefined(operand.memory.base.storage,
+                                       operand.location);
+                    if (operand.memory.index) {
+                        diagnose_undefined(operand.memory.index->storage,
+                                           operand.location);
                     }
                 }
                 for (const auto resource : instruction.form->implicit_reads) {
@@ -1608,15 +3630,7 @@ private:
                         }
                         continue;
                     }
-                    if (!tracked_resource(resource) ||
-                        state.defined_resources.contains(std::string(resource))) continue;
-                    const auto key = std::to_string(instruction.location.offset) + ':' +
-                                     std::string(resource);
-                    if (undefined_resource_diagnostics.insert(key).second) {
-                        diagnostics_.error(instruction.location,
-                                           "raw instruction reads undefined machine resource '" +
-                                               std::string(resource) + "'");
-                    }
+                    diagnose_undefined(resource, instruction.location);
                 }
                 state.stack_depth -= instruction.form->stack_delta;
                 if (state.stack_depth < 0) {
@@ -1644,6 +3658,20 @@ private:
                 for (const auto resource : instruction.form->implicit_writes) {
                     if (!x87_position(resource) && tracked_resource(resource)) {
                         state.defined_resources.insert(std::string(resource));
+                    }
+                }
+                for (std::size_t operand_index = 0;
+                     operand_index < instruction.operands.size() &&
+                     operand_index < instruction.form->operands.size();
+                     ++operand_index) {
+                    const auto& operand = instruction.operands[operand_index];
+                    const auto role =
+                        instruction.form->operands[operand_index].role;
+                    if (operand.kind == mir::Operand::Kind::Register &&
+                        !x87_position(operand.reg.storage) &&
+                        (role == InstructionOperandRole::Output ||
+                         role == InstructionOperandRole::InOut)) {
+                        state.defined_resources.insert(operand.reg.storage);
                     }
                 }
                 if (instruction.form->control == InstructionControlEffect::RawReturn &&
@@ -1735,9 +3763,15 @@ private:
     std::unordered_map<std::string, TypePtr> binding_types_;
     std::unordered_map<std::string, bool> binding_signed_;
     std::unordered_set<std::string> label_bindings_;
+    std::vector<std::string> raw_inline_scratch_;
+    std::unordered_set<std::string> scratch_in_use_;
+    std::unordered_set<std::string> protected_storages_;
+    std::vector<InlineFrame> inline_frames_;
+    std::vector<std::uint32_t> inline_call_stack_;
     std::unordered_map<std::uint32_t, mir::BlockId> label_blocks_;
     std::unordered_set<std::uint32_t> laid_out_;
     std::vector<LoopContext> loops_;
+    std::vector<mir::BlockId> break_targets_;
     std::set<std::pair<std::uint32_t, std::uint64_t>> patch_sinks_;
     std::uint32_t next_patch_id_{};
     unsigned entry_ordered_depth_{};

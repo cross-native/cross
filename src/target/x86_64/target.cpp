@@ -670,6 +670,76 @@ InstructionEntry system_memory_form(
             0, InstructionControlEffect::None};
 }
 
+InstructionEntry scalar_float_move_form(std::string_view name,
+                                        std::string_view mnemonic) {
+    return {name, "x86-64", mnemonic,
+            {class_register_operand(InstructionOperandRole::Output, 128,
+                                    "simd"),
+             class_register_operand(InstructionOperandRole::Input, 128,
+                                    "simd")},
+            {}, {}, 0, InstructionControlEffect::None};
+}
+
+InstructionEntry scalar_float_binary_form(std::string_view name,
+                                          std::string_view mnemonic) {
+    return {name, "x86-64", mnemonic,
+            {class_register_operand(InstructionOperandRole::InOut, 128,
+                                    "simd"),
+             class_register_operand(InstructionOperandRole::Input, 128,
+                                    "simd")},
+            {}, {}, 0, InstructionControlEffect::None};
+}
+
+InstructionEntry scalar_float_load_form(std::string_view name,
+                                        std::string_view mnemonic,
+                                        unsigned memory_bits) {
+    return {name, "x86-64", mnemonic,
+            {class_register_operand(InstructionOperandRole::Output, 128,
+                                    "simd"),
+             integer_memory_operand(InstructionOperandRole::Input,
+                                    memory_bits)},
+            {"memory"}, {}, 0, InstructionControlEffect::None};
+}
+
+InstructionEntry scalar_float_store_form(std::string_view name,
+                                         std::string_view mnemonic,
+                                         unsigned memory_bits) {
+    return {name, "x86-64", mnemonic,
+            {integer_memory_operand(InstructionOperandRole::Output,
+                                    memory_bits),
+             class_register_operand(InstructionOperandRole::Input, 128,
+                                    "simd")},
+            {}, {"memory"}, 0, InstructionControlEffect::None};
+}
+
+InstructionEntry scalar_float_compare_form(std::string_view name,
+                                           std::string_view mnemonic) {
+    return {name, "x86-64", mnemonic,
+            {class_register_operand(InstructionOperandRole::Input, 128,
+                                    "simd"),
+             class_register_operand(InstructionOperandRole::Input, 128,
+                                    "simd")},
+            {}, {"flags"}, 0, InstructionControlEffect::None};
+}
+
+InstructionEntry scalar_bit_move_form(std::string_view name,
+                                      std::string_view mnemonic,
+                                      unsigned integer_bits,
+                                      bool to_simd) {
+    return {name, "x86-64", mnemonic,
+            {to_simd
+                 ? class_register_operand(InstructionOperandRole::Output,
+                                          128, "simd")
+                 : integer_register_operand(InstructionOperandRole::Output,
+                                            integer_bits),
+             to_simd
+                 ? integer_register_operand(InstructionOperandRole::Input,
+                                            integer_bits)
+                 : class_register_operand(InstructionOperandRole::Input, 128,
+                                          "simd")},
+            {}, {}, 0, InstructionControlEffect::None};
+}
+
 InstructionEntry xstate_memory_form(
     std::string_view name, std::string_view feature,
     std::string_view mnemonic, InstructionOperandRole role,
@@ -1432,6 +1502,26 @@ const TargetInfo target{
         packed_store_form("$::_movdqa", "x86-64", "movdqa", 128),
         packed_load_form("$::_movdqu", "x86-64", "movdqu", 128),
         packed_store_form("$::_movdqu", "x86-64", "movdqu", 128),
+        scalar_float_move_form("$::_movss", "movss"),
+        scalar_float_load_form("$::_movss", "movss", 32),
+        scalar_float_store_form("$::_movss", "movss", 32),
+        scalar_float_move_form("$::_movsd", "movsd"),
+        scalar_float_load_form("$::_movsd", "movsd", 64),
+        scalar_float_store_form("$::_movsd", "movsd", 64),
+        scalar_float_binary_form("$::_addss", "addss"),
+        scalar_float_binary_form("$::_subss", "subss"),
+        scalar_float_binary_form("$::_mulss", "mulss"),
+        scalar_float_binary_form("$::_divss", "divss"),
+        scalar_float_binary_form("$::_addsd", "addsd"),
+        scalar_float_binary_form("$::_subsd", "subsd"),
+        scalar_float_binary_form("$::_mulsd", "mulsd"),
+        scalar_float_binary_form("$::_divsd", "divsd"),
+        scalar_float_compare_form("$::_ucomiss", "ucomiss"),
+        scalar_float_compare_form("$::_ucomisd", "ucomisd"),
+        scalar_bit_move_form("$::_movd", "movd", 32, true),
+        scalar_bit_move_form("$::_movd", "movd", 32, false),
+        scalar_bit_move_form("$::_movq", "movq", 64, true),
+        scalar_bit_move_form("$::_movq", "movq", 64, false),
 #define CROSS_X86_SSE_FLOAT_BINARY(name, mnemonic)                             \
         packed_legacy_binary_form(name "ps", "x86-64", mnemonic "ps", 128),\
         packed_legacy_binary_form(name "pd", "x86-64", mnemonic "pd", 128)
@@ -2465,6 +2555,12 @@ const TargetInfo target{
          {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jne", "x86-64", "jne",
+         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
+        {"$::_jp", "x86-64", "jp",
+         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
+        {"$::_jnp", "x86-64", "jnp",
          {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_ja", "x86-64", "ja",

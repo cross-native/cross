@@ -3922,18 +3922,6 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     return diagnostics.errors() == 0;
 }
 
-const Expr* raw_inline_result(const FunctionDecl& function) {
-    if (!function.body ||
-        function.body->kind != Statement::Kind::Compound ||
-        function.body->statements.size() != 1) {
-        return nullptr;
-    }
-    const auto& statement = *function.body->statements.front();
-    return statement.kind == Statement::Kind::Return
-               ? statement.expression.get()
-               : nullptr;
-}
-
 void collect_patch_expressions(const Expr& expression,
                                std::vector<const Expr*>& patches) {
     if (expression.kind == Expr::Kind::Call && expression.left &&
@@ -3980,34 +3968,25 @@ void collect_patch_expressions(const Statement& statement,
     if (statement.second) collect_patch_expressions(*statement.second, patches);
 }
 
-void rewrite_raw_inline_expr(std::unique_ptr<Expr>& expression,
+void resolve_raw_inline_expr(std::unique_ptr<Expr>& expression,
                              FunctionDecl& caller, Program& program,
-                             Diagnostics& diagnostics, unsigned depth) {
+                             Diagnostics& diagnostics) {
     if (!expression) return;
-    if (depth > 128) {
-        diagnostics.error(expression->location,
-                          "recursive raw_inline expansion exceeded 128 calls");
-        return;
-    }
     if (expression->left) {
-        rewrite_raw_inline_expr(expression->left, caller, program, diagnostics,
-                                depth);
+        resolve_raw_inline_expr(expression->left, caller, program, diagnostics);
     }
     if (expression->right) {
-        rewrite_raw_inline_expr(expression->right, caller, program, diagnostics,
-                                depth);
+        resolve_raw_inline_expr(expression->right, caller, program, diagnostics);
     }
     if (expression->third) {
-        rewrite_raw_inline_expr(expression->third, caller, program, diagnostics,
-                                depth);
+        resolve_raw_inline_expr(expression->third, caller, program, diagnostics);
     }
     for (auto& argument : expression->arguments) {
-        rewrite_raw_inline_expr(argument, caller, program, diagnostics, depth);
+        resolve_raw_inline_expr(argument, caller, program, diagnostics);
     }
     visit_initializer_children(*expression,
         [&](std::unique_ptr<Expr>& child) {
-            rewrite_raw_inline_expr(child, caller, program, diagnostics,
-                                    depth);
+            resolve_raw_inline_expr(child, caller, program, diagnostics);
         });
     if (expression->kind != Expr::Kind::Call || !expression->left ||
         expression->left->kind != Expr::Kind::Name) {
@@ -4025,56 +4004,47 @@ void rewrite_raw_inline_expr(std::unique_ptr<Expr>& expression,
                               callee->name + "'");
         return;
     }
-    const auto* result = raw_inline_result(*callee);
-    if (!result) {
-        diagnostics.error(
-            callee->location,
-            "bootstrap raw legalization currently requires raw_inline body "
-            "to contain one return expression");
-        return;
-    }
-    ValueSubstitutions values;
-    for (std::size_t index = 0; index < callee->parameters.size(); ++index) {
-        values.emplace(callee->parameters[index].name,
-                       expression->arguments[index].get());
-    }
-    expression = clone_expr(*result, {}, values);
-    rewrite_raw_inline_expr(expression, caller, program, diagnostics, depth + 1);
+    // Raw-compatible calls deliberately survive as structured AST until
+    // target legalization.  Canonicalizing the source name here retains the
+    // frontend's namespace/import resolution while allowing the raw backend
+    // to clone the complete managed body (locals and control flow included)
+    // under the naked caller's resource contract.
+    expression->left->text = callee->name;
 }
 
-void rewrite_raw_inline_statement(Statement& statement, FunctionDecl& caller,
+void resolve_raw_inline_statement(Statement& statement, FunctionDecl& caller,
                                   Program& program, Diagnostics& diagnostics) {
     for (auto& child : statement.statements) {
-        rewrite_raw_inline_statement(*child, caller, program, diagnostics);
+        resolve_raw_inline_statement(*child, caller, program, diagnostics);
     }
     if (statement.declaration) {
         if (statement.declaration->dynamic_array_bound) {
-            rewrite_raw_inline_expr(statement.declaration->dynamic_array_bound,
-                                    caller, program, diagnostics, 0);
+            resolve_raw_inline_expr(statement.declaration->dynamic_array_bound,
+                                    caller, program, diagnostics);
         }
         if (statement.declaration->initializer) {
-            rewrite_raw_inline_expr(statement.declaration->initializer,
-                                    caller, program, diagnostics, 0);
+            resolve_raw_inline_expr(statement.declaration->initializer,
+                                    caller, program, diagnostics);
         }
     }
     if (statement.expression) {
-        rewrite_raw_inline_expr(statement.expression, caller, program,
-                                diagnostics, 0);
+        resolve_raw_inline_expr(statement.expression, caller, program,
+                                diagnostics);
     }
     if (statement.condition) {
-        rewrite_raw_inline_expr(statement.condition, caller, program,
-                                diagnostics, 0);
+        resolve_raw_inline_expr(statement.condition, caller, program,
+                                diagnostics);
     }
     if (statement.increment) {
-        rewrite_raw_inline_expr(statement.increment, caller, program,
-                                diagnostics, 0);
+        resolve_raw_inline_expr(statement.increment, caller, program,
+                                diagnostics);
     }
     if (statement.first) {
-        rewrite_raw_inline_statement(*statement.first, caller, program,
+        resolve_raw_inline_statement(*statement.first, caller, program,
                                      diagnostics);
     }
     if (statement.second) {
-        rewrite_raw_inline_statement(*statement.second, caller, program,
+        resolve_raw_inline_statement(*statement.second, caller, program,
                                      diagnostics);
     }
 }
@@ -4126,8 +4096,12 @@ bool expand_raw_inline(Program& program, Diagnostics& diagnostics) {
         }
     }
     for (auto& function : program.functions) {
-        if (!function->attribute("naked") || !function->body) continue;
-        rewrite_raw_inline_statement(*function->body, *function, program,
+        if ((!function->attribute("naked") &&
+             !function->attribute("raw_inline")) ||
+            !function->body) {
+            continue;
+        }
+        resolve_raw_inline_statement(*function->body, *function, program,
                                      diagnostics);
     }
     return diagnostics.errors() == 0;

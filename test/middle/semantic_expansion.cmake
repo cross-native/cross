@@ -48,7 +48,14 @@ foreach(pattern
         "add i64 %mir.v2, 123"
         "xor i32"
         "raw_inline_entry:"
-        "addq")
+        "addq"
+        "raw_inline_complex:"
+        "raw_inline_structured:"
+        "raw_inline_memory:"
+        "raw_inline_store:"
+        "shrq"
+        "xorq"
+        "imulq")
     string(FIND "${ir}" "${pattern}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "semantic expansion IR is missing '${pattern}'")
@@ -68,6 +75,20 @@ string(REGEX MATCH "raw_inline_entry:[^\"]*" raw_inline_assembly "${ir}")
 if(raw_inline_assembly MATCHES "call")
     message(FATAL_ERROR "raw_inline left a call in the naked function")
 endif()
+string(REGEX MATCH "raw_inline_complex:[^\"]*" raw_inline_complex_assembly "${ir}")
+foreach(register "%r9" "%r10" "%r11" "%r8")
+    string(FIND "${raw_inline_complex_assembly}" "${register}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "raw_inline complex lowering did not use declared register ${register}")
+    endif()
+endforeach()
+foreach(symbol raw_inline_structured raw_inline_memory raw_inline_store)
+    string(REGEX MATCH "${symbol}:[^\"]*" raw_inline_body "${ir}")
+    if(raw_inline_body MATCHES "call")
+        message(FATAL_ERROR "${symbol} retained a call after raw-compatible inlining")
+    endif()
+endforeach()
 string(FIND "${ir}" "hash40" eval_function_position)
 if(NOT eval_function_position EQUAL -1)
     message(FATAL_ERROR "eval_only function retained a runtime definition")

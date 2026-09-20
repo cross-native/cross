@@ -2262,6 +2262,11 @@ if(BUILD_TESTING)
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/semantic-expansion
                 -P "${CMAKE_SOURCE_DIR}/test/middle/semantic_expansion.cmake")
     set_tests_properties(cross_semantic_expansion PROPERTIES TIMEOUT 15)
+    add_test(NAME cross_raw_inline_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/raw_inline_errors.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/raw-inline-errors.s
+        -P "${CMAKE_SOURCE_DIR}/test/middle/raw_inline_errors.cmake")
     add_test(NAME cross_default_evaluation
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2273,6 +2278,12 @@ if(BUILD_TESTING)
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation.x
         -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/floating_evaluation_driver.cpp
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-evaluation
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
+    add_test(NAME cross_raw_inline_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/raw_inline_runtime.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/raw_inline_runtime_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/raw-inline-runtime
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/runtime.cmake")
     add_test(NAME cross_floating_evaluation_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
