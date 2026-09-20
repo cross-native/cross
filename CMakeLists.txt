@@ -2358,6 +2358,13 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/procedural_namespace.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/procedural-namespace.ll
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/procedural_namespace.cmake")
+    add_test(NAME cross_procedural_body
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/procedural_body.x
+                -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/frontend/procedural_body_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/procedural-body.ll
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/procedural_body.cmake")
     add_test(NAME cross_patch_value_diagnostics
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

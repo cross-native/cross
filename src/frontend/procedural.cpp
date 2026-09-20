@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -20,17 +21,27 @@ namespace cross {
 namespace {
 
 struct MetaExpression {
-    enum class Kind { Input, Literal, Concat, Template } kind{Kind::Input};
+    enum class Kind { Variable, Literal, Concat, Template } kind{Kind::Variable};
     std::string literal;
     std::unique_ptr<MetaExpression> left;
     std::unique_ptr<MetaExpression> right;
     std::vector<MetaExpression> parts;
 };
 
+struct MetaStatement {
+    enum class Kind { Return, Declare, If } kind{Kind::Return};
+    std::string name;
+    MetaExpression expression;
+    bool condition{};
+    std::vector<MetaStatement> then_branch;
+    std::vector<MetaStatement> else_branch;
+    SourceLocation location;
+};
+
 struct TokenMacro {
     std::string name;
     std::string parameter;
-    MetaExpression result;
+    std::vector<MetaStatement> body;
     SourceLocation location;
 };
 
@@ -61,9 +72,10 @@ std::optional<std::size_t> matching_group(const std::vector<Token>& tokens,
 class MetaParser {
 public:
     MetaParser(const std::vector<Token>& tokens, std::size_t begin,
-               std::size_t end, std::string_view parameter,
+               std::size_t end,
+               const std::unordered_set<std::string>& variables,
                Diagnostics& diagnostics)
-        : tokens_(tokens), index_(begin), end_(end), parameter_(parameter),
+        : tokens_(tokens), index_(begin), end_(end), variables_(variables),
           diagnostics_(diagnostics) {}
 
     std::optional<MetaExpression> parse() {
@@ -74,8 +86,8 @@ public:
                                       : SourceLocation{};
             diagnostics_.error(
                 location,
-                "'macro' return expression supports its token parameter, "
-                "$::quote { ... $::unquote(parameter) ... }, "
+                "'macro' token expression supports a token variable, "
+                "$::quote { ... $::unquote(variable) ... }, "
                 "$::meta::parse(string), and "
                 "$::meta::concat(left, right)");
             return std::nullopt;
@@ -93,9 +105,11 @@ private:
     std::optional<MetaExpression> expression() {
         if (index_ >= end_) return std::nullopt;
         if (tokens_[index_].kind == TokenKind::Identifier &&
-            tokens_[index_].text == parameter_) {
+            variables_.contains(std::string(tokens_[index_].text))) {
+            MetaExpression result;
+            result.literal = std::string(tokens_[index_].text);
             ++index_;
-            return MetaExpression{};
+            return result;
         }
         if (tokens_[index_].text == "$::meta::parse") {
             ++index_;
@@ -153,20 +167,28 @@ private:
 
             for (auto cursor = opening + 1;
                  cursor < *closing;) {
-                if (cursor + 3 < *closing &&
-                    tokens_[cursor].text == "$::unquote" &&
+                if (tokens_[cursor].text == "$::unquote" &&
+                    cursor + 3 < *closing &&
                     tokens_[cursor + 1].text == "(" &&
                     tokens_[cursor + 2].kind ==
                         TokenKind::Identifier &&
-                    tokens_[cursor + 2].text == parameter_ &&
+                    variables_.contains(
+                        std::string(tokens_[cursor + 2].text)) &&
                     tokens_[cursor + 3].text == ")") {
                     append_literal(tokens_[cursor].location.offset);
-                    result.parts.emplace_back();
+                    MetaExpression variable;
+                    variable.literal = std::string(tokens_[cursor + 2].text);
+                    result.parts.push_back(std::move(variable));
                     literal_begin =
                         tokens_[cursor + 3].location.offset +
                         tokens_[cursor + 3].text.size();
                     cursor += 4;
                     continue;
+                }
+                if (tokens_[cursor].text == "$::unquote") {
+                    diagnostics_.error(tokens_[cursor].location,
+                                       "$::unquote requires a visible token variable inside $::quote");
+                    return std::nullopt;
                 }
                 ++cursor;
             }
@@ -180,28 +202,192 @@ private:
     const std::vector<Token>& tokens_;
     std::size_t index_{};
     std::size_t end_{};
-    std::string_view parameter_;
+    const std::unordered_set<std::string>& variables_;
     Diagnostics& diagnostics_;
 };
 
-std::string evaluate(const MetaExpression& expression, std::string_view input) {
+std::optional<std::size_t> meta_statement_end(
+    const std::vector<Token>& tokens, std::size_t begin, std::size_t end) {
+    for (auto cursor = begin; cursor < end; ++cursor) {
+        if (tokens[cursor].text == ";") return cursor;
+        if (tokens[cursor].text == "(" || tokens[cursor].text == "[" ||
+            tokens[cursor].text == "{") {
+            const auto closing = matching_group(tokens, cursor);
+            if (!closing || *closing >= end) return std::nullopt;
+            cursor = *closing;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<MetaStatement>> parse_meta_body(
+    const std::vector<Token>& tokens, std::size_t begin, std::size_t end,
+    std::unordered_set<std::string> variables, Diagnostics& diagnostics,
+    unsigned depth = 0) {
+    if (depth > 128) {
+        diagnostics.error(tokens[begin].location,
+                          "procedural macro body exceeds the nesting limit");
+        return std::nullopt;
+    }
+    std::vector<MetaStatement> result;
+    for (auto cursor = begin; cursor < end;) {
+        MetaStatement statement;
+        statement.location = tokens[cursor].location;
+        if (tokens[cursor].text == "if") {
+            if (cursor + 1 >= end || tokens[cursor + 1].text != "(") {
+                diagnostics.error(statement.location,
+                                  "procedural macro 'if' requires a condition");
+                return std::nullopt;
+            }
+            const auto condition_end = matching_group(tokens, cursor + 1);
+            if (!condition_end || *condition_end != cursor + 3 ||
+                *condition_end + 1 >= end ||
+                tokens[*condition_end + 1].text != "{") {
+                diagnostics.error(statement.location,
+                                  "procedural macro 'if' currently requires a literal condition and braced body");
+                return std::nullopt;
+            }
+            const auto condition = tokens[cursor + 2].text;
+            if (condition == "true" || condition == "1") {
+                statement.condition = true;
+            } else if (condition == "false" || condition == "0") {
+                statement.condition = false;
+            } else {
+                diagnostics.error(tokens[cursor + 2].location,
+                                  "procedural macro 'if' condition currently requires a literal bool or 0/1");
+                return std::nullopt;
+            }
+            statement.kind = MetaStatement::Kind::If;
+            const auto then_open = *condition_end + 1;
+            const auto then_end = matching_group(tokens, then_open);
+            if (!then_end || *then_end >= end) {
+                diagnostics.error(tokens[then_open].location,
+                                  "unterminated procedural macro 'if' body");
+                return std::nullopt;
+            }
+            auto then_body = parse_meta_body(tokens, then_open + 1,
+                                             *then_end, variables,
+                                             diagnostics, depth + 1);
+            if (!then_body) return std::nullopt;
+            statement.then_branch = std::move(*then_body);
+            cursor = *then_end + 1;
+            if (cursor < end && tokens[cursor].text == "else") {
+                if (cursor + 1 >= end || tokens[cursor + 1].text != "{") {
+                    diagnostics.error(tokens[cursor].location,
+                                      "procedural macro 'else' requires a braced body");
+                    return std::nullopt;
+                }
+                const auto else_open = cursor + 1;
+                const auto else_end = matching_group(tokens, else_open);
+                if (!else_end || *else_end >= end) {
+                    diagnostics.error(tokens[else_open].location,
+                                      "unterminated procedural macro 'else' body");
+                    return std::nullopt;
+                }
+                auto else_body = parse_meta_body(tokens, else_open + 1,
+                                                 *else_end, variables,
+                                                 diagnostics, depth + 1);
+                if (!else_body) return std::nullopt;
+                statement.else_branch = std::move(*else_body);
+                cursor = *else_end + 1;
+            }
+            result.push_back(std::move(statement));
+            continue;
+        }
+        const bool declaration = tokens[cursor].text == "$::meta::tokens";
+        const bool returning = tokens[cursor].text == "return";
+        if (!declaration && !returning) {
+            diagnostics.error(statement.location,
+                              "procedural macro body currently supports token locals, braced if/else, and return");
+            return std::nullopt;
+        }
+        auto expression_begin = cursor + 1;
+        if (declaration) {
+            if (expression_begin + 1 >= end ||
+                tokens[expression_begin].kind != TokenKind::Identifier ||
+                tokens[expression_begin + 1].text != "=") {
+                diagnostics.error(statement.location,
+                                  "procedural macro token local requires a name and initializer");
+                return std::nullopt;
+            }
+            statement.kind = MetaStatement::Kind::Declare;
+            statement.name = std::string(tokens[expression_begin].text);
+            if (variables.contains(statement.name)) {
+                diagnostics.error(tokens[expression_begin].location,
+                                  "procedural macro token local redeclares '" +
+                                      statement.name + "'");
+                return std::nullopt;
+            }
+            expression_begin += 2;
+        }
+        const auto semicolon = meta_statement_end(tokens, expression_begin,
+                                                   end);
+        if (!semicolon) {
+            diagnostics.error(statement.location,
+                              "unterminated procedural macro statement");
+            return std::nullopt;
+        }
+        MetaParser parser(tokens, expression_begin, *semicolon, variables,
+                          diagnostics);
+        auto expression = parser.parse();
+        if (!expression) return std::nullopt;
+        statement.expression = std::move(*expression);
+        if (declaration) variables.insert(statement.name);
+        result.push_back(std::move(statement));
+        cursor = *semicolon + 1;
+    }
+    return result;
+}
+
+using MetaEnvironment = std::unordered_map<std::string, std::string>;
+
+std::optional<std::string> evaluate(const MetaExpression& expression,
+                                    const MetaEnvironment& variables) {
     switch (expression.kind) {
-    case MetaExpression::Kind::Input:
-        return std::string(input);
+    case MetaExpression::Kind::Variable: {
+        const auto found = variables.find(expression.literal);
+        if (found == variables.end()) return std::nullopt;
+        return found->second;
+    }
     case MetaExpression::Kind::Literal:
         return expression.literal;
-    case MetaExpression::Kind::Concat:
-        return evaluate(*expression.left, input) +
-               evaluate(*expression.right, input);
+    case MetaExpression::Kind::Concat: {
+        auto left = evaluate(*expression.left, variables);
+        auto right = evaluate(*expression.right, variables);
+        if (!left || !right) return std::nullopt;
+        return *left + *right;
+    }
     case MetaExpression::Kind::Template: {
         std::string result;
         for (const auto& part : expression.parts) {
-            result += evaluate(part, input);
+            auto value = evaluate(part, variables);
+            if (!value) return std::nullopt;
+            result += *value;
         }
         return result;
     }
     }
-    return {};
+    return std::nullopt;
+}
+
+std::optional<std::string> execute_meta_body(
+    const std::vector<MetaStatement>& body, MetaEnvironment& variables) {
+    for (const auto& statement : body) {
+        if (statement.kind == MetaStatement::Kind::If) {
+            auto branch_variables = variables;
+            const auto& branch = statement.condition
+                ? statement.then_branch : statement.else_branch;
+            if (auto result = execute_meta_body(branch, branch_variables)) {
+                return result;
+            }
+            continue;
+        }
+        auto value = evaluate(statement.expression, variables);
+        if (!value) return std::nullopt;
+        if (statement.kind == MetaStatement::Kind::Return) return value;
+        variables[statement.name] = std::move(*value);
+    }
+    return std::nullopt;
 }
 
 std::string qualified_name(const std::vector<Token>& tokens, std::size_t& index,
@@ -408,18 +594,9 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
             continue;
         }
         const auto body_begin = cursor + 1;
-        if (body_begin + 2 >= *body_end ||
-            tokens[body_begin].text != "return" ||
-            tokens[*body_end - 1].text != ";") {
-            diagnostics.error(
-                tokens[cursor].location,
-                "bootstrap 'macro' body must contain one return expression");
-            continue;
-        }
-        MetaParser parser(tokens, body_begin + 1, *body_end - 1, parameter,
-                          diagnostics);
-        auto result = parser.parse();
-        if (!result) continue;
+        auto body = parse_meta_body(tokens, body_begin, *body_end,
+                                    {parameter}, diagnostics);
+        if (!body) continue;
         const auto declaration_end =
             tokens[*body_end].location.offset + tokens[*body_end].text.size();
         removals.push_back(
@@ -434,7 +611,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
             continue;
         }
         macros.push_back({std::move(name), std::move(parameter),
-                          std::move(*result), tokens[index].location});
+                          std::move(*body), tokens[index].location});
         index = *body_end;
     }
     return macros;
@@ -508,11 +685,20 @@ std::optional<Replacement> find_expansion(const SourceFile& file,
                 const auto input_end = tokens[*close].location.offset;
                 const auto replacement_end = tokens[*close].location.offset +
                                              tokens[*close].text.size();
+                MetaEnvironment variables;
+                variables.emplace(macro->parameter,
+                    std::string(std::string_view(file.text).substr(
+                        input_begin, input_end - input_begin)));
+                auto output = execute_meta_body(macro->body, variables);
+                if (!output) {
+                    diagnostics.error(tokens[index].location,
+                                      "procedural macro '" + macro->name +
+                                          "' did not return a token value");
+                    return std::nullopt;
+                }
                 return Replacement{
                     tokens[index].location.offset, replacement_end,
-                    evaluate(macro->result,
-                             std::string_view(file.text).substr(
-                                 input_begin, input_end - input_begin)),
+                    std::move(*output),
                     macro->name, tokens[index].location, macro->location};
             }
         }
