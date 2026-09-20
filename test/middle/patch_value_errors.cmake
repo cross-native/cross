@@ -17,7 +17,7 @@ if(status EQUAL 0)
     message(FATAL_ERROR "invalid patch values unexpectedly compiled")
 endif()
 foreach(pattern
-        "initial value must be an integer constant"
+        "initial value must be a translation-time integer or"
         "no contiguous $::patch materializer for u128")
     string(FIND "${stderr}" "${pattern}" position)
     if(position EQUAL -1)

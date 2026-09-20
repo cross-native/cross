@@ -8,12 +8,14 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace cross {
 class Diagnostics;
 class Subtarget;
+struct Expr;
 
 namespace data {
 
@@ -40,6 +42,17 @@ struct AddressConstant {
     std::optional<hir::LabelId> label;
     std::int64_t addend{};
 };
+
+struct AddressScope {
+    std::string_view source_name;
+    std::string_view source_unit;
+};
+
+// Shared source-to-typed-relocation recognition for static data and patch
+// initials. `integer` requires an explicit address-width integer cast.
+[[nodiscard]] std::optional<AddressConstant> relocatable_address(
+    const hir::Module& module, AddressScope scope, const Expr& expression,
+    const Subtarget& subtarget, bool integer);
 
 struct Relocation {
     unsigned offset{};

@@ -479,32 +479,33 @@ const hir::Function* find_function(const hir::Module& module,
 }
 
 std::optional<std::string> qualified_owner_name(std::string_view name,
-                                                const hir::Object& owner) {
+                                                AddressScope scope) {
     if (name.find("::") != std::string_view::npos) return std::nullopt;
-    const auto separator = owner.source_name.rfind("::");
+    const auto separator = scope.source_name.rfind("::");
     if (separator == std::string::npos) return std::nullopt;
-    return owner.source_name.substr(0, separator + 2) + std::string(name);
+    return std::string(scope.source_name.substr(0, separator + 2)) +
+           std::string(name);
 }
 
 const hir::Object* find_object(const hir::Module& module,
                                std::string_view name,
-                               const hir::Object& owner) {
-    if (const auto qualified = qualified_owner_name(name, owner)) {
+                               AddressScope scope) {
+    if (const auto qualified = qualified_owner_name(name, scope)) {
         if (const auto* object = find_object(module, *qualified,
-                                             owner.source_unit)) return object;
+                                             scope.source_unit)) return object;
     }
-    return find_object(module, name, owner.source_unit);
+    return find_object(module, name, scope.source_unit);
 }
 
 const hir::Function* find_function(const hir::Module& module,
                                    std::string_view name,
-                                   const hir::Object& owner) {
-    if (const auto qualified = qualified_owner_name(name, owner)) {
+                                   AddressScope scope) {
+    if (const auto qualified = qualified_owner_name(name, scope)) {
         if (const auto* function = find_function(module, *qualified,
-                                                 owner.source_unit))
+                                                 scope.source_unit))
             return function;
     }
-    return find_function(module, name, owner.source_unit);
+    return find_function(module, name, scope.source_unit);
 }
 
 struct AddressValue {
@@ -588,17 +589,17 @@ bool compatible_static_pointee(const hir::Module& module, hir::TypeId source,
 }
 
 std::optional<AddressValue> address_value(
-    const hir::Module& module, const hir::Object& owner,
+    const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget);
 
 std::optional<AddressValue> address_designator(
-    const hir::Module& module, const hir::Object& owner,
+    const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget) {
     if (expression.kind == Expr::Kind::Parenthesized && expression.left)
-        return address_designator(module, owner, *expression.left, subtarget);
+        return address_designator(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
-                find_object(module, expression.text, owner)) {
+                find_object(module, expression.text, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Object;
             result.address.object = object->id;
@@ -606,7 +607,7 @@ std::optional<AddressValue> address_designator(
             return result;
         }
         if (const auto* function =
-                find_function(module, expression.text, owner)) {
+                find_function(module, expression.text, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
@@ -618,7 +619,7 @@ std::optional<AddressValue> address_designator(
         !expression.right) return std::nullopt;
     if (expression.text == "member" &&
         expression.right->kind == Expr::Kind::Name) {
-        auto base = address_designator(module, owner, *expression.left,
+        auto base = address_designator(module, scope, *expression.left,
                                        subtarget);
         if (!base) return std::nullopt;
         const hir::Record* record{};
@@ -641,7 +642,7 @@ std::optional<AddressValue> address_designator(
         return base;
     }
     if (expression.text == "index") {
-        auto base = address_designator(module, owner, *expression.left,
+        auto base = address_designator(module, scope, *expression.left,
                                        subtarget);
         if (base && base->pointee) {
             const auto& selected = module.type(*base->pointee);
@@ -652,7 +653,7 @@ std::optional<AddressValue> address_designator(
             }
         }
         if (!base)
-            base = address_value(module, owner, *expression.left, subtarget);
+            base = address_value(module, scope, *expression.left, subtarget);
         if (!base || (!base->pointee && !base->cast_pointee) ||
             base->integer) return std::nullopt;
         const auto offset = integer_value(*expression.right);
@@ -673,16 +674,16 @@ std::optional<AddressValue> address_designator(
 }
 
 std::optional<AddressValue> address_value(
-    const hir::Module& module, const hir::Object& owner,
+    const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget) {
     if (expression.kind == Expr::Kind::Parenthesized && expression.left)
-        return address_value(module, owner, *expression.left, subtarget);
+        return address_value(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Unary && expression.text == "&" &&
         expression.left)
-        return address_designator(module, owner, *expression.left, subtarget);
+        return address_designator(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
-                find_object(module, expression.text, owner)) {
+                find_object(module, expression.text, scope)) {
             const auto& type = module.type(object->type);
             if (type.kind != hir::Type::Kind::Array || !type.element)
                 return std::nullopt;
@@ -693,7 +694,7 @@ std::optional<AddressValue> address_value(
             return result;
         }
         if (const auto* function =
-                find_function(module, expression.text, owner)) {
+                find_function(module, expression.text, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
@@ -702,7 +703,7 @@ std::optional<AddressValue> address_value(
         const auto split = expression.text.rfind("::");
         if (split == std::string::npos) return std::nullopt;
         const auto* function = find_function(
-            module, expression.text.substr(0, split), owner);
+            module, expression.text.substr(0, split), scope);
         if (!function) return std::nullopt;
         const auto* label = module.label(
             function->id, expression.text.substr(split + 2));
@@ -715,7 +716,7 @@ std::optional<AddressValue> address_value(
     }
     if (expression.kind == Expr::Kind::Binary &&
         expression.text == "member") {
-        auto value = address_designator(module, owner, expression,
+        auto value = address_designator(module, scope, expression,
                                          subtarget);
         if (!value || !value->pointee) return std::nullopt;
         const auto& selected = module.type(*value->pointee);
@@ -726,7 +727,7 @@ std::optional<AddressValue> address_value(
     }
     if (expression.kind == Expr::Kind::Cast && expression.left &&
         expression.type) {
-        auto value = address_value(module, owner, *expression.left,
+        auto value = address_value(module, scope, *expression.left,
                                    subtarget);
         if (!value) return std::nullopt;
         if (expression.type->kind == Type::Kind::Builtin) {
@@ -765,11 +766,11 @@ std::optional<AddressValue> address_value(
     if (expression.kind == Expr::Kind::Binary && expression.left &&
         expression.right &&
         (expression.text == "+" || expression.text == "-")) {
-        auto value = address_value(module, owner, *expression.left,
+        auto value = address_value(module, scope, *expression.left,
                                    subtarget);
         const Expr* offset_expression = expression.right.get();
         if (!value && expression.text == "+") {
-            value = address_value(module, owner, *expression.right,
+            value = address_value(module, scope, *expression.right,
                                   subtarget);
             offset_expression = expression.left.get();
         }
@@ -813,15 +814,16 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
     if (type.kind == hir::Type::Kind::Pointer ||
         (type.kind == hir::Type::Kind::Builtin &&
          type.builtin == BuiltinType::Label)) {
-        const auto address = address_value(module, entity, expression,
-                                           subtarget);
-        if (!address || address->integer) {
+        const auto address = relocatable_address(
+            module, {entity.source_name, entity.source_unit}, expression,
+            subtarget, false);
+        if (!address) {
             diagnostics.error(
                 expression.location,
                 "global pointer/label initializer is not an address constant");
             return false;
         }
-        result.address = address->address;
+        result.address = *address;
         const auto expected_function =
             type.kind == hir::Type::Kind::Pointer && type.pointee &&
             module.type(*type.pointee).kind == hir::Type::Kind::Function;
@@ -852,18 +854,19 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
     if (type.kind == hir::Type::Kind::Builtin &&
         type.builtin <= BuiltinType::Uptr) {
         if (result.size == (module.address_bits + 7U) / 8U) {
-            const auto address = address_value(module, entity, expression,
-                                               subtarget);
-            if (address && address->integer) {
-                if (address->address.kind == AddressKind::Object &&
-                    address->address.object &&
-                    module.object(*address->address.object).is_thread_local) {
+            const auto address = relocatable_address(
+                module, {entity.source_name, entity.source_unit}, expression,
+                subtarget, true);
+            if (address) {
+                if (address->kind == AddressKind::Object &&
+                    address->object &&
+                    module.object(*address->object).is_thread_local) {
                     diagnostics.error(expression.location,
                         "a thread-local address is not an ordinary static relocation");
                     return false;
                 }
                 result.initializer = InitializerKind::Address;
-                result.address = address->address;
+                result.address = *address;
                 return true;
             }
         }
@@ -1115,6 +1118,14 @@ bool lower_initializer(Object& result, const hir::Module& module,
 }
 
 } // namespace
+
+std::optional<AddressConstant> relocatable_address(
+    const hir::Module& module, AddressScope scope, const Expr& expression,
+    const Subtarget& subtarget, bool integer) {
+    const auto value = address_value(module, scope, expression, subtarget);
+    if (!value || value->integer != integer) return std::nullopt;
+    return value->address;
+}
 
 std::optional<UInt128> parse_binary128_literal(std::string text) {
     return parse_binary128(std::move(text));

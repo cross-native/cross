@@ -320,6 +320,8 @@ struct PatchValueMaterializerEntry {
     unsigned bits{};
     std::string_view feature;
     bool supports_address_sink{};
+    // The contiguous encoded field accepts a link-time symbol plus addend.
+    bool supports_symbol_relocation{};
 };
 
 struct AtomicWidthEntry {

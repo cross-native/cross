@@ -1110,6 +1110,11 @@ private:
             return;
         }
         if (value.kind == ValueKind::PatchValue) {
+            if (value.patch_initial_address) {
+                diagnostics_.error(value.location,
+                    "LLVM debug serialization cannot preserve a relocatable $::patch immediate");
+                return;
+            }
             const auto bits = patch_bits(hir_, value.type);
             std::string mnemonic;
             std::string register_modifier;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "middle/data_ir.hpp"
 #include "middle/hir.hpp"
 
 #include <cstdint>
@@ -161,6 +162,7 @@ struct ManagedValue {
     // scale and result type from the pointer-typed first operand.
     std::optional<hir::ObjectId> object;
     std::optional<PatchSink> patch_sink;
+    std::optional<data::AddressConstant> patch_initial_address;
     std::uint32_t patch_id{};
     bool is_volatile_access{};
     // A source [[musttail]] return owns this call. Optimizers and targets must

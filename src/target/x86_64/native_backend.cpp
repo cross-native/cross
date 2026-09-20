@@ -1652,8 +1652,30 @@ private:
         if (value.kind == ValueKind::PatchValue) {
             auto instruction = target_instruction(Opcode::Patch, value.location);
             const auto target = reg(value.id);
-            instruction.operands.push_back(immediate_operand(
-                value.integer, value.integer_high, target.mode));
+            if (value.patch_initial_address) {
+                const auto& address = *value.patch_initial_address;
+                machine::SymbolOperand symbol;
+                symbol.addend = address.addend;
+                if (address.kind == data::AddressKind::Object) {
+                    const auto& object = hir_.object(*address.object);
+                    symbol.name = object.link_symbol;
+                    symbol.object = object.id;
+                } else if (address.kind == data::AddressKind::Function) {
+                    const auto& function = hir_.function(*address.function);
+                    symbol.name = function.link_symbol;
+                    symbol.is_function = true;
+                    symbol.function = function.id;
+                } else {
+                    const auto& label = hir_.labels.at(address.label->value);
+                    symbol.name = label.link_symbol;
+                    symbol.is_function = true;
+                    symbol.function = label.owner;
+                }
+                instruction.operands.push_back(std::move(symbol));
+            } else {
+                instruction.operands.push_back(immediate_operand(
+                    value.integer, value.integer_high, target.mode));
+            }
             instruction.defs.push_back(target);
             instruction.patch =
                 machine::PatchSite{value.patch_id, target.mode.bits,
@@ -17605,8 +17627,6 @@ private:
 
     void emit_patch(const machine::Function& function,
                     const machine::Instruction& value) {
-        const auto& immediate =
-            std::get<machine::ImmediateOperand>(value.operands.front());
         const auto target = value.defs.front();
         if (target.mode.bits > 64 || !value.patch) {
             diagnostics_.error(value.location,
@@ -17617,8 +17637,22 @@ private:
         const auto bits = target.mode.bits;
         const auto opcode = bits == 64 ? "movabsq" :
                             "mov" + std::string(1, suffix(bits));
-        instruction(opcode, "$" + std::to_string(immediate.value) + ", " +
-                                register_name("rax", bits));
+        std::string immediate;
+        if (const auto* symbol = std::get_if<machine::SymbolOperand>(
+                &value.operands.front())) {
+            if (bits != 64 || !safe_assembly_text(symbol->name)) {
+                diagnostics_.error(value.location,
+                    "x86-64 patch relocation requires a safe 64-bit symbol field");
+                return;
+            }
+            immediate = symbol_with_addend(*symbol);
+        } else {
+            immediate = std::to_string(
+                std::get<machine::ImmediateOperand>(
+                    value.operands.front()).value);
+        }
+        instruction(opcode, "$" + immediate + ", " +
+                            register_name("rax", bits));
         output_ << ".Lcross.patch.value." << value.patch->identity
                 << ".end:\n";
         store(function, target, "rax");

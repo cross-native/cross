@@ -271,6 +271,28 @@ if(BUILD_TESTING)
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/relocatable-addresses
             -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
             -P "${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses.cmake")
+    foreach(level IN ITEMS O0 O2)
+        add_test(NAME cross_runtime_patch_relocatable_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_relocatable.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/patch-relocatable-${level}
+                -DENTRY=patch_relocatable_entry
+                -DEXPECTED=0
+                -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
+    add_test(NAME cross_patch_relocatable_targets
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_relocatable.x
+            -DBAD_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_relocatable_shadow.x
+            -DTLS_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_relocatable_tls.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/patch-relocatable
+            -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+            -P "${CMAKE_SOURCE_DIR}/test/middle/patch_relocatable.cmake")
     add_test(NAME cross_semantic_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x

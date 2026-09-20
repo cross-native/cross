@@ -3030,6 +3030,66 @@ void fold_relocation_offsets(std::unique_ptr<Expr>& expression,
     }
 }
 
+void fold_patch_initial_offsets(std::unique_ptr<Expr>& expression,
+                                Program& program, Diagnostics& diagnostics,
+                                const LayoutQuery& size_of,
+                                const LayoutQuery& align_of,
+                                std::string_view source_namespace) {
+    if (!expression) return;
+    fold_patch_initial_offsets(expression->left, program, diagnostics,
+                               size_of, align_of, source_namespace);
+    fold_patch_initial_offsets(expression->right, program, diagnostics,
+                               size_of, align_of, source_namespace);
+    fold_patch_initial_offsets(expression->third, program, diagnostics,
+                               size_of, align_of, source_namespace);
+    for (auto& argument : expression->arguments)
+        fold_patch_initial_offsets(argument, program, diagnostics,
+                                   size_of, align_of, source_namespace);
+    for (auto& entry : expression->initializer_entries)
+        fold_patch_initial_offsets(entry.value, program, diagnostics,
+                                   size_of, align_of, source_namespace);
+    if (expression->kind == Expr::Kind::Call && expression->left &&
+        expression->left->kind == Expr::Kind::Name &&
+        expression->left->text == "$::patch" &&
+        !expression->arguments.empty() && expression->arguments.front() &&
+        contains_relocation_candidate(*expression->arguments.front(),
+                                      program, source_namespace)) {
+        fold_relocation_offsets(expression->arguments.front(), program,
+                                diagnostics, size_of, align_of,
+                                source_namespace);
+    }
+}
+
+void fold_patch_initial_offsets(Statement& statement, Program& program,
+                                Diagnostics& diagnostics,
+                                const LayoutQuery& size_of,
+                                const LayoutQuery& align_of,
+                                std::string_view source_namespace) {
+    for (auto& child : statement.statements)
+        fold_patch_initial_offsets(*child, program, diagnostics, size_of,
+                                   align_of, source_namespace);
+    if (statement.declaration) {
+        fold_patch_initial_offsets(statement.declaration->dynamic_array_bound,
+                                   program, diagnostics, size_of, align_of,
+                                   source_namespace);
+        fold_patch_initial_offsets(statement.declaration->initializer,
+                                   program, diagnostics, size_of, align_of,
+                                   source_namespace);
+    }
+    fold_patch_initial_offsets(statement.expression, program, diagnostics,
+                               size_of, align_of, source_namespace);
+    fold_patch_initial_offsets(statement.condition, program, diagnostics,
+                               size_of, align_of, source_namespace);
+    fold_patch_initial_offsets(statement.increment, program, diagnostics,
+                               size_of, align_of, source_namespace);
+    if (statement.first)
+        fold_patch_initial_offsets(*statement.first, program, diagnostics,
+                                   size_of, align_of, source_namespace);
+    if (statement.second)
+        fold_patch_initial_offsets(*statement.second, program, diagnostics,
+                                   size_of, align_of, source_namespace);
+}
+
 bool normalize_generic_arguments(const FunctionDecl& generic,
                                  std::vector<Expr::GenericArgument>& arguments,
                                  const FunctionDecl* caller, Program& program,
@@ -4080,6 +4140,12 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
             align_locals(align_locals, *function->body,
                          function->source_namespace);
         }
+    }
+    for (auto& function : program.functions) {
+        if (function->body)
+            fold_patch_initial_offsets(*function->body, program, diagnostics,
+                                       size_of, align_of,
+                                       function->source_namespace);
     }
     return diagnostics.errors() == 0;
 }

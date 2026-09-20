@@ -5240,16 +5240,73 @@ private:
             failed_ = true;
             return std::nullopt;
         }
-        const auto initial = patch_initial(
-            *expression.arguments.front(), hir_.address_bits);
-        if (!initial) {
+        const auto& initial_expression = *expression.arguments.front();
+        const auto initial = patch_initial(initial_expression,
+                                           hir_.address_bits);
+        std::optional<data::AddressConstant> initial_address;
+        BuiltinType initial_type{};
+        if (initial) {
+            initial_type = initial->type;
+        } else {
+            const auto& caller = hir_.function(current_.source);
+            const std::function<bool(const Expr&)> names_runtime_cell =
+                [&](const Expr& node) {
+                    if (node.kind == Expr::Kind::Name &&
+                        node.text.find("::") == std::string::npos &&
+                        (find_local(node.text) ||
+                         parameter_values_.contains(node.text))) return true;
+                    if (node.left && names_runtime_cell(*node.left)) return true;
+                    if (node.right && names_runtime_cell(*node.right)) return true;
+                    if (node.third && names_runtime_cell(*node.third)) return true;
+                    return std::any_of(
+                        node.arguments.begin(), node.arguments.end(),
+                        [&](const auto& argument) {
+                            return names_runtime_cell(*argument);
+                        });
+                };
+            if (!names_runtime_cell(initial_expression)) {
+                initial_address = data::relocatable_address(
+                    hir_, {caller.source_name, caller.source_unit},
+                    initial_expression, subtarget_, true);
+            }
+            if (initial_address) {
+                const auto inferred = infer_type(initial_expression);
+                if (!inferred ||
+                    hir_.type(*inferred).kind != hir::Type::Kind::Builtin ||
+                    type_bits(hir_, *inferred) != hir_.address_bits) {
+                    diagnostics_.error(initial_expression.location,
+                        "$::patch relocatable initial requires an address-width integer type");
+                    failed_ = true;
+                    return std::nullopt;
+                }
+                initial_type = hir_.type(*inferred).builtin;
+                if (initial_address->kind == data::AddressKind::Object &&
+                    initial_address->object &&
+                    hir_.object(*initial_address->object).is_thread_local) {
+                    diagnostics_.error(initial_expression.location,
+                        "$::patch initial cannot use an ordinary relocation to thread-local storage");
+                    failed_ = true;
+                    return std::nullopt;
+                }
+                if ((initial_address->kind == data::AddressKind::Function ||
+                     initial_address->kind == data::AddressKind::Label) &&
+                    initial_address->function &&
+                    !hir::stabilize_function_address(
+                        hir_, *initial_address->function,
+                        initial_expression.location, diagnostics_)) {
+                    failed_ = true;
+                    return std::nullopt;
+                }
+            }
+        }
+        if (!initial && !initial_address) {
             diagnostics_.error(
                 expression.arguments.front()->location,
-                "bootstrap $::patch initial value must be an integer constant");
+                "$::patch initial value must be a translation-time integer or relocatable address");
             failed_ = true;
             return std::nullopt;
         }
-        const auto source_type = builtin_type(initial->type);
+        const auto source_type = builtin_type(initial_type);
         const auto materializer = find_patch_value_materializer(
             target_, type_name(source_type));
         if (!materializer) {
@@ -5260,7 +5317,13 @@ private:
             failed_ = true;
             return std::nullopt;
         }
-        const auto type = hir_.builtin(initial->type);
+        if (initial_address && !materializer->supports_symbol_relocation) {
+            diagnostics_.error(initial_expression.location,
+                "selected target patch materializer cannot encode a symbol relocation");
+            failed_ = true;
+            return std::nullopt;
+        }
+        const auto type = hir_.builtin(initial_type);
         if (!type) {
             failed_ = true;
             return std::nullopt;
@@ -5280,8 +5343,12 @@ private:
         const auto result = add_value(ValueKind::PatchValue, *type,
                                       expression.location);
         auto& patch = current_.values[result.value];
-        patch.integer = initial->value.low;
-        patch.integer_high = initial->value.high;
+        if (initial) {
+            patch.integer = initial->value.low;
+            patch.integer_high = initial->value.high;
+        } else {
+            patch.patch_initial_address = *initial_address;
+        }
         patch.patch_id = next_patch_id_++;
         if (sink) patch.patch_sink = *sink;
         return result;
@@ -6655,6 +6722,11 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
     for (const auto& block : function.blocks) {
         for (std::size_t order = 0; order < block.values.size(); ++order) {
             const auto& value = function.values[block.values[order].value];
+            if (value.patch_initial_address &&
+                value.kind != ValueKind::PatchValue) {
+                fail(value.location,
+                     "relocatable patch initial belongs only to a patch value");
+            }
             if (value.must_tail) {
                 if (value.kind != ValueKind::Call) {
                     fail(value.location,
@@ -7454,9 +7526,29 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                 const auto bits =
                     valid_type ? type_bits(hir_module, value.type) : 0;
                 if (bits == 0 ||
-                    !fits_unsigned({value.integer, value.integer_high}, bits)) {
+                    (!value.patch_initial_address &&
+                     !fits_unsigned({value.integer, value.integer_high},
+                                    bits))) {
                     fail(value.location,
                          "patch initial bits do not fit its type");
+                }
+                if (value.patch_initial_address) {
+                    const auto& address = *value.patch_initial_address;
+                    const bool identity_valid =
+                        (address.kind == data::AddressKind::Object &&
+                         address.object &&
+                         address.object->value < hir_module.objects.size()) ||
+                        (address.kind == data::AddressKind::Function &&
+                         address.function &&
+                         address.function->value < hir_module.functions.size()) ||
+                        (address.kind == data::AddressKind::Label &&
+                         address.label &&
+                         address.label->value < hir_module.labels.size());
+                    if (!identity_valid || bits != hir_module.address_bits ||
+                        value.integer != 0 || value.integer_high != 0) {
+                        fail(value.location,
+                             "invalid relocatable patch initial");
+                    }
                 }
                 if (!patch_ids.insert(value.patch_id).second) {
                     fail(value.location, "duplicate patch-value site id");
