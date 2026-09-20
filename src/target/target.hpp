@@ -357,6 +357,7 @@ struct AddressSpaceEntry {
 enum class ByteOrder { Little, Big };
 enum class BitFieldOrder { LeastSignificantFirst, MostSignificantFirst };
 enum class BitFieldUnitSharing { SameUnqualifiedBase, SameStorageSize };
+enum class BitFieldPlacement { AlignedUnits, NextAvailableBit };
 
 // Target storage facts used before instruction selection. Pointer width comes
 // from the selected ABI because architectures such as MIPS may expose more
@@ -369,6 +370,7 @@ struct TargetDataLayout {
     BitFieldOrder bit_field_order{BitFieldOrder::LeastSignificantFirst};
     BitFieldUnitSharing bit_field_unit_sharing{
         BitFieldUnitSharing::SameUnqualifiedBase};
+    BitFieldPlacement bit_field_placement{BitFieldPlacement::AlignedUnits};
 };
 
 // Target-independent optimizations describe the value they need priced;

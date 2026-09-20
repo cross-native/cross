@@ -896,6 +896,12 @@ private:
             unsigned alignment{1};
         };
         std::optional<ActiveBitFieldUnit> active_bit_field;
+        // GNU x86-64 layout tracks the first unallocated bit separately from
+        // the containing integer unit used for access and ABI transport.
+        const bool next_bit_placement =
+            target_.data_layout.bit_field_placement ==
+            BitFieldPlacement::NextAvailableBit;
+        std::uint64_t next_bit{};
         const auto current_namespace = source_namespace(record.source_name);
         for (auto& member : record.members) {
             if (member.pending_bit_width &&
@@ -905,6 +911,7 @@ private:
             const auto [size, natural_alignment] =
                 storage_layout(member.type, member.location);
             if (size == 0) valid = false;
+            const auto requested_alignment = member.alignment;
             const auto placement_alignment =
                 std::max(member.alignment,
                          (record.packed || member.packed)
@@ -928,6 +935,17 @@ private:
                                    align_up(extent, placement_alignment)) {
                         member.offset = *offset;
                         extent = *offset;
+                        if (next_bit_placement) {
+                            if (extent >
+                                std::numeric_limits<std::uint64_t>::max() / 8U) {
+                                diagnostics_.error(
+                                    member.location,
+                                    "record layout overflows target storage");
+                                valid = false;
+                            } else {
+                                next_bit = extent * 8U;
+                            }
+                        }
                     } else {
                         diagnostics_.error(
                             member.location,
@@ -948,6 +966,66 @@ private:
                             ? 0U
                             : unit_bits - width;
                     extent = std::max(extent, size);
+                    continue;
+                }
+                if (next_bit_placement && !record.packed && !member.packed) {
+                    active_bit_field.reset();
+                    auto start = next_bit;
+                    if (requested_alignment > 1) {
+                        if (requested_alignment >
+                            std::numeric_limits<unsigned>::max() / 8U) {
+                            diagnostics_.error(
+                                member.location,
+                                "record layout overflows target storage");
+                            valid = false;
+                            continue;
+                        }
+                        const auto aligned = align_up(
+                            start, requested_alignment * 8U);
+                        if (!aligned) {
+                            diagnostics_.error(
+                                member.location,
+                                "record layout overflows target storage");
+                            valid = false;
+                            continue;
+                        }
+                        start = *aligned;
+                    }
+                    const auto unit_start =
+                        (start / unit_bits) * unit_bits;
+                    if (width > unit_bits - (start - unit_start)) {
+                        if (unit_start >
+                            std::numeric_limits<std::uint64_t>::max() -
+                                unit_bits) {
+                            diagnostics_.error(
+                                member.location,
+                                "record layout overflows target storage");
+                            valid = false;
+                            continue;
+                        }
+                        start = unit_start + unit_bits;
+                    }
+                    if (start >
+                        std::numeric_limits<std::uint64_t>::max() - width) {
+                        diagnostics_.error(
+                            member.location,
+                            "record layout overflows target storage");
+                        valid = false;
+                        continue;
+                    }
+                    const auto storage_start =
+                        (start / unit_bits) * unit_bits;
+                    member.offset = storage_start / 8U;
+                    const auto within_unit =
+                        static_cast<unsigned>(start - storage_start);
+                    member.bit_offset =
+                        target_.data_layout.bit_field_order ==
+                                BitFieldOrder::LeastSignificantFirst
+                            ? within_unit
+                            : unit_bits - within_unit - width;
+                    next_bit = start + width;
+                    extent = next_bit / 8U +
+                             static_cast<std::uint64_t>(next_bit % 8U != 0);
                     continue;
                 }
                 const auto unqualified = module_.unqualified(member.type);
@@ -976,6 +1054,17 @@ private:
                         unqualified, *offset, unit_bits, 0,
                         placement_alignment};
                     extent = *offset + size;
+                    if (next_bit_placement) {
+                        if (extent >
+                            std::numeric_limits<std::uint64_t>::max() / 8U) {
+                            diagnostics_.error(
+                                member.location,
+                                "record layout overflows target storage");
+                            valid = false;
+                        } else {
+                            next_bit = extent * 8U;
+                        }
+                    }
                 }
                 member.offset = active_bit_field->offset;
                 member.bit_offset =
@@ -1007,6 +1096,17 @@ private:
             }
             member.offset = *offset;
             extent = *offset + size;
+            if (next_bit_placement) {
+                if (extent >
+                    std::numeric_limits<std::uint64_t>::max() / 8U) {
+                    diagnostics_.error(
+                        member.location,
+                        "record layout overflows target storage");
+                    valid = false;
+                } else {
+                    next_bit = extent * 8U;
+                }
+            }
         }
         record_alignment = std::max(record_alignment,
                                     record.explicit_alignment);

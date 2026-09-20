@@ -182,17 +182,6 @@ std::size_t variadic_save_area_size(const AbiEntry& abi) {
     return variadic_save_bank_offset(abi, {});
 }
 
-ReturnAssignment automatic_return(AbiId abi,
-                                  ScalarMode mode,
-                                  AbiFeatureSet features = {}) {
-    const auto* model = abi_model(abi);
-    if (model) return classify_return(*model, AbiValue{mode}, features);
-    ReturnAssignment result;
-    result.mode = mode;
-    result.error = ClassificationError::UnsupportedAbi;
-    return result;
-}
-
 bool is_void(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
     return type.kind == hir::Type::Kind::Builtin &&
@@ -412,6 +401,39 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
     }
     result.mode = abi_scalar_mode(module, id, abi);
     return result;
+}
+
+std::optional<ReturnAssignment> classify_function_result(
+    const hir::Module& module, const hir::Function& entity,
+    const Subtarget& subtarget) {
+    const auto* abi = abi_model(entity.abi);
+    if (!abi || is_void(module, entity.result_type)) return std::nullopt;
+
+    std::vector<AbiValue> arguments;
+    arguments.reserve(entity.parameters.size());
+    for (const auto& parameter : entity.parameters) {
+        arguments.push_back(abi_value_for(
+            module, parameter.type, *abi,
+            parameter.mode == ParameterMode::In
+                ? ValueTransport::Direct
+                : ValueTransport::ByReference));
+    }
+    const std::array results{
+        abi_value_for(module, entity.result_type, *abi)};
+    const auto classified = entity.variadic
+        ? classify_variadic_signature(
+              *abi, arguments, results, entity.parameters.size(),
+              subtarget.enabled_features())
+        : classify_signature(
+              *abi, arguments, results, subtarget.enabled_features());
+    if (!classified || classified.layout.results.size() != 1) {
+        return std::nullopt;
+    }
+    return classified.layout.results.front();
+}
+
+std::string indirect_result_home_name(std::size_t index) {
+    return "$result.sret." + std::to_string(index);
 }
 
 std::uint32_t align_up(std::uint32_t value, std::uint32_t alignment) {
@@ -994,69 +1016,33 @@ private:
             }
         }
         const auto* manual = manual_plans_.find(source.source);
-        const auto automatic_f80_result =
-            automatic_return(entity.abi, ScalarMode::floating(80),
-                             subtarget_.enabled_features());
-        if (!manual && automatic_f80_result &&
-            automatic_f80_result.indirect &&
-            type_bits(hir_, entity.result_type) == 80) {
-            const auto* abi = abi_model(entity.abi);
-            const auto address_bytes =
-                abi ? (abi->address_bits + 7U) / 8U : 8U;
-            machine::StackSlot result_pointer;
-            result_pointer.id = {
-                static_cast<std::uint32_t>(
-                    current_.stack_slots.size())};
-            result_pointer.kind = machine::StackSlotKind::Local;
-            result_pointer.size = address_bytes;
-            result_pointer.alignment = address_bytes;
-            result_pointer.location = source.location;
-            result_pointer.name = "$f80.sret";
-            current_.stack_slots.push_back(std::move(result_pointer));
-        }
-        const auto automatic_f128_result =
-            automatic_return(entity.abi, ScalarMode::floating(128),
-                             subtarget_.enabled_features());
         const auto* dynamic = dynamic_plans_.find(source.source);
-        const bool indirect_f128_result =
-            type_bits(hir_, entity.result_type) == 128 &&
-            is_floating(hir_, entity.result_type) &&
-            ((dynamic && dynamic->result && dynamic->result->indirect) ||
-             (!dynamic && !manual && automatic_f128_result &&
-              automatic_f128_result.indirect));
-        if (indirect_f128_result) {
-            machine::StackSlot result_pointer;
-            result_pointer.id = {
-                static_cast<std::uint32_t>(
-                    current_.stack_slots.size())};
-            result_pointer.kind = machine::StackSlotKind::Local;
-            result_pointer.size = 8;
-            result_pointer.alignment = 8;
-            result_pointer.location = source.location;
-            result_pointer.name = "$f128.sret";
-            current_.stack_slots.push_back(std::move(result_pointer));
-        }
-        std::optional<ReturnAssignment> aggregate_result;
-        if (!manual && is_aggregate(hir_, entity.result_type)) {
+        std::optional<ReturnAssignment> managed_result;
+        if (!manual) {
             if (dynamic && dynamic->result) {
-                aggregate_result = *dynamic->result;
-            } else if (const auto* abi = abi_model(entity.abi)) {
-                aggregate_result = classify_return(
-                    *abi, abi_value_for(hir_, entity.result_type, *abi),
-                    subtarget_.enabled_features());
+                managed_result = *dynamic->result;
+            } else {
+                managed_result = classify_function_result(
+                    hir_, entity, subtarget_);
             }
         }
-        if (aggregate_result && *aggregate_result &&
-            aggregate_result->indirect) {
-            machine::StackSlot result_pointer;
-            result_pointer.id = {
-                static_cast<std::uint32_t>(current_.stack_slots.size())};
-            result_pointer.kind = machine::StackSlotKind::Local;
-            result_pointer.size = 8;
-            result_pointer.alignment = 8;
-            result_pointer.location = source.location;
-            result_pointer.name = "$aggregate.sret";
-            current_.stack_slots.push_back(std::move(result_pointer));
+        if (managed_result && *managed_result && managed_result->indirect) {
+            const auto* abi = abi_model(entity.abi);
+            const auto address_bytes = static_cast<std::uint32_t>(
+                abi ? (abi->address_bits + 7U) / 8U : 8U);
+            for (std::size_t index = 0;
+                 index < managed_result->pieces.size(); ++index) {
+                machine::StackSlot result_pointer;
+                result_pointer.id = {
+                    static_cast<std::uint32_t>(
+                        current_.stack_slots.size())};
+                result_pointer.kind = machine::StackSlotKind::Local;
+                result_pointer.size = address_bytes;
+                result_pointer.alignment = address_bytes;
+                result_pointer.location = source.location;
+                result_pointer.name = indirect_result_home_name(index);
+                current_.stack_slots.push_back(std::move(result_pointer));
+            }
         }
         if (manual && manual->x87.has_x87) {
             for (unsigned position = 0;
@@ -6265,11 +6251,19 @@ private:
                 const bool extended_float_cast =
                     (instruction.opcode == Opcode::Fextend ||
                      instruction.opcode == Opcode::Ftruncate) &&
-                    std::any_of(
-                        instruction.uses.begin(), instruction.uses.end(),
-                        [](const machine::Register& reg) {
-                            return reg.mode.bits > 64;
-                        });
+                    (std::any_of(
+                         instruction.uses.begin(), instruction.uses.end(),
+                         [](const machine::Register& reg) {
+                             return reg.mode.bits > 64;
+                         }) ||
+                     std::any_of(
+                         instruction.defs.begin(), instruction.defs.end(),
+                         [](const machine::Register& reg) {
+                             // f32/f64 -> f80 feeds FLDS/FLDL from the
+                             // source home, even when the source could
+                             // otherwise reside in an XMM register.
+                             return reg.mode.bits == 80;
+                         }));
                 if (extended_float_cast) {
                     for (const auto& reg : instruction.defs) {
                         mark_ineligible(reg);
@@ -7214,13 +7208,8 @@ private:
                             dynamic && dynamic->result) {
                             result = *dynamic->result;
                         } else if (!is_void(hir_, callee.result_type)) {
-                            if (const auto* abi = abi_model(callee.abi)) {
-                                result = classify_return(
-                                    *abi,
-                                    abi_value_for(
-                                        hir_, callee.result_type, *abi),
-                                    subtarget_.enabled_features());
-                            }
+                            result = classify_function_result(
+                                hir_, callee, subtarget_);
                         }
                         if (result && *result && !result->indirect &&
                             result->stack_size == 0 &&
@@ -7315,10 +7304,8 @@ private:
             if (dynamic_function_plan && dynamic_function_plan->result) {
                 function_result = *dynamic_function_plan->result;
             } else if (!is_void(hir_, entity.result_type)) {
-                function_result = classify_return(
-                    *function_abi,
-                    abi_value_for(hir_, entity.result_type, *function_abi),
-                    subtarget_.enabled_features());
+                function_result = classify_function_result(
+                    hir_, entity, subtarget_);
             }
         }
         const RegisterView* direct_result_view{};
@@ -10305,9 +10292,26 @@ private:
                                       register_name(target, 32));
             return;
         }
-        // Odd-sized SysV integer eightbytes (for example a three-byte
-        // record) must not read beyond the source object. Assemble exactly
-        // the declared bytes in scratch storage, then publish the carrier.
+        // Odd-sized integer pieces (for example a three-byte record) must
+        // not read beyond the source object. Build the carrier in its own ABI
+        // endpoint from high byte to low byte. This avoids reserving RAX/R10
+        // as implicit scratch: either register may itself be another
+        // model-defined result endpoint.
+        if (view && view->register_class == RegisterClass::integer &&
+            view->bit_offset == 0) {
+            const auto storage = view->storage_name;
+            instruction("xorl", register_name(storage, 32) + ", " +
+                                    register_name(storage, 32));
+            for (unsigned remaining = bytes; remaining != 0; --remaining) {
+                if (remaining != bytes) {
+                    instruction("shlq", "$8, " +
+                                            register_name(storage, 64));
+                }
+                instruction("movb", source(remaining - 1U) + ", " +
+                                        register_name(storage, 8));
+            }
+            return;
+        }
         instruction("xorl", "%eax, %eax");
         for (unsigned offset = 0; offset < bytes; ++offset) {
             instruction("movzbl", source(offset) + ", %r10d");
@@ -10341,6 +10345,22 @@ private:
                               : bytes == 2 ? 16U : 8U;
             instruction("mov" + std::string(1, suffix(width)),
                         register_name(source, width) + ", " + destination(0));
+            return;
+        }
+        // The endpoint is dead after capture, so consume it directly instead
+        // of using RAX as scratch. This matters when a separate result piece
+        // is carried by RAX and has not yet been captured.
+        if (view && view->register_class == RegisterClass::integer &&
+            view->bit_offset == 0) {
+            const auto storage = view->storage_name;
+            for (unsigned offset = 0; offset < bytes; ++offset) {
+                instruction("movb", register_name(storage, 8) + ", " +
+                                        destination(offset));
+                if (offset + 1U != bytes) {
+                    instruction("shrq", "$8, " +
+                                            register_name(storage, 64));
+                }
+            }
             return;
         }
         if (source != "rax") {
@@ -20494,25 +20514,59 @@ private:
                 }
             }
         }
-        // The hidden result pointer is itself a register-boundary write.  It
-        // is independent of every argument, so materialize it last: doing so
-        // cannot destroy a source still needed by the parallel argument move.
+        // Hidden result pointers are boundary writes independent of ordinary
+        // arguments, so materialize them last. A declarative indirect rule
+        // may partition the object into several independently addressed
+        // pieces and a dynamic plan may place a channel in stack storage.
         if (result && result->indirect) {
-            if (value.defs.empty() || result->pieces.empty() ||
-                result->pieces.front().location.kind !=
-                    LocationKind::Register) {
+            if (value.defs.empty() || result->pieces.empty()) {
                 diagnostics_.error(
                     value.location,
-                    "indirect managed call result has no hidden register channel");
+                    "indirect managed call result has no hidden channel");
             } else {
-                instruction(
-                    "leaq",
-                    memory(vreg_offset(function, value.defs.front())) + ", " +
-                        register_name(
-                            result->pieces.front().location.reg, 64));
-                apply_abi_register_extension(
-                    result->pieces.front().location.reg,
-                    result->pieces.front());
+                const auto base = vreg_offset(function, value.defs.front());
+                // Stack and SIMD channels need RAX to materialize an address;
+                // fill them before publishing any integer register channel,
+                // including a model-selected RAX endpoint.
+                for (const bool integer_register : {false, true}) {
+                    for (const auto& piece : result->pieces) {
+                        const auto* view =
+                            piece.location.kind == LocationKind::Register
+                                ? find_register_view(piece.location.reg)
+                                : nullptr;
+                        const bool direct_integer =
+                            view && view->register_class ==
+                                        RegisterClass::integer;
+                        if (direct_integer != integer_register) continue;
+                        const auto offset = static_cast<std::int32_t>(
+                            piece.value_bit_offset / 8U);
+                        if (piece.location.kind == LocationKind::Stack) {
+                            instruction("leaq", memory(base + offset) +
+                                                    ", %rax");
+                            instruction(
+                                "movq", "%rax, " + outgoing_memory(
+                                                     piece.location.stack_offset));
+                        } else if (direct_integer) {
+                            instruction(
+                                "leaq", memory(base + offset) + ", " +
+                                            register_name(
+                                                view->storage_name, 64));
+                            apply_abi_register_extension(
+                                piece.location.reg, piece);
+                        } else if (view && view->register_class ==
+                                               RegisterClass::simd) {
+                            instruction("leaq", memory(base + offset) +
+                                                    ", %rax");
+                            instruction(
+                                "movq", "%rax, %" + piece.location.reg);
+                        } else {
+                            diagnostics_.error(
+                                value.location,
+                                "indirect managed call result uses an "
+                                "unsupported hidden channel");
+                        }
+                    }
+                }
             }
         }
         if (tail) {
@@ -20547,8 +20601,7 @@ private:
         }
         if (!value.defs.empty()) {
             const auto target = value.defs.front();
-            if (!result || !*result ||
-                result->stack_size != 0 || result->pieces.empty()) {
+            if (!result || !*result || result->pieces.empty()) {
                 diagnostics_.error(
                     value.location,
                     "x86-64 could not classify managed call result");
@@ -20556,27 +20609,49 @@ private:
                 // The callee has already populated the target's spill home.
             } else if (is_aggregate(hir_, callee->result_type)) {
                 const auto destination = vreg_offset(function, target);
-                for (const auto& piece : result->pieces) {
-                    if (piece.location.kind != LocationKind::Register) {
-                        diagnostics_.error(
-                            value.location,
-                            "automatic aggregate result requires register pieces");
-                        continue;
+                // Register endpoints are ephemeral after CALL. Capture all of
+                // them before a stack copy is allowed to use RAX/XMM0 as
+                // scratch; neither scratch is a fixed ABI result register.
+                for (const bool stack_piece : {false, true}) {
+                    for (const auto& piece : result->pieces) {
+                        if ((piece.location.kind == LocationKind::Stack) !=
+                            stack_piece) {
+                            continue;
+                        }
+                        const auto offset = static_cast<std::int32_t>(
+                            piece.value_bit_offset / 8U);
+                        if (stack_piece) {
+                            copy_fixed_storage(
+                                static_cast<unsigned>(
+                                    (piece.value_bits + 7U) / 8U),
+                                [&](unsigned byte) {
+                                    return outgoing_memory(
+                                        piece.location.stack_offset + byte);
+                                },
+                                [&](unsigned byte) {
+                                    return memory(
+                                        destination + offset +
+                                        static_cast<std::int32_t>(byte));
+                                });
+                        } else {
+                            store_abi_piece(
+                                piece.location.reg,
+                                [&](unsigned byte) {
+                                    return memory(
+                                        destination + offset +
+                                        static_cast<std::int32_t>(byte));
+                                },
+                                piece.value_bits);
+                        }
                     }
-                    store_abi_piece(
-                        piece.location.reg,
-                        [&](unsigned byte) {
-                            return memory(
-                                destination +
-                                static_cast<std::int32_t>(
-                                    piece.value_bit_offset / 8U + byte));
-                        },
-                        piece.value_bits);
                 }
             } else if (type_bits(hir_, callee->result_type) == 80) {
                 const auto& source = result->pieces.front().location;
-                if (source.kind != LocationKind::Register ||
-                    source.reg != "st0") {
+                if (source.kind == LocationKind::Stack) {
+                    instruction("fldt", outgoing_memory(
+                                            source.stack_offset));
+                    store_x87(function, target);
+                } else if (source.reg != "st0") {
                     diagnostics_.error(
                         value.location,
                         "automatic f80 result requires the x87 st0 endpoint");
@@ -20585,33 +20660,98 @@ private:
                 }
             } else if (is_vector(hir_, callee->result_type)) {
                 const auto destination = vreg_offset(function, target);
-                for (const auto& piece : result->pieces) {
-                    if (piece.location.kind != LocationKind::Register) {
-                        diagnostics_.error(
-                            value.location,
-                            "automatic vector result requires register "
-                            "pieces");
-                        continue;
+                for (const bool stack_piece : {false, true}) {
+                    for (const auto& piece : result->pieces) {
+                        if ((piece.location.kind == LocationKind::Stack) !=
+                            stack_piece) {
+                            continue;
+                        }
+                        const auto offset = static_cast<std::int32_t>(
+                            piece.value_bit_offset / 8U);
+                        if (stack_piece) {
+                            copy_fixed_storage(
+                                static_cast<unsigned>(
+                                    (piece.value_bits + 7U) / 8U),
+                                [&](unsigned byte) {
+                                    return outgoing_memory(
+                                        piece.location.stack_offset + byte);
+                                },
+                                [&](unsigned byte) {
+                                    return memory(
+                                        destination + offset +
+                                        static_cast<std::int32_t>(byte));
+                                });
+                        } else {
+                            instruction(
+                                simd_vector_move_opcode(piece.carrier_bits),
+                                "%" + piece.location.reg + ", " +
+                                    memory(destination + offset));
+                        }
                     }
-                    instruction(
-                        simd_vector_move_opcode(piece.carrier_bits),
-                        "%" + piece.location.reg + ", " +
-                            memory(destination +
-                                   static_cast<std::int32_t>(
-                                       piece.value_bit_offset / 8U)));
                 }
             } else if (is_floating(hir_, callee->result_type)) {
-                store_float(
-                    function, target,
-                    result->pieces.front().location.reg);
-            } else if (target.mode.bits == 128 &&
-                       result->pieces.size() >= 2) {
-                store(function, target,
-                      result->pieces[0].location.reg,
-                      result->pieces[1].location.reg);
+                const auto& source = result->pieces.front().location;
+                if (source.kind == LocationKind::Stack) {
+                    if (target.mode.bits == 128) {
+                        copy_outgoing_to_frame(
+                            source.stack_offset,
+                            vreg_offset(function, target), 16);
+                    } else {
+                        instruction(
+                            target.mode.bits == 32 ? "movss" : "movsd",
+                            outgoing_memory(source.stack_offset) +
+                                ", %xmm0");
+                        store_float(function, target, "xmm0");
+                    }
+                } else {
+                    store_float(function, target, source.reg);
+                }
+            } else if (target.mode.bits == 128) {
+                const auto destination = vreg_offset(function, target);
+                for (const bool stack_piece : {false, true}) {
+                    for (const auto& piece : result->pieces) {
+                        if ((piece.location.kind == LocationKind::Stack) !=
+                            stack_piece) {
+                            continue;
+                        }
+                        const auto offset = static_cast<std::int32_t>(
+                            piece.value_bit_offset / 8U);
+                        if (stack_piece) {
+                            copy_fixed_storage(
+                                static_cast<unsigned>(
+                                    (piece.value_bits + 7U) / 8U),
+                                [&](unsigned byte) {
+                                    return outgoing_memory(
+                                        piece.location.stack_offset + byte);
+                                },
+                                [&](unsigned byte) {
+                                    return memory(
+                                        destination + offset +
+                                        static_cast<std::int32_t>(byte));
+                                });
+                        } else {
+                            store_abi_piece(
+                                piece.location.reg,
+                                [&](unsigned byte) {
+                                    return memory(
+                                        destination + offset +
+                                        static_cast<std::int32_t>(byte));
+                                },
+                                piece.value_bits);
+                        }
+                    }
+                }
             } else {
-                store(function, target,
-                      result->pieces.front().location.reg);
+                const auto& source = result->pieces.front().location;
+                if (source.kind == LocationKind::Stack) {
+                    instruction(
+                        "mov" + std::string(1, suffix(target.mode.bits)),
+                        outgoing_memory(source.stack_offset) + ", " +
+                            register_name("rax", target.mode.bits));
+                    store(function, target, "rax");
+                } else {
+                    store(function, target, source.reg);
+                }
             }
         }
         restore_hard_registers(function, "$hard.call.");
@@ -21610,155 +21750,256 @@ private:
             }
         }
         if (!value.uses.empty()) {
-            if (type_bits(hir_, entity.result_type) == 80) {
-                const auto result = automatic_return(
-                    entity.abi, ScalarMode::floating(80),
-                    subtarget_.enabled_features());
-                if (result && result.indirect) {
-                    const auto result_pointer =
-                        named_slot_offset(function, "$f80.sret");
-                    if (!result_pointer) {
+            std::optional<ReturnAssignment> classified_result;
+            if (const auto* dynamic =
+                    dynamic_plans_.find(function.source);
+                dynamic && dynamic->result) {
+                classified_result = *dynamic->result;
+            } else {
+                classified_result = classify_function_result(
+                    hir_, entity, subtarget_);
+            }
+            const auto emit_indirect_result =
+                [&](const ReturnAssignment& result) {
+                    if (result.pieces.empty()) {
                         diagnostics_.error(
                             value.location,
-                            "automatic f80 result has no hidden-result home");
-                    } else {
-                        instruction("movq",
-                                    memory(*result_pointer) + ", %r10");
-                        load_x87(function, value.uses.front());
-                        instruction("fstpt", "0(%r10)");
-                        if (!result.indirect_result_reg.empty()) {
-                            instruction(
-                                "movq",
-                                "%r10, %" +
-                                    result.indirect_result_reg);
+                            "automatic indirect result has no hidden channel");
+                        return;
+                    }
+                    const auto source =
+                        vreg_offset(function, value.uses.front());
+                    const auto object_bytes =
+                        storage_size(hir_, entity.result_type);
+                    for (std::size_t index = 0;
+                         index < result.pieces.size(); ++index) {
+                        const auto& piece = result.pieces[index];
+                        const auto offset = static_cast<unsigned>(
+                            piece.value_bit_offset / 8U);
+                        const auto bytes = static_cast<unsigned>(
+                            (piece.indirect_value_bits + 7U) / 8U);
+                        const auto pointer = named_slot_offset(
+                            function, indirect_result_home_name(index));
+                        if (!pointer || bytes == 0 || offset > object_bytes ||
+                            bytes > object_bytes - offset) {
+                            diagnostics_.error(
+                                value.location,
+                                "automatic indirect result piece has no "
+                                "valid hidden-pointer home");
+                            continue;
+                        }
+                        instruction("movq", memory(*pointer) + ", %r10");
+                        copy_fixed_storage(
+                            bytes,
+                            [&](unsigned byte) {
+                                return memory(
+                                    source +
+                                    static_cast<std::int32_t>(offset + byte));
+                            },
+                            [&](unsigned byte) {
+                                return std::to_string(byte) + "(%r10)";
+                            });
+                    }
+                    if (!result.indirect_result_reg.empty()) {
+                        const auto pointer = named_slot_offset(
+                            function, indirect_result_home_name(0));
+                        const auto* abi = abi_model(entity.abi);
+                        const auto bits = abi ? abi->address_bits : 64U;
+                        if (!pointer) {
+                            diagnostics_.error(
+                                value.location,
+                                "automatic indirect result has no primary "
+                                "pointer home");
+                        } else {
+                            load_abi_piece(
+                                [&](unsigned byte) {
+                                    return memory(
+                                        *pointer +
+                                        static_cast<std::int32_t>(byte));
+                                },
+                                result.indirect_result_reg, bits);
                         }
                     }
-                } else {
+                };
+            if (type_bits(hir_, entity.result_type) == 80) {
+                if (classified_result && classified_result->indirect) {
+                    emit_indirect_result(*classified_result);
+                } else if (classified_result &&
+                           !classified_result->pieces.empty() &&
+                           classified_result->pieces.front().location.kind ==
+                               LocationKind::Stack) {
                     load_x87(function, value.uses.front());
+                    instruction(
+                        "fstpt",
+                        incoming_memory(
+                            classified_result->pieces.front()
+                                .location.stack_offset));
+                } else if (classified_result &&
+                           !classified_result->pieces.empty() &&
+                           classified_result->pieces.front().location.kind ==
+                               LocationKind::Register &&
+                           classified_result->pieces.front().location.reg ==
+                               "st0") {
+                    load_x87(function, value.uses.front());
+                } else {
+                    diagnostics_.error(
+                        value.location,
+                        "x86-64 could not classify managed f80 function "
+                        "result");
                 }
             } else {
-                std::optional<ReturnAssignment> result;
-                if (const auto* dynamic =
-                        dynamic_plans_.find(function.source);
-                    dynamic && dynamic->result) {
-                    result = *dynamic->result;
-                } else if (const auto* abi = abi_model(entity.abi)) {
-                    result = classify_return(
-                        *abi, abi_value_for(
-                            hir_, entity.result_type, *abi),
-                        subtarget_.enabled_features());
-                }
-                if (!result || !*result ||
-                    result->stack_size != 0 ||
-                    result->pieces.empty()) {
+                auto& result = classified_result;
+                if (!result || !*result || result->pieces.empty()) {
                     diagnostics_.error(
                         value.location,
                         "x86-64 could not classify managed function "
                         "result");
-                } else if (result->indirect &&
-                           is_aggregate(hir_, entity.result_type)) {
-                    const auto result_pointer =
-                        named_slot_offset(function, "$aggregate.sret");
-                    if (!result_pointer) {
-                        diagnostics_.error(
-                            value.location,
-                            "automatic aggregate result has no hidden-result home");
-                    } else {
-                        instruction("movq", memory(*result_pointer) +
-                                                ", %r10");
-                        copy_frame_to_pointer(
-                            vreg_offset(function, value.uses.front()),
-                            "r10", storage_size(hir_, entity.result_type));
-                        if (!result->indirect_result_reg.empty()) {
-                            instruction(
-                                "movq", "%r10, " + register_name(
-                                                   result->indirect_result_reg,
-                                                   64));
-                        }
-                    }
-                } else if (result->indirect &&
-                           type_bits(hir_, entity.result_type) == 128 &&
-                           is_floating(hir_, entity.result_type)) {
-                    const auto result_pointer =
-                        named_slot_offset(function, "$f128.sret");
-                    if (!result_pointer) {
-                        diagnostics_.error(
-                            value.location,
-                            "automatic f128 result has no hidden-result home");
-                    } else {
-                        instruction("movq", memory(*result_pointer) + ", %r10");
-                        load_float(function, value.uses.front(), "xmm0");
-                        instruction("movdqu", "%xmm0, 0(%r10)");
-                        if (!result->indirect_result_reg.empty()) {
-                            instruction(
-                                "movq",
-                                "%r10, " + register_name(
-                                               result->indirect_result_reg, 64));
-                        }
-                    }
                 } else if (result->indirect) {
-                    diagnostics_.error(
-                        value.location,
-                        "indirect managed function result is not selected for this type");
+                    emit_indirect_result(*result);
                 } else if (is_aggregate(hir_, entity.result_type)) {
                     const auto source =
                         vreg_offset(function, value.uses.front());
-                    for (const auto& piece : result->pieces) {
-                        if (piece.location.kind != LocationKind::Register) {
-                            diagnostics_.error(
-                                value.location,
-                                "automatic aggregate result requires register pieces");
-                            continue;
+                    // Stack stores may use RAX/XMM0 as scratch. Complete them
+                    // before publishing any model-defined register result.
+                    for (const bool stack_piece : {true, false}) {
+                        for (const auto& piece : result->pieces) {
+                            if ((piece.location.kind == LocationKind::Stack) !=
+                                stack_piece) {
+                                continue;
+                            }
+                            const auto offset = static_cast<std::int32_t>(
+                                piece.value_bit_offset / 8U);
+                            if (stack_piece) {
+                                copy_fixed_storage(
+                                    static_cast<unsigned>(
+                                        (piece.value_bits + 7U) / 8U),
+                                    [&](unsigned byte) {
+                                        return memory(
+                                            source + offset +
+                                            static_cast<std::int32_t>(byte));
+                                    },
+                                    [&](unsigned byte) {
+                                        return incoming_memory(
+                                            piece.location.stack_offset + byte);
+                                    });
+                            } else {
+                                load_abi_piece(
+                                    [&](unsigned byte) {
+                                        return memory(
+                                            source + offset +
+                                            static_cast<std::int32_t>(byte));
+                                    },
+                                    piece.location.reg, piece.value_bits);
+                                apply_abi_register_extension(
+                                    piece.location.reg, piece);
+                            }
                         }
-                        load_abi_piece(
-                            [&](unsigned byte) {
-                                return memory(
-                                    source +
-                                    static_cast<std::int32_t>(
-                                        piece.value_bit_offset / 8U + byte));
-                            },
-                            piece.location.reg, piece.value_bits);
-                        apply_abi_register_extension(
-                            piece.location.reg, piece);
                     }
                 } else if (is_vector(hir_, entity.result_type)) {
                     const auto source =
                         vreg_offset(function, value.uses.front());
-                    for (const auto& piece : result->pieces) {
-                        if (piece.location.kind != LocationKind::Register) {
-                            diagnostics_.error(
-                                value.location,
-                                "automatic vector result requires register "
-                                "pieces");
-                            continue;
+                    for (const bool stack_piece : {true, false}) {
+                        for (const auto& piece : result->pieces) {
+                            if ((piece.location.kind == LocationKind::Stack) !=
+                                stack_piece) {
+                                continue;
+                            }
+                            const auto offset = static_cast<std::int32_t>(
+                                piece.value_bit_offset / 8U);
+                            if (stack_piece) {
+                                copy_fixed_storage(
+                                    static_cast<unsigned>(
+                                        (piece.value_bits + 7U) / 8U),
+                                    [&](unsigned byte) {
+                                        return memory(
+                                            source + offset +
+                                            static_cast<std::int32_t>(byte));
+                                    },
+                                    [&](unsigned byte) {
+                                        return incoming_memory(
+                                            piece.location.stack_offset + byte);
+                                    });
+                            } else {
+                                instruction(
+                                    simd_vector_move_opcode(piece.carrier_bits),
+                                    memory(source + offset) +
+                                        ", %" + piece.location.reg);
+                            }
                         }
-                        instruction(
-                            simd_vector_move_opcode(piece.carrier_bits),
-                            memory(source + static_cast<std::int32_t>(
-                                                piece.value_bit_offset / 8U)) +
-                                ", %" + piece.location.reg);
                     }
                 } else if (is_floating(hir_, entity.result_type)) {
-                    load_float(
-                        function, value.uses.front(),
-                        result->pieces.front().location.reg);
-                } else if (type_bits(hir_, entity.result_type) == 128 &&
-                           result->pieces.size() >= 2) {
-                    load(function, value.uses.front(),
-                         result->pieces[0].location.reg,
-                         result->pieces[1].location.reg);
-                    apply_abi_register_extension(
-                        result->pieces[0].location.reg,
-                        result->pieces[0]);
-                    apply_abi_register_extension(
-                        result->pieces[1].location.reg,
-                        result->pieces[1]);
+                    const auto& destination =
+                        result->pieces.front().location;
+                    if (destination.kind == LocationKind::Stack) {
+                        if (type_bits(hir_, entity.result_type) == 128) {
+                            copy_frame_to_incoming(
+                                vreg_offset(function, value.uses.front()),
+                                destination.stack_offset, 16);
+                        } else {
+                            load_float(
+                                function, value.uses.front(), "xmm0");
+                            instruction(
+                                type_bits(hir_, entity.result_type) == 32
+                                    ? "movss" : "movsd",
+                                "%xmm0, " + incoming_memory(
+                                                 destination.stack_offset));
+                        }
+                    } else {
+                        load_float(function, value.uses.front(),
+                                   destination.reg);
+                    }
+                } else if (type_bits(hir_, entity.result_type) == 128) {
+                    const auto source =
+                        vreg_offset(function, value.uses.front());
+                    for (const bool stack_piece : {true, false}) {
+                        for (const auto& piece : result->pieces) {
+                            if ((piece.location.kind == LocationKind::Stack) !=
+                                stack_piece) {
+                                continue;
+                            }
+                            const auto offset = static_cast<std::int32_t>(
+                                piece.value_bit_offset / 8U);
+                            if (stack_piece) {
+                                copy_fixed_storage(
+                                    static_cast<unsigned>(
+                                        (piece.value_bits + 7U) / 8U),
+                                    [&](unsigned byte) {
+                                        return memory(
+                                            source + offset +
+                                            static_cast<std::int32_t>(byte));
+                                    },
+                                    [&](unsigned byte) {
+                                        return incoming_memory(
+                                            piece.location.stack_offset + byte);
+                                    });
+                            } else {
+                                load_abi_piece(
+                                    [&](unsigned byte) {
+                                        return memory(
+                                            source + offset +
+                                            static_cast<std::int32_t>(byte));
+                                    },
+                                    piece.location.reg, piece.value_bits);
+                                apply_abi_register_extension(
+                                    piece.location.reg, piece);
+                            }
+                        }
+                    }
                 } else {
-                    load(function, value.uses.front(),
-                         result->pieces.front().location.reg);
-                    apply_abi_register_extension(
-                        result->pieces.front().location.reg,
-                        result->pieces.front());
+                    const auto& destination =
+                        result->pieces.front().location;
+                    if (destination.kind == LocationKind::Stack) {
+                        load(function, value.uses.front(), "rax");
+                        const auto bits = value.uses.front().mode.bits;
+                        instruction(
+                            "mov" + std::string(1, suffix(bits)),
+                            register_name("rax", bits) + ", " +
+                                incoming_memory(destination.stack_offset));
+                    } else {
+                        load(function, value.uses.front(), destination.reg);
+                        apply_abi_register_extension(
+                            destination.reg, result->pieces.front());
+                    }
                 }
             }
         }
@@ -22851,93 +23092,62 @@ private:
             capture_manual_x87_inputs(function, *manual);
             capture_manual_register_inputs(function, *manual);
         }
-        const auto automatic_f80_result =
-            automatic_return(entity.abi, ScalarMode::floating(80),
-                             subtarget_.enabled_features());
-        if (!manual_plans_.find(function.source) &&
-            automatic_f80_result &&
-            automatic_f80_result.indirect &&
-            type_bits(hir_, entity.result_type) == 80) {
-            const auto result_pointer =
-                named_slot_offset(function, "$f80.sret");
-            if (!result_pointer) {
-                diagnostics_.error(
-                    function.location,
-                    "automatic f80 result has no hidden-result home");
-            } else {
-                if (automatic_f80_result.pieces.empty() ||
-                    automatic_f80_result.pieces.front().location.kind !=
-                        LocationKind::Register) {
-                    diagnostics_.error(
-                        function.location,
-                        "automatic f80 hidden result has no register "
-                        "channel");
-                } else {
-                    instruction(
-                        "movq",
-                        "%" +
-                            automatic_f80_result.pieces.front()
-                                .location.reg +
-                            ", " + memory(*result_pointer));
-                    }
-                }
-            }
-        std::optional<ReturnAssignment> f128_result;
-        if (const auto* dynamic = dynamic_plans_.find(function.source);
-            dynamic && dynamic->result) {
-            f128_result = *dynamic->result;
-        } else if (!manual_plans_.find(function.source) &&
-                   type_bits(hir_, entity.result_type) == 128 &&
-                   is_floating(hir_, entity.result_type)) {
-            f128_result = automatic_return(
-                entity.abi, ScalarMode::floating(128),
-                subtarget_.enabled_features());
-        }
-        if (f128_result && *f128_result && f128_result->indirect) {
-            const auto result_pointer =
-                named_slot_offset(function, "$f128.sret");
-            if (!result_pointer || f128_result->pieces.empty() ||
-                f128_result->pieces.front().location.kind !=
-                    LocationKind::Register) {
-                diagnostics_.error(
-                    function.location,
-                    "automatic f128 result has no hidden register home");
-            } else {
-                instruction(
-                    "movq",
-                    register_name(
-                        f128_result->pieces.front().location.reg, 64) +
-                        ", " + memory(*result_pointer));
-            }
-        }
-        std::optional<ReturnAssignment> aggregate_result;
-        if (!manual_plans_.find(function.source) &&
-            is_aggregate(hir_, entity.result_type)) {
+        std::optional<ReturnAssignment> managed_result;
+        if (!manual_plans_.find(function.source)) {
             if (const auto* dynamic = dynamic_plans_.find(function.source);
                 dynamic && dynamic->result) {
-                aggregate_result = *dynamic->result;
-            } else if (const auto* abi = abi_model(entity.abi)) {
-                aggregate_result = classify_return(
-                    *abi, abi_value_for(hir_, entity.result_type, *abi),
-                    subtarget_.enabled_features());
+                managed_result = *dynamic->result;
+            } else {
+                managed_result = classify_function_result(
+                    hir_, entity, subtarget_);
             }
         }
-        if (aggregate_result && *aggregate_result &&
-            aggregate_result->indirect) {
-            const auto result_pointer =
-                named_slot_offset(function, "$aggregate.sret");
-            if (!result_pointer || aggregate_result->pieces.empty() ||
-                aggregate_result->pieces.front().location.kind !=
-                    LocationKind::Register) {
-                diagnostics_.error(
-                    function.location,
-                    "automatic aggregate result has no hidden register home");
-            } else {
-                instruction(
-                    "movq",
-                    register_name(
-                        aggregate_result->pieces.front().location.reg, 64) +
-                        ", " + memory(*result_pointer));
+        if (managed_result && *managed_result && managed_result->indirect) {
+            const auto* abi = abi_model(entity.abi);
+            const auto address_bytes = static_cast<unsigned>(
+                abi ? (abi->address_bits + 7U) / 8U : 8U);
+            // Save register channels before stack loads use an integer
+            // scratch. Dynamic/custom plans are allowed to choose either.
+            for (const bool stack_piece : {false, true}) {
+                for (std::size_t index = 0;
+                     index < managed_result->pieces.size(); ++index) {
+                    const auto& piece = managed_result->pieces[index];
+                    if ((piece.location.kind == LocationKind::Stack) !=
+                        stack_piece) {
+                        continue;
+                    }
+                    const auto result_pointer = named_slot_offset(
+                        function, indirect_result_home_name(index));
+                    if (!result_pointer) {
+                        diagnostics_.error(
+                            function.location,
+                            "automatic indirect result pointer has no frame "
+                            "home");
+                        continue;
+                    }
+                    if (stack_piece) {
+                        copy_fixed_storage(
+                            address_bytes,
+                            [&](unsigned byte) {
+                                return incoming_memory(
+                                    piece.location.stack_offset + byte);
+                            },
+                            [&](unsigned byte) {
+                                return memory(
+                                    *result_pointer +
+                                    static_cast<std::int32_t>(byte));
+                            });
+                    } else {
+                        store_abi_piece(
+                            piece.location.reg,
+                            [&](unsigned byte) {
+                                return memory(
+                                    *result_pointer +
+                                    static_cast<std::int32_t>(byte));
+                            },
+                            address_bytes * 8U);
+                    }
+                }
             }
         }
         emit_variadic_prologue(function, entity);

@@ -7,9 +7,11 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define CROSS_SYSV __attribute__((sysv_abi))
 #define CROSS_MS __attribute__((ms_abi))
+#define CROSS_GCC_STRUCT __attribute__((gcc_struct))
 #else
 #define CROSS_SYSV
 #define CROSS_MS
+#define CROSS_GCC_STRUCT
 #endif
 
 struct pair_i32 { std::int32_t left, right; };
@@ -31,6 +33,26 @@ struct bitfield_mixed {
     std::int32_t b : 5;
     std::uint32_t c : 6;
 };
+struct CROSS_GCC_STRUCT bitfield_after_u8 {
+    std::uint8_t x;
+    std::uint32_t a : 3;
+    std::uint32_t b : 5;
+};
+struct CROSS_GCC_STRUCT bitfield_after_u16 {
+    std::uint16_t x;
+    std::uint32_t a : 3;
+    std::uint32_t b : 5;
+};
+struct CROSS_GCC_STRUCT bitfield_after_u32 {
+    std::uint32_t x;
+    std::uint32_t a : 3;
+    std::uint32_t b : 5;
+};
+struct CROSS_GCC_STRUCT bitfield_with_tail {
+    std::uint8_t x;
+    std::uint32_t a : 3;
+    std::uint8_t y;
+};
 union integer_or_float { std::uint64_t integer; double floating; };
 
 extern "C" CROSS_SYSV pair_i32 cross_sysv_pair_i32(pair_i32);
@@ -44,7 +66,12 @@ extern "C" CROSS_SYSV wrapped_f80 cross_sysv_wrapped_f80(wrapped_f80);
 extern "C" CROSS_SYSV integer_or_float cross_sysv_union(integer_or_float);
 extern "C" CROSS_SYSV bitfield_u32 cross_sysv_bitfield_u32(bitfield_u32);
 extern "C" CROSS_SYSV int cross_bitfield_mixed_size();
+extern "C" CROSS_SYSV int cross_bitfield_mixed_sizes();
 extern "C" CROSS_SYSV int cross_sysv_bitfield_mixed(bitfield_mixed);
+extern "C" CROSS_SYSV int cross_sysv_bitfield_after_u8(bitfield_after_u8);
+extern "C" CROSS_SYSV int cross_sysv_bitfield_after_u16(bitfield_after_u16);
+extern "C" CROSS_SYSV bitfield_with_tail
+    cross_sysv_bitfield_with_tail(bitfield_with_tail);
 extern "C" CROSS_MS pair_i32 cross_ms_pair_i32(pair_i32);
 extern "C" CROSS_MS three_bytes cross_ms_three_bytes(three_bytes);
 extern "C" CROSS_MS triple_i64 cross_ms_triple_i64(triple_i64);
@@ -55,10 +82,17 @@ extern "C" int cross_aggregate_calls();
 int main() {
     static_assert(sizeof(bitfield_u32) == 4);
     static_assert(sizeof(bitfield_mixed) == 4);
+    static_assert(sizeof(bitfield_after_u8) == 4);
+    static_assert(sizeof(bitfield_after_u16) == 4);
+    static_assert(sizeof(bitfield_after_u32) == 8);
+    static_assert(sizeof(bitfield_with_tail) == 4);
     const auto sysv_bitfields = cross_sysv_bitfield_u32({1, 3});
     const auto ms_bitfields = cross_ms_bitfield_u32({1, 3});
     const auto sysv_mixed_bits = cross_sysv_bitfield_mixed({5, -3, 33});
     const auto ms_mixed_bits = cross_ms_bitfield_mixed({5, -3, 33});
+    const auto after_u8 = cross_sysv_bitfield_after_u8({7, 5, 17});
+    const auto after_u16 = cross_sysv_bitfield_after_u16({0x1234, 5, 17});
+    const auto with_tail = cross_sysv_bitfield_with_tail({7, 5, 9});
     const auto i32 = cross_sysv_pair_i32({10, 20});
     const auto f32 = cross_sysv_pair_f32({1.5f, 2.5f});
     const auto f64 = cross_sysv_pair_f64({3.5, 4.5});
@@ -90,6 +124,11 @@ int main() {
     check(ms_mixed_bits == 1, "Win64 mixed-sign bit-field carrier");
     check(cross_bitfield_mixed_size() == sizeof(bitfield_mixed),
           "mixed-sign bit-field size");
+    check(cross_bitfield_mixed_sizes() == 1, "mixed-member bit-field sizes");
+    check(after_u8 == 1, "SysV bit-field after u8");
+    check(after_u16 == 1, "SysV bit-field after u16");
+    check(with_tail.x == 7 && with_tail.a == 6 && with_tail.y == 23,
+          "SysV bit-field with following member");
     check(i32.left == 11 && i32.right == 22, "SysV two i32");
     check(f32.left == 2.5f && f32.right == 4.5f, "SysV two f32");
     check(f64.left == 4.5 && f64.right == 6.5, "SysV two f64");

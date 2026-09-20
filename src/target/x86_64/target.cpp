@@ -877,7 +877,8 @@ const TargetInfo target{
     {"x86_64", "amd64"},
     {ByteOrder::Little, 16, 16, 16,
      BitFieldOrder::LeastSignificantFirst,
-     BitFieldUnitSharing::SameStorageSize},
+     BitFieldUnitSharing::SameStorageSize,
+     BitFieldPlacement::NextAvailableBit},
     target_registers(),
     {
         {"i8", 8, "x86-64", true}, {"u8", 8, "x86-64", true},

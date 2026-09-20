@@ -231,6 +231,24 @@ if(BUILD_TESTING)
         -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language/semantics
         -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/semantic-errors
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/errors.cmake")
+    add_test(NAME cross_out_definite_assignment COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language/semantics
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/out-definite-assignment
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/out_definite_assignment.cmake")
+    foreach(level IN ITEMS O0 O1 O2 O3 Os Oz)
+        add_test(NAME cross_runtime_f80_promote_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/f80_promote.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/f80-promote-${level}
+                -DENTRY=f80_promote_entry
+                -DEXPECTED=15
+                -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_test(NAME cross_semantic_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x

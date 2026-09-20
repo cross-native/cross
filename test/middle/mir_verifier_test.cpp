@@ -157,7 +157,8 @@ mir::ManagedModule diamond_module() {
 mir::ManagedModule effectful_module() {
     auto module = valid_module();
     auto& function = module.functions.front();
-    function.slots = {{{0}, {}, {2}, "value", std::nullopt, false}};
+    function.slots = {{{0}, {}, {2}, "value", std::nullopt, false,
+                       false, false, 1, std::nullopt}};
 
     mir::ManagedValue start;
     start.id = {1};

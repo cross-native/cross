@@ -12,7 +12,39 @@ struct three_bytes { u8 first; u8 second; u8 third; };
 struct wrapped_f80 { f80 value; };
 struct bitfield_u32 { u32 ready : 1; u32 mode : 3; };
 struct bitfield_mixed { u32 a : 3; i32 b : 5; u32 c : 6; };
+struct bitfield_after_u8 { u8 x; u32 a : 3; u32 b : 5; };
+struct bitfield_after_u16 { u16 x; u32 a : 3; u32 b : 5; };
+struct bitfield_after_u32 { u32 x; u32 a : 3; u32 b : 5; };
+struct bitfield_with_tail { u8 x; u32 a : 3; u8 y; };
 union integer_or_float { u64 integer; f64 floating; };
+
+[[abi("sysv_abi"), link_name("cross_bitfield_mixed_sizes")]]
+global i32 bitfield_mixed_sizes() {
+    return sizeof(struct bitfield_after_u8) == 4 &&
+           sizeof(struct bitfield_after_u16) == 4 &&
+           sizeof(struct bitfield_after_u32) == 8 &&
+           sizeof(struct bitfield_with_tail) == 4;
+}
+
+[[abi("sysv_abi"), link_name("cross_sysv_bitfield_after_u8"), noinline]]
+global i32 sysv_bitfield_after_u8(in struct bitfield_after_u8 value) {
+    return value.x == 7u8 && value.a == 5u32 && value.b == 17u32;
+}
+
+[[abi("sysv_abi"), link_name("cross_sysv_bitfield_after_u16"), noinline]]
+global i32 sysv_bitfield_after_u16(in struct bitfield_after_u16 value) {
+    return value.x == 0x1234u16 && value.a == 5u32 &&
+           value.b == 17u32;
+}
+
+[[abi("sysv_abi"), link_name("cross_sysv_bitfield_with_tail"), noinline]]
+global struct bitfield_with_tail sysv_bitfield_with_tail(
+    in struct bitfield_with_tail value) {
+    struct bitfield_with_tail result = value;
+    result.a = 6u32;
+    result.y = 23u8;
+    return result;
+}
 
 [[abi("sysv_abi"), link_name("cross_bitfield_mixed_size")]]
 global i32 bitfield_mixed_size() {

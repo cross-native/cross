@@ -85,10 +85,173 @@ abi "odd_abi" {
         carrier_bits = 32;
     }
 
+    rule "small-aggregate" {
+        match = ["pair", "aggregate"];
+        action = "direct";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 64;
+    }
+
+    rule "aggregate-fields" {
+        match = ["pair", "aggregate"];
+        action = "flatten";
+    }
+
     rule "argument-memory" {
         match = ["any"];
         action = "stack";
         applies_to = ["arguments"];
+    }
+}
+
+abi "stack_result_abi" {
+    architecture = "x86-64";
+    address_bits = 64;
+    llvm_calling_convention = "";
+    function_selectable = true;
+    argument_register_failure = "stack";
+    result_register_failure = "stack";
+    stack_layout = "packed";
+    stack_order = ["arguments", "results"];
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 8;
+    call_clobbers = ["r8", "r9", "r10", "r11", "memory", "flags"];
+
+    bank "integer" {
+        class = "integer";
+        register_bits = 64;
+        arguments = ["r10", "r11"];
+        results = ["r8", "r9"];
+    }
+
+    rule "aggregate-result" {
+        match = ["pair", "aggregate"];
+        action = "stack";
+        applies_to = ["results"];
+    }
+
+    rule "aggregate-arguments" {
+        match = ["pair", "aggregate"];
+        action = "flatten";
+        applies_to = ["arguments"];
+    }
+
+    rule "integer-result" {
+        match = ["integer", "pointer"];
+        action = "stack";
+        applies_to = ["results"];
+    }
+
+    rule "integer-arguments" {
+        match = ["integer", "pointer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 32;
+        applies_to = ["arguments"];
+    }
+
+    rule "memory" {
+        match = ["any"];
+        action = "stack";
+    }
+}
+
+abi "partial_result_abi" {
+    architecture = "x86-64";
+    address_bits = 64;
+    llvm_calling_convention = "";
+    function_selectable = true;
+    argument_register_failure = "stack";
+    result_register_failure = "partial";
+    stack_layout = "packed";
+    stack_order = ["arguments", "results"];
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 8;
+    call_clobbers = ["rax", "r10", "r11", "memory", "flags"];
+
+    bank "integer" {
+        class = "integer";
+        register_bits = 64;
+        arguments = ["r10", "r11"];
+        results = ["rax"];
+    }
+
+    rule "integer" {
+        match = ["integer", "pointer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+    }
+
+    rule "memory" {
+        match = ["any"];
+        action = "stack";
+    }
+}
+
+abi "memory_result_abi" {
+    architecture = "x86-64";
+    address_bits = 64;
+    llvm_calling_convention = "";
+    function_selectable = true;
+    argument_register_failure = "stack";
+    result_register_failure = "error";
+    stack_layout = "packed";
+    stack_order = ["arguments", "results"];
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 8;
+    call_clobbers = [
+        "r9", "r10", "r11", "r12", "memory", "flags"
+    ];
+
+    bank "integer" {
+        class = "integer";
+        register_bits = 64;
+        arguments = ["r10", "r11", "r12"];
+        results = ["r9"];
+    }
+
+    rule "aggregate-result" {
+        match = ["pair", "aggregate"];
+        action = "indirect";
+        bank = "integer";
+        unit_bits = 64;
+        applies_to = ["results"];
+    }
+
+    rule "aggregate-arguments" {
+        match = ["pair", "aggregate"];
+        action = "flatten";
+        applies_to = ["arguments"];
+    }
+
+    rule "integer" {
+        match = ["integer", "pointer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 32;
+        applies_to = ["arguments"];
+    }
+
+    rule "memory" {
+        match = ["any"];
+        action = "stack";
     }
 }
 

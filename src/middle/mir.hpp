@@ -126,6 +126,11 @@ struct PatchSink {
 };
 
 struct ManagedValue {
+    struct BitFieldRegion {
+        unsigned width{};
+        unsigned offset{};
+    };
+
     ValueId id;
     SourceLocation location;
     hir::TypeId type;
@@ -142,6 +147,11 @@ struct ManagedValue {
     std::uint32_t parameter_index{};
     AbiStateId variadic_state;
     std::optional<SlotId> slot;
+    // A bit-field access uses a carrier load/store, but its source-semantic
+    // access covers only the named field. The update's carrier load is not a
+    // source read of otherwise uninitialized neighboring fields.
+    std::optional<BitFieldRegion> bit_field_region;
+    bool bit_field_update_read{};
     std::optional<hir::FunctionId> callee;
     // Indirect calls carry their stable function TypeId and place the target
     // value first in operands. Direct calls retain only canonical callee ID.
@@ -178,6 +188,9 @@ struct ManagedSlot {
     // source-level body. Optimizers must model that implicit return-edge read.
     bool live_on_return{};
     unsigned minimum_alignment{1};
+    // Present only for a source parameter cell. Kept through lowering so
+    // source definite-assignment checks do not infer identity from slot names.
+    std::optional<std::uint32_t> source_parameter;
 };
 
 enum class EffectKind { Entry, Phi, Operation };

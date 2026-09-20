@@ -1055,7 +1055,7 @@ private:
                 {slot, parameter.location, cell_type,
                  "$param." + std::to_string(index), std::nullopt, false,
                  address_taken_names_.contains(parameter.name),
-                 parameter.mode != ParameterMode::In});
+                 parameter.mode != ParameterMode::In, 1, index});
             const LocalBinding binding{slot, cell_type, std::nullopt,
                                        std::nullopt};
             if (!scopes_.back().bindings.emplace(parameter.name, binding).second) {
@@ -1088,7 +1088,8 @@ private:
                      (state_model ? state_model->canonical_name
                                   : std::to_string(state.state.value)),
                  std::nullopt, false,
-                 address_taken_names_.contains(state.name), false});
+                 address_taken_names_.contains(state.name), false, 1,
+                 std::nullopt});
             const LocalBinding binding{slot, state.type, std::nullopt,
                                        std::nullopt};
             if (!scopes_.back().bindings.emplace(
@@ -2092,6 +2093,10 @@ private:
         auto storage = load_pointer(designator.address, location,
                                     designator.alignment);
         if (!storage) return std::nullopt;
+        current_.values[storage->value].bit_field_region =
+            mir::ManagedValue::BitFieldRegion{
+                designator.bit_field->width,
+                designator.bit_field->offset};
         return LoadedBitField{
             extract_bit_field(*storage, designator.type,
                               *designator.bit_field, location),
@@ -2135,6 +2140,9 @@ private:
             if (!previous) {
                 previous = load_pointer(designator.address, location,
                                         designator.alignment);
+                if (previous) {
+                    current_.values[previous->value].bit_field_update_read = true;
+                }
             }
             if (!previous) return std::nullopt;
             *previous = cast(*previous, storage_type, location);
@@ -2149,10 +2157,13 @@ private:
             inserted = integer_binary(BinaryOperation::BitOr, storage_type,
                                       cleared, inserted, location);
         }
-        if (!store_pointer(designator.address, inserted, location,
-                           designator.alignment)) {
+        const auto stored = store_pointer(designator.address, inserted,
+                                          location, designator.alignment);
+        if (!stored) {
             return std::nullopt;
         }
+        current_.values[stored->value].bit_field_region =
+            mir::ManagedValue::BitFieldRegion{field.width, field.offset};
         return extract_bit_field(source_bits, designator.type,
                                  BitFieldAccess{field.width, 0}, location);
     }
@@ -5103,7 +5114,7 @@ private:
                 {cell, actual.location, parameter.type,
                  "$call." + std::to_string(current_.values.size()) + "." +
                      std::to_string(index),
-                 std::nullopt, false});
+                 std::nullopt, false, false, false, 1, std::nullopt});
             (void)lifetime(ValueKind::LifetimeStart, cell, actual.location);
             const LocalBinding temporary{cell, parameter.type, std::nullopt,
                                          std::nullopt};
@@ -5586,7 +5597,8 @@ private:
                                       std::move(physical_location),
                                       declaration.type->is_volatile,
                                       address_taken_names_.contains(
-                                          declaration.name)});
+                                          declaration.name),
+                                      false, 1, std::nullopt});
             current_.slots.back().minimum_alignment =
                 declaration.explicit_alignment;
             const LocalBinding binding{slot, type, std::nullopt,
@@ -6055,6 +6067,317 @@ private:
 
 bool comparison(BinaryOperation operation) {
     return operation >= BinaryOperation::Equal;
+}
+
+struct SlotAddressOffset {
+    SlotId slot;
+    std::uint64_t bytes{};
+    friend bool operator==(const SlotAddressOffset&,
+                           const SlotAddressOffset&) = default;
+};
+
+std::optional<SlotAddressOffset> slot_address_offset(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const TargetInfo& target, ValueId id, unsigned depth = 0) {
+    if (depth >= 16 || id.value >= function.values.size()) return std::nullopt;
+    const auto& value = function.values[id.value];
+    if (value.kind == ValueKind::SlotAddress && value.slot)
+        return SlotAddressOffset{*value.slot, 0};
+    if (value.kind == ValueKind::Cast &&
+        value.cast == CastOperation::Reinterpret &&
+        value.operands.size() == 1) {
+        return slot_address_offset(function, hir_module, target,
+                                   value.operands.front(), depth + 1);
+    }
+    if (value.kind == ValueKind::IndexedAddress &&
+        value.operands.size() == 2) {
+        auto base = slot_address_offset(function, hir_module, target,
+                                        value.operands[0], depth + 1);
+        const auto& index = function.values[value.operands[1].value];
+        const auto& pointer =
+            hir_module.type(function.values[value.operands[0].value].type);
+        if (!base || index.kind != ValueKind::ConstantInteger ||
+            index.integer_high != 0 ||
+            pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee) {
+            return std::nullopt;
+        }
+        const auto scale = storage_size(hir_module, *pointer.pointee, target);
+        if (scale == 0 || index.integer >
+                (std::numeric_limits<std::uint64_t>::max() - base->bytes) /
+                    scale) {
+            return std::nullopt;
+        }
+        base->bytes += index.integer * scale;
+        return base;
+    }
+    if (value.kind == ValueKind::Select && value.operands.size() == 3) {
+        const auto left = slot_address_offset(function, hir_module, target,
+                                              value.operands[1], depth + 1);
+        const auto right = slot_address_offset(function, hir_module, target,
+                                               value.operands[2], depth + 1);
+        if (left && right && *left == *right) return left;
+    }
+    return std::nullopt;
+}
+
+struct OutBitInterval {
+    std::uint64_t begin{};
+    std::uint64_t end{};
+    friend bool operator==(const OutBitInterval&,
+                           const OutBitInterval&) = default;
+};
+using OutBitIntervals = std::vector<OutBitInterval>;
+
+void add_out_interval(OutBitIntervals& intervals, OutBitInterval added) {
+    if (added.begin >= added.end) return;
+    intervals.push_back(added);
+    std::sort(intervals.begin(), intervals.end(),
+              [](const auto& left, const auto& right) {
+                  return left.begin < right.begin;
+              });
+    std::size_t kept = 0;
+    for (const auto& interval : intervals) {
+        if (kept && interval.begin <= intervals[kept - 1].end) {
+            intervals[kept - 1].end =
+                std::max(intervals[kept - 1].end, interval.end);
+        } else {
+            intervals[kept++] = interval;
+        }
+    }
+    intervals.resize(kept);
+}
+
+OutBitIntervals intersect_out_intervals(const OutBitIntervals& left,
+                                        const OutBitIntervals& right) {
+    OutBitIntervals result;
+    std::size_t a = 0;
+    std::size_t b = 0;
+    while (a < left.size() && b < right.size()) {
+        const auto begin = std::max(left[a].begin, right[b].begin);
+        const auto end = std::min(left[a].end, right[b].end);
+        if (begin < end) result.push_back({begin, end});
+        if (left[a].end < right[b].end) ++a;
+        else ++b;
+    }
+    return result;
+}
+
+bool out_intervals_cover(const OutBitIntervals& assigned,
+                         const OutBitIntervals& needed) {
+    return std::all_of(needed.begin(), needed.end(),
+        [&](const OutBitInterval& part) {
+            return std::any_of(assigned.begin(), assigned.end(),
+                [&](const OutBitInterval& available) {
+                    return available.begin <= part.begin &&
+                           available.end >= part.end;
+                });
+        });
+}
+
+bool out_type_complete(const hir::Module& module, const TargetInfo& target,
+                       hir::TypeId id, std::uint64_t base_bits,
+                       const OutBitIntervals& assigned,
+                       unsigned depth = 0) {
+    if (depth >= 32) return false;
+    const auto& type = module.type(id);
+    if (type.kind == hir::Type::Kind::Record && type.record) {
+        const auto& record = module.record(*type.record);
+        bool any_member = false;
+        bool any_complete = false;
+        for (const auto& member : record.members) {
+            if (member.name.empty() && member.bit_width) continue;
+            any_member = true;
+            const auto member_base = base_bits + member.offset * 8;
+            bool complete = false;
+            if (member.bit_width) {
+                complete = out_intervals_cover(assigned,
+                    {{member_base + member.bit_offset,
+                      member_base + member.bit_offset + *member.bit_width}});
+            } else {
+                complete = out_type_complete(module, target, member.type,
+                                             member_base, assigned, depth + 1);
+            }
+            if (!record.is_union && !complete) return false;
+            any_complete |= complete;
+        }
+        return !record.is_union || !any_member || any_complete;
+    }
+    if (type.kind == hir::Type::Kind::Array && type.element) {
+        const auto element_size = storage_size(module, *type.element, target);
+        if (type.lanes > 4096) {
+            return out_intervals_cover(assigned,
+                {{base_bits, base_bits + element_size * type.lanes * 8}});
+        }
+        for (std::uint32_t index = 0; index < type.lanes; ++index) {
+            if (!out_type_complete(module, target, *type.element,
+                    base_bits + element_size * index * 8, assigned,
+                    depth + 1)) return false;
+        }
+        return true;
+    }
+    const auto size = storage_size(module, id, target);
+    return out_intervals_cover(assigned,
+                               {{base_bits, base_bits + size * 8}});
+}
+
+// Run this on source MIR, before inlining or slot promotion can erase the
+// parameter-cell writes. A normal return consumes every `out` cell even when
+// the body contains no explicit load of it.
+void check_out_definite_assignment(const ManagedFunction& function,
+                                   const hir::Module& hir_module,
+                                   const TargetInfo& target,
+                                   Diagnostics& diagnostics) {
+    const auto& source = hir_module.function(function.source);
+    std::vector<bool> reachable(function.blocks.size());
+    std::vector<BlockId> pending{function.entry};
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        if (id.value >= function.blocks.size() || reachable[id.value]) continue;
+        reachable[id.value] = true;
+        for (const auto successor :
+             function.blocks[id.value].terminator.successors) {
+            pending.push_back(successor);
+        }
+    }
+
+    for (const auto& slot : function.slots) {
+        if (!slot.source_parameter ||
+            *slot.source_parameter >= source.parameters.size() ||
+            source.parameters[*slot.source_parameter].mode != ParameterMode::Out) {
+            continue;
+        }
+        const auto& parameter = source.parameters[*slot.source_parameter];
+        const auto slot_size = storage_size(hir_module, slot.type, target);
+        const OutBitIntervals top{{0, slot_size * 8}};
+        std::vector<OutBitIntervals> assigned_in(function.blocks.size(), top);
+        std::vector<OutBitIntervals> assigned_out(function.blocks.size(), top);
+        assigned_in[function.entry.value].clear();
+        const auto pointer_region = [&](const ManagedValue& value,
+                                        bool write)
+            -> std::optional<OutBitInterval> {
+            if (value.operands.empty()) return std::nullopt;
+            const auto address = slot_address_offset(
+                function, hir_module, target, value.operands.front());
+            if (!address || address->slot != slot.id ||
+                address->bytes > slot_size) return std::nullopt;
+            const auto start = address->bytes * 8;
+            std::uint64_t begin = start;
+            std::uint64_t end{};
+            if (value.bit_field_region) {
+                begin += value.bit_field_region->offset;
+                end = begin + value.bit_field_region->width;
+            } else {
+                const auto type = write && value.operands.size() >= 2
+                    ? function.values[value.operands[1].value].type
+                    : value.type;
+                end = begin + storage_size(hir_module, type, target) * 8;
+            }
+            if (end > slot_size * 8 || begin >= end) return std::nullopt;
+            return OutBitInterval{begin, end};
+        };
+        const auto transfer_value = [&](const ManagedValue& value,
+                                        OutBitIntervals assigned) {
+            if (value.kind == ValueKind::LifetimeStart &&
+                value.slot == slot.id) {
+                assigned.clear();
+            } else if (value.kind == ValueKind::Store &&
+                       value.slot == slot.id) {
+                add_out_interval(assigned, {0, slot_size * 8});
+            } else if (value.kind == ValueKind::PointerStore) {
+                if (const auto region = pointer_region(value, true))
+                    add_out_interval(assigned, *region);
+            } else if (value.kind == ValueKind::Atomic &&
+                       value.atomic == AtomicOperation::Store) {
+                if (const auto region = pointer_region(value, true))
+                    add_out_interval(assigned, *region);
+            }
+            return assigned;
+        };
+        const auto transfer = [&](const ManagedBlock& block,
+                                  OutBitIntervals assigned) {
+            for (const auto id : block.values)
+                assigned = transfer_value(function.values[id.value],
+                                          std::move(assigned));
+            return assigned;
+        };
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& block : function.blocks) {
+                if (!reachable[block.id.value]) continue;
+                OutBitIntervals incoming;
+                if (block.id != function.entry &&
+                    !block.predecessors.empty()) {
+                    bool first = true;
+                    for (const auto predecessor : block.predecessors) {
+                        if (predecessor.value >= reachable.size() ||
+                            !reachable[predecessor.value]) continue;
+                        if (first) {
+                            incoming = assigned_out[predecessor.value];
+                            first = false;
+                        } else {
+                            incoming = intersect_out_intervals(
+                                incoming, assigned_out[predecessor.value]);
+                        }
+                    }
+                }
+                const auto outgoing = transfer(block, incoming);
+                if (assigned_in[block.id.value] != incoming ||
+                    assigned_out[block.id.value] != outgoing) {
+                    assigned_in[block.id.value] = incoming;
+                    assigned_out[block.id.value] = outgoing;
+                    changed = true;
+                }
+            }
+        }
+        bool read_reported = false;
+        bool return_reported = false;
+        for (const auto& block : function.blocks) {
+            if (!reachable[block.id.value]) continue;
+            auto assigned = assigned_in[block.id.value];
+            for (const auto id : block.values) {
+                const auto& value = function.values[id.value];
+                const bool direct_read =
+                    value.kind == ValueKind::Load && value.slot == slot.id;
+                const bool pointer_read = !value.bit_field_update_read &&
+                    (value.kind == ValueKind::PointerLoad ||
+                     (value.kind == ValueKind::Atomic &&
+                      value.atomic != AtomicOperation::Store));
+                const auto read_region = pointer_read
+                    ? pointer_region(value, false)
+                    : std::optional<OutBitInterval>{};
+                const bool pointer_read_ready = !read_region ||
+                    (!value.bit_field_region &&
+                     (hir_module.type(value.type).kind ==
+                          hir::Type::Kind::Record ||
+                      hir_module.type(value.type).kind ==
+                          hir::Type::Kind::Array)
+                        ? out_type_complete(hir_module, target, value.type,
+                                            read_region->begin, assigned)
+                        : out_intervals_cover(assigned, {*read_region}));
+                if (!read_reported &&
+                    ((direct_read &&
+                      !out_type_complete(hir_module, target, slot.type, 0,
+                                         assigned)) ||
+                     !pointer_read_ready)) {
+                    diagnostics.error(value.location,
+                        "read of 'out' parameter '" + parameter.name +
+                        "' before assignment");
+                    read_reported = true;
+                }
+                assigned = transfer_value(value, std::move(assigned));
+            }
+            if (!out_type_complete(hir_module, target, slot.type, 0,
+                                   assigned) && !return_reported &&
+                block.terminator.kind == TerminatorKind::Return) {
+                diagnostics.error(block.terminator.location,
+                    "normal return leaves 'out' parameter '" +
+                    parameter.name + "' unassigned");
+                return_reported = true;
+            }
+        }
+    }
 }
 
 bool verify_function(const ManagedFunction& function, const hir::Module& hir_module,
@@ -7228,6 +7551,9 @@ ManagedModule lower_managed(hir::Module& hir_module,
     auto module = ManagedLowerer(
         hir_module, subtarget, options, diagnostics).run();
     (void)verify(module, hir_module, diagnostics);
+    for (const auto& function : module.functions)
+        check_out_definite_assignment(function, hir_module,
+                                      subtarget.target(), diagnostics);
     return module;
 }
 
