@@ -661,6 +661,8 @@ std::optional<AddressValue> address_designator(
     const Expr& expression, const Subtarget& subtarget) {
     if (expression.kind == Expr::Kind::Parenthesized && expression.left)
         return address_designator(module, scope, *expression.left, subtarget);
+    if (expression.kind == Expr::Kind::Unary && expression.text == "*" && expression.left)
+        return address_value(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
                 find_object(module, expression.text, scope)) {
@@ -681,10 +683,11 @@ std::optional<AddressValue> address_designator(
     }
     if (expression.kind != Expr::Kind::Binary || !expression.left ||
         !expression.right) return std::nullopt;
-    if (expression.text == "member" &&
+    if ((expression.text == "member" || expression.text == "pointer_member") &&
         expression.right->kind == Expr::Kind::Name) {
-        auto base = address_designator(module, scope, *expression.left,
-                                       subtarget);
+        auto base = expression.text == "member"
+            ? address_designator(module, scope, *expression.left, subtarget)
+            : address_value(module, scope, *expression.left, subtarget);
         if (!base) return std::nullopt;
         const hir::Record* record{};
         if (base->pointee) {
@@ -800,7 +803,7 @@ std::optional<AddressValue> address_value(
         return result;
     }
     if (expression.kind == Expr::Kind::Binary &&
-        expression.text == "member") {
+        (expression.text == "member" || expression.text == "pointer_member")) {
         auto value = address_designator(module, scope, expression,
                                          subtarget);
         if (!value || !value->pointee) return std::nullopt;
@@ -841,8 +844,8 @@ std::optional<AddressValue> address_value(
                      module, *value->pointee,
                      expression.type->pointee)) ||
                 (value->cast_pointee &&
-                 !same_type(value->cast_pointee,
-                            expression.type->pointee))) {
+                 !compatible_pointee(value->cast_pointee,
+                                      expression.type->pointee))) {
                 return std::nullopt;
             }
             value->integer = false;
@@ -1290,7 +1293,46 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                (node.right && self(self, *node.right)) ||
                (node.third && self(self, *node.third));
     };
+    const GenericPointerResolver resolve_pointer =
+        [&](std::unique_ptr<Expr>& node, const TypePtr& type,
+            const FunctionDecl* context, std::span<const std::string> local_names) {
+            return normalize_generic_pointer(program, node, type, context, local_names,
+                                              options, subtarget, diagnostics);
+        };
+    const auto pointer_type_of = [&](const auto& self, const Expr& node) -> TypePtr {
+        if (node.type && node.type->kind == Type::Kind::Pointer) return node.type;
+        if (node.kind == Expr::Kind::Parenthesized && node.left) return self(self, *node.left);
+        if (node.kind == Expr::Kind::Call && node.left && node.left->kind == Expr::Kind::Name) {
+            if (node.left->text == "$::eval" && node.arguments.size() == 1)
+                return self(self, *node.arguments.front());
+            if (const auto* function = find_function(module, node.left->text, scope)) {
+                const auto* source = function->definition ? function->definition : function->declarations.back();
+                if (source->return_type->kind == Type::Kind::Pointer) return source->return_type;
+            }
+        }
+        if (node.kind == Expr::Kind::Binary && (node.text == "+" || node.text == "-")) {
+            if (node.left) if (auto type = self(self, *node.left)) return type;
+            if (node.text == "+" && node.right) return self(self, *node.right);
+        }
+        return {};
+    };
     const auto fold = [&](const auto& self, std::unique_ptr<Expr>& node) -> bool {
+        if (node->kind == Expr::Kind::Call && node->left &&
+            node->left->kind == Expr::Kind::Name && node->left->text == "$::eval") {
+            if (node->arguments.size() != 1)
+                return reject(node->location, "$::eval requires exactly one expression");
+            auto operand = std::move(node->arguments.front());
+            node = std::move(operand);
+            return self(self, node);
+        }
+        if (node->kind == Expr::Kind::Call && pointer_type_of(pointer_type_of, *node)) {
+            auto value = evaluate_target_pointer_constant(program, *node,
+                pointer_type_of(pointer_type_of, *node), caller, diagnostics,
+                size_of, align_of, resolve_pointer);
+            if (!value) return false;
+            node = std::move(value);
+            return true;
+        }
         if (node->kind == Expr::Kind::Conditional && node->left &&
             node->right && node->third) {
             const auto condition = integer(*node->left);
@@ -1305,12 +1347,46 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                 return self(self, node->left) && fold_integer(node->right);
             }
             if (node->text == "+" || node->text == "-") {
+                // Fold pointer-producing calls before deciding which operand
+                // supplies the address and which supplies the integer offset.
+                if (!self(self, node->left) || !self(self, node->right)) return false;
                 const bool left_address = has_address(has_address, *node->left);
                 const bool right_address = has_address(has_address, *node->right);
                 if (left_address && !right_address)
-                    return self(self, node->left) && fold_integer(node->right);
+                    return fold_integer(node->right);
                 if (!left_address && right_address && node->text == "+")
-                    return fold_integer(node->left) && self(self, node->right);
+                    return fold_integer(node->left);
+                const auto left_type = pointer_type_of(pointer_type_of, *node->left);
+                const auto right_type = pointer_type_of(pointer_type_of, *node->right);
+                if ((left_type && !right_type) || (!left_type && right_type && node->text == "+")) {
+                    auto& base = left_type ? node->left : node->right;
+                    auto& offset = left_type ? node->right : node->left;
+                    const auto type = left_type ? left_type : right_type;
+                    if (!resolve_pointer(base, type, caller, locals) || !fold_integer(offset)) return false;
+                    const auto scale = size_of(type->pointee);
+                    AddressConstant delta;
+                    if (!scale || !apply_address_offset(delta, *offset, *scale,
+                                                        node->text == "+", address_bits))
+                        return reject(node->location, "generic pointer arithmetic requires a complete object type and representable offset");
+                    auto value = *base->evaluated_address;
+                    const bool negative = delta.addend < 0;
+                    const auto magnitude = negative ? std::uint64_t{0} - static_cast<std::uint64_t>(delta.addend)
+                                                    : static_cast<std::uint64_t>(delta.addend);
+                    const UInt128 amount{magnitude};
+                    const auto sum = negative ? subtract(value.absolute, amount) : add(value.absolute, amount);
+                    if ((negative && value.absolute < amount) ||
+                        (!negative && sum < value.absolute) || !fits_unsigned(sum, address_bits))
+                        return reject(node->location, "generic pointer arithmetic overflows the selected target width");
+                    value.absolute = sum;
+                    auto result = std::make_unique<Expr>();
+                    result->kind = Expr::Kind::Address;
+                    result->location = node->location;
+                    result->type = type;
+                    result->evaluated_address = value;
+                    node = std::move(result);
+                    return true;
+                }
+                return true;
             }
         }
         if (node->left && !self(self, node->left)) return false;

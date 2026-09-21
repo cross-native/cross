@@ -50,6 +50,14 @@ std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::string_view source_namespace = {});
 
+// Required pointer calls use the ordinary bounded evaluator. The resolver
+// supplies target-owned address operations; no runtime storage is read.
+std::unique_ptr<Expr> evaluate_target_pointer_constant(
+    Program& program, const Expr& expression, const TypePtr& destination,
+    const FunctionDecl* caller, Diagnostics& diagnostics,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    const GenericPointerResolver& resolver);
+
 // Uses the same required-constant evaluator for each `aligned` placement.
 // The caller supplies the subject only for a precise argument-count error.
 std::optional<unsigned> evaluate_alignment_attribute(

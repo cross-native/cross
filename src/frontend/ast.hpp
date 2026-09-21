@@ -77,6 +77,9 @@ std::string type_name(const TypePtr& type);
 // compiler-owned mangling decisions.
 std::string canonical_type_name(const TypePtr& type);
 bool same_type(const TypePtr& left, const TypePtr& right);
+// Pointee compatibility for qualification-preserving object/void conversions.
+bool compatible_pointee(const TypePtr& source, const TypePtr& destination,
+                        unsigned depth = 0, bool nested_qualification = true);
 bool is_integer(const TypePtr& type);
 bool is_floating(const TypePtr& type);
 bool is_scalar(const TypePtr& type);

@@ -1282,31 +1282,26 @@ std::string operator_key(std::string_view token,
 const ObjectDecl* resolve_object(const Program& program,
                                  const FunctionDecl* caller,
                                  std::string_view name) {
-    const auto exact = std::find_if(
-        program.objects.begin(), program.objects.end(),
-        [&](const auto& candidate) { return candidate->name == name; });
-    if (exact != program.objects.end()) return exact->get();
-    if (!caller || name.find("::") != std::string_view::npos) return nullptr;
-    const auto prefix = namespace_prefix(caller->name);
-    if (!prefix.empty()) {
-        const auto qualified = prefix + "::" + std::string(name);
-        const auto local = std::find_if(
-            program.objects.begin(), program.objects.end(),
-            [&](const auto& candidate) {
-                return candidate->name == qualified;
-            });
-        if (local != program.objects.end()) return local->get();
+    const auto exact = [&](std::string_view qualified) -> const ObjectDecl* {
+        const ObjectDecl* shared{};
+        for (const auto& candidate : program.objects) {
+            if (candidate->name != qualified) continue;
+            if (candidate->linkage == Linkage::Static) {
+                if (!caller || candidate->source_unit == caller->source_unit) return candidate.get();
+            } else if (!shared) shared = candidate.get();
+        }
+        return shared;
+    };
+    if (caller && name.find("::") == std::string_view::npos) {
+        auto prefix = caller->source_namespace;
+        while (!prefix.empty()) {
+            if (const auto* local = exact(prefix + "::" + std::string(name))) return local;
+            prefix = namespace_prefix(prefix);
+        }
+        for (const auto& imported : caller->imports)
+            if (const auto* found = exact(imported + "::" + std::string(name))) return found;
     }
-    for (const auto& imported : caller->imports) {
-        const auto qualified = imported + "::" + std::string(name);
-        const auto found = std::find_if(
-            program.objects.begin(), program.objects.end(),
-            [&](const auto& candidate) {
-                return candidate->name == qualified;
-            });
-        if (found != program.objects.end()) return found->get();
-    }
-    return nullptr;
+    return exact(name);
 }
 
 struct ResolvedEnumerator {
@@ -1716,6 +1711,10 @@ struct EvalValue {
     std::optional<floating::Value> floating;
     std::shared_ptr<std::string> string{};
     std::size_t offset{};
+    std::optional<AddressConstant> address;
+    // A named function has not yet acquired its contextual pointer ABI.
+    // Binding it to a typed cell/parameter/result consumes this distinction.
+    bool function_designator{};
 
     EvalValue() = default;
     EvalValue(UInt128 integer_value, TypePtr value_type,
@@ -1726,7 +1725,7 @@ struct EvalValue {
     EvalValue(floating::Value floating_value, TypePtr value_type)
         : type(std::move(value_type)), floating(floating_value) {}
 
-    [[nodiscard]] bool pointer() const { return string != nullptr; }
+    [[nodiscard]] bool pointer() const { return string != nullptr || address.has_value(); }
     [[nodiscard]] bool truthy() const {
         return floating ? floating::nonzero(*floating) : integer != UInt128{};
     }
@@ -1846,11 +1845,23 @@ public:
               const FunctionDecl* caller = nullptr,
               std::string current_namespace = {},
               const LayoutQuery* size_of = nullptr,
-              const LayoutQuery* align_of = nullptr)
+              const LayoutQuery* align_of = nullptr,
+              const GenericPointerResolver* pointer_resolver = nullptr)
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller),
           current_namespace_(std::move(current_namespace)),
-          size_of_(size_of), align_of_(align_of) {}
+          size_of_(size_of), align_of_(align_of), pointer_resolver_(pointer_resolver) {}
+
+    std::unique_ptr<Expr> required_pointer(const Expr& source, const TypePtr& destination) {
+        if (!validate_required_tree(source)) return {};
+        auto value = expression(source);
+        if (value) value = convert(*value, destination, source.location);
+        if (!value || !value->address) {
+            fail(source.location, "translation-time object pointer cannot escape into a generic argument");
+            return {};
+        }
+        return value_expression(*value, source.location);
+    }
 
     std::optional<EvalValue> required_integer(const Expr& source,
                                              const TypePtr& destination = {}) {
@@ -2022,10 +2033,16 @@ public:
         }
         case Expr::Kind::Name:
             return lookup(expression.text, expression.location);
-        case Expr::Kind::Address:
-            fail(expression.location,
-                 "a runtime address cannot be inspected during translation-time execution");
-            return std::nullopt;
+        case Expr::Kind::Address: {
+            if (!pointer_resolver_ || !expression.evaluated_address) {
+                fail(expression.location,
+                     "a runtime address cannot be inspected during translation-time execution");
+                return std::nullopt;
+            }
+            EvalValue value{UInt128{}, expression.type};
+            value.address = expression.evaluated_address;
+            return value;
+        }
         case Expr::Kind::Parenthesized:
             return expression.left ? this->expression(*expression.left)
                                    : std::nullopt;
@@ -2034,7 +2051,7 @@ public:
                              ? this->expression(*expression.left)
                              : std::nullopt;
             return value && expression.type
-                       ? convert(*value, expression.type, expression.location)
+                       ? convert(*value, expression.type, expression.location, true)
                        : std::nullopt;
         }
         case Expr::Kind::Sizeof:
@@ -2042,7 +2059,7 @@ public:
             const auto type = expression.type
                                   ? expression.type
                                   : expression.left
-                                        ? expression_type(*expression.left)
+                                        ? expression_type(*expression.left, false)
                                         : TypePtr{};
             const auto* query = expression.kind == Expr::Kind::Sizeof
                                     ? size_of_
@@ -2089,6 +2106,103 @@ public:
     }
 
 private:
+    const FunctionDecl* direct_function(const Expr& expression) {
+        const Expr* node = &expression;
+        while (node->kind == Expr::Kind::Parenthesized && node->left)
+            node = node->left.get();
+        if (node->kind == Expr::Kind::Unary && node->text == "&" && node->left) {
+            node = node->left.get();
+            while (node->kind == Expr::Kind::Parenthesized && node->left)
+                node = node->left.get();
+        }
+        if (node->kind != Expr::Kind::Name || lookup_mutable(node->text) ||
+            resolve_object(program_, current_function_, node->text)) return nullptr;
+        return resolve_function(program_, current_function_, node->text,
+                                [](const FunctionDecl&) { return true; });
+    }
+
+    std::unique_ptr<Expr> value_expression(const EvalValue& value, SourceLocation location) {
+        auto result = std::make_unique<Expr>();
+        result->location = location;
+        result->type = clone_type(value.type);
+        if (value.address) {
+            result->kind = Expr::Kind::Address;
+            result->evaluated_address = value.address;
+        } else if (!value.pointer() && is_integer(value.type)) {
+            result->kind = Expr::Kind::Integer;
+            result->evaluated_integer = {value.integer, value.type->builtin};
+            result->text = to_decimal(value.integer);
+        } else {
+            fail(location, "translation-time object pointer cannot escape into a runtime address");
+            return {};
+        }
+        return result;
+    }
+
+    std::optional<EvalValue> resolve_pointer(std::unique_ptr<Expr> source,
+                                            const TypePtr& destination) {
+        if (!source || !pointer_resolver_) return std::nullopt;
+        std::vector<std::string> locals;
+        for (auto index = frame_base_; index < scopes_.size(); ++index)
+            for (const auto& [name, cell] : scopes_[index]) locals.push_back(name);
+        if (!(*pointer_resolver_)(source, destination, current_function_, locals)) {
+            fail(source->location, "address operation failed during translation-time evaluation");
+            return std::nullopt;
+        }
+        EvalValue result{UInt128{}, destination};
+        result.address = source->evaluated_address;
+        return result;
+    }
+
+    // Evaluate only pointer bases and integer indices of an address designator.
+    // Its designated cell is never read, nor can an automatic cell escape.
+    std::unique_ptr<Expr> address_designator(const Expr& node) {
+        if (node.kind == Expr::Kind::Name) {
+            if (lookup_mutable(node.text)) {
+                fail(node.location, "translation-time automatic object address cannot escape");
+                return {};
+            }
+            return clone_expr(node);
+        }
+        auto result = clone_expr(node);
+        if (node.kind == Expr::Kind::Parenthesized && node.left) {
+            result->left = address_designator(*node.left);
+            return result->left ? std::move(result) : nullptr;
+        }
+        if (node.kind == Expr::Kind::Unary && node.text == "*" && node.left) {
+            const auto base = expression(*node.left);
+            if (!base) return {};
+            result->left = value_expression(*base, node.left->location);
+            return result->left ? std::move(result) : nullptr;
+        }
+        if (node.kind == Expr::Kind::Binary && node.left && node.right) {
+            if (node.text == "member") {
+                result->left = address_designator(*node.left);
+                return result->left ? std::move(result) : nullptr;
+            }
+            if (node.text == "index" || node.text == "pointer_member") {
+                const auto type = expression_type(*node.left, false);
+                if (node.text == "index" && type && type->kind == Type::Kind::Array) {
+                    result->left = address_designator(*node.left);
+                } else {
+                    auto base = expression(*node.left);
+                    if (!base) return {};
+                    result->left = value_expression(*base, node.left->location);
+                }
+                if (!result->left) return {};
+                if (node.text == "index") {
+                    const auto index = expression(*node.right);
+                    if (!index) return {};
+                    result->right = value_expression(*index, node.right->location);
+                    if (!result->right) return {};
+                }
+                return result;
+            }
+        }
+        fail(node.location, "unsupported translation-time address designator");
+        return {};
+    }
+
     struct Cell {
         EvalValue value;
         bool initialized{};
@@ -2193,21 +2307,9 @@ private:
                         to->kind != Type::Kind::Pointer || !from->pointee || !to->pointee)
                         return false;
                     if (from->address_space != to->address_space) return false;
-                    if ((from->pointee->is_const && !to->pointee->is_const) ||
-                        (from->pointee->is_volatile && !to->pointee->is_volatile) ||
-                        from->pointee->is_atomic != to->pointee->is_atomic)
-                        return false;
-                    auto source = clone_type(from->pointee);
-                    auto destination = clone_type(to->pointee);
-                    source->is_const = destination->is_const = false;
-                    source->is_volatile = destination->is_volatile = false;
-                    source->is_restrict = destination->is_restrict = false;
-                    const auto void_type = [](const TypePtr& type) {
-                        return type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
-                    };
-                    return same_type(source, destination) ||
-                        ((void_type(source) || void_type(destination)) &&
-                         source->kind != Type::Kind::Function && destination->kind != Type::Kind::Function);
+                    if (pointer_resolver_ && direct_function(argument))
+                        return resolve_pointer(clone_expr(argument), to).has_value();
+                    return compatible_pointee(from->pointee, to->pointee);
                 };
                 const bool compatible = from && to &&
                     (((is_integer(from) || is_floating(from)) &&
@@ -2221,7 +2323,9 @@ private:
             return true;
         }
         if (node.left && !validate_required_tree(*node.left)) return false;
-        if (node.right && !validate_required_tree(*node.right)) return false;
+        const bool member = node.kind == Expr::Kind::Binary &&
+            (node.text == "member" || node.text == "pointer_member");
+        if (node.right && !member && !validate_required_tree(*node.right)) return false;
         if (node.third && !validate_required_tree(*node.third)) return false;
         if (node.kind == Expr::Kind::Integer) return expression(node).has_value();
         if (node.kind == Expr::Kind::Floating) return expression(node).has_value();
@@ -2235,7 +2339,9 @@ private:
             fail(node.location, "unresolved name or unsupported type in required constant expression");
             return false;
         }
-        if (node.kind == Expr::Kind::Unary &&
+        const bool pointer_unary = pointer_resolver_ && node.kind == Expr::Kind::Unary &&
+            (node.text == "&" || node.text == "*");
+        if (node.kind == Expr::Kind::Unary && !pointer_unary &&
             (!node.left ||
              !(is_integer(expression_type(*node.left)) ||
                is_floating(expression_type(*node.left))) ||
@@ -2271,6 +2377,7 @@ private:
             }
         }
         if (node.kind == Expr::Kind::Binary || node.kind == Expr::Kind::Conditional) {
+            if (pointer_resolver_ && member) return true;
             const auto left = node.left ? expression_type(*node.left) : nullptr;
             const auto right = node.right ? expression_type(*node.right) : nullptr;
             const bool indexing = node.kind == Expr::Kind::Binary && node.text == "index";
@@ -2284,9 +2391,13 @@ private:
                 node.text == "/" || node.text == "==" || node.text == "!=" ||
                 node.text == "<" || node.text == "<=" || node.text == ">" ||
                 node.text == ">=" || node.text == "&&" || node.text == "||";
+            const auto result_type = expression_type(node);
+            const bool pointer_operation = pointer_resolver_ && result_type &&
+                result_type->kind == Type::Kind::Pointer &&
+                (node.kind == Expr::Kind::Conditional || node.text == "+" || node.text == "-");
             if (indexing ? (!left || left->kind != Type::Kind::Pointer ||
                             !right || !is_integer(right))
-                         : (!scalar || (floating_operands && !floating_operator))) {
+                         : (!pointer_operation && (!scalar || (floating_operands && !floating_operator)))) {
                 fail(node.location, "unsupported operation in required scalar expression");
                 return false;
             }
@@ -2299,7 +2410,7 @@ private:
         return true;
     }
 
-    TypePtr expression_type(const Expr& expression) {
+    TypePtr expression_type(const Expr& expression, bool decay = true) {
         switch (expression.kind) {
         case Expr::Kind::Integer: {
             const auto value = parse_integer_value(expression);
@@ -2312,7 +2423,18 @@ private:
                 for (const auto& parameter : current_function_->parameters)
                     if (parameter.name == expression.text) return parameter.type;
             }
-            if (const auto* object = resolve_object(program_, current_function_, expression.text)) return object->type;
+            if (const auto* object = resolve_object(program_, current_function_, expression.text)) {
+                if (pointer_resolver_ && decay && object->type->kind == Type::Kind::Array)
+                    return pointer_type(object->type->element);
+                return object->type;
+            }
+            if (pointer_resolver_) {
+                if (const auto* function = resolve_function(program_, current_function_, expression.text,
+                        [](const FunctionDecl&) { return true; })) {
+                    auto type = function_type(function->return_type, function->parameters, function->variadic);
+                    return decay ? pointer_type(type) : type;
+                }
+            }
             if (const auto found = resolve_enumerator(
                     program_, current_function_, current_namespace_,
                     expression.text);
@@ -2322,7 +2444,7 @@ private:
             }
             return {};
         case Expr::Kind::Parenthesized:
-            return expression.left ? expression_type(*expression.left) : nullptr;
+            return expression.left ? expression_type(*expression.left, decay) : nullptr;
         case Expr::Kind::Address:
             return expression.type;
         case Expr::Kind::Cast:
@@ -2334,8 +2456,11 @@ private:
             return expression_type(*expression.left);
         case Expr::Kind::Unary: {
             if (expression.text == "!") return builtin_type(BuiltinType::Bool);
-            auto type = expression_type(*expression.left);
+            auto type = expression_type(*expression.left, expression.text != "&");
             if (!type) return {};
+            if (pointer_resolver_ && expression.text == "&") return pointer_type(type);
+            if (pointer_resolver_ && expression.text == "*" && type->kind == Type::Kind::Pointer)
+                return type->pointee;
             if (is_floating(type)) return type;
             if (!is_integer(type)) return {};
             if (expression.text == "++" || expression.text == "--" || expression.text.starts_with("post")) return type;
@@ -2355,11 +2480,18 @@ private:
                 result->is_const = result->is_const || owner->is_const;
                 result->is_volatile = result->is_volatile ||
                                       owner->is_volatile;
+                if (pointer_resolver_ && decay && result->kind == Type::Kind::Array) {
+                    auto element = clone_type(result->element);
+                    element->is_const = element->is_const || result->is_const;
+                    element->is_volatile = element->is_volatile || result->is_volatile;
+                    return pointer_type(element);
+                }
                 return result;
             }
             if (!conditional && expression.text == "index") {
                 const auto base = expression_type(*expression.left);
-                return base && base->kind == Type::Kind::Pointer ? base->pointee : nullptr;
+                return base && base->kind == Type::Kind::Pointer ? base->pointee
+                    : base && base->kind == Type::Kind::Array ? base->element : nullptr;
             }
             if (!conditional && (expression.text == "==" || expression.text == "!=" ||
                 expression.text == "<" || expression.text == ">" || expression.text == "<=" ||
@@ -2368,6 +2500,17 @@ private:
             const auto left = expression_type(*(conditional ? expression.right : expression.left));
             const auto right = expression_type(*(conditional ? expression.third : expression.right));
             if (!left || !right) return {};
+            if (pointer_resolver_) {
+                if (conditional && left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer &&
+                    left->address_space == right->address_space) {
+                    if (compatible_pointee(left->pointee, right->pointee)) return right;
+                    if (compatible_pointee(right->pointee, left->pointee)) return left;
+                }
+                if (!conditional && (expression.text == "+" || expression.text == "-")) {
+                    if (left->kind == Type::Kind::Pointer && is_integer(right)) return left;
+                    if (expression.text == "+" && is_integer(left) && right->kind == Type::Kind::Pointer) return right;
+                }
+            }
             if (is_floating(left) || is_floating(right)) {
                 if ((!is_integer(left) && !is_floating(left)) ||
                     (!is_integer(right) && !is_floating(right))) return {};
@@ -2433,9 +2576,30 @@ private:
     }
 
     std::optional<EvalValue> convert(EvalValue value, const TypePtr& type,
-                                     SourceLocation location) {
+                                     SourceLocation location, bool explicit_cast = false) {
         if (!type || type->is_volatile || type->is_atomic) {
             fail(location, "volatile or atomic access is not permitted during translation-time evaluation");
+            return std::nullopt;
+        }
+        if (pointer_resolver_ && type->kind == Type::Kind::Pointer && !value.string) {
+            auto source = value_expression(value, location);
+            if (!source) return std::nullopt;
+            // Check a direct declaration against the destination signature,
+            // leaving the registered-ABI adapter to the normal lifting pass.
+            // A previously typed pointer must instead retain its ABI identity.
+            if (value.function_designator) source->type.reset();
+            if (explicit_cast) {
+                auto cast = std::make_unique<Expr>();
+                cast->kind = Expr::Kind::Cast;
+                cast->location = location;
+                cast->type = type;
+                cast->left = std::move(source);
+                source = std::move(cast);
+            }
+            return resolve_pointer(std::move(source), type);
+        }
+        if (value.address) {
+            fail(location, "emitted object addresses cannot be inspected during translation-time evaluation");
             return std::nullopt;
         }
         if (value.pointer()) {
@@ -2603,11 +2767,41 @@ private:
                 enum_type(found->enumeration->name,
                           found->enumeration->underlying)};
         }
+        if (pointer_resolver_) {
+            auto source = std::make_unique<Expr>();
+            source->kind = Expr::Kind::Name;
+            source->text = name;
+            source->location = location;
+            const auto type = expression_type(*source);
+            const auto* object = resolve_object(program_, current_function_, name);
+            if (object && object->type->kind != Type::Kind::Array) {
+                fail(location, "runtime/static storage cannot be read during translation-time evaluation");
+                return std::nullopt;
+            }
+            if (type && type->kind == Type::Kind::Pointer) {
+                const bool function = direct_function(*source) != nullptr;
+                auto value = resolve_pointer(std::move(source), type);
+                if (value) value->function_designator = function;
+                return value;
+            }
+        }
         return std::nullopt;
     }
 
     std::optional<EvalValue> unary(const Expr& expression) {
         if (!expression.left) return std::nullopt;
+        if (pointer_resolver_ && expression.text == "&") {
+            auto source = clone_expr(expression);
+            source->left = address_designator(*expression.left);
+            if (!source->left) return std::nullopt;
+            auto value = resolve_pointer(std::move(source), expression_type(expression));
+            if (value) value->function_designator = direct_function(expression) != nullptr;
+            return value;
+        }
+        if (pointer_resolver_ && expression.text == "*") {
+            fail(expression.location, "runtime/static storage cannot be read during translation-time evaluation");
+            return std::nullopt;
+        }
         if (expression.text == "++" || expression.text == "--" ||
             expression.text == "post++" || expression.text == "post--") {
             if (expression.left->kind != Expr::Kind::Name) return std::nullopt;
@@ -2618,7 +2812,20 @@ private:
                 return std::nullopt;
             }
             const auto previous = lookup(expression.left->text, expression.location);
-            if (!previous || previous->pointer()) return std::nullopt;
+            if (!previous) return std::nullopt;
+            if (previous->address && pointer_resolver_) {
+                auto source = std::make_unique<Expr>();
+                source->kind = Expr::Kind::Binary;
+                source->location = expression.location;
+                source->text = expression.text == "++" || expression.text == "post++" ? "+" : "-";
+                source->left = value_expression(*previous, expression.location);
+                source->right = value_expression(EvalValue{UInt128{1}, builtin_type(BuiltinType::I32)}, expression.location);
+                auto value = resolve_pointer(std::move(source), previous->type);
+                if (!value) return std::nullopt;
+                lookup_mutable(expression.left->text)->value = *value;
+                return expression.text.starts_with("post") ? previous : value;
+            }
+            if (previous->pointer()) return std::nullopt;
             auto value = previous->floating
                 ? calculate_floating(expression.text == "++" || expression.text == "post++"
                                          ? "+" : "-", *previous,
@@ -2685,7 +2892,9 @@ private:
         auto right = this->expression(*expression.right);
         if (!right) return std::nullopt;
         if (expression.text == "index") {
-            if (!left->pointer() || right->pointer() || right->integer.high != 0) {
+            if (!left->string || right->pointer() || right->integer.high != 0) {
+                if (left->address) fail(expression.location,
+                    "runtime/static storage cannot be read during translation-time evaluation");
                 return std::nullopt;
             }
             const auto index = left->offset +
@@ -2698,7 +2907,20 @@ private:
             return EvalValue{{static_cast<unsigned char>((*left->string)[index]), 0},
                              builtin_type(BuiltinType::U8)};
         }
-        if (left->pointer() || right->pointer()) return std::nullopt;
+        if (pointer_resolver_ && (left->address || right->address) &&
+            (operation == "+" || operation == "-")) {
+            auto source = clone_expr(expression);
+            source->left = value_expression(*left, expression.left->location);
+            source->right = value_expression(*right, expression.right->location);
+            if (!source->left || !source->right) return std::nullopt;
+            const auto type = expression_type(expression);
+            if (!type || type->kind != Type::Kind::Pointer) return std::nullopt;
+            return resolve_pointer(std::move(source), type);
+        }
+        if (left->pointer() || right->pointer()) {
+            fail(expression.location, "emitted object addresses cannot be inspected during translation-time evaluation");
+            return std::nullopt;
+        }
         if (left->floating || right->floating) {
             return calculate_floating(operation, *left, *right,
                                       expression.location);
@@ -2757,6 +2979,10 @@ private:
 
     std::optional<EvalValue> call_expression(const Expr& expression) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
+            return std::nullopt;
+        }
+        if (lookup_mutable(expression.left->text)) {
+            fail(expression.location, "indirect calls are not permitted during translation-time evaluation");
             return std::nullopt;
         }
         if (expression.left->text == "$::eval") {
@@ -3028,6 +3254,7 @@ private:
     std::string current_namespace_;
     const LayoutQuery* size_of_{};
     const LayoutQuery* align_of_{};
+    const GenericPointerResolver* pointer_resolver_{};
     std::vector<std::unordered_map<std::string, Cell>> scopes_;
     std::size_t frame_base_{};
     std::uint64_t steps_{};
@@ -4630,6 +4857,19 @@ std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(
         return std::nullopt;
     }
     return Expr::IntegerConstant{value->integer, value->type->builtin};
+}
+
+std::unique_ptr<Expr> evaluate_target_pointer_constant(
+    Program& program, const Expr& expression, const TypePtr& destination,
+    const FunctionDecl* caller, Diagnostics& diagnostics,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    const GenericPointerResolver& resolver) {
+    Evaluator evaluator(program, diagnostics, caller,
+                        caller ? caller->source_namespace : std::string{},
+                        &size_of, &align_of, &resolver);
+    auto value = evaluator.required_pointer(expression, destination);
+    if (!value) evaluator.diagnose(expression.location);
+    return value;
 }
 
 std::optional<unsigned> evaluate_alignment_attribute(

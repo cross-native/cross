@@ -48,6 +48,15 @@ foreach(level O0 O2 O3 Oz)
 endforeach()
 
 get_filename_component(test_dir "${SOURCE}" DIRECTORY)
+execute_process(COMMAND "${CC}" "--model=${CUSTOM_MODEL}" "-mabi=${abi}"
+    -DCUSTOM_POINTER_ABI -DCALLBACK_ABI_ERROR "-DHOST_ABI=\"${abi}\""
+    -c "${SOURCE}" -o "${OUTPUT}-callback-abi-error.o"
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "incompatible function type" OR
+   NOT stderr MATCHES "while evaluating call to 'mismatched_callback'")
+    message(FATAL_ERROR "typed function pointer lost its ABI during evaluation\n${stdout}\n${stderr}")
+endif()
+
 foreach(order forward reverse)
     set(units "${test_dir}/generic_pointer_units_a.x" "${test_dir}/generic_pointer_units_b.x")
     if(order STREQUAL reverse)
@@ -110,6 +119,16 @@ foreach(case
         "PAST|outside its object or one-past bound"
         "BEFORE|outside its object or one-past bound"
         "OVERFLOW|not a supported address constant"
+        "ABSOLUTE_OVERFLOW|arithmetic overflows the selected target width"
+        "ABSOLUTE_UNDERFLOW|arithmetic overflows the selected target width"
+        "VOID_ARITHMETIC|requires a complete object type and representable offset"
+        "RUNTIME_CALL|call to runtime-only function"
+        "STATIC_READ|runtime/static storage cannot be read"
+        "ESCAPE|automatic object address cannot escape"
+        "UNINITIALIZED|read of uninitialized value"
+        "INDIRECT_CALL|indirect calls are not permitted"
+        "CALL_QUALIFIERS|incompatible pointed-to type or qualifiers"
+        "ROUNDTRIP_QUALIFIERS|incompatible pointed-to type or qualifiers"
         "EVAL_ADDRESS|requires a function with a runtime address"
         "RUNTIME|runtime expression is not permitted in a generic pointer argument")
     string(REPLACE "|" ";" fields "${case}")
@@ -127,6 +146,19 @@ execute_process(COMMAND "${CC}" -target mips-unknown-elf -march=vr4300 -mabi=o32
     RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
 if(status EQUAL 0 OR NOT stderr MATCHES "not representable in the selected target width")
     message(FATAL_ERROR "pointer generic target width was not checked\n${stdout}\n${stderr}")
+endif()
+
+execute_process(COMMAND "${CC}" -target mipsel-unknown-elf -march=vr4300 -mabi=o32
+    -c "${test_dir}/generic_pointer_width.x" -o "${OUTPUT}-arithmetic-width.o"
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "arithmetic overflows the selected target width")
+    message(FATAL_ERROR "pointer arithmetic ignored the selected address width\n${stdout}\n${stderr}")
+endif()
+execute_process(COMMAND "${CC}" -target mips64el-unknown-elf -march=mips64 -mabi=n64
+    -c "${test_dir}/generic_pointer_width.x" -o "${OUTPUT}-arithmetic-wide.o"
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "64-bit pointer arithmetic rejected a representable result\n${stdout}\n${stderr}")
 endif()
 
 execute_process(COMMAND "${CC}" "--model=${MODEL}" -mmangling=erase-generic-arguments

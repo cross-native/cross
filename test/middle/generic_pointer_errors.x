@@ -14,6 +14,13 @@ global u32 *cell;
 typedef u32 (*Callback)(in u32 x);
 [[generic(Callback F)]] static u32 call(in u32 x) { return F(x); }
 
+[[runtime_only]] static u32 *runtime_address() { return values; }
+static u32 *read_static() { return values + values[0]; }
+static u32 *escape_local() { u32 local = 1u32; return &local; }
+static u32 *uninitialized_pointer() { u32 *p; return p; }
+static u32 *bad_cast(in const u32 *p) { return (u32 *)p; }
+static u32 *indirect_pointer(in Callback only_eval) { return values + only_eval(0u32); }
+
 global u32 *pointer_error(in u32 index) {
 #if defined(LOCAL)
     u32 values[4];
@@ -47,6 +54,26 @@ global u32 *pointer_error(in u32 index) {
     return identity::<values + 0x4000000000000000u64>();
 #elif defined(WIDTH)
     return identity::<(u32 *)0x100000000u64>();
+#elif defined(ABSOLUTE_OVERFLOW)
+    return identity::<(u32 *)0xffffffffffffffffu64 + 1>();
+#elif defined(ABSOLUTE_UNDERFLOW)
+    return identity::<(u32 *)1uptr - 1>();
+#elif defined(VOID_ARITHMETIC)
+    return identity::<(u32 *)((void *)1uptr + 1)>();
+#elif defined(RUNTIME_CALL)
+    return identity::<runtime_address()>();
+#elif defined(STATIC_READ)
+    return identity::<read_static()>();
+#elif defined(ESCAPE)
+    return identity::<escape_local()>();
+#elif defined(UNINITIALIZED)
+    return identity::<uninitialized_pointer()>();
+#elif defined(INDIRECT_CALL)
+    return identity::<indirect_pointer((Callback)0uptr)>();
+#elif defined(CALL_QUALIFIERS)
+    return identity::<bad_cast(&immutable)>();
+#elif defined(ROUNDTRIP_QUALIFIERS)
+    return identity::<(u32 *)(const void *)&immutable>();
 #elif defined(EVAL_ADDRESS)
     call::<only_eval>(1u32);
     return values;

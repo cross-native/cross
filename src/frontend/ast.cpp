@@ -263,6 +263,37 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
            left->nominal_name == right->nominal_name;
 }
 
+bool compatible_pointee(const TypePtr& source, const TypePtr& destination,
+                        unsigned depth, bool nested_qualification) {
+    if (!source || !destination || depth >= 32) return false;
+    if ((source->is_const && !destination->is_const) ||
+        (source->is_volatile && !destination->is_volatile) ||
+        source->is_atomic != destination->is_atomic) return false;
+    if (!nested_qualification &&
+        ((!source->is_const && destination->is_const) ||
+         (!source->is_volatile && destination->is_volatile))) return false;
+    const auto is_void = [](const TypePtr& type) {
+        return type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
+    };
+    if (depth == 0 && (is_void(source) || is_void(destination)))
+        return source->kind != Type::Kind::Function && destination->kind != Type::Kind::Function;
+    if (source->kind != destination->kind) return false;
+    if (source->kind == Type::Kind::Pointer)
+        return source->address_space == destination->address_space &&
+            compatible_pointee(source->pointee, destination->pointee, depth + 1,
+                               nested_qualification && destination->is_const);
+    if (source->kind == Type::Kind::Array || source->kind == Type::Kind::Vector)
+        return source->lanes == destination->lanes && source->scalable == destination->scalable &&
+            compatible_pointee(source->element, destination->element, depth + 1,
+                               nested_qualification);
+    auto from = std::make_shared<Type>(*source);
+    auto to = std::make_shared<Type>(*destination);
+    from->is_const = to->is_const = false;
+    from->is_volatile = to->is_volatile = false;
+    from->is_restrict = to->is_restrict = false;
+    return same_type(from, to);
+}
+
 bool is_integer(const TypePtr& type) {
     return type && type->kind == Type::Kind::Builtin && type->builtin >= BuiltinType::Bool &&
            type->builtin <= BuiltinType::Uptr;
