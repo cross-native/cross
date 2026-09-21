@@ -572,9 +572,110 @@ cross::mir::ManagedFunction tail_factor_function() {
 
 } // namespace
 
-int main() {
+bool local_pointer_analysis_checks() {
+    using namespace cross;
     using namespace cross::mir;
     bool ok = true;
+    TargetInfo target;
+    for (const unsigned width : {32U, 64U}) {
+        auto module = transform_hir();
+        module.address_bits = width;
+        const auto pointer = module.pointer_to({1});
+        const auto pointer_pointer = module.pointer_to(pointer);
+        ManagedFunction function;
+        function.entry = {0};
+        function.slots.resize(3);
+        for (std::uint32_t i = 0; i < 3; ++i) {
+            function.slots[i].id = {i};
+            function.slots[i].type = i == 2 ? pointer : hir::TypeId{1};
+        }
+        function.slots[2].address_taken = true;
+        function.blocks.resize(5);
+        for (std::uint32_t i = 0; i < 5; ++i) function.blocks[i].id = {i};
+        function.blocks[0].terminator.successors = {{1}, {2}};
+        function.blocks[1].predecessors = {{0}};
+        function.blocks[2].predecessors = {{0}};
+        function.blocks[1].terminator.successors = {{3}};
+        function.blocks[2].terminator.successors = {{3}};
+        // Block 4 is unreachable but deliberately contributes a different phi arm.
+        function.blocks[3].predecessors = {{1}, {2}, {4}};
+        function.blocks[4].terminator.successors = {{3}};
+        const auto add = [&](unsigned block, ValueKind kind, hir::TypeId type,
+                             std::vector<ValueId> operands = {}, std::optional<SlotId> slot = {}) {
+            ManagedValue value;
+            value.id = {static_cast<std::uint32_t>(function.values.size())};
+            value.kind = kind;
+            value.type = type;
+            value.operands = std::move(operands);
+            value.slot = slot;
+            function.values.push_back(value);
+            function.blocks[block].values.push_back(value.id);
+            return value.id;
+        };
+        const auto x = add(0, ValueKind::SlotAddress, pointer, {}, SlotId{0});
+        const auto other = add(0, ValueKind::SlotAddress, pointer, {}, SlotId{1});
+        const auto cell = add(0, ValueKind::SlotAddress, pointer_pointer, {}, SlotId{2});
+        add(1, ValueKind::Store, {1}, {x}, SlotId{2});
+        const auto right_store = add(2, ValueKind::Store, {1}, {x}, SlotId{2});
+        const auto loaded = add(3, ValueKind::Load, pointer, {}, SlotId{2});
+        const auto phi = add(3, ValueKind::Phi, pointer);
+        function.values[phi.value].incoming = {{{1}, x}, {{2}, x}, {{4}, other}};
+        add(3, ValueKind::PointerStore, {1}, {cell, other});
+        const auto replaced = add(3, ValueKind::PointerLoad, pointer, {cell});
+        const auto one = add(3, ValueKind::ConstantInteger, {2});
+        function.values[one.value].integer = 1;
+        const auto scaled = add(3, ValueKind::IndexedAddress, pointer_pointer, {cell, one});
+        const auto negative = add(3, ValueKind::Unary, {2}, {one});
+        function.values[negative.value].unary = UnaryOperation::Negate;
+        const auto back = add(3, ValueKind::IndexedAddress, pointer_pointer, {scaled, negative});
+        add(3, ValueKind::Call, {1});
+        const auto after_call = add(3, ValueKind::Load, pointer, {}, SlotId{2});
+        LocalPointerAnalysis analysis(function, module, target);
+        ok &= expect(analysis.targets(loaded).definite() == LocalAddress{SlotId{0}, 0},
+                     "equal CFG incoming pointer cells should agree and retain load-time identity");
+        ok &= expect(analysis.targets(phi).definite() == LocalAddress{SlotId{0}, 0},
+                     "unreachable phi edges must not poison provenance");
+        ok &= expect(analysis.targets(replaced).definite() == LocalAddress{SlotId{1}, 0},
+                     "indirect pointer-cell store should update subsequent loads");
+        ok &= expect(analysis.targets(scaled).definite() == LocalAddress{SlotId{2}, width / 8} &&
+                     analysis.targets(back).definite() == LocalAddress{SlotId{2}, 0},
+                     "signed pointer displacement must use model-selected pointer width");
+        ok &= expect(!analysis.targets(after_call).definite() && analysis.targets(after_call).unknown,
+                     "a call cannot preserve a must-alias fact for an addressable pointer cell");
+
+        function.values[right_store.value].operands = {other};
+        LocalPointerAnalysis ambiguous(function, module, target);
+        ok &= expect(!ambiguous.targets(loaded).definite() && ambiguous.targets(loaded).addresses.size() == 2,
+                     "different CFG pointer cells must retain both possible read targets");
+
+        // A loop that keeps advancing its pointer must converge by losing the
+        // displacement, not by forgetting the possible original local cell.
+        function.blocks.resize(3);
+        function.values.resize(3);
+        for (auto& block : function.blocks) { block.values.clear(); block.predecessors.clear(); }
+        function.blocks[0].values = {x, other, cell};
+        function.blocks[0].terminator.successors = {{1}};
+        function.blocks[1].predecessors = {{0}, {1}};
+        function.blocks[1].terminator.successors = {{1}, {2}};
+        function.blocks[2].predecessors = {{1}};
+        function.blocks[2].terminator.successors.clear();
+        add(0, ValueKind::Store, {1}, {x}, SlotId{2});
+        const auto step = add(0, ValueKind::ConstantInteger, {2});
+        function.values[step.value].integer = 1;
+        const auto current = add(1, ValueKind::Load, pointer, {}, SlotId{2});
+        const auto next = add(1, ValueKind::IndexedAddress, pointer, {current, step});
+        add(1, ValueKind::Store, {1}, {next}, SlotId{2});
+        LocalPointerAnalysis loop(function, module, target);
+        ok &= expect(!loop.targets(current).definite() &&
+                     loop.targets(current).addresses == std::vector<LocalAddress>{{SlotId{0}, std::nullopt}},
+                     "loop widening must preserve may-alias identity and terminate");
+    }
+    return ok;
+}
+
+int main() {
+    using namespace cross::mir;
+    bool ok = local_pointer_analysis_checks();
     auto function = loop_function();
 
     UseLists uses(function);

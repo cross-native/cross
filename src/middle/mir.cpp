@@ -6159,57 +6159,6 @@ bool comparison(BinaryOperation operation) {
     return operation >= BinaryOperation::Equal;
 }
 
-struct SlotAddressOffset {
-    SlotId slot;
-    std::uint64_t bytes{};
-    friend bool operator==(const SlotAddressOffset&,
-                           const SlotAddressOffset&) = default;
-};
-
-std::optional<SlotAddressOffset> slot_address_offset(
-    const ManagedFunction& function, const hir::Module& hir_module,
-    const TargetInfo& target, ValueId id, unsigned depth = 0) {
-    if (depth >= 16 || id.value >= function.values.size()) return std::nullopt;
-    const auto& value = function.values[id.value];
-    if (value.kind == ValueKind::SlotAddress && value.slot)
-        return SlotAddressOffset{*value.slot, 0};
-    if (value.kind == ValueKind::Cast &&
-        value.cast == CastOperation::Reinterpret &&
-        value.operands.size() == 1) {
-        return slot_address_offset(function, hir_module, target,
-                                   value.operands.front(), depth + 1);
-    }
-    if (value.kind == ValueKind::IndexedAddress &&
-        value.operands.size() == 2) {
-        auto base = slot_address_offset(function, hir_module, target,
-                                        value.operands[0], depth + 1);
-        const auto& index = function.values[value.operands[1].value];
-        const auto& pointer =
-            hir_module.type(function.values[value.operands[0].value].type);
-        if (!base || index.kind != ValueKind::ConstantInteger ||
-            index.integer_high != 0 ||
-            pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee) {
-            return std::nullopt;
-        }
-        const auto scale = storage_size(hir_module, *pointer.pointee, target);
-        if (scale == 0 || index.integer >
-                (std::numeric_limits<std::uint64_t>::max() - base->bytes) /
-                    scale) {
-            return std::nullopt;
-        }
-        base->bytes += index.integer * scale;
-        return base;
-    }
-    if (value.kind == ValueKind::Select && value.operands.size() == 3) {
-        const auto left = slot_address_offset(function, hir_module, target,
-                                              value.operands[1], depth + 1);
-        const auto right = slot_address_offset(function, hir_module, target,
-                                               value.operands[2], depth + 1);
-        if (left && right && *left == *right) return left;
-    }
-    return std::nullopt;
-}
-
 struct OutBitInterval {
     std::uint64_t begin{};
     std::uint64_t end{};
@@ -6318,6 +6267,9 @@ void check_out_definite_assignment(const ManagedFunction& function,
                                    const TargetInfo& target,
                                    Diagnostics& diagnostics) {
     const auto& source = hir_module.function(function.source);
+    if (std::none_of(source.parameters.begin(), source.parameters.end(),
+                    [](const auto& parameter) { return parameter.mode == ParameterMode::Out; })) return;
+    const LocalPointerAnalysis pointers(function, hir_module, target);
     std::vector<bool> reachable(function.blocks.size());
     std::vector<BlockId> pending{function.entry};
     while (!pending.empty()) {
@@ -6344,14 +6296,11 @@ void check_out_definite_assignment(const ManagedFunction& function,
         std::vector<OutBitIntervals> assigned_out(function.blocks.size(), top);
         assigned_in[function.entry.value].clear();
         const auto pointer_region = [&](const ManagedValue& value,
-                                        bool write)
+                                        const LocalAddress& address, bool write)
             -> std::optional<OutBitInterval> {
-            if (value.operands.empty()) return std::nullopt;
-            const auto address = slot_address_offset(
-                function, hir_module, target, value.operands.front());
-            if (!address || address->slot != slot.id ||
-                address->bytes > slot_size) return std::nullopt;
-            const auto start = address->bytes * 8;
+            if (address.slot != slot.id || !address.bytes ||
+                *address.bytes > slot_size) return std::nullopt;
+            const auto start = *address.bytes * 8;
             std::uint64_t begin = start;
             std::uint64_t end{};
             if (value.bit_field_region) {
@@ -6374,13 +6323,12 @@ void check_out_definite_assignment(const ManagedFunction& function,
             } else if (value.kind == ValueKind::Store &&
                        value.slot == slot.id) {
                 add_out_interval(assigned, {0, slot_size * 8});
-            } else if (value.kind == ValueKind::PointerStore) {
-                if (const auto region = pointer_region(value, true))
-                    add_out_interval(assigned, *region);
-            } else if (value.kind == ValueKind::Atomic &&
-                       value.atomic == AtomicOperation::Store) {
-                if (const auto region = pointer_region(value, true))
-                    add_out_interval(assigned, *region);
+            } else if ((value.kind == ValueKind::PointerStore ||
+                        (value.kind == ValueKind::Atomic && value.atomic == AtomicOperation::Store)) &&
+                       !value.operands.empty()) {
+                if (const auto address = pointers.targets(value.operands.front()).definite())
+                    if (const auto region = pointer_region(value, *address, true))
+                        add_out_interval(assigned, *region);
             }
             return assigned;
         };
@@ -6434,18 +6382,22 @@ void check_out_definite_assignment(const ManagedFunction& function,
                     (value.kind == ValueKind::PointerLoad ||
                      (value.kind == ValueKind::Atomic &&
                       value.atomic != AtomicOperation::Store));
-                const auto read_region = pointer_read
-                    ? pointer_region(value, false)
-                    : std::optional<OutBitInterval>{};
-                const bool pointer_read_ready = !read_region ||
-                    (!value.bit_field_region &&
-                     (hir_module.type(value.type).kind ==
-                          hir::Type::Kind::Record ||
-                      hir_module.type(value.type).kind ==
-                          hir::Type::Kind::Array)
-                        ? out_type_complete(hir_module, target, value.type,
-                                            read_region->begin, assigned)
-                        : out_intervals_cover(assigned, {*read_region}));
+                bool pointer_read_ready = true;
+                if (pointer_read && !value.operands.empty()) {
+                    for (const auto& address : pointers.targets(value.operands.front()).addresses) {
+                        if (address.slot != slot.id) continue;
+                        const auto region = pointer_region(value, address, false);
+                        if (!address.bytes) {
+                            pointer_read_ready &= out_type_complete(hir_module, target, slot.type, 0, assigned);
+                        } else if (region) {
+                            const auto kind = hir_module.type(value.type).kind;
+                            pointer_read_ready &= !value.bit_field_region &&
+                                (kind == hir::Type::Kind::Record || kind == hir::Type::Kind::Array)
+                                ? out_type_complete(hir_module, target, value.type, region->begin, assigned)
+                                : out_intervals_cover(assigned, {*region});
+                        }
+                    }
+                }
                 if (!read_reported &&
                     ((direct_read &&
                       !out_type_complete(hir_module, target, slot.type, 0,

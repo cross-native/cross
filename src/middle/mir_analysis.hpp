@@ -16,6 +16,34 @@ std::optional<UInt128> unsigned_upper_bound_at_exit(const ManagedFunction& funct
                                                   ValueId value, BlockId at);
 bool has_reachable_return(const ManagedFunction& function);
 
+struct LocalAddress {
+    SlotId slot;
+    // Missing displacement means some part of this cell, not a proven write.
+    std::optional<std::uint64_t> bytes;
+    friend bool operator==(const LocalAddress&, const LocalAddress&) = default;
+};
+
+struct LocalPointerTargets {
+    bool unknown{};
+    std::vector<LocalAddress> addresses;
+    [[nodiscard]] std::optional<LocalAddress> definite() const;
+    friend bool operator==(const LocalPointerTargets&,
+                           const LocalPointerTargets&) = default;
+};
+
+// Flow-sensitive local pointer cells, SSA copies, and CFG joins. This is a
+// source-MIR analysis: no optimizer, ABI carrier, or physical register facts
+// are required. Calls/unknown writes invalidate addressable pointer cells.
+// Widening retains may-alias cell identity without guessing a displacement.
+class LocalPointerAnalysis {
+public:
+    LocalPointerAnalysis(const ManagedFunction& function,
+                         const hir::Module& module, const TargetInfo& target);
+    [[nodiscard]] const LocalPointerTargets& targets(ValueId value) const;
+private:
+    std::vector<LocalPointerTargets> values_;
+};
+
 enum class UseKind : std::uint8_t {
     Operand,
     CallArgument,

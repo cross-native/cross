@@ -242,6 +242,15 @@ if(BUILD_TESTING)
         -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language/semantics
         -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/out-definite-assignment
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/out_definite_assignment.cmake")
+    add_test(NAME cross_out_alias_assignment COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language/semantics
+        -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/out-alias-assignment
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/out_alias.cmake")
     foreach(level IN ITEMS O0 O1 O2 O3 Os Oz)
         add_test(NAME cross_runtime_f80_promote_${level}
             COMMAND "${CMAKE_COMMAND}"
