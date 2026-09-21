@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common/diagnostic.hpp"
+#include "frontend/semantic.hpp"
 
 #include <string_view>
 
@@ -13,6 +14,9 @@ namespace cross {
 const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            const std::filesystem::path& path,
                                            std::string_view source,
-                                           Diagnostics& diagnostics);
+                                           Diagnostics& diagnostics,
+                                           unsigned address_bits,
+                                           const LayoutQuery& size_of,
+                                           const LayoutQuery& align_of);
 
 } // namespace cross

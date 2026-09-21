@@ -31,7 +31,9 @@ struct Type {
         Vector,
         Array,
         Record,
-        Function
+        Function,
+        // Translation-only; never assigned a runtime layout or ABI channel.
+        Tokens
     } kind{Kind::Builtin};
     BuiltinType builtin{BuiltinType::Void};
     TypePtr pointee;
@@ -57,6 +59,7 @@ struct Type {
 
 TypePtr builtin_type(BuiltinType kind, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
+TypePtr tokens_type();
 TypePtr pointer_type(TypePtr pointee, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
 TypePtr generic_type(std::string name, bool is_const = false,
@@ -130,7 +133,7 @@ struct Expr {
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
         Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
-        AggregateInitializer, Address,
+        AggregateInitializer, Address, Quote,
     } kind{Kind::Integer};
     struct InitializerDesignator {
         enum class Kind { Member, Index } kind{Kind::Member};
@@ -164,6 +167,9 @@ struct Expr {
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> third;
     std::vector<std::unique_ptr<Expr>> arguments;
+    // Quote literals alternate with token-valued unquotes in arguments.
+    // Currently source fragments; syntax-context hygiene remains to be added.
+    std::vector<std::string> quote_fragments;
     std::vector<GenericArgument> generic_arguments;
     std::vector<InitializerEntry> initializer_entries;
 };

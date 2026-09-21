@@ -467,10 +467,24 @@ int cc_main(int argc, char** argv) {
         return diagnostics.errors() == 0 ? 0 : 1;
     }
 
+    const auto* target = target_for_triple(options.target);
+    auto subtarget = resolve_subtarget(*target, options, diagnostics);
+    if (!subtarget) return 1;
     Program program;
+    program.address_bits = subtarget->abi_info().address_bits;
+    // Macro execution precedes source declarations. Scalar layout queries
+    // nevertheless use the same target-owned context as later required folds.
+    auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);
+    const LayoutQuery macro_size = [&](const TypePtr& type) {
+        return hir::layout_size(macro_layout, macro_layout.intern_type(type), *target);
+    };
+    const LayoutQuery macro_align = [&](const TypePtr& type) {
+        return hir::layout_alignment(macro_layout, macro_layout.intern_type(type), *target);
+    };
     for (std::size_t i = 0; i < preprocessed.size(); ++i) {
         const auto* source = expand_procedural_macros(
-            sources, options.inputs[i], preprocessed[i], diagnostics);
+            sources, options.inputs[i], preprocessed[i], diagnostics,
+            program.address_bits, macro_size, macro_align);
         if (diagnostics.errors() != 0) return 1;
         Lexer lexer(*source, diagnostics);
         Parser parser(lexer.lex(), diagnostics);
@@ -491,10 +505,6 @@ int cc_main(int argc, char** argv) {
         for (auto& object : unit.objects) program.objects.push_back(std::move(object));
     }
     if (diagnostics.errors() != 0) return 1;
-    const auto* target = target_for_triple(options.target);
-    auto subtarget = resolve_subtarget(*target, options, diagnostics);
-    if (!subtarget) return 1;
-    program.address_bits = subtarget->abi_info().address_bits;
     if (!hir::validate_source_address_spaces(
             program, options, *target, diagnostics)) return 1;
     if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";

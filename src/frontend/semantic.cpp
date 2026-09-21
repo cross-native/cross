@@ -5,6 +5,7 @@
 #include "common/uint128.hpp"
 #include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
+#include "frontend/lexer.hpp"
 #include "model/model.hpp"
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -127,6 +129,8 @@ TypePtr clone_type(const TypePtr& source,
                             source->lanes);
     } else if (source->kind == Type::Kind::Record) {
         result = record_type(source->nominal_name, source->is_union);
+    } else if (source->kind == Type::Kind::Tokens) {
+        result = tokens_type();
     } else {
         const auto found = substitutions.find(source->generic_name);
         if (found == substitutions.end()) {
@@ -161,6 +165,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->location = source.location;
     result->text = source.text;
     result->string_value = source.string_value;
+    result->quote_fragments = source.quote_fragments;
     result->evaluated_integer = source.evaluated_integer;
     result->evaluated_floating = source.evaluated_floating;
     result->evaluated_address = source.evaluated_address;
@@ -932,6 +937,7 @@ private:
 
     TypePtr infer(const Expr& expression) const {
         switch (expression.kind) {
+        case Expr::Kind::Quote: return {};
         case Expr::Kind::Address:
             return expression.type;
         case Expr::Kind::Integer:
@@ -1526,6 +1532,7 @@ private:
 
     TypePtr infer(const Expr& expression) const {
         switch (expression.kind) {
+        case Expr::Kind::Quote: return {};
         case Expr::Kind::Integer:
             return builtin_type(BuiltinType::I32);
         case Expr::Kind::Floating:
@@ -1715,6 +1722,8 @@ struct EvalValue {
     // A named function has not yet acquired its contextual pointer ABI.
     // Binding it to a typed cell/parameter/result consumes this distinction.
     bool function_designator{};
+    // Immutable token storage is distinct from both strings and integers.
+    std::shared_ptr<const std::string> tokens;
 
     EvalValue() = default;
     EvalValue(UInt128 integer_value, TypePtr value_type,
@@ -1846,11 +1855,13 @@ public:
               std::string current_namespace = {},
               const LayoutQuery* size_of = nullptr,
               const LayoutQuery* align_of = nullptr,
-              const GenericPointerResolver* pointer_resolver = nullptr)
+              const GenericPointerResolver* pointer_resolver = nullptr,
+              bool procedural = false)
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller),
           current_namespace_(std::move(current_namespace)),
-          size_of_(size_of), align_of_(align_of), pointer_resolver_(pointer_resolver) {}
+          size_of_(size_of), align_of_(align_of), pointer_resolver_(pointer_resolver),
+          procedural_(procedural) {}
 
     std::unique_ptr<Expr> required_pointer(const Expr& source, const TypePtr& destination) {
         if (!validate_required_tree(source)) return {};
@@ -1920,6 +1931,16 @@ public:
             return std::nullopt;
         }
         return value;
+    }
+
+    bool validate_procedural_body(const FunctionDecl& function) {
+        scopes_.emplace_back();
+        for (const auto& parameter : function.parameters)
+            scopes_.back()[parameter.name] = {
+                EvalValue{UInt128{}, parameter.type}, false, true};
+        const bool valid = function.body && validate_macro_statement(*function.body, 0, 0);
+        scopes_.pop_back();
+        return valid;
     }
 
     void diagnose(SourceLocation fallback) const {
@@ -1996,6 +2017,26 @@ public:
     std::optional<EvalValue> expression(const Expr& expression) {
         if (!step(expression.location)) return std::nullopt;
         switch (expression.kind) {
+        case Expr::Kind::Quote: {
+            if (!procedural_ || expression.quote_fragments.size() != expression.arguments.size() + 1) {
+                fail(expression.location, "$::quote requires procedural macro execution");
+                return std::nullopt;
+            }
+            std::string result;
+            for (std::size_t index = 0; index < expression.quote_fragments.size(); ++index) {
+                if (!append_tokens(result, expression.quote_fragments[index], expression.location))
+                    return std::nullopt;
+                if (index == expression.arguments.size()) break;
+                auto value = this->expression(*expression.arguments[index]);
+                if (!value || !value->tokens) {
+                    fail(expression.arguments[index]->location, "$::unquote requires a token value");
+                    return std::nullopt;
+                }
+                if (!append_tokens(result, *value->tokens, expression.arguments[index]->location))
+                    return std::nullopt;
+            }
+            return token_value(std::move(result));
+        }
         case Expr::Kind::Integer: {
             auto value = parse_integer_value(expression);
             if (value && !expression.evaluated_integer) {
@@ -2064,6 +2105,10 @@ public:
             const auto* query = expression.kind == Expr::Kind::Sizeof
                                     ? size_of_
                                     : align_of_;
+            if (type && type->kind == Type::Kind::Tokens) {
+                fail(expression.location, "$::meta::tokens has no runtime size or alignment");
+                return std::nullopt;
+            }
             if (!type || !query) {
                 fail(expression.location,
                      "target layout is unavailable for this translation-time query");
@@ -2087,7 +2132,7 @@ public:
         case Expr::Kind::Conditional: {
             const auto type = expression_type(expression);
             auto condition = this->expression(*expression.left);
-            if (!condition || condition->pointer() || !type) return std::nullopt;
+            if (!condition || condition->pointer() || condition->tokens || !type) return std::nullopt;
             auto value = this->expression(*(condition->truthy()
                                           ? expression.right
                                           : expression.third));
@@ -2106,6 +2151,70 @@ public:
     }
 
 private:
+    static bool contains_tokens(const TypePtr& type) {
+        return type && (type->kind == Type::Kind::Tokens ||
+            contains_tokens(type->pointee) || contains_tokens(type->element) ||
+            (type->function && (contains_tokens(type->function->result) ||
+                std::any_of(type->function->parameters.begin(), type->function->parameters.end(),
+                    [](const ParameterDecl& parameter) { return contains_tokens(parameter.type); }))));
+    }
+
+    static EvalValue token_value(std::string text) {
+        EvalValue result{UInt128{}, tokens_type()};
+        result.tokens = std::make_shared<const std::string>(std::move(text));
+        return result;
+    }
+
+    bool append_tokens(std::string& result, std::string_view part, SourceLocation location) {
+        // Charge materialized output, including intermediate copies, so a
+        // bounded loop cannot grow token storage exponentially without limit.
+        constexpr std::size_t budget = 16 * 1024 * 1024;
+        if (part.size() >= budget - token_bytes_) {
+            fail(location, "translation-time token construction budget exceeded 16777216 bytes");
+            return false;
+        }
+        token_bytes_ += part.size() + 1;
+        result += part;
+        result += '\n'; // Keep token boundaries, including trailing line comments.
+        return true;
+    }
+
+    bool validate_parsed_tokens(std::string_view text, SourceLocation location) {
+        // Lex at the string boundary without retaining pointers into this
+        // temporary source. Diagnostics belong to the actual macro expression.
+        if (text.find('\0') != std::string_view::npos) {
+            fail(location, "$::meta::parse string contains a zero byte");
+            return false;
+        }
+        SourceFile source("<meta::parse>", std::string(text));
+        std::ostringstream output;
+        Diagnostics diagnostics(output);
+        const auto tokens = Lexer(source, diagnostics).lex();
+        if (diagnostics.errors() != 0) {
+            fail(location, "$::meta::parse could not tokenize its string");
+            return false;
+        }
+        std::vector<std::string_view> closers;
+        for (const auto& token : tokens) {
+            if (token.is("(")) closers.push_back(")");
+            else if (token.is("[")) closers.push_back("]");
+            else if (token.is("[[")) closers.push_back("]]");
+            else if (token.is("{")) closers.push_back("}");
+            else if (token.is(")") || token.is("]") || token.is("]]") || token.is("}")) {
+                if (closers.empty() || closers.back() != token.text) {
+                    fail(location, "$::meta::parse requires balanced token groups");
+                    return false;
+                }
+                closers.pop_back();
+            }
+        }
+        if (!closers.empty()) {
+            fail(location, "$::meta::parse requires balanced token groups");
+            return false;
+        }
+        return true;
+    }
+
     const FunctionDecl* direct_function(const Expr& expression) {
         const Expr* node = &expression;
         while (node->kind == Expr::Kind::Parenthesized && node->left)
@@ -2252,8 +2361,27 @@ private:
     // This validates the scalar expression boundary without executing calls
     // or arithmetic (division by zero in a short-circuited arm is permitted).
     bool validate_required_tree(const Expr& node) {
+        if (procedural_ && node.kind == Expr::Kind::Quote) {
+            for (const auto& argument : node.arguments) {
+                if (!validate_required_tree(*argument)) return false;
+                const auto type = expression_type(*argument);
+                if (!type || type->kind != Type::Kind::Tokens) {
+                    fail(argument->location, "$::unquote requires a token value");
+                    return false;
+                }
+            }
+            return true;
+        }
         if (node.kind == Expr::Kind::Sizeof ||
             node.kind == Expr::Kind::Alignof) {
+            if (procedural_) {
+                const auto type = node.type ? node.type
+                    : node.left ? expression_type(*node.left, false) : nullptr;
+                if (!type || contains_tokens(type)) {
+                    fail(node.location, "layout query requires a runtime object type, not tokens");
+                    return false;
+                }
+            }
             if (node.type) return true;
             if (node.left) {
                 if (const auto* member =
@@ -2277,6 +2405,28 @@ private:
             if (!node.left || node.left->kind != Expr::Kind::Name) {
                 fail(node.location, "indirect calls in required constant expressions are not implemented yet");
                 return false;
+            }
+            if (procedural_ && (node.left->text == "$::meta::parse" ||
+                                node.left->text == "$::meta::concat")) {
+                const bool parse = node.left->text == "$::meta::parse";
+                if (node.arguments.size() != (parse ? 1U : 2U)) {
+                    fail(node.location, parse ? "$::meta::parse requires one string argument"
+                                              : "$::meta::concat requires two token arguments");
+                    return false;
+                }
+                for (const auto& argument : node.arguments) {
+                    if (!validate_required_tree(*argument)) return false;
+                    const auto type = expression_type(*argument);
+                    const bool string = type && type->kind == Type::Kind::Pointer &&
+                        type->pointee && type->pointee->kind == Type::Kind::Builtin &&
+                        type->pointee->builtin == BuiltinType::U8;
+                    if (parse ? !string : (!type || type->kind != Type::Kind::Tokens)) {
+                        fail(argument->location, parse ? "$::meta::parse requires a translation-time string"
+                                                       : "$::meta::concat requires token values");
+                        return false;
+                    }
+                }
+                return true;
             }
             if (node.left->text == "$::runtime") {
                 fail(node.location, "$::runtime is invalid where a translation-time value is required");
@@ -2339,6 +2489,11 @@ private:
             fail(node.location, "unresolved name or unsupported type in required constant expression");
             return false;
         }
+        if (procedural_ && node.kind == Expr::Kind::Cast && node.left &&
+            !macro_convertible(expression_type(*node.left), node.type)) {
+            fail(node.location, "unsupported conversion in procedural macro");
+            return false;
+        }
         const bool pointer_unary = pointer_resolver_ && node.kind == Expr::Kind::Unary &&
             (node.text == "&" || node.text == "*");
         if (node.kind == Expr::Kind::Unary && !pointer_unary &&
@@ -2359,14 +2514,25 @@ private:
             (node.kind == Expr::Kind::Unary &&
              (node.text == "++" || node.text == "--" || node.text.starts_with("post")));
         if (modifying) {
+            const auto destination = node.left ? expression_type(*node.left) : nullptr;
+            const bool procedural_assignment = procedural_ && node.kind == Expr::Kind::Assign &&
+                node.text == "=" && destination &&
+                node.right && macro_convertible(expression_type(*node.right), destination);
+            if (procedural_ && node.kind == Expr::Kind::Assign && node.right &&
+                !macro_convertible(expression_type(*node.right), destination)) {
+                fail(node.location, "incompatible assignment type in procedural macro");
+                return false;
+            }
             if (!node.left || node.left->kind != Expr::Kind::Name ||
-                (node.right && !(is_integer(expression_type(*node.right)) ||
+                (node.right && !procedural_assignment && !(is_integer(expression_type(*node.right)) ||
                                  is_floating(expression_type(*node.right))))) {
                 fail(node.location, "unsupported assignment in required scalar expression");
                 return false;
             }
             bool read_only = expression_type(*node.left)->is_const;
-            if (current_function_) {
+            if (const auto* cell = lookup_mutable(node.left->text)) {
+                read_only = read_only || cell->read_only;
+            } else if (current_function_) {
                 for (const auto& parameter : current_function_->parameters)
                     if (parameter.name == node.left->text)
                         read_only = read_only || parameter.mode == ParameterMode::In;
@@ -2377,6 +2543,16 @@ private:
             }
         }
         if (node.kind == Expr::Kind::Binary || node.kind == Expr::Kind::Conditional) {
+            if (procedural_ && node.kind == Expr::Kind::Conditional) {
+                const auto condition = expression_type(*node.left);
+                const auto yes = expression_type(*node.right);
+                const auto no = expression_type(*node.third);
+                if (yes && no && yes->kind == Type::Kind::Tokens && no->kind == Type::Kind::Tokens) {
+                    if (is_integer(condition) || is_floating(condition)) return true;
+                    fail(node.location, "procedural macro condition must be scalar");
+                    return false;
+                }
+            }
             if (pointer_resolver_ && member) return true;
             const auto left = node.left ? expression_type(*node.left) : nullptr;
             const auto right = node.right ? expression_type(*node.right) : nullptr;
@@ -2410,8 +2586,100 @@ private:
         return true;
     }
 
+    static bool macro_convertible(const TypePtr& from, const TypePtr& to) {
+        if (!from || !to) return false;
+        if (from->kind == Type::Kind::Tokens || to->kind == Type::Kind::Tokens)
+            return from->kind == to->kind;
+        if ((is_integer(from) || is_floating(from)) && (is_integer(to) || is_floating(to)))
+            return true;
+        return from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Pointer &&
+            from->address_space == to->address_space &&
+            compatible_pointee(from->pointee, to->pointee);
+    }
+
+    bool validate_macro_statement(const Statement& node, unsigned loops, unsigned breaks) {
+        if (!node.attributes.empty()) {
+            fail(node.location, "statement attributes are not supported during procedural macro execution");
+            return false;
+        }
+        if (node.kind == Statement::Kind::Goto || node.kind == Statement::Kind::Label) {
+            fail(node.location, "labels and goto are not permitted during translation-time evaluation");
+            return false;
+        }
+        if ((node.kind == Statement::Kind::Break && breaks == 0) ||
+            (node.kind == Statement::Kind::Continue && loops == 0)) {
+            fail(node.location, "break or continue has no enclosing control statement");
+            return false;
+        }
+        const bool loop = node.kind == Statement::Kind::While ||
+            node.kind == Statement::Kind::DoWhile || node.kind == Statement::Kind::For;
+        const bool scope = node.kind == Statement::Kind::Compound || node.kind == Statement::Kind::For;
+        if (scope) scopes_.emplace_back();
+        const auto validate = [&]() -> bool {
+            if (node.declaration) {
+                const auto& declaration = *node.declaration;
+                const auto& type = declaration.type;
+                if (!type || type->is_volatile || type->is_atomic || declaration.storage_static ||
+                    declaration.storage_register || declaration.storage_stack || declaration.location_name ||
+                    !declaration.attributes.empty() || declaration.dynamic_array_bound ||
+                    !(is_integer(type) || is_floating(type) || type->kind == Type::Kind::Tokens ||
+                      (type->kind == Type::Kind::Pointer && type->pointee &&
+                       type->pointee->kind == Type::Kind::Builtin && type->pointee->builtin == BuiltinType::U8))) {
+                    fail(node.location, "procedural macro locals require ordinary scalar, string-pointer, or token cells without runtime storage qualifiers");
+                    return false;
+                }
+                if (scopes_.back().contains(declaration.name)) {
+                    fail(node.location, "local cell is declared more than once in the same scope");
+                    return false;
+                }
+                scopes_.back()[declaration.name] = {EvalValue{UInt128{}, type}, false, type->is_const};
+                if (declaration.initializer) {
+                    if (!validate_required_tree(*declaration.initializer)) return false;
+                    if (!macro_convertible(expression_type(*declaration.initializer), type)) {
+                        fail(node.location, "incompatible initializer type in procedural macro");
+                        return false;
+                    }
+                }
+            }
+            if (node.kind == Statement::Kind::For && node.first &&
+                !validate_macro_statement(*node.first, loops, breaks)) return false;
+            if (node.expression && !validate_required_tree(*node.expression)) return false;
+            if (node.kind == Statement::Kind::Return &&
+                (!node.expression || expression_type(*node.expression)->kind != Type::Kind::Tokens)) {
+                fail(node.location, "procedural macro must return a token value");
+                return false;
+            }
+            if (node.kind == Statement::Kind::Case &&
+                (!node.expression || !is_integer(expression_type(*node.expression)))) {
+                fail(node.location, "case requires a translation-time integer constant");
+                return false;
+            }
+            if (node.condition) {
+                if (!validate_required_tree(*node.condition)) return false;
+                const auto type = expression_type(*node.condition);
+                if (!is_integer(type) && (node.kind == Statement::Kind::Switch || !is_floating(type))) {
+                    fail(node.condition->location, "procedural macro condition must be scalar (integer for switch)");
+                    return false;
+                }
+            }
+            if (node.increment && !validate_required_tree(*node.increment)) return false;
+            const auto child_loops = loops + (loop ? 1U : 0U);
+            const auto child_breaks = breaks + (loop || node.kind == Statement::Kind::Switch ? 1U : 0U);
+            if (node.kind != Statement::Kind::For && node.first &&
+                !validate_macro_statement(*node.first, child_loops, child_breaks)) return false;
+            if (node.second && !validate_macro_statement(*node.second, child_loops, child_breaks)) return false;
+            for (const auto& child : node.statements)
+                if (!validate_macro_statement(*child, child_loops, child_breaks)) return false;
+            return true;
+        };
+        const bool valid = validate();
+        if (scope) scopes_.pop_back();
+        return valid;
+    }
+
     TypePtr expression_type(const Expr& expression, bool decay = true) {
         switch (expression.kind) {
+        case Expr::Kind::Quote: return procedural_ ? tokens_type() : nullptr;
         case Expr::Kind::Integer: {
             const auto value = parse_integer_value(expression);
             return value ? value->type : nullptr;
@@ -2500,6 +2768,8 @@ private:
             const auto left = expression_type(*(conditional ? expression.right : expression.left));
             const auto right = expression_type(*(conditional ? expression.third : expression.right));
             if (!left || !right) return {};
+            if (procedural_ && conditional && left->kind == Type::Kind::Tokens &&
+                right->kind == Type::Kind::Tokens) return tokens_type();
             if (pointer_resolver_) {
                 if (conditional && left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer &&
                     left->address_space == right->address_space) {
@@ -2529,6 +2799,8 @@ private:
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
+            if (procedural_ && (expression.left->text == "$::meta::parse" ||
+                                expression.left->text == "$::meta::concat")) return tokens_type();
             if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
                 expression.arguments.size() == 1) return expression_type(*expression.arguments.front());
             if (const auto* callee = resolve_function(program_, current_function_, expression.left->text,
@@ -2580,6 +2852,14 @@ private:
         if (!type || type->is_volatile || type->is_atomic) {
             fail(location, "volatile or atomic access is not permitted during translation-time evaluation");
             return std::nullopt;
+        }
+        if (value.tokens || type->kind == Type::Kind::Tokens) {
+            if (!procedural_ || !value.tokens || type->kind != Type::Kind::Tokens) {
+                fail(location, "token values cannot be converted to or from runtime types");
+                return std::nullopt;
+            }
+            value.type = clone_type(type);
+            return value;
         }
         if (pointer_resolver_ && type->kind == Type::Kind::Pointer && !value.string) {
             auto source = value_expression(value, location);
@@ -2825,7 +3105,7 @@ private:
                 lookup_mutable(expression.left->text)->value = *value;
                 return expression.text.starts_with("post") ? previous : value;
             }
-            if (previous->pointer()) return std::nullopt;
+            if (previous->pointer() || previous->tokens) return std::nullopt;
             auto value = previous->floating
                 ? calculate_floating(expression.text == "++" || expression.text == "post++"
                                          ? "+" : "-", *previous,
@@ -2842,7 +3122,7 @@ private:
             return expression.text.starts_with("post") ? previous : value;
         }
         auto value = this->expression(*expression.left);
-        if (!value || value->pointer()) return std::nullopt;
+        if (!value || value->pointer() || value->tokens) return std::nullopt;
         if (value->floating) {
             if (expression.text == "+") return value;
             if (expression.text == "-") {
@@ -2875,6 +3155,10 @@ private:
     std::optional<EvalValue> binary(const Expr& expression) {
         auto left = this->expression(*expression.left);
         if (!left) return std::nullopt;
+        if (left->tokens) {
+            fail(expression.location, "token values do not support scalar operators");
+            return std::nullopt;
+        }
         const auto operation = expression.text;
         if (operation == "&&" || operation == "||") {
             if (left->pointer()) return std::nullopt;
@@ -2885,12 +3169,16 @@ private:
                                  builtin_type(BuiltinType::Bool)};
             }
             auto right = this->expression(*expression.right);
-            if (!right || right->pointer()) return std::nullopt;
+            if (!right || right->pointer() || right->tokens) return std::nullopt;
             return EvalValue{{right->truthy(), 0},
                              builtin_type(BuiltinType::Bool)};
         }
         auto right = this->expression(*expression.right);
         if (!right) return std::nullopt;
+        if (right->tokens) {
+            fail(expression.location, "token values do not support scalar operators");
+            return std::nullopt;
+        }
         if (expression.text == "index") {
             if (!left->string || right->pointer() || right->integer.high != 0) {
                 if (left->address) fail(expression.location,
@@ -2985,6 +3273,32 @@ private:
             fail(expression.location, "indirect calls are not permitted during translation-time evaluation");
             return std::nullopt;
         }
+        if (procedural_ && (expression.left->text == "$::meta::parse" ||
+                            expression.left->text == "$::meta::concat")) {
+            const bool parse = expression.left->text == "$::meta::parse";
+            if (expression.arguments.size() != (parse ? 1U : 2U)) {
+                fail(expression.location, parse ? "$::meta::parse requires one string argument"
+                                                : "$::meta::concat requires two token arguments");
+                return std::nullopt;
+            }
+            std::string result;
+            for (const auto& argument : expression.arguments) {
+                auto value = this->expression(*argument);
+                if (!value) return std::nullopt;
+                if (parse ? !value->string : !value->tokens) {
+                    fail(argument->location, parse ? "$::meta::parse requires a translation-time string"
+                                                   : "$::meta::concat requires token values");
+                    return std::nullopt;
+                }
+                const auto part = parse
+                    ? std::string_view(*value->string).substr(value->offset,
+                          value->string->size() - value->offset - 1)
+                    : std::string_view(*value->tokens);
+                if (!append_tokens(result, part, argument->location)) return std::nullopt;
+                if (parse && !validate_parsed_tokens(part, argument->location)) return std::nullopt;
+            }
+            return token_value(std::move(result));
+        }
         if (expression.left->text == "$::eval") {
             if (expression.arguments.size() != 1) {
                 fail(expression.location,
@@ -3046,6 +3360,14 @@ private:
         }
         case Statement::Kind::Declaration: {
             if (!statement.declaration) return {Flow::Failed};
+            if (statement.declaration->storage_static) {
+                fail(statement.location, "runtime/static storage cannot be used during translation-time evaluation");
+                return {Flow::Failed};
+            }
+            if (scopes_.back().contains(statement.declaration->name)) {
+                fail(statement.location, "local cell is declared more than once in the same scope");
+                return {Flow::Failed};
+            }
             if (statement.declaration->dynamic_array_bound) {
                 return {Flow::Failed};
             }
@@ -3074,7 +3396,7 @@ private:
                                          : std::optional<EvalValue>{}};
         case Statement::Kind::If: {
             auto condition = expression(*statement.condition);
-            if (!condition || condition->pointer()) return {Flow::Failed};
+            if (!condition || condition->pointer() || condition->tokens) return {Flow::Failed};
             if (condition->truthy()) {
                 return this->statement(*statement.first);
             }
@@ -3190,7 +3512,7 @@ private:
         case Statement::Kind::While:
             while (true) {
                 auto condition = expression(*statement.condition);
-                if (!condition || condition->pointer()) return {Flow::Failed};
+                if (!condition || condition->pointer() || condition->tokens) return {Flow::Failed};
                 if (!condition->truthy()) return {};
                 auto flow = this->statement(*statement.first);
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
@@ -3202,7 +3524,7 @@ private:
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
                 if (flow.kind == Flow::Break) return {};
                 auto condition = expression(*statement.condition);
-                if (!condition || condition->pointer()) return {Flow::Failed};
+                if (!condition || condition->pointer() || condition->tokens) return {Flow::Failed};
                 if (!condition->truthy()) return {};
             } while (true);
         case Statement::Kind::For: {
@@ -3215,7 +3537,7 @@ private:
             while (true) {
                 if (statement.condition) {
                     auto condition = expression(*statement.condition);
-                    if (!condition || condition->pointer()) {
+                    if (!condition || condition->pointer() || condition->tokens) {
                         scopes_.pop_back();
                         return {Flow::Failed};
                     }
@@ -3255,6 +3577,8 @@ private:
     const LayoutQuery* size_of_{};
     const LayoutQuery* align_of_{};
     const GenericPointerResolver* pointer_resolver_{};
+    bool procedural_{};
+    std::size_t token_bytes_{};
     std::vector<std::unordered_map<std::string, Cell>> scopes_;
     std::size_t frame_base_{};
     std::uint64_t steps_{};
@@ -4843,6 +5167,29 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
                                        function->source_namespace);
     }
     return diagnostics.errors() == 0;
+}
+
+std::optional<std::string> evaluate_procedural_body(
+    const FunctionDecl& macro, std::string_view input, unsigned address_bits,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    SourceLocation invocation, Diagnostics& diagnostics) {
+    Program context;
+    context.address_bits = address_bits;
+    Evaluator evaluator(context, diagnostics, &macro, macro.source_namespace,
+                        &size_of, &align_of, nullptr, true);
+    if (!evaluator.validate_procedural_body(macro)) {
+        evaluator.diagnose(macro.location);
+        diagnostics.note(invocation, "while expanding procedural macro '" + macro.name + "'");
+        return std::nullopt;
+    }
+    EvalValue argument{UInt128{}, tokens_type()};
+    argument.tokens = std::make_shared<const std::string>(input);
+    const auto result = evaluator.call(macro, {argument}, invocation);
+    if (!result || !result->tokens) {
+        evaluator.diagnose(invocation);
+        return std::nullopt;
+    }
+    return *result->tokens;
 }
 
 std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(

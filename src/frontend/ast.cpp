@@ -9,6 +9,12 @@
 
 namespace cross {
 
+TypePtr tokens_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::Tokens;
+    return type;
+}
+
 TypePtr builtin_type(BuiltinType kind, bool is_const, bool is_volatile,
                      bool is_atomic) {
     auto type = std::make_shared<Type>();
@@ -94,6 +100,7 @@ TypePtr enum_type(std::string name, BuiltinType underlying, bool is_const,
 
 std::string type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
+    if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
     std::string prefix;
     if (type->is_const) prefix += "const ";
     if (type->is_volatile) prefix += "volatile ";
@@ -153,6 +160,7 @@ std::string type_name(const TypePtr& type) {
 
 std::string canonical_type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
+    if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
     std::string result;
     if (type->is_const) result += 'K';
     if (type->is_volatile) result += 'V';
@@ -324,7 +332,8 @@ bool is_nominal(const TypePtr& type) {
 unsigned type_bits(const TypePtr& type) {
     if (!type) return 0;
     if (type->kind == Type::Kind::Pointer) return 64;
-    if (type->kind == Type::Kind::Generic || type->kind == Type::Kind::Function)
+    if (type->kind == Type::Kind::Generic || type->kind == Type::Kind::Function ||
+        type->kind == Type::Kind::Tokens)
         return 0;
     if (type->kind == Type::Kind::Vector) {
         return type->scalable ? 0 : type_bits(type->element) * type->lanes;

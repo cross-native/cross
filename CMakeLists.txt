@@ -251,6 +251,14 @@ if(BUILD_TESTING)
         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/out-alias-assignment
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/out_alias.cmake")
+    add_test(NAME cross_procedural_scalar COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/frontend
+        -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/procedural-scalar
+        -P "${CMAKE_SOURCE_DIR}/test/frontend/procedural_scalar.cmake")
     foreach(level IN ITEMS O0 O1 O2 O3 Os Oz)
         add_test(NAME cross_runtime_f80_promote_${level}
             COMMAND "${CMAKE_COMMAND}"

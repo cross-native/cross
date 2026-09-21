@@ -5,43 +5,23 @@
 #include "common/source.hpp"
 #include "frontend/ast.hpp"
 #include "frontend/lexer.hpp"
+#include "frontend/parser.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace cross {
 namespace {
 
-struct MetaExpression {
-    enum class Kind { Variable, Literal, Concat, Template } kind{Kind::Variable};
-    std::string literal;
-    std::unique_ptr<MetaExpression> left;
-    std::unique_ptr<MetaExpression> right;
-    std::vector<MetaExpression> parts;
-};
-
-struct MetaStatement {
-    enum class Kind { Return, Declare, If } kind{Kind::Return};
-    std::string name;
-    MetaExpression expression;
-    bool condition{};
-    std::vector<MetaStatement> then_branch;
-    std::vector<MetaStatement> else_branch;
-    SourceLocation location;
-};
-
 struct TokenMacro {
     std::string name;
-    std::string parameter;
-    std::vector<MetaStatement> body;
+    FunctionDecl function;
     SourceLocation location;
 };
 
@@ -65,327 +45,6 @@ std::optional<std::size_t> matching_group(const std::vector<Token>& tokens,
     for (std::size_t index = opening; index < tokens.size(); ++index) {
         if (tokens[index].text == opener) ++depth;
         else if (tokens[index].text == closer && --depth == 0) return index;
-    }
-    return std::nullopt;
-}
-
-class MetaParser {
-public:
-    MetaParser(const std::vector<Token>& tokens, std::size_t begin,
-               std::size_t end,
-               const std::unordered_set<std::string>& variables,
-               Diagnostics& diagnostics)
-        : tokens_(tokens), index_(begin), end_(end), variables_(variables),
-          diagnostics_(diagnostics) {}
-
-    std::optional<MetaExpression> parse() {
-        auto result = expression();
-        if (!result || index_ != end_) {
-            const auto location = index_ < tokens_.size()
-                                      ? tokens_[index_].location
-                                      : SourceLocation{};
-            diagnostics_.error(
-                location,
-                "'macro' token expression supports a token variable, "
-                "$::quote { ... $::unquote(variable) ... }, "
-                "$::meta::parse(string), and "
-                "$::meta::concat(left, right)");
-            return std::nullopt;
-        }
-        return result;
-    }
-
-private:
-    bool consume(std::string_view spelling) {
-        if (index_ >= end_ || tokens_[index_].text != spelling) return false;
-        ++index_;
-        return true;
-    }
-
-    std::optional<MetaExpression> expression() {
-        if (index_ >= end_) return std::nullopt;
-        if (tokens_[index_].kind == TokenKind::Identifier &&
-            variables_.contains(std::string(tokens_[index_].text))) {
-            MetaExpression result;
-            result.literal = std::string(tokens_[index_].text);
-            ++index_;
-            return result;
-        }
-        if (tokens_[index_].text == "$::meta::parse") {
-            ++index_;
-            if (!consume("(") || index_ >= end_ ||
-                tokens_[index_].kind != TokenKind::String) {
-                return std::nullopt;
-            }
-            const auto decoded = decode_string_literal(tokens_[index_++].text);
-            if (!decoded || !consume(")")) return std::nullopt;
-            MetaExpression result;
-            result.kind = MetaExpression::Kind::Literal;
-            result.literal = *decoded;
-            return result;
-        }
-        if (tokens_[index_].text == "$::meta::concat") {
-            ++index_;
-            if (!consume("(")) return std::nullopt;
-            auto left = expression();
-            if (!left || !consume(",")) return std::nullopt;
-            auto right = expression();
-            if (!right || !consume(")")) return std::nullopt;
-            MetaExpression result;
-            result.kind = MetaExpression::Kind::Concat;
-            result.left = std::make_unique<MetaExpression>(std::move(*left));
-            result.right = std::make_unique<MetaExpression>(std::move(*right));
-            return result;
-        }
-        if (tokens_[index_].text == "$::quote") {
-            ++index_;
-            if (index_ >= end_ || tokens_[index_].text != "{") {
-                return std::nullopt;
-            }
-            const auto opening = index_;
-            const auto closing = matching_group(tokens_, opening);
-            if (!closing || *closing >= end_) return std::nullopt;
-            const auto* file = tokens_[opening].location.file;
-            if (!file || tokens_[*closing].location.file != file) {
-                return std::nullopt;
-            }
-
-            MetaExpression result;
-            result.kind = MetaExpression::Kind::Template;
-            auto literal_begin =
-                tokens_[opening].location.offset +
-                tokens_[opening].text.size();
-            auto append_literal = [&](std::size_t end) {
-                if (end <= literal_begin) return;
-                MetaExpression literal;
-                literal.kind = MetaExpression::Kind::Literal;
-                literal.literal =
-                    std::string_view(file->text)
-                        .substr(literal_begin, end - literal_begin);
-                result.parts.push_back(std::move(literal));
-            };
-
-            for (auto cursor = opening + 1;
-                 cursor < *closing;) {
-                if (tokens_[cursor].text == "$::unquote" &&
-                    cursor + 3 < *closing &&
-                    tokens_[cursor + 1].text == "(" &&
-                    tokens_[cursor + 2].kind ==
-                        TokenKind::Identifier &&
-                    variables_.contains(
-                        std::string(tokens_[cursor + 2].text)) &&
-                    tokens_[cursor + 3].text == ")") {
-                    append_literal(tokens_[cursor].location.offset);
-                    MetaExpression variable;
-                    variable.literal = std::string(tokens_[cursor + 2].text);
-                    result.parts.push_back(std::move(variable));
-                    literal_begin =
-                        tokens_[cursor + 3].location.offset +
-                        tokens_[cursor + 3].text.size();
-                    cursor += 4;
-                    continue;
-                }
-                if (tokens_[cursor].text == "$::unquote") {
-                    diagnostics_.error(tokens_[cursor].location,
-                                       "$::unquote requires a visible token variable inside $::quote");
-                    return std::nullopt;
-                }
-                ++cursor;
-            }
-            append_literal(tokens_[*closing].location.offset);
-            index_ = *closing + 1;
-            return result;
-        }
-        return std::nullopt;
-    }
-
-    const std::vector<Token>& tokens_;
-    std::size_t index_{};
-    std::size_t end_{};
-    const std::unordered_set<std::string>& variables_;
-    Diagnostics& diagnostics_;
-};
-
-std::optional<std::size_t> meta_statement_end(
-    const std::vector<Token>& tokens, std::size_t begin, std::size_t end) {
-    for (auto cursor = begin; cursor < end; ++cursor) {
-        if (tokens[cursor].text == ";") return cursor;
-        if (tokens[cursor].text == "(" || tokens[cursor].text == "[" ||
-            tokens[cursor].text == "{") {
-            const auto closing = matching_group(tokens, cursor);
-            if (!closing || *closing >= end) return std::nullopt;
-            cursor = *closing;
-        }
-    }
-    return std::nullopt;
-}
-
-std::optional<std::vector<MetaStatement>> parse_meta_body(
-    const std::vector<Token>& tokens, std::size_t begin, std::size_t end,
-    std::unordered_set<std::string> variables, Diagnostics& diagnostics,
-    unsigned depth = 0) {
-    if (depth > 128) {
-        diagnostics.error(tokens[begin].location,
-                          "procedural macro body exceeds the nesting limit");
-        return std::nullopt;
-    }
-    std::vector<MetaStatement> result;
-    for (auto cursor = begin; cursor < end;) {
-        MetaStatement statement;
-        statement.location = tokens[cursor].location;
-        if (tokens[cursor].text == "if") {
-            if (cursor + 1 >= end || tokens[cursor + 1].text != "(") {
-                diagnostics.error(statement.location,
-                                  "procedural macro 'if' requires a condition");
-                return std::nullopt;
-            }
-            const auto condition_end = matching_group(tokens, cursor + 1);
-            if (!condition_end || *condition_end != cursor + 3 ||
-                *condition_end + 1 >= end ||
-                tokens[*condition_end + 1].text != "{") {
-                diagnostics.error(statement.location,
-                                  "procedural macro 'if' currently requires a literal condition and braced body");
-                return std::nullopt;
-            }
-            const auto condition = tokens[cursor + 2].text;
-            if (condition == "true" || condition == "1") {
-                statement.condition = true;
-            } else if (condition == "false" || condition == "0") {
-                statement.condition = false;
-            } else {
-                diagnostics.error(tokens[cursor + 2].location,
-                                  "procedural macro 'if' condition currently requires a literal bool or 0/1");
-                return std::nullopt;
-            }
-            statement.kind = MetaStatement::Kind::If;
-            const auto then_open = *condition_end + 1;
-            const auto then_end = matching_group(tokens, then_open);
-            if (!then_end || *then_end >= end) {
-                diagnostics.error(tokens[then_open].location,
-                                  "unterminated procedural macro 'if' body");
-                return std::nullopt;
-            }
-            auto then_body = parse_meta_body(tokens, then_open + 1,
-                                             *then_end, variables,
-                                             diagnostics, depth + 1);
-            if (!then_body) return std::nullopt;
-            statement.then_branch = std::move(*then_body);
-            cursor = *then_end + 1;
-            if (cursor < end && tokens[cursor].text == "else") {
-                if (cursor + 1 >= end || tokens[cursor + 1].text != "{") {
-                    diagnostics.error(tokens[cursor].location,
-                                      "procedural macro 'else' requires a braced body");
-                    return std::nullopt;
-                }
-                const auto else_open = cursor + 1;
-                const auto else_end = matching_group(tokens, else_open);
-                if (!else_end || *else_end >= end) {
-                    diagnostics.error(tokens[else_open].location,
-                                      "unterminated procedural macro 'else' body");
-                    return std::nullopt;
-                }
-                auto else_body = parse_meta_body(tokens, else_open + 1,
-                                                 *else_end, variables,
-                                                 diagnostics, depth + 1);
-                if (!else_body) return std::nullopt;
-                statement.else_branch = std::move(*else_body);
-                cursor = *else_end + 1;
-            }
-            result.push_back(std::move(statement));
-            continue;
-        }
-        const bool declaration = tokens[cursor].text == "$::meta::tokens";
-        const bool returning = tokens[cursor].text == "return";
-        if (!declaration && !returning) {
-            diagnostics.error(statement.location,
-                              "procedural macro body currently supports token locals, braced if/else, and return");
-            return std::nullopt;
-        }
-        auto expression_begin = cursor + 1;
-        if (declaration) {
-            if (expression_begin + 1 >= end ||
-                tokens[expression_begin].kind != TokenKind::Identifier ||
-                tokens[expression_begin + 1].text != "=") {
-                diagnostics.error(statement.location,
-                                  "procedural macro token local requires a name and initializer");
-                return std::nullopt;
-            }
-            statement.kind = MetaStatement::Kind::Declare;
-            statement.name = std::string(tokens[expression_begin].text);
-            if (variables.contains(statement.name)) {
-                diagnostics.error(tokens[expression_begin].location,
-                                  "procedural macro token local redeclares '" +
-                                      statement.name + "'");
-                return std::nullopt;
-            }
-            expression_begin += 2;
-        }
-        const auto semicolon = meta_statement_end(tokens, expression_begin,
-                                                   end);
-        if (!semicolon) {
-            diagnostics.error(statement.location,
-                              "unterminated procedural macro statement");
-            return std::nullopt;
-        }
-        MetaParser parser(tokens, expression_begin, *semicolon, variables,
-                          diagnostics);
-        auto expression = parser.parse();
-        if (!expression) return std::nullopt;
-        statement.expression = std::move(*expression);
-        if (declaration) variables.insert(statement.name);
-        result.push_back(std::move(statement));
-        cursor = *semicolon + 1;
-    }
-    return result;
-}
-
-using MetaEnvironment = std::unordered_map<std::string, std::string>;
-
-std::optional<std::string> evaluate(const MetaExpression& expression,
-                                    const MetaEnvironment& variables) {
-    switch (expression.kind) {
-    case MetaExpression::Kind::Variable: {
-        const auto found = variables.find(expression.literal);
-        if (found == variables.end()) return std::nullopt;
-        return found->second;
-    }
-    case MetaExpression::Kind::Literal:
-        return expression.literal;
-    case MetaExpression::Kind::Concat: {
-        auto left = evaluate(*expression.left, variables);
-        auto right = evaluate(*expression.right, variables);
-        if (!left || !right) return std::nullopt;
-        return *left + *right;
-    }
-    case MetaExpression::Kind::Template: {
-        std::string result;
-        for (const auto& part : expression.parts) {
-            auto value = evaluate(part, variables);
-            if (!value) return std::nullopt;
-            result += *value;
-        }
-        return result;
-    }
-    }
-    return std::nullopt;
-}
-
-std::optional<std::string> execute_meta_body(
-    const std::vector<MetaStatement>& body, MetaEnvironment& variables) {
-    for (const auto& statement : body) {
-        if (statement.kind == MetaStatement::Kind::If) {
-            auto branch_variables = variables;
-            const auto& branch = statement.condition
-                ? statement.then_branch : statement.else_branch;
-            if (auto result = execute_meta_body(branch, branch_variables)) {
-                return result;
-            }
-            continue;
-        }
-        auto value = evaluate(statement.expression, variables);
-        if (!value) return std::nullopt;
-        if (statement.kind == MetaStatement::Kind::Return) return value;
-        variables[statement.name] = std::move(*value);
     }
     return std::nullopt;
 }
@@ -593,9 +252,11 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                               "unterminated 'macro' body");
             continue;
         }
-        const auto body_begin = cursor + 1;
-        auto body = parse_meta_body(tokens, body_begin, *body_end,
-                                    {parameter}, diagnostics);
+        std::vector<Token> body_tokens(tokens.begin() + static_cast<std::ptrdiff_t>(cursor),
+            tokens.begin() + static_cast<std::ptrdiff_t>(*body_end + 1));
+        body_tokens.push_back({TokenKind::End, {}, tokens[*body_end].location});
+        Parser parser(std::move(body_tokens), diagnostics);
+        auto body = parser.parse_procedural_body();
         if (!body) continue;
         const auto declaration_end =
             tokens[*body_end].location.offset + tokens[*body_end].text.size();
@@ -610,8 +271,16 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                   "' is defined more than once");
             continue;
         }
-        macros.push_back({std::move(name), std::move(parameter),
-                          std::move(*body), tokens[index].location});
+        FunctionDecl function;
+        function.name = name;
+        function.location = tokens[index].location;
+        function.return_type = tokens_type();
+        function.source_namespace = current_namespace;
+        function.linkage = Linkage::Static;
+        function.parameters.push_back({tokens[*parameter_end - 1].location,
+            std::move(parameter), tokens_type(), ParameterMode::In, true, {}});
+        function.body = std::move(body);
+        macros.push_back({std::move(name), std::move(function), tokens[index].location});
         index = *body_end;
     }
     return macros;
@@ -659,7 +328,10 @@ const TokenMacro* find_macro(const std::vector<TokenMacro>& macros,
 std::optional<Replacement> find_expansion(const SourceFile& file,
                                           const std::vector<Token>& tokens,
                                            const std::vector<TokenMacro>& macros,
-                                           Diagnostics& diagnostics) {
+                                           Diagnostics& diagnostics,
+                                           unsigned address_bits,
+                                           const LayoutQuery& size_of,
+                                           const LayoutQuery& align_of) {
     const auto regions = namespace_regions(tokens);
     for (std::size_t index = 0; index + 2 < tokens.size(); ++index) {
         if (tokens[index].kind == TokenKind::Identifier) {
@@ -685,11 +357,9 @@ std::optional<Replacement> find_expansion(const SourceFile& file,
                 const auto input_end = tokens[*close].location.offset;
                 const auto replacement_end = tokens[*close].location.offset +
                                              tokens[*close].text.size();
-                MetaEnvironment variables;
-                variables.emplace(macro->parameter,
-                    std::string(std::string_view(file.text).substr(
-                        input_begin, input_end - input_begin)));
-                auto output = execute_meta_body(macro->body, variables);
+                auto output = evaluate_procedural_body(macro->function,
+                    std::string_view(file.text).substr(input_begin, input_end - input_begin),
+                    address_bits, size_of, align_of, tokens[index].location, diagnostics);
                 if (!output) {
                     diagnostics.error(tokens[index].location,
                                       "procedural macro '" + macro->name +
@@ -763,7 +433,10 @@ std::vector<SourceExpansion> remap_expansions(
 const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            const std::filesystem::path& path,
                                            std::string_view source,
-                                           Diagnostics& diagnostics) {
+                                           Diagnostics& diagnostics,
+                                           unsigned address_bits,
+                                           const LayoutQuery& size_of,
+                                           const LayoutQuery& align_of) {
     std::string result(source);
     const auto* definition_file = sources.add(path, result);
     Lexer definition_lexer(*definition_file, diagnostics);
@@ -780,7 +453,8 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
         const auto tokens = lexer.lex();
         if (diagnostics.errors() != 0) return current;
         auto replacement =
-            find_expansion(*current, tokens, macros, diagnostics);
+            find_expansion(*current, tokens, macros, diagnostics,
+                           address_bits, size_of, align_of);
         if (!replacement) return current;
         auto origins = remap_expansions(*current, *replacement);
         result.replace(replacement->begin, replacement->end - replacement->begin,

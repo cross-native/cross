@@ -445,6 +445,7 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
 bool Parser::type_start() const {
     const auto& token = current();
     return token.is("const") || token.is("volatile") ||
+           token.is("$::meta::tokens") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
            builtin_kind(token.text).has_value() ||
@@ -469,7 +470,14 @@ TypePtr Parser::parse_type() {
         }
     }
     TypePtr type;
-    if (current().is("struct") || current().is("union")) {
+    if (current().is("$::meta::tokens")) {
+        if (!parsing_procedural_body_)
+            error_here("$::meta::tokens is only available in translation-time macro bodies");
+        ++index_;
+        type = tokens_type();
+        type->is_const = is_const;
+        type->is_volatile = is_volatile;
+    } else if (current().is("struct") || current().is("union")) {
         const bool is_union = consume("union");
         if (!is_union) consume("struct");
         const auto name = parse_qualified_name();
@@ -1972,8 +1980,68 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
     return expression;
 }
 
+std::unique_ptr<Statement> Parser::parse_procedural_body() {
+    parsing_procedural_body_ = true;
+    auto body = parse_compound();
+    if (current().kind != TokenKind::End)
+        error_here("unexpected tokens after procedural macro body");
+    parsing_procedural_body_ = false;
+    return body;
+}
+
+std::unique_ptr<Expr> Parser::parse_quote() {
+    auto result = std::make_unique<Expr>();
+    result->kind = Expr::Kind::Quote;
+    result->location = current().location;
+    if (!parsing_procedural_body_)
+        error_here("$::quote is only available in translation-time macro bodies");
+    ++index_;
+    const auto opening = current();
+    if (!expect("{", "after $::quote")) return result;
+    const auto* file = opening.location.file;
+    auto literal_begin = opening.location.offset + opening.text.size();
+    std::vector<std::string_view> closers{"}"};
+    while (current().kind != TokenKind::End) {
+        if (current().is("$::unquote")) {
+            result->quote_fragments.push_back(file->text.substr(
+                literal_begin, current().location.offset - literal_begin));
+            ++index_;
+            if (!expect("(", "after $::unquote")) return result;
+            result->arguments.push_back(parse_expression());
+            const auto closing = current();
+            if (!expect(")", "after $::unquote expression")) return result;
+            literal_begin = closing.location.offset + closing.text.size();
+            continue;
+        }
+        if (current().is("(")) closers.push_back(")");
+        else if (current().is("[")) closers.push_back("]");
+        else if (current().is("[[")) closers.push_back("]]");
+        else if (current().is("{")) closers.push_back("}");
+        else if (current().is(")") || current().is("]") ||
+                 current().is("]]") || current().is("}")) {
+            if (closers.empty() || closers.back() != current().text) {
+                error_here("$::quote requires balanced token groups");
+                return result;
+            }
+            closers.pop_back();
+            if (closers.empty()) {
+                result->quote_fragments.push_back(file->text.substr(
+                    literal_begin, current().location.offset - literal_begin));
+                ++index_;
+                return result;
+            }
+        }
+        ++index_;
+    }
+    error_here("unterminated $::quote token tree");
+    return result;
+}
+
 std::unique_ptr<Expr> Parser::parse_primary() {
     const auto item = current();
+    if (current().is("$::quote")) return parse_quote();
+    if (current().is("$::unquote"))
+        error_here("$::unquote is only valid inside $::quote");
     if (current().is("$::alignof") && current(1).is("(")) {
         index_ += 2;
         auto result = std::make_unique<Expr>();

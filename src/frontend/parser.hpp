@@ -17,6 +17,9 @@ class Parser {
 public:
     Parser(std::vector<Token> tokens, Diagnostics& diagnostics);
     Program parse();
+    // Parse a macro's braced body with the ordinary statement/expression
+    // grammar, enabling translation-only token types and quotation.
+    std::unique_ptr<Statement> parse_procedural_body();
 
 private:
     const Token& current(std::size_t lookahead = 0) const;
@@ -84,6 +87,7 @@ private:
     std::unique_ptr<Expr> parse_unary();
     std::unique_ptr<Expr> parse_postfix();
     std::unique_ptr<Expr> parse_primary();
+    std::unique_ptr<Expr> parse_quote();
     std::vector<FunctionDecl::GenericParameter> generic_parameters(
         const std::vector<Attribute>& attributes);
     static int precedence(std::string_view operation);
@@ -103,6 +107,7 @@ private:
     std::unordered_map<std::string, TypePtr> type_aliases_;
     std::vector<StaticAssertDecl> static_assertions_;
     bool parsing_generic_argument_{};
+    bool parsing_procedural_body_{};
     unsigned switch_depth_{};
     std::vector<bool> switch_default_seen_;
 };
