@@ -3,6 +3,8 @@
 
 #include "procedural_lookup.x"
 #include "procedural_locals.x"
+#include "namespace_values.x"
+global uptr quoted_string_size = sizeof(value_definition::literal!{});
 #if defined(TEST_MACRO_RAW)
 #include "procedural_locals_raw.x"
 #endif
@@ -100,6 +102,10 @@ static struct pair memory_result(in u64 n) {
 [[abi(HOST_ABI)]]
 #endif
 global i32 procedural_scalar_entry() {
+    if (quoted_string_size != 3uptr) return 99;
+    if (value_definition::quoted!{} != 115u64) return 98;
+    i32 namespace_check = namespace_values_check();
+    if (namespace_check != 0) return 100 + namespace_check;
     i32 local_check = hygienic_locals::check();
     if (local_check != 0) return 70 + local_check;
 #if defined(TEST_MACRO_RAW)

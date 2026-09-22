@@ -138,6 +138,7 @@ struct Expr {
         Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
         AggregateInitializer, Address, Quote,
     } kind{Kind::Integer};
+    std::shared_ptr<const NameLookupContext> name_context;
     struct InitializerDesignator {
         enum class Kind { Member, Index } kind{Kind::Member};
         SourceLocation location;
@@ -179,6 +180,23 @@ struct Expr {
 
 inline NameKey name_key(const Expr& expression) {
     return NameKey(expression.text, expression.location);
+}
+
+inline NameUse::NameUse(const Expr& expression)
+    : spelling(expression.text), location(expression.location),
+      context(expression.name_context.get()) {
+    const auto* node = &expression;
+    while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
+    spelling = node->text;
+    location = node->location;
+    context = node->name_context.get();
+}
+
+inline void bind_exact_name(Expr& expression, std::string name) {
+    expression.text = std::move(name);
+    auto context = std::make_shared<NameLookupContext>();
+    context->kind = NameLookupContext::Kind::Exact;
+    expression.name_context = std::move(context);
 }
 
 struct VariableDecl {

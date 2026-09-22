@@ -1270,29 +1270,23 @@ private:
         return result;
     }
 
-    const hir::Function* resolve_function(std::string_view name) const {
-        std::vector<std::string> candidates;
+    std::pair<const hir::Function*, const hir::Object*> resolve_value_name(NameUse name) const {
         const auto* source = hir_.function(current_.source).definition;
-        if (name.find("::") != std::string_view::npos || !source) {
-            candidates.emplace_back(name);
-        } else {
-            auto current_namespace = source->source_namespace;
-            while (!current_namespace.empty()) {
-                candidates.push_back(current_namespace + "::" + std::string(name));
-                const auto separator = current_namespace.rfind("::");
-                if (separator == std::string::npos) break;
-                current_namespace.resize(separator);
-            }
-            for (const auto& imported : source->imports) {
-                candidates.push_back(imported + "::" + std::string(name));
-            }
-            candidates.emplace_back(name);
-        }
+        const auto candidates = namespace_candidates(name,
+            source ? source->source_namespace : std::string{},
+            source ? source->imports : std::vector<std::string>{});
         for (const auto& candidate : candidates) {
-            if (const auto* function = exact_function(candidate, true)) return function;
-            if (const auto* function = exact_function(candidate, false)) return function;
+            const auto* function = exact_function(candidate, true);
+            if (!function) function = exact_function(candidate, false);
+            const auto* object = exact_object(candidate, true);
+            if (!object) object = exact_object(candidate, false);
+            if (function || object) return {function, object};
         }
-        return nullptr;
+        return {};
+    }
+
+    const hir::Function* resolve_function(NameUse name) const {
+        return resolve_value_name(name).first;
     }
 
     const hir::Object* exact_object(std::string_view name,
@@ -1311,30 +1305,8 @@ private:
         return result;
     }
 
-    const hir::Object* resolve_object(std::string_view name) const {
-        std::vector<std::string> candidates;
-        const auto* source = hir_.function(current_.source).definition;
-        if (name.find("::") != std::string_view::npos || !source) {
-            candidates.emplace_back(name);
-        } else {
-            auto current_namespace = source->source_namespace;
-            while (!current_namespace.empty()) {
-                candidates.push_back(current_namespace + "::" +
-                                     std::string(name));
-                const auto separator = current_namespace.rfind("::");
-                if (separator == std::string::npos) break;
-                current_namespace.resize(separator);
-            }
-            for (const auto& imported : source->imports) {
-                candidates.push_back(imported + "::" + std::string(name));
-            }
-            candidates.emplace_back(name);
-        }
-        for (const auto& candidate : candidates) {
-            if (const auto* object = exact_object(candidate, true)) return object;
-            if (const auto* object = exact_object(candidate, false)) return object;
-        }
-        return nullptr;
+    const hir::Object* resolve_object(NameUse name) const {
+        return resolve_value_name(name).second;
     }
 
     const hir::Label* resolve_label(std::string_view name) const {
@@ -1360,7 +1332,7 @@ private:
     std::optional<PatchSink> resolve_patch_sink(const Expr& expression) {
         auto result = resolve_patch_sink_designator(
             expression, hir_, target_,
-            [&](std::string_view name) { return resolve_object(name); },
+            [&](NameUse name) { return resolve_object(name); },
             diagnostics_);
         if (!result) {
             failed_ = true;
@@ -1565,7 +1537,7 @@ private:
                     slot_address(*local, expression.location), local->type,
                     storage_alignment(hir_, local->type, target_)};
             }
-            if (const auto* object = resolve_object(expression.text);
+            if (const auto* object = resolve_object(expression);
                 object && global_object(*object)) {
                 return DesignatorAddress{
                     global_address(*object, expression.location), object->type,
@@ -1695,7 +1667,7 @@ private:
             if (const auto* local = find_local(name_key(expression))) {
                 return local->type;
             }
-            if (const auto* object = resolve_object(expression.text);
+            if (const auto* object = resolve_object(expression);
                 object && global_object(*object)) {
                 return object->type;
             }
@@ -1803,7 +1775,7 @@ private:
                     return std::nullopt;
                 }
                 address = slot_address(*local, source->location);
-            } else if (const auto* global = resolve_object(source->text);
+            } else if (const auto* global = resolve_object(*source);
                        global && global_scalar(*global)) {
                 address = global_address(*global, source->location);
             }
@@ -2650,7 +2622,7 @@ private:
             if (found != parameter_values_.end()) {
                 return current_.values[found->second.value].type;
             }
-            const auto* object = resolve_object(expression.text);
+            const auto* object = resolve_object(expression);
             if (object && global_object(*object)) {
                 if (array_type(hir_, object->type)) {
                     return hir_.pointer_to(qualified_array_element(object->type));
@@ -2660,7 +2632,7 @@ private:
                                  hir_.unqualified(object->type))
                            : std::optional<hir::TypeId>(object->type);
             }
-            if (const auto* function = resolve_function(expression.text)) {
+            if (const auto* function = resolve_function(expression)) {
                 return function_pointer_type(*function);
             }
             return resolve_label(expression.text)
@@ -2721,11 +2693,11 @@ private:
                     return hir_.pointer_to(
                         current_.values[parameter->second.value].type);
                 }
-                if (const auto* object = resolve_object(name->spelling);
+                if (const auto* object = resolve_object(*expression.left);
                     object && global_object(*object)) {
                     return hir_.pointer_to(object->type);
                 }
-                if (const auto* function = resolve_function(name->spelling))
+                if (const auto* function = resolve_function(*expression.left))
                     return function_pointer_type(*function);
                 return std::nullopt;
             }
@@ -2861,7 +2833,7 @@ private:
                                  hir_.unqualified(local->type))
                            : std::optional<hir::TypeId>(local->type);
             }
-            const auto* object = name ? resolve_object(name->spelling) : nullptr;
+            const auto* object = name ? resolve_object(*expression.left) : nullptr;
             return object && global_scalar(*object) &&
                            !hir_.type(object->type).is_const
                        ? std::optional<hir::TypeId>(
@@ -2922,7 +2894,7 @@ private:
                                      hir_.unqualified(*pointee))
                                : std::nullopt;
             }
-            const auto* function = resolve_function(expression.left->text);
+            const auto* function = resolve_function(*expression.left);
             return function && callable(*function)
                        ? std::optional<hir::TypeId>(function->result_type)
                        : std::nullopt;
@@ -3297,7 +3269,7 @@ private:
                 const auto found = parameter_values_.find(name_key(expression));
                 if (found != parameter_values_.end()) {
                     result = found->second;
-                } else if (const auto* object = resolve_object(expression.text);
+                } else if (const auto* object = resolve_object(expression);
                            object && global_object(*object)) {
                     if (array_type(hir_, object->type)) {
                         result = decay_array_address(
@@ -3310,7 +3282,7 @@ private:
                                resolve_label(expression.text)) {
                     result = label_address(*label, expression.location);
                 } else if (const auto* function =
-                               resolve_function(expression.text)) {
+                               resolve_function(expression)) {
                     result = function_address(*function, expression.location);
                 }
             }
@@ -3531,13 +3503,13 @@ private:
                     break;
                 }
                 if (name) {
-                    if (const auto* object = resolve_object(name->spelling);
+                    if (const auto* object = resolve_object(*expression.left);
                         object && global_object(*object)) {
                         result = add_value(ValueKind::GlobalAddress,
                                            hir_.pointer_to(object->type),
                                            expression.location);
                         current_.values[result->value].object = object->id;
-                    } else if (const auto* function = resolve_function(name->spelling)) {
+                    } else if (const auto* function = resolve_function(*expression.left)) {
                         result =
                             function_address(*function, expression.location);
                     }
@@ -4361,7 +4333,7 @@ private:
             const auto name = local_name(*expression.left->left);
             const auto* local = name ? find_local(*name) : nullptr;
             const auto* object = local || !name ? nullptr
-                                                : resolve_object(name->spelling);
+                                                : resolve_object(*expression.left->left);
             const auto vector_type_id = local ? local->type
                                       : object ? object->type
                                                : hir::TypeId{};
@@ -4455,7 +4427,7 @@ private:
         }
         const auto name = local_name(*expression.left);
         const auto* found = name ? find_local(*name) : nullptr;
-        const auto* object = found || !name ? nullptr : resolve_object(name->spelling);
+        const auto* object = found || !name ? nullptr : resolve_object(*expression.left);
         if (found && (found->dynamic_address ||
                       array_type(hir_, found->type))) {
             return std::nullopt;
@@ -5016,9 +4988,9 @@ private:
         }
         if (find_local(name_key(*expression.left)) ||
             parameter_values_.contains(name_key(*expression.left)) ||
-            resolve_object(expression.left->text))
+            resolve_object(*expression.left))
             return lower_indirect_call(expression);
-        const auto* callee = resolve_function(expression.left->text);
+        const auto* callee = resolve_function(*expression.left);
         if (!callee || !callable(*callee)) return std::nullopt;
         return lower_resolved_call(expression,
                                    {callee->result_type, callee->parameters,
@@ -5117,7 +5089,7 @@ private:
                     if (const auto* found = find_local(*name)) {
                         actual_local = *found;
                     } else {
-                        actual_object = resolve_object(name->spelling);
+                        actual_object = resolve_object(actual);
                     }
                 } else {
                     const Expr* designator = &actual;

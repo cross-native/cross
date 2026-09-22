@@ -164,6 +164,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->kind = source.kind;
     result->location = source.location;
     result->text = source.text;
+    result->name_context = source.name_context;
     result->string_value = source.string_value;
     result->quote_fragments = source.quote_fragments;
     result->evaluated_integer = source.evaluated_integer;
@@ -274,15 +275,49 @@ std::string namespace_prefix(std::string_view name) {
                : std::string(name.substr(0, separator));
 }
 
+std::string lookup_source_unit(NameUse name, const FunctionDecl* caller) {
+    if (name.location.file) return name.location.file->path.generic_string();
+    return caller ? caller->source_unit : std::string{};
+}
+
+std::optional<std::string> value_namespace(
+    const Program& program, const FunctionDecl* caller, NameUse name,
+    std::string_view fallback_namespace = {}) {
+    const auto unit = lookup_source_unit(name, caller);
+    const auto visible = [&](const auto& declaration) {
+        return declaration.linkage != Linkage::Static || unit.empty() ||
+               declaration.source_unit == unit;
+    };
+    const auto candidates = namespace_candidates(
+        name, fallback_namespace.empty() && caller ? caller->source_namespace : fallback_namespace,
+        caller ? caller->imports : std::vector<std::string>{});
+    for (const auto& candidate : candidates) {
+        for (const auto& object : program.objects)
+            if (object->name == candidate && visible(*object)) return candidate;
+        for (const auto& function : program.functions)
+            if (function->name == candidate && visible(*function)) return candidate;
+        for (const auto& enumeration : program.enumerations)
+            for (const auto& enumerator : enumeration.enumerators)
+                if (enumerator.name == candidate) return candidate;
+    }
+    return std::nullopt;
+}
+
+const ObjectDecl* resolve_object(const Program& program,
+                                const FunctionDecl* caller, NameUse name);
+
 template <typename Predicate>
 FunctionDecl* resolve_function(Program& program, const FunctionDecl* caller,
-                               std::string_view name, Predicate predicate) {
+                               NameUse name, Predicate predicate) {
+    const auto selected = value_namespace(program, caller, name);
+    if (!selected) return nullptr;
+    const auto unit = lookup_source_unit(name, caller);
     const auto exact = [&](std::string_view qualified) -> FunctionDecl* {
         FunctionDecl* shared = nullptr;
         for (const auto& candidate : program.functions) {
             if (candidate->name != qualified || !predicate(*candidate)) continue;
             if (candidate->linkage == Linkage::Static) {
-                if (!caller || candidate->source_unit == caller->source_unit)
+                if (unit.empty() || candidate->source_unit == unit)
                     return candidate.get();
             } else if (!shared) {
                 shared = candidate.get();
@@ -290,17 +325,7 @@ FunctionDecl* resolve_function(Program& program, const FunctionDecl* caller,
         }
         return shared;
     };
-    if (caller && name.find("::") == std::string_view::npos) {
-        auto prefix = caller->source_namespace;
-        while (!prefix.empty()) {
-            if (auto* local = exact(prefix + "::" + std::string(name))) return local;
-            prefix = namespace_prefix(prefix);
-        }
-        for (const auto& imported : caller->imports) {
-            if (auto* found = exact(imported + "::" + std::string(name))) return found;
-        }
-    }
-    return exact(name);
+    return exact(*selected);
 }
 
 std::uint64_t stable_hash(std::string_view text) {
@@ -622,7 +647,7 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
     }
     const auto name = expression->left->text;
     auto* generic = resolve_function(
-        program, caller, name,
+        program, caller, *expression->left,
         [](const FunctionDecl& candidate) {
             return !candidate.generic_parameters.empty();
         });
@@ -632,7 +657,7 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                               "generic function '" + generic->name +
                                   "' requires explicit ::<...> arguments");
         } else if (auto* function = resolve_function(
-                       program, caller, name,
+                       program, caller, *expression->left,
                        [](const FunctionDecl& candidate) { return candidate.body != nullptr; })) {
             // An ordinary helper used by a generic constant may itself call
             // generics. Prepare its definition before any evaluator enters it,
@@ -700,7 +725,7 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
             --state.depth;
         }
     }
-    expression->left->text = std::move(internal_name);
+    bind_exact_name(*expression->left, std::move(internal_name));
     expression->generic_arguments.clear();
 }
 
@@ -762,7 +787,7 @@ private:
         if (!expression) return;
         if (expression->kind == Expr::Kind::Name) {
             if (const auto* name = replacement(expression->text, expression->location)) {
-                expression->text = *name;
+                bind_exact_name(*expression, *name);
             }
         }
         rewrite(expression->left);
@@ -906,32 +931,12 @@ private:
         return effective_source == effective_destination;
     }
 
-    TypePtr lookup(std::string_view name, SourceLocation location) const {
+    TypePtr lookup(const Expr& expression) const {
         for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
-            const auto found = scope->find(NameKey(name, location));
+            const auto found = scope->find(name_key(expression));
             if (found != scope->end()) return found->second;
         }
-        const auto find = [&](std::string_view candidate) -> TypePtr {
-            const auto found = std::find_if(
-                program_.objects.begin(), program_.objects.end(),
-                [&](const auto& object) { return object->name == candidate; });
-            return found == program_.objects.end() ? TypePtr{}
-                                                    : (*found)->type;
-        };
-        if (const auto exact = find(name)) return exact;
-        if (!caller_ || name.find("::") != std::string_view::npos) return {};
-        const auto prefix = namespace_prefix(caller_->name);
-        if (!prefix.empty()) {
-            if (const auto local = find(prefix + "::" + std::string(name))) {
-                return local;
-            }
-        }
-        for (const auto& imported : caller_->imports) {
-            if (const auto object =
-                    find(imported + "::" + std::string(name))) {
-                return object;
-            }
-        }
+        if (const auto* object = resolve_object(program_, caller_, expression)) return object->type;
         return {};
     }
 
@@ -953,7 +958,7 @@ private:
         case Expr::Kind::Character:
             return builtin_type(BuiltinType::U32);
         case Expr::Kind::Name:
-            return lookup(expression.text, expression.location);
+            return lookup(expression);
         case Expr::Kind::Parenthesized:
             return expression.left ? infer(*expression.left) : TypePtr{};
         case Expr::Kind::Cast:
@@ -1011,7 +1016,7 @@ private:
             if (expression.left &&
                 expression.left->kind == Expr::Kind::Name) {
                 if (const auto* function = resolve_function(
-                        program_, caller_, expression.left->text,
+                        program_, caller_, *expression.left,
                         [](const FunctionDecl&) { return true; })) {
                     return function->return_type;
                 }
@@ -1119,14 +1124,14 @@ private:
                              expression->evaluated_address;
         if (expression->kind != Expr::Kind::Name && !address) return false;
         const auto* source = address ? expression->evaluated_address->function
-            : resolve_function(program_, caller_, expression->text,
+            : resolve_function(program_, caller_, *expression,
                                [](const FunctionDecl&) { return true; });
         if (!source || !same_shape(*source, *signature) ||
             already_stable(*source, signature->abi) || source->variadic) {
             return false;
         }
-        expression->text = make_adapter(*source, *signature,
-                                        expression->location);
+        bind_exact_name(*expression, make_adapter(*source, *signature,
+                                                  expression->location));
         if (address) {
             expression->evaluated_address->function = resolve_function(
                 program_, nullptr, expression->text,
@@ -1161,7 +1166,7 @@ private:
             if (expression->left &&
                 expression->left->kind == Expr::Kind::Name) {
                 if (const auto* callee = resolve_function(
-                        program_, caller_, expression->left->text,
+                        program_, caller_, *expression->left,
                         [](const FunctionDecl&) { return true; })) {
                     for (std::size_t index = 0;
                          index < expression->arguments.size(); ++index) {
@@ -1287,27 +1292,21 @@ std::string operator_key(std::string_view token,
 
 const ObjectDecl* resolve_object(const Program& program,
                                  const FunctionDecl* caller,
-                                 std::string_view name) {
+                                 NameUse name) {
+    const auto selected = value_namespace(program, caller, name);
+    if (!selected) return nullptr;
+    const auto unit = lookup_source_unit(name, caller);
     const auto exact = [&](std::string_view qualified) -> const ObjectDecl* {
         const ObjectDecl* shared{};
         for (const auto& candidate : program.objects) {
             if (candidate->name != qualified) continue;
             if (candidate->linkage == Linkage::Static) {
-                if (!caller || candidate->source_unit == caller->source_unit) return candidate.get();
+                if (unit.empty() || candidate->source_unit == unit) return candidate.get();
             } else if (!shared) shared = candidate.get();
         }
         return shared;
     };
-    if (caller && name.find("::") == std::string_view::npos) {
-        auto prefix = caller->source_namespace;
-        while (!prefix.empty()) {
-            if (const auto* local = exact(prefix + "::" + std::string(name))) return local;
-            prefix = namespace_prefix(prefix);
-        }
-        for (const auto& imported : caller->imports)
-            if (const auto* found = exact(imported + "::" + std::string(name))) return found;
-    }
-    return exact(name);
+    return exact(*selected);
 }
 
 struct ResolvedEnumerator {
@@ -1330,30 +1329,9 @@ std::optional<ResolvedEnumerator> exact_enumerator(
 
 std::optional<ResolvedEnumerator> resolve_enumerator(
     const Program& program, const FunctionDecl* caller,
-    std::string_view current_namespace, std::string_view name) {
-    if (name.find("::") != std::string_view::npos) {
-        return exact_enumerator(program, name);
-    }
-    auto name_space = std::string(current_namespace);
-    if (name_space.empty() && caller) name_space = caller->source_namespace;
-    while (!name_space.empty()) {
-        if (auto found = exact_enumerator(
-                program, name_space + "::" + std::string(name))) {
-            return found;
-        }
-        const auto separator = name_space.rfind("::");
-        if (separator == std::string::npos) break;
-        name_space.resize(separator);
-    }
-    if (caller) {
-        for (const auto& imported : caller->imports) {
-            if (auto found = exact_enumerator(
-                    program, imported + "::" + std::string(name))) {
-                return found;
-            }
-        }
-    }
-    return exact_enumerator(program, name);
+    std::string_view current_namespace, NameUse name) {
+    const auto selected = value_namespace(program, caller, name, current_namespace);
+    return selected ? exact_enumerator(program, *selected) : std::nullopt;
 }
 
 class OperatorBinder {
@@ -1486,12 +1464,12 @@ private:
         }
     }
 
-    TypePtr find_name(std::string_view name, SourceLocation location) const {
+    TypePtr find_name(const Expr& expression) const {
         for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
-            const auto found = scope->find(NameKey(name, location));
+            const auto found = scope->find(name_key(expression));
             if (found != scope->end()) return found->second;
         }
-        if (const auto* object = resolve_object(program_, caller_, name)) {
+        if (const auto* object = resolve_object(program_, caller_, expression)) {
             return object->type;
         }
         return {};
@@ -1545,7 +1523,7 @@ private:
             return pointer_type(
                 builtin_type(BuiltinType::U8, true));
         case Expr::Kind::Name:
-            return find_name(expression.text, expression.location);
+            return find_name(expression);
         case Expr::Kind::Address:
             return expression.type;
         case Expr::Kind::Parenthesized:
@@ -1600,7 +1578,7 @@ private:
             if (expression.left &&
                 expression.left->kind == Expr::Kind::Name) {
                 if (const auto* function = resolve_function(
-                        program_, caller_, expression.left->text,
+                        program_, caller_, *expression.left,
                         [](const FunctionDecl&) { return true; })) {
                     return function->return_type;
                 }
@@ -2077,7 +2055,7 @@ public:
                              std::make_shared<std::string>(std::move(*decoded)), 0};
         }
         case Expr::Kind::Name:
-            return lookup(expression.text, expression.location);
+            return lookup(expression);
         case Expr::Kind::Address: {
             if (!pointer_resolver_ || !expression.evaluated_address) {
                 fail(expression.location,
@@ -2241,8 +2219,8 @@ private:
                 node = node->left.get();
         }
         if (node->kind != Expr::Kind::Name || lookup_mutable(node->text, node->location) ||
-            resolve_object(program_, current_function_, node->text)) return nullptr;
-        return resolve_function(program_, current_function_, node->text,
+            resolve_object(program_, current_function_, *node)) return nullptr;
+        return resolve_function(program_, current_function_, *node,
                                 [](const FunctionDecl&) { return true; });
     }
 
@@ -2455,7 +2433,7 @@ private:
                 }
                 return validate_required_tree(*node.arguments.front());
             }
-            const auto* function = resolve_function(program_, current_function_, node.left->text,
+            const auto* function = resolve_function(program_, current_function_, *node.left,
                                                      [](const FunctionDecl&) { return true; });
             if (!function || (!function->variadic && node.arguments.size() != function->parameters.size()) ||
                 (function->variadic && node.arguments.size() < function->parameters.size())) {
@@ -2707,13 +2685,13 @@ private:
                 for (const auto& parameter : current_function_->parameters)
                     if (name_key(parameter) == name_key(expression)) return parameter.type;
             }
-            if (const auto* object = resolve_object(program_, current_function_, expression.text)) {
+            if (const auto* object = resolve_object(program_, current_function_, expression)) {
                 if (pointer_resolver_ && decay && object->type->kind == Type::Kind::Array)
                     return pointer_type(object->type->element);
                 return object->type;
             }
             if (pointer_resolver_) {
-                if (const auto* function = resolve_function(program_, current_function_, expression.text,
+                if (const auto* function = resolve_function(program_, current_function_, expression,
                         [](const FunctionDecl&) { return true; })) {
                     auto type = function_type(function->return_type, function->parameters, function->variadic);
                     return decay ? pointer_type(type) : type;
@@ -2721,7 +2699,7 @@ private:
             }
             if (const auto found = resolve_enumerator(
                     program_, current_function_, current_namespace_,
-                    expression.text);
+                    expression);
                 found && found->enumerator->value) {
                 return enum_type(found->enumeration->name,
                                  found->enumeration->underlying);
@@ -2819,7 +2797,7 @@ private:
                                 expression.left->text == "$::meta::concat")) return tokens_type();
             if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
                 expression.arguments.size() == 1) return expression_type(*expression.arguments.front());
-            if (const auto* callee = resolve_function(program_, current_function_, expression.left->text,
+            if (const auto* callee = resolve_function(program_, current_function_, *expression.left,
                     [](const FunctionDecl&) { return true; })) return callee->return_type;
             return {};
         case Expr::Kind::String: return pointer_type(builtin_type(BuiltinType::U8, true));
@@ -3043,7 +3021,9 @@ private:
         return nullptr;
     }
 
-    std::optional<EvalValue> lookup(std::string_view name, SourceLocation location) {
+    std::optional<EvalValue> lookup(const Expr& expression) {
+        const auto& name = expression.text;
+        const auto location = expression.location;
         if (auto* cell = lookup_mutable(name, location)) {
             if (!cell->initialized) {
                 fail(location, "read of uninitialized value during translation-time evaluation");
@@ -3056,7 +3036,7 @@ private:
             return cell->value;
         }
         if (const auto found = resolve_enumerator(
-                program_, current_function_, current_namespace_, name);
+                program_, current_function_, current_namespace_, expression);
             found && found->enumerator->value) {
             return EvalValue{
                 found->enumerator->value->value,
@@ -3064,12 +3044,9 @@ private:
                           found->enumeration->underlying)};
         }
         if (pointer_resolver_) {
-            auto source = std::make_unique<Expr>();
-            source->kind = Expr::Kind::Name;
-            source->text = name;
-            source->location = location;
+            auto source = clone_expr(expression);
             const auto type = expression_type(*source);
-            const auto* object = resolve_object(program_, current_function_, name);
+            const auto* object = resolve_object(program_, current_function_, expression);
             if (object && object->type->kind != Type::Kind::Array) {
                 fail(location, "runtime/static storage cannot be read during translation-time evaluation");
                 return std::nullopt;
@@ -3109,7 +3086,7 @@ private:
                 fail(expression.location, "cannot write an 'in' or const cell");
                 return std::nullopt;
             }
-            const auto previous = lookup(expression.left->text, expression.left->location);
+            const auto previous = lookup(*expression.left);
             if (!previous) return std::nullopt;
             if (previous->address && pointer_resolver_) {
                 auto source = std::make_unique<Expr>();
@@ -3330,7 +3307,7 @@ private:
             return std::nullopt;
         }
         if (auto* blocked = resolve_function(
-                program_, current_function_, expression.left->text,
+                program_, current_function_, *expression.left,
                 [](const FunctionDecl& candidate) {
                     return candidate.attribute("runtime_only") != nullptr;
                 })) {
@@ -3340,7 +3317,7 @@ private:
             return std::nullopt;
         }
         auto* function = resolve_function(
-            program_, current_function_, expression.left->text,
+            program_, current_function_, *expression.left,
             [](const FunctionDecl& candidate) {
                 return candidate.body != nullptr &&
                        candidate.attribute("runtime_only") == nullptr &&
@@ -3700,6 +3677,9 @@ public:
             for (const auto& parameter : function->parameters) {
                 scopes_.back().insert(name_key(parameter));
             }
+            for (const auto& parameter : function->generic_parameters) {
+                scopes_.back().insert(name_key(parameter));
+            }
             if (function->body) rewrite(*function->body);
         }
         caller_ = nullptr;
@@ -3717,12 +3697,18 @@ private:
     void rewrite(std::unique_ptr<Expr>& expression) {
         if (!expression) return;
         if (expression->kind == Expr::Kind::Name &&
+            local(expression->text, expression->location)) {
+            auto context = std::make_shared<NameLookupContext>();
+            context->kind = NameLookupContext::Kind::Local;
+            expression->name_context = std::move(context);
+        }
+        if (expression->kind == Expr::Kind::Name &&
             !local(expression->text, expression->location) &&
-            !resolve_object(program_, caller_, expression->text) &&
-            !resolve_function(program_, caller_, expression->text,
+            !resolve_object(program_, caller_, *expression) &&
+            !resolve_function(program_, caller_, *expression,
                               [](const FunctionDecl&) { return true; })) {
             if (const auto found = resolve_enumerator(
-                    program_, caller_, current_namespace_, expression->text);
+                    program_, caller_, current_namespace_, *expression);
                 found && found->enumerator->value) {
                 expression->kind = Expr::Kind::Integer;
                 expression->evaluated_integer = found->enumerator->value;
@@ -3735,7 +3721,9 @@ private:
             }
         }
         rewrite(expression->left);
-        rewrite(expression->right);
+        const bool member = expression->kind == Expr::Kind::Binary &&
+            (expression->text == "member" || expression->text == "pointer_member");
+        if (!member) rewrite(expression->right);
         rewrite(expression->third);
         for (auto& argument : expression->arguments) rewrite(argument);
         for (auto& argument : expression->generic_arguments) {
@@ -3801,24 +3789,19 @@ bool contains_layout_query(const Expr& expression) {
 bool contains_relocation_candidate(const Expr& expression,
                                    const Program& program,
                                    std::string_view source_namespace) {
+    if (expression.kind == Expr::Kind::Sizeof ||
+        expression.kind == Expr::Kind::Alignof) return false;
     if (expression.kind == Expr::Kind::Address && expression.evaluated_address)
         return expression.evaluated_address->kind != AddressConstant::Kind::Absolute;
     if (expression.kind == Expr::Kind::Unary && expression.text == "&")
         return true;
     if (expression.kind == Expr::Kind::Name) {
-        const auto is_array = [&](std::string_view name) {
-            return std::any_of(
-                program.objects.begin(), program.objects.end(),
-                [&](const auto& candidate) {
-                    return candidate->name == name && candidate->type &&
-                           candidate->type->kind == Type::Kind::Array;
-                });
-        };
-        if (is_array(expression.text)) return true;
-        if (!source_namespace.empty() &&
-            expression.text.find("::") == std::string::npos &&
-            is_array(std::string(source_namespace) + "::" +
-                     expression.text)) return true;
+        const auto selected = value_namespace(program, nullptr, expression, source_namespace);
+        if (selected && std::any_of(program.objects.begin(), program.objects.end(),
+                [&](const auto& object) {
+                    return object->name == *selected && object->type &&
+                           object->type->kind == Type::Kind::Array;
+                })) return true;
     }
     if (expression.left &&
         contains_relocation_candidate(*expression.left, program,
@@ -4295,13 +4278,13 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
     }
 
     auto* function = resolve_function(
-        program, caller, expression->left->text,
+        program, caller, *expression->left,
         [](const FunctionDecl& candidate) {
             return candidate.body != nullptr &&
                    candidate.attribute("macro") == nullptr;
         });
     auto* required_declaration = resolve_function(
-        program, caller, expression->left->text,
+        program, caller, *expression->left,
         [](const FunctionDecl& candidate) {
             return evaluation_only(candidate);
         });
@@ -4601,7 +4584,7 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                     if (found != scope->end()) { read_only = found->second; break; }
                 }
                 if (!read_only) {
-                    if (const auto* object = resolve_object(program, function.get(), destination->text))
+                    if (const auto* object = resolve_object(program, function.get(), *destination))
                         read_only = object->type->is_const;
                 }
                 if (read_only.value_or(false))
@@ -4786,7 +4769,7 @@ void resolve_raw_inline_expr(std::unique_ptr<Expr>& expression,
         return;
     }
     auto* callee = resolve_function(
-        program, &caller, expression->left->text,
+        program, &caller, *expression->left,
         [](const FunctionDecl& candidate) {
             return candidate.attribute("raw_inline") != nullptr;
         });
@@ -4802,7 +4785,7 @@ void resolve_raw_inline_expr(std::unique_ptr<Expr>& expression,
     // frontend's namespace/import resolution while allowing the raw backend
     // to clone the complete managed body (locals and control flow included)
     // under the naked caller's resource contract.
-    expression->left->text = callee->name;
+    bind_exact_name(*expression->left, callee->name);
 }
 
 void resolve_raw_inline_statement(Statement& statement, FunctionDecl& caller,
@@ -5000,7 +4983,9 @@ private:
             auto object = std::make_unique<ObjectDecl>();
             object->location = expression->location;
             object->name = name;
-            object->source_unit = source_unit_;
+            object->source_unit = source_unit_.empty() && expression->location.file
+                ? expression->location.file->path.generic_string()
+                : source_unit_;
             object->type = array_type(
                 builtin_type(BuiltinType::U8, true),
                 static_cast<std::uint32_t>(expression->string_value.size() + 1));
@@ -5011,7 +4996,7 @@ private:
             expression = std::make_unique<Expr>();
             expression->kind = Expr::Kind::Name;
             expression->location = program_.objects.back()->location;
-            expression->text = name;
+            bind_exact_name(*expression, name);
             return;
         }
         rewrite(expression->left);

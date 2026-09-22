@@ -1520,6 +1520,19 @@ private:
             instruction.defs.push_back(reg(value.id));
             instruction.may_load = true;
             instruction.has_side_effects = value.is_volatile_access;
+            // PIC, TLS, and absolute-data forms may materialize a symbol
+            // through R11, with R10 as a second address scratch.
+            append_fixed_clobber(instruction, "r10", machine::i64);
+            append_fixed_clobber(instruction, "r11", machine::i64);
+            // The global-access emitter stages scalar values through fixed
+            // scratch even when their result has a different allocation.
+            if (instruction.opcode == Opcode::GlobalLoad) {
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                if (reg(value.id).mode.bits > 64)
+                    append_fixed_clobber(instruction, "rdx", machine::i64);
+            } else if (instruction.opcode == Opcode::FglobalLoad && reg(value.id).mode.bits != 80) {
+                append_fixed_clobber(instruction, "xmm0", machine::i128);
+            }
             return instruction;
         }
         if (value.kind == ValueKind::GlobalStore) {
@@ -1543,6 +1556,15 @@ private:
             instruction.uses.push_back(source);
             instruction.may_store = true;
             instruction.has_side_effects = true;
+            append_fixed_clobber(instruction, "r10", machine::i64);
+            append_fixed_clobber(instruction, "r11", machine::i64);
+            if (instruction.opcode == Opcode::GlobalStore) {
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                if (source.mode.bits > 64)
+                    append_fixed_clobber(instruction, "rdx", machine::i64);
+            } else if (instruction.opcode == Opcode::FglobalStore && source.mode.bits != 80) {
+                append_fixed_clobber(instruction, "xmm0", machine::i128);
+            }
             return instruction;
         }
         if (value.kind == ValueKind::Atomic) {

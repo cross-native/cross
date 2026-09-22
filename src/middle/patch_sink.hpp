@@ -17,7 +17,7 @@ struct TargetInfo;
 namespace mir {
 
 using PatchSinkObjectResolver =
-    std::function<const hir::Object*(std::string_view)>;
+    std::function<const hir::Object*(NameUse)>;
 
 // Resolves the deliberately narrow static-sink grammar without lowering a
 // general lvalue: one static object followed only by direct member and

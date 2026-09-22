@@ -32,7 +32,7 @@ std::optional<Selection> select(
                       diagnostics);
     }
     if (expression.kind == Expr::Kind::Name) {
-        const auto* object = resolve_object(expression.text);
+        const auto* object = resolve_object(expression);
         if (!object) {
             diagnostics.error(expression.location,
                               "unknown $::patch address sink '" +

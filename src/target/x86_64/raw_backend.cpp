@@ -1128,34 +1128,25 @@ private:
     std::optional<mir::PatchSink> resolve_patch_sink(
         const Expr& expression) {
         if (!current_function_) return std::nullopt;
-        const hir::Object* result = nullptr;
-        std::string_view candidate_name;
-        const auto consider = [&](const hir::Object& object) {
-            if (object.source_name != candidate_name) return;
-            if (object.linkage == Linkage::Static &&
-                object.source_unit != current_function_->source_unit) {
-                return;
-            }
-            result = &object;
-        };
-        auto resolve = [&](std::string_view name) -> const hir::Object* {
-            candidate_name = name;
-            result = nullptr;
-            for (const auto& object : hir_.objects) consider(object);
-            if (!result && name.find("::") == std::string::npos) {
-                const auto separator =
-                    current_function_->source_name.rfind("::");
-                if (separator != std::string::npos) {
-                    const auto qualified = current_function_->source_name.substr(
-                                               0, separator + 2) +
-                                           std::string(name);
-                    candidate_name = qualified;
-                    for (const auto& object : hir_.objects) {
-                        consider(object);
-                    }
+        auto resolve = [&](NameUse name) -> const hir::Object* {
+            const auto* source = current_function_->definition;
+            for (const auto& candidate : namespace_candidates(name,
+                    source ? source->source_namespace : std::string{},
+                    source ? source->imports : std::vector<std::string>{})) {
+                const hir::Object* result{};
+                for (const auto& object : hir_.objects) {
+                    if (object.source_name != candidate) continue;
+                    if (object.linkage == Linkage::Static) {
+                        if (object.source_unit == current_function_->source_unit) return &object;
+                    } else result = &object;
                 }
+                if (result) return result;
+                for (const auto& function : hir_.functions)
+                    if (function.source_name == candidate &&
+                        (function.linkage != Linkage::Static ||
+                         function.source_unit == current_function_->source_unit)) return nullptr;
             }
-            return result;
+            return nullptr;
         };
         auto sink = mir::resolve_patch_sink_designator(
             expression, hir_, target_, resolve, diagnostics_);

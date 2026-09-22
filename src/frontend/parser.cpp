@@ -984,14 +984,20 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         auto nested = parse_qualified_name();
         if (!nested || !expect("{")) { synchronize_external(); return; }
         const auto full = join_namespace(name_space, *nested);
-        const auto import_count = active_imports_.size();
+        const auto saved_imports = active_imports_;
+        const auto saved_scope_imports = current_scope_imports_;
+        current_scope_imports_ = 0;
         while (!current().is("}") && current().kind != TokenKind::End) parse_external(program, full);
         expect("}");
-        active_imports_.resize(import_count);
+        active_imports_ = saved_imports;
+        current_scope_imports_ = saved_scope_imports;
         return;
     }
     if (consume("using")) {
-        if (auto imported = parse_qualified_name()) active_imports_.push_back(std::move(*imported));
+        if (auto imported = parse_qualified_name()) {
+            active_imports_.insert(active_imports_.begin() + static_cast<std::ptrdiff_t>(current_scope_imports_), std::move(*imported));
+            ++current_scope_imports_;
+        }
         else error_here("expected namespace name after 'using'");
         expect(";");
         return;
@@ -1494,14 +1500,31 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
 }
 
 std::unique_ptr<Statement> Parser::parse_compound() {
+    const auto saved_imports = active_imports_;
+    const auto saved_scope_imports = current_scope_imports_;
+    current_scope_imports_ = 0;
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Compound;
     statement->location = current().location;
     expect("{");
     while (!current().is("}") && current().kind != TokenKind::End) {
-        statement->statements.push_back(parse_statement());
+        if (consume("using")) {
+            auto declaration = std::make_unique<Statement>();
+            declaration->kind = Statement::Kind::Empty;
+            declaration->location = tokens_[index_ - 1].location;
+            if (auto imported = parse_qualified_name()) {
+                active_imports_.insert(active_imports_.begin() +
+                    static_cast<std::ptrdiff_t>(current_scope_imports_),
+                    std::move(*imported));
+                ++current_scope_imports_;
+            } else error_here("expected namespace name after 'using'");
+            expect(";", "after using declaration");
+            statement->statements.push_back(std::move(declaration));
+        } else statement->statements.push_back(parse_statement());
     }
     expect("}");
+    active_imports_ = saved_imports;
+    current_scope_imports_ = saved_scope_imports;
     return statement;
 }
 
@@ -2100,6 +2123,11 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         result->kind = Expr::Kind::Name;
         if (item.kind == TokenKind::Identifier) {
             if (auto name = parse_qualified_name()) result->text = *name;
+            const auto origin = token_origin(item.location);
+            auto context = std::make_shared<NameLookupContext>();
+            context->name_space = origin.context ? origin.context->name_space : active_namespace_;
+            context->imports = origin.context ? origin.context->imports : active_imports_;
+            result->name_context = std::move(context);
             return result;
         }
     } else {

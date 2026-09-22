@@ -480,34 +480,29 @@ const hir::Function* find_function(const hir::Module& module,
     return nullptr;
 }
 
-std::optional<std::string> qualified_owner_name(std::string_view name,
-                                                AddressScope scope) {
-    if (name.find("::") != std::string_view::npos) return std::nullopt;
+std::pair<const hir::Object*, const hir::Function*> find_value_name(
+    const hir::Module& module, NameUse name, AddressScope scope) {
     const auto separator = scope.source_name.rfind("::");
-    if (separator == std::string::npos) return std::nullopt;
-    return std::string(scope.source_name.substr(0, separator + 2)) +
-           std::string(name);
+    const auto prefix = separator == std::string::npos ? std::string_view{}
+        : scope.source_name.substr(0, separator);
+    for (const auto& candidate : namespace_candidates(name, prefix)) {
+        const auto* object = find_object(module, candidate, scope.source_unit);
+        const auto* function = find_function(module, candidate, scope.source_unit);
+        if (object || function) return {object, function};
+    }
+    return {};
 }
 
 const hir::Object* find_object(const hir::Module& module,
-                               std::string_view name,
+                               NameUse name,
                                AddressScope scope) {
-    if (const auto qualified = qualified_owner_name(name, scope)) {
-        if (const auto* object = find_object(module, *qualified,
-                                             scope.source_unit)) return object;
-    }
-    return find_object(module, name, scope.source_unit);
+    return find_value_name(module, name, scope).first;
 }
 
 const hir::Function* find_function(const hir::Module& module,
-                                   std::string_view name,
+                                   NameUse name,
                                    AddressScope scope) {
-    if (const auto qualified = qualified_owner_name(name, scope)) {
-        if (const auto* function = find_function(module, *qualified,
-                                                 scope.source_unit))
-            return function;
-    }
-    return find_function(module, name, scope.source_unit);
+    return find_value_name(module, name, scope).second;
 }
 
 struct AddressValue {
@@ -665,7 +660,7 @@ std::optional<AddressValue> address_designator(
         return address_value(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
-                find_object(module, expression.text, scope)) {
+                find_object(module, expression, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Object;
             result.address.object = object->id;
@@ -673,7 +668,7 @@ std::optional<AddressValue> address_designator(
             return result;
         }
         if (const auto* function =
-                find_function(module, expression.text, scope)) {
+                find_function(module, expression, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
@@ -769,7 +764,7 @@ std::optional<AddressValue> address_value(
         return address_designator(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
-                find_object(module, expression.text, scope)) {
+                find_object(module, expression, scope)) {
             const auto& type = module.type(object->type);
             if (type.kind != hir::Type::Kind::Array || !type.element)
                 return std::nullopt;
@@ -782,7 +777,7 @@ std::optional<AddressValue> address_value(
             return result;
         }
         if (const auto* function =
-                find_function(module, expression.text, scope)) {
+                find_function(module, expression, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
@@ -1226,18 +1221,9 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
             if (std::find(locals.begin(), locals.end(), name_key(node)) != locals.end())
                 return reject(node.location,
                     "generic pointer argument cannot depend on an automatic local or parameter");
-            std::vector<std::string> candidates;
-            if (caller && node.text.find("::") == std::string::npos) {
-                auto prefix = caller->source_namespace;
-                while (!prefix.empty()) {
-                    candidates.push_back(prefix + "::" + node.text);
-                    const auto split = prefix.rfind("::");
-                    prefix = split == std::string::npos ? std::string{} : prefix.substr(0, split);
-                }
-                for (const auto& imported : caller->imports)
-                    candidates.push_back(imported + "::" + node.text);
-            }
-            candidates.push_back(node.text);
+            const auto candidates = namespace_candidates(node,
+                caller ? caller->source_namespace : std::string{},
+                caller ? caller->imports : std::vector<std::string>{});
             const hir::Object* object{};
             const hir::Function* function{};
             for (const auto& candidate : candidates) {
@@ -1245,8 +1231,8 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                 function = find_function(module, candidate, scope.source_unit);
                 if (object || function) break;
             }
-            if (object) node.text = object->source_name;
-            else if (function) node.text = function->source_name;
+            if (object) bind_exact_name(node, object->source_name);
+            else if (function) bind_exact_name(node, function->source_name);
             else if (node.text == "$::runtime")
                 return reject(node.location, "runtime expression is not permitted in a generic pointer argument");
             else if (node.text != "$::eval")
@@ -1283,9 +1269,9 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                 node.evaluated_address->kind != cross::AddressConstant::Kind::Absolute;
         if (node.kind == Expr::Kind::Unary && node.text == "&") return true;
         if (node.kind == Expr::Kind::Name) {
-            const auto* object = find_object(module, node.text, scope);
+            const auto* object = find_object(module, node, scope);
             return (object && module.type(object->type).kind == hir::Type::Kind::Array) ||
-                   find_function(module, node.text, scope);
+                   find_function(module, node, scope);
         }
         if (node.kind == Expr::Kind::Call || node.kind == Expr::Kind::Sizeof ||
             node.kind == Expr::Kind::Alignof) return false;
@@ -1305,7 +1291,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
         if (node.kind == Expr::Kind::Call && node.left && node.left->kind == Expr::Kind::Name) {
             if (node.left->text == "$::eval" && node.arguments.size() == 1)
                 return self(self, *node.arguments.front());
-            if (const auto* function = find_function(module, node.left->text, scope)) {
+            if (const auto* function = find_function(module, *node.left, scope)) {
                 const auto* source = function->definition ? function->definition : function->declarations.back();
                 if (source->return_type->kind == Type::Kind::Pointer) return source->return_type;
             }

@@ -22,4 +22,20 @@ static u64 subject(in u64 value) {
 }
 static u64 subject() { body! {} return 7u64; }
 $::static_assert($::eval(subject()) == 7u64, "duplicate binding in one context");
+#elif defined(QUOTED_NAMESPACE_CAPTURE)
+namespace definitions {
+    [[macro]] static $::meta::tokens body(in $::meta::tokens input) {
+        return $::quote { only_at_call_site() };
+    }
+}
+namespace invocations {
+    static u64 only_at_call_site() { return 7u64; }
+    $::static_assert(definitions::body!{} == 7u64, "definition context must not capture caller function");
+}
+#elif defined(OBJECT_SHADOWS_FUNCTION)
+static u64 callable() { return 7u64; }
+namespace inner {
+    global u64 callable = 3u64;
+    global u64 subject() { return callable(); }
+}
 #endif

@@ -97,6 +97,7 @@ private:
     Diagnostics& diagnostics_;
     std::size_t index_{};
     std::vector<std::string> active_imports_;
+    std::size_t current_scope_imports_{};
     std::vector<std::string> active_generic_types_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;

@@ -148,17 +148,19 @@ std::vector<std::string> active_imports(const std::vector<Token>& tokens,
         const auto visible_begin = cursor + 1;
         if (visible_begin > use) continue;
         auto visible_end = tokens.size();
+        std::size_t scope_begin = 0;
         for (std::size_t opening = 0; opening < index; ++opening) {
             if (tokens[opening].text != "{") continue;
             const auto closing = matching_group(tokens, opening);
             if (closing && opening < index && index < *closing &&
                 *closing < visible_end) {
                 visible_end = *closing;
+                scope_begin = opening;
             }
         }
         if (use < visible_end) {
             active.push_back(
-                {std::move(name), visible_end - visible_begin, index});
+                {std::move(name), visible_end - scope_begin, index});
         }
         index = cursor;
     }
