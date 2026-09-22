@@ -1191,7 +1191,7 @@ bool lower_initializer(Object& result, const hir::Module& module,
 bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expression,
                                const TypePtr& destination,
                                const FunctionDecl* caller,
-                               std::span<const std::string> locals,
+                               std::span<const NameKey> locals,
                                const CompilerOptions& options,
                                const Subtarget& subtarget,
                                Diagnostics& diagnostics) {
@@ -1223,7 +1223,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
     // to the generic definition. Runtime cells can never become relocations.
     const auto bind = [&](const auto& self, Expr& node) -> bool {
         if (node.kind == Expr::Kind::Name) {
-            if (std::find(locals.begin(), locals.end(), node.text) != locals.end())
+            if (std::find(locals.begin(), locals.end(), name_key(node)) != locals.end())
                 return reject(node.location,
                     "generic pointer argument cannot depend on an automatic local or parameter");
             std::vector<std::string> candidates;
@@ -1295,7 +1295,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
     };
     const GenericPointerResolver resolve_pointer =
         [&](std::unique_ptr<Expr>& node, const TypePtr& type,
-            const FunctionDecl* context, std::span<const std::string> local_names) {
+            const FunctionDecl* context, std::span<const NameKey> local_names) {
             return normalize_generic_pointer(program, node, type, context, local_names,
                                               options, subtarget, diagnostics);
         };

@@ -59,7 +59,7 @@ struct AddressScope {
 bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expression,
                                const TypePtr& destination,
                                const FunctionDecl* caller,
-                               std::span<const std::string> locals,
+                               std::span<const NameKey> locals,
                                const CompilerOptions& options,
                                const Subtarget& subtarget,
                                Diagnostics& diagnostics);

@@ -510,7 +510,7 @@ int cc_main(int argc, char** argv) {
     if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
     const GenericPointerResolver pointer_resolver =
         [&](std::unique_ptr<Expr>& expression, const TypePtr& destination,
-            const FunctionDecl* caller, std::span<const std::string> locals) {
+            const FunctionDecl* caller, std::span<const NameKey> locals) {
             return data::normalize_generic_pointer(program, expression, destination,
                 caller, locals, options, *subtarget, diagnostics);
         };

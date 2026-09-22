@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "procedural_lookup.x"
+#include "procedural_locals.x"
+#if defined(TEST_MACRO_RAW)
+#include "procedural_locals_raw.x"
+#endif
 
 [[macro]]
 static $::meta::tokens select(in $::meta::tokens input) {
@@ -96,6 +100,11 @@ static struct pair memory_result(in u64 n) {
 [[abi(HOST_ABI)]]
 #endif
 global i32 procedural_scalar_entry() {
+    i32 local_check = hygienic_locals::check();
+    if (local_check != 0) return 70 + local_check;
+#if defined(TEST_MACRO_RAW)
+    if (hygienic_raw(13u64) != 13u64 || hygienic_raw_inline(17u64) != 17u64) return 8;
+#endif
     if (origin_caller::check() != 0) return 6;
     if (generated != 11 || register_result(1u64) != 42u64) return 1;
     if (typed! { 17u64 } != 17u64 || token_expression! { 2u64 } != 15u64) return 2;

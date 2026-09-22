@@ -208,8 +208,8 @@ private:
                     return fail(source.right->location,
                                 "raw memory index must be an integer constant or one hard-bound 64-bit register");
                 }
-                const auto binding = bindings_.find(index_expression.text);
-                const auto type = binding_types_.find(index_expression.text);
+                const auto binding = bindings_.find(name_key(index_expression));
+                const auto type = binding_types_.find(name_key(index_expression));
                 if (binding == bindings_.end() || type == binding_types_.end() ||
                     !type->second || !is_integer(type->second) ||
                     binding->second->register_class != "integer" ||
@@ -235,8 +235,8 @@ private:
             return fail(pointer ? pointer->location : source.location,
                         "raw memory base must be one hard-bound pointer register");
         }
-        const auto binding = bindings_.find(pointer->text);
-        const auto type = binding_types_.find(pointer->text);
+        const auto binding = bindings_.find(name_key(*pointer));
+        const auto type = binding_types_.find(name_key(*pointer));
         if (binding == bindings_.end() || type == binding_types_.end() ||
             !type->second || type->second->kind != Type::Kind::Pointer ||
             !type->second->pointee) {
@@ -304,7 +304,7 @@ private:
                    hir_.label(current_function_->id, source->text);
         }
         if (source->kind == Expr::Kind::Name && specification.allow_register) {
-            const auto found = bindings_.find(source->text);
+            const auto found = bindings_.find(name_key(*source));
             if (found != bindings_.end()) {
                 const auto* entry = found->second;
                 return entry->bits == specification.register_bits &&
@@ -613,23 +613,23 @@ private:
                             std::max(return_ordered_depth_, *position + 1);
                     }
                 }
-                bindings_[parameter.name] = entry;
+                bindings_[name_key(parameter)] = entry;
                 if (function.definition) {
                     const auto declaration = std::find_if(
                         function.definition->parameters.begin(),
                         function.definition->parameters.end(),
                         [&](const auto& candidate) {
-                            return candidate.name == parameter.name;
+                            return name_key(candidate) == name_key(parameter);
                         });
                     if (declaration != function.definition->parameters.end()) {
-                        binding_types_[parameter.name] = declaration->type;
+                        binding_types_[name_key(parameter)] = declaration->type;
                     }
                 }
                 const auto& type = hir_.type(parameter.type);
-                binding_signed_[parameter.name] = signed_integer_type(type);
+                binding_signed_[name_key(parameter)] = signed_integer_type(type);
                 if (type.kind == hir::Type::Kind::Builtin &&
                     type.builtin == BuiltinType::Label) {
-                    label_bindings_.insert(parameter.name);
+                    label_bindings_.insert(name_key(parameter));
                 }
             }
         }
@@ -992,9 +992,9 @@ private:
             append_instruction(std::move(instruction));
             return;
         }
-        const auto binding = bindings_.find(destination.text);
+        const auto binding = bindings_.find(name_key(destination));
         if (binding == bindings_.end() ||
-            !label_bindings_.contains(destination.text)) {
+            !label_bindings_.contains(name_key(destination))) {
             diagnostics_.error(destination.location,
                                "raw goto target is not a hard-bound label value");
             return;
@@ -1022,11 +1022,11 @@ private:
                     declaration.name + "'");
             if (!entry) return;
             inline_frames_.back().owned.push_back(entry);
-            bindings_[declaration.name] = entry;
-            binding_types_[declaration.name] = declaration.type;
-            binding_signed_[declaration.name] =
+            bindings_[name_key(declaration)] = entry;
+            binding_types_[name_key(declaration)] = declaration.type;
+            binding_signed_[name_key(declaration)] =
                 signed_integer_type(declaration.type);
-            inline_frames_.back().readonly_names.erase(declaration.name);
+            inline_frames_.back().readonly_names.erase(name_key(declaration));
             if (declaration.initializer) {
                 (void)lower_inline_value(*declaration.initializer, *entry,
                                          declaration.type);
@@ -1061,18 +1061,18 @@ private:
                                "raw stack pointer changes must use registry-declared stack instructions");
             return;
         }
-        if (bindings_.contains(declaration.name)) {
+        if (bindings_.contains(name_key(declaration))) {
             diagnostics_.error(declaration.location,
                                "duplicate raw register object '" + declaration.name + "'");
             return;
         }
-        bindings_[declaration.name] = entry;
+        bindings_[name_key(declaration)] = entry;
         protected_storages_.insert(std::string(entry->storage));
-        binding_types_[declaration.name] = declaration.type;
-        binding_signed_[declaration.name] = signed_integer_type(declaration.type);
+        binding_types_[name_key(declaration)] = declaration.type;
+        binding_signed_[name_key(declaration)] = signed_integer_type(declaration.type);
         if (declaration.type->kind == Type::Kind::Builtin &&
             declaration.type->builtin == BuiltinType::Label) {
-            label_bindings_.insert(declaration.name);
+            label_bindings_.insert(name_key(declaration));
         }
         if (!declaration.initializer) return;
         if (!raw_integer_type(declaration.type) &&
@@ -1232,7 +1232,7 @@ private:
             return memory_operand(*address, source->location);
         }
         if (source->kind == Expr::Kind::Name && specification.allow_register) {
-            const auto found = bindings_.find(source->text);
+            const auto found = bindings_.find(name_key(*source));
             if (found == bindings_.end()) {
                 diagnostics_.error(source->location,
                                     "unknown raw register object '" + source->text + "'");
@@ -1655,7 +1655,7 @@ private:
         const RegisterEntry* scratch = nullptr;
         const auto& value = unparenthesized(expression);
         if (value.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(value.text);
+            const auto found = bindings_.find(name_key(value));
             if (found != bindings_.end()) {
                 source = integer_storage_view(found->second->storage,
                                               type_bits(source_type));
@@ -1708,7 +1708,7 @@ private:
                                     ? BuiltinType::F32 : BuiltinType::F64);
         }
         if (source.kind == Expr::Kind::Name) {
-            const auto found = binding_types_.find(source.text);
+            const auto found = binding_types_.find(name_key(source));
             if (found != binding_types_.end()) return found->second;
         }
         if (source.kind == Expr::Kind::Cast && source.type) return source.type;
@@ -1823,7 +1823,7 @@ private:
             return false;
         }
         if (!divisor && divisor_expression.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(divisor_expression.text);
+            const auto found = bindings_.find(name_key(divisor_expression));
             if (found != bindings_.end()) {
                 divisor = integer_storage_view(found->second->storage,
                                                destination.bits);
@@ -1927,7 +1927,7 @@ private:
             }
         }
         if (source.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(source.text);
+            const auto found = bindings_.find(name_key(source));
             if (found != bindings_.end() &&
                 found->second->bits == destination.bits &&
                 found->second->register_class == destination.register_class) {
@@ -2066,8 +2066,8 @@ private:
             return false;
         }
         if (source.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(source.text);
-            const auto found_type = binding_types_.find(source.text);
+            const auto found = bindings_.find(name_key(source));
+            const auto found_type = binding_types_.find(name_key(source));
             if (found != bindings_.end() &&
                 found_type != binding_types_.end() &&
                 raw_scalar_float_type(found_type->second) &&
@@ -2090,7 +2090,7 @@ private:
                                   std::string_view storage) const {
         const auto& source = unparenthesized(expression);
         if (source.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(source.text);
+            const auto found = bindings_.find(name_key(source));
             return found != bindings_.end() &&
                    found->second->storage == storage;
         }
@@ -2110,7 +2110,7 @@ private:
                                   std::string_view storage) const {
         const auto& source = unparenthesized(expression);
         if (source.kind != Expr::Kind::Name) return false;
-        const auto found = bindings_.find(source.text);
+        const auto found = bindings_.find(name_key(source));
         return found != bindings_.end() &&
                found->second->storage == storage;
     }
@@ -2128,8 +2128,8 @@ private:
             return emit_float_constant(source, destination, type);
         }
         if (source.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(source.text);
-            const auto found_type = binding_types_.find(source.text);
+            const auto found = bindings_.find(name_key(source));
+            const auto found_type = binding_types_.find(name_key(source));
             if (found == bindings_.end() ||
                 found_type == binding_types_.end() ||
                 !raw_scalar_float_type(found_type->second) ||
@@ -2280,7 +2280,7 @@ private:
                                          source.location);
         }
         if (source.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(source.text);
+            const auto found = bindings_.find(name_key(source));
             if (found == bindings_.end()) {
                 diagnostics_.error(source.location,
                                    "raw-compatible value refers to unavailable object '" +
@@ -2395,9 +2395,9 @@ private:
         const auto& destination_expression =
             unparenthesized(*expression.left);
         if (destination_expression.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(destination_expression.text);
+            const auto found = bindings_.find(name_key(destination_expression));
             const auto type_found =
-                binding_types_.find(destination_expression.text);
+                binding_types_.find(name_key(destination_expression));
             if (found == bindings_.end() || type_found == binding_types_.end()) {
                 diagnostics_.error(
                     destination_expression.location,
@@ -2406,7 +2406,7 @@ private:
             }
             if (!inline_frames_.empty() &&
                 inline_frames_.back().readonly_names.contains(
-                    destination_expression.text)) {
+                    name_key(destination_expression))) {
                 diagnostics_.error(
                     destination_expression.location,
                     "raw_inline cannot modify an 'in' parameter; copy it to a local first");
@@ -2529,7 +2529,7 @@ private:
         auto saved_signed = binding_signed_;
         auto saved_labels = label_bindings_;
         std::vector<const RegisterEntry*> owned;
-        std::unordered_set<std::string> readonly_names;
+        NameSet readonly_names;
         const auto cleanup = [&] {
             for (const auto* entry : owned) release_scratch(entry);
             bindings_ = std::move(saved_bindings);
@@ -2547,8 +2547,8 @@ private:
                 unparenthesized(*expression.arguments[index]);
             const RegisterEntry* binding = nullptr;
             if (argument.kind == Expr::Kind::Name) {
-                const auto found = saved_bindings.find(argument.text);
-                const auto found_type = saved_types.find(argument.text);
+                const auto found = saved_bindings.find(name_key(argument));
+                const auto found_type = saved_types.find(name_key(argument));
                 const bool floating_mismatch =
                     raw_scalar_float_type(parameter.type) &&
                     (found_type == saved_types.end() ||
@@ -2578,11 +2578,11 @@ private:
              index < callee->definition->parameters.size(); ++index) {
             const auto& parameter = callee->definition->parameters[index];
             const auto* binding = parameter_bindings[index];
-            bindings_[parameter.name] = binding;
-            binding_types_[parameter.name] = parameter.type;
-            binding_signed_[parameter.name] =
+            bindings_[name_key(parameter)] = binding;
+            binding_types_[name_key(parameter)] = parameter.type;
+            binding_signed_[name_key(parameter)] =
                 signed_integer_type(parameter.type);
-            readonly_names.insert(parameter.name);
+            readonly_names.insert(name_key(parameter));
         }
 
         const auto continuation = new_block(expression.location);
@@ -2649,7 +2649,7 @@ private:
                                    "raw-compatible increment requires a scalar local");
                 return;
             }
-            const auto found = bindings_.find(subject.text);
+            const auto found = bindings_.find(name_key(subject));
             if (found == bindings_.end()) {
                 diagnostics_.error(subject.location,
                                    "raw-compatible increment refers to an unavailable local");
@@ -2846,7 +2846,7 @@ private:
             const RegisterEntry* left_register = nullptr;
             const RegisterEntry* left_scratch = nullptr;
             if (left->kind == Expr::Kind::Name) {
-                const auto found = bindings_.find(left->text);
+                const auto found = bindings_.find(name_key(*left));
                 if (found != bindings_.end()) left_register = found->second;
             }
             if (!left_register) {
@@ -2863,7 +2863,7 @@ private:
             const RegisterEntry* right_register = nullptr;
             const RegisterEntry* right_scratch = nullptr;
             if (right->kind == Expr::Kind::Name) {
-                const auto found = bindings_.find(right->text);
+                const auto found = bindings_.find(name_key(*right));
                 if (found != bindings_.end()) right_register = found->second;
             }
             if (!right_register) {
@@ -2942,7 +2942,7 @@ private:
         const RegisterEntry* left_scratch = nullptr;
         TypePtr left_type = expression_type(*left);
         if (left->kind == Expr::Kind::Name) {
-            const auto binding = bindings_.find(left->text);
+            const auto binding = bindings_.find(name_key(*left));
             if (binding != bindings_.end()) left_register = binding->second;
         }
         if (!left_register && !inline_frames_.empty()) {
@@ -2978,7 +2978,7 @@ private:
             }
         }
         if (!compare && right->kind == Expr::Kind::Name) {
-            const auto binding = bindings_.find(right->text);
+            const auto binding = bindings_.find(name_key(*right));
             if (binding != bindings_.end()) {
                 const auto* view = integer_storage_view(
                     binding->second->storage, left_register->bits);
@@ -3021,7 +3021,7 @@ private:
 
         bool signed_comparison = signed_integer_type(left_type);
         if (right->kind == Expr::Kind::Name) {
-            const auto found = binding_signed_.find(right->text);
+            const auto found = binding_signed_.find(name_key(*right));
             signed_comparison = signed_comparison &&
                                 found != binding_signed_.end() && found->second;
         } else if (explicitly_unsigned_literal(*right)) {
@@ -3105,7 +3105,7 @@ private:
         const RegisterEntry* condition_scratch = nullptr;
         const auto condition_type = expression_type(source);
         if (source.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(source.text);
+            const auto found = bindings_.find(name_key(source));
             if (found != bindings_.end()) condition_register = found->second;
         } else {
             condition_scratch = acquire_scratch(condition_type, source.location,
@@ -3351,7 +3351,7 @@ private:
         const auto& selector_expression =
             unparenthesized(*statement.condition);
         if (selector_expression.kind == Expr::Kind::Name) {
-            const auto found = bindings_.find(selector_expression.text);
+            const auto found = bindings_.find(name_key(selector_expression));
             if (found != bindings_.end()) selector_register = found->second;
         }
         if (!selector_register) {
@@ -3509,7 +3509,7 @@ private:
         TypePtr result_type;
         mir::BlockId return_target;
         std::vector<const RegisterEntry*> owned;
-        std::unordered_set<std::string> readonly_names;
+        NameSet readonly_names;
         std::size_t loop_base{};
         std::size_t break_base{};
         bool saw_return{};
@@ -3759,10 +3759,10 @@ private:
     mir::RawFunction current_;
     const hir::Function* current_function_{};
     std::optional<mir::BlockId> current_block_;
-    std::unordered_map<std::string, const RegisterEntry*> bindings_;
-    std::unordered_map<std::string, TypePtr> binding_types_;
-    std::unordered_map<std::string, bool> binding_signed_;
-    std::unordered_set<std::string> label_bindings_;
+    NameMap<const RegisterEntry*> bindings_;
+    NameMap<TypePtr> binding_types_;
+    NameMap<bool> binding_signed_;
+    NameSet label_bindings_;
     std::vector<std::string> raw_inline_scratch_;
     std::unordered_set<std::string> scratch_in_use_;
     std::unordered_set<std::string> protected_storages_;

@@ -20,7 +20,7 @@ bool is_known_attribute(std::string_view name);
 
 using GenericPointerResolver = std::function<bool(
     std::unique_ptr<Expr>&, const TypePtr&, const FunctionDecl*,
-    std::span<const std::string>)>;
+    std::span<const NameKey>)>;
 
 // Expands explicit generic instances and deterministic translation-time calls.
 // Ordinary visible functions are evaluated opportunistically when requested;

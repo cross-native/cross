@@ -41,7 +41,8 @@ private:
     TypePtr
     parse_declarator(TypePtr base, std::optional<std::string>& name,
                      bool parameter = false,
-                     std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
+                     std::unique_ptr<Expr>* dynamic_outer_bound = nullptr,
+                     SourceLocation* name_location = nullptr);
     void apply_callable_attributes(TypePtr& type,
                                    const std::vector<Attribute>& attributes);
     TypePtr parse_array_suffix(

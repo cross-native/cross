@@ -1,0 +1,25 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#if defined(QUOTED_CAPTURE)
+[[macro]] static $::meta::tokens body(in $::meta::tokens input) {
+    return $::quote { return value; };
+}
+static u64 subject(in u64 value) { body! {} }
+$::static_assert($::eval(subject(7u64)) == 7u64, "quote must not capture parameter");
+#elif defined(COPIED_READONLY)
+[[macro]] static $::meta::tokens body(in $::meta::tokens input) {
+    return $::quote { u64 value = 3u64; $::unquote(input) };
+}
+static u64 subject(in u64 value) {
+    body! { value += 2u64; }
+    return value;
+}
+#elif defined(DUPLICATE_QUOTE)
+[[macro]] static $::meta::tokens body(in $::meta::tokens input) {
+    $::meta::tokens item = $::quote { u64 value = 3u64; };
+    return $::meta::concat(item, item);
+}
+static u64 subject() { body! {} return 7u64; }
+$::static_assert($::eval(subject()) == 7u64, "duplicate binding in one context");
+#endif

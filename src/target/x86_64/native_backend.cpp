@@ -8621,11 +8621,20 @@ private:
         std::size_t largest_outgoing_alignment = 16;
         bool has_call = false;
         bool has_indirect_call = false;
+        bool has_spilled_indirect_target = false;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (instruction.kind != machine::InstructionKind::Call) continue;
                 has_call = true;
                 has_indirect_call |= !instruction.direct_callee;
+                if (!instruction.direct_callee && !instruction.operands.empty()) {
+                    const auto* target = std::get_if<machine::RegisterOperand>(
+                        &instruction.operands.front());
+                    has_spilled_indirect_target |= !target ||
+                        target->value.kind != machine::RegisterKind::Virtual ||
+                        target->value.id >= current_.virtual_register_assignments.size() ||
+                        !current_.virtual_register_assignments[target->value.id];
+                }
                 const auto callee =
                     hir::call_signature(hir_, instruction.direct_callee,
                                         instruction.call_signature);
@@ -8748,6 +8757,8 @@ private:
             add_dynamic_save_slot("$large.call.target");
         }
         if (has_indirect_call) add_dynamic_save_slot("$indirect.call.target");
+        if (has_spilled_indirect_target)
+            add_dynamic_save_slot("$indirect.call.capture");
         const bool dynamic_realign =
             dynamic_stack && std::any_of(
                 current_.stack_slots.begin(), current_.stack_slots.end(),
@@ -20099,8 +20110,24 @@ private:
                 if (!tail) restore_hard_registers(function, "$hard.call.");
                 return;
             }
-            load(function, target->value, "rax");
-            instruction("movq", "%rax, " + memory(*slot));
+            // Target capture happens before argument placement. The selected
+            // ABI may preserve RAX, and a live result or an outgoing argument
+            // may occupy it. Do not silently add a scratch clobber here.
+            if (const auto* source = assigned_integer_register(function, target->value)) {
+                instruction("movq", register_name(source->storage_name, 64) +
+                                        ", " + memory(*slot));
+            } else {
+                const auto scratch = named_slot_offset(function, "$indirect.call.capture");
+                if (!scratch) {
+                    diagnostics_.error(value.location, "indirect call has no capture scratch slot");
+                    if (!tail) restore_hard_registers(function, "$hard.call.");
+                    return;
+                }
+                instruction("movq", "%rax, " + memory(*scratch));
+                load(function, target->value, "rax");
+                instruction("movq", "%rax, " + memory(*slot));
+                instruction("movq", memory(*scratch) + ", %rax");
+            }
         }
         if (const auto* manual =
                 entity ? manual_plans_.find(entity->id) : nullptr;

@@ -5,6 +5,7 @@
 #include "common/source.hpp"
 #include "common/uint128.hpp"
 #include "frontend/token.hpp"
+#include "frontend/name.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -111,6 +112,7 @@ struct AddressConstant {
 struct GenericParameter {
     std::string name;
     TypePtr value_type;
+    SourceLocation location{};
 };
 
 struct Attribute {
@@ -174,6 +176,10 @@ struct Expr {
     std::vector<GenericArgument> generic_arguments;
     std::vector<InitializerEntry> initializer_entries;
 };
+
+inline NameKey name_key(const Expr& expression) {
+    return NameKey(expression.text, expression.location);
+}
 
 struct VariableDecl {
     SourceLocation location;

@@ -728,14 +728,14 @@ bool eligible_statement(const Statement& statement) {
 }
 
 void collect_address_taken_names(const Expr& expression,
-                                 std::unordered_set<std::string>& names) {
+                                 NameSet& names) {
     if (expression.kind == Expr::Kind::Unary && expression.text == "&" &&
         expression.left) {
         const Expr* operand = expression.left.get();
         while (operand->kind == Expr::Kind::Parenthesized && operand->left) {
             operand = operand->left.get();
         }
-        if (operand->kind == Expr::Kind::Name) names.insert(operand->text);
+        if (operand->kind == Expr::Kind::Name) names.insert(name_key(*operand));
     }
     if (expression.left) collect_address_taken_names(*expression.left, names);
     if (expression.right) collect_address_taken_names(*expression.right, names);
@@ -746,7 +746,7 @@ void collect_address_taken_names(const Expr& expression,
 }
 
 void collect_address_taken_names(const Statement& statement,
-                                 std::unordered_set<std::string>& names) {
+                                 NameSet& names) {
     if (statement.declaration &&
         statement.declaration->dynamic_array_bound) {
         collect_address_taken_names(
@@ -874,7 +874,7 @@ private:
     };
 
     struct Scope {
-        std::unordered_map<std::string, LocalBinding> bindings;
+        NameMap<LocalBinding> bindings;
         std::vector<SlotId> slots;
         std::optional<ValueId> dynamic_stack_mark;
     };
@@ -1031,11 +1031,11 @@ private:
             if (parameter.mode == ParameterMode::In &&
                 (!parameter.physical_location ||
                  *parameter.physical_location == "auto") &&
-                !address_taken_names_.contains(parameter.name) &&
+                !address_taken_names_.contains(name_key(parameter)) &&
                 !hir_.type(parameter.type).is_atomic &&
                 !record_value_type(hir_, parameter.type)) {
                 if (!parameter_values_.emplace(
-                        parameter.name, value).second) {
+                        name_key(parameter), value).second) {
                     failed_ = true;
                 }
                 continue;
@@ -1049,11 +1049,11 @@ private:
             current_.slots.push_back(
                 {slot, parameter.location, cell_type,
                  "$param." + std::to_string(index), std::nullopt, false,
-                 address_taken_names_.contains(parameter.name),
+                 address_taken_names_.contains(name_key(parameter)),
                  parameter.mode != ParameterMode::In, 1, index});
             const LocalBinding binding{slot, cell_type, std::nullopt,
                                        std::nullopt};
-            if (!scopes_.back().bindings.emplace(parameter.name, binding).second) {
+            if (!scopes_.back().bindings.emplace(name_key(parameter), binding).second) {
                 failed_ = true;
             }
             scopes_.back().slots.push_back(slot);
@@ -1083,12 +1083,12 @@ private:
                      (state_model ? state_model->canonical_name
                                   : std::to_string(state.state.value)),
                  std::nullopt, false,
-                 address_taken_names_.contains(state.name), false, 1,
+                 address_taken_names_.contains(name_key(state)), false, 1,
                  std::nullopt});
             const LocalBinding binding{slot, state.type, std::nullopt,
                                        std::nullopt};
             if (!scopes_.back().bindings.emplace(
-                    state.name, binding).second) {
+                    name_key(state), binding).second) {
                 diagnostics_.error(
                     state.location,
                     "variadic state binding '" + state.name +
@@ -1207,17 +1207,17 @@ private:
         current_effect_.reset();
     }
 
-    std::optional<std::string_view> local_name(const Expr& expression) const {
-        if (expression.kind == Expr::Kind::Name) return expression.text;
+    std::optional<NameKey> local_name(const Expr& expression) const {
+        if (expression.kind == Expr::Kind::Name) return name_key(expression);
         if (expression.kind == Expr::Kind::Parenthesized && expression.left) {
             return local_name(*expression.left);
         }
         return std::nullopt;
     }
 
-    const LocalBinding* find_local(std::string_view name) const {
+    const LocalBinding* find_local(const NameKey& name) const {
         for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
-            const auto found = scope->bindings.find(std::string(name));
+            const auto found = scope->bindings.find(name);
             if (found != scope->bindings.end()) return &found->second;
         }
         return nullptr;
@@ -1549,7 +1549,7 @@ private:
             return lower_designator_address(*expression.left);
         }
         if (expression.kind == Expr::Kind::Name) {
-            if (const auto* local = find_local(expression.text)) {
+            if (const auto* local = find_local(name_key(expression))) {
                 if (local->dynamic_address) {
                     return DesignatorAddress{
                         cast(*local->dynamic_address,
@@ -1692,7 +1692,7 @@ private:
             return designator_type(*expression.left, is_bit_field);
         }
         if (expression.kind == Expr::Kind::Name) {
-            if (const auto* local = find_local(expression.text)) {
+            if (const auto* local = find_local(name_key(expression))) {
                 return local->type;
             }
             if (const auto* object = resolve_object(expression.text);
@@ -1794,7 +1794,7 @@ private:
         }
         std::optional<ValueId> address;
         if (source->kind == Expr::Kind::Name) {
-            if (const auto* local = find_local(source->text)) {
+            if (const auto* local = find_local(name_key(*source))) {
                 if (current_.slots[local->slot.value].physical_location) {
                     diagnostics_.error(
                         source->location,
@@ -2633,7 +2633,7 @@ private:
             return parsed ? hir_.builtin(parsed->type) : std::nullopt;
         }
         case Expr::Kind::Name: {
-            if (const auto* local = find_local(expression.text)) {
+            if (const auto* local = find_local(name_key(expression))) {
                 if (array_type(hir_, local->type)) {
                     if (local->dynamic_address) {
                         return hir_.pointer_to(
@@ -2646,7 +2646,7 @@ private:
                                  hir_.unqualified(local->type))
                            : std::optional<hir::TypeId>(local->type);
             }
-            const auto found = parameter_values_.find(expression.text);
+            const auto found = parameter_values_.find(name_key(expression));
             if (found != parameter_values_.end()) {
                 return current_.values[found->second.value].type;
             }
@@ -2716,16 +2716,16 @@ private:
                 if (const auto* local = find_local(*name)) {
                     return hir_.pointer_to(local->type);
                 }
-                const auto parameter = parameter_values_.find(std::string(*name));
+                const auto parameter = parameter_values_.find(*name);
                 if (parameter != parameter_values_.end()) {
                     return hir_.pointer_to(
                         current_.values[parameter->second.value].type);
                 }
-                if (const auto* object = resolve_object(*name);
+                if (const auto* object = resolve_object(name->spelling);
                     object && global_object(*object)) {
                     return hir_.pointer_to(object->type);
                 }
-                if (const auto* function = resolve_function(*name))
+                if (const auto* function = resolve_function(name->spelling))
                     return function_pointer_type(*function);
                 return std::nullopt;
             }
@@ -2861,7 +2861,7 @@ private:
                                  hir_.unqualified(local->type))
                            : std::optional<hir::TypeId>(local->type);
             }
-            const auto* object = name ? resolve_object(*name) : nullptr;
+            const auto* object = name ? resolve_object(name->spelling) : nullptr;
             return object && global_scalar(*object) &&
                            !hir_.type(object->type).is_const
                        ? std::optional<hir::TypeId>(
@@ -3282,7 +3282,7 @@ private:
             break;
         }
         case Expr::Kind::Name: {
-            if (const auto* local = find_local(expression.text)) {
+            if (const auto* local = find_local(name_key(expression))) {
                 if (array_type(hir_, local->type)) {
                     result = local->dynamic_address
                                  ? *local->dynamic_address
@@ -3294,7 +3294,7 @@ private:
                     result = load_slot(*local, expression.location);
                 }
             } else {
-                const auto found = parameter_values_.find(expression.text);
+                const auto found = parameter_values_.find(name_key(expression));
                 if (found != parameter_values_.end()) {
                     result = found->second;
                 } else if (const auto* object = resolve_object(expression.text);
@@ -3531,13 +3531,13 @@ private:
                     break;
                 }
                 if (name) {
-                    if (const auto* object = resolve_object(*name);
+                    if (const auto* object = resolve_object(name->spelling);
                         object && global_object(*object)) {
                         result = add_value(ValueKind::GlobalAddress,
                                            hir_.pointer_to(object->type),
                                            expression.location);
                         current_.values[result->value].object = object->id;
-                    } else if (const auto* function = resolve_function(*name)) {
+                    } else if (const auto* function = resolve_function(name->spelling)) {
                         result =
                             function_address(*function, expression.location);
                     }
@@ -4361,7 +4361,7 @@ private:
             const auto name = local_name(*expression.left->left);
             const auto* local = name ? find_local(*name) : nullptr;
             const auto* object = local || !name ? nullptr
-                                                : resolve_object(*name);
+                                                : resolve_object(name->spelling);
             const auto vector_type_id = local ? local->type
                                       : object ? object->type
                                                : hir::TypeId{};
@@ -4455,7 +4455,7 @@ private:
         }
         const auto name = local_name(*expression.left);
         const auto* found = name ? find_local(*name) : nullptr;
-        const auto* object = found || !name ? nullptr : resolve_object(*name);
+        const auto* object = found || !name ? nullptr : resolve_object(name->spelling);
         if (found && (found->dynamic_address ||
                       array_type(hir_, found->type))) {
             return std::nullopt;
@@ -4913,8 +4913,8 @@ private:
                 predicate = predicate->left.get();
             if (predicate->kind == Expr::Kind::Binary && predicate->text == "<" &&
                 predicate->left && predicate->right && predicate->left->kind == Expr::Kind::Name &&
-                !find_local(predicate->left->text)) {
-                const auto parameter = parameter_values_.find(predicate->left->text);
+                !find_local(name_key(*predicate->left))) {
+                const auto parameter = parameter_values_.find(name_key(*predicate->left));
                 const auto limit = patch_initial(*predicate->right, hir_.address_bits);
                 if (parameter != parameter_values_.end() && limit) {
                     const auto source_type = current_.values[parameter->second.value].type;
@@ -5014,8 +5014,8 @@ private:
                     "managed MIR form");
             return std::nullopt;
         }
-        if (find_local(expression.left->text) ||
-            parameter_values_.contains(expression.left->text) ||
+        if (find_local(name_key(*expression.left)) ||
+            parameter_values_.contains(name_key(*expression.left)) ||
             resolve_object(expression.left->text))
             return lower_indirect_call(expression);
         const auto* callee = resolve_function(expression.left->text);
@@ -5117,7 +5117,7 @@ private:
                     if (const auto* found = find_local(*name)) {
                         actual_local = *found;
                     } else {
-                        actual_object = resolve_object(*name);
+                        actual_object = resolve_object(name->spelling);
                     }
                 } else {
                     const Expr* designator = &actual;
@@ -5283,8 +5283,8 @@ private:
                 [&](const Expr& node) {
                     if (node.kind == Expr::Kind::Name &&
                         node.text.find("::") == std::string::npos &&
-                        (find_local(node.text) ||
-                         parameter_values_.contains(node.text))) return true;
+                        (find_local(name_key(node)) ||
+                         parameter_values_.contains(name_key(node)))) return true;
                     if (node.left && names_runtime_cell(*node.left)) return true;
                     if (node.right && names_runtime_cell(*node.right)) return true;
                     if (node.third && names_runtime_cell(*node.third)) return true;
@@ -5606,7 +5606,7 @@ private:
                 return;
             }
             if (!managed_object_type(hir_, type) ||
-                scopes_.back().bindings.contains(declaration.name)) {
+                scopes_.back().bindings.contains(name_key(declaration))) {
                 failed_ = true;
                 return;
             }
@@ -5685,7 +5685,7 @@ private:
                     failed_ = true;
                     return;
                 }
-                scopes_.back().bindings.emplace(declaration.name, binding);
+                scopes_.back().bindings.emplace(name_key(declaration), binding);
                 return;
             }
             const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
@@ -5694,13 +5694,13 @@ private:
                                       std::move(physical_location),
                                       declaration.type->is_volatile,
                                       address_taken_names_.contains(
-                                          declaration.name),
+                                          name_key(declaration)),
                                       false, 1, std::nullopt});
             current_.slots.back().minimum_alignment =
                 declaration.explicit_alignment;
             const LocalBinding binding{slot, type, std::nullopt,
                                        std::nullopt};
-            scopes_.back().bindings.emplace(declaration.name, binding);
+            scopes_.back().bindings.emplace(name_key(declaration), binding);
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot, declaration.location);
             if (declaration.initializer) {
@@ -6147,8 +6147,8 @@ private:
     ManagedFunction current_;
     std::optional<BlockId> current_block_;
     std::optional<EffectId> current_effect_;
-    std::unordered_map<std::string, ValueId> parameter_values_;
-    std::unordered_set<std::string> address_taken_names_;
+    NameMap<ValueId> parameter_values_;
+    NameSet address_taken_names_;
     std::unordered_map<std::uint32_t, BlockId> label_blocks_;
     std::unordered_map<std::uint32_t, ControlPoint> label_control_points_;
     std::unordered_map<const Statement*, ControlPoint> goto_control_points_;

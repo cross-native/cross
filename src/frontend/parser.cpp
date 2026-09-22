@@ -209,6 +209,7 @@ std::vector<Attribute> Parser::parse_attributes() {
                     while (!current().is(")") &&
                            current().kind != TokenKind::End) {
                         const auto start = index_;
+                        auto parameter_location = current().location;
                         std::optional<std::string> parameter_name;
                         TypePtr value_type;
                         if (current().kind == TokenKind::Identifier &&
@@ -220,7 +221,8 @@ std::vector<Attribute> Parser::parse_attributes() {
                             value_type = parse_type();
                             if (value_type) {
                                 value_type = parse_declarator(
-                                    std::move(value_type), parameter_name);
+                                    std::move(value_type), parameter_name, false,
+                                    nullptr, &parameter_location);
                             }
                             if (value_type && !is_integer(value_type) &&
                                 value_type->kind != Type::Kind::Pointer &&
@@ -246,7 +248,7 @@ std::vector<Attribute> Parser::parse_attributes() {
                                                    *parameter_name + "'");
                         } else {
                             attribute.generic_parameters.push_back(
-                                {std::move(*parameter_name), std::move(value_type)});
+                                {std::move(*parameter_name), std::move(value_type), parameter_location});
                         }
                         std::string spelling;
                         for (auto token = start; token < index_; ++token) {
@@ -633,7 +635,8 @@ TypePtr Parser::parse_type() {
 
 TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                                  bool parameter,
-                                 std::unique_ptr<Expr>* dynamic_outer_bound) {
+                                 std::unique_ptr<Expr>* dynamic_outer_bound,
+                                 SourceLocation* name_location) {
     while (consume("*")) {
         bool is_const = false;
         bool is_volatile = false;
@@ -658,10 +661,12 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     if (current().is("(") && (current(1).is("*") || current(1).is("("))) {
         consume("(");
         hole = std::make_shared<Type>();
-        nested = parse_declarator(hole, name, parameter);
+        nested = parse_declarator(hole, name, parameter, nullptr, name_location);
         expect(")", "after parenthesized declarator");
     } else {
+        const auto location = current().location;
         name = parse_qualified_name();
+        if (name && name_location) *name_location = location;
     }
     if (current().is("[")) {
         base = parse_array_suffix(std::move(base), parameter, dynamic_outer_bound);
@@ -1307,7 +1312,8 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     else if (consume("inout")) { parameter.mode = ParameterMode::InOut; parameter.explicit_mode = true; }
     parameter.type = parse_type();
     std::optional<std::string> name;
-    parameter.type = parse_declarator(std::move(parameter.type), name, true);
+    parameter.type = parse_declarator(std::move(parameter.type), name, true,
+                                      nullptr, &parameter.location);
     parameter.name = name.value_or("_parameter" + std::to_string(ordinal));
     apply_callable_attributes(parameter.type, attributes);
     if (!parameter.explicit_mode && parameter.type && parameter.type->is_const) {
@@ -1442,7 +1448,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
     std::optional<std::string> name;
     declaration.type =
         parse_declarator(std::move(declaration.type), name, false,
-                         &declaration.dynamic_array_bound);
+                         &declaration.dynamic_array_bound, &declaration.location);
     if (!name) error_here("expected local variable name");
     else declaration.name = *name;
     auto trailing = parse_attributes();
