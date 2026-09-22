@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "procedural_lookup.x"
+
 [[macro]]
 static $::meta::tokens select(in $::meta::tokens input) {
     u32 n = 1u32;
@@ -94,6 +96,7 @@ static struct pair memory_result(in u64 n) {
 [[abi(HOST_ABI)]]
 #endif
 global i32 procedural_scalar_entry() {
+    if (origin_caller::check() != 0) return 6;
     if (generated != 11 || register_result(1u64) != 42u64) return 1;
     if (typed! { 17u64 } != 17u64 || token_expression! { 2u64 } != 15u64) return 2;
     if (separate_tokens! { 1u64 } != 2u64) return 5;

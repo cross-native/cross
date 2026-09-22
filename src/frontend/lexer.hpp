@@ -3,31 +3,12 @@
 #pragma once
 
 #include "common/diagnostic.hpp"
+#include "frontend/token.hpp"
 
 #include <string_view>
 #include <vector>
 
 namespace cross {
-
-enum class TokenKind {
-    End,
-    Identifier,
-    BuiltinName,
-    Integer,
-    Floating,
-    String,
-    Character,
-    Punctuator,
-    Invalid,
-};
-
-struct Token {
-    TokenKind kind{TokenKind::Invalid};
-    std::string_view text;
-    SourceLocation location;
-
-    [[nodiscard]] bool is(std::string_view spelling) const { return text == spelling; }
-};
 
 class Lexer {
 public:

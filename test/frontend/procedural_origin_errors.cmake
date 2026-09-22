@@ -22,9 +22,19 @@ foreach(expected
         "in expansion of procedural macro 'inner'"
         "procedural macro 'inner' defined here"
         "in expansion of procedural macro 'outer'"
-        "procedural macro 'outer' defined here")
+        "procedural macro 'outer' defined here"
+        "token supplied from here"
+        "in expansion of procedural macro 'copied_inner'"
+        "procedural macro 'copied_inner' defined here"
+        "in expansion of procedural macro 'copied_outer'"
+        "procedural macro 'copied_outer' defined here")
     string(FIND "${stderr}" "${expected}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "missing generated-source origin '${expected}'\n${stdout}\n${stderr}")
     endif()
 endforeach()
+
+# The supplied span must be in the original input, not the flattened output.
+if(NOT stderr MATCHES "procedural_origin_errors\\.x:34:17: note: token supplied from here")
+    message(FATAL_ERROR "copied token lost its original input span\n${stdout}\n${stderr}")
+endif()

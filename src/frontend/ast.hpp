@@ -4,6 +4,7 @@
 
 #include "common/source.hpp"
 #include "common/uint128.hpp"
+#include "frontend/token.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -168,8 +169,8 @@ struct Expr {
     std::unique_ptr<Expr> third;
     std::vector<std::unique_ptr<Expr>> arguments;
     // Quote literals alternate with token-valued unquotes in arguments.
-    // Currently source fragments; syntax-context hygiene remains to be added.
-    std::vector<std::string> quote_fragments;
+    // Literal token sequences retain definition spans separately from splices.
+    std::vector<TokenSequence> quote_fragments;
     std::vector<GenericArgument> generic_arguments;
     std::vector<InitializerEntry> initializer_entries;
 };

@@ -205,6 +205,11 @@ cross_tool(cross_cpp)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(cross_procedural_tokens_test test/frontend/procedural_tokens_test.cpp)
+    target_link_libraries(cross_procedural_tokens_test PRIVATE cross_frontend)
+    cross_component(cross_procedural_tokens_test)
+    add_test(NAME cross_procedural_tokens COMMAND $<TARGET_FILE:cross_procedural_tokens_test>)
+
     add_executable(cross_address_space_types_test
                    test/frontend/address_space_types_test.cpp)
     target_link_libraries(cross_address_space_types_test PRIVATE cross_middle)

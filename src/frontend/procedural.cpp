@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@ struct Replacement {
     std::string macro_name;
     SourceLocation invocation;
     SourceLocation definition;
+    std::vector<SourceTokenOrigin> token_origins{};
 };
 
 std::optional<std::size_t> matching_group(const std::vector<Token>& tokens,
@@ -276,6 +278,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         function.location = tokens[index].location;
         function.return_type = tokens_type();
         function.source_namespace = current_namespace;
+        function.imports = active_imports(tokens, index);
         function.linkage = Linkage::Static;
         function.parameters.push_back({tokens[*parameter_end - 1].location,
             std::move(parameter), tokens_type(), ParameterMode::In, true, {}});
@@ -286,13 +289,39 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
     return macros;
 }
 
-void apply_replacements(std::string& source,
+std::vector<SourceTokenOrigin> remap_token_origins(
+    const std::vector<SourceTokenOrigin>& source, const Replacement& replacement) {
+    std::vector<SourceTokenOrigin> result;
+    const auto delta = static_cast<std::int64_t>(replacement.text.size()) -
+        static_cast<std::int64_t>(replacement.end - replacement.begin);
+    for (auto token : source) {
+        if (token.end <= replacement.begin) {
+            result.push_back(std::move(token));
+        } else if (token.begin >= replacement.end) {
+            token.begin = static_cast<std::size_t>(static_cast<std::int64_t>(token.begin) + delta);
+            token.end = static_cast<std::size_t>(static_cast<std::int64_t>(token.end) + delta);
+            result.push_back(std::move(token));
+        }
+    }
+    for (auto token : replacement.token_origins) {
+        token.begin += replacement.begin;
+        token.end += replacement.begin;
+        result.push_back(std::move(token));
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        return left.begin < right.begin;
+    });
+    return result;
+}
+
+void apply_replacements(std::string& source, std::vector<SourceTokenOrigin>& origins,
                         std::vector<Replacement> replacements) {
     std::sort(replacements.begin(), replacements.end(),
               [](const Replacement& left, const Replacement& right) {
                   return left.begin > right.begin;
               });
     for (auto& replacement : replacements) {
+        origins = remap_token_origins(origins, replacement);
         source.replace(replacement.begin, replacement.end - replacement.begin,
                        replacement.text);
     }
@@ -325,7 +354,7 @@ const TokenMacro* find_macro(const std::vector<TokenMacro>& macros,
     return exact(written_name);
 }
 
-std::optional<Replacement> find_expansion(const SourceFile& file,
+std::optional<Replacement> find_expansion(SourceManager& sources,
                                           const std::vector<Token>& tokens,
                                            const std::vector<TokenMacro>& macros,
                                            Diagnostics& diagnostics,
@@ -337,8 +366,11 @@ std::optional<Replacement> find_expansion(const SourceFile& file,
         if (tokens[index].kind == TokenKind::Identifier) {
             auto cursor = index;
             const auto name = qualified_name(tokens, cursor, tokens.size());
-            const auto current_namespace = namespace_at(regions, index);
-            const auto imports = active_imports(tokens, index);
+            const auto source_origin = token_origin(tokens[index].location);
+            const auto current_namespace = source_origin.context
+                ? source_origin.context->name_space : namespace_at(regions, index);
+            const auto imports = source_origin.context
+                ? source_origin.context->imports : active_imports(tokens, index);
             if (const auto* macro =
                     find_macro(macros, name, current_namespace, imports);
                 macro && cursor + 1 < tokens.size() &&
@@ -352,24 +384,52 @@ std::optional<Replacement> find_expansion(const SourceFile& file,
                                       "unterminated procedural macro token tree");
                     return std::nullopt;
                 }
-                const auto input_begin = tokens[cursor + 1].location.offset +
-                                         tokens[cursor + 1].text.size();
-                const auto input_end = tokens[*close].location.offset;
                 const auto replacement_end = tokens[*close].location.offset +
                                              tokens[*close].text.size();
+                const auto expansion = sources.next_expansion();
+                auto call_context = std::make_shared<SyntaxContext>();
+                call_context->kind = SyntaxContext::Kind::CallSite;
+                call_context->expansion = expansion;
+                call_context->invocation = tokens[index].location;
+                call_context->name_space = current_namespace;
+                call_context->imports = imports;
+                TokenSequence input;
+                for (auto item = cursor + 2; item < *close; ++item) {
+                    MetaToken token(tokens[item]);
+                    if (!token.origin.context) token.origin.context = call_context;
+                    input.push_back(std::move(token));
+                }
+                auto definition_context = std::make_shared<SyntaxContext>();
+                definition_context->kind = SyntaxContext::Kind::DefinitionSite;
+                definition_context->expansion = expansion;
+                definition_context->definition = macro->location;
+                definition_context->invocation = tokens[index].location;
+                definition_context->name_space = macro->function.source_namespace;
+                definition_context->imports = macro->function.imports;
                 auto output = evaluate_procedural_body(macro->function,
-                    std::string_view(file.text).substr(input_begin, input_end - input_begin),
-                    address_bits, size_of, align_of, tokens[index].location, diagnostics);
+                    input, address_bits, size_of, align_of, definition_context, diagnostics);
                 if (!output) {
                     diagnostics.error(tokens[index].location,
                                       "procedural macro '" + macro->name +
                                           "' did not return a token value");
                     return std::nullopt;
                 }
-                return Replacement{
-                    tokens[index].location.offset, replacement_end,
-                    std::move(*output),
-                    macro->name, tokens[index].location, macro->location};
+                Replacement replacement{tokens[index].location.offset, replacement_end,
+                    " ", macro->name, tokens[index].location, macro->location};
+                for (std::size_t position = 0; position < output->size(); ++position) {
+                    auto& token = (*output)[position];
+                    if (!token.origin.identity.source_unit) {
+                        token.origin.identity = {source_origin.identity.source_unit, 0,
+                                                 expansion, position};
+                    }
+                    const auto begin = replacement.text.size();
+                    replacement.text += token.text;
+                    replacement.token_origins.push_back({begin, replacement.text.size(), token.origin});
+                    // Serialization is the only text boundary. Never paste two
+                    // adjacent token spellings into a different lexical token.
+                    replacement.text += ' ';
+                }
+                return replacement;
             }
         }
     }
@@ -444,22 +504,29 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
     std::vector<Replacement> removals;
     auto macros = collect_macros(definition_tokens, removals, diagnostics);
     if (diagnostics.errors() != 0) return definition_file;
-    apply_replacements(result, std::move(removals));
-    auto* current = sources.add(path, result);
-    if (macros.empty()) return current;
+    if (macros.empty()) return definition_file;
+    std::vector<SourceTokenOrigin> token_origins;
+    for (const auto& token : definition_tokens) {
+        if (token.kind != TokenKind::End)
+            token_origins.push_back({token.location.offset,
+                token.location.offset + token.text.size(), token_origin(token.location)});
+    }
+    apply_replacements(result, token_origins, std::move(removals));
+    auto* current = sources.add(path, result, {}, std::move(token_origins));
 
     for (unsigned expansion = 0; expansion < 128; ++expansion) {
         Lexer lexer(*current, diagnostics);
         const auto tokens = lexer.lex();
         if (diagnostics.errors() != 0) return current;
         auto replacement =
-            find_expansion(*current, tokens, macros, diagnostics,
+            find_expansion(sources, tokens, macros, diagnostics,
                            address_bits, size_of, align_of);
         if (!replacement) return current;
         auto origins = remap_expansions(*current, *replacement);
+        token_origins = remap_token_origins(current->token_origins, *replacement);
         result.replace(replacement->begin, replacement->end - replacement->begin,
                        replacement->text);
-        current = sources.add(path, result, std::move(origins));
+        current = sources.add(path, result, std::move(origins), std::move(token_origins));
     }
     diagnostics.command_error(
         "procedural macro expansion exceeded 128 explicit invocations");

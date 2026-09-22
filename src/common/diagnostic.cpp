@@ -39,6 +39,13 @@ void Diagnostics::report(DiagnosticLevel level, SourceLocation location,
     };
 
     emit(location, label, message);
+    if (location.file && location.file->expansion_at(location.offset)) {
+        if (const auto* token = location.file->token_origin_at(location.offset);
+            token && token->span.valid() && token->identity.expansion.value == 0 &&
+            (token->span.file != location.file || token->span.offset != location.offset)) {
+            emit(token->span, "note", "token supplied from here");
+        }
+    }
     auto origin = location;
     for (unsigned depth = 0; origin.valid() && depth < 64; ++depth) {
         const auto* expansion = origin.file->expansion_at(origin.offset);

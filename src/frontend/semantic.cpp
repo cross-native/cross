@@ -1723,7 +1723,7 @@ struct EvalValue {
     // Binding it to a typed cell/parameter/result consumes this distinction.
     bool function_designator{};
     // Immutable token storage is distinct from both strings and integers.
-    std::shared_ptr<const std::string> tokens;
+    std::shared_ptr<const TokenSequence> tokens;
 
     EvalValue() = default;
     EvalValue(UInt128 integer_value, TypePtr value_type,
@@ -1856,12 +1856,12 @@ public:
               const LayoutQuery* size_of = nullptr,
               const LayoutQuery* align_of = nullptr,
               const GenericPointerResolver* pointer_resolver = nullptr,
-              bool procedural = false)
+              std::shared_ptr<const SyntaxContext> macro_context = {})
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller),
           current_namespace_(std::move(current_namespace)),
           size_of_(size_of), align_of_(align_of), pointer_resolver_(pointer_resolver),
-          procedural_(procedural) {}
+          procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)) {}
 
     std::unique_ptr<Expr> required_pointer(const Expr& source, const TypePtr& destination) {
         if (!validate_required_tree(source)) return {};
@@ -2022,9 +2022,13 @@ public:
                 fail(expression.location, "$::quote requires procedural macro execution");
                 return std::nullopt;
             }
-            std::string result;
+            TokenSequence result;
             for (std::size_t index = 0; index < expression.quote_fragments.size(); ++index) {
-                if (!append_tokens(result, expression.quote_fragments[index], expression.location))
+                auto literal = expression.quote_fragments[index];
+                for (auto& token : literal) {
+                    token.origin = {token_origin(macro_context_->invocation).span, {}, macro_context_};
+                }
+                if (!append_tokens(result, literal, expression.location))
                     return std::nullopt;
                 if (index == expression.arguments.size()) break;
                 auto value = this->expression(*expression.arguments[index]);
@@ -2159,32 +2163,37 @@ private:
                     [](const ParameterDecl& parameter) { return contains_tokens(parameter.type); }))));
     }
 
-    static EvalValue token_value(std::string text) {
+    static EvalValue token_value(TokenSequence tokens) {
         EvalValue result{UInt128{}, tokens_type()};
-        result.tokens = std::make_shared<const std::string>(std::move(text));
+        result.tokens = std::make_shared<const TokenSequence>(std::move(tokens));
         return result;
     }
 
-    bool append_tokens(std::string& result, std::string_view part, SourceLocation location) {
+    bool append_tokens(TokenSequence& result, const TokenSequence& part, SourceLocation location) {
         // Charge materialized output, including intermediate copies, so a
         // bounded loop cannot grow token storage exponentially without limit.
         constexpr std::size_t budget = 16 * 1024 * 1024;
-        if (part.size() >= budget - token_bytes_) {
-            fail(location, "translation-time token construction budget exceeded 16777216 bytes");
-            return false;
+        // Logical metadata charge, not sizeof(MetaToken): resource decisions
+        // must not depend on the host C++ library's string/pointer layout.
+        constexpr std::size_t metadata_cost = 128;
+        for (const auto& token : part) {
+            if (token.text.size() >= budget - token_bytes_ ||
+                metadata_cost > budget - token_bytes_ - token.text.size()) {
+                fail(location, "translation-time token construction budget exceeded 16777216 bytes");
+                return false;
+            }
+            token_bytes_ += token.text.size() + metadata_cost;
         }
-        token_bytes_ += part.size() + 1;
-        result += part;
-        result += '\n'; // Keep token boundaries, including trailing line comments.
+        result.insert(result.end(), part.begin(), part.end());
         return true;
     }
 
-    bool validate_parsed_tokens(std::string_view text, SourceLocation location) {
+    std::optional<TokenSequence> parse_tokens(std::string_view text, SourceLocation location) {
         // Lex at the string boundary without retaining pointers into this
         // temporary source. Diagnostics belong to the actual macro expression.
         if (text.find('\0') != std::string_view::npos) {
             fail(location, "$::meta::parse string contains a zero byte");
-            return false;
+            return std::nullopt;
         }
         SourceFile source("<meta::parse>", std::string(text));
         std::ostringstream output;
@@ -2192,7 +2201,7 @@ private:
         const auto tokens = Lexer(source, diagnostics).lex();
         if (diagnostics.errors() != 0) {
             fail(location, "$::meta::parse could not tokenize its string");
-            return false;
+            return std::nullopt;
         }
         std::vector<std::string_view> closers;
         for (const auto& token : tokens) {
@@ -2203,16 +2212,23 @@ private:
             else if (token.is(")") || token.is("]") || token.is("]]") || token.is("}")) {
                 if (closers.empty() || closers.back() != token.text) {
                     fail(location, "$::meta::parse requires balanced token groups");
-                    return false;
+                    return std::nullopt;
                 }
                 closers.pop_back();
             }
         }
         if (!closers.empty()) {
             fail(location, "$::meta::parse requires balanced token groups");
-            return false;
+            return std::nullopt;
         }
-        return true;
+        TokenSequence result;
+        for (const auto& token : tokens) {
+            if (token.kind == TokenKind::End) break;
+            MetaToken value(token);
+            value.origin = {token_origin(macro_context_->invocation).span, {}, macro_context_};
+            result.push_back(std::move(value));
+        }
+        return result;
     }
 
     const FunctionDecl* direct_function(const Expr& expression) {
@@ -3281,7 +3297,7 @@ private:
                                                 : "$::meta::concat requires two token arguments");
                 return std::nullopt;
             }
-            std::string result;
+            TokenSequence result;
             for (const auto& argument : expression.arguments) {
                 auto value = this->expression(*argument);
                 if (!value) return std::nullopt;
@@ -3290,12 +3306,13 @@ private:
                                                    : "$::meta::concat requires token values");
                     return std::nullopt;
                 }
-                const auto part = parse
-                    ? std::string_view(*value->string).substr(value->offset,
-                          value->string->size() - value->offset - 1)
-                    : std::string_view(*value->tokens);
-                if (!append_tokens(result, part, argument->location)) return std::nullopt;
-                if (parse && !validate_parsed_tokens(part, argument->location)) return std::nullopt;
+                if (parse) {
+                    auto part = parse_tokens(std::string_view(*value->string).substr(value->offset,
+                        value->string->size() - value->offset - 1), argument->location);
+                    if (!part || !append_tokens(result, *part, argument->location)) return std::nullopt;
+                } else if (!append_tokens(result, *value->tokens, argument->location)) {
+                    return std::nullopt;
+                }
             }
             return token_value(std::move(result));
         }
@@ -3578,6 +3595,7 @@ private:
     const LayoutQuery* align_of_{};
     const GenericPointerResolver* pointer_resolver_{};
     bool procedural_{};
+    std::shared_ptr<const SyntaxContext> macro_context_;
     std::size_t token_bytes_{};
     std::vector<std::unordered_map<std::string, Cell>> scopes_;
     std::size_t frame_base_{};
@@ -5169,21 +5187,22 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
     return diagnostics.errors() == 0;
 }
 
-std::optional<std::string> evaluate_procedural_body(
-    const FunctionDecl& macro, std::string_view input, unsigned address_bits,
+std::optional<TokenSequence> evaluate_procedural_body(
+    const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
-    SourceLocation invocation, Diagnostics& diagnostics) {
+    std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics) {
     Program context;
     context.address_bits = address_bits;
+    const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &macro, macro.source_namespace,
-                        &size_of, &align_of, nullptr, true);
+                        &size_of, &align_of, nullptr, std::move(macro_context));
     if (!evaluator.validate_procedural_body(macro)) {
         evaluator.diagnose(macro.location);
         diagnostics.note(invocation, "while expanding procedural macro '" + macro.name + "'");
         return std::nullopt;
     }
     EvalValue argument{UInt128{}, tokens_type()};
-    argument.tokens = std::make_shared<const std::string>(input);
+    argument.tokens = std::make_shared<const TokenSequence>(input);
     const auto result = evaluator.call(macro, {argument}, invocation);
     if (!result || !result->tokens) {
         evaluator.diagnose(invocation);

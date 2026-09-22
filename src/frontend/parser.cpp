@@ -1996,21 +1996,17 @@ std::unique_ptr<Expr> Parser::parse_quote() {
     if (!parsing_procedural_body_)
         error_here("$::quote is only available in translation-time macro bodies");
     ++index_;
-    const auto opening = current();
     if (!expect("{", "after $::quote")) return result;
-    const auto* file = opening.location.file;
-    auto literal_begin = opening.location.offset + opening.text.size();
+    TokenSequence literal;
     std::vector<std::string_view> closers{"}"};
     while (current().kind != TokenKind::End) {
         if (current().is("$::unquote")) {
-            result->quote_fragments.push_back(file->text.substr(
-                literal_begin, current().location.offset - literal_begin));
+            result->quote_fragments.push_back(std::move(literal));
+            literal.clear();
             ++index_;
             if (!expect("(", "after $::unquote")) return result;
             result->arguments.push_back(parse_expression());
-            const auto closing = current();
             if (!expect(")", "after $::unquote expression")) return result;
-            literal_begin = closing.location.offset + closing.text.size();
             continue;
         }
         if (current().is("(")) closers.push_back(")");
@@ -2025,12 +2021,12 @@ std::unique_ptr<Expr> Parser::parse_quote() {
             }
             closers.pop_back();
             if (closers.empty()) {
-                result->quote_fragments.push_back(file->text.substr(
-                    literal_begin, current().location.offset - literal_begin));
+                result->quote_fragments.push_back(std::move(literal));
                 ++index_;
                 return result;
             }
         }
+        literal.emplace_back(current());
         ++index_;
     }
     error_here("unterminated $::quote token tree");

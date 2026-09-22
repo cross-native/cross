@@ -9,14 +9,32 @@
 namespace cross {
 
 SourceFile::SourceFile(std::filesystem::path source_path, std::string source_text,
-                       std::vector<SourceExpansion> source_expansions)
+                       std::vector<SourceExpansion> source_expansions,
+                       std::vector<SourceTokenOrigin> source_token_origins)
     : path(std::move(source_path)), text(std::move(source_text)),
-      expansions(std::move(source_expansions)) {
+      expansions(std::move(source_expansions)),
+      token_origins(std::move(source_token_origins)) {
     for (std::size_t i = 0; i < text.size(); ++i) {
         if (text[i] == '\n') {
             line_starts.push_back(i + 1);
         }
     }
+}
+
+const TokenOrigin* SourceFile::token_origin_at(std::size_t offset) const {
+    const auto found = std::lower_bound(token_origins.begin(), token_origins.end(), offset,
+        [](const SourceTokenOrigin& origin, std::size_t position) {
+            return origin.end <= position;
+        });
+    return found != token_origins.end() && found->begin <= offset
+        ? &found->origin : nullptr;
+}
+
+TokenOrigin token_origin(SourceLocation location) {
+    if (location.file) {
+        if (const auto* origin = location.file->token_origin_at(location.offset)) return *origin;
+    }
+    return {location, {location.file, location.offset, {}, 0}, {}};
 }
 
 const SourceExpansion* SourceFile::expansion_at(std::size_t offset) const {
@@ -68,9 +86,11 @@ const SourceFile* SourceManager::add(std::filesystem::path path, std::string tex
 
 const SourceFile* SourceManager::add(
     std::filesystem::path path, std::string text,
-    std::vector<SourceExpansion> expansions) {
+    std::vector<SourceExpansion> expansions,
+    std::vector<SourceTokenOrigin> token_origins) {
     files_.push_back(std::make_unique<SourceFile>(
-        std::move(path), std::move(text), std::move(expansions)));
+        std::move(path), std::move(text), std::move(expansions),
+        std::move(token_origins)));
     return files_.back().get();
 }
 
