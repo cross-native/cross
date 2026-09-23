@@ -69,6 +69,13 @@ expect_error(shift "#if 1 << 64\n#endif\n" "shift count")
 expect_error(ternary "#if 1 ? 2 : 3\n#endif\n" "unexpected token")
 expect_error(builtin "#undef $::target::abi\n" "non-builtin macro name")
 expect_error(unknown "#iffoo 1\n" "unsupported preprocessing directive")
+expect_error(require_false "#require 0\n" "#require condition is false")
+expect_error(require_reason "#require 0, \"needed, now\"\n" "#require condition is false: needed, now")
+expect_error(require_reason_macro "#define WHY \"expanded reason\"\n#require 0, WHY\n" "#require condition is false: expanded reason")
+expect_error(require_invalid_reason "#require 0, \"one\" \"two\"\n" "#require reason must be one string literal")
+expect_error(require_missing "#require , \"missing\"\n" "expected integer expression")
+expect_error(require_nested "#require UNKNOWN(1, 2), \"nested\"\n" "unexpected token")
+expect_error(require_feature "#require $::has_feature($::feature::not_a_real_feature)\n" "#require condition is false")
 
 set(included "${OUTPUT}.included.x")
 file(WRITE "${included}" "\n\n#if 1 / 0\n#endif\n")
@@ -77,4 +84,15 @@ execute_process(COMMAND "${CPP}" "${OUTPUT}.include.x" -o "${OUTPUT}.include.i"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(status EQUAL 0 OR NOT err MATCHES "included\\.x:3:1: error: division by zero")
     message(FATAL_ERROR "lost included-file diagnostic location\n${out}\n${err}")
+endif()
+
+file(WRITE "${OUTPUT}.require-included.x" "\n\n#require 0, \"from include\"\n")
+file(WRITE "${OUTPUT}.require-include.x"
+    "#include \"${OUTPUT}.require-included.x\"\n")
+execute_process(COMMAND "${CPP}" "${OUTPUT}.require-include.x"
+    -o "${OUTPUT}.require-include.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES
+   "require-included\\.x:3:1: error: #require condition is false: from include")
+    message(FATAL_ERROR "lost #require included-file location\n${out}\n${err}")
 endif()

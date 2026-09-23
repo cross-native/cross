@@ -3,6 +3,11 @@
 #define PRESENT 17
 #define EMPTY
 #define FUNCTION(x) ((x) + 1)
+#define REQUIRE_VALUE 23
+#define REQUIRE_REASON "expanded reason"
+
+#require COMMAND_PRESENT == REQUIRE_VALUE, REQUIRE_REASON
+#require $::has_abi($::target::abi) || $::has_patch_operand($::_nop, 0, u32), "resolved target"
 
 #if defined(MISSING) || 0 && PRESENT
 #error a false condition was selected
@@ -15,6 +20,7 @@ global i32 correct_branch = 42;
 #endif
 
 #if 0
+#require 1 / 0, 123
 #define HIDDEN 1
 #if ( invalid syntax ignored in inactive group
 #error inactive nested group

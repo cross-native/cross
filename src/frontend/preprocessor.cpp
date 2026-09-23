@@ -120,6 +120,41 @@ Directive directive(std::string_view text) {
     return {body.substr(0, end), trim(std::string_view(body).substr(end))};
 }
 
+std::optional<std::size_t> top_level_comma(std::string_view text) {
+    unsigned parentheses = 0;
+    char quote = 0;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char ch = text[index];
+        if (quote) {
+            if (ch == '\\' && index + 1 < text.size()) ++index;
+            else if (ch == quote) quote = 0;
+        } else if (ch == '\'' || ch == '"') {
+            quote = ch;
+        } else if (ch == '(') {
+            ++parentheses;
+        } else if (ch == ')' && parentheses != 0) {
+            --parentheses;
+        } else if (ch == ',' && parentheses == 0) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> require_reason(std::string_view text) {
+    const auto literal = trim(text);
+    if (literal.size() < 2 || literal.front() != '"') return std::nullopt;
+    for (std::size_t index = 1; index < literal.size(); ++index) {
+        if (literal[index] == '\\' && index + 1 < literal.size()) {
+            ++index;
+        } else if (literal[index] == '"') {
+            if (index != literal.size() - 1) return std::nullopt;
+            return decode_string_literal(literal);
+        }
+    }
+    return std::nullopt;
+}
+
 bool valid_macro_name(std::string_view text) {
     if (text.starts_with("$::")) text.remove_prefix(3);
     for (;;) {
@@ -609,8 +644,14 @@ std::string Preprocessor::expand_text(std::string_view text,
             disabled.erase(name);
             continue;
         }
-        if (name.starts_with("$::has_")) output += evaluate_query(name, arguments);
-        else output += substitute(macro, arguments, disabled, depth + 1, condition);
+        if (name.starts_with("$::has_")) {
+            for (auto& query_argument : arguments)
+                query_argument = expand_text(query_argument, disabled,
+                                             depth + 1, condition);
+            output += evaluate_query(name, arguments);
+        } else {
+            output += substitute(macro, arguments, disabled, depth + 1, condition);
+        }
         disabled.erase(name);
     }
     return output;
@@ -739,6 +780,35 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
         }
         if (command.name == "warning") {
             diagnostics_.warning(location, "#warning " + command.operand);
+            continue;
+        }
+        if (command.name == "require") {
+            std::unordered_set<std::string> disabled;
+            const auto errors = diagnostics_.errors();
+            const auto expanded = expand_text(command.operand, disabled, 0,
+                                              location);
+            if (diagnostics_.errors() != errors) continue;
+            const auto separator = top_level_comma(expanded);
+            const auto condition = trim(std::string_view(expanded).substr(
+                0, separator.value_or(expanded.size())));
+            std::optional<std::string> reason;
+            if (separator) {
+                reason = require_reason(
+                    std::string_view(expanded).substr(*separator + 1));
+                if (!reason) {
+                    diagnostics_.error(
+                        location, "#require reason must be one string literal");
+                    continue;
+                }
+            }
+            const auto expression_errors = diagnostics_.errors();
+            const bool satisfied = evaluate_preprocessing_condition(
+                condition, location, diagnostics_, address_bits);
+            if (diagnostics_.errors() == expression_errors && !satisfied) {
+                diagnostics_.error(
+                    location, "#require condition is false" +
+                                  (reason ? ": " + *reason : std::string{}));
+            }
             continue;
         }
         diagnostics_.error(location, "unsupported preprocessing directive");
