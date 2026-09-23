@@ -2400,7 +2400,7 @@ private:
                     name_key(destination_expression))) {
                 diagnostics_.error(
                     destination_expression.location,
-                    "raw_inline cannot modify an 'in' parameter; copy it to a local first");
+                    "raw_inline cannot modify a const parameter cell");
                 return false;
             }
             bool lowered{};
@@ -2485,6 +2485,69 @@ private:
         return lowered;
     }
 
+    bool raw_parameter_written(const Expr& expression,
+                               const NameKey& parameter) const {
+        const bool write = expression.kind == Expr::Kind::Assign ||
+            (expression.kind == Expr::Kind::Unary &&
+             (expression.text == "++" || expression.text == "--" ||
+              expression.text == "post++" || expression.text == "post--"));
+        if (write && expression.left) {
+            const auto& target = unparenthesized(*expression.left);
+            if (target.kind == Expr::Kind::Name &&
+                name_key(target) == parameter) return true;
+        }
+        if (expression.kind == Expr::Kind::Call && expression.left) {
+            const auto* callee = expression.left->kind == Expr::Kind::Name
+                ? raw_inline_function(expression.left->text) : nullptr;
+            for (std::size_t index = 0; callee && index < expression.arguments.size(); ++index) {
+                if (index >= callee->parameters.size() ||
+                    callee->parameters[index].mode == ParameterMode::In)
+                    continue;
+                const auto& actual = unparenthesized(*expression.arguments[index]);
+                if (actual.kind == Expr::Kind::Name &&
+                    name_key(actual) == parameter) return true;
+            }
+        }
+        if (expression.left && raw_parameter_written(*expression.left, parameter))
+            return true;
+        if (expression.right && raw_parameter_written(*expression.right, parameter))
+            return true;
+        if (expression.third && raw_parameter_written(*expression.third, parameter))
+            return true;
+        for (const auto& argument : expression.arguments)
+            if (raw_parameter_written(*argument, parameter)) return true;
+        for (const auto& entry : expression.initializer_entries) {
+            if (entry.value && raw_parameter_written(*entry.value, parameter))
+                return true;
+            for (const auto& designator : entry.designators)
+                if (designator.index &&
+                    raw_parameter_written(*designator.index, parameter))
+                    return true;
+        }
+        return false;
+    }
+
+    bool raw_parameter_written(const Statement& statement,
+                               const NameKey& parameter) const {
+        if (statement.declaration) {
+            if (statement.declaration->dynamic_array_bound &&
+                raw_parameter_written(*statement.declaration->dynamic_array_bound,
+                                      parameter)) return true;
+            if (statement.declaration->initializer &&
+                raw_parameter_written(*statement.declaration->initializer,
+                                      parameter)) return true;
+        }
+        for (const auto* expression : {statement.expression.get(),
+                                       statement.condition.get(),
+                                       statement.increment.get()})
+            if (expression && raw_parameter_written(*expression, parameter))
+                return true;
+        for (const auto& child : statement.statements)
+            if (raw_parameter_written(*child, parameter)) return true;
+        return (statement.first && raw_parameter_written(*statement.first, parameter)) ||
+               (statement.second && raw_parameter_written(*statement.second, parameter));
+    }
+
     bool lower_raw_inline_call(const Expr& expression,
                                const RegisterEntry* destination) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
@@ -2554,7 +2617,11 @@ private:
             const auto& argument =
                 unparenthesized(*expression.arguments[index]);
             const RegisterEntry* binding = nullptr;
-            if (argument.kind == Expr::Kind::Name) {
+            const bool copy_input_cell = parameter.mode == ParameterMode::In &&
+                !parameter.type->is_const &&
+                raw_parameter_written(*callee->definition->body,
+                                      name_key(parameter));
+            if (!copy_input_cell && argument.kind == Expr::Kind::Name) {
                 const auto found = saved_bindings.find(name_key(argument));
                 const auto found_type = saved_types.find(name_key(argument));
                 const bool floating_mismatch =
@@ -2590,7 +2657,8 @@ private:
             binding_types_[name_key(parameter)] = parameter.type;
             binding_signed_[name_key(parameter)] =
                 signed_integer_type(parameter.type);
-            readonly_names.insert(name_key(parameter));
+            if (parameter.type->is_const)
+                readonly_names.insert(name_key(parameter));
         }
 
         const auto continuation = new_block(expression.location);

@@ -9,6 +9,20 @@ static u64 mix(in u64 value) {
 }
 
 [[raw_inline]]
+static u64 copyin_bump(in u64 value) {
+    value += 9u64;
+    return value;
+}
+
+[[naked, clobber("r10", "flags")]]
+static u64 raw_copyin_bump(in u64 value "r9") -> "r8" {
+    register u64 result "r8";
+    result = copyin_bump(value);
+    result += value;
+    $::_ret();
+}
+
+[[raw_inline]]
 static u64 structured(in u64 value) {
     u64 x = value;
     u64 iteration = 0;
@@ -242,6 +256,10 @@ static u64 raw_f32_is_less(in f32 value "xmm4") -> "r8" {
 
 global u64 raw_inline_mix_entry(in u64 value) {
     return raw_mix(value);
+}
+
+global u64 raw_inline_copyin_entry(in u64 value) {
+    return raw_copyin_bump(value);
 }
 
 global u64 raw_inline_structured_entry(in u64 value) {

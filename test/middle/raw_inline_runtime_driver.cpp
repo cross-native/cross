@@ -10,6 +10,7 @@
 #endif
 
 extern "C" CROSS_ABI std::uint64_t raw_inline_mix_entry(std::uint64_t);
+extern "C" CROSS_ABI std::uint64_t raw_inline_copyin_entry(std::uint64_t);
 extern "C" CROSS_ABI std::uint64_t raw_inline_structured_entry(std::uint64_t);
 extern "C" CROSS_ABI std::uint64_t raw_inline_load_entry(std::uint64_t*);
 extern "C" CROSS_ABI void raw_inline_store_entry(std::uint64_t, std::uint64_t*);
@@ -62,6 +63,7 @@ int main() {
         raw_inline_structured_entry(20) != structured(20)) {
         return 1;
     }
+    if (raw_inline_copyin_entry(7) != 23) return 18;
     std::uint64_t memory = 37;
     if (raw_inline_load_entry(&memory) != 42) return 2;
     raw_inline_store_entry(input, &memory);
