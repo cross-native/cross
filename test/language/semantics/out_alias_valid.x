@@ -61,6 +61,30 @@ done:
 }
 
 struct alias_record { u8 tag; uptr count; i32 values[2]; };
+// A top-level const on an in cell does not change its callable identity.
+[[noinline]] static i32 copyin_local(in const i32 value);
+[[noinline]] static i32 copyin_local(i32 value) {
+    value += 5;
+    return value;
+}
+typedef i32 (*copyin_callback)(in const i32);
+typedef void (*copyout_callback)(out i32);
+[[noinline]] static i32 copyin_nested_output(i32 value) {
+    write_value(value);
+    return value;
+}
+[[noinline]] static i32 copyin_indirect_output(i32 value) {
+    copyout_callback callback = write_value;
+    callback(value);
+    return value;
+}
+[[noinline]] static u8 copyin_record(struct alias_record value) {
+    value.tag = 19u8;
+    return value.tag;
+}
+[[noinline]] static u8 copyin_readonly_record(in const struct alias_record value) {
+    return value.tag;
+}
 [[noinline]] static void member_alias(out struct alias_record x) {
     struct alias_record *p = &x;
     p->tag = 3u8;
@@ -79,6 +103,10 @@ struct alias_bits { u32 first : 3; u32 second : 5; };
 }
 
 #ifdef CUSTOM_ALIAS_ABI
+[[abi("odd_abi"), noinline]] static i32 copyin_odd(i32 value) {
+    value += 11;
+    return value;
+}
 [[abi("odd_abi"), noinline]] static i32 register_alias(out i32 x) {
     i32 *p = &x;
     *p = 53;
@@ -108,6 +136,13 @@ struct alias_result { u64 first; u64 second; };
 #endif
 [[link_name("out_alias_entry")]] global i32 out_alias_entry() {
     i32 x = 0;
+    copyin_callback callback = copyin_local;
+    x = 7;
+    if (copyin_local(x) != 12 || x != 7) return 18;
+    if (callback(x) != 12 || x != 7) return 19;
+    if (copyin_nested_output(x) != 31 || x != 7) return 22;
+    if (copyin_indirect_output(x) != 31 || x != 7) return 24;
+    x = 0;
     local_alias(x); if (x != 9) return 1;
     joined_alias(x, 0); if (x != 13) return 2;
     joined_alias(x, 1); if (x != 13) return 3;
@@ -123,10 +158,14 @@ struct alias_result { u64 first; u64 second; };
     member_alias(record);
     if (record.tag != 3u8 || record.count != 41uptr ||
         record.values[0] != 43 || record.values[1] != 47) return 12;
+    if (copyin_record(record) != 19u8 || record.tag != 3u8) return 20;
+    if (copyin_readonly_record(record) != 3u8) return 23;
     struct alias_bits bits;
     bitfield_alias(bits);
     if (bits.first != 5u32 || bits.second != 19u32) return 13;
 #ifdef CUSTOM_ALIAS_ABI
+    x = 7;
+    if (copyin_odd(x) != 18 || x != 7) return 21;
     i32 result = register_alias(x); if (x != 53 || result != 59) return 14;
     result = stack_alias(x); if (x != 61 || result != 67) return 15;
     struct alias_result memory = memory_alias(x);

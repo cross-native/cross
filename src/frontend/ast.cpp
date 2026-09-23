@@ -188,7 +188,7 @@ std::string canonical_type_name(const TypePtr& type) {
             result += parameter.mode == ParameterMode::In    ? 'i'
                       : parameter.mode == ParameterMode::Out ? 'o'
                                                              : 'b';
-            append(parameter.type);
+            append(callable_parameter_type(parameter.type, parameter.mode));
         }
         result += signature.variadic ? "zE" : "E";
         return result;
@@ -248,7 +248,10 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
             return false;
         for (std::size_t index = 0; index < a.parameters.size(); ++index) {
             if (a.parameters[index].mode != b.parameters[index].mode ||
-                !same_type(a.parameters[index].type, b.parameters[index].type))
+                !same_type(callable_parameter_type(a.parameters[index].type,
+                                                   a.parameters[index].mode),
+                           callable_parameter_type(b.parameters[index].type,
+                                                   b.parameters[index].mode)))
                 return false;
         }
         return true;
@@ -269,6 +272,13 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
     }
     return left->builtin == right->builtin &&
            left->nominal_name == right->nominal_name;
+}
+
+TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode) {
+    if (!type || mode != ParameterMode::In || !type->is_const) return type;
+    auto normalized = std::make_shared<Type>(*type);
+    normalized->is_const = false;
+    return normalized;
 }
 
 bool compatible_pointee(const TypePtr& source, const TypePtr& destination,

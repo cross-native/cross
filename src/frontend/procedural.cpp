@@ -232,17 +232,32 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                               "unterminated 'macro' parameter list");
             continue;
         }
-        if (*parameter_end != cursor + 4 ||
-            tokens[cursor + 1].text != "in" ||
-            tokens[cursor + 2].text != "$::meta::tokens" ||
-            tokens[cursor + 3].kind != TokenKind::Identifier) {
+        const bool valid_length =
+            *parameter_end == cursor + 4 ||
+            *parameter_end == cursor + 5;
+        if (!valid_length) {
             diagnostics.error(
                 tokens[cursor].location,
-                "'macro' requires exactly one 'in $::meta::tokens name' "
+                "'macro' requires exactly one 'in [const] $::meta::tokens name' "
                 "parameter");
             continue;
         }
-        std::string parameter(tokens[cursor + 3].text);
+        const bool local_const =
+            *parameter_end == cursor + 5 &&
+            tokens[cursor + 2].text == "const";
+        const auto type_index = cursor + (local_const ? 3 : 2);
+        const auto name_index = type_index + 1;
+        if ((*parameter_end != cursor + 4 && !local_const) ||
+            tokens[cursor + 1].text != "in" ||
+            tokens[type_index].text != "$::meta::tokens" ||
+            tokens[name_index].kind != TokenKind::Identifier) {
+            diagnostics.error(
+                tokens[cursor].location,
+                "'macro' requires exactly one 'in [const] $::meta::tokens name' "
+                "parameter");
+            continue;
+        }
+        std::string parameter(tokens[name_index].text);
         cursor = *parameter_end + 1;
         if (parameter.empty() || cursor >= tokens.size() ||
             tokens[cursor].text != "{") {
@@ -282,8 +297,10 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         function.source_namespace = current_namespace;
         function.imports = active_imports(tokens, index);
         function.linkage = Linkage::Static;
+        auto parameter_type = tokens_type();
+        parameter_type->is_const = local_const;
         function.parameters.push_back({tokens[*parameter_end - 1].location,
-            std::move(parameter), tokens_type(), ParameterMode::In, true, {}});
+            std::move(parameter), std::move(parameter_type), ParameterMode::In, true, {}});
         function.body = std::move(body);
         macros.push_back({std::move(name), std::move(function), tokens[index].location});
         index = *body_end;

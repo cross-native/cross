@@ -95,6 +95,10 @@ unsigned type_bits(const TypePtr& type);
 enum class Linkage { Group, Static, Global };
 enum class ParameterMode { In, Out, InOut };
 
+// The top-level const of an in parameter qualifies its local cell, not the
+// callable boundary. Preserve all nested and non-const qualifiers.
+TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode);
+
 struct Expr;
 struct ObjectDecl;
 struct FunctionDecl;
@@ -237,7 +241,7 @@ struct ParameterDecl {
     SourceLocation location;
     std::string name;
     TypePtr type;
-    ParameterMode mode{ParameterMode::InOut};
+    ParameterMode mode{ParameterMode::In};
     bool explicit_mode{};
     std::optional<std::string> location_name;
 };

@@ -35,7 +35,7 @@ global u64 native_rotate(in u64 value, in u64 count) {
     return (value << count) | (value >> (64u64 - count));
 }
 
-global void native_adjust(i64 value) {
+global void native_adjust(inout i64 value) {
     value += 2;
 }
 

@@ -31,7 +31,7 @@ i32 optimization_pure_leaf(in i32 value) {
 }
 
 [[noinline, link_name("optimization_cell_leaf")]]
-void optimization_cell_leaf(i32 value) {
+void optimization_cell_leaf(inout i32 value) {
     value += 1;
 }
 

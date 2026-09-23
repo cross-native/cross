@@ -1,1 +1,1 @@
-global void invalid(i32 value, ...);
+global void invalid(inout i32 value, ...);

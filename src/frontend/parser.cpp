@@ -1320,11 +1320,13 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     std::optional<std::string> name;
     parameter.type = parse_declarator(std::move(parameter.type), name, true,
                                       nullptr, &parameter.location);
+    if (parameter.mode != ParameterMode::In && parameter.type &&
+        parameter.type->is_const) {
+        diagnostics_.error(parameter.location,
+                           "'out' and 'inout' parameter cells cannot be const");
+    }
     parameter.name = name.value_or("_parameter" + std::to_string(ordinal));
     apply_callable_attributes(parameter.type, attributes);
-    if (!parameter.explicit_mode && parameter.type && parameter.type->is_const) {
-        parameter.mode = ParameterMode::In;
-    }
     if (const auto* location = consume_kind(TokenKind::String)) {
         parameter.location_name = decode_string_literal(location->text);
         if (!parameter.location_name) diagnostics_.error(location->location, "invalid location string");

@@ -7,7 +7,7 @@ global $::meta::tokens escaped;
 global u64 escaped() { return $::quote { 1u64 }; }
 #else
 [[macro]]
-static $::meta::tokens bad(in $::meta::tokens input) {
+static $::meta::tokens bad(in const $::meta::tokens input) {
 #if defined(OVERFLOW)
     i32 n = 2147483647;
     n += 1;

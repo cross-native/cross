@@ -77,7 +77,7 @@ struct ManualBoundary {
 struct ManualParameterPlan {
     std::size_t parameter_index{};
     hir::TypeId type;
-    ParameterMode mode{ParameterMode::InOut};
+    ParameterMode mode{ParameterMode::In};
     ManualBoundary input;
     ManualBoundary output;
 };

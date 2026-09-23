@@ -64,7 +64,8 @@ std::string resolved_link_name(const FunctionDecl& function,
         parameters.reserve(function.parameters.size());
         for (const auto& parameter : function.parameters) {
             parameters.push_back(
-                {.spelling = canonical_type_name(parameter.type),
+                {.spelling = canonical_type_name(
+                     callable_parameter_type(parameter.type, parameter.mode)),
                  .mode = std::string(parameter_mode_name(parameter.mode))});
         }
         return encode_model_link_name(
@@ -1352,7 +1353,11 @@ private:
         for (std::size_t index = 0; index < canonical.parameters.size(); ++index) {
             const auto& left = canonical.parameters[index];
             const auto& right = declaration.parameters[index];
-            if (left.type != intern_type(right.type) || left.mode != right.mode ||
+            const auto* previous = canonical.declarations.front();
+            const auto& previous_parameter = previous->parameters[index];
+            if (left.mode != right.mode ||
+                !same_type(callable_parameter_type(previous_parameter.type, left.mode),
+                           callable_parameter_type(right.type, right.mode)) ||
                 !same_location(left.physical_location, right.location_name)) return false;
         }
         return true;
@@ -2269,7 +2274,8 @@ TypeId Module::intern_type(const TypePtr& source) {
             for (const auto& parameter : source->function->parameters) {
                 signature.parameters.push_back(
                     {parameter.location, parameter.name,
-                     intern_type(parameter.type), parameter.mode,
+                     intern_type(callable_parameter_type(parameter.type,
+                                                         parameter.mode)), parameter.mode,
                      parameter.location_name});
             }
             candidate.function = std::move(signature);
@@ -2318,6 +2324,10 @@ TypeId Module::intern_type(const TypePtr& source) {
 }
 
 TypeId Module::function_type(FunctionSignature signature) {
+    for (auto& parameter : signature.parameters) {
+        if (parameter.mode == ParameterMode::In)
+            parameter.type = without_top_level_const(parameter.type);
+    }
     for (std::uint32_t index = 0; index < types.size(); ++index) {
         if (types[index].kind == Type::Kind::Function &&
             types[index].function == signature)
@@ -2348,6 +2358,34 @@ TypeId Module::pointer_to(TypeId pointee) {
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(type));
     return id;
+}
+
+TypeId Module::without_top_level_const(TypeId id) {
+    const auto& source = type(id);
+    if (!source.is_const) return id;
+    Type candidate = source;
+    candidate.is_const = false;
+    for (std::uint32_t index = 0; index < types.size(); ++index) {
+        const auto& existing = types[index];
+        if (existing.kind == candidate.kind &&
+            existing.builtin == candidate.builtin &&
+            existing.pointee == candidate.pointee &&
+            existing.record == candidate.record &&
+            existing.function == candidate.function &&
+            existing.element == candidate.element &&
+            existing.lanes == candidate.lanes &&
+            existing.scalable == candidate.scalable &&
+            existing.nominal_name == candidate.nominal_name &&
+            existing.is_const == candidate.is_const &&
+            existing.is_volatile == candidate.is_volatile &&
+            existing.is_restrict == candidate.is_restrict &&
+            existing.is_atomic == candidate.is_atomic &&
+            existing.address_space == candidate.address_space)
+            return {index};
+    }
+    const TypeId result{static_cast<std::uint32_t>(types.size())};
+    types.push_back(std::move(candidate));
+    return result;
 }
 
 TypeId Module::unqualified(TypeId id) {

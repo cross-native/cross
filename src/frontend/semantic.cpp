@@ -395,7 +395,8 @@ std::string generic_link_name(const FunctionDecl& function,
     parameters.reserve(function.parameters.size());
     for (const auto& parameter : function.parameters) {
         parameters.push_back(
-            {.spelling = canonical_type_name(parameter.type),
+            {.spelling = canonical_type_name(
+                 callable_parameter_type(parameter.type, parameter.mode)),
              .mode = std::string(parameter_mode_name(parameter.mode))});
     }
     return encode_model_generic_link_name(
@@ -901,8 +902,10 @@ private:
         for (std::size_t index = 0; index < source.parameters.size(); ++index) {
             if (source.parameters[index].mode !=
                     destination.parameters[index].mode ||
-                !same_type(source.parameters[index].type,
-                           destination.parameters[index].type)) {
+                !same_type(callable_parameter_type(source.parameters[index].type,
+                                                   source.parameters[index].mode),
+                           callable_parameter_type(destination.parameters[index].type,
+                                                   destination.parameters[index].mode))) {
                 return false;
             }
         }
@@ -1915,7 +1918,8 @@ public:
         scopes_.emplace_back();
         for (const auto& parameter : function.parameters)
             scopes_.back()[name_key(parameter)] = {
-                EvalValue{UInt128{}, parameter.type}, false, true};
+                EvalValue{UInt128{}, parameter.type}, false,
+                parameter.type->is_const};
         const bool valid = function.body && validate_macro_statement(*function.body, 0, 0);
         scopes_.pop_back();
         return valid;
@@ -1970,7 +1974,8 @@ public:
             const auto& parameter = function.parameters[index];
             auto value = convert(arguments[index], parameter.type, location);
             if (!value) { valid = false; break; }
-            scopes_.back()[name_key(parameter)] = {*value, true, true};
+            scopes_.back()[name_key(parameter)] = {
+                *value, true, parameter.type->is_const};
         }
         const auto previous = current_function_;
         current_function_ = &function;
@@ -2529,10 +2534,10 @@ private:
             } else if (current_function_) {
                 for (const auto& parameter : current_function_->parameters)
                     if (name_key(parameter) == name_key(*node.left))
-                        read_only = read_only || parameter.mode == ParameterMode::In;
+                        read_only = read_only || parameter.type->is_const;
             }
             if (read_only) {
-                fail(node.location, "cannot write an 'in' or const cell");
+                fail(node.location, "cannot write a const cell");
                 return false;
             }
         }
@@ -3083,7 +3088,7 @@ private:
             auto* cell = lookup_mutable(expression.left->text, expression.left->location);
             if (!cell) return std::nullopt;
             if (cell->read_only) {
-                fail(expression.location, "cannot write an 'in' or const cell");
+                fail(expression.location, "cannot write a const cell");
                 return std::nullopt;
             }
             const auto previous = lookup(*expression.left);
@@ -3231,7 +3236,7 @@ private:
         auto* destination = lookup_mutable(expression.left->text, expression.left->location);
         if (!destination) return std::nullopt;
         if (destination->read_only) {
-            fail(expression.location, "cannot write an 'in' or const cell");
+            fail(expression.location, "cannot write a const cell");
             return std::nullopt;
         }
         const auto destination_type = destination->value.type;
@@ -4567,7 +4572,7 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
         if (!function->body) continue;
         std::vector<NameMap<bool>> scopes(1);
         for (const auto& parameter : function->parameters)
-            scopes.back()[name_key(parameter)] = parameter.mode == ParameterMode::In || parameter.type->is_const;
+            scopes.back()[name_key(parameter)] = parameter.type->is_const;
         const auto check_expression = [&](const auto& self, const Expr* expression) -> void {
             if (!expression) return;
             const bool write = expression->kind == Expr::Kind::Assign ||
@@ -4588,7 +4593,7 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                         read_only = object->type->is_const;
                 }
                 if (read_only.value_or(false))
-                    diagnostics.error(expression->location, "cannot write an 'in' or const cell");
+                    diagnostics.error(expression->location, "cannot write a const cell");
             }
             self(self, expression->left.get());
             self(self, expression->right.get());

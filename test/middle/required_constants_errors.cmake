@@ -50,8 +50,8 @@ reject(generic_unknown "[[generic(i32 N)]] static i32 g() { return N; } global i
     "unresolved name")
 reject(generic_runtime "[[generic(i32 N)]] static i32 g() { return N; } global i32 f(in i32 x) { return g::<x>(); }"
     "not a translation-time value")
-reject(generic_const_write "[[generic(i32 N)]] static i32 g() { return N; } global i32 f(in i32 x) { return g::<1 || ++x>(); }"
-    "cannot write an 'in' or const cell")
+reject(generic_const_write "[[generic(i32 N)]] static i32 g() { return N; } global i32 f(in const i32 x) { return g::<1 || ++x>(); }"
+    "cannot write a const cell")
 reject(budget "[[generic(uptr N)]] static i32 g() { return g::<N + 1>(); } global i32 f() { return g::<0>(); }"
     "generic instantiation budget exceeded")
 

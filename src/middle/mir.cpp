@@ -743,6 +743,12 @@ void collect_address_taken_names(const Expr& expression,
     for (const auto& argument : expression.arguments) {
         collect_address_taken_names(*argument, names);
     }
+    for (const auto& entry : expression.initializer_entries) {
+        if (entry.value) collect_address_taken_names(*entry.value, names);
+        for (const auto& designator : entry.designators)
+            if (designator.index)
+                collect_address_taken_names(*designator.index, names);
+    }
 }
 
 void collect_address_taken_names(const Statement& statement,
@@ -772,6 +778,57 @@ void collect_address_taken_names(const Statement& statement,
     if (statement.second) collect_address_taken_names(*statement.second, names);
 }
 
+void collect_modified_names(const Expr& expression, NameSet& names) {
+    const bool modifying = expression.kind == Expr::Kind::Assign ||
+        (expression.kind == Expr::Kind::Unary &&
+         (expression.text == "++" || expression.text == "--" ||
+          expression.text == "post++" || expression.text == "post--"));
+    if (modifying && expression.left) {
+        const Expr* target = expression.left.get();
+        while (target->kind == Expr::Kind::Parenthesized && target->left)
+            target = target->left.get();
+        if (target->kind == Expr::Kind::Name)
+            names.insert(name_key(*target));
+    }
+    if (expression.left) collect_modified_names(*expression.left, names);
+    if (expression.right) collect_modified_names(*expression.right, names);
+    if (expression.third) collect_modified_names(*expression.third, names);
+    for (const auto& argument : expression.arguments)
+        collect_modified_names(*argument, names);
+    for (const auto& entry : expression.initializer_entries) {
+        if (entry.value) collect_modified_names(*entry.value, names);
+        for (const auto& designator : entry.designators)
+            if (designator.index)
+                collect_modified_names(*designator.index, names);
+    }
+}
+
+void collect_modified_names(const Statement& statement, NameSet& names) {
+    if (statement.declaration) {
+        if (statement.declaration->dynamic_array_bound)
+            collect_modified_names(
+                *statement.declaration->dynamic_array_bound, names);
+        if (statement.declaration->initializer)
+            collect_modified_names(*statement.declaration->initializer, names);
+    }
+    if (statement.expression) collect_modified_names(*statement.expression, names);
+    if (statement.condition) collect_modified_names(*statement.condition, names);
+    if (statement.increment) collect_modified_names(*statement.increment, names);
+    for (const auto& child : statement.statements)
+        collect_modified_names(*child, names);
+    if (statement.first) collect_modified_names(*statement.first, names);
+    if (statement.second) collect_modified_names(*statement.second, names);
+}
+
+void collect_local_names(const Statement& statement, NameSet& names) {
+    if (statement.declaration)
+        names.insert(name_key(*statement.declaration));
+    for (const auto& child : statement.statements)
+        collect_local_names(*child, names);
+    if (statement.first) collect_local_names(*statement.first, names);
+    if (statement.second) collect_local_names(*statement.second, names);
+}
+
 bool contains_dynamic_array(const Statement& statement) {
     if (statement.declaration &&
         statement.declaration->dynamic_array_bound) {
@@ -790,22 +847,24 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
     const auto* abi = find_abi(target, function.abi);
     if (!abi || !abi->function_selectable ||
         (function.variadic && !abi->variadic_supported)) return false;
-    const auto supported_type = [&](hir::TypeId type) {
+    const auto supported_type = [&](hir::TypeId type,
+                                    bool allow_local_const = false) {
         const auto& value = module.type(type);
         if (value.kind == hir::Type::Kind::Pointer) {
             return value.is_atomic || !value.is_volatile;
         }
         if (value.kind == hir::Type::Kind::Vector) {
-            return !value.is_const && !value.is_volatile &&
+            return (!value.is_const || allow_local_const) && !value.is_volatile &&
                    !value.is_atomic && !value.scalable &&
                    value.element && type_bits(module, type) != 0;
         }
         if (value.kind == hir::Type::Kind::Record) {
-            return !value.is_const && !value.is_volatile &&
+            return (!value.is_const || allow_local_const) && !value.is_volatile &&
                    record_value_type(module, type);
         }
         const bool qualifiers_supported =
-            value.is_atomic || (!value.is_const && !value.is_volatile);
+            value.is_atomic ||
+            ((!value.is_const || allow_local_const) && !value.is_volatile);
         return value.kind == hir::Type::Kind::Builtin &&
                qualifiers_supported &&
                (value.builtin == BuiltinType::Void || integer_type(module, type) ||
@@ -813,7 +872,8 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
     };
     if (!supported_type(function.result_type)) return false;
     for (const auto& parameter : function.parameters) {
-        if (!supported_type(parameter.type) ||
+        if (!supported_type(parameter.type,
+                            parameter.mode == ParameterMode::In) ||
             void_type(module, parameter.type)) return false;
     }
     for (const auto& attribute : function.definition->attributes) {
@@ -996,11 +1056,18 @@ private:
         case_blocks_.clear();
         scopes_.clear();
         loops_.clear();
+        current_ = {};
+        current_.source = function.id;
         address_taken_names_.clear();
         collect_address_taken_names(*function.definition->body,
                                     address_taken_names_);
-        current_ = {};
-        current_.source = function.id;
+        modified_names_.clear();
+        collect_modified_names(*function.definition->body, modified_names_);
+        local_names_.clear();
+        for (const auto& parameter : function.parameters)
+            local_names_.insert(name_key(parameter));
+        collect_local_names(*function.definition->body, local_names_);
+        collect_copyout_names(*function.definition->body);
         current_.location = function.location;
         current_.result_type = function.result_type;
         has_dynamic_arrays_ =
@@ -1026,12 +1093,13 @@ private:
             current_.parameters.push_back(value);
             // An atomic-qualified parameter is still transported by value,
             // but source semantics require a distinct atomic callee cell.
-            // Scalar immutable `in` parameters may stay in SSA. Record
-            // designators need a distinct callee cell for members/subobjects.
+            // An unmodified scalar `in` parameter may stay in SSA. Written
+            // parameters and record designators need a distinct callee cell.
             if (parameter.mode == ParameterMode::In &&
                 (!parameter.physical_location ||
                  *parameter.physical_location == "auto") &&
                 !address_taken_names_.contains(name_key(parameter)) &&
+                !modified_names_.contains(name_key(parameter)) &&
                 !hir_.type(parameter.type).is_atomic &&
                 !record_value_type(hir_, parameter.type)) {
                 if (!parameter_values_.emplace(
@@ -1042,10 +1110,7 @@ private:
             }
             const SlotId slot{
                 static_cast<std::uint32_t>(current_.slots.size())};
-            const auto cell_type = parameter.mode == ParameterMode::In &&
-                                           record_value_type(hir_, parameter.type)
-                                       ? hir_.add_qualifiers(parameter.type, true, false)
-                                       : parameter.type;
+            const auto cell_type = parameter.type;
             current_.slots.push_back(
                 {slot, parameter.location, cell_type,
                  "$param." + std::to_string(index), std::nullopt, false,
@@ -1223,22 +1288,24 @@ private:
         return nullptr;
     }
 
-    bool call_type(hir::TypeId type, bool allow_void) const {
+    bool call_type(hir::TypeId type, bool allow_void,
+                   bool allow_local_const = false) const {
         const auto& value = hir_.type(type);
         if (value.kind == hir::Type::Kind::Pointer) {
             return value.is_atomic || !value.is_volatile;
         }
         if (value.kind == hir::Type::Kind::Vector) {
-            return !value.is_const && !value.is_volatile &&
+            return (!value.is_const || allow_local_const) && !value.is_volatile &&
                    !value.is_atomic && !value.scalable &&
                    value.element && type_bits(hir_, type) != 0;
         }
         if (value.kind == hir::Type::Kind::Record) {
-            return !value.is_const && !value.is_volatile &&
+            return (!value.is_const || allow_local_const) && !value.is_volatile &&
                    record_value_type(hir_, type);
         }
         const bool qualifiers_supported =
-            value.is_atomic || (!value.is_const && !value.is_volatile);
+            value.is_atomic ||
+            ((!value.is_const || allow_local_const) && !value.is_volatile);
         return value.kind == hir::Type::Kind::Builtin &&
                qualifiers_supported &&
                ((allow_void && value.builtin == BuiltinType::Void) ||
@@ -1287,6 +1354,55 @@ private:
 
     const hir::Function* resolve_function(NameUse name) const {
         return resolve_value_name(name).first;
+    }
+
+    void collect_copyout_names(const Expr& expression) {
+        if (expression.kind == Expr::Kind::Call && expression.left) {
+            const auto* callee = expression.left->kind == Expr::Kind::Name &&
+                                         !local_names_.contains(name_key(*expression.left))
+                                     ? resolve_function(*expression.left)
+                                     : nullptr;
+            const bool builtin = expression.left->kind == Expr::Kind::Name &&
+                expression.left->text.starts_with("$::");
+            for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+                if (builtin ||
+                    (callee && (index >= callee->parameters.size() ||
+                                callee->parameters[index].mode == ParameterMode::In)))
+                    continue;
+                const Expr* actual = expression.arguments[index].get();
+                while (actual && actual->kind == Expr::Kind::Parenthesized &&
+                       actual->left) actual = actual->left.get();
+                if (actual && actual->kind == Expr::Kind::Name)
+                    modified_names_.insert(name_key(*actual));
+            }
+        }
+        if (expression.left) collect_copyout_names(*expression.left);
+        if (expression.right) collect_copyout_names(*expression.right);
+        if (expression.third) collect_copyout_names(*expression.third);
+        for (const auto& argument : expression.arguments)
+            collect_copyout_names(*argument);
+        for (const auto& entry : expression.initializer_entries) {
+            if (entry.value) collect_copyout_names(*entry.value);
+            for (const auto& designator : entry.designators)
+                if (designator.index)
+                    collect_copyout_names(*designator.index);
+        }
+    }
+
+    void collect_copyout_names(const Statement& statement) {
+        if (statement.declaration) {
+            if (statement.declaration->dynamic_array_bound)
+                collect_copyout_names(*statement.declaration->dynamic_array_bound);
+            if (statement.declaration->initializer)
+                collect_copyout_names(*statement.declaration->initializer);
+        }
+        if (statement.expression) collect_copyout_names(*statement.expression);
+        if (statement.condition) collect_copyout_names(*statement.condition);
+        if (statement.increment) collect_copyout_names(*statement.increment);
+        for (const auto& child : statement.statements)
+            collect_copyout_names(*child);
+        if (statement.first) collect_copyout_names(*statement.first);
+        if (statement.second) collect_copyout_names(*statement.second);
     }
 
     const hir::Object* exact_object(std::string_view name,
@@ -1358,7 +1474,8 @@ private:
         if (!abi || !abi->function_selectable ||
             (function.variadic && !abi->variadic_supported)) return false;
         for (const auto& parameter : function.parameters) {
-            if (!call_type(parameter.type, false)) return false;
+            if (!call_type(parameter.type, false,
+                           parameter.mode == ParameterMode::In)) return false;
         }
         return true;
     }
@@ -3540,7 +3657,7 @@ private:
                     auto designator =
                         lower_designator_address(*expression.left);
                     if (designator && hir_.type(designator->type).is_const) {
-                        diagnostics_.error(expression.location, "cannot write an 'in' or const subobject");
+                        diagnostics_.error(expression.location, "cannot write a const subobject");
                         failed_ = true;
                         break;
                     }
@@ -4163,7 +4280,7 @@ private:
             }
             if (designator) {
                 if (hir_.type(designator->type).is_const) {
-                    diagnostics_.error(expression.location, "cannot write an 'in' or const subobject");
+                    diagnostics_.error(expression.location, "cannot write a const subobject");
                     failed_ = true;
                     return std::nullopt;
                 }
@@ -6110,6 +6227,8 @@ private:
     std::optional<EffectId> current_effect_;
     NameMap<ValueId> parameter_values_;
     NameSet address_taken_names_;
+    NameSet modified_names_;
+    NameSet local_names_;
     std::unordered_map<std::uint32_t, BlockId> label_blocks_;
     std::unordered_map<std::uint32_t, ControlPoint> label_control_points_;
     std::unordered_map<const Statement*, ControlPoint> goto_control_points_;

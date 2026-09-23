@@ -9,7 +9,7 @@ static u32 atomic_parameter(in volatile u32 [[atomic]] input) {
 }
 
 [[noinline]]
-static void atomic_inout(u32 [[atomic]] value) {
+static void atomic_inout(inout u32 [[atomic]] value) {
     ++value;
 }
 

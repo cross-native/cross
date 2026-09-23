@@ -44,7 +44,7 @@ struct Parameter {
     SourceLocation location;
     std::string name;
     TypeId type;
-    ParameterMode mode{ParameterMode::InOut};
+    ParameterMode mode{ParameterMode::In};
     std::optional<std::string> physical_location;
 };
 
@@ -206,6 +206,7 @@ public:
     [[nodiscard]] TypeId intern_type(const TypePtr& source);
     [[nodiscard]] TypeId function_type(FunctionSignature signature);
     [[nodiscard]] TypeId pointer_to(TypeId pointee);
+    [[nodiscard]] TypeId without_top_level_const(TypeId type);
     [[nodiscard]] TypeId unqualified(TypeId type);
     [[nodiscard]] TypeId add_qualifiers(TypeId type, bool is_const,
                                         bool is_volatile);

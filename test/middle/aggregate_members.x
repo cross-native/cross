@@ -13,7 +13,7 @@ union member_union { u64 integer; f64 floating; };
                                          in struct member_nested other) {
     const u32 *left = &cell.pair.left;
     const u32 *values = cell.values;
-    // The pointer cell is immutable, not the separately owned pointee.
+    // The pointed-to object is distinct from the copied parameter cell.
     cell.pointer[0] += 1u32;
     return *left + values[1] + cell.values[2] + other.pair.right +
         (&cell != &other);
@@ -39,7 +39,7 @@ union member_union { u64 integer; f64 floating; };
 global i32 aggregate_members_entry() {
     struct member_pair pair; pair.left = 7u32; pair.right = 11u32;
     if (member_host_read(pair) != 40u32) return 2;
-    if (member_discard(pair) != 18u32) return 3;
+    if (member_discard(pair) != 499u32) return 3;
     if (pair.left != 7u32 || pair.right != 11u32) return 4;
     u32 pointee = 20u32;
     struct member_nested cell; cell.pair = pair;

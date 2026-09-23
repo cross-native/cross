@@ -1,4 +1,4 @@
-global void normalize(i32 status "eax") {
+global void normalize(inout i32 status "eax") {
     if (status == 0) {
         status = 1;
     }
@@ -14,7 +14,7 @@ global i32 manual_result(in i32 value "ecx") -> "eax" {
     return value + 7;
 }
 
-void local_adjust(i32 value "r10d") {
+void local_adjust(inout i32 value "r10d") {
     value += 8;
 }
 
