@@ -205,6 +205,23 @@ cross_tool(cross_cpp)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_test(NAME cross_callable_contract_types
+             COMMAND $<TARGET_FILE:cross_cc> -S -target x86_64-unknown-linux-gnu
+                     "${CMAKE_SOURCE_DIR}/test/language/callable_contract_types.x"
+                     -o "${CMAKE_CURRENT_BINARY_DIR}/callable-contract-types.s")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_callable_custom_result_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/callable_custom_result.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/callable-custom-result-${level}
+                         -DENTRY=callable_custom_result_entry
+                         -DEXPECTED=1
+                         "-DCC_FLAGS=--model=${CMAKE_SOURCE_DIR}/test/model/custom.y;-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_executable(cross_procedural_tokens_test test/frontend/procedural_tokens_test.cpp)
     target_link_libraries(cross_procedural_tokens_test PRIVATE cross_frontend)
     cross_component(cross_procedural_tokens_test)
@@ -216,6 +233,13 @@ if(BUILD_TESTING)
     cross_component(cross_address_space_types_test)
     add_test(NAME cross_address_space_types
              COMMAND $<TARGET_FILE:cross_address_space_types_test>)
+
+    add_executable(cross_callable_type_test
+                   test/frontend/callable_type_test.cpp)
+    target_link_libraries(cross_callable_type_test PRIVATE cross_middle)
+    cross_component(cross_callable_type_test)
+    add_test(NAME cross_callable_type
+             COMMAND $<TARGET_FILE:cross_callable_type_test>)
 
     add_executable(cross_options_test test/common/options_test.cpp)
     target_link_libraries(cross_options_test PRIVATE cross_targets)

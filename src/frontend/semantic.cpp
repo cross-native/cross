@@ -121,6 +121,11 @@ TypePtr clone_type(const TypePtr& source,
             function_type(clone_type(source->function->result, substitutions),
                           std::move(parameters), source->function->variadic,
                           source->function->abi);
+        result->function->result_location =
+            source->function->result_location;
+        result->function->clobbers = source->function->clobbers;
+        result->function->stack_cleanup =
+            source->function->stack_cleanup;
     } else if (source->kind == Type::Kind::Vector) {
         result = vector_type(clone_type(source->element, substitutions),
                              source->lanes, source->scalable);
@@ -896,12 +901,35 @@ private:
                            const FunctionType& destination) {
         if (source.variadic != destination.variadic ||
             source.parameters.size() != destination.parameters.size() ||
+            source.result_location.value_or("auto") !=
+                destination.result_location.value_or("auto") ||
             !same_type(source.return_type, destination.result)) {
             return false;
         }
+        const auto* cleanup = source.attribute("stack_cleanup");
+        const auto cleanup_name =
+            cleanup && cleanup->arguments.size() == 1
+                ? decode_string_literal(cleanup->arguments.front())
+                : std::nullopt;
+        if (cleanup_name.value_or("caller") !=
+            destination.stack_cleanup.value_or("caller")) return false;
+        std::vector<std::string> source_clobbers;
+        for (const auto& attribute : source.attributes) {
+            if (attribute.name != "clobber") continue;
+            for (const auto& argument : attribute.arguments) {
+                if (const auto value = decode_string_literal(argument))
+                    source_clobbers.push_back(*value);
+            }
+        }
+        auto destination_clobbers = destination.clobbers;
+        std::sort(source_clobbers.begin(), source_clobbers.end());
+        std::sort(destination_clobbers.begin(), destination_clobbers.end());
+        if (source_clobbers != destination_clobbers) return false;
         for (std::size_t index = 0; index < source.parameters.size(); ++index) {
             if (source.parameters[index].mode !=
                     destination.parameters[index].mode ||
+                source.parameters[index].location_name.value_or("auto") !=
+                    destination.parameters[index].location_name.value_or("auto") ||
                 !same_type(callable_parameter_type(source.parameters[index].type,
                                                    source.parameters[index].mode),
                            callable_parameter_type(destination.parameters[index].type,

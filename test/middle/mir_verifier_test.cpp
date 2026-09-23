@@ -28,7 +28,9 @@ hir::Module hir_fixture() {
     function.result_type = {2};
     function.ownership = hir::BodyOwnership::ManagedMir;
     module.functions.push_back(std::move(function));
-    const auto signature = module.function_type({{2}, {}, {}, false});
+    hir::FunctionSignature callable;
+    callable.result_type = {2};
+    const auto signature = module.function_type(std::move(callable));
     (void)module.pointer_to(signature);
     return module;
 }

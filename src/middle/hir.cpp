@@ -1242,13 +1242,32 @@ private:
                 diagnostics_.error(
                     location, "function type cannot have object qualifiers");
             }
-            for (const auto& parameter : type.function->parameters) {
-                if (parameter.physical_location &&
-                    *parameter.physical_location != "auto") {
-                    diagnostics_.error(parameter.location,
-                                       "manual function-pointer endpoints are "
-                                       "not implemented yet");
+            if (type.function->stack_cleanup &&
+                *type.function->stack_cleanup != "caller" &&
+                *type.function->stack_cleanup != "callee") {
+                diagnostics_.error(location,
+                                   "stack_cleanup requires 'caller' or 'callee'");
+            }
+            for (const auto& resource : type.function->clobbers) {
+                const auto instruction_resource = std::any_of(
+                    target_.instructions.begin(), target_.instructions.end(),
+                    [&](const InstructionEntry& instruction) {
+                        const auto contains = [&](const auto& resources) {
+                            return std::find(resources.begin(), resources.end(),
+                                             resource) != resources.end();
+                        };
+                        return contains(instruction.implicit_reads) ||
+                               contains(instruction.implicit_writes);
+                    });
+                if (resource != "memory" && resource != "flags" &&
+                    !find_register(target_, resource) &&
+                    !instruction_resource) {
+                    diagnostics_.error(location,
+                                       "unknown target resource in callable clobber: '" +
+                                           resource + "'");
                 }
+            }
+            for (const auto& parameter : type.function->parameters) {
                 validate_atomic_type(parameter.type, parameter.location);
             }
             validate_atomic_type(type.function->result_type, location);
@@ -2267,6 +2286,10 @@ TypeId Module::intern_type(const TypePtr& source) {
             FunctionSignature signature;
             signature.result_type = intern_type(source->function->result);
             signature.variadic = source->function->variadic;
+            signature.result_location = source->function->result_location;
+            signature.clobbers = source->function->clobbers;
+            std::sort(signature.clobbers.begin(), signature.clobbers.end());
+            signature.stack_cleanup = source->function->stack_cleanup;
             const auto found = abi_names.find(source->function->abi);
             signature.abi = source->function->abi.empty() ? default_abi
                             : found == abi_names.end()    ? AbiId{}
@@ -2592,8 +2615,23 @@ call_signature(const Module& module, std::optional<FunctionId> direct,
     if (direct) {
         if (direct->value >= module.functions.size()) return std::nullopt;
         const auto& function = module.function(*direct);
-        return FunctionSignature{function.result_type, function.parameters,
-                                 function.abi, function.variadic};
+        FunctionSignature signature;
+        signature.result_type = function.result_type;
+        signature.parameters = function.parameters;
+        signature.abi = function.abi;
+        signature.variadic = function.variadic;
+        signature.result_location = function.result_location;
+        signature.clobbers = function.clobbers;
+        std::sort(signature.clobbers.begin(), signature.clobbers.end());
+        if (!function.declarations.empty()) {
+            const auto* declaration = function.definition
+                                          ? function.definition
+                                          : function.declarations.back();
+            const auto cleanup = decode_attribute_string(
+                declaration->attribute("stack_cleanup"));
+            if (!cleanup.empty()) signature.stack_cleanup = cleanup;
+        }
+        return signature;
     }
     if (indirect->value >= module.types.size()) return std::nullopt;
     const auto& type = module.type(*indirect);

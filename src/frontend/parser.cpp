@@ -692,6 +692,30 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
             expect(")", "after function parameters");
         }
         base = function_type(std::move(base), std::move(parameters), variadic);
+        if (consume("->")) {
+            const auto* location_token = consume_kind(TokenKind::String);
+            if (!location_token) {
+                error_here("expected result location string after '->'");
+            } else {
+                base->function->result_location =
+                    decode_string_literal(location_token->text);
+                if (!base->function->result_location)
+                    diagnostics_.error(location_token->location,
+                                       "invalid result location string");
+            }
+        }
+        // In a grouped declarator the attributes follow this function
+        // suffix, even if another callable component surrounds it.
+        if (nested) {
+            auto suffix_attributes = parse_attributes();
+            apply_callable_attributes(base, suffix_attributes);
+            for (const auto& attribute : suffix_attributes) {
+                if (attribute.name != "abi" && attribute.name != "clobber" &&
+                    attribute.name != "stack_cleanup")
+                    diagnostics_.error(attribute.location,
+                                       "function-only attribute cannot qualify a nested callable type");
+            }
+        }
     }
     if (nested) {
         // The inner declarator binds first. Fill its unique placeholder only
@@ -757,15 +781,26 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
 void Parser::apply_callable_attributes(
     TypePtr& type, const std::vector<Attribute>& attributes) {
     for (const auto& attribute : attributes) {
-        if (attribute.name != "abi") continue;
-        const auto spelling =
-            attribute.arguments.size() == 1
-                ? decode_string_literal(attribute.arguments.front())
-                : std::nullopt;
-        if (!spelling || spelling->empty()) {
-            diagnostics_.error(attribute.location,
-                               "'abi' requires one nonempty string");
-            continue;
+        if (attribute.name != "abi" && attribute.name != "clobber" &&
+            attribute.name != "stack_cleanup") continue;
+        if (type && type->kind != Type::Kind::Function) {
+            const auto count = [&](const auto& self, const TypePtr& item)
+                                   -> unsigned {
+                if (!item) return 0;
+                if (item->kind == Type::Kind::Pointer)
+                    return self(self, item->pointee);
+                if (item->kind == Type::Kind::Array)
+                    return self(self, item->element);
+                if (item->kind == Type::Kind::Function && item->function)
+                    return 1 + self(self, item->function->result);
+                return 0;
+            };
+            if (count(count, type) > 1) {
+                diagnostics_.error(
+                    attribute.location,
+                    "leading callable attribute is ambiguous between nested function types");
+                continue;
+            }
         }
         TypePtr* node = &type;
         while (*node && ((*node)->kind == Type::Kind::Pointer ||
@@ -778,12 +813,38 @@ void Parser::apply_callable_attributes(
             !(*node)->function) {
             diagnostics_.error(
                 attribute.location,
-                "'abi' requires a function or function-pointer type");
+                "callable attribute requires a function or function-pointer type");
             continue;
         }
         *node = std::make_shared<Type>(**node);
         (*node)->function = std::make_shared<FunctionType>(*(*node)->function);
-        (*node)->function->abi = *spelling;
+        auto& signature = *(*node)->function;
+        if (attribute.name == "clobber") {
+            if (attribute.arguments.empty()) {
+                diagnostics_.error(attribute.location,
+                                   "'clobber' requires string arguments");
+            }
+            for (const auto& argument : attribute.arguments) {
+                const auto resource = decode_string_literal(argument);
+                if (!resource || resource->empty())
+                    diagnostics_.error(attribute.location,
+                                       "clobber arguments must be nonempty strings");
+                else
+                    signature.clobbers.push_back(*resource);
+            }
+            continue;
+        }
+        const auto spelling = attribute.arguments.size() == 1
+                                  ? decode_string_literal(attribute.arguments.front())
+                                  : std::nullopt;
+        if (!spelling || spelling->empty()) {
+            diagnostics_.error(attribute.location,
+                               "'" + attribute.name +
+                                   "' requires one nonempty string");
+            continue;
+        }
+        if (attribute.name == "abi") signature.abi = *spelling;
+        else signature.stack_cleanup = *spelling;
     }
 }
 
@@ -1355,9 +1416,21 @@ Parser::parse_function(SourceLocation location, std::string name,
     if (signature) {
         function->parameters = signature->parameters;
         function->variadic = signature->variadic;
+        function->result_location = signature->result_location;
         if (!signature->abi.empty() && !function->attribute("abi")) {
             function->attributes.push_back(
                 {"abi", {"\"" + signature->abi + "\""}, location});
+        }
+        if (!function->attribute("clobber")) {
+            for (const auto& resource : signature->clobbers)
+                function->attributes.push_back(
+                    {"clobber", {"\"" + resource + "\""}, location});
+        }
+        if (signature->stack_cleanup &&
+            !function->attribute("stack_cleanup")) {
+            function->attributes.push_back(
+                {"stack_cleanup", {"\"" + *signature->stack_cleanup + "\""},
+                 location});
         }
     } else {
         expect("(");

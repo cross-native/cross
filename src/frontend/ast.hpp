@@ -247,12 +247,16 @@ struct ParameterDecl {
 };
 
 // Source-level callable identity. Names and source locations aid diagnostics;
-// parameter modes, types, variadicness, and ABI determine compatibility.
+// parameter modes, types, endpoints, variadicness, ABI, clobbers, and cleanup
+// ownership determine compatibility.
 struct FunctionType {
     TypePtr result;
     std::vector<ParameterDecl> parameters;
     bool variadic{};
     std::string abi;
+    std::optional<std::string> result_location;
+    std::vector<std::string> clobbers;
+    std::optional<std::string> stack_cleanup;
 };
 
 TypePtr function_type(TypePtr result, std::vector<ParameterDecl> parameters,

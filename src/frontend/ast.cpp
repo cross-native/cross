@@ -4,6 +4,7 @@
 
 #include "model/model.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <sstream>
 
@@ -51,8 +52,11 @@ TypePtr function_type(TypePtr result, std::vector<ParameterDecl> parameters,
                       bool variadic, std::string abi) {
     auto type = std::make_shared<Type>();
     type->kind = Type::Kind::Function;
-    type->function = std::make_shared<FunctionType>(FunctionType{
-        std::move(result), std::move(parameters), variadic, std::move(abi)});
+    type->function = std::make_shared<FunctionType>();
+    type->function->result = std::move(result);
+    type->function->parameters = std::move(parameters);
+    type->function->variadic = variadic;
+    type->function->abi = std::move(abi);
     return type;
 }
 
@@ -124,12 +128,20 @@ std::string type_name(const TypePtr& type) {
                       : parameter.mode == ParameterMode::Out ? "out "
                                                              : "inout ";
             result += type_name(parameter.type);
+            if (parameter.location_name)
+                result += " \"" + *parameter.location_name + "\"";
         }
         if (signature.variadic)
             result += signature.parameters.empty() ? "..." : ", ...";
         result += ")";
+        if (signature.result_location)
+            result += " -> \"" + *signature.result_location + "\"";
         if (!signature.abi.empty())
             result += " [[abi(\"" + signature.abi + "\")]]";
+        for (const auto& clobber : signature.clobbers)
+            result += " [[clobber(\"" + clobber + "\")]]";
+        if (signature.stack_cleanup)
+            result += " [[stack_cleanup(\"" + *signature.stack_cleanup + "\")]]";
         return prefix + result;
     }
     if (type->kind == Type::Kind::Generic) return prefix + type->generic_name;
@@ -182,13 +194,23 @@ std::string canonical_type_name(const TypePtr& type) {
             const auto spelling = canonical_type_name(item);
             result += std::to_string(spelling.size()) + "_" + spelling;
         };
+        const auto append_text = [&](const std::string& item) {
+            result += std::to_string(item.size()) + "_" + item;
+        };
         append(signature.result);
+        append_text(signature.result_location.value_or("auto"));
+        append_text(signature.stack_cleanup.value_or("caller"));
+        auto clobbers = signature.clobbers;
+        std::sort(clobbers.begin(), clobbers.end());
+        result += std::to_string(clobbers.size()) + "_";
+        for (const auto& clobber : clobbers) append_text(clobber);
         result += "_" + std::to_string(signature.parameters.size()) + "_";
         for (const auto& parameter : signature.parameters) {
             result += parameter.mode == ParameterMode::In    ? 'i'
                       : parameter.mode == ParameterMode::Out ? 'o'
                                                              : 'b';
             append(callable_parameter_type(parameter.type, parameter.mode));
+            append_text(parameter.location_name.value_or("auto"));
         }
         result += signature.variadic ? "zE" : "E";
         return result;
@@ -242,12 +264,23 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
         if (!left->function || !right->function) return false;
         const auto& a = *left->function;
         const auto& b = *right->function;
+        auto a_clobbers = a.clobbers;
+        auto b_clobbers = b.clobbers;
+        std::sort(a_clobbers.begin(), a_clobbers.end());
+        std::sort(b_clobbers.begin(), b_clobbers.end());
         if (a.abi != b.abi || a.variadic != b.variadic ||
+            a.result_location.value_or("auto") !=
+                b.result_location.value_or("auto") ||
+            a.stack_cleanup.value_or("caller") !=
+                b.stack_cleanup.value_or("caller") ||
+            a_clobbers != b_clobbers ||
             a.parameters.size() != b.parameters.size() ||
             !same_type(a.result, b.result))
             return false;
         for (std::size_t index = 0; index < a.parameters.size(); ++index) {
             if (a.parameters[index].mode != b.parameters[index].mode ||
+                a.parameters[index].location_name.value_or("auto") !=
+                    b.parameters[index].location_name.value_or("auto") ||
                 !same_type(callable_parameter_type(a.parameters[index].type,
                                                    a.parameters[index].mode),
                            callable_parameter_type(b.parameters[index].type,

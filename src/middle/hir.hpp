@@ -53,10 +53,18 @@ struct FunctionSignature {
     std::vector<Parameter> parameters;
     AbiId abi;
     bool variadic{};
+    std::optional<std::string> result_location;
+    std::vector<std::string> clobbers;
+    std::optional<std::string> stack_cleanup;
     friend bool operator==(const FunctionSignature& a,
                            const FunctionSignature& b) {
         if (a.result_type != b.result_type || a.abi != b.abi ||
             a.variadic != b.variadic ||
+            a.result_location.value_or("auto") !=
+                b.result_location.value_or("auto") ||
+            a.clobbers != b.clobbers ||
+            a.stack_cleanup.value_or("caller") !=
+                b.stack_cleanup.value_or("caller") ||
             a.parameters.size() != b.parameters.size())
             return false;
         for (std::size_t index = 0; index < a.parameters.size(); ++index) {

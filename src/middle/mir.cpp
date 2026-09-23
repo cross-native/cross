@@ -1481,10 +1481,8 @@ private:
     }
 
     hir::TypeId function_pointer_type(const hir::Function& function) {
-        const auto signature =
-            hir_.function_type({function.result_type, function.parameters,
-                                function.abi, function.variadic});
-        return hir_.pointer_to(signature);
+        auto signature = *hir::call_signature(hir_, function.id, {});
+        return hir_.pointer_to(hir_.function_type(std::move(signature)));
     }
 
     std::optional<ValueId> function_address(const hir::Function& function,
@@ -5098,10 +5096,8 @@ private:
             return lower_indirect_call(expression);
         const auto* callee = resolve_function(*expression.left);
         if (!callee || !callable(*callee)) return std::nullopt;
-        return lower_resolved_call(expression,
-                                   {callee->result_type, callee->parameters,
-                                    callee->abi, callee->variadic},
-                                   callee);
+        return lower_resolved_call(
+            expression, *hir::call_signature(hir_, callee->id, {}), callee);
     }
 
     std::optional<ValueId> lower_indirect_call(const Expr& expression) {
@@ -5127,6 +5123,18 @@ private:
             diagnostics_.error(
                 expression.location,
                 "indirect call has no compatible registered ABI");
+            failed_ = true;
+            return std::nullopt;
+        }
+        if ((signature.result_location &&
+             *signature.result_location != "auto") ||
+            !signature.clobbers.empty() ||
+            (signature.stack_cleanup &&
+             *signature.stack_cleanup != "caller")) {
+            diagnostics_.error(expression.location,
+                               "indirect calls with manual result locations, "
+                               "extra clobbers, or callee stack cleanup are "
+                               "not implemented yet");
             failed_ = true;
             return std::nullopt;
         }
