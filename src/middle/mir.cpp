@@ -2819,28 +2819,18 @@ private:
                                           : std::nullopt;
         }
         case Expr::Kind::Assign: {
-            if (expression.left &&
-                expression.left->kind == Expr::Kind::Binary &&
-                expression.left->text == "index") {
-                return infer_type(*expression.left);
-            }
-            const auto name = expression.left ? local_name(*expression.left)
-                                              : std::nullopt;
-            const auto* local = name ? find_local(*name) : nullptr;
-            if (local) {
-                return atomic_object_type(hir_, local->type)
-                           ? std::optional<hir::TypeId>(
-                                 hir_.unqualified(local->type))
-                           : std::optional<hir::TypeId>(local->type);
-            }
-            const auto* object = name ? resolve_object(*expression.left) : nullptr;
-            return object && global_scalar(*object) &&
-                           !hir_.type(object->type).is_const
-                       ? std::optional<hir::TypeId>(
-                             atomic_object_type(hir_, object->type)
-                                 ? hir_.unqualified(object->type)
-                                 : object->type)
-                       : std::nullopt;
+            if (!expression.left) return std::nullopt;
+            const Expr* target = expression.left.get();
+            while (target->kind == Expr::Kind::Parenthesized && target->left)
+                target = target->left.get();
+            if (target->kind == Expr::Kind::Binary &&
+                target->text == "index") return infer_type(*target);
+            const auto type = designator_type(*target);
+            if (!type || !managed_value_type(hir_, *type) ||
+                hir_.type(*type).is_const) return std::nullopt;
+            return atomic_object_type(hir_, *type)
+                ? std::optional<hir::TypeId>(hir_.unqualified(*type))
+                : type;
         }
         case Expr::Kind::Call: {
             if (expression.left) {
@@ -4148,27 +4138,28 @@ private:
     }
 
     std::optional<ValueId> lower_assignment(const Expr& expression) {
-        if (expression.left) {
-            const auto object_type = designator_type(*expression.left);
-            if (object_type && atomic_object_type(hir_, *object_type)) {
-                return lower_atomic_assignment(expression, *object_type);
-            }
+        const Expr* target = expression.left.get();
+        while (target && target->kind == Expr::Kind::Parenthesized &&
+               target->left) target = target->left.get();
+        if (!target) return std::nullopt;
+        const auto object_type = designator_type(*target);
+        if (object_type && atomic_object_type(hir_, *object_type)) {
+            return lower_atomic_assignment(expression, *object_type);
         }
-        if (expression.left &&
-            expression.left->kind == Expr::Kind::Binary &&
-            (expression.left->text == "member" ||
-             expression.left->text == "pointer_member" ||
-             expression.left->text == "index")) {
+        if (target->kind == Expr::Kind::Binary &&
+            (target->text == "member" ||
+             target->text == "pointer_member" ||
+             target->text == "index")) {
             std::optional<DesignatorAddress> designator;
-            const auto aggregate_type = expression.left->text == "index" &&
-                                                expression.left->left
+            const auto aggregate_type = target->text == "index" &&
+                                                target->left
                                             ? infer_type(
-                                                  *expression.left->left)
+                                                  *target->left)
                                             : std::nullopt;
             if (!aggregate_type ||
                 !vector_type(hir_, *aggregate_type)) {
                 designator =
-                    lower_designator_address(*expression.left);
+                    lower_designator_address(*target);
             }
             if (designator) {
                 if (hir_.type(designator->type).is_const) {
@@ -4260,15 +4251,14 @@ private:
                                          : std::optional<ValueId>(result);
             }
         }
-        if (expression.left &&
-            expression.left->kind == Expr::Kind::Binary &&
-            expression.left->text == "index" &&
-            expression.left->left && expression.left->right) {
-            const auto element_type = designator_type(*expression.left);
+        if (target->kind == Expr::Kind::Binary &&
+            target->text == "index" &&
+            target->left && target->right) {
+            const auto element_type = designator_type(*target);
             if (element_type && managed_value_type(hir_, *element_type) &&
                 !hir_.type(*element_type).is_const) {
-                auto base = lower_expression(*expression.left->left);
-                auto index = lower_expression(*expression.left->right);
+                auto base = lower_expression(*target->left);
+                auto index = lower_expression(*target->right);
                 if (!base || !index ||
                     !integer_type(hir_, current_.values[index->value].type)) {
                     return std::nullopt;
@@ -4325,15 +4315,14 @@ private:
                 return result;
             }
         }
-        if (expression.left &&
-            expression.left->kind == Expr::Kind::Binary &&
-            expression.left->text == "index" &&
-            expression.left->left && expression.left->right &&
+        if (target->kind == Expr::Kind::Binary &&
+            target->text == "index" &&
+            target->left && target->right &&
             expression.text == "=") {
-            const auto name = local_name(*expression.left->left);
+            const auto name = local_name(*target->left);
             const auto* local = name ? find_local(*name) : nullptr;
             const auto* object = local || !name ? nullptr
-                                                : resolve_object(*expression.left->left);
+                                                : resolve_object(*target->left);
             const auto vector_type_id = local ? local->type
                                       : object ? object->type
                                                : hir::TypeId{};
@@ -4343,7 +4332,7 @@ private:
                 return std::nullopt;
             }
             const auto& vector = hir_.type(vector_type_id);
-            auto index = lower_expression(*expression.left->right);
+            auto index = lower_expression(*target->right);
             auto element = lower_expression(*expression.right,
                                              *vector.element);
             if (!index || !element ||
@@ -4354,7 +4343,7 @@ private:
             if (index_value.kind == ValueKind::ConstantInteger &&
                 (index_value.integer_high != 0 ||
                  index_value.integer >= vector.lanes)) {
-                diagnostics_.error(expression.left->right->location,
+                diagnostics_.error(target->right->location,
                                    "fixed-vector lane index is out of range");
                 failed_ = true;
                 return std::nullopt;
@@ -4376,10 +4365,10 @@ private:
             }
             return *element;
         }
-        if (expression.left && expression.left->kind == Expr::Kind::Unary &&
-            expression.left->text == "*" && expression.left->left) {
-            auto address = lower_expression(*expression.left->left);
-            const auto type = infer_type(*expression.left);
+        if (target->kind == Expr::Kind::Unary &&
+            target->text == "*" && target->left) {
+            auto address = lower_expression(*target->left);
+            const auto type = infer_type(*target);
             if (!address || !type) return std::nullopt;
             if (expression.text == "=") {
                 auto source = lower_expression(*expression.right, *type);
@@ -4425,9 +4414,9 @@ private:
             }
             return result;
         }
-        const auto name = local_name(*expression.left);
+        const auto name = local_name(*target);
         const auto* found = name ? find_local(*name) : nullptr;
-        const auto* object = found || !name ? nullptr : resolve_object(*expression.left);
+        const auto* object = found || !name ? nullptr : resolve_object(*target);
         if (found && (found->dynamic_address ||
                       array_type(hir_, found->type))) {
             return std::nullopt;

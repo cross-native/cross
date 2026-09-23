@@ -47,6 +47,24 @@ global i32 expression_core_entry() {
     walk -= 1iptr;
     if (*walk != 22u64) return 18;
 
+    u64 through_pointer = 3u64;
+    u64 *pointer = &through_pointer;
+    (*pointer) += 10u64;
+    if (through_pointer != 13u64) return 30;
+    ((*pointer)) -= 3u64;
+    if (through_pointer != 10u64) return 31;
+    (through_pointer) *= 2u64;
+    if (through_pointer != 20u64) return 32;
+    if (((*pointer) += 1u64) != 21u64 || through_pointer != 21u64) return 34;
+    u64 indexed[1] = { 4u64 };
+    (indexed[0]) += 5u64;
+    if (indexed[0] != 9u64) return 33;
+    u64 tracked[2] = { 2u64, 4u64 };
+    u64 *cursor = &tracked[0];
+    (*(cursor++)) += 5u64;
+    if (tracked[0] != 7u64 || tracked[1] != 4u64 ||
+        cursor != &tracked[1]) return 35;
+
     uptr address = (uptr)(base);
     if ((u64 *)(address) != base) return 8;
     if ((bool)(base) != 1) return 22;

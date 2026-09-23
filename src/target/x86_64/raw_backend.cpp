@@ -2431,8 +2431,7 @@ private:
             return emit_value_move(*value_destination, *view,
                                    type_found->second, expression.location);
         }
-        if (expression.text != "=" ||
-            !((destination_expression.kind == Expr::Kind::Unary &&
+        if (!((destination_expression.kind == Expr::Kind::Unary &&
                destination_expression.text == "*") ||
               (destination_expression.kind == Expr::Kind::Binary &&
                destination_expression.text == "index"))) {
@@ -2443,14 +2442,32 @@ private:
         }
         const auto address = memory_address(destination_expression, true);
         if (!address) return false;
+        if (expression.text != "=" && !is_integer(address->pointee) &&
+            !raw_scalar_float_type(address->pointee)) {
+            diagnostics_.error(expression.location,
+                "raw-compatible pointer compound assignment requires an integer or f32/f64 pointee");
+            return false;
+        }
         const auto* scratch = acquire_scratch(address->pointee,
                                               expression.location,
                                               "store value");
         if (!scratch) return false;
-        bool lowered = lower_inline_value(*expression.right, *scratch,
-                                          address->pointee);
+        const bool floating = raw_scalar_float_type(address->pointee);
+        bool lowered = expression.text == "="
+            ? lower_inline_value(*expression.right, *scratch,
+                                 address->pointee)
+            : floating
+                ? emit_float_load(*scratch, *address, address->pointee,
+                                  expression.location) &&
+                  apply_float_binary_rhs(expression.text, *scratch,
+                      address->pointee, *expression.right,
+                      expression.location)
+                : emit_load(*scratch, *address, expression.location) &&
+                  apply_binary_rhs(expression.text, *scratch,
+                      address->pointee, *expression.right,
+                      expression.location);
         if (lowered && value_destination) {
-            const auto* view = raw_scalar_float_type(address->pointee)
+            const auto* view = floating
                 ? storage_view(scratch->storage, address->pointee)
                 : integer_storage_view(scratch->storage,
                                        value_destination->bits);
@@ -2459,7 +2476,7 @@ private:
                                               expression.location);
         }
         if (lowered) {
-            lowered = raw_scalar_float_type(address->pointee)
+            lowered = floating
                 ? emit_float_store(*address, *scratch, address->pointee,
                                    expression.location)
                 : emit_store(*address, *scratch, expression.location);

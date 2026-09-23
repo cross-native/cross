@@ -40,6 +40,16 @@ static u64 load_add(in u64 *source) {
 }
 
 [[raw_inline]]
+static u64 bump_memory(in u64 *destination, in u64 increment) {
+    return ((*destination) += increment);
+}
+
+[[raw_inline]]
+static f64 bump_float_memory(in f64 *destination, in f64 increment) {
+    return ((*destination) += increment);
+}
+
+[[raw_inline]]
 static u64 divide_sum(in u64 value, in u64 divisor) {
     return value / divisor + value % divisor;
 }
@@ -140,6 +150,20 @@ static void raw_store(in u64 value "r9", in u64 *destination "r8") {
     $::_ret();
 }
 
+[[naked, clobber("r10", "r11", "flags", "memory")]]
+static u64 raw_bump_memory(in u64 *destination "r9", in u64 increment "rcx") -> "r8" {
+    register u64 result "r8";
+    result = bump_memory(destination, increment);
+    $::_ret();
+}
+
+[[naked, clobber("xmm6", "xmm7", "memory")]]
+static f64 raw_bump_float_memory(in f64 *destination "r9", in f64 increment "xmm4") -> "xmm5" {
+    register f64 result "xmm5";
+    result = bump_float_memory(destination, increment);
+    $::_ret();
+}
+
 [[naked, clobber("r10", "rax", "rdx", "flags")]]
 static u64 raw_divide(in u64 value "r9", in u64 divisor "rcx") -> "r8" {
     register u64 result "r8";
@@ -230,6 +254,14 @@ global u64 raw_inline_load_entry(in u64 *source) {
 
 global void raw_inline_store_entry(in u64 value, in u64 *destination) {
     raw_store(value, destination);
+}
+
+global u64 raw_inline_bump_memory_entry(in u64 *destination, in u64 increment) {
+    return raw_bump_memory(destination, increment);
+}
+
+global f64 raw_inline_bump_float_memory_entry(in f64 *destination, in f64 increment) {
+    return raw_bump_float_memory(destination, increment);
 }
 
 global u64 raw_inline_divide_entry(in u64 value, in u64 divisor) {

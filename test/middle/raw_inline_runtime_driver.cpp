@@ -13,6 +13,9 @@ extern "C" CROSS_ABI std::uint64_t raw_inline_mix_entry(std::uint64_t);
 extern "C" CROSS_ABI std::uint64_t raw_inline_structured_entry(std::uint64_t);
 extern "C" CROSS_ABI std::uint64_t raw_inline_load_entry(std::uint64_t*);
 extern "C" CROSS_ABI void raw_inline_store_entry(std::uint64_t, std::uint64_t*);
+extern "C" CROSS_ABI std::uint64_t raw_inline_bump_memory_entry(
+    std::uint64_t*, std::uint64_t);
+extern "C" CROSS_ABI double raw_inline_bump_float_memory_entry(double*, double);
 extern "C" CROSS_ABI std::uint64_t raw_inline_divide_entry(std::uint64_t,
                                                             std::uint64_t);
 extern "C" CROSS_ABI double raw_inline_affine_entry(double, double*);
@@ -63,6 +66,11 @@ int main() {
     if (raw_inline_load_entry(&memory) != 42) return 2;
     raw_inline_store_entry(input, &memory);
     if (memory != mix(input)) return 3;
+    if (raw_inline_bump_memory_entry(&memory, 7) != mix(input) + 7 ||
+        memory != mix(input) + 7) return 16;
+    double float_memory = 2.5;
+    if (raw_inline_bump_float_memory_entry(&float_memory, 1.25) != 3.75 ||
+        float_memory != 3.75) return 17;
     if (raw_inline_divide_entry(100, 9) != 12) return 4;
     double bias = 0.75;
     if (raw_inline_affine_entry(4.0, &bias) != 4.0 * 1.5 + bias) return 5;
