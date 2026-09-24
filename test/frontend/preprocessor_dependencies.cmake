@@ -57,6 +57,81 @@ file(READ "${OUTPUT}.i" expanded)
 if(NOT expanded MATCHES "global i32 answer = 7 [+] 11 [+] 13;")
     message(FATAL_ERROR "includes and macros did not expand in order\n${expanded}")
 endif()
+if(NOT expanded MATCHES "#line [0-9]+ \"[^\"]*main[.]x\"")
+    message(FATAL_ERROR "preprocessed input line marker is missing\n${expanded}")
+endif()
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.i" -o "${OUTPUT}.from-i.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "cc did not consume cpp line markers\n${out}\n${err}")
+endif()
+file(WRITE "${local_dir}/line-meta.h"
+    "global i32 header_line = $::source::line;\n"
+    "global const u8 header_file[] = $::source::file;\n")
+file(WRITE "${local_dir}/line-meta.x"
+    "#include \"line-meta.h\"\nglobal i32 input_line = $::source::line;\n")
+execute_process(COMMAND "${CPP}" "${local_dir}/line-meta.x"
+    -o "${OUTPUT}.line-meta.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "source line macros failed\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}.line-meta.i" marked)
+if(NOT marked MATCHES "header_line = 1;" OR
+   NOT marked MATCHES "input_line = 2;" OR
+   NOT marked MATCHES "header_file\\[\\] = \"[^\"]*line-meta[.]h\";" OR
+   NOT marked MATCHES "#line 1 \"[^\"]*line-meta[.]h\"" OR
+   NOT marked MATCHES "#line 2 \"[^\"]*line-meta[.]x\"")
+    message(FATAL_ERROR "source line macros/markers lost logical locations\n${marked}")
+endif()
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.line-meta.i"
+    -o "${OUTPUT}.line-meta.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "line-marked preprocessed source did not compile\n${out}\n${err}")
+endif()
+file(WRITE "${local_dir}/line-error.h" "global i32 broken = ;\n")
+file(WRITE "${local_dir}/line-error.x" "#include \"line-error.h\"\n")
+execute_process(COMMAND "${CPP}" "${local_dir}/line-error.x"
+    -o "${OUTPUT}.line-error.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "error fixture did not preprocess\n${out}\n${err}")
+endif()
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.line-error.i"
+    -o "${OUTPUT}.line-error.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "line-error[.]h:1:[0-9]+: error:")
+    message(FATAL_ERROR "preprocessed diagnostic lost included source location\n${out}\n${err}")
+endif()
+execute_process(COMMAND "${CC}" -S "${local_dir}/line-error.x"
+    -o "${OUTPUT}.line-error-direct.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "line-error[.]h:1:[0-9]+: error:")
+    message(FATAL_ERROR "integrated diagnostic lost included source location\n${out}\n${err}")
+endif()
+file(WRITE "${OUTPUT}.comment-marker.i"
+    "/*\n#line 900 \"not-a-marker.x\"\n*/\nglobal i32 comment_safe = 1;\n")
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.comment-marker.i"
+    -o "${OUTPUT}.comment-marker.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "line-marker spelling inside a comment was consumed\n${out}\n${err}")
+endif()
+file(WRITE "${OUTPUT}.bad-marker.i" "#line 0 \"bad.x\"\nglobal i32 x = 1;\n")
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.bad-marker.i"
+    -o "${OUTPUT}.bad-marker.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "malformed preprocessed #line marker")
+    message(FATAL_ERROR "invalid line marker was accepted\n${out}\n${err}")
+endif()
+file(WRITE "${OUTPUT}.negative-marker.i" "#line -1 \"bad.x\"\nglobal i32 x = 1;\n")
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.negative-marker.i"
+    -o "${OUTPUT}.negative-marker.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "malformed preprocessed #line marker")
+    message(FATAL_ERROR "negative line marker was accepted\n${out}\n${err}")
+endif()
 file(READ "${OUTPUT}.d" depfile)
 if(NOT depfile STREQUAL dep)
     message(FATAL_ERROR "-MD dependency file differs from -M\n${depfile}\n${dep}")
@@ -251,6 +326,18 @@ execute_process(COMMAND "${CPP}" -M "${asset_dir}/included.x"
 if(NOT status EQUAL 0 OR NOT dep MATCHES "embed_header.h" OR
    NOT dep MATCHES "preprocessor-dependencies.system/system-local.bin")
     message(FATAL_ERROR "included logical source asset lookup failed\n${dep}\n${err}")
+endif()
+execute_process(COMMAND "${CPP}" "${asset_dir}/included.x"
+    -isystem "${system_dir}" -o "${OUTPUT}.included.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "included embed did not preprocess\n${out}\n${err}")
+endif()
+execute_process(COMMAND "${CC}" -M "${OUTPUT}.included.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE dep ERROR_VARIABLE err)
+if(NOT status EQUAL 0 OR NOT dep MATCHES "system-local.bin" OR
+   dep MATCHES "embed_header.h")
+    message(FATAL_ERROR "line-marked .i asset lookup/dependencies failed\n${dep}\n${err}")
 endif()
 
 file(TO_CMAKE_PATH "${asset_dir}/payload.bin" absolute_asset)

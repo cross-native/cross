@@ -191,7 +191,7 @@ EmbedDiscovery discover_embeds(SourceManager& sources, const SourceFile& source,
         std::sort(token_origins.begin(), token_origins.end(),
             [](const auto& left, const auto& right) { return left.begin < right.begin; });
         result.source = sources.add(source.path, source.text, {},
-                                    std::move(token_origins));
+                                    std::move(token_origins), source.line_origins);
     }
     return result;
 }

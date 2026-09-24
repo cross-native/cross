@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <iomanip>
 #include <sstream>
 
 namespace cross {
@@ -190,6 +191,8 @@ void Preprocessor::install_predefined_macros() {
     macros_["$::language::version"].replacement = "800i64";
     macros_["$::language::version_major"].replacement = "0";
     macros_["$::language::version_minor"].replacement = "8";
+    macros_["$::source::file"].replacement = "\"\"";
+    macros_["$::source::line"].replacement = "0";
     macros_["$::target::triple"].replacement = '"' + options_.target + '"';
     macros_["$::target::abi"].replacement = '"' + options_.abi + '"';
     macros_["$::target::mangling"].replacement =
@@ -608,6 +611,16 @@ std::string Preprocessor::expand_text(std::string_view text,
             }
             if (parenthesized) ++i;
             output += macros_.contains(std::string(operand)) ? "1 " : "0 ";
+            continue;
+        }
+        if (origin && origin->valid() && name == "$::source::file") {
+            std::ostringstream spelling;
+            spelling << std::quoted(origin->file->path.generic_string());
+            output += spelling.str();
+            continue;
+        }
+        if (origin && origin->valid() && name == "$::source::line") {
+            output += std::to_string(origin->line);
             continue;
         }
         const auto found = macros_.find(name);

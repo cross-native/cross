@@ -28,10 +28,14 @@
 #include "target/subtarget.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace cross {
@@ -255,6 +259,8 @@ void print_builtins(const CompilerOptions& options) {
                  "$::language::version predefined macro\n"
                  "$::language::version_major predefined macro\n"
                  "$::language::version_minor predefined macro\n"
+                 "$::source::file source-location macro\n"
+                 "$::source::line source-location macro\n"
                  "$::target::triple predefined macro\n"
                  "$::target::abi predefined macro\n"
                  "$::target::mangling predefined macro\n"
@@ -377,6 +383,106 @@ void diagnose_codegen_ownership_gaps(const hir::Module& module,
     }
 }
 
+void track_block_comment(std::string_view line, bool& inside) {
+    for (std::size_t index = 0; index < line.size();) {
+        if (inside) {
+            if (index + 1 < line.size() && line[index] == '*' && line[index + 1] == '/') {
+                inside = false;
+                index += 2;
+            } else ++index;
+            continue;
+        }
+        if (index + 1 < line.size() && line[index] == '/' && line[index + 1] == '/') break;
+        if (index + 1 < line.size() && line[index] == '/' && line[index + 1] == '*') {
+            inside = true;
+            index += 2;
+            continue;
+        }
+        if (line[index] == '"' || line[index] == '\'') {
+            const char quote = line[index++];
+            while (index < line.size() && line[index] != quote) {
+                if (line[index] == '\\' && index + 1 < line.size()) ++index;
+                ++index;
+            }
+            if (index < line.size()) ++index;
+            continue;
+        }
+        ++index;
+    }
+}
+
+std::string with_line_markers(std::string_view source,
+                              const std::vector<SourceLocation>& origins,
+                              const std::filesystem::path& primary) {
+    std::istringstream input{std::string(source)};
+    std::ostringstream output;
+    std::string line;
+    std::filesystem::path previous;
+    unsigned previous_line = 0;
+    bool inside_comment = false;
+    std::size_t index = 0;
+    while (std::getline(input, line)) {
+        const auto origin = index < origins.size() ? origins[index] : SourceLocation{};
+        const auto path = origin.file ? origin.file->path : primary;
+        const auto number = origin.file ? origin.line : static_cast<unsigned>(index + 1);
+        if (!inside_comment &&
+            (index == 0 || path != previous || number != previous_line + 1))
+            output << "#line " << number << ' ' << std::quoted(path.generic_string()) << '\n';
+        output << line << '\n';
+        if (!inside_comment) {
+            previous = path;
+            previous_line = number;
+        }
+        track_block_comment(line, inside_comment);
+        ++index;
+    }
+    return output.str();
+}
+
+std::string without_line_markers(SourceManager& sources, const SourceFile& source,
+                                 std::vector<SourceLocation>& origins,
+                                 Diagnostics& diagnostics) {
+    std::istringstream input(source.text);
+    std::ostringstream output;
+    std::unordered_map<std::string, const SourceFile*> named;
+    const SourceFile* logical = &source;
+    unsigned logical_line = 1;
+    unsigned physical_line = 0;
+    bool inside_comment = false;
+    std::string line;
+    while (std::getline(input, line)) {
+        ++physical_line;
+        if (!inside_comment && line.starts_with("#line") &&
+            (line.size() == 5 ||
+             std::isspace(static_cast<unsigned char>(line[5])) != 0)) {
+            std::istringstream marker(line.substr(5));
+            unsigned number = 0;
+            std::string path;
+            marker >> std::ws;
+            const auto first = marker.peek();
+            if (first >= 0 && std::isdigit(static_cast<unsigned char>(first)) != 0)
+                marker >> number >> std::ws;
+            if (marker.peek() == '"') marker >> std::quoted(path);
+            marker >> std::ws;
+            if (!marker || !marker.eof() || number == 0 || path.empty()) {
+                diagnostics.error({&source, 0, physical_line, 1},
+                                  "malformed preprocessed #line marker");
+                continue;
+            }
+            auto [entry, inserted] = named.try_emplace(path, nullptr);
+            if (inserted) entry->second = sources.add(path, "");
+            logical = entry->second;
+            logical_line = number;
+            continue;
+        }
+        output << line << '\n';
+        origins.push_back({logical, 0, logical_line, 1});
+        track_block_comment(line, inside_comment);
+        if (logical_line != std::numeric_limits<unsigned>::max()) ++logical_line;
+    }
+    return output.str();
+}
+
 bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
                        Diagnostics& diagnostics, std::vector<std::string>& outputs,
                        std::vector<std::vector<std::filesystem::path>>& dependencies,
@@ -386,19 +492,28 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
         const SourceFile* preprocessed{};
         std::vector<SourceLocation> line_origins;
         std::vector<std::filesystem::path> found;
+        std::string serialized;
         if (input.extension() == ".i") {
             std::string error;
-            preprocessed = sources.load(input, error);
-            if (!preprocessed) diagnostics.command_error(error);
-            else found.push_back(input);
+            const auto* written = sources.load(input, error);
+            if (!written) diagnostics.command_error(error);
+            else {
+                serialized = written->text;
+                auto source = without_line_markers(sources, *written,
+                                                   line_origins, diagnostics);
+                preprocessed = sources.add(input, std::move(source), {}, {}, line_origins);
+                found.push_back(input);
+            }
         } else {
             Preprocessor preprocessor(sources, diagnostics, options);
-            preprocessed = sources.add(input, preprocessor.process(input));
+            auto source = preprocessor.process(input);
             found = preprocessor.dependencies();
             line_origins = preprocessor.output_line_locations();
+            serialized = with_line_markers(source, line_origins, input);
+            preprocessed = sources.add(input, std::move(source), {}, {}, line_origins);
         }
         if (!preprocessed) continue;
-        outputs.push_back(preprocessed->text);
+        outputs.push_back(std::move(serialized));
         if (diagnostics.errors() == 0) {
             auto embedded = discover_embeds(sources, *preprocessed, line_origins,
                 options, diagnostics,
