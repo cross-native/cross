@@ -262,6 +262,13 @@ struct FunctionType {
 TypePtr function_type(TypePtr result, std::vector<ParameterDecl> parameters,
                       bool variadic = false, std::string abi = {});
 
+struct StaticAssertDecl {
+    SourceLocation location;
+    std::string source_namespace;
+    std::unique_ptr<Expr> condition;
+    std::string message;
+};
+
 struct FunctionDecl {
     using GenericParameter = cross::GenericParameter;
 
@@ -274,6 +281,7 @@ struct FunctionDecl {
     std::vector<ParameterDecl> parameters;
     std::vector<Attribute> attributes;
     std::vector<GenericParameter> generic_parameters;
+    std::vector<StaticAssertDecl> deferred_static_assertions;
     std::optional<std::string> result_location;
     std::unique_ptr<Statement> body;
     Linkage linkage{Linkage::Group};
@@ -324,13 +332,6 @@ struct RecordDecl {
     bool complete{};
     std::vector<Attribute> attributes;
     std::vector<RecordMemberDecl> members;
-};
-
-struct StaticAssertDecl {
-    SourceLocation location;
-    std::string source_namespace;
-    std::unique_ptr<Expr> condition;
-    std::string message;
 };
 
 struct GlobalLabelDecl {

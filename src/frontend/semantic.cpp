@@ -463,7 +463,184 @@ struct GenericExpansionState {
     unsigned depth{};
     GenericPointerResolver pointer_resolver;
     std::vector<NameKey> locals;
+    std::vector<std::pair<NameKey, TypePtr>> local_types;
 };
+
+TypePtr infer_generic_actual(const Expr& expression,
+                             const FunctionDecl* caller,
+                             Program& program,
+                             const GenericExpansionState& state,
+                             bool decay = true);
+
+bool match_deduced_type(const TypePtr& formal, const TypePtr& actual,
+                        TypeSubstitutions& bindings,
+                        const std::unordered_set<std::string>& type_parameters,
+                        std::string& conflict) {
+    if (!formal || !actual) return false;
+    if (formal->kind == Type::Kind::Generic &&
+        type_parameters.contains(formal->generic_name)) {
+        const auto found = bindings.find(formal->generic_name);
+        if (found != bindings.end()) {
+            if (!same_type(found->second, actual)) {
+                conflict = formal->generic_name;
+                return false;
+            }
+            return true;
+        }
+        bindings.emplace(formal->generic_name, clone_type(actual));
+        return true;
+    }
+    const auto has_unbound = [&](const auto& self, const TypePtr& type)
+                                 -> bool {
+        if (!type) return false;
+        if (type->kind == Type::Kind::Generic)
+            return type_parameters.contains(type->generic_name);
+        if (type->kind == Type::Kind::Pointer)
+            return self(self, type->pointee);
+        if (type->kind == Type::Kind::Array ||
+            type->kind == Type::Kind::Vector)
+            return self(self, type->element);
+        if (type->kind == Type::Kind::Function && type->function) {
+            if (self(self, type->function->result)) return true;
+            for (const auto& parameter : type->function->parameters)
+                if (self(self, parameter.type)) return true;
+        }
+        return false;
+    };
+    if (!has_unbound(has_unbound, formal)) return true;
+    if (formal->kind != actual->kind ||
+        formal->is_const != actual->is_const ||
+        formal->is_volatile != actual->is_volatile ||
+        formal->is_atomic != actual->is_atomic ||
+        formal->is_restrict != actual->is_restrict) return false;
+    if (formal->kind == Type::Kind::Pointer)
+        return formal->address_space == actual->address_space &&
+               match_deduced_type(formal->pointee, actual->pointee,
+                                  bindings, type_parameters, conflict);
+    if (formal->kind == Type::Kind::Array ||
+        formal->kind == Type::Kind::Vector)
+        return formal->lanes == actual->lanes &&
+               formal->scalable == actual->scalable &&
+               match_deduced_type(formal->element, actual->element,
+                                  bindings, type_parameters, conflict);
+    if (formal->kind == Type::Kind::Function && formal->function &&
+        actual->function) {
+        const auto& left = *formal->function;
+        const auto& right = *actual->function;
+        if (left.abi != right.abi || left.variadic != right.variadic ||
+            left.result_location.value_or("auto") !=
+                right.result_location.value_or("auto") ||
+            left.stack_cleanup.value_or("caller") !=
+                right.stack_cleanup.value_or("caller") ||
+            left.clobbers != right.clobbers ||
+            left.parameters.size() != right.parameters.size()) return false;
+        if (!match_deduced_type(left.result, right.result, bindings,
+                                type_parameters, conflict)) return false;
+        for (std::size_t index = 0; index < left.parameters.size(); ++index) {
+            if (left.parameters[index].mode != right.parameters[index].mode ||
+                left.parameters[index].location_name.value_or("auto") !=
+                    right.parameters[index].location_name.value_or("auto") ||
+                !match_deduced_type(
+                    callable_parameter_type(left.parameters[index].type,
+                                            left.parameters[index].mode),
+                    callable_parameter_type(right.parameters[index].type,
+                                            right.parameters[index].mode),
+                    bindings, type_parameters, conflict)) return false;
+        }
+        return true;
+    }
+    return same_type(formal, actual);
+}
+
+bool deduce_generic_arguments(const FunctionDecl& generic,
+                              const Expr& call, const FunctionDecl* caller,
+                              Program& program,
+                              const GenericExpansionState& state,
+                              std::vector<Expr::GenericArgument>& arguments,
+                              Diagnostics& diagnostics) {
+    if (arguments.size() > generic.generic_parameters.size()) {
+        diagnostics.error(call.location, "generic argument count does not match '" +
+                                             generic.name + "'");
+        return false;
+    }
+    std::unordered_set<std::string> type_parameters;
+    TypeSubstitutions bindings;
+    for (const auto& parameter : generic.generic_parameters)
+        if (!parameter.value_type) type_parameters.insert(parameter.name);
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        const auto& parameter = generic.generic_parameters[index];
+        if (parameter.value_type) {
+            if (!arguments[index].value) {
+                diagnostics.error(call.location,
+                                  "generic value parameter '" + parameter.name +
+                                      "' requires a value argument");
+                return false;
+            }
+        } else if (arguments[index].type) {
+            bindings.emplace(parameter.name, arguments[index].type);
+            type_parameters.erase(parameter.name);
+        } else {
+            diagnostics.error(call.location,
+                              "generic type parameter '" + parameter.name +
+                                  "' requires a type argument");
+            return false;
+        }
+    }
+    if (call.arguments.size() < generic.parameters.size()) {
+        diagnostics.error(call.location,
+                          "generic call has too few fixed arguments for deduction");
+        return false;
+    }
+    for (std::size_t index = 0; index < generic.parameters.size(); ++index) {
+        const auto& parameter = generic.parameters[index];
+        const auto& argument = *call.arguments[index];
+        auto actual = infer_generic_actual(
+            argument, caller, program, state,
+            parameter.mode == ParameterMode::In);
+        if (!actual) {
+            diagnostics.error(argument.location,
+                              "cannot determine generic call argument type");
+            return false;
+        }
+        auto formal = callable_parameter_type(parameter.type, parameter.mode);
+        if (parameter.mode == ParameterMode::In)
+            actual = callable_parameter_type(actual, ParameterMode::In);
+        std::string conflict;
+        if (!match_deduced_type(formal, actual, bindings,
+                                type_parameters, conflict)) {
+            diagnostics.error(argument.location,
+                conflict.empty()
+                    ? "generic type deduction requires an exact structural match"
+                    : "conflicting deductions for generic type parameter '" +
+                          conflict + "'");
+            return false;
+        }
+    }
+    std::vector<Expr::GenericArgument> complete(
+        generic.generic_parameters.size());
+    for (std::size_t index = 0; index < arguments.size(); ++index)
+        complete[index] = std::move(arguments[index]);
+    for (std::size_t index = arguments.size();
+         index < generic.generic_parameters.size(); ++index) {
+        const auto& parameter = generic.generic_parameters[index];
+        if (parameter.value_type) {
+            diagnostics.error(call.location,
+                              "generic value parameter '" + parameter.name +
+                                  "' requires an explicit argument");
+            return false;
+        }
+        const auto found = bindings.find(parameter.name);
+        if (found == bindings.end()) {
+            diagnostics.error(call.location,
+                              "could not deduce generic type parameter '" +
+                                  parameter.name + "'");
+            return false;
+        }
+        complete[index].type = found->second;
+    }
+    arguments = std::move(complete);
+    return true;
+}
 
 void lift_static_locals(Program& program, FunctionDecl& function);
 void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expression,
@@ -487,6 +664,7 @@ void rewrite_generic_statement(
     GenericExpansionState& state,
     std::string_view mangling) {
     const auto saved_locals = state.locals.size();
+    const auto saved_local_types = state.local_types.size();
     const bool scoped = statement.kind == Statement::Kind::Compound ||
                         statement.kind == Statement::Kind::For;
     if (statement.kind == Statement::Kind::For && statement.first) {
@@ -499,6 +677,8 @@ void rewrite_generic_statement(
     }
     if (statement.declaration) {
         state.locals.push_back(name_key(*statement.declaration));
+        state.local_types.emplace_back(name_key(*statement.declaration),
+                                       statement.declaration->type);
         if (statement.declaration->dynamic_array_bound) {
             rewrite_generic_expr(statement.declaration->dynamic_array_bound,
                                  caller, program, diagnostics, state, mangling);
@@ -528,7 +708,10 @@ void rewrite_generic_statement(
         rewrite_generic_statement(*statement.second, caller, program, diagnostics,
                                   state, mangling);
     }
-    if (scoped) state.locals.resize(saved_locals);
+    if (scoped) {
+        state.locals.resize(saved_locals);
+        state.local_types.resize(saved_local_types);
+    }
 }
 
 void rewrite_generic_function(FunctionDecl& function, Program& program,
@@ -539,12 +722,17 @@ void rewrite_generic_function(FunctionDecl& function, Program& program,
         !state.rewritten_functions.insert(&function).second) return;
     lift_static_locals(program, function);
     auto saved_locals = std::move(state.locals);
+    auto saved_local_types = std::move(state.local_types);
     state.locals.clear();
-    for (const auto& parameter : function.parameters)
+    state.local_types.clear();
+    for (const auto& parameter : function.parameters) {
         state.locals.push_back(name_key(parameter));
+        state.local_types.emplace_back(name_key(parameter), parameter.type);
+    }
     rewrite_generic_statement(*function.body, &function, program, diagnostics,
                               state, mangling);
     state.locals = std::move(saved_locals);
+    state.local_types = std::move(saved_local_types);
 }
 
 std::unique_ptr<FunctionDecl> instantiate(
@@ -608,6 +796,14 @@ std::unique_ptr<FunctionDecl> instantiate(
         }
     }
     result->result_location = source.result_location;
+    for (const auto& assertion : source.deferred_static_assertions) {
+        result->deferred_static_assertions.push_back(
+            {assertion.location, assertion.source_namespace,
+             assertion.condition
+                 ? clone_expr(*assertion.condition, types, values)
+                 : std::unique_ptr<Expr>{},
+             assertion.message});
+    }
     if (source.body) result->body = clone_statement(*source.body, types, values);
     result->linkage = source.linkage;
     result->variadic = source.variadic;
@@ -657,12 +853,8 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
         [](const FunctionDecl& candidate) {
             return !candidate.generic_parameters.empty();
         });
-    if (expression->generic_arguments.empty()) {
-        if (generic) {
-            diagnostics.error(expression->location,
-                              "generic function '" + generic->name +
-                                  "' requires explicit ::<...> arguments");
-        } else if (auto* function = resolve_function(
+    if (!generic && expression->generic_arguments.empty()) {
+        if (auto* function = resolve_function(
                        program, caller, *expression->left,
                        [](const FunctionDecl& candidate) { return candidate.body != nullptr; })) {
             // An ordinary helper used by a generic constant may itself call
@@ -678,6 +870,9 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                               name + "'");
         return;
     }
+    if (!deduce_generic_arguments(*generic, *expression, caller, program,
+                                  state, expression->generic_arguments,
+                                  diagnostics)) return;
     if (!normalize_generic_arguments(*generic, expression->generic_arguments,
                                      caller, program, diagnostics, expression->location,
                                      state)) return;
@@ -722,6 +917,9 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
         state.instances.push_back({generic, std::move(keys), internal_name});
         auto* concrete = instance.get();
         program.functions.push_back(std::move(instance));
+        for (auto& assertion : concrete->deferred_static_assertions)
+            program.static_assertions.push_back(std::move(assertion));
+        concrete->deferred_static_assertions.clear();
         // Publish before walking the body so recursive identical instances
         // resolve to the in-progress function. Nested constant generic calls
         // can then be evaluated through the same visible definition table.
@@ -1845,6 +2043,146 @@ std::optional<EvalValue> parse_integer_value(const Expr& expression) {
         else return std::nullopt;
     }
     return EvalValue{*parsed, builtin_type(type)};
+}
+
+TypePtr infer_generic_actual(const Expr& expression,
+                             const FunctionDecl* caller,
+                             Program& program,
+                             const GenericExpansionState& state,
+                             bool decay) {
+    const auto adjusted = [&](TypePtr type) -> TypePtr {
+        if (!type || !decay) return type;
+        if (type->kind == Type::Kind::Array)
+            return pointer_type(type->element);
+        if (type->kind == Type::Kind::Function)
+            return pointer_type(type);
+        return type;
+    };
+    switch (expression.kind) {
+    case Expr::Kind::Integer: {
+        const auto value = parse_integer_value(expression);
+        return value ? value->type : TypePtr{};
+    }
+    case Expr::Kind::Floating:
+        return builtin_type(expression.text.ends_with("f32")
+                                ? BuiltinType::F32
+                                : BuiltinType::F64);
+    case Expr::Kind::Character:
+        return builtin_type(BuiltinType::U32);
+    case Expr::Kind::String:
+        return pointer_type(builtin_type(BuiltinType::U8, true));
+    case Expr::Kind::Address:
+        return expression.type;
+    case Expr::Kind::Name: {
+        const auto key = name_key(expression);
+        for (auto entry = state.local_types.rbegin();
+             entry != state.local_types.rend(); ++entry)
+            if (entry->first == key) return adjusted(entry->second);
+        if (const auto* object = resolve_object(program, caller, expression))
+            return adjusted(object->type);
+        if (const auto* function = resolve_function(
+                program, caller, expression,
+                [](const FunctionDecl& candidate) {
+                    return candidate.generic_parameters.empty();
+                })) {
+            auto type = function_type(function->return_type,
+                                      function->parameters,
+                                      function->variadic);
+            type->function->result_location = function->result_location;
+            if (const auto* abi = function->attribute("abi"); abi &&
+                abi->arguments.size() == 1)
+                type->function->abi = decode_string_literal(
+                    abi->arguments.front()).value_or("");
+            if (const auto* cleanup = function->attribute("stack_cleanup");
+                cleanup && cleanup->arguments.size() == 1)
+                type->function->stack_cleanup = decode_string_literal(
+                    cleanup->arguments.front());
+            for (const auto& attribute : function->attributes) {
+                if (attribute.name != "clobber") continue;
+                for (const auto& argument : attribute.arguments)
+                    if (const auto resource = decode_string_literal(argument))
+                        type->function->clobbers.push_back(*resource);
+            }
+            return adjusted(type);
+        }
+        return {};
+    }
+    case Expr::Kind::Parenthesized:
+        return expression.left
+                   ? infer_generic_actual(*expression.left, caller, program,
+                                          state, decay)
+                   : TypePtr{};
+    case Expr::Kind::Cast:
+        return adjusted(expression.type);
+    case Expr::Kind::Sizeof:
+    case Expr::Kind::Alignof:
+        return builtin_type(BuiltinType::Uptr);
+    case Expr::Kind::Assign:
+        return expression.left
+                   ? infer_generic_actual(*expression.left, caller, program,
+                                          state, false)
+                   : TypePtr{};
+    case Expr::Kind::Unary: {
+        if (expression.text == "!") return builtin_type(BuiltinType::Bool);
+        if (!expression.left) return {};
+        auto operand = infer_generic_actual(
+            *expression.left, caller, program, state,
+            expression.text != "&");
+        if (!operand) return {};
+        if (expression.text == "&") return pointer_type(operand);
+        if (expression.text == "*")
+            return operand->kind == Type::Kind::Pointer
+                       ? adjusted(operand->pointee)
+                       : TypePtr{};
+        return operand;
+    }
+    case Expr::Kind::Binary: {
+        if (!expression.left || !expression.right) return {};
+        if (expression.text == "==" || expression.text == "!=" ||
+            expression.text == "<" || expression.text == "<=" ||
+            expression.text == ">" || expression.text == ">=" ||
+            expression.text == "&&" || expression.text == "||")
+            return builtin_type(BuiltinType::Bool);
+        const auto left = infer_generic_actual(*expression.left, caller,
+                                               program, state);
+        if (expression.text == "index") {
+            if (!left) return {};
+            return left->kind == Type::Kind::Pointer ||
+                           left->kind == Type::Kind::Array
+                       ? adjusted(left->kind == Type::Kind::Pointer
+                                      ? left->pointee
+                                      : left->element)
+                       : TypePtr{};
+        }
+        const auto right = infer_generic_actual(*expression.right, caller,
+                                                program, state);
+        if (!left || !right) return {};
+        if ((expression.text == "+" || expression.text == "-") &&
+            left->kind == Type::Kind::Pointer && is_integer(right))
+            return left;
+        return same_type(left, right) ? left : TypePtr{};
+    }
+    case Expr::Kind::Conditional: {
+        if (!expression.right || !expression.third) return {};
+        const auto yes = infer_generic_actual(*expression.right, caller,
+                                              program, state);
+        const auto no = infer_generic_actual(*expression.third, caller,
+                                             program, state);
+        return same_type(yes, no) ? yes : TypePtr{};
+    }
+    case Expr::Kind::Call: {
+        if (!expression.left || expression.left->kind != Expr::Kind::Name)
+            return {};
+        const auto* function = resolve_function(
+            program, caller, *expression.left,
+            [](const FunctionDecl& candidate) {
+                return candidate.generic_parameters.empty();
+            });
+        return function ? adjusted(function->return_type) : TypePtr{};
+    }
+    default:
+        return {};
+    }
 }
 
 bool signed_value(const EvalValue& value) {

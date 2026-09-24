@@ -633,10 +633,126 @@ TypePtr Parser::parse_type() {
     return type;
 }
 
+std::vector<std::string> Parser::preview_angle_generic_types() const {
+    for (auto cursor = index_; cursor < tokens_.size(); ++cursor) {
+        if (tokens_[cursor].is(";") || tokens_[cursor].is("{") ||
+            tokens_[cursor].is("=")) break;
+        if (!tokens_[cursor].is("<") || cursor == 0 ||
+            tokens_[cursor - 1].kind != TokenKind::Identifier) continue;
+        unsigned depth = 1;
+        auto close = cursor + 1;
+        for (; close < tokens_.size(); ++close) {
+            if (tokens_[close].is("<")) ++depth;
+            else if (tokens_[close].is(">")) --depth;
+            else if (tokens_[close].is(">>")) {
+                if (depth < 2) break;
+                depth -= 2;
+            }
+            if (depth == 0) break;
+        }
+        if (depth != 0 || close + 1 >= tokens_.size() ||
+            !tokens_[close + 1].is("(")) continue;
+        std::vector<std::string> result;
+        auto begin = cursor + 1;
+        for (auto index = begin; index <= close; ++index) {
+            if (index != close && !tokens_[index].is(",")) continue;
+            if (index == begin + 1 &&
+                tokens_[begin].kind == TokenKind::Identifier)
+                result.emplace_back(tokens_[begin].text);
+            begin = index + 1;
+        }
+        return result;
+    }
+    return {};
+}
+
+std::vector<FunctionDecl::GenericParameter>
+Parser::parse_angle_generic_parameters() {
+    std::vector<FunctionDecl::GenericParameter> result;
+    consume("<");
+    if (consume(">")) {
+        error_here("a generic parameter list cannot be empty");
+        return result;
+    }
+    for (;;) {
+        const auto location = current().location;
+        std::optional<std::string> name;
+        TypePtr value_type;
+        if (current().kind == TokenKind::Identifier &&
+            (current(1).is(",") || current(1).is(">"))) {
+            name = std::string(current().text);
+            ++index_;
+        } else {
+            value_type = parse_type();
+            if (value_type)
+                value_type = parse_declarator(std::move(value_type), name);
+            if (value_type && !is_integer(value_type) &&
+                value_type->kind != Type::Kind::Pointer &&
+                !(value_type->kind == Type::Kind::Builtin &&
+                  value_type->builtin == BuiltinType::Label))
+                diagnostics_.error(location,
+                    "generic value parameter requires an integer, enumeration, bool, label, or pointer type");
+        }
+        if (!name || name->find("::") != std::string::npos) {
+            diagnostics_.error(location,
+                               "expected an unqualified generic parameter name");
+        } else if (std::any_of(result.begin(), result.end(),
+                               [&](const auto& parameter) {
+                                   return parameter.name == *name;
+                               })) {
+            diagnostics_.error(location,
+                               "duplicate generic parameter '" + *name + "'");
+        } else {
+            if (!value_type) active_generic_types_.push_back(*name);
+            result.push_back({std::move(*name), std::move(value_type), location});
+        }
+        if (!consume(",")) break;
+        if (current().is(">")) {
+            error_here("a generic parameter list cannot have a trailing comma");
+            break;
+        }
+    }
+    expect(">", "after generic parameters");
+    return result;
+}
+
+bool Parser::known_generic_name(std::string_view name) const {
+    if (known_generic_functions_.contains(std::string(name))) return true;
+    if (name.find("::") != std::string_view::npos) return false;
+    auto name_space = active_namespace_;
+    while (!name_space.empty()) {
+        if (known_generic_functions_.contains(join_namespace(name_space, name)))
+            return true;
+        const auto separator = name_space.rfind("::");
+        if (separator == std::string::npos) break;
+        name_space.resize(separator);
+    }
+    for (const auto& imported : active_imports_)
+        if (known_generic_functions_.contains(join_namespace(imported, name)))
+            return true;
+    return false;
+}
+
+bool Parser::consume_generic_close() {
+    if (consume(">")) return true;
+    if (!current().is(">>")) return false;
+    auto remainder = current();
+    remainder.text = ">";
+    ++remainder.location.offset;
+    ++remainder.location.column;
+    tokens_[index_].text = ">";
+    tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(index_) + 1,
+                   remainder);
+    ++index_;
+    return true;
+}
+
 TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                                  bool parameter,
                                  std::unique_ptr<Expr>* dynamic_outer_bound,
-                                 SourceLocation* name_location) {
+                                 SourceLocation* name_location,
+                                 std::vector<FunctionDecl::GenericParameter>*
+                                     angle_parameters) {
     while (consume("*")) {
         bool is_const = false;
         bool is_volatile = false;
@@ -661,12 +777,15 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     if (current().is("(") && (current(1).is("*") || current(1).is("("))) {
         consume("(");
         hole = std::make_shared<Type>();
-        nested = parse_declarator(hole, name, parameter, nullptr, name_location);
+        nested = parse_declarator(hole, name, parameter, nullptr,
+                                  name_location, angle_parameters);
         expect(")", "after parenthesized declarator");
     } else {
         const auto location = current().location;
         name = parse_qualified_name();
         if (name && name_location) *name_location = location;
+        if (name && angle_parameters && current().is("<"))
+            *angle_parameters = parse_angle_generic_parameters();
     }
     if (current().is("[")) {
         base = parse_array_suffix(std::move(base), parameter, dynamic_outer_bound);
@@ -1112,6 +1231,11 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     for (const auto& parameter : parameters) {
         if (!parameter.value_type) active_generic_types_.push_back(parameter.name);
     }
+    for (const auto& name : preview_angle_generic_types()) {
+        if (std::find(active_generic_types_.begin(), active_generic_types_.end(),
+                      name) == active_generic_types_.end())
+            active_generic_types_.push_back(name);
+    }
     if (!type_start()) {
         if (const auto message = familiar_c_spelling(current().text)) {
             error_here(*message);
@@ -1125,7 +1249,9 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     const auto location = current().location;
     auto type = parse_type();
     std::optional<std::string> name;
-    type = parse_declarator(std::move(type), name);
+    std::vector<FunctionDecl::GenericParameter> angle_parameters;
+    type = parse_declarator(std::move(type), name, false, nullptr, nullptr,
+                            &angle_parameters);
     if (!type || !name) {
         if (!name) error_here("expected declaration name");
         synchronize_external();
@@ -1134,13 +1260,19 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     }
     *name = join_namespace(name_space, *name);
     if (type->kind == Type::Kind::Function && type->function) {
+        if (!angle_parameters.empty() || !parameters.empty())
+            known_generic_functions_.insert(*name);
         auto signature = type->function;
         auto result_type = signature->result;
         auto function = parse_function(
             location, std::move(*name), name_space, std::move(result_type),
-            linkage, inline_hint, std::move(attributes), std::move(signature));
+            linkage, inline_hint, std::move(attributes), std::move(signature),
+            std::move(angle_parameters));
         if (function) program.functions.push_back(std::move(function));
     } else {
+        if (!angle_parameters.empty())
+            diagnostics_.error(location,
+                               "angle generic parameters require a direct function declaration");
         apply_callable_attributes(type, attributes);
         if (inline_hint)
             diagnostics_.error(location,
@@ -1364,9 +1496,14 @@ bool Parser::parse_static_assertion() {
                                    .value_or("static assertion failed")
                              : std::string("static assertion failed");
     if (!condition) return false;
-    static_assertions_.push_back(
-        {location, active_namespace_, std::move(condition),
-         std::move(message)});
+    StaticAssertDecl assertion{location, active_namespace_,
+                               std::move(condition), std::move(message)};
+    if (active_function_ &&
+        !active_function_->generic_parameters.empty())
+        active_function_->deferred_static_assertions.push_back(
+            std::move(assertion));
+    else
+        static_assertions_.push_back(std::move(assertion));
     return true;
 }
 
@@ -1400,7 +1537,9 @@ Parser::parse_function(SourceLocation location, std::string name,
                        std::string name_space, TypePtr return_type,
                        Linkage linkage, bool inline_hint,
                        std::vector<Attribute> attributes,
-                       std::shared_ptr<FunctionType> signature) {
+                       std::shared_ptr<FunctionType> signature,
+                       std::vector<FunctionDecl::GenericParameter>
+                           angle_parameters) {
     auto function = std::make_unique<FunctionDecl>();
     function->location = location;
     function->name = std::move(name);
@@ -1413,6 +1552,13 @@ Parser::parse_function(SourceLocation location, std::string name,
     function->inline_hint = inline_hint;
     function->attributes = std::move(attributes);
     function->generic_parameters = generic_parameters(function->attributes);
+    if (!angle_parameters.empty()) {
+        if (!function->generic_parameters.empty())
+            diagnostics_.error(location,
+                               "angle generic parameters cannot be combined with [[generic]]");
+        else
+            function->generic_parameters = std::move(angle_parameters);
+    }
     if (signature) {
         function->parameters = signature->parameters;
         function->variadic = signature->variadic;
@@ -1474,7 +1620,10 @@ Parser::parse_function(SourceLocation location, std::string name,
         synchronize_external();
         return function;
     }
+    auto* previous_function = active_function_;
+    active_function_ = function.get();
     function->body = parse_compound();
+    active_function_ = previous_function;
     return function;
 }
 
@@ -1905,7 +2054,8 @@ std::unique_ptr<Expr> Parser::parse_conditional() {
 std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence) {
     auto left = parse_cast();
     for (;;) {
-        if (parsing_generic_argument_ && current().is(">")) break;
+        if (parsing_generic_argument_ &&
+            (current().is(">") || current().is(">>"))) break;
         const int current_precedence = precedence(current().text);
         if (current_precedence < minimum_precedence) break;
         const auto operation = current(); ++index_;
@@ -1995,8 +2145,13 @@ std::unique_ptr<Expr> Parser::parse_unary() {
 std::unique_ptr<Expr> Parser::parse_postfix() {
     auto expression = parse_primary();
     for (;;) {
-        if (current().is("::") && current(1).is("<")) {
-            index_ += 2;
+        const bool explicit_generic = current().is("::") &&
+                                      current(1).is("<");
+        const bool inferred_generic = current().is("<") && expression &&
+                                      expression->kind == Expr::Kind::Name &&
+                                      known_generic_name(expression->text);
+        if (explicit_generic || inferred_generic) {
+            index_ += explicit_generic ? 2 : 1;
             if (consume(">")) {
                 error_here("a generic argument list cannot be empty");
             } else {
@@ -2013,7 +2168,8 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
                     expression->generic_arguments.push_back(std::move(argument));
                     if (!consume(",")) break;
                 }
-                expect(">", "to close generic argument list");
+                if (!consume_generic_close())
+                    error_here("expected '>' to close generic argument list");
             }
             continue;
         }

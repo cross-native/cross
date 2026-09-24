@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace cross {
@@ -42,7 +43,14 @@ private:
     parse_declarator(TypePtr base, std::optional<std::string>& name,
                      bool parameter = false,
                      std::unique_ptr<Expr>* dynamic_outer_bound = nullptr,
-                     SourceLocation* name_location = nullptr);
+                     SourceLocation* name_location = nullptr,
+                     std::vector<FunctionDecl::GenericParameter>*
+                         angle_parameters = nullptr);
+    std::vector<FunctionDecl::GenericParameter>
+    parse_angle_generic_parameters();
+    std::vector<std::string> preview_angle_generic_types() const;
+    bool consume_generic_close();
+    bool known_generic_name(std::string_view name) const;
     void apply_callable_attributes(TypePtr& type,
                                    const std::vector<Attribute>& attributes);
     TypePtr parse_array_suffix(
@@ -65,7 +73,9 @@ private:
     parse_function(SourceLocation location, std::string name,
                    std::string name_space, TypePtr return_type, Linkage linkage,
                    bool inline_hint, std::vector<Attribute> attributes,
-                   std::shared_ptr<FunctionType> signature = {});
+                   std::shared_ptr<FunctionType> signature = {},
+                   std::vector<FunctionDecl::GenericParameter>
+                       angle_parameters = {});
     std::unique_ptr<ObjectDecl> parse_object(
         SourceLocation location, std::string name, TypePtr type, Linkage linkage,
         std::vector<Attribute> attributes);
@@ -99,6 +109,7 @@ private:
     std::vector<std::string> active_imports_;
     std::size_t current_scope_imports_{};
     std::vector<std::string> active_generic_types_;
+    std::unordered_set<std::string> known_generic_functions_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
     struct RecordTag {
@@ -108,6 +119,7 @@ private:
     std::unordered_map<std::string, RecordTag> record_types_;
     std::unordered_map<std::string, TypePtr> type_aliases_;
     std::vector<StaticAssertDecl> static_assertions_;
+    FunctionDecl* active_function_{};
     bool parsing_generic_argument_{};
     bool parsing_procedural_body_{};
     unsigned switch_depth_{};

@@ -222,6 +222,25 @@ if(BUILD_TESTING)
                          "-DCC_FLAGS=--model=${CMAKE_SOURCE_DIR}/test/model/custom.y;-${level}"
                          -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     endforeach()
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_generic_angle_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_angle.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-angle-${level}
+                         -DENTRY=generic_angle_entry
+                         -DEXPECTED=1
+                         -DCC_FLAGS=-${level}
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
+    add_test(NAME cross_generic_angle_errors
+             COMMAND "${CMAKE_COMMAND}"
+                     -DCC=$<TARGET_FILE:cross_cc>
+                     -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
+                     -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/generic-angle-errors
+                     -P "${CMAKE_SOURCE_DIR}/test/language/generic_angle_errors.cmake")
     add_executable(cross_procedural_tokens_test test/frontend/procedural_tokens_test.cpp)
     target_link_libraries(cross_procedural_tokens_test PRIVATE cross_frontend)
     cross_component(cross_procedural_tokens_test)
