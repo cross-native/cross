@@ -263,6 +263,37 @@ if(BUILD_TESTING)
                      -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
                      -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/generic-angle-errors
                      -P "${CMAKE_SOURCE_DIR}/test/language/generic_angle_errors.cmake")
+    foreach(level O0 O2)
+        add_test(NAME cross_generic_group_runtime_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE_USE=${CMAKE_SOURCE_DIR}/test/language/generic_group_use.x
+                         -DSOURCE_DEF=${CMAKE_SOURCE_DIR}/test/language/generic_group_def.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-group-${level}
+                         -DENTRY=generic_group_entry
+                         -DLEVEL=${level}
+                         -P "${CMAKE_SOURCE_DIR}/test/language/generic_group_runtime.cmake")
+        add_test(NAME cross_generic_group_custom_abi_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE_USE=${CMAKE_SOURCE_DIR}/test/language/generic_group_custom_use.x
+                         -DSOURCE_DEF=${CMAKE_SOURCE_DIR}/test/language/generic_group_custom_def.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-group-custom-${level}
+                         -DENTRY=generic_group_custom_entry
+                         -DLEVEL=${level}
+                         -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+                         -P "${CMAKE_SOURCE_DIR}/test/language/generic_group_runtime.cmake")
+    endforeach()
+    add_test(NAME cross_generic_group_errors
+             COMMAND "${CMAKE_COMMAND}"
+                     -DCC=$<TARGET_FILE:cross_cc>
+                     -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
+                     -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/generic-group-errors
+                     -P "${CMAKE_SOURCE_DIR}/test/language/generic_group_errors.cmake")
     add_executable(cross_procedural_tokens_test test/frontend/procedural_tokens_test.cpp)
     target_link_libraries(cross_procedural_tokens_test PRIVATE cross_frontend)
     cross_component(cross_procedural_tokens_test)

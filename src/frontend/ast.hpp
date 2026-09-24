@@ -180,6 +180,10 @@ struct Expr {
     std::vector<TokenSequence> quote_fragments;
     std::vector<GenericArgument> generic_arguments;
     std::vector<InitializerEntry> initializer_entries;
+    // Whether a generic declaration was visible when this call was parsed.
+    // Semantic expansion must not turn a later/group-only definition into an
+    // implicit declaration.
+    bool generic_visible_at_call{};
 };
 
 inline NameKey name_key(const Expr& expression) {

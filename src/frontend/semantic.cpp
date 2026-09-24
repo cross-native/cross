@@ -175,6 +175,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->evaluated_integer = source.evaluated_integer;
     result->evaluated_floating = source.evaluated_floating;
     result->evaluated_address = source.evaluated_address;
+    result->generic_visible_at_call = source.generic_visible_at_call;
     if (source.type) result->type = clone_type(source.type, types);
     if (source.left) result->left = clone_expr(*source.left, types, values);
     if (source.right) result->right = clone_expr(*source.right, types, values);
@@ -495,6 +496,102 @@ bool normalize_generic_callable_abis(TypePtr& type,
         if (!normalize_generic_callable_abis(parameter.type, state,
                                              diagnostics, location)) return false;
     return true;
+}
+
+TypePtr generic_declaration_type(const FunctionDecl& function,
+                                 const TypeSubstitutions& type_names) {
+    auto parameters = function.parameters;
+    for (auto& parameter : parameters)
+        parameter.type = clone_type(parameter.type, type_names);
+    auto type = function_type(clone_type(function.return_type, type_names),
+                              std::move(parameters), function.variadic);
+    type->function->result_location = function.result_location;
+    if (const auto* abi = function.attribute("abi"); abi &&
+        abi->arguments.size() == 1)
+        type->function->abi =
+            decode_string_literal(abi->arguments.front()).value_or("");
+    if (const auto* cleanup = function.attribute("stack_cleanup"); cleanup &&
+        cleanup->arguments.size() == 1)
+        type->function->stack_cleanup =
+            decode_string_literal(cleanup->arguments.front());
+    for (const auto& attribute : function.attributes) {
+        if (attribute.name != "clobber") continue;
+        for (const auto& argument : attribute.arguments)
+            if (const auto resource = decode_string_literal(argument))
+                type->function->clobbers.push_back(*resource);
+    }
+    return type;
+}
+
+bool compatible_generic_declarations(
+    const FunctionDecl& left, const FunctionDecl& right,
+    const GenericExpansionState& state, Diagnostics& diagnostics) {
+    if (left.linkage != right.linkage ||
+        left.generic_parameters.size() != right.generic_parameters.size())
+        return false;
+    TypeSubstitutions left_names;
+    TypeSubstitutions right_names;
+    for (std::size_t index = 0; index < left.generic_parameters.size();
+         ++index) {
+        const auto& a = left.generic_parameters[index];
+        const auto& b = right.generic_parameters[index];
+        if (static_cast<bool>(a.value_type) !=
+            static_cast<bool>(b.value_type)) return false;
+        if (!a.value_type) {
+            const auto placeholder = generic_type(
+                "__generic_parameter_" + std::to_string(index));
+            left_names.emplace(a.name, placeholder);
+            right_names.emplace(b.name, placeholder);
+        }
+    }
+    for (std::size_t index = 0; index < left.generic_parameters.size();
+         ++index) {
+        const auto& a = left.generic_parameters[index];
+        const auto& b = right.generic_parameters[index];
+        if (!a.value_type) continue;
+        auto a_type = clone_type(a.value_type, left_names);
+        auto b_type = clone_type(b.value_type, right_names);
+        if (!normalize_generic_callable_abis(a_type, state, diagnostics,
+                                             a.location) ||
+            !normalize_generic_callable_abis(b_type, state, diagnostics,
+                                             b.location) ||
+            !same_type(a_type, b_type)) return false;
+    }
+    auto a_type = generic_declaration_type(left, left_names);
+    auto b_type = generic_declaration_type(right, right_names);
+    return normalize_generic_callable_abis(a_type, state, diagnostics,
+                                           left.location) &&
+           normalize_generic_callable_abis(b_type, state, diagnostics,
+                                           right.location) &&
+           same_type(a_type, b_type);
+}
+
+bool validate_generic_redeclarations(const Program& program,
+                                     const GenericExpansionState& state,
+                                     Diagnostics& diagnostics) {
+    for (std::size_t left = 0; left < program.functions.size(); ++left) {
+        const auto& a = *program.functions[left];
+        if (a.generic_parameters.empty()) continue;
+        for (std::size_t right = left + 1;
+             right < program.functions.size(); ++right) {
+            const auto& b = *program.functions[right];
+            if (b.generic_parameters.empty() || a.name != b.name) continue;
+            if ((a.linkage == Linkage::Static ||
+                 b.linkage == Linkage::Static) &&
+                a.source_unit != b.source_unit) continue;
+            if (a.body && b.body) {
+                diagnostics.error(b.location,
+                                  "duplicate definition of generic function '" +
+                                      b.name + "'");
+            } else if (!compatible_generic_declarations(
+                           a, b, state, diagnostics)) {
+                diagnostics.error(b.location,
+                                  "generic declarations of '" + b.name +
+                                      "' have incompatible interfaces");
+            }
+        }
+    }
+    return diagnostics.errors() == 0;
 }
 
 TypePtr infer_generic_actual(const Expr& expression,
@@ -892,13 +989,23 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
         expression->left->kind != Expr::Kind::Name) {
         return;
     }
+    if (std::find(state.locals.begin(), state.locals.end(),
+                  name_key(*expression->left)) != state.locals.end())
+        return;
     const auto name = expression->left->text;
-    auto* generic = resolve_function(
+    auto* declared_generic = resolve_function(
         program, caller, *expression->left,
         [](const FunctionDecl& candidate) {
             return !candidate.generic_parameters.empty();
         });
-    if (!generic && expression->generic_arguments.empty()) {
+    auto* generic = resolve_function(
+        program, caller, *expression->left,
+        [](const FunctionDecl& candidate) {
+            return !candidate.generic_parameters.empty() &&
+                   candidate.body != nullptr;
+        });
+    if (!generic && !declared_generic &&
+        expression->generic_arguments.empty()) {
         if (auto* function = resolve_function(
                        program, caller, *expression->left,
                        [](const FunctionDecl& candidate) { return candidate.body != nullptr; })) {
@@ -910,9 +1017,19 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
         return;
     }
     if (!generic) {
+        diagnostics.error(
+            expression->location,
+            declared_generic
+                ? "definition of generic function '" + name +
+                      "' is not visible in this compilation group"
+                : "generic arguments applied to non-generic function '" +
+                      name + "'");
+        return;
+    }
+    if (!expression->generic_visible_at_call) {
         diagnostics.error(expression->location,
-                          "generic arguments applied to non-generic function '" +
-                              name + "'");
+                          "generic function '" + name +
+                              "' must be declared before use");
         return;
     }
     if (!deduce_generic_arguments(*generic, *expression, caller, program,
@@ -985,6 +1102,8 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
     GenericExpansionState state;
     state.pointer_resolver = pointer_resolver;
     state.canonical_abi = canonical_abi;
+    if (!validate_generic_redeclarations(program, state, diagnostics))
+        return false;
     for (std::size_t index = 0; index < program.functions.size(); ++index) {
         auto* function = program.functions[index].get();
         if (!function->generic_parameters.empty()) continue;

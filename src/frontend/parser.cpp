@@ -2193,6 +2193,9 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
             auto call = std::make_unique<Expr>();
             call->kind = Expr::Kind::Call;
             call->location = expression->location;
+            call->generic_visible_at_call =
+                expression->kind == Expr::Kind::Name &&
+                known_generic_name(expression->text);
             call->generic_arguments = std::move(expression->generic_arguments);
             call->left = std::move(expression);
             if (!consume(")")) {

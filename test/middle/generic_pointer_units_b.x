@@ -1,6 +1,12 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+[[generic(const u32 *P)]]
+global const u32 *shared_pointer();
+typedef u32 (*UnitCallback)(in u32 x);
+[[generic(UnitCallback F)]]
+global u32 shared_callback(in u32 x);
+
 static u32 cell = 13u32;
 static const u32 *local_address() { return &cell; }
 [[generic(const u32 *P), noinline]]

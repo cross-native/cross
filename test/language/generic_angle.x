@@ -57,9 +57,14 @@ global i32 generic_angle_entry() {
     i32 member = choose(1 == 1, pair.left, pair_pointer->right);
     i32 called = choose(1 == 0, callback(4i32), callback(5i32));
     i32 shadow = 0i32;
+    i32 shadow_call = 0i32;
     {
         i32 choose = 2i32;
         shadow = choose < 3i32 ? 1i32 : 2i32;
+    }
+    {
+        generic_callback choose = callback_plus_two;
+        shadow_call = choose(39i32);
     }
     i32 iterations = 0i32;
     for (i32 choose = 0i32; choose < 1i32; ++choose)
@@ -70,7 +75,8 @@ global i32 generic_angle_entry() {
            *pointer == 17i32 && copied(39i32) == 41i32 &&
            alias_copy(40i32) == 42i32 &&
            member == 3i32 && called == 7i32 &&
-           shadow == 1i32 && iterations == 1i32 &&
+           shadow == 1i32 && shadow_call == 41i32 &&
+           iterations == 1i32 &&
            after_shadow == 13i32 && shadow_parameter(2i32) == 1i32
         ? 1i32 : 2i32;
 }
