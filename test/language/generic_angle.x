@@ -27,6 +27,10 @@ static void assign<T>(out T destination, in T value) {
     destination = value;
 }
 
+static i32 shadow_parameter(in i32 choose) {
+    return choose < 3i32 ? 1i32 : 2i32;
+}
+
 typedef i32 (*generic_callback)(in i32 value) [[abi("ms_abi")]];
 typedef i32 (*generic_alias_callback)(in i32 value) [[abi("ms")]];
 struct generic_pair { i32 left; i32 right; };
@@ -52,10 +56,21 @@ global i32 generic_angle_entry() {
     struct generic_pair *pair_pointer = &pair;
     i32 member = choose(1 == 1, pair.left, pair_pointer->right);
     i32 called = choose(1 == 0, callback(4i32), callback(5i32));
+    i32 shadow = 0i32;
+    {
+        i32 choose = 2i32;
+        shadow = choose < 3i32 ? 1i32 : 2i32;
+    }
+    i32 iterations = 0i32;
+    for (i32 choose = 0i32; choose < 1i32; ++choose)
+        iterations += 1i32;
+    i32 after_shadow = choose<i32>(1 == 1, 13i32, 14i32);
     return counted == 11i32 && shifted == 11i32 &&
            selected < counted && inferred == 11i32 && partial == 7i32 &&
            *pointer == 17i32 && copied(39i32) == 41i32 &&
            alias_copy(40i32) == 42i32 &&
-           member == 3i32 && called == 7i32
+           member == 3i32 && called == 7i32 &&
+           shadow == 1i32 && iterations == 1i32 &&
+           after_shadow == 13i32 && shadow_parameter(2i32) == 1i32
         ? 1i32 : 2i32;
 }

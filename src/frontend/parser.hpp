@@ -110,6 +110,7 @@ private:
     std::size_t current_scope_imports_{};
     std::vector<std::string> active_generic_types_;
     std::unordered_set<std::string> known_generic_functions_;
+    std::vector<std::unordered_set<std::string>> local_scopes_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
     struct RecordTag {

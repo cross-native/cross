@@ -717,6 +717,10 @@ Parser::parse_angle_generic_parameters() {
 }
 
 bool Parser::known_generic_name(std::string_view name) const {
+    if (name.find("::") == std::string_view::npos)
+        for (auto scope = local_scopes_.rbegin();
+             scope != local_scopes_.rend(); ++scope)
+            if (scope->contains(std::string(name))) return false;
     if (known_generic_functions_.contains(std::string(name))) return true;
     if (name.find("::") != std::string_view::npos) return false;
     auto name_space = active_namespace_;
@@ -1680,7 +1684,10 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
         parse_declarator(std::move(declaration.type), name, false,
                          &declaration.dynamic_array_bound, &declaration.location);
     if (!name) error_here("expected local variable name");
-    else declaration.name = *name;
+    else {
+        declaration.name = *name;
+        if (!local_scopes_.empty()) local_scopes_.back().insert(*name);
+    }
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
@@ -1727,6 +1734,10 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     const auto saved_imports = active_imports_;
     const auto saved_scope_imports = current_scope_imports_;
     current_scope_imports_ = 0;
+    local_scopes_.emplace_back();
+    if (local_scopes_.size() == 1 && active_function_)
+        for (const auto& parameter : active_function_->parameters)
+            local_scopes_.back().insert(parameter.name);
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Compound;
     statement->location = current().location;
@@ -1749,6 +1760,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     expect("}");
     active_imports_ = saved_imports;
     current_scope_imports_ = saved_scope_imports;
+    local_scopes_.pop_back();
     return statement;
 }
 
@@ -1869,6 +1881,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     }
     if (consume("for")) {
         statement->kind = Statement::Kind::For;
+        local_scopes_.emplace_back();
         expect("(");
         if (consume(";")) {
             statement->first = std::make_unique<Statement>();
@@ -1906,6 +1919,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         if (!current().is(")")) statement->increment = parse_expression();
         expect(")");
         statement->second = parse_statement();
+        local_scopes_.pop_back();
         return statement;
     }
     if (consume("break")) {
