@@ -251,6 +251,7 @@ void print_builtins(const CompilerOptions& options) {
                  "$::has_abi query\n"
                  "$::has_mangling query\n"
                  "$::has_profile query\n"
+                 "$::has_include query\n"
                  "$::language::version predefined macro\n"
                  "$::language::version_major predefined macro\n"
                  "$::language::version_minor predefined macro\n"

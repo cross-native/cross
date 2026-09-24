@@ -288,6 +288,21 @@ file(READ "${OUTPUT}.queries.i" queried)
 if(NOT queried MATCHES "global i32 present = 1;")
     message(FATAL_ERROR "ordinary has_include query was not expanded\n${queried}")
 endif()
+execute_process(COMMAND "${CC}" -E ${search} "${asset_dir}/queries.x"
+    -o "${OUTPUT}.queries.cc.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "integrated has_include query failed\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}.queries.cc.i" queried_cc)
+if(NOT queried_cc STREQUAL queried)
+    message(FATAL_ERROR "cpp and cc disagree on has_include\n${queried_cc}\n${queried}")
+endif()
+execute_process(COMMAND "${CC}" --print-builtins
+    RESULT_VARIABLE status OUTPUT_VARIABLE builtin_list ERROR_VARIABLE err)
+if(NOT status EQUAL 0 OR NOT builtin_list MATCHES "[$]::has_include query")
+    message(FATAL_ERROR "has_include is absent from builtin inspection\n${builtin_list}\n${err}")
+endif()
 
 file(WRITE "${asset_dir}/invalid.x"
     "static const u8 value[] = $::embed(\"one\" \"two\");\n")
