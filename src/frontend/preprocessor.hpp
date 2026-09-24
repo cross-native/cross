@@ -20,6 +20,7 @@ public:
     Preprocessor(SourceManager& sources, Diagnostics& diagnostics,
                  const CompilerOptions& options);
     std::string process(const std::filesystem::path& input);
+    const std::vector<std::filesystem::path>& dependencies() const { return dependencies_; }
 
 private:
     struct Macro {
@@ -54,6 +55,8 @@ private:
     std::unordered_set<std::string> pragma_once_files_;
     std::unordered_set<std::string> already_included_;
     std::vector<SourceLocation> line_locations_;
+    std::vector<std::filesystem::path> dependencies_;
+    std::unordered_set<std::string> dependency_identities_;
 };
 
 } // namespace cross

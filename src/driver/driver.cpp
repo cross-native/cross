@@ -376,19 +376,106 @@ void diagnose_codegen_ownership_gaps(const hir::Module& module,
 }
 
 bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
-                       Diagnostics& diagnostics, std::vector<std::string>& outputs) {
+                       Diagnostics& diagnostics, std::vector<std::string>& outputs,
+                       std::vector<std::vector<std::filesystem::path>>& dependencies) {
     for (const auto& input : options.inputs) {
         if (input.extension() == ".i") {
             std::string error;
             const auto* source = sources.load(input, error);
             if (!source) diagnostics.command_error(error);
-            else outputs.push_back(source->text);
+            else {
+                outputs.push_back(source->text);
+                dependencies.push_back({input});
+            }
             continue;
         }
         Preprocessor preprocessor(sources, diagnostics, options);
         outputs.push_back(preprocessor.process(input));
+        auto& found = dependencies.emplace_back();
+        for (const auto& dependency : preprocessor.dependencies())
+            found.push_back(dependency);
     }
     return diagnostics.errors() == 0;
+}
+
+std::string make_escape(std::string_view spelling) {
+    std::string result;
+    for (const char ch : spelling) {
+        if (ch == ' ' || ch == '#' || ch == ':') result += '\\';
+        if (ch == '$') result += '$';
+        result += ch;
+    }
+    return result;
+}
+
+std::string dependency_text(
+    const CompilerOptions& options,
+    const std::vector<std::vector<std::filesystem::path>>& dependencies,
+    bool compiler) {
+    std::ostringstream output;
+    for (std::size_t index = 0; index < dependencies.size(); ++index) {
+        if (!options.dependency_targets.empty()) {
+            for (std::size_t target = 0; target < options.dependency_targets.size(); ++target) {
+                if (target != 0) output << ' ';
+                const auto& spelling = options.dependency_targets[target];
+                output << (spelling.quote ? make_escape(spelling.spelling)
+                                          : spelling.spelling);
+            }
+        } else {
+            auto target = options.inputs[index].stem();
+            target += ".o";
+            if (compiler && options.dependency_mode == DependencyMode::Alongside &&
+                options.output && options.inputs.size() == 1 &&
+                options.emit != EmitKind::Preprocess)
+                target = *options.output;
+            output << make_escape(target.generic_string());
+        }
+        output << ':';
+        for (const auto& path : dependencies[index])
+            output << ' ' << make_escape(path.generic_string());
+        output << '\n';
+    }
+    return output.str();
+}
+
+bool emit_dependencies(
+    const CompilerOptions& options,
+    const std::vector<std::vector<std::filesystem::path>>& dependencies,
+    bool compiler, Diagnostics& diagnostics) {
+    if (options.dependency_mode == DependencyMode::None) return true;
+    const auto content = dependency_text(options, dependencies, compiler);
+    std::optional<std::filesystem::path> path = options.dependency_file;
+    if (!path && options.dependency_mode == DependencyMode::Only)
+        path = options.output;
+    if (!path && options.dependency_mode == DependencyMode::Alongside) {
+        if (options.output) path = *options.output;
+        else path = options.inputs.front().stem();
+        path->replace_extension(".d");
+    }
+    if (path && options.output &&
+        options.dependency_mode == DependencyMode::Alongside) {
+        std::error_code dependency_error, source_error;
+        const auto dependency_identity =
+            std::filesystem::weakly_canonical(*path, dependency_error);
+        const auto source_identity =
+            std::filesystem::weakly_canonical(*options.output, source_error);
+        if (!dependency_error && !source_error &&
+            dependency_identity == source_identity) {
+            diagnostics.command_error(
+                "source output and dependency file must be different paths");
+            return false;
+        }
+    }
+    if (!path) {
+        std::cout << content;
+        return true;
+    }
+    std::string error;
+    if (!write_file(*path, content, error)) {
+        diagnostics.command_error(error);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -406,7 +493,10 @@ int cpp_main(int argc, char** argv) {
     }
     SourceManager sources;
     std::vector<std::string> outputs;
-    if (!preprocess_inputs(options, sources, diagnostics, outputs)) return 1;
+    std::vector<std::vector<std::filesystem::path>> dependencies;
+    if (!preprocess_inputs(options, sources, diagnostics, outputs, dependencies)) return 1;
+    if (!emit_dependencies(options, dependencies, false, diagnostics)) return 1;
+    if (options.dependency_mode == DependencyMode::Only) return 0;
     std::ostringstream joined;
     for (const auto& output : outputs) joined << output;
     if (options.output) {
@@ -450,14 +540,18 @@ int cc_main(int argc, char** argv) {
                                   "' is not implemented; use --print-targets to list compiled-in targets");
         return 1;
     }
-    if (options.emit == EmitKind::Link) {
+    if (options.emit == EmitKind::Link &&
+        options.dependency_mode != DependencyMode::Only) {
         diagnostics.command_error("link mode is not implemented yet; use -c or -S");
         return 1;
     }
 
     SourceManager sources;
     std::vector<std::string> preprocessed;
-    if (!preprocess_inputs(options, sources, diagnostics, preprocessed)) return 1;
+    std::vector<std::vector<std::filesystem::path>> dependencies;
+    if (!preprocess_inputs(options, sources, diagnostics, preprocessed, dependencies)) return 1;
+    if (!emit_dependencies(options, dependencies, true, diagnostics)) return 1;
+    if (options.dependency_mode == DependencyMode::Only) return 0;
     if (options.emit == EmitKind::Preprocess) {
         std::ostringstream joined;
         for (const auto& source : preprocessed) joined << source;

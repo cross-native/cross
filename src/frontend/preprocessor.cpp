@@ -232,13 +232,18 @@ void Preprocessor::define_command_line_macros() {
     }
 }
 
-std::filesystem::path Preprocessor::find_include(const std::filesystem::path& including,
-                                                 std::string_view name, bool quoted) const {
+std::filesystem::path Preprocessor::find_include(
+    const std::filesystem::path& including, std::string_view name,
+    bool quoted) const {
     if (quoted) {
         auto candidate = including.parent_path() / std::string(name);
         if (std::filesystem::is_regular_file(candidate)) return candidate;
     }
     for (const auto& directory : options_.include_paths) {
+        auto candidate = directory / std::string(name);
+        if (std::filesystem::is_regular_file(candidate)) return candidate;
+    }
+    for (const auto& directory : options_.system_include_paths) {
         auto candidate = directory / std::string(name);
         if (std::filesystem::is_regular_file(candidate)) return candidate;
     }
@@ -261,6 +266,7 @@ std::string Preprocessor::expand_includes(const std::filesystem::path& path,
     }
     stack.push_back(path);
     already_included_.insert(identity);
+    if (dependency_identities_.insert(identity).second) dependencies_.push_back(path);
     std::ostringstream output;
     for (const auto& line : preprocessing_lines(*file, diagnostics_)) {
         const auto stripped = trim(line.text);
@@ -820,6 +826,8 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
 
 std::string Preprocessor::process(const std::filesystem::path& input) {
     line_locations_.clear();
+    dependencies_.clear();
+    dependency_identities_.clear();
     std::vector<std::filesystem::path> stack;
     auto included = expand_includes(input, stack);
     if (diagnostics_.errors() != 0) return {};

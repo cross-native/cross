@@ -2332,6 +2332,12 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_conditions.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/preprocessor-conditions
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_conditions.cmake")
+    add_test(NAME cross_preprocessor_dependencies
+        COMMAND "${CMAKE_COMMAND}"
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/preprocessor-dependencies
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_dependencies.cmake")
     add_test(NAME cross_diagnostic
         COMMAND $<TARGET_FILE:cross_cc> -emit-llvm
                 "${CMAKE_SOURCE_DIR}/test/frontend/diagnostic.x"

@@ -127,6 +127,26 @@ bool common_option(int argc, char** argv, int& index, CompilerOptions& options,
     if (argument == "-v") { options.verbose = true; return true; }
     if (argument == "-save-temps") { options.save_temps = true; return true; }
     if (parse_optimization(argument, options, diagnostics)) return true;
+    if (argument == "-M" || argument == "-MM" ||
+        argument == "-MD" || argument == "-MMD") {
+        options.dependency_mode =
+            argument == "-M" || argument == "-MM"
+                ? DependencyMode::Only : DependencyMode::Alongside;
+        return true;
+    }
+    if (argument == "-MF" || argument.starts_with("-MF")) {
+        if (!take_value(argc, argv, index, "-MF", value, diagnostics)) return true;
+        options.dependency_file = value;
+        return true;
+    }
+    if (argument == "-MT" || argument.starts_with("-MT") ||
+        argument == "-MQ" || argument.starts_with("-MQ")) {
+        const std::string_view prefix = argument.starts_with("-MQ") ? "-MQ" : "-MT";
+        if (!take_value(argc, argv, index, prefix, value, diagnostics)) return true;
+        options.dependency_targets.push_back({std::move(value),
+                                              prefix == std::string_view("-MQ")});
+        return true;
+    }
     if (argument == "-o" || argument.starts_with("-o")) {
         if (!take_value(argc, argv, index, "-o", value, diagnostics)) return true;
         options.output = value;
@@ -199,6 +219,11 @@ bool common_option(int argc, char** argv, int& index, CompilerOptions& options,
     if (argument == "-I" || argument.starts_with("-I")) {
         if (!take_value(argc, argv, index, "-I", value, diagnostics)) return true;
         options.include_paths.emplace_back(value);
+        return true;
+    }
+    if (argument == "-isystem" || argument.starts_with("-isystem")) {
+        if (!take_value(argc, argv, index, "-isystem", value, diagnostics)) return true;
+        options.system_include_paths.emplace_back(value);
         return true;
     }
     if (argument == "-D" || argument.starts_with("-D")) {
@@ -938,6 +963,9 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         }
         options.inputs.emplace_back(argument);
     }
+    if (options.dependency_mode == DependencyMode::None &&
+        (options.dependency_file || !options.dependency_targets.empty()))
+        diagnostics.command_error("-MF, -MT, and -MQ require -M, -MM, -MD, or -MMD");
     return diagnostics.errors() == 0;
 }
 
@@ -955,6 +983,9 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
         }
         options.inputs.emplace_back(argument);
     }
+    if (options.dependency_mode == DependencyMode::None &&
+        (options.dependency_file || !options.dependency_targets.empty()))
+        diagnostics.command_error("-MF, -MT, and -MQ require -M, -MM, -MD, or -MMD");
     return diagnostics.errors() == 0;
 }
 
@@ -973,6 +1004,11 @@ void print_cc_help() {
   -emit-gimple          serialize GCC GIMPLE SSA for GIMPLE + RTL passes
   -emit-gimple=rtl      serialize optimized GIMPLE SSA for GCC RTL passes
   -o FILE               write output to FILE
+  -I DIR/-isystem DIR   add ordered source search directories
+  -M/-MM                emit Make dependencies instead of source
+  -MD/-MMD              emit source and a Make dependency file
+  -MF FILE              set dependency output path
+  -MT TARGET/-MQ TARGET set dependency target (raw/Make-escaped)
   -O0/-Og/-O1/-O2/-O3/-Os/-Oz
                         select a model-defined optimization preset
   -O=NAME               select any loaded optimization preset
@@ -1011,6 +1047,11 @@ void print_cpp_help() {
   -Dname[=value]        define a macro
   -Uname                undefine a macro
   -Ipath                add an include directory
+  -isystem DIR          add a later-searched include directory
+  -M/-MM                emit Make dependencies instead of source
+  -MD/-MMD              emit source and a Make dependency file
+  -MF FILE              set dependency output path
+  -MT TARGET/-MQ TARGET set dependency target (raw/Make-escaped)
   -target TRIPLE        select target macros
   -march=CPU            select target instruction compatibility
   -mtune=CPU            select target tuning

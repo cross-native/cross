@@ -26,6 +26,15 @@ enum class EmitKind {
     Preprocess,
 };
 
+enum class DependencyMode {
+    None, Only, Alongside,
+};
+
+struct DependencyTarget {
+    std::string spelling;
+    bool quote{};
+};
+
 enum class OptimizationGoal { Debug, Speed, Size, MinimumSize };
 enum class CodeModel { Small, Kernel, Medium, Large };
 enum class FpContractMode { Off, On, Fast };
@@ -81,6 +90,10 @@ struct CompilerOptions {
     std::vector<std::filesystem::path> inputs;
     std::optional<std::filesystem::path> output;
     std::vector<std::filesystem::path> include_paths;
+    std::vector<std::filesystem::path> system_include_paths;
+    DependencyMode dependency_mode{DependencyMode::None};
+    std::optional<std::filesystem::path> dependency_file;
+    std::vector<DependencyTarget> dependency_targets;
     std::vector<std::filesystem::path> model_paths;
     std::vector<std::filesystem::path> model_files;
     std::vector<std::string> macro_definitions;
