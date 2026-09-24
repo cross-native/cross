@@ -71,6 +71,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf mips64-unknown-elf)
     endif()
     file(READ "${OUTPUT}-${target}.s" assembly)
     if(NOT assembly MATCHES "original:\n[^\n]*[.]byte 65,0,128,255,33" OR
+       NOT assembly MATCHES "copied:\n[^\n]*[.]byte 65,0,128,255,33" OR
        NOT assembly MATCHES "rotated:\n[^\n]*[.]byte 0,128,255,33,65" OR
        NOT assembly MATCHES "asset_size:\n[^\n]*${length_directive}" OR
        NOT assembly MATCHES "static_size:\n[^\n]*${length_directive}")

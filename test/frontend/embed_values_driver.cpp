@@ -6,6 +6,7 @@
 
 extern "C" {
 extern const std::uint8_t original[5];
+extern const std::uint8_t copied[5];
 extern std::uint8_t rotated[5];
 extern std::size_t asset_size;
 extern std::size_t static_size;
@@ -20,7 +21,8 @@ int main() {
     if (asset_size != 5 || static_size != 5 || first_byte != input[0] ||
         zero_byte != 0 || high_byte != 0xff) return 1;
     for (std::size_t index = 0; index < 5; ++index) {
-        if (original[index] != input[index] || rotated[index] != output[index])
+        if (original[index] != input[index] || copied[index] != input[index] ||
+            rotated[index] != output[index])
             return 2;
     }
     rotated[0] = 0;

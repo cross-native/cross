@@ -7,7 +7,12 @@ static $::meta::bytes rotate(in $::meta::bytes source) {
                           $::meta::slice(source, 0u32, 1u32));
 }
 
+[[macro]] static $::meta::tokens copy_asset(in $::meta::tokens input) {
+    return $::quote { $::unquote(input) };
+}
+
 global const u8 original[] = $::embed("payload.bin");
+global const u8 copied[] = copy_asset! { $::embed("payload.bin") };
 global u8 rotated[5] = rotate($::embed("payload.bin"));
 global uptr asset_size = $::meta::len($::embed("payload.bin"));
 global uptr static_size = sizeof(original);
