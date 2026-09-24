@@ -462,9 +462,40 @@ struct GenericExpansionState {
     std::unordered_set<const FunctionDecl*> rewritten_functions;
     unsigned depth{};
     GenericPointerResolver pointer_resolver;
+    GenericAbiCanonicalizer canonical_abi;
     std::vector<NameKey> locals;
     std::vector<std::pair<NameKey, TypePtr>> local_types;
 };
+
+bool normalize_generic_callable_abis(TypePtr& type,
+                                     const GenericExpansionState& state,
+                                     Diagnostics& diagnostics,
+                                     SourceLocation location) {
+    if (!type) return true;
+    if (type->kind == Type::Kind::Pointer)
+        return normalize_generic_callable_abis(type->pointee, state,
+                                               diagnostics, location);
+    if (type->kind == Type::Kind::Array || type->kind == Type::Kind::Vector)
+        return normalize_generic_callable_abis(type->element, state,
+                                               diagnostics, location);
+    if (type->kind != Type::Kind::Function || !type->function) return true;
+    if (state.canonical_abi) {
+        auto resolved = state.canonical_abi(type->function->abi);
+        if (!resolved) {
+            diagnostics.error(location,
+                              "unknown callable ABI '" +
+                                  type->function->abi + "'");
+            return false;
+        }
+        type->function->abi = std::move(*resolved);
+    }
+    if (!normalize_generic_callable_abis(type->function->result, state,
+                                         diagnostics, location)) return false;
+    for (auto& parameter : type->function->parameters)
+        if (!normalize_generic_callable_abis(parameter.type, state,
+                                             diagnostics, location)) return false;
+    return true;
+}
 
 TypePtr infer_generic_actual(const Expr& expression,
                              const FunctionDecl* caller,
@@ -527,12 +558,16 @@ bool match_deduced_type(const TypePtr& formal, const TypePtr& actual,
         actual->function) {
         const auto& left = *formal->function;
         const auto& right = *actual->function;
+        auto left_clobbers = left.clobbers;
+        auto right_clobbers = right.clobbers;
+        std::sort(left_clobbers.begin(), left_clobbers.end());
+        std::sort(right_clobbers.begin(), right_clobbers.end());
         if (left.abi != right.abi || left.variadic != right.variadic ||
             left.result_location.value_or("auto") !=
                 right.result_location.value_or("auto") ||
             left.stack_cleanup.value_or("caller") !=
                 right.stack_cleanup.value_or("caller") ||
-            left.clobbers != right.clobbers ||
+            left_clobbers != right_clobbers ||
             left.parameters.size() != right.parameters.size()) return false;
         if (!match_deduced_type(left.result, right.result, bindings,
                                 type_parameters, conflict)) return false;
@@ -577,6 +612,10 @@ bool deduce_generic_arguments(const FunctionDecl& generic,
                 return false;
             }
         } else if (arguments[index].type) {
+            arguments[index].type = clone_type(arguments[index].type);
+            if (!normalize_generic_callable_abis(arguments[index].type,
+                                                 state, diagnostics,
+                                                 call.location)) return false;
             bindings.emplace(parameter.name, arguments[index].type);
             type_parameters.erase(parameter.name);
         } else {
@@ -602,9 +641,15 @@ bool deduce_generic_arguments(const FunctionDecl& generic,
                               "cannot determine generic call argument type");
             return false;
         }
-        auto formal = callable_parameter_type(parameter.type, parameter.mode);
+        actual = clone_type(actual);
+        auto formal = clone_type(
+            callable_parameter_type(parameter.type, parameter.mode));
         if (parameter.mode == ParameterMode::In)
             actual = callable_parameter_type(actual, ParameterMode::In);
+        if (!normalize_generic_callable_abis(formal, state, diagnostics,
+                                             parameter.location) ||
+            !normalize_generic_callable_abis(actual, state, diagnostics,
+                                             argument.location)) return false;
         std::string conflict;
         if (!match_deduced_type(formal, actual, bindings,
                                 type_parameters, conflict)) {
@@ -935,9 +980,11 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
 
 bool expand_generics(Program& program, Diagnostics& diagnostics,
                      std::string_view mangling,
-                     const GenericPointerResolver& pointer_resolver) {
+                     const GenericPointerResolver& pointer_resolver,
+                     const GenericAbiCanonicalizer& canonical_abi) {
     GenericExpansionState state;
     state.pointer_resolver = pointer_resolver;
+    state.canonical_abi = canonical_abi;
     for (std::size_t index = 0; index < program.functions.size(); ++index) {
         auto* function = program.functions[index].get();
         if (!function->generic_parameters.empty()) continue;
@@ -2138,6 +2185,34 @@ TypePtr infer_generic_actual(const Expr& expression,
     }
     case Expr::Kind::Binary: {
         if (!expression.left || !expression.right) return {};
+        if (expression.text == "member" ||
+            expression.text == "pointer_member") {
+            if (expression.right->kind != Expr::Kind::Name) return {};
+            auto base = infer_generic_actual(*expression.left, caller,
+                                             program, state, false);
+            if (expression.text == "pointer_member") {
+                if (!base || base->kind != Type::Kind::Pointer) return {};
+                base = base->pointee;
+            }
+            if (!base || base->kind != Type::Kind::Record) return {};
+            const auto record = std::find_if(
+                program.records.begin(), program.records.end(),
+                [&](const RecordDecl& candidate) {
+                    return candidate.name == base->nominal_name &&
+                           candidate.complete;
+                });
+            if (record == program.records.end()) return {};
+            const auto member = std::find_if(
+                record->members.begin(), record->members.end(),
+                [&](const RecordMemberDecl& candidate) {
+                    return candidate.name == expression.right->text;
+                });
+            if (member == record->members.end()) return {};
+            auto result = clone_type(member->type);
+            result->is_const = result->is_const || base->is_const;
+            result->is_volatile = result->is_volatile || base->is_volatile;
+            return adjusted(result);
+        }
         if (expression.text == "==" || expression.text == "!=" ||
             expression.text == "<" || expression.text == "<=" ||
             expression.text == ">" || expression.text == ">=" ||
@@ -2171,14 +2246,23 @@ TypePtr infer_generic_actual(const Expr& expression,
         return same_type(yes, no) ? yes : TypePtr{};
     }
     case Expr::Kind::Call: {
-        if (!expression.left || expression.left->kind != Expr::Kind::Name)
-            return {};
-        const auto* function = resolve_function(
-            program, caller, *expression.left,
-            [](const FunctionDecl& candidate) {
-                return candidate.generic_parameters.empty();
-            });
-        return function ? adjusted(function->return_type) : TypePtr{};
+        if (!expression.left) return {};
+        if (expression.left->kind == Expr::Kind::Name) {
+            const auto* function = resolve_function(
+                program, caller, *expression.left,
+                [](const FunctionDecl& candidate) {
+                    return candidate.generic_parameters.empty();
+                });
+            if (function) return adjusted(function->return_type);
+        }
+        auto callee = infer_generic_actual(*expression.left, caller,
+                                           program, state);
+        if (callee && callee->kind == Type::Kind::Pointer)
+            callee = callee->pointee;
+        return callee && callee->kind == Type::Kind::Function &&
+                       callee->function
+                   ? adjusted(callee->function->result)
+                   : TypePtr{};
     }
     default:
         return {};
@@ -5415,11 +5499,13 @@ void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expr
 bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls, std::string_view mangling,
                       std::string_view default_abi,
-                      const GenericPointerResolver& pointer_resolver) {
+                      const GenericPointerResolver& pointer_resolver,
+                      const GenericAbiCanonicalizer& canonical_abi) {
     if (!validate_attribute_names(program, diagnostics)) return false;
     if (!evaluate_enumerations(program, diagnostics)) return false;
     materialize_enumerators(program);
-    if (!expand_generics(program, diagnostics, mangling, pointer_resolver)) {
+    if (!expand_generics(program, diagnostics, mangling, pointer_resolver,
+                         canonical_abi)) {
         if (diagnostics.errors() == 0) {
             diagnostics.command_error("generic expansion failed without a diagnostic");
         }

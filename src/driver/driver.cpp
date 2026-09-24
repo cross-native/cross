@@ -514,8 +514,17 @@ int cc_main(int argc, char** argv) {
             return data::normalize_generic_pointer(program, expression, destination,
                 caller, locals, options, *subtarget, diagnostics);
         };
+    const GenericAbiCanonicalizer canonical_abi =
+        [&](std::string_view name) -> std::optional<std::string> {
+            const auto* abi = find_abi(*target,
+                name.empty() ? std::string_view(options.abi) : name,
+                options.target);
+            return abi ? std::optional<std::string>(abi->canonical_name)
+                       : std::nullopt;
+        };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
-                          options.mangling, options.abi, pointer_resolver)) return 1;
+                          options.mangling, options.abi, pointer_resolver,
+                          canonical_abi)) return 1;
     const auto* backend = target_backend_for(*target);
     if (!backend) {
         diagnostics.command_error(

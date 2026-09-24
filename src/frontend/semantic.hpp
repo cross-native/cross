@@ -21,6 +21,8 @@ bool is_known_attribute(std::string_view name);
 using GenericPointerResolver = std::function<bool(
     std::unique_ptr<Expr>&, const TypePtr&, const FunctionDecl*,
     std::span<const NameKey>)>;
+using GenericAbiCanonicalizer =
+    std::function<std::optional<std::string>(std::string_view)>;
 
 // Expands explicit generic instances and deterministic translation-time calls.
 // Ordinary visible functions are evaluated opportunistically when requested;
@@ -30,7 +32,8 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls = true,
                       std::string_view mangling = "default",
                       std::string_view default_abi = "default",
-                      const GenericPointerResolver& pointer_resolver = {});
+                      const GenericPointerResolver& pointer_resolver = {},
+                      const GenericAbiCanonicalizer& canonical_abi = {});
 
 using LayoutQuery =
     std::function<std::optional<std::uint64_t>(const TypePtr&)>;

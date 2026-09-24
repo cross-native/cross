@@ -28,6 +28,8 @@ static void assign<T>(out T destination, in T value) {
 }
 
 typedef i32 (*generic_callback)(in i32 value) [[abi("ms_abi")]];
+typedef i32 (*generic_alias_callback)(in i32 value) [[abi("ms")]];
+struct generic_pair { i32 left; i32 right; };
 
 [[abi("ms_abi"), noinline]] static i32 callback_plus_two(in i32 value) {
     return value + 2i32;
@@ -44,8 +46,16 @@ global i32 generic_angle_entry() {
     i32 *pointer = echo_pointer(&output);
     generic_callback callback = callback_plus_two;
     generic_callback copied = first(callback, 0i32);
+    generic_alias_callback alias = callback_plus_two;
+    generic_alias_callback alias_copy = first(alias, 0i32);
+    struct generic_pair pair = {3i32, 5i32};
+    struct generic_pair *pair_pointer = &pair;
+    i32 member = choose(1 == 1, pair.left, pair_pointer->right);
+    i32 called = choose(1 == 0, callback(4i32), callback(5i32));
     return counted == 11i32 && shifted == 11i32 &&
            selected < counted && inferred == 11i32 && partial == 7i32 &&
-           *pointer == 17i32 && copied(39i32) == 41i32
+           *pointer == 17i32 && copied(39i32) == 41i32 &&
+           alias_copy(40i32) == 42i32 &&
+           member == 3i32 && called == 7i32
         ? 1i32 : 2i32;
 }
