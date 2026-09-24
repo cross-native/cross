@@ -21,6 +21,9 @@ public:
                  const CompilerOptions& options);
     std::string process(const std::filesystem::path& input);
     const std::vector<std::filesystem::path>& dependencies() const { return dependencies_; }
+    const std::vector<SourceLocation>& output_line_locations() const {
+        return output_line_locations_;
+    }
 
 private:
     struct Macro {
@@ -40,13 +43,16 @@ private:
     std::string expand_text(std::string_view text,
                             std::unordered_set<std::string>& disabled,
                             unsigned depth,
-                            std::optional<SourceLocation> condition = {}) const;
+                            std::optional<SourceLocation> condition = {},
+                            std::optional<SourceLocation> origin = {}) const;
     std::string substitute(const Macro& macro, const std::vector<std::string>& arguments,
                            std::unordered_set<std::string>& disabled,
                            unsigned depth,
-                           std::optional<SourceLocation> condition = {}) const;
+                           std::optional<SourceLocation> condition = {},
+                           std::optional<SourceLocation> origin = {}) const;
     std::string evaluate_query(std::string_view name,
-                               const std::vector<std::string>& arguments) const;
+                               const std::vector<std::string>& arguments,
+                               std::optional<SourceLocation> origin) const;
 
     SourceManager& sources_;
     Diagnostics& diagnostics_;
@@ -55,6 +61,7 @@ private:
     std::unordered_set<std::string> pragma_once_files_;
     std::unordered_set<std::string> already_included_;
     std::vector<SourceLocation> line_locations_;
+    std::vector<SourceLocation> output_line_locations_;
     std::vector<std::filesystem::path> dependencies_;
     std::unordered_set<std::string> dependency_identities_;
 };

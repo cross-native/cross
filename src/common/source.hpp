@@ -48,10 +48,20 @@ struct SyntaxContext {
     std::vector<std::string> imports;
 };
 
+// One pre-expansion embed expression owns its selected file identity. The
+// four lexical pieces carry the same identity through token copying.
+struct EmbedIdentity {
+    std::string written_path;
+    std::filesystem::path selected_path;
+    SourceLocation logical_location;
+};
+
 struct TokenOrigin {
     SourceLocation span;
     TokenIdentity identity;
     std::shared_ptr<const SyntaxContext> context;
+    std::shared_ptr<const EmbedIdentity> embed;
+    unsigned embed_piece{};
 };
 
 struct SourceTokenOrigin {

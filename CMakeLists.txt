@@ -101,6 +101,7 @@ cross_component(cross_targets)
 
 add_library(cross_frontend
     src/frontend/ast.cpp
+    src/frontend/embed.cpp
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
     src/frontend/preprocessor.cpp
@@ -298,6 +299,12 @@ if(BUILD_TESTING)
     target_link_libraries(cross_procedural_tokens_test PRIVATE cross_frontend)
     cross_component(cross_procedural_tokens_test)
     add_test(NAME cross_procedural_tokens COMMAND $<TARGET_FILE:cross_procedural_tokens_test>)
+    add_executable(cross_embed_identity_test test/frontend/embed_identity_test.cpp)
+    target_link_libraries(cross_embed_identity_test PRIVATE cross_frontend)
+    cross_component(cross_embed_identity_test)
+    add_test(NAME cross_embed_identity
+        COMMAND $<TARGET_FILE:cross_embed_identity_test>
+                "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor.x")
 
     add_executable(cross_address_space_types_test
                    test/frontend/address_space_types_test.cpp)

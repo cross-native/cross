@@ -13,6 +13,7 @@
 #include "common/options.hpp"
 #include "common/source.hpp"
 #include "frontend/lexer.hpp"
+#include "frontend/embed.hpp"
 #include "frontend/parser.hpp"
 #include "frontend/preprocessor.hpp"
 #include "frontend/procedural.hpp"
@@ -377,23 +378,43 @@ void diagnose_codegen_ownership_gaps(const hir::Module& module,
 
 bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
                        Diagnostics& diagnostics, std::vector<std::string>& outputs,
-                       std::vector<std::vector<std::filesystem::path>>& dependencies) {
+                       std::vector<std::vector<std::filesystem::path>>& dependencies,
+                       std::vector<const SourceFile*>& preprocessed_sources,
+                       bool compiler) {
     for (const auto& input : options.inputs) {
+        const SourceFile* preprocessed{};
+        std::vector<SourceLocation> line_origins;
+        std::vector<std::filesystem::path> found;
         if (input.extension() == ".i") {
             std::string error;
-            const auto* source = sources.load(input, error);
-            if (!source) diagnostics.command_error(error);
-            else {
-                outputs.push_back(source->text);
-                dependencies.push_back({input});
-            }
-            continue;
+            preprocessed = sources.load(input, error);
+            if (!preprocessed) diagnostics.command_error(error);
+            else found.push_back(input);
+        } else {
+            Preprocessor preprocessor(sources, diagnostics, options);
+            preprocessed = sources.add(input, preprocessor.process(input));
+            found = preprocessor.dependencies();
+            line_origins = preprocessor.output_line_locations();
         }
-        Preprocessor preprocessor(sources, diagnostics, options);
-        outputs.push_back(preprocessor.process(input));
-        auto& found = dependencies.emplace_back();
-        for (const auto& dependency : preprocessor.dependencies())
-            found.push_back(dependency);
+        if (!preprocessed) continue;
+        outputs.push_back(preprocessed->text);
+        if (diagnostics.errors() == 0) {
+            auto embedded = discover_embeds(sources, *preprocessed, line_origins,
+                options, diagnostics,
+                options.dependency_mode != DependencyMode::None ||
+                (compiler && options.emit != EmitKind::Preprocess));
+            preprocessed = embedded.source;
+            std::unordered_set<std::string> seen;
+            for (const auto& path : found) {
+                std::error_code error;
+                const auto canonical = std::filesystem::weakly_canonical(path, error);
+                seen.insert((error ? path.lexically_normal() : canonical).generic_string());
+            }
+            for (const auto& path : embedded.dependencies)
+                if (seen.insert(path.generic_string()).second) found.push_back(path);
+        }
+        dependencies.push_back(std::move(found));
+        preprocessed_sources.push_back(preprocessed);
     }
     return diagnostics.errors() == 0;
 }
@@ -494,7 +515,9 @@ int cpp_main(int argc, char** argv) {
     SourceManager sources;
     std::vector<std::string> outputs;
     std::vector<std::vector<std::filesystem::path>> dependencies;
-    if (!preprocess_inputs(options, sources, diagnostics, outputs, dependencies)) return 1;
+    std::vector<const SourceFile*> preprocessed_sources;
+    if (!preprocess_inputs(options, sources, diagnostics, outputs, dependencies,
+                           preprocessed_sources, false)) return 1;
     if (!emit_dependencies(options, dependencies, false, diagnostics)) return 1;
     if (options.dependency_mode == DependencyMode::Only) return 0;
     std::ostringstream joined;
@@ -549,7 +572,9 @@ int cc_main(int argc, char** argv) {
     SourceManager sources;
     std::vector<std::string> preprocessed;
     std::vector<std::vector<std::filesystem::path>> dependencies;
-    if (!preprocess_inputs(options, sources, diagnostics, preprocessed, dependencies)) return 1;
+    std::vector<const SourceFile*> preprocessed_sources;
+    if (!preprocess_inputs(options, sources, diagnostics, preprocessed, dependencies,
+                           preprocessed_sources, true)) return 1;
     if (!emit_dependencies(options, dependencies, true, diagnostics)) return 1;
     if (options.dependency_mode == DependencyMode::Only) return 0;
     if (options.emit == EmitKind::Preprocess) {
@@ -577,9 +602,11 @@ int cc_main(int argc, char** argv) {
     };
     for (std::size_t i = 0; i < preprocessed.size(); ++i) {
         const auto* source = expand_procedural_macros(
-            sources, options.inputs[i], preprocessed[i], diagnostics,
+            sources, *preprocessed_sources[i], diagnostics,
             program.address_bits, macro_size, macro_align);
         if (diagnostics.errors() != 0) return 1;
+        if (!validate_embeds(*source, diagnostics)) return 1;
+        if (!diagnose_unimplemented_embed_values(*source, diagnostics)) return 1;
         Lexer lexer(*source, diagnostics);
         Parser parser(lexer.lex(), diagnostics);
         auto unit = parser.parse();

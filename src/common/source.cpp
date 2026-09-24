@@ -34,7 +34,7 @@ TokenOrigin token_origin(SourceLocation location) {
     if (location.file) {
         if (const auto* origin = location.file->token_origin_at(location.offset)) return *origin;
     }
-    return {location, {location.file, location.offset, {}, 0}, {}};
+    return {location, {location.file, location.offset, {}, 0}, {}, {}, 0};
 }
 
 const SourceExpansion* SourceFile::expansion_at(std::size_t offset) const {

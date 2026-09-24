@@ -2578,7 +2578,8 @@ public:
             for (std::size_t index = 0; index < expression.quote_fragments.size(); ++index) {
                 auto literal = expression.quote_fragments[index];
                 for (auto& token : literal) {
-                    token.origin = {token_origin(macro_context_->invocation).span, {}, macro_context_};
+                    token.origin = {token_origin(macro_context_->invocation).span,
+                                    {}, macro_context_, {}, 0};
                 }
                 if (!append_tokens(result, literal, expression.location))
                     return std::nullopt;
@@ -2777,7 +2778,8 @@ private:
         for (const auto& token : tokens) {
             if (token.kind == TokenKind::End) break;
             MetaToken value(token);
-            value.origin = {token_origin(macro_context_->invocation).span, {}, macro_context_};
+            value.origin = {token_origin(macro_context_->invocation).span,
+                            {}, macro_context_, {}, 0};
             result.push_back(std::move(value));
         }
         return result;

@@ -209,7 +209,7 @@ void Preprocessor::install_predefined_macros() {
                               "$::has_patch_value", "$::has_patch_operand",
                               "$::has_attribute", "$::has_feature", "$::has_extension",
                               "$::has_abi", "$::has_mangling",
-                              "$::has_profile"}) {
+                              "$::has_profile", "$::has_include"}) {
         macros_[query].function_like = true;
     }
 }
@@ -303,7 +303,8 @@ std::string Preprocessor::substitute(const Macro& macro,
                                      const std::vector<std::string>& arguments,
                                      std::unordered_set<std::string>& disabled,
                                      unsigned depth,
-                                     std::optional<SourceLocation> condition) const {
+                                     std::optional<SourceLocation> condition,
+                                     std::optional<SourceLocation> origin) const {
     std::unordered_map<std::string, std::string> replacements;
     for (std::size_t i = 0; i < macro.parameters.size(); ++i) {
         replacements[macro.parameters[i]] = i < arguments.size() ? arguments[i] : std::string{};
@@ -346,7 +347,8 @@ std::string Preprocessor::substitute(const Macro& macro,
             const auto name = macro.replacement.substr(begin, i - begin);
             const auto found = replacements.find(name);
             if (found != replacements.end()) {
-                output += expand_text(found->second, disabled, depth + 1, condition);
+                output += expand_text(found->second, disabled, depth + 1,
+                                      condition, origin);
             } else {
                 output += name;
             }
@@ -362,11 +364,12 @@ std::string Preprocessor::substitute(const Macro& macro,
         }
         output.push_back(macro.replacement[i++]);
     }
-    return expand_text(output, disabled, depth + 1, condition);
+    return expand_text(output, disabled, depth + 1, condition, origin);
 }
 
 std::string Preprocessor::evaluate_query(
-    std::string_view name, const std::vector<std::string>& arguments) const {
+    std::string_view name, const std::vector<std::string>& arguments,
+    std::optional<SourceLocation> origin) const {
     const auto normalized_argument = [&](std::size_t index) {
         auto result = trim(arguments[index]);
         if (const auto decoded = decode_string_literal(result)) result = *decoded;
@@ -442,6 +445,19 @@ std::string Preprocessor::evaluate_query(
         return "0";
     }
     if (arguments.size() != 1) return "0";
+    if (name == "$::has_include") {
+        const auto operand = trim(arguments.front());
+        const bool quoted = operand.size() >= 2 && operand.front() == '"' && operand.back() == '"';
+        const bool angled = operand.size() >= 2 && operand.front() == '<' && operand.back() == '>';
+        if (!quoted && !angled) return "0";
+        const auto written = quoted
+            ? decode_string_literal(operand)
+            : std::optional<std::string>(operand.substr(1, operand.size() - 2));
+        if (!written || written->empty() || written->find('\0') != std::string::npos) return "0";
+        const auto including = origin && origin->file
+            ? origin->file->path : std::filesystem::path{};
+        return find_include(including, *written, quoted).empty() ? "0" : "1";
+    }
     auto argument = normalized_argument(0);
     const auto one_of = [&](std::initializer_list<std::string_view> entries) {
         return std::any_of(entries.begin(), entries.end(),
@@ -552,7 +568,8 @@ std::string Preprocessor::evaluate_query(
 std::string Preprocessor::expand_text(std::string_view text,
                                       std::unordered_set<std::string>& disabled,
                                       unsigned depth,
-                                      std::optional<SourceLocation> condition) const {
+                                      std::optional<SourceLocation> condition,
+                                      std::optional<SourceLocation> origin) const {
     if (depth > 100) return std::string(text);
     std::string output;
     for (std::size_t i = 0; i < text.size();) {
@@ -601,7 +618,8 @@ std::string Preprocessor::expand_text(std::string_view text,
         const auto& macro = found->second;
         disabled.insert(name);
         if (!macro.function_like) {
-            output += expand_text(macro.replacement, disabled, depth + 1, condition);
+            output += expand_text(macro.replacement, disabled, depth + 1,
+                                  condition, origin);
             disabled.erase(name);
             continue;
         }
@@ -653,10 +671,11 @@ std::string Preprocessor::expand_text(std::string_view text,
         if (name.starts_with("$::has_")) {
             for (auto& query_argument : arguments)
                 query_argument = expand_text(query_argument, disabled,
-                                             depth + 1, condition);
-            output += evaluate_query(name, arguments);
+                                             depth + 1, condition, origin);
+            output += evaluate_query(name, arguments, origin);
         } else {
-            output += substitute(macro, arguments, disabled, depth + 1, condition);
+            output += substitute(macro, arguments, disabled, depth + 1,
+                                 condition, origin);
         }
         disabled.erase(name);
     }
@@ -680,7 +699,8 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
     const auto evaluate = [&](std::string_view expression, SourceLocation location) {
         std::unordered_set<std::string> disabled;
         const auto errors = diagnostics_.errors();
-        const auto expanded = expand_text(expression, disabled, 0, location);
+        const auto expanded = expand_text(expression, disabled, 0, location,
+                                          location);
         return diagnostics_.errors() == errors &&
             evaluate_preprocessing_condition(expanded, location, diagnostics_, address_bits);
     };
@@ -695,7 +715,8 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
         if (!stripped.starts_with('#')) {
             if (active) {
                 std::unordered_set<std::string> disabled;
-                output << expand_text(line, disabled, 0) << '\n';
+                output << expand_text(line, disabled, 0, {}, location) << '\n';
+                output_line_locations_.push_back(location);
             }
             continue;
         }
@@ -792,7 +813,7 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
             std::unordered_set<std::string> disabled;
             const auto errors = diagnostics_.errors();
             const auto expanded = expand_text(command.operand, disabled, 0,
-                                              location);
+                                              location, location);
             if (diagnostics_.errors() != errors) continue;
             const auto separator = top_level_comma(expanded);
             const auto condition = trim(std::string_view(expanded).substr(
@@ -826,6 +847,7 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
 
 std::string Preprocessor::process(const std::filesystem::path& input) {
     line_locations_.clear();
+    output_line_locations_.clear();
     dependencies_.clear();
     dependency_identities_.clear();
     std::vector<std::filesystem::path> stack;

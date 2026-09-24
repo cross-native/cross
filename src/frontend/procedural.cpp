@@ -510,14 +510,13 @@ std::vector<SourceExpansion> remap_expansions(
 } // namespace
 
 const SourceFile* expand_procedural_macros(SourceManager& sources,
-                                           const std::filesystem::path& path,
-                                           std::string_view source,
+                                           const SourceFile& source,
                                            Diagnostics& diagnostics,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
                                            const LayoutQuery& align_of) {
-    std::string result(source);
-    const auto* definition_file = sources.add(path, result);
+    std::string result(source.text);
+    const auto* definition_file = &source;
     Lexer definition_lexer(*definition_file, diagnostics);
     const auto definition_tokens = definition_lexer.lex();
     std::vector<Replacement> removals;
@@ -531,7 +530,7 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
                 token.location.offset + token.text.size(), token_origin(token.location)});
     }
     apply_replacements(result, token_origins, std::move(removals));
-    auto* current = sources.add(path, result, {}, std::move(token_origins));
+    auto* current = sources.add(source.path, result, {}, std::move(token_origins));
 
     for (unsigned expansion = 0; expansion < 128; ++expansion) {
         Lexer lexer(*current, diagnostics);
@@ -545,11 +544,23 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
         token_origins = remap_token_origins(current->token_origins, *replacement);
         result.replace(replacement->begin, replacement->end - replacement->begin,
                        replacement->text);
-        current = sources.add(path, result, std::move(origins), std::move(token_origins));
+        current = sources.add(source.path, result, std::move(origins), std::move(token_origins));
     }
     diagnostics.command_error(
         "procedural macro expansion exceeded 128 explicit invocations");
     return current;
+}
+
+const SourceFile* expand_procedural_macros(SourceManager& sources,
+                                           const std::filesystem::path& path,
+                                           std::string_view source,
+                                           Diagnostics& diagnostics,
+                                           unsigned address_bits,
+                                           const LayoutQuery& size_of,
+                                           const LayoutQuery& align_of) {
+    const auto* input = sources.add(path, std::string(source));
+    return expand_procedural_macros(sources, *input, diagnostics,
+                                    address_bits, size_of, align_of);
 }
 
 } // namespace cross

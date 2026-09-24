@@ -18,5 +18,11 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
                                            const LayoutQuery& align_of);
+const SourceFile* expand_procedural_macros(SourceManager& sources,
+                                           const SourceFile& source,
+                                           Diagnostics& diagnostics,
+                                           unsigned address_bits,
+                                           const LayoutQuery& size_of,
+                                           const LayoutQuery& align_of);
 
 } // namespace cross
