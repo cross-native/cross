@@ -87,14 +87,18 @@ struct SourceFile {
     std::vector<SourceExpansion> expansions;
     // One logical origin per emitted source line; empty for written source.
     std::vector<SourceLocation> line_origins;
+    // Primary translation-unit identity is distinct from a line's include path.
+    std::vector<std::string> line_units;
     // Sorted by begin; serialization records one exact range per token.
     std::vector<SourceTokenOrigin> token_origins;
 
     SourceFile(std::filesystem::path path, std::string text,
                std::vector<SourceExpansion> expansions = {},
                std::vector<SourceTokenOrigin> token_origins = {},
-               std::vector<SourceLocation> line_origins = {});
+               std::vector<SourceLocation> line_origins = {},
+               std::vector<std::string> line_units = {});
     [[nodiscard]] std::string_view line(unsigned line) const;
+    [[nodiscard]] std::string source_unit_at(unsigned line) const;
     [[nodiscard]] const SourceExpansion* expansion_at(
         std::size_t offset) const;
     [[nodiscard]] const TokenOrigin* token_origin_at(std::size_t offset) const;
@@ -107,7 +111,8 @@ public:
     const SourceFile* add(std::filesystem::path path, std::string text,
                           std::vector<SourceExpansion> expansions,
                           std::vector<SourceTokenOrigin> token_origins = {},
-                          std::vector<SourceLocation> line_origins = {});
+                          std::vector<SourceLocation> line_origins = {},
+                          std::vector<std::string> line_units = {});
     ExpansionId next_expansion() { return {++next_expansion_}; }
 
 private:

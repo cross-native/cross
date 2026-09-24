@@ -11,16 +11,24 @@ namespace cross {
 SourceFile::SourceFile(std::filesystem::path source_path, std::string source_text,
                        std::vector<SourceExpansion> source_expansions,
                        std::vector<SourceTokenOrigin> source_token_origins,
-                       std::vector<SourceLocation> source_line_origins)
+                       std::vector<SourceLocation> source_line_origins,
+                       std::vector<std::string> source_line_units)
     : path(std::move(source_path)), text(std::move(source_text)),
       expansions(std::move(source_expansions)),
       line_origins(std::move(source_line_origins)),
+      line_units(std::move(source_line_units)),
       token_origins(std::move(source_token_origins)) {
     for (std::size_t i = 0; i < text.size(); ++i) {
         if (text[i] == '\n') {
             line_starts.push_back(i + 1);
         }
     }
+}
+
+std::string SourceFile::source_unit_at(unsigned number) const {
+    if (number != 0 && number <= line_units.size() &&
+        !line_units[number - 1].empty()) return line_units[number - 1];
+    return path.generic_string();
 }
 
 const TokenOrigin* SourceFile::token_origin_at(std::size_t offset) const {
@@ -90,10 +98,12 @@ const SourceFile* SourceManager::add(
     std::filesystem::path path, std::string text,
     std::vector<SourceExpansion> expansions,
     std::vector<SourceTokenOrigin> token_origins,
-    std::vector<SourceLocation> line_origins) {
+    std::vector<SourceLocation> line_origins,
+    std::vector<std::string> line_units) {
     files_.push_back(std::make_unique<SourceFile>(
         std::move(path), std::move(text), std::move(expansions),
-        std::move(token_origins), std::move(line_origins)));
+        std::move(token_origins), std::move(line_origins),
+        std::move(line_units)));
     return files_.back().get();
 }
 

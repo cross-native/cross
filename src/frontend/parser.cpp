@@ -1549,7 +1549,7 @@ Parser::parse_function(SourceLocation location, std::string name,
     function->name = std::move(name);
     function->source_namespace = std::move(name_space);
     if (location.file)
-        function->source_unit = location.file->path.generic_string();
+        function->source_unit = location.file->source_unit_at(location.line);
     function->imports = active_imports_;
     function->return_type = std::move(return_type);
     function->linkage = linkage;
@@ -1637,7 +1637,7 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
     auto object = std::make_unique<ObjectDecl>();
     object->location = location;
     object->name = std::move(name);
-    if (location.file) object->source_unit = location.file->path.generic_string();
+    if (location.file) object->source_unit = location.file->source_unit_at(location.line);
     object->type = std::move(type);
     object->linkage = linkage;
     object->attributes = std::move(attributes);

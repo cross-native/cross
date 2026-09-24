@@ -282,7 +282,7 @@ std::string namespace_prefix(std::string_view name) {
 }
 
 std::string lookup_source_unit(NameUse name, const FunctionDecl* caller) {
-    if (name.location.file) return name.location.file->path.generic_string();
+    if (name.location.file) return name.location.file->source_unit_at(name.location.line);
     return caller ? caller->source_unit : std::string{};
 }
 
@@ -5560,7 +5560,7 @@ private:
             object->location = expression->location;
             object->name = name;
             object->source_unit = source_unit_.empty() && expression->location.file
-                ? expression->location.file->path.generic_string()
+                ? expression->location.file->source_unit_at(expression->location.line)
                 : source_unit_;
             object->type = array_type(
                 builtin_type(BuiltinType::U8, true),

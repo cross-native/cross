@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -411,6 +412,25 @@ void track_block_comment(std::string_view line, bool& inside) {
     }
 }
 
+std::string normalized_unit(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto normalized = std::filesystem::weakly_canonical(path, error);
+    return (error ? path.lexically_normal() : normalized).generic_string();
+}
+
+std::string unit_occurrence(std::string path,
+                            std::unordered_map<std::string, unsigned>& counts) {
+    const auto ordinal = ++counts[path];
+    if (ordinal == 1) return path;
+    return path + '\x1f' + std::to_string(ordinal);
+}
+
+std::string source_unit_marker(std::string_view unit) {
+    std::ostringstream output;
+    output << "#$::source::unit " << std::quoted(std::string(unit)) << '\n';
+    return output.str();
+}
+
 std::string with_line_markers(std::string_view source,
                               const std::vector<SourceLocation>& origins,
                               const std::filesystem::path& primary) {
@@ -441,10 +461,13 @@ std::string with_line_markers(std::string_view source,
 
 std::string without_line_markers(SourceManager& sources, const SourceFile& source,
                                  std::vector<SourceLocation>& origins,
+                                 std::vector<std::string>& units,
+                                 std::string unit,
                                  Diagnostics& diagnostics) {
     std::istringstream input(source.text);
     std::ostringstream output;
     std::unordered_map<std::string, const SourceFile*> named;
+    std::unordered_map<std::string, unsigned> unit_counts;
     const SourceFile* logical = &source;
     unsigned logical_line = 1;
     unsigned physical_line = 0;
@@ -452,6 +475,18 @@ std::string without_line_markers(SourceManager& sources, const SourceFile& sourc
     std::string line;
     while (std::getline(input, line)) {
         ++physical_line;
+        if (!inside_comment && line.starts_with("#$::source::unit")) {
+            std::istringstream marker(line.substr(16));
+            marker >> std::ws;
+            std::string path;
+            if (marker.peek() == '"') marker >> std::quoted(path);
+            marker >> std::ws;
+            if (!marker || !marker.eof() || path.empty()) {
+                diagnostics.error({&source, 0, physical_line, 1},
+                                  "malformed preprocessed source-unit boundary");
+            } else unit = unit_occurrence(std::move(path), unit_counts);
+            continue;
+        }
         if (!inside_comment && line.starts_with("#line") &&
             (line.size() == 5 ||
              std::isspace(static_cast<unsigned char>(line[5])) != 0)) {
@@ -477,6 +512,7 @@ std::string without_line_markers(SourceManager& sources, const SourceFile& sourc
         }
         output << line << '\n';
         origins.push_back({logical, 0, logical_line, 1});
+        units.push_back(unit);
         track_block_comment(line, inside_comment);
         if (logical_line != std::numeric_limits<unsigned>::max()) ++logical_line;
     }
@@ -488,9 +524,11 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
                        std::vector<std::vector<std::filesystem::path>>& dependencies,
                        std::vector<const SourceFile*>& preprocessed_sources,
                        bool compiler) {
+    std::unordered_map<std::string, unsigned> unit_counts;
     for (const auto& input : options.inputs) {
         const SourceFile* preprocessed{};
         std::vector<SourceLocation> line_origins;
+        std::vector<std::string> line_units;
         std::vector<std::filesystem::path> found;
         std::string serialized;
         if (input.extension() == ".i") {
@@ -500,8 +538,12 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
             else {
                 serialized = written->text;
                 auto source = without_line_markers(sources, *written,
-                                                   line_origins, diagnostics);
-                preprocessed = sources.add(input, std::move(source), {}, {}, line_origins);
+                                                   line_origins, line_units,
+                                                   unit_occurrence(normalized_unit(input),
+                                                                   unit_counts),
+                                                   diagnostics);
+                preprocessed = sources.add(input, std::move(source), {}, {},
+                                           line_origins, line_units);
                 found.push_back(input);
             }
         } else {
@@ -510,9 +552,14 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
             found = preprocessor.dependencies();
             line_origins = preprocessor.output_line_locations();
             serialized = with_line_markers(source, line_origins, input);
-            preprocessed = sources.add(input, std::move(source), {}, {}, line_origins);
+            line_units.assign(line_origins.size(),
+                unit_occurrence(normalized_unit(input), unit_counts));
+            preprocessed = sources.add(input, std::move(source), {}, {},
+                                       line_origins, line_units);
         }
         if (!preprocessed) continue;
+        if (options.inputs.size() > 1)
+            serialized.insert(0, source_unit_marker(normalized_unit(input)));
         outputs.push_back(std::move(serialized));
         if (diagnostics.errors() == 0) {
             auto embedded = discover_embeds(sources, *preprocessed, line_origins,
@@ -533,6 +580,40 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
         preprocessed_sources.push_back(preprocessed);
     }
     return diagnostics.errors() == 0;
+}
+
+std::vector<const SourceFile*> split_source_units(
+    SourceManager& sources, const SourceFile& source) {
+    if (source.line_units.empty()) return {&source};
+    std::vector<const SourceFile*> result;
+    for (std::size_t begin_line = 0; begin_line < source.line_units.size();) {
+        auto end_line = begin_line + 1;
+        while (end_line < source.line_units.size() &&
+               source.line_units[end_line] == source.line_units[begin_line])
+            ++end_line;
+        if (begin_line == 0 && end_line == source.line_units.size())
+            return {&source};
+        const auto begin = source.line_starts[begin_line];
+        const auto end = source.line_starts[end_line];
+        const auto first = static_cast<std::ptrdiff_t>(begin_line);
+        const auto last = static_cast<std::ptrdiff_t>(end_line);
+        std::vector<SourceTokenOrigin> origins;
+        for (const auto& token : source.token_origins) {
+            if (token.begin < begin || token.end > end) continue;
+            auto shifted = token;
+            shifted.begin -= begin;
+            shifted.end -= begin;
+            origins.push_back(std::move(shifted));
+        }
+        result.push_back(sources.add(source.path,
+            source.text.substr(begin, end - begin), {}, std::move(origins),
+            std::vector<SourceLocation>(source.line_origins.begin() + first,
+                                        source.line_origins.begin() + last),
+            std::vector<std::string>(source.line_units.begin() + first,
+                                     source.line_units.begin() + last)));
+        begin_line = end_line;
+    }
+    return result;
 }
 
 std::string make_escape(std::string_view spelling) {
@@ -716,9 +797,14 @@ int cc_main(int argc, char** argv) {
     const LayoutQuery macro_align = [&](const TypePtr& type) {
         return hir::layout_alignment(macro_layout, macro_layout.intern_type(type), *target);
     };
-    for (std::size_t i = 0; i < preprocessed.size(); ++i) {
+    std::vector<const SourceFile*> compilation_units;
+    for (const auto* source : preprocessed_sources) {
+        auto sections = split_source_units(sources, *source);
+        compilation_units.insert(compilation_units.end(), sections.begin(), sections.end());
+    }
+    for (const auto* preprocessed_source : compilation_units) {
         const auto* source = expand_procedural_macros(
-            sources, *preprocessed_sources[i], diagnostics,
+            sources, *preprocessed_source, diagnostics,
             program.address_bits, macro_size, macro_align);
         if (diagnostics.errors() != 0) return 1;
         if (!validate_embeds(*source, diagnostics)) return 1;

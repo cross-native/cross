@@ -132,6 +132,14 @@ execute_process(COMMAND "${CC}" -S "${OUTPUT}.negative-marker.i"
 if(status EQUAL 0 OR NOT err MATCHES "malformed preprocessed #line marker")
     message(FATAL_ERROR "negative line marker was accepted\n${out}\n${err}")
 endif()
+file(WRITE "${OUTPUT}.bad-unit.i"
+    "#$::source::unit unquoted\nglobal i32 x = 1;\n")
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.bad-unit.i"
+    -o "${OUTPUT}.bad-unit.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "malformed preprocessed source-unit boundary")
+    message(FATAL_ERROR "invalid source-unit boundary was accepted\n${out}\n${err}")
+endif()
 file(READ "${OUTPUT}.d" depfile)
 if(NOT depfile STREQUAL dep)
     message(FATAL_ERROR "-MD dependency file differs from -M\n${depfile}\n${dep}")
@@ -171,6 +179,75 @@ list(LENGTH targets target_count)
 if(escaped_targets EQUAL -1 OR NOT target_count EQUAL 2 OR
    NOT multi MATCHES "second.x")
     message(FATAL_ERROR "expected two dependency rules\n${multi}")
+endif()
+file(WRITE "${local_dir}/unit-one.x"
+    "[[macro]] static $::meta::tokens identity(in $::meta::tokens input) { return input; }\n"
+    "static i32 hidden = 11;\nglobal i32 first() { return hidden + identity! { 0 }; }\n")
+file(WRITE "${local_dir}/unit-two.x"
+    "static i32 hidden = 22;\nglobal i32 second() { return hidden; }\n")
+execute_process(COMMAND "${CPP}" "${local_dir}/unit-one.x"
+    "${local_dir}/unit-two.x" -o "${OUTPUT}.units.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "multi-input source-unit stream failed\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}.units.i" unit_stream)
+string(REGEX MATCHALL "#[$]::source::unit" boundaries "${unit_stream}")
+list(LENGTH boundaries boundary_count)
+if(NOT boundary_count EQUAL 2)
+    message(FATAL_ERROR "multi-input stream lacks two source-unit boundaries\n${unit_stream}")
+endif()
+execute_process(COMMAND "${CC}" -E "${local_dir}/unit-one.x"
+    "${local_dir}/unit-two.x" -o "${OUTPUT}.units.cc.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "integrated multi-input preprocessing failed\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}.units.cc.i" integrated_units)
+if(NOT integrated_units STREQUAL unit_stream)
+    message(FATAL_ERROR "cpp and cc disagree on source-unit boundaries")
+endif()
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.units.i"
+    -o "${OUTPUT}.units.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "same-spelled statics in separate units collided\n${out}\n${err}")
+endif()
+file(WRITE "${local_dir}/unit-leak.x"
+    "global i32 leak() { return hidden; }\n")
+execute_process(COMMAND "${CPP}" "${local_dir}/unit-one.x"
+    "${local_dir}/unit-leak.x" -o "${OUTPUT}.unit-leak.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "source-unit leak fixture did not preprocess\n${out}\n${err}")
+endif()
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.unit-leak.i"
+    -o "${OUTPUT}.unit-leak.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "unit-leak[.]x:1:[0-9]+: error:")
+    message(FATAL_ERROR "static declaration leaked across primary units\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}.unit-leak.i" leak_stream)
+string(REGEX REPLACE "#[$]::source::unit [^\n]*\n" "" merged_stream "${leak_stream}")
+file(WRITE "${OUTPUT}.unit-merged.i" "${merged_stream}")
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.unit-merged.i"
+    -o "${OUTPUT}.unit-merged.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "unit-boundary rejection was not boundary-sensitive\n${out}\n${err}")
+endif()
+file(WRITE "${local_dir}/unit-repeat.x" "static i32 repeated = 7;\n")
+execute_process(COMMAND "${CPP}" "${local_dir}/unit-repeat.x"
+    "${local_dir}/unit-repeat.x" -o "${OUTPUT}.unit-repeat.i"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "repeated primary input did not preprocess\n${out}\n${err}")
+endif()
+execute_process(COMMAND "${CC}" -S "${OUTPUT}.unit-repeat.i"
+    -o "${OUTPUT}.unit-repeat.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "repeated primary inputs shared a static unit identity\n${out}\n${err}")
 endif()
 
 execute_process(COMMAND "${CC}" -MD -S ${search} "${source}"

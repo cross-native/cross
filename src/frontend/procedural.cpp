@@ -530,7 +530,15 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
                 token.location.offset + token.text.size(), token_origin(token.location)});
     }
     apply_replacements(result, token_origins, std::move(removals));
-    auto* current = sources.add(source.path, result, {}, std::move(token_origins));
+    const auto unit_lines = [&](std::string_view text) {
+        if (source.line_units.empty()) return std::vector<std::string>{};
+        const auto count = static_cast<std::size_t>(
+            std::count(text.begin(), text.end(), '\n')) +
+            (text.empty() || text.back() == '\n' ? 0U : 1U);
+        return std::vector<std::string>(count, source.source_unit_at(1));
+    };
+    auto* current = sources.add(source.path, result, {},
+                                std::move(token_origins), {}, unit_lines(result));
 
     for (unsigned expansion = 0; expansion < 128; ++expansion) {
         Lexer lexer(*current, diagnostics);
@@ -544,7 +552,8 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
         token_origins = remap_token_origins(current->token_origins, *replacement);
         result.replace(replacement->begin, replacement->end - replacement->begin,
                        replacement->text);
-        current = sources.add(source.path, result, std::move(origins), std::move(token_origins));
+        current = sources.add(source.path, result, std::move(origins),
+                              std::move(token_origins), {}, unit_lines(result));
     }
     diagnostics.command_error(
         "procedural macro expansion exceeded 128 explicit invocations");
