@@ -28,7 +28,7 @@ endfunction()
 expect_array_error(zero_bound
     "fixed array bound must be a positive integer translation-time value")
 expect_array_error(omitted_bound
-    "an omitted array bound requires a u8 string initializer")
+    "an omitted array bound requires an initializer")
 expect_array_error(initializer
     "aggregate initializer requires a brace list")
 expect_array_error(vla_inner_bound

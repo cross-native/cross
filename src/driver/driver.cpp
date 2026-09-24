@@ -525,6 +525,7 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
                        std::vector<const SourceFile*>& preprocessed_sources,
                        bool compiler) {
     std::unordered_map<std::string, unsigned> unit_counts;
+    EmbedSnapshots snapshots;
     for (const auto& input : options.inputs) {
         const SourceFile* preprocessed{};
         std::vector<SourceLocation> line_origins;
@@ -565,7 +566,7 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
             auto embedded = discover_embeds(sources, *preprocessed, line_origins,
                 options, diagnostics,
                 options.dependency_mode != DependencyMode::None ||
-                (compiler && options.emit != EmitKind::Preprocess));
+                (compiler && options.emit != EmitKind::Preprocess), &snapshots);
             preprocessed = embedded.source;
             std::unordered_set<std::string> seen;
             for (const auto& path : found) {
@@ -808,7 +809,6 @@ int cc_main(int argc, char** argv) {
             program.address_bits, macro_size, macro_align);
         if (diagnostics.errors() != 0) return 1;
         if (!validate_embeds(*source, diagnostics)) return 1;
-        if (!diagnose_unimplemented_embed_values(*source, diagnostics)) return 1;
         Lexer lexer(*source, diagnostics);
         Parser parser(lexer.lex(), diagnostics);
         auto unit = parser.parse();

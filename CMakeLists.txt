@@ -2345,6 +2345,15 @@ if(BUILD_TESTING)
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/preprocessor-dependencies
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_dependencies.cmake")
+    add_test(NAME cross_embed_values
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/embed_values.x
+                -DDRIVER=${CMAKE_SOURCE_DIR}/test/frontend/embed_values_driver.cpp
+                -DGENERATOR=${CMAKE_SOURCE_DIR}/test/frontend/embed_values_generator.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embed-values
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/embed_values.cmake")
     add_test(NAME cross_diagnostic
         COMMAND $<TARGET_FILE:cross_cc> -emit-llvm
                 "${CMAKE_SOURCE_DIR}/test/frontend/diagnostic.x"

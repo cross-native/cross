@@ -325,9 +325,8 @@ endif()
 execute_process(COMMAND "${CC}" -S ${search} "${asset_source}"
     -o "${OUTPUT}.asset.s"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(status EQUAL 0 OR NOT err MATCHES
-   "main.x:[0-9]+:[0-9]+: error: [$]::embed byte evaluation")
-    message(FATAL_ERROR "pending byte evaluator has an imprecise diagnostic\n${out}\n${err}")
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "embedded byte materialization failed\n${out}\n${err}")
 endif()
 execute_process(COMMAND "${CPP}" -M "${OUTPUT}.asset.i"
     -I "${asset_dir}" -I "${user_dir}"

@@ -1055,6 +1055,20 @@ bool lower_initializer(Object& result, const hir::Module& module,
     if (type.kind == hir::Type::Kind::Array && type.element &&
         module.type(*type.element).kind == hir::Type::Kind::Builtin &&
         module.type(*type.element).builtin == BuiltinType::U8 &&
+        expression.kind == Expr::Kind::ByteSequence) {
+        if (expression.string_value.size() != result.size) {
+            diagnostics.error(expression.location,
+                              "materialized byte count does not match the u8 array bound");
+            return false;
+        }
+        result.initializer = InitializerKind::Bytes;
+        result.bytes.assign(expression.string_value.begin(),
+                            expression.string_value.end());
+        return true;
+    }
+    if (type.kind == hir::Type::Kind::Array && type.element &&
+        module.type(*type.element).kind == hir::Type::Kind::Builtin &&
+        module.type(*type.element).builtin == BuiltinType::U8 &&
         expression.kind == Expr::Kind::String) {
         const auto required = expression.string_value.size() + 1;
         if (required > result.size) {

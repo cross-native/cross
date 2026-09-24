@@ -16,6 +16,18 @@ TypePtr tokens_type() {
     return type;
 }
 
+TypePtr bytes_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::Bytes;
+    return type;
+}
+
+TypePtr buffer_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::Buffer;
+    return type;
+}
+
 TypePtr builtin_type(BuiltinType kind, bool is_const, bool is_volatile,
                      bool is_atomic) {
     auto type = std::make_shared<Type>();
@@ -105,6 +117,8 @@ TypePtr enum_type(std::string name, BuiltinType underlying, bool is_const,
 std::string type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
     if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
+    if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
+    if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     std::string prefix;
     if (type->is_const) prefix += "const ";
     if (type->is_volatile) prefix += "volatile ";
@@ -173,6 +187,8 @@ std::string type_name(const TypePtr& type) {
 std::string canonical_type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
     if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
+    if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
+    if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     std::string result;
     if (type->is_const) result += 'K';
     if (type->is_volatile) result += 'V';
@@ -303,6 +319,8 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
         return left->is_union == right->is_union &&
                left->nominal_name == right->nominal_name;
     }
+    if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::Bytes ||
+        left->kind == Type::Kind::Buffer) return true;
     return left->builtin == right->builtin &&
            left->nominal_name == right->nominal_name;
 }
@@ -376,7 +394,8 @@ unsigned type_bits(const TypePtr& type) {
     if (!type) return 0;
     if (type->kind == Type::Kind::Pointer) return 64;
     if (type->kind == Type::Kind::Generic || type->kind == Type::Kind::Function ||
-        type->kind == Type::Kind::Tokens)
+        type->kind == Type::Kind::Tokens || type->kind == Type::Kind::Bytes ||
+        type->kind == Type::Kind::Buffer)
         return 0;
     if (type->kind == Type::Kind::Vector) {
         return type->scalable ? 0 : type_bits(type->element) * type->lanes;

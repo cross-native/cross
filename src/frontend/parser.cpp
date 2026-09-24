@@ -448,6 +448,7 @@ bool Parser::type_start() const {
     const auto& token = current();
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
+           token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
            builtin_kind(token.text).has_value() ||
@@ -477,6 +478,13 @@ TypePtr Parser::parse_type() {
             error_here("$::meta::tokens is only available in translation-time macro bodies");
         ++index_;
         type = tokens_type();
+        type->is_const = is_const;
+        type->is_volatile = is_volatile;
+    } else if (current().is("$::meta::bytes") ||
+               current().is("$::meta::buffer")) {
+        const bool bytes = consume("$::meta::bytes");
+        if (!bytes) consume("$::meta::buffer");
+        type = bytes ? bytes_type() : buffer_type();
         type->is_const = is_const;
         type->is_volatile = is_volatile;
     } else if (current().is("struct") || current().is("union")) {
@@ -1653,10 +1661,9 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
     }
     if (object->type && object->type->kind == Type::Kind::Array &&
         object->type->lanes == 0 &&
-        (!object->initializer ||
-         object->initializer->kind != Expr::Kind::AggregateInitializer)) {
+        !object->initializer) {
         diagnostics_.error(location,
-                           "an omitted array bound requires a u8 string initializer");
+                           "an omitted array bound requires an initializer");
     }
     expect(";");
     return object;

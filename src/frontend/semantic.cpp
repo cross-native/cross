@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -136,6 +137,10 @@ TypePtr clone_type(const TypePtr& source,
         result = record_type(source->nominal_name, source->is_union);
     } else if (source->kind == Type::Kind::Tokens) {
         result = tokens_type();
+    } else if (source->kind == Type::Kind::Bytes) {
+        result = bytes_type();
+    } else if (source->kind == Type::Kind::Buffer) {
+        result = buffer_type();
     } else {
         const auto found = substitutions.find(source->generic_name);
         if (found == substitutions.end()) {
@@ -1338,6 +1343,7 @@ private:
     TypePtr infer(const Expr& expression) const {
         switch (expression.kind) {
         case Expr::Kind::Quote: return {};
+        case Expr::Kind::ByteSequence: return {};
         case Expr::Kind::Address:
             return expression.type;
         case Expr::Kind::Integer:
@@ -1906,6 +1912,7 @@ private:
     TypePtr infer(const Expr& expression) const {
         switch (expression.kind) {
         case Expr::Kind::Quote: return {};
+        case Expr::Kind::ByteSequence: return {};
         case Expr::Kind::Integer:
             return builtin_type(BuiltinType::I32);
         case Expr::Kind::Floating:
@@ -2097,6 +2104,9 @@ struct EvalValue {
     bool function_designator{};
     // Immutable token storage is distinct from both strings and integers.
     std::shared_ptr<const TokenSequence> tokens;
+    std::shared_ptr<const std::string> bytes;
+    std::size_t byte_offset{};
+    std::size_t byte_length{};
 
     EvalValue() = default;
     EvalValue(UInt128 integer_value, TypePtr value_type,
@@ -2459,6 +2469,10 @@ public:
                                                const TypePtr& destination) {
         if (!validate_required_tree(source)) return std::nullopt;
         auto value = expression(source);
+        if (value && value->bytes) {
+            fail(source.location, "translation-time bytes cannot be used as a runtime scalar");
+            return std::nullopt;
+        }
         if (!value || value->pointer() ||
             (!is_integer(value->type) && !is_floating(value->type))) {
             fail(source.location,
@@ -2474,6 +2488,10 @@ public:
     std::optional<EvalValue> required_scalar(const Expr& source) {
         if (!validate_required_tree(source)) return std::nullopt;
         auto value = expression(source);
+        if (value && value->bytes) {
+            fail(source.location, "translation-time bytes cannot be used as a runtime scalar");
+            return std::nullopt;
+        }
         if (!value || value->pointer() ||
             (!is_integer(value->type) && !is_floating(value->type))) {
             fail(source.location,
@@ -2481,6 +2499,19 @@ public:
             return std::nullopt;
         }
         return value;
+    }
+
+    std::optional<std::string> required_bytes(const Expr& source) {
+        if (!validate_required_tree(source)) return std::nullopt;
+        auto value = expression(source);
+        if (!value) return std::nullopt;
+        if (!value->bytes || !value->type ||
+            value->type->kind != Type::Kind::Bytes) {
+            fail(source.location, "static byte array requires a $::meta::bytes initializer; got '" +
+                 type_name(value->type) + "'");
+            return std::nullopt;
+        }
+        return value->bytes->substr(value->byte_offset, value->byte_length);
     }
 
     bool validate_procedural_body(const FunctionDecl& function) {
@@ -2594,6 +2625,9 @@ public:
             }
             return token_value(std::move(result));
         }
+        case Expr::Kind::ByteSequence:
+            fail(expression.location, "materialized bytes are not an expression");
+            return std::nullopt;
         case Expr::Kind::Integer: {
             auto value = parse_integer_value(expression);
             if (value && !expression.evaluated_integer) {
@@ -2662,8 +2696,10 @@ public:
             const auto* query = expression.kind == Expr::Kind::Sizeof
                                     ? size_of_
                                     : align_of_;
-            if (type && type->kind == Type::Kind::Tokens) {
-                fail(expression.location, "$::meta::tokens has no runtime size or alignment");
+            if (type && (type->kind == Type::Kind::Tokens ||
+                         type->kind == Type::Kind::Bytes ||
+                         type->kind == Type::Kind::Buffer)) {
+                fail(expression.location, type_name(type) + " has no runtime size or alignment");
                 return std::nullopt;
             }
             if (!type || !query) {
@@ -2689,7 +2725,8 @@ public:
         case Expr::Kind::Conditional: {
             const auto type = expression_type(expression);
             auto condition = this->expression(*expression.left);
-            if (!condition || condition->pointer() || condition->tokens || !type) return std::nullopt;
+            if (!condition || condition->pointer() || condition->tokens ||
+                condition->bytes || !type) return std::nullopt;
             auto value = this->expression(*(condition->truthy()
                                           ? expression.right
                                           : expression.third));
@@ -2944,6 +2981,13 @@ private:
         }
         if (node.kind == Expr::Kind::Sizeof ||
             node.kind == Expr::Kind::Alignof) {
+            const auto queried = node.type ? node.type
+                : node.left ? expression_type(*node.left, false) : nullptr;
+            if (queried && (queried->kind == Type::Kind::Bytes ||
+                            queried->kind == Type::Kind::Buffer)) {
+                fail(node.location, type_name(queried) + " has no runtime size or alignment");
+                return false;
+            }
             if (procedural_) {
                 const auto type = node.type ? node.type
                     : node.left ? expression_type(*node.left, false) : nullptr;
@@ -2974,6 +3018,45 @@ private:
         if (node.kind == Expr::Kind::Call) {
             if (!node.left || node.left->kind != Expr::Kind::Name) {
                 fail(node.location, "indirect calls in required constant expressions are not implemented yet");
+                return false;
+            }
+            const auto& name = node.left->text;
+            if (name == "$::embed") {
+                if (node.arguments.size() != 1 ||
+                    node.arguments.front()->kind != Expr::Kind::String ||
+                    !token_origin(node.left->location).embed) {
+                    fail(node.location, "$::embed requires one identified string-literal path");
+                    return false;
+                }
+                return true;
+            }
+            if (name == "$::meta::len" || name == "$::meta::at" ||
+                name == "$::meta::slice" ||
+                (name == "$::meta::concat" && !procedural_)) {
+                const auto count = name == "$::meta::len" ? 1U
+                    : name == "$::meta::at" || name == "$::meta::concat" ? 2U : 3U;
+                if (node.arguments.size() != count) {
+                    fail(node.location, name + " requires " + std::to_string(count) + " arguments");
+                    return false;
+                }
+                for (std::size_t index = 0; index < count; ++index) {
+                    const auto& argument = *node.arguments[index];
+                    if (!validate_required_tree(argument)) return false;
+                    const auto type = expression_type(argument);
+                    const bool byte_argument = index == 0 || name == "$::meta::concat";
+                    if (!type || (byte_argument ? type->kind != Type::Kind::Bytes
+                                                : !is_integer(type))) {
+                        fail(argument.location, name +
+                            (byte_argument ? " requires $::meta::bytes" : " requires an integer index"));
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (name.starts_with("$::meta::") &&
+                !(procedural_ && (name == "$::meta::parse" ||
+                                  name == "$::meta::concat"))) {
+                fail(node.location, name + " is not implemented for byte evaluation");
                 return false;
             }
             if (procedural_ && (node.left->text == "$::meta::parse" ||
@@ -3369,6 +3452,13 @@ private:
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
+            if (expression.left->text == "$::embed" ||
+                expression.left->text == "$::meta::slice" ||
+                (expression.left->text == "$::meta::concat" && !procedural_)) return bytes_type();
+            if (expression.left->text == "$::meta::len")
+                return builtin_type(BuiltinType::Uptr);
+            if (expression.left->text == "$::meta::at")
+                return builtin_type(BuiltinType::U8);
             if (procedural_ && (expression.left->text == "$::meta::parse" ||
                                 expression.left->text == "$::meta::concat")) return tokens_type();
             if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
@@ -3377,6 +3467,7 @@ private:
                     [](const FunctionDecl&) { return true; })) return callee->return_type;
             return {};
         case Expr::Kind::String: return pointer_type(builtin_type(BuiltinType::U8, true));
+        case Expr::Kind::ByteSequence: return bytes_type();
         case Expr::Kind::Floating:
             return builtin_type(expression.evaluated_floating
                 ? expression.evaluated_floating->type
@@ -3426,6 +3517,15 @@ private:
         if (value.tokens || type->kind == Type::Kind::Tokens) {
             if (!procedural_ || !value.tokens || type->kind != Type::Kind::Tokens) {
                 fail(location, "token values cannot be converted to or from runtime types");
+                return std::nullopt;
+            }
+            value.type = clone_type(type);
+            return value;
+        }
+        if (value.bytes || type->kind == Type::Kind::Bytes ||
+            type->kind == Type::Kind::Buffer) {
+            if (!value.bytes || type->kind != Type::Kind::Bytes) {
+                fail(location, "translation-time bytes cannot be converted to a runtime type");
                 return std::nullopt;
             }
             value.type = clone_type(type);
@@ -3676,7 +3776,7 @@ private:
                 lookup_mutable(expression.left->text, expression.left->location)->value = *value;
                 return expression.text.starts_with("post") ? previous : value;
             }
-            if (previous->pointer() || previous->tokens) return std::nullopt;
+            if (previous->pointer() || previous->tokens || previous->bytes) return std::nullopt;
             auto value = previous->floating
                 ? calculate_floating(expression.text == "++" || expression.text == "post++"
                                          ? "+" : "-", *previous,
@@ -3693,7 +3793,7 @@ private:
             return expression.text.starts_with("post") ? previous : value;
         }
         auto value = this->expression(*expression.left);
-        if (!value || value->pointer() || value->tokens) return std::nullopt;
+        if (!value || value->pointer() || value->tokens || value->bytes) return std::nullopt;
         if (value->floating) {
             if (expression.text == "+") return value;
             if (expression.text == "-") {
@@ -3726,8 +3826,8 @@ private:
     std::optional<EvalValue> binary(const Expr& expression) {
         auto left = this->expression(*expression.left);
         if (!left) return std::nullopt;
-        if (left->tokens) {
-            fail(expression.location, "token values do not support scalar operators");
+        if (left->tokens || left->bytes) {
+            fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
         }
         const auto operation = expression.text;
@@ -3740,14 +3840,14 @@ private:
                                  builtin_type(BuiltinType::Bool)};
             }
             auto right = this->expression(*expression.right);
-            if (!right || right->pointer() || right->tokens) return std::nullopt;
+            if (!right || right->pointer() || right->tokens || right->bytes) return std::nullopt;
             return EvalValue{{right->truthy(), 0},
                              builtin_type(BuiltinType::Bool)};
         }
         auto right = this->expression(*expression.right);
         if (!right) return std::nullopt;
-        if (right->tokens) {
-            fail(expression.location, "token values do not support scalar operators");
+        if (right->tokens || right->bytes) {
+            fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
         }
         if (expression.text == "index") {
@@ -3869,6 +3969,110 @@ private:
             }
             return token_value(std::move(result));
         }
+        const auto& name = expression.left->text;
+        constexpr std::size_t byte_budget = 16 * 1024 * 1024;
+        if (name == "$::embed") {
+            const auto identity = token_origin(expression.left->location).embed;
+            if (expression.arguments.size() != 1 || !identity || !identity->snapshot ||
+                expression.arguments.front()->kind != Expr::Kind::String) {
+                fail(expression.location, "$::embed requires one identified string-literal path");
+                return std::nullopt;
+            }
+            auto& snapshot = *identity->snapshot;
+            if (!snapshot.bytes) {
+                std::ifstream input(snapshot.path, std::ios::binary | std::ios::ate);
+                if (!input) {
+                    fail(expression.location, "cannot read embedded asset '" + identity->written_path + "'");
+                    return std::nullopt;
+                }
+                const auto end = input.tellg();
+                if (end < 0 || static_cast<std::uint64_t>(end) > byte_budget ||
+                    !fits_unsigned(UInt128{static_cast<std::uint64_t>(end)}, program_.address_bits)) {
+                    fail(expression.location, "embedded asset exceeds the target uptr or 16777216-byte limit");
+                    return std::nullopt;
+                }
+                std::string data(static_cast<std::size_t>(end), '\0');
+                input.seekg(0);
+                if (!input || (!data.empty() && !input.read(data.data(),
+                        static_cast<std::streamsize>(data.size())))) {
+                    fail(expression.location, "cannot read embedded asset '" + identity->written_path + "'");
+                    return std::nullopt;
+                }
+                snapshot.bytes = std::make_shared<const std::string>(std::move(data));
+            }
+            EvalValue value{UInt128{}, bytes_type()};
+            value.bytes = snapshot.bytes;
+            value.byte_length = value.bytes->size();
+            return value;
+        }
+        if (name == "$::meta::len" || name == "$::meta::at" ||
+            name == "$::meta::slice" || name == "$::meta::concat") {
+            const auto count = name == "$::meta::len" ? 1U
+                : name == "$::meta::at" || name == "$::meta::concat" ? 2U : 3U;
+            if (expression.arguments.size() != count) {
+                fail(expression.location, name + " requires " + std::to_string(count) + " arguments");
+                return std::nullopt;
+            }
+            auto source = this->expression(*expression.arguments[0]);
+            if (!source || !source->bytes) {
+                fail(expression.arguments[0]->location, name + " requires $::meta::bytes");
+                return std::nullopt;
+            }
+            if (name == "$::meta::len")
+                return EvalValue{UInt128{source->byte_length}, builtin_type(BuiltinType::Uptr)};
+            if (name == "$::meta::concat") {
+                auto second = this->expression(*expression.arguments[1]);
+                if (!second || !second->bytes) {
+                    fail(expression.arguments[1]->location, name + " requires $::meta::bytes");
+                    return std::nullopt;
+                }
+                if (second->byte_length > byte_budget - source->byte_length ||
+                    !fits_unsigned(UInt128{source->byte_length + second->byte_length},
+                                   program_.address_bits)) {
+                    fail(expression.location, "concatenated bytes exceed the target uptr or 16777216-byte limit");
+                    return std::nullopt;
+                }
+                auto result = std::make_shared<std::string>();
+                result->reserve(source->byte_length + second->byte_length);
+                result->append(*source->bytes, source->byte_offset, source->byte_length);
+                result->append(*second->bytes, second->byte_offset, second->byte_length);
+                EvalValue value{UInt128{}, bytes_type()};
+                value.bytes = std::move(result);
+                value.byte_length = value.bytes->size();
+                return value;
+            }
+            const auto index = this->expression(*expression.arguments[1]);
+            if (!index || !is_integer(index->type) ||
+                integer_negative(index->integer, integer_type(index->type)) ||
+                index->integer.high != 0 || index->integer.low > source->byte_length) {
+                fail(expression.arguments[1]->location, name + " index is outside the byte sequence");
+                return std::nullopt;
+            }
+            const auto offset = static_cast<std::size_t>(index->integer.low);
+            if (name == "$::meta::at") {
+                if (offset == source->byte_length) {
+                    fail(expression.arguments[1]->location, "$::meta::at index is outside the byte sequence");
+                    return std::nullopt;
+                }
+                return EvalValue{UInt128{static_cast<unsigned char>(
+                    (*source->bytes)[source->byte_offset + offset])}, builtin_type(BuiltinType::U8)};
+            }
+            const auto length = this->expression(*expression.arguments[2]);
+            if (!length || !is_integer(length->type) ||
+                integer_negative(length->integer, integer_type(length->type)) ||
+                length->integer.high != 0 ||
+                length->integer.low > source->byte_length - offset) {
+                fail(expression.arguments[2]->location, "$::meta::slice length is outside the byte sequence");
+                return std::nullopt;
+            }
+            source->byte_offset += offset;
+            source->byte_length = static_cast<std::size_t>(length->integer.low);
+            return source;
+        }
+        if (name.starts_with("$::meta::")) {
+            fail(expression.location, name + " is not implemented for byte evaluation");
+            return std::nullopt;
+        }
         if (expression.left->text == "$::eval") {
             if (expression.arguments.size() != 1) {
                 fail(expression.location,
@@ -3966,7 +4170,8 @@ private:
                                          : std::optional<EvalValue>{}};
         case Statement::Kind::If: {
             auto condition = expression(*statement.condition);
-            if (!condition || condition->pointer() || condition->tokens) return {Flow::Failed};
+            if (!condition || condition->pointer() || condition->tokens ||
+                condition->bytes) return {Flow::Failed};
             if (condition->truthy()) {
                 return this->statement(*statement.first);
             }
@@ -4082,7 +4287,8 @@ private:
         case Statement::Kind::While:
             while (true) {
                 auto condition = expression(*statement.condition);
-                if (!condition || condition->pointer() || condition->tokens) return {Flow::Failed};
+                if (!condition || condition->pointer() || condition->tokens ||
+                    condition->bytes) return {Flow::Failed};
                 if (!condition->truthy()) return {};
                 auto flow = this->statement(*statement.first);
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
@@ -4094,7 +4300,8 @@ private:
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
                 if (flow.kind == Flow::Break) return {};
                 auto condition = expression(*statement.condition);
-                if (!condition || condition->pointer() || condition->tokens) return {Flow::Failed};
+                if (!condition || condition->pointer() || condition->tokens ||
+                    condition->bytes) return {Flow::Failed};
                 if (!condition->truthy()) return {};
             } while (true);
         case Statement::Kind::For: {
@@ -4107,7 +4314,8 @@ private:
             while (true) {
                 if (statement.condition) {
                     auto condition = expression(*statement.condition);
-                    if (!condition || condition->pointer() || condition->tokens) {
+                    if (!condition || condition->pointer() || condition->tokens ||
+                        condition->bytes) {
                         scopes_.pop_back();
                         return {Flow::Failed};
                     }
@@ -4415,7 +4623,15 @@ std::string literal_suffix(const TypePtr& type) {
 }
 
 bool evaluation_only(const FunctionDecl& function) {
-    return function.attribute("eval_only") != nullptr;
+    if (function.attribute("eval_only")) return true;
+    if (function.return_type && (function.return_type->kind == Type::Kind::Bytes ||
+                                  function.return_type->kind == Type::Kind::Buffer)) return true;
+    return std::any_of(function.parameters.begin(), function.parameters.end(),
+        [](const ParameterDecl& parameter) {
+            return parameter.type &&
+                (parameter.type->kind == Type::Kind::Bytes ||
+                 parameter.type->kind == Type::Kind::Buffer);
+        });
 }
 
 bool runtime_only(const FunctionDecl& function) {
@@ -4828,7 +5044,30 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                 "a translation-time pointer cannot escape through $::eval");
             return;
         }
+        if (value->bytes) {
+            diagnostics.error(expression->location,
+                "$::meta::bytes may only initialize a static u8 array");
+            return;
+        }
         replace_eval_value(expression, *value);
+        return;
+    }
+
+    if (expression->kind == Expr::Kind::Call && expression->left &&
+        expression->left->kind == Expr::Kind::Name &&
+        (expression->left->text == "$::embed" ||
+         expression->left->text == "$::meta::len" ||
+         expression->left->text == "$::meta::at" ||
+         expression->left->text == "$::meta::slice" ||
+         expression->left->text == "$::meta::concat" ||
+         expression->left->text == "$::meta::data" ||
+         expression->left->text == "$::meta::alloc" ||
+         expression->left->text == "$::meta::cap" ||
+         expression->left->text == "$::meta::freeze")) {
+        Evaluator evaluator(program, diagnostics, caller);
+        const auto value = evaluator.required_scalar(*expression);
+        if (!value) evaluator.diagnose(expression->location);
+        else replace_eval_value(expression, *value);
         return;
     }
 
@@ -4895,6 +5134,11 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                 "an evaluation-only call cannot return a translation-time "
                 "pointer");
         }
+        return;
+    }
+    if (value->bytes) {
+        diagnostics.error(expression->location,
+            "$::meta::bytes may only initialize a static u8 array");
         return;
     }
     replace_eval_value(expression, *value);
@@ -5129,8 +5373,23 @@ void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
 
 bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                        bool opportunistic) {
+    const auto contains_meta = [&](const auto& self, const TypePtr& type) -> bool {
+        if (!type) return false;
+        if (type->kind == Type::Kind::Bytes || type->kind == Type::Kind::Buffer)
+            return true;
+        if (self(self, type->pointee) || self(self, type->element)) return true;
+        if (type->function) {
+            if (self(self, type->function->result)) return true;
+            for (const auto& parameter : type->function->parameters)
+                if (self(self, parameter.type)) return true;
+        }
+        return false;
+    };
     for (auto& record : program.records) {
         for (auto& member : record.members) {
+            if (contains_meta(contains_meta, member.type))
+                diagnostics.error(member.location,
+                    "meta values cannot be record members");
             if (!member.bit_width) continue;
             if (contains_layout_query(*member.bit_width)) {
                 continue;
@@ -5177,6 +5436,14 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
             const bool scoped = statement.kind == Statement::Kind::Compound || statement.kind == Statement::Kind::For;
             if (scoped) scopes.emplace_back();
             if (statement.declaration) {
+                if (contains_meta(contains_meta, statement.declaration->type) &&
+                    (!evaluation_only(*function) ||
+                     statement.declaration->type->kind != Type::Kind::Bytes)) {
+                    diagnostics.error(statement.declaration->location,
+                        statement.declaration->type->kind == Type::Kind::Buffer
+                            ? "$::meta::buffer evaluation is not implemented yet"
+                            : "meta values cannot have runtime local storage");
+                }
                 scopes.back()[name_key(*statement.declaration)] = statement.declaration->type->is_const;
                 check_expression(check_expression, statement.declaration->initializer.get());
                 check_expression(check_expression, statement.declaration->dynamic_array_bound.get());
@@ -5193,12 +5460,35 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     }
     if (diagnostics.errors() != 0) return false;
     for (const auto& function : program.functions) {
+        if (function->return_type && function->return_type->kind == Type::Kind::Buffer)
+            diagnostics.error(function->location, "$::meta::buffer evaluation is not implemented yet");
+        if (contains_meta(contains_meta, function->return_type) &&
+            function->return_type->kind != Type::Kind::Bytes &&
+            function->return_type->kind != Type::Kind::Buffer)
+            diagnostics.error(function->location, "meta types cannot be nested in runtime function types");
+        for (const auto& parameter : function->parameters) {
+            if (parameter.type && parameter.type->kind == Type::Kind::Buffer)
+                diagnostics.error(parameter.location, "$::meta::buffer evaluation is not implemented yet");
+            if (contains_meta(contains_meta, parameter.type) &&
+                parameter.type->kind != Type::Kind::Bytes &&
+                parameter.type->kind != Type::Kind::Buffer)
+                diagnostics.error(parameter.location, "meta types cannot be nested in runtime function types");
+        }
         if (evaluation_only(*function) && runtime_only(*function)) {
             diagnostics.error(
                 function->location,
                 "a function cannot be both eval_only and runtime_only");
         }
         if (!evaluation_only(*function)) continue;
+        if ((function->return_type && function->return_type->kind == Type::Kind::Bytes) ||
+            std::any_of(function->parameters.begin(), function->parameters.end(),
+                [](const ParameterDecl& parameter) {
+                    return parameter.type && parameter.type->kind == Type::Kind::Bytes;
+                })) {
+            if (function->linkage != Linkage::Static)
+                diagnostics.error(function->location,
+                    "function with $::meta::bytes in its signature must be static");
+        }
         if (!function->body) {
             diagnostics.error(
                 function->location,
@@ -5229,7 +5519,42 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
         }
     }
     for (auto& object : program.objects) {
+        if (contains_meta(contains_meta, object->type)) {
+            diagnostics.error(object->location,
+                "meta values cannot have runtime object storage");
+            continue;
+        }
         if (object->initializer) {
+            const bool byte_array = object->type &&
+                object->type->kind == Type::Kind::Array && object->type->element &&
+                object->type->element->kind == Type::Kind::Builtin &&
+                object->type->element->builtin == BuiltinType::U8;
+            if (byte_array && object->initializer->kind != Expr::Kind::String &&
+                object->initializer->kind != Expr::Kind::AggregateInitializer) {
+                Evaluator evaluator(program, diagnostics, nullptr,
+                    namespace_prefix(object->name));
+                auto bytes = evaluator.required_bytes(*object->initializer);
+                if (!bytes) evaluator.diagnose(object->initializer->location);
+                else if (bytes->empty() ||
+                         bytes->size() > std::numeric_limits<std::uint32_t>::max() ||
+                         !fits_unsigned(UInt128{bytes->size()}, program.address_bits)) {
+                    diagnostics.error(object->initializer->location,
+                        "materialized byte array has an invalid target-sized bound");
+                } else if (object->type->lanes != 0 &&
+                           object->type->lanes != bytes->size()) {
+                    diagnostics.error(object->initializer->location,
+                        "explicit byte-array bound must equal the embedded byte count");
+                } else {
+                    if (object->type->lanes == 0)
+                        object->type->lanes = static_cast<std::uint32_t>(bytes->size());
+                    auto replacement = std::make_unique<Expr>();
+                    replacement->kind = Expr::Kind::ByteSequence;
+                    replacement->location = object->initializer->location;
+                    replacement->string_value = std::move(*bytes);
+                    object->initializer = std::move(replacement);
+                }
+                continue;
+            }
             if ((is_integer(object->type) || is_floating(object->type)) &&
                 object->initializer->kind !=
                     Expr::Kind::AggregateInitializer &&
@@ -5256,6 +5581,10 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
             infer_initializer_array_bound(object->type,
                                           object->initializer.get(),
                                           diagnostics);
+            if (object->type && object->type->kind == Type::Kind::Array &&
+                object->type->lanes == 0)
+                diagnostics.error(object->initializer->location,
+                    "an omitted array bound requires a string, brace, or meta-byte initializer");
             fold_static_initializer(*object->initializer, object->type,
                                     program, diagnostics);
         }

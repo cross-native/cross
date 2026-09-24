@@ -48,12 +48,20 @@ struct SyntaxContext {
     std::vector<std::string> imports;
 };
 
+struct EmbedSnapshot {
+    std::filesystem::path path;
+    // Filled on the first mandatory evaluation, then shared by every
+    // occurrence selecting this file during the compilation group.
+    std::shared_ptr<const std::string> bytes;
+};
+
 // One pre-expansion embed expression owns its selected file identity. The
 // four lexical pieces carry the same identity through token copying.
 struct EmbedIdentity {
     std::string written_path;
     std::filesystem::path selected_path;
     SourceLocation logical_location;
+    std::shared_ptr<EmbedSnapshot> snapshot;
 };
 
 struct TokenOrigin {

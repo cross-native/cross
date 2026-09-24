@@ -140,7 +140,8 @@ void visit_embeds(std::span<const Token> tokens,
 EmbedDiscovery discover_embeds(SourceManager& sources, const SourceFile& source,
                                std::span<const SourceLocation> line_origins,
                                const CompilerOptions& options,
-                               Diagnostics& diagnostics, bool validate) {
+                               Diagnostics& diagnostics, bool validate,
+                               EmbedSnapshots* snapshots) {
     EmbedDiscovery result{&source, {}};
     if (source.text.find("$::embed") == std::string::npos) return result;
 
@@ -172,8 +173,19 @@ EmbedDiscovery discover_embeds(SourceManager& sources, const SourceFile& source,
                     return;
                 }
             }
+            std::shared_ptr<EmbedSnapshot> snapshot;
+            if (snapshots && !selected.path.empty()) {
+                auto& entry = (*snapshots)[selected.path.generic_string()];
+                if (!entry) entry = std::make_shared<EmbedSnapshot>(
+                    EmbedSnapshot{selected.path, {}});
+                snapshot = entry;
+            } else {
+                snapshot = std::make_shared<EmbedSnapshot>(
+                    EmbedSnapshot{selected.path, {}});
+            }
             auto identity = std::make_shared<EmbedIdentity>(
-                EmbedIdentity{*written, selected.path, logical(index)});
+                EmbedIdentity{*written, selected.path, logical(index),
+                              std::move(snapshot)});
             for (unsigned piece = 0; piece < 4; ++piece) {
                 const auto& token = tokens[index + piece];
                 auto origin = token_origin(token.location);
@@ -213,21 +225,6 @@ bool validate_embeds(const SourceFile& source, Diagnostics& diagnostics) {
         intact = intact && written && *written == first->written_path;
         if (!intact) diagnostics.error(tokens[index].location,
             "generated $::embed expression lacks its declared dependency identity");
-    });
-    return diagnostics.errors() == errors;
-}
-
-bool diagnose_unimplemented_embed_values(const SourceFile& source,
-                                          Diagnostics& diagnostics) {
-    if (source.text.find("$::embed") == std::string::npos) return true;
-    const auto errors = diagnostics.errors();
-    const auto tokens = Lexer(source, diagnostics).lex();
-    if (diagnostics.errors() != errors) return false;
-    visit_embeds(tokens, {}, diagnostics, [&](std::size_t index) {
-        const auto origin = token_origin(tokens[index].location);
-        diagnostics.error(origin.span,
-            "$::embed byte evaluation and static-array materialization "
-            "are not implemented yet");
     });
     return diagnostics.errors() == errors;
 }

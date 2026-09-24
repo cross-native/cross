@@ -462,6 +462,7 @@ std::optional<ParsedInteger> patch_initial(const Expr& expression,
 bool eligible_expression(const Expr& expression) {
     switch (expression.kind) {
     case Expr::Kind::Quote: return false;
+    case Expr::Kind::ByteSequence: return false;
     case Expr::Kind::Address:
         return expression.type && expression.evaluated_address;
     case Expr::Kind::Integer:
@@ -592,6 +593,7 @@ bool eligible_expression(const Expr& expression) {
 bool valid_assumption_expression(const Expr& expression) {
     switch (expression.kind) {
     case Expr::Kind::Quote: return false;
+    case Expr::Kind::ByteSequence: return false;
     case Expr::Kind::Address:
         return expression.type && expression.evaluated_address;
     case Expr::Kind::Integer:
@@ -2702,6 +2704,7 @@ private:
     std::optional<hir::TypeId> infer_type(const Expr& expression) {
         switch (expression.kind) {
         case Expr::Kind::Quote: return std::nullopt;
+        case Expr::Kind::ByteSequence: return std::nullopt;
         case Expr::Kind::Address:
             return expression.type ? std::optional<hir::TypeId>(hir_.intern_type(expression.type))
                                    : std::nullopt;
@@ -3309,6 +3312,10 @@ private:
         case Expr::Kind::Quote:
             diagnostics_.error(expression.location,
                 "translation-time token quotation cannot enter runtime lowering");
+            return std::nullopt;
+        case Expr::Kind::ByteSequence:
+            diagnostics_.error(expression.location,
+                "materialized bytes cannot enter runtime lowering");
             return std::nullopt;
         case Expr::Kind::Address: {
             if (!expression.type || !expression.evaluated_address) break;

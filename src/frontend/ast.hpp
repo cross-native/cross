@@ -35,7 +35,9 @@ struct Type {
         Record,
         Function,
         // Translation-only; never assigned a runtime layout or ABI channel.
-        Tokens
+        Tokens,
+        Bytes,
+        Buffer
     } kind{Kind::Builtin};
     BuiltinType builtin{BuiltinType::Void};
     TypePtr pointee;
@@ -62,6 +64,8 @@ struct Type {
 TypePtr builtin_type(BuiltinType kind, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
 TypePtr tokens_type();
+TypePtr bytes_type();
+TypePtr buffer_type();
 TypePtr pointer_type(TypePtr pointee, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
 TypePtr generic_type(std::string name, bool is_const = false,
@@ -140,7 +144,7 @@ struct Expr {
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
         Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
-        AggregateInitializer, Address, Quote,
+        AggregateInitializer, Address, Quote, ByteSequence,
     } kind{Kind::Integer};
     std::shared_ptr<const NameLookupContext> name_context;
     struct InitializerDesignator {
