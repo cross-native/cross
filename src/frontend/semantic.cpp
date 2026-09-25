@@ -2476,14 +2476,6 @@ TypePtr infer_generic_actual(const Expr& expression,
     }
     case Expr::Kind::Call: {
         if (!expression.left) return {};
-        if (expression.left->kind == Expr::Kind::Name) {
-            const auto* function = resolve_function(
-                program, caller, *expression.left,
-                [](const FunctionDecl& candidate) {
-                    return candidate.generic_parameters.empty();
-                });
-            if (function) return adjusted(function->return_type);
-        }
         auto callee = infer_generic_actual(*expression.left, caller,
                                            program, state);
         if (callee && callee->kind == Type::Kind::Pointer)

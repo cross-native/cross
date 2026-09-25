@@ -27,6 +27,10 @@ static bool same_generic<T>(in T left, in T right) {
     return left == right;
 }
 
+static i32 local_callable_name(in i32 value) { return value; }
+static u64 wide_callback(in u64 value) { return value + 1u64; }
+typedef u64 (*wide_callback_type)(in u64 value);
+
 static void assign<T>(out T destination, in T value) {
     destination = value;
 }
@@ -105,6 +109,7 @@ global i32 generic_angle_entry() {
     i32 called = choose(1 == 0, callback(4i32), callback(5i32));
     i32 shadow = 0i32;
     i32 shadow_call = 0i32;
+    bool inferred_local_call = 0 == 1;
     {
         i32 choose = 2i32;
         shadow = choose < 3i32 ? 1i32 : 2i32;
@@ -112,6 +117,10 @@ global i32 generic_angle_entry() {
     {
         generic_callback choose = callback_plus_two;
         shadow_call = choose(39i32);
+    }
+    {
+        wide_callback_type local_callable_name = wide_callback;
+        inferred_local_call = same_generic(local_callable_name(3u64), 4u64);
     }
     i32 iterations = 0i32;
     for (i32 choose = 0i32; choose < 1i32; ++choose)
@@ -124,7 +133,7 @@ global i32 generic_angle_entry() {
            copied(39i32) == 41i32 &&
            alias_copy(40i32) == 42i32 &&
            member == 3i32 && called == 7i32 &&
-           shadow == 1i32 && shadow_call == 41i32 &&
+           shadow == 1i32 && shadow_call == 41i32 && inferred_local_call &&
            iterations == 1i32 &&
            after_shadow == 13i32 && shadow_parameter(2i32) == 1i32 &&
            lexical_shadow::inner::check() == 1i32 &&
