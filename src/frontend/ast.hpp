@@ -355,9 +355,19 @@ struct EvaluationLimits {
     unsigned depth{256};
 };
 
+enum class EvaluationByteOrder { Little, Big };
+
+struct EvaluationLayout {
+    EvaluationByteOrder byte_order{EvaluationByteOrder::Little};
+    unsigned natural_alignment_limit{1};
+    unsigned f80_storage_bytes{10};
+    unsigned f80_alignment{1};
+};
+
 struct Program {
     unsigned address_bits{64};
     EvaluationLimits evaluation_limits;
+    EvaluationLayout evaluation_layout;
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
     std::vector<StaticAssertDecl> static_assertions;

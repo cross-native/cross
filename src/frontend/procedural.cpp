@@ -380,7 +380,8 @@ std::optional<Replacement> find_expansion(SourceManager& sources,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
                                            const LayoutQuery& align_of,
-                                           EvaluationLimits limits) {
+                                           EvaluationLimits limits,
+                                           EvaluationLayout layout) {
     const auto regions = namespace_regions(tokens);
     for (std::size_t index = 0; index + 2 < tokens.size(); ++index) {
         if (tokens[index].kind == TokenKind::Identifier) {
@@ -428,7 +429,7 @@ std::optional<Replacement> find_expansion(SourceManager& sources,
                 definition_context->imports = macro->function.imports;
                 auto output = evaluate_procedural_body(macro->function,
                     input, address_bits, size_of, align_of, definition_context,
-                    diagnostics, limits);
+                    diagnostics, limits, layout);
                 if (!output) {
                     diagnostics.error(tokens[index].location,
                                       "procedural macro '" + macro->name +
@@ -517,7 +518,8 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
                                            const LayoutQuery& align_of,
-                                           EvaluationLimits limits) {
+                                           EvaluationLimits limits,
+                                           EvaluationLayout layout) {
     std::string result(source.text);
     const auto* definition_file = &source;
     Lexer definition_lexer(*definition_file, diagnostics);
@@ -549,7 +551,7 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
         if (diagnostics.errors() != 0) return current;
         auto replacement =
             find_expansion(sources, tokens, macros, diagnostics,
-                           address_bits, size_of, align_of, limits);
+                           address_bits, size_of, align_of, limits, layout);
         if (!replacement) return current;
         auto origins = remap_expansions(*current, *replacement);
         token_origins = remap_token_origins(current->token_origins, *replacement);
@@ -570,10 +572,11 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
                                            const LayoutQuery& align_of,
-                                           EvaluationLimits limits) {
+                                           EvaluationLimits limits,
+                                           EvaluationLayout layout) {
     const auto* input = sources.add(path, std::string(source));
     return expand_procedural_macros(sources, *input, diagnostics,
-                                    address_bits, size_of, align_of, limits);
+                                    address_bits, size_of, align_of, limits, layout);
 }
 
 } // namespace cross

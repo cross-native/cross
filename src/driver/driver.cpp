@@ -792,6 +792,12 @@ int cc_main(int argc, char** argv) {
     program.evaluation_limits = {
         options.eval_byte_limit, options.eval_memory_limit,
         options.eval_step_limit, options.eval_depth_limit};
+    program.evaluation_layout = {
+        target->data_layout.byte_order == ByteOrder::Big
+            ? EvaluationByteOrder::Big : EvaluationByteOrder::Little,
+        target->data_layout.natural_alignment_limit,
+        target->data_layout.f80_storage_bytes,
+        target->data_layout.f80_alignment};
     // Macro execution precedes source declarations. Scalar layout queries
     // nevertheless use the same target-owned context as later required folds.
     auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);
@@ -810,7 +816,7 @@ int cc_main(int argc, char** argv) {
         const auto* source = expand_procedural_macros(
             sources, *preprocessed_source, diagnostics,
             program.address_bits, macro_size, macro_align,
-            program.evaluation_limits);
+            program.evaluation_limits, program.evaluation_layout);
         if (diagnostics.errors() != 0) return 1;
         if (!validate_embeds(*source, diagnostics)) return 1;
         Lexer lexer(*source, diagnostics);

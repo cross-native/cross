@@ -140,7 +140,10 @@ foreach(case unassigned_prefix double_freeze over_capacity nonstatic_buffer meta
     endif()
 endforeach()
 
-foreach(case unassigned_read frozen_pointer const_write view_overread integer_cast non_byte_cast)
+foreach(case unassigned_read frozen_pointer const_write view_overread integer_cast
+        non_byte_cast misaligned wide_overread effective_type
+        float_effective_type invalid_bool invalid_f80 unassigned_wide
+        different_pointer_views)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -161,13 +164,74 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const u8 *pointer = $::meta::data(value);\n"
             "pointer[0u32] = 7u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable byte storage")
+        set(expected "meta pointer write requires mutable scalar storage")
     elseif(case STREQUAL view_overread)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const u8 *pointer = $::meta::data($::meta::slice(value, 1u32, 2u32));\n"
             "return pointer[2u32];")
         set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL misaligned)
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const u32 *pointer = (const u32 *)$::meta::data($::meta::slice(value, 1u32, 4u32));\n"
+            "return pointer[0u32];")
+        set(expected "misaligned meta pointer access")
+    elseif(case STREQUAL wide_overread)
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const u32 *pointer = (const u32 *)$::meta::data($::meta::slice(value, 0u32, 3u32));\n"
+            "return pointer[0u32];")
+        set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL effective_type)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "u32 *word = (u32 *)$::meta::data(value);\n"
+            "word[0u32] = 7u32;\n"
+            "const u16 *half = (const u16 *)word;\n"
+            "return half[0u32];")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL float_effective_type)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "f32 *real = (f32 *)$::meta::data(value);\n"
+            "real[0u32] = 1.5f32;\n"
+            "const u32 *bits = (const u32 *)real;\n"
+            "return bits[0u32];")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL invalid_bool)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(1u32);\n"
+            "u8 *bytes = $::meta::data(value);\n"
+            "bytes[0u32] = 2u32;\n"
+            "const bool *flag = (const bool *)bytes;\n"
+            "return flag[0u32];")
+        set(expected "invalid bool representation")
+    elseif(case STREQUAL invalid_f80)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(16u32);\n"
+            "u8 *bytes = $::meta::data(value);\n"
+            "uptr index = 0u32;\n"
+            "while (index < 16u32) { bytes[index] = 0u32; ++index; }\n"
+            "bytes[8u32] = 1u32;\n"
+            "const f80 *real = (const f80 *)bytes;\n"
+            "return real[0u32] != 0.0f80;")
+        set(expected "invalid f80 representation")
+    elseif(case STREQUAL different_pointer_views)
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const u8 *first = $::meta::data($::meta::slice(value, 0u32, 2u32));\n"
+            "const u8 *second = $::meta::data($::meta::slice(value, 2u32, 2u32));\n"
+            "return first < second;")
+        set(expected "ordering or subtraction requires one compatible view")
+    elseif(case STREQUAL unassigned_wide)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "u8 *bytes = $::meta::data(value);\n"
+            "bytes[0u32] = 7u32;\n"
+            "const u32 *word = (const u32 *)bytes;\n"
+            "return word[0u32];")
+        set(expected "read of unassigned buffer byte")
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -177,9 +241,9 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
     else()
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
-            "const u16 *pointer = (const u16 *)$::meta::data(value);\n"
-            "return pointer[0u32];")
-        set(expected "non-byte pointer types")
+            "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
+            "return 0u32;")
+        set(expected "supported scalar pointer cast")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"
@@ -195,14 +259,19 @@ endforeach()
 
 # Byte materialization is independent of scalar byte order and target uptr
 # width. The scalar length still follows the selected target's layout.
-foreach(target mips-unknown-elf mipsel-unknown-elf mips64-unknown-elf)
+foreach(target mips-unknown-elf mipsel-unknown-elf
+        mips64-unknown-elf mips64el-unknown-elf)
     set(flags -target "${target}")
-    if(target STREQUAL mips64-unknown-elf)
+    if(target MATCHES "^mips64")
         list(APPEND flags -mabi=n64)
         set(length_directive "[.]quad 5")
+        set(success_directive "[.]quad 1")
+        set(distance_directive "[.]quad 2")
     else()
         list(APPEND flags -mabi=o32)
         set(length_directive "[.]long 5")
+        set(success_directive "[.]long 1")
+        set(distance_directive "[.]long 2")
     endif()
     execute_process(COMMAND "${CC}" -S ${flags}
         "${directory}/embed_values.x" -o "${OUTPUT}-${target}.s"
@@ -211,12 +280,48 @@ foreach(target mips-unknown-elf mipsel-unknown-elf mips64-unknown-elf)
         message(FATAL_ERROR "${target} embedded value compile failed\n${out}\n${err}")
     endif()
     file(READ "${OUTPUT}-${target}.s" assembly)
+    if(target STREQUAL mipsel-unknown-elf OR target STREQUAL mips64el-unknown-elf)
+        set(word_bytes "120,86,52,18,240,222,188,154")
+        set(source_word "4286578753")
+        set(float_bytes "0,0,192,63")
+        set(double_bytes "0,0,0,0,0,0,0,128")
+        set(quad_bytes "0,0,0,0,0,0,0,0,0,0,0,0,0,128,255,63")
+        set(extended_bytes "0,0,0,0,0,0,0,192,255,63,0,0,0,0,0,0")
+    else()
+        set(word_bytes "18,52,86,120,154,188,222,240")
+        set(source_word "1090552063")
+        set(float_bytes "63,192,0,0")
+        set(double_bytes "128,0,0,0,0,0,0,0")
+        set(quad_bytes "63,255,128,0,0,0,0,0,0,0,0,0,0,0,0,0")
+        set(extended_bytes "0,0,0,0,0,0,63,255,192,0,0,0,0,0,0,0")
+    endif()
+    if(target STREQUAL mips-unknown-elf)
+        set(pointer_scalars "18,52,86,120,63,192,0,0")
+    elseif(target STREQUAL mipsel-unknown-elf)
+        set(pointer_scalars "120,86,52,18,0,0,192,63")
+    elseif(target STREQUAL mips64-unknown-elf)
+        set(pointer_scalars "0,0,0,0,18,52,86,120,63,248,0,0,0,0,0,0")
+    else()
+        set(pointer_scalars "120,86,52,18,0,0,0,0,0,0,0,0,0,0,248,63")
+    endif()
     if(NOT assembly MATCHES "original:\n[^\n]*[.]byte 65,0,128,255,33" OR
        NOT assembly MATCHES "copied:\n[^\n]*[.]byte 65,0,128,255,33" OR
        NOT assembly MATCHES "rotated:\n[^\n]*[.]byte 0,128,255,33,65" OR
        NOT assembly MATCHES "asset_size:\n[^\n]*${length_directive}" OR
-       NOT assembly MATCHES "static_size:\n[^\n]*${length_directive}")
-        message(FATAL_ERROR "${target} emitted incorrect byte data or target-sized length\n${assembly}")
+       NOT assembly MATCHES "static_size:\n[^\n]*${length_directive}" OR
+       NOT assembly MATCHES "words:\n[^\n]*[.]byte ${word_bytes}" OR
+       NOT assembly MATCHES "float_bytes:\n[^\n]*[.]byte ${float_bytes}" OR
+       NOT assembly MATCHES "double_bytes:\n[^\n]*[.]byte ${double_bytes}" OR
+       NOT assembly MATCHES "quad_bytes:\n[^\n]*[.]byte ${quad_bytes}" OR
+       NOT assembly MATCHES "extended_bytes:\n[^\n]*[.]byte ${extended_bytes}" OR
+       NOT assembly MATCHES "pointer_scalars:\n[^\n]*[.]byte ${pointer_scalars}" OR
+       NOT assembly MATCHES "source_word:\n[^\n]*[.]long ${source_word}" OR
+       NOT assembly MATCHES "endian_read_ok:\n[^\n]*[.]long 1" OR
+       NOT assembly MATCHES "endian_write_ok:\n[^\n]*[.]long 1" OR
+       NOT assembly MATCHES "extended_padding_ok:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "meta_pointer_distance:\n[^\n]*${distance_directive}" OR
+       NOT assembly MATCHES "meta_pointer_order_ok:\n[^\n]*${success_directive}")
+        message(FATAL_ERROR "${target} emitted incorrect embedded values or target-sized length\n${assembly}")
     endif()
 endforeach()
 

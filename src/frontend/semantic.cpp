@@ -2095,6 +2095,9 @@ bool bind_operators(Program& program, Diagnostics& diagnostics) {
 struct EvalBuffer {
     std::string data;
     std::vector<std::uint8_t> assigned;
+    // Zero means raw byte storage; nonzero records the scalar lvalue that
+    // established effective type for each byte of a typed write.
+    std::vector<std::uint8_t> effective_type;
     bool frozen{};
 };
 
@@ -3353,23 +3356,30 @@ private:
                 node.text == "<" || node.text == "<=" || node.text == ">" ||
                 node.text == ">=" || node.text == "&&" || node.text == "||";
             const auto result_type = expression_type(node);
-            const bool byte_pointer = result_type &&
+            const bool scalar_pointer = result_type &&
                 result_type->kind == Type::Kind::Pointer &&
                 result_type->pointee &&
-                result_type->pointee->kind == Type::Kind::Builtin &&
-                (result_type->pointee->builtin == BuiltinType::U8 ||
-                 result_type->pointee->builtin == BuiltinType::I8);
+                meta_scalar_type(result_type->pointee);
             const bool pointer_operation = pointer_resolver_ && result_type &&
                 result_type->kind == Type::Kind::Pointer &&
                 (node.kind == Expr::Kind::Conditional || node.text == "+" || node.text == "-");
-            const bool byte_pointer_operation = byte_pointer &&
+            const bool meta_pointer_operation = scalar_pointer &&
                 node.kind == Expr::Kind::Binary &&
                 (node.text == "+" || node.text == "-") &&
                 ((node.left && meta_pointer_source(*node.left)) ||
                  (node.right && meta_pointer_source(*node.right)));
+            const bool meta_pointer_pair = node.kind == Expr::Kind::Binary &&
+                left && right && left->kind == Type::Kind::Pointer &&
+                right->kind == Type::Kind::Pointer &&
+                ((node.left && meta_pointer_source(*node.left)) ||
+                 (node.right && meta_pointer_source(*node.right))) &&
+                (node.text == "-" || node.text == "==" || node.text == "!=" ||
+                 node.text == "<" || node.text == "<=" ||
+                 node.text == ">" || node.text == ">=");
             if (indexing ? (!left || left->kind != Type::Kind::Pointer ||
                             !right || !is_integer(right))
-                         : (!pointer_operation && !byte_pointer_operation &&
+                         : (!pointer_operation && !meta_pointer_operation &&
+                            !meta_pointer_pair &&
                             (!scalar || (floating_operands && !floating_operator)))) {
                 fail(node.location, "unsupported operation in required scalar expression");
                 return false;
@@ -3585,14 +3595,12 @@ private:
             if (!left || !right) return {};
             if (procedural_ && conditional && left->kind == Type::Kind::Tokens &&
                 right->kind == Type::Kind::Tokens) return tokens_type();
-            const auto byte_pointer = [](const TypePtr& type) {
+            const auto scalar_pointer = [](const TypePtr& type) {
                 return type->kind == Type::Kind::Pointer && type->pointee &&
-                    type->pointee->kind == Type::Kind::Builtin &&
-                    (type->pointee->builtin == BuiltinType::U8 ||
-                     type->pointee->builtin == BuiltinType::I8);
+                    meta_scalar_type(type->pointee);
             };
             if (pointer_resolver_ ||
-                ((byte_pointer(left) || byte_pointer(right)) &&
+                ((scalar_pointer(left) || scalar_pointer(right)) &&
                  ((expression.left && meta_pointer_source(*expression.left)) ||
                   (expression.right && meta_pointer_source(*expression.right))))) {
                 if (conditional && left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer &&
@@ -3603,6 +3611,9 @@ private:
                 if (!conditional && (expression.text == "+" || expression.text == "-")) {
                     if (left->kind == Type::Kind::Pointer && is_integer(right)) return left;
                     if (expression.text == "+" && is_integer(left) && right->kind == Type::Kind::Pointer) return right;
+                    if (expression.text == "-" && left->kind == Type::Kind::Pointer &&
+                        right->kind == Type::Kind::Pointer)
+                        return builtin_type(BuiltinType::Iptr);
                 }
             }
             if (is_floating(left) || is_floating(right)) {
@@ -3730,15 +3741,20 @@ private:
             return value;
         }
         if (value.meta_pointer) {
-            if (type->kind != Type::Kind::Pointer || !type->pointee ||
-                type->pointee->kind != Type::Kind::Builtin ||
-                (type->pointee->builtin != BuiltinType::U8 &&
-                 type->pointee->builtin != BuiltinType::I8) ||
+            if (type->kind != Type::Kind::Pointer) {
+                fail(location, "meta data pointers cannot convert to integer or other runtime values");
+                return std::nullopt;
+            }
+            if (!type->pointee ||
+                !meta_scalar_type(type->pointee) ||
+                type->pointee->is_volatile || type->pointee->is_atomic ||
                 !value.type || value.type->kind != Type::Kind::Pointer ||
                 !value.type->pointee ||
                 (value.type->pointee->is_const && !type->pointee->is_const) ||
-                type->address_space != value.type->address_space) {
-                fail(location, "meta data pointers cannot convert to integer or non-byte pointer types");
+                type->address_space != value.type->address_space ||
+                (!explicit_cast &&
+                 type->pointee->builtin != value.type->pointee->builtin)) {
+                fail(location, "meta data pointers require an explicit supported scalar pointer cast without qualifier loss");
                 return std::nullopt;
             }
             if (value.meta_pointer->mutable_buffer &&
@@ -3962,13 +3978,53 @@ private:
         return std::nullopt;
     }
 
-    bool byte_meta_pointer(const EvalValue& value, SourceLocation location) {
+    static bool byte_meta_type(BuiltinType type) {
+        return type == BuiltinType::U8 || type == BuiltinType::I8;
+    }
+
+    static bool meta_scalar_type(const TypePtr& type) {
+        if (is_integer(type)) return true;
+        return type && type->kind == Type::Kind::Builtin &&
+            (type->builtin == BuiltinType::F32 ||
+             type->builtin == BuiltinType::F64 ||
+             type->builtin == BuiltinType::F80 ||
+             type->builtin == BuiltinType::F128 ||
+             type->builtin == BuiltinType::Fptr);
+    }
+
+    static bool compatible_meta_type(BuiltinType stored, BuiltinType access) {
+        if (stored == access) return true;
+        switch (stored) {
+        case BuiltinType::I16: return access == BuiltinType::U16;
+        case BuiltinType::U16: return access == BuiltinType::I16;
+        case BuiltinType::I32: return access == BuiltinType::U32;
+        case BuiltinType::U32: return access == BuiltinType::I32;
+        case BuiltinType::I64: return access == BuiltinType::U64;
+        case BuiltinType::U64: return access == BuiltinType::I64;
+        case BuiltinType::I128: return access == BuiltinType::U128;
+        case BuiltinType::U128: return access == BuiltinType::I128;
+        case BuiltinType::Iptr: return access == BuiltinType::Uptr;
+        case BuiltinType::Uptr: return access == BuiltinType::Iptr;
+        default: return false;
+        }
+    }
+
+    std::size_t meta_scalar_size(const EvalValue& value) const {
+        const auto& pointee = value.type->pointee;
+        if (pointee->builtin == BuiltinType::F80)
+            return program_.evaluation_layout.f80_storage_bytes;
+        const auto bits = pointee->builtin == BuiltinType::Fptr ||
+                pointee->builtin == BuiltinType::Iptr ||
+                pointee->builtin == BuiltinType::Uptr
+            ? program_.address_bits : type_bits(pointee);
+        return (bits + 7U) / 8U;
+    }
+
+    bool scalar_meta_pointer(const EvalValue& value, SourceLocation location) {
         if (!value.meta_pointer || !value.type ||
             value.type->kind != Type::Kind::Pointer || !value.type->pointee ||
-            value.type->pointee->kind != Type::Kind::Builtin ||
-            (value.type->pointee->builtin != BuiltinType::U8 &&
-             value.type->pointee->builtin != BuiltinType::I8)) {
-            fail(location, "only byte-type meta pointer access is implemented");
+            !meta_scalar_type(value.type->pointee)) {
+            fail(location, "meta pointer access requires a supported scalar type");
             return false;
         }
         if (value.meta_pointer->mutable_buffer &&
@@ -3979,11 +4035,37 @@ private:
         return true;
     }
 
+    std::optional<std::size_t> meta_access_index(const EvalValue& base,
+                                                  SourceLocation location,
+                                                  bool write = false) {
+        if (!scalar_meta_pointer(base, location)) return std::nullopt;
+        const auto& pointer = *base.meta_pointer;
+        const auto size = meta_scalar_size(base);
+        if (pointer.position > pointer.view_length ||
+            size > pointer.view_length - pointer.position) {
+            fail(location, write ? "meta pointer write is outside its view"
+                                 : "meta pointer read is outside its view");
+            return std::nullopt;
+        }
+        const auto index = pointer.view_offset + pointer.position;
+        const auto alignment = base.type->pointee->builtin == BuiltinType::F80
+            ? std::max<std::size_t>(1,
+                program_.evaluation_layout.f80_alignment)
+            : std::max<std::size_t>(1,
+                std::min<std::size_t>(size,
+                    program_.evaluation_layout.natural_alignment_limit));
+        if (index % alignment != 0) {
+            fail(location, "misaligned meta pointer access for target scalar type");
+            return std::nullopt;
+        }
+        return index;
+    }
+
     std::optional<EvalValue> meta_pointer_offset(EvalValue base,
                                                  const EvalValue& index,
                                                  bool subtract,
                                                  SourceLocation location) {
-        if (!byte_meta_pointer(base, location)) return std::nullopt;
+        if (!scalar_meta_pointer(base, location)) return std::nullopt;
         if (!is_integer(index.type)) {
             fail(location, "meta pointer offset requires an integer");
             return std::nullopt;
@@ -3992,44 +4074,128 @@ private:
         const bool negative = integer_negative(index.integer, type);
         const auto magnitude = negative
             ? mask_to(negate(index.integer), type.bits) : index.integer;
-        if (magnitude.high != 0) {
+        if (magnitude.high != 0 ||
+            magnitude.low > std::numeric_limits<std::size_t>::max()) {
             fail(location, "meta pointer offset is outside its view");
             return std::nullopt;
         }
         const auto amount = static_cast<std::size_t>(magnitude.low);
         auto& pointer = *base.meta_pointer;
         const bool backwards = subtract != negative;
-        if (backwards ? amount > pointer.position
-                      : amount > pointer.view_length - pointer.position) {
+        const auto available = backwards ? pointer.position
+            : pointer.view_length - pointer.position;
+        const auto stride = meta_scalar_size(base);
+        if (amount > available / stride) {
             fail(location, "meta pointer offset is outside its view");
             return std::nullopt;
         }
-        pointer.position = backwards ? pointer.position - amount
-                                     : pointer.position + amount;
+        pointer.position = backwards ? pointer.position - amount * stride
+                                     : pointer.position + amount * stride;
         return base;
+    }
+
+    std::optional<EvalValue> compare_meta_pointers(const EvalValue& left,
+                                                   const EvalValue& right,
+                                                   std::string_view operation,
+                                                   SourceLocation location) {
+        if (!scalar_meta_pointer(left, location) ||
+            !scalar_meta_pointer(right, location)) return std::nullopt;
+        const auto& a = *left.meta_pointer;
+        const auto& b = *right.meta_pointer;
+        const bool same_backing = a.immutable
+            ? a.immutable == b.immutable
+            : a.mutable_buffer && a.mutable_buffer == b.mutable_buffer;
+        const auto a_position = a.view_offset + a.position;
+        const auto b_position = b.view_offset + b.position;
+        if (operation == "==" || operation == "!=") {
+            const bool equal = same_backing && a_position == b_position;
+            return EvalValue{UInt128{operation == "==" ? equal : !equal},
+                             builtin_type(BuiltinType::Bool)};
+        }
+        if (!same_backing || a.view_offset != b.view_offset ||
+            a.view_length != b.view_length ||
+            meta_scalar_size(left) != meta_scalar_size(right) ||
+            left.type->pointee->builtin != right.type->pointee->builtin ||
+            left.type->address_space != right.type->address_space) {
+            fail(location, "meta pointer ordering or subtraction requires one compatible view");
+            return std::nullopt;
+        }
+        if (operation == "-") {
+            const auto stride = meta_scalar_size(left);
+            const auto distance = a_position > b_position
+                ? a_position - b_position : b_position - a_position;
+            if (distance % stride != 0) {
+                fail(location, "meta pointer difference is not a whole target element");
+                return std::nullopt;
+            }
+            const auto magnitude = UInt128{distance / stride};
+            const auto result = a_position < b_position
+                ? mask_to(negate(magnitude), program_.address_bits) : magnitude;
+            return EvalValue{result, builtin_type(BuiltinType::Iptr)};
+        }
+        const bool result = operation == "<" ? a_position < b_position
+            : operation == "<=" ? a_position <= b_position
+            : operation == ">" ? a_position > b_position
+            : a_position >= b_position;
+        return EvalValue{UInt128{result}, builtin_type(BuiltinType::Bool)};
     }
 
     std::optional<EvalValue> read_meta_pointer(const EvalValue& base,
                                                 SourceLocation location) {
-        if (!byte_meta_pointer(base, location)) return std::nullopt;
+        const auto index = meta_access_index(base, location);
+        if (!index) return std::nullopt;
         const auto& pointer = *base.meta_pointer;
-        if (pointer.position >= pointer.view_length) {
-            fail(location, "meta pointer read is outside its view");
+        const auto size = meta_scalar_size(base);
+        const auto access_type = base.type->pointee->builtin;
+        UInt128 result;
+        if (pointer.mutable_buffer) {
+            for (std::size_t offset = 0; offset < size; ++offset) {
+                const bool f80_padding = access_type == BuiltinType::F80 &&
+                    (program_.evaluation_layout.byte_order == EvaluationByteOrder::Little
+                         ? offset >= size - 10 : offset < size - 10);
+                if (!f80_padding &&
+                    !pointer.mutable_buffer->assigned[*index + offset]) {
+                    fail(location, "read of unassigned buffer byte");
+                    return std::nullopt;
+                }
+                const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
+                if (!byte_meta_type(access_type) && tag != 0 &&
+                    !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
+                                          access_type)) {
+                    fail(location, "meta pointer read violates effective type");
+                    return std::nullopt;
+                }
+            }
+        }
+        for (std::size_t offset = 0; offset < size; ++offset) {
+            const auto raw = pointer.mutable_buffer
+                ? pointer.mutable_buffer->data[*index + offset]
+                : (*pointer.immutable)[*index + offset];
+            const auto lane = program_.evaluation_layout.byte_order ==
+                EvaluationByteOrder::Little ? offset : size - 1 - offset;
+            result = bit_or(result, shift_left(
+                UInt128{static_cast<unsigned char>(raw)},
+                static_cast<unsigned>(lane * 8)));
+        }
+        if (access_type == BuiltinType::Bool && result != UInt128{} &&
+            result != UInt128{1}) {
+            fail(location, "invalid bool representation in meta storage");
             return std::nullopt;
         }
-        const auto index = pointer.view_offset + pointer.position;
-        if (pointer.mutable_buffer) {
-            if (!pointer.mutable_buffer->assigned[index]) {
-                fail(location, "read of unassigned buffer byte");
+        if (access_type == BuiltinType::F80) {
+            result = mask_to(result, 80);
+            const auto exponent = (result.high >> 0) & 0x7fffU;
+            if (bit(result, 63) != (exponent != 0)) {
+                fail(location, "invalid f80 representation in meta storage");
                 return std::nullopt;
             }
-            return EvalValue{UInt128{static_cast<unsigned char>(
-                pointer.mutable_buffer->data[index])},
-                builtin_type(base.type->pointee->builtin)};
         }
-        return EvalValue{UInt128{static_cast<unsigned char>(
-            (*pointer.immutable)[index])},
-            builtin_type(base.type->pointee->builtin)};
+        if (is_floating(base.type->pointee))
+            return EvalValue{floating::Value{
+                result,
+                floating_format(access_type, program_.address_bits)},
+                builtin_type(access_type)};
+        return EvalValue{result, builtin_type(access_type)};
     }
 
     std::optional<EvalValue> unary(const Expr& expression) {
@@ -4147,6 +4313,13 @@ private:
         }
         auto right = this->expression(*expression.right);
         if (!right) return std::nullopt;
+        if (left->meta_pointer && right->meta_pointer &&
+            (expression.text == "-" || expression.text == "==" ||
+             expression.text == "!=" || expression.text == "<" ||
+             expression.text == "<=" || expression.text == ">" ||
+             expression.text == ">="))
+            return compare_meta_pointers(*left, *right, expression.text,
+                                         expression.location);
         if (right->tokens || right->bytes || right->buffer) {
             fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
@@ -4239,27 +4412,48 @@ private:
                 return std::nullopt;
             }
             if (expression.text != "=" ||
-                !byte_meta_pointer(*pointer, designator->location) ||
+                !scalar_meta_pointer(*pointer, designator->location) ||
                 pointer->type->pointee->is_const ||
                 !pointer->meta_pointer->mutable_buffer) {
                 fail(designator->location,
-                    "meta pointer write requires mutable byte storage and simple assignment");
+                    "meta pointer write requires mutable scalar storage and simple assignment");
                 return std::nullopt;
             }
             const auto& target = *pointer->meta_pointer;
-            if (target.position >= target.view_length) {
-                fail(designator->location, "meta pointer write is outside its view");
-                return std::nullopt;
+            const auto offset = meta_access_index(*pointer, designator->location, true);
+            if (!offset) return std::nullopt;
+            const auto size = meta_scalar_size(*pointer);
+            const auto access_type = pointer->type->pointee->builtin;
+            if (!byte_meta_type(access_type)) {
+                for (std::size_t index = 0; index < size; ++index) {
+                    const auto tag = target.mutable_buffer->effective_type[*offset + index];
+                    if (tag != 0 &&
+                        !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
+                                              access_type)) {
+                        fail(designator->location,
+                            "meta pointer write violates effective type");
+                        return std::nullopt;
+                    }
+                }
             }
             auto source = this->expression(*expression.right);
             if (!source) return std::nullopt;
             source = convert(*source, builtin_type(pointer->type->pointee->builtin),
                              expression.right->location);
             if (!source) return std::nullopt;
-            const auto offset = target.view_offset + target.position;
-            target.mutable_buffer->data[offset] =
-                static_cast<char>(source->integer.low);
-            target.mutable_buffer->assigned[offset] = 1;
+            const auto bits = source->floating ? source->floating->bits
+                                               : source->integer;
+            for (std::size_t index = 0; index < size; ++index) {
+                const auto lane = program_.evaluation_layout.byte_order ==
+                    EvaluationByteOrder::Little ? index : size - 1 - index;
+                target.mutable_buffer->data[*offset + index] = static_cast<char>(
+                    shift_right(bits,
+                        static_cast<unsigned>(lane * 8)).low & 0xffU);
+                target.mutable_buffer->assigned[*offset + index] = 1;
+                if (!byte_meta_type(access_type))
+                    target.mutable_buffer->effective_type[*offset + index] =
+                        static_cast<std::uint8_t>(access_type) + 1;
+            }
             return source;
         }
         if (!designator || designator->kind != Expr::Kind::Name)
@@ -4507,11 +4701,12 @@ private:
                     return std::nullopt;
                 }
                 if (!charge_meta_bytes(
-                        static_cast<std::size_t>(capacity->integer.low) * 2,
+                        static_cast<std::size_t>(capacity->integer.low) * 3,
                         expression.location)) return std::nullopt;
                 auto storage = std::make_shared<EvalBuffer>();
                 storage->data.resize(static_cast<std::size_t>(capacity->integer.low));
                 storage->assigned.resize(storage->data.size());
+                storage->effective_type.resize(storage->data.size());
                 EvalValue result{UInt128{}, buffer_type()};
                 result.buffer = std::move(storage);
                 return result;
@@ -6595,10 +6790,11 @@ std::optional<TokenSequence> evaluate_procedural_body(
     const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
-    EvaluationLimits limits) {
+    EvaluationLimits limits, EvaluationLayout layout) {
     Program context;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
+    context.evaluation_layout = layout;
     const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &macro, macro.source_namespace,
                         &size_of, &align_of, nullptr, std::move(macro_context));
