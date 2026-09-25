@@ -143,7 +143,9 @@ endforeach()
 foreach(case unassigned_read frozen_pointer const_write view_overread integer_cast
         non_byte_cast misaligned wide_overread effective_type
         float_effective_type invalid_bool invalid_f80 unassigned_wide
-        different_pointer_views)
+        different_pointer_views array_row_overread array_row_write_overflow
+        array_row_misaligned array_row_unassigned array_row_effective_type
+        array_row_views array_const_loss array_frozen)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -232,6 +234,63 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const u32 *word = (const u32 *)bytes;\n"
             "return word[0u32];")
         set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL array_row_overread)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(8u32);\n"
+            "word_row rows = (word_row)$::meta::data(value);\n"
+            "rows[0u32][0u32] = 7u16;\n"
+            "return rows[0u32][2u32];")
+        set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL array_row_write_overflow)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(8u32);\n"
+            "word_row rows = (word_row)$::meta::data(value);\n"
+            "rows[0u32][2u32] = 7u16;\n"
+            "return 0u32;")
+        set(expected "meta pointer write is outside its view")
+    elseif(case STREQUAL array_row_misaligned)
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const_word_row rows = (const_word_row)$::meta::data($::meta::slice(value, 1u32, 4u32));\n"
+            "return rows[0u32][0u32];")
+        set(expected "misaligned meta pointer access")
+    elseif(case STREQUAL array_row_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "word_row rows = (word_row)$::meta::data(value);\n"
+            "return rows[0u32][1u32];")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL array_row_effective_type)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "word_row rows = (word_row)$::meta::data(value);\n"
+            "rows[0u32][0u32] = 7u16;\n"
+            "rows[0u32][1u32] = 8u16;\n"
+            "return ((u32 *)rows)[0u32];")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL array_row_views)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(8u32);\n"
+            "word_row rows = (word_row)$::meta::data(value);\n"
+            "u16 *first = rows[0u32];\n"
+            "u16 *second = rows[1u32];\n"
+            "return first < second;")
+        set(expected "ordering or subtraction requires one compatible view")
+    elseif(case STREQUAL array_const_loss)
+        string(CONCAT body
+            "const_word_row rows = (const_word_row)$::meta::data($::embed(\"payload.bin\"));\n"
+            "word_row writable = (word_row)rows;\n"
+            "return 0u32;")
+        set(expected "conversion without qualifier loss")
+    elseif(case STREQUAL array_frozen)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "word_row rows = (word_row)$::meta::data(value);\n"
+            "rows[0u32][0u32] = 1u16;\n"
+            "rows[0u32][1u32] = 2u16;\n"
+            "$::meta::bytes frozen = $::meta::freeze(value, 4u32);\n"
+            "return rows[0u32][0u32];")
+        set(expected "buffer data pointer was used after freeze")
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -243,10 +302,12 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
             "return 0u32;")
-        set(expected "compatible scalar or void pointer conversion")
+        set(expected "compatible scalar, fixed-array, or void pointer conversion")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"
+        "typedef u16 (*word_row)[2];\n"
+        "typedef const u16 (*const_word_row)[2];\n"
         "[[eval_only]] static uptr bad() { ${body} }\n"
         "global uptr result = bad();\n")
     execute_process(COMMAND "${CC}" -S "${input}"
@@ -292,6 +353,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
     file(READ "${OUTPUT}-${target}.s" assembly)
     if(target STREQUAL mipsel-unknown-elf OR target STREQUAL mips64el-unknown-elf)
         set(word_bytes "120,86,52,18,240,222,188,154")
+        set(row_bytes "34,17,68,51,102,85,136,119")
         set(source_word "4286578753")
         set(float_bytes "0,0,192,63")
         set(double_bytes "0,0,0,0,0,0,0,128")
@@ -299,6 +361,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
         set(extended_bytes "0,0,0,0,0,0,0,192,255,63,0,0,0,0,0,0")
     else()
         set(word_bytes "18,52,86,120,154,188,222,240")
+        set(row_bytes "17,34,51,68,85,102,119,136")
         set(source_word "1090552063")
         set(float_bytes "63,192,0,0")
         set(double_bytes "128,0,0,0,0,0,0,0")
@@ -320,6 +383,9 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "asset_size:\n[^\n]*${length_directive}" OR
        NOT assembly MATCHES "static_size:\n[^\n]*${length_directive}" OR
        NOT assembly MATCHES "words:\n[^\n]*[.]byte ${word_bytes}" OR
+       NOT assembly MATCHES "rows:\n[^\n]*[.]byte ${row_bytes}" OR
+       NOT assembly MATCHES "array_view_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "target_sized_array_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "float_bytes:\n[^\n]*[.]byte ${float_bytes}" OR
        NOT assembly MATCHES "double_bytes:\n[^\n]*[.]byte ${double_bytes}" OR
        NOT assembly MATCHES "quad_bytes:\n[^\n]*[.]byte ${quad_bytes}" OR

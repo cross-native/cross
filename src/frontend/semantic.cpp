@@ -3481,14 +3481,14 @@ private:
                 node.text == "<" || node.text == "<=" || node.text == ">" ||
                 node.text == ">=" || node.text == "&&" || node.text == "||";
             const auto result_type = expression_type(node);
-            const bool scalar_pointer = result_type &&
+            const bool object_pointer = result_type &&
                 result_type->kind == Type::Kind::Pointer &&
                 result_type->pointee &&
-                meta_scalar_type(result_type->pointee);
+                meta_object_type(result_type->pointee);
             const bool pointer_operation = pointer_resolver_ && result_type &&
                 result_type->kind == Type::Kind::Pointer &&
                 (node.kind == Expr::Kind::Conditional || node.text == "+" || node.text == "-");
-            const bool meta_pointer_operation = scalar_pointer &&
+            const bool meta_pointer_operation = object_pointer &&
                 node.kind == Expr::Kind::Binary &&
                 (node.text == "+" || node.text == "-") &&
                 ((node.left && meta_pointer_source(*node.left)) ||
@@ -3501,7 +3501,8 @@ private:
                 (node.text == "-" || node.text == "==" || node.text == "!=" ||
                  node.text == "<" || node.text == "<=" ||
                  node.text == ">" || node.text == ">=");
-            if (indexing ? (!left || left->kind != Type::Kind::Pointer ||
+            if (indexing ? (!left || (left->kind != Type::Kind::Pointer &&
+                                     left->kind != Type::Kind::Array) ||
                             !right || !is_integer(right))
                          : (!pointer_operation && !meta_pointer_operation &&
                             !meta_pointer_pair &&
@@ -3720,12 +3721,12 @@ private:
             if (!left || !right) return {};
             if (procedural_ && conditional && left->kind == Type::Kind::Tokens &&
                 right->kind == Type::Kind::Tokens) return tokens_type();
-            const auto scalar_pointer = [](const TypePtr& type) {
+            const auto object_pointer = [](const TypePtr& type) {
                 return type->kind == Type::Kind::Pointer && type->pointee &&
-                    meta_scalar_type(type->pointee);
+                    meta_object_type(type->pointee);
             };
             if (pointer_resolver_ ||
-                ((scalar_pointer(left) || scalar_pointer(right)) &&
+                ((object_pointer(left) || object_pointer(right)) &&
                  ((expression.left && meta_pointer_source(*expression.left)) ||
                   (expression.right && meta_pointer_source(*expression.right))))) {
                 if (conditional && left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer &&
@@ -3891,18 +3892,17 @@ private:
                     pointee->builtin == BuiltinType::Void;
             };
             if (!type->pointee ||
-                (!meta_scalar_type(type->pointee) &&
+                (!meta_object_type(type->pointee) &&
                  !void_pointee(type->pointee)) ||
-                type->pointee->is_volatile || type->pointee->is_atomic ||
+                meta_volatile_or_atomic(type->pointee) ||
                 !value.type || value.type->kind != Type::Kind::Pointer ||
                 !value.type->pointee ||
-                (value.type->pointee->is_const && !type->pointee->is_const) ||
+                (meta_leaf_const(value.type->pointee) &&
+                 !meta_leaf_const(type->pointee)) ||
                 type->address_space != value.type->address_space ||
-                (!explicit_cast &&
-                 type->pointee->builtin != value.type->pointee->builtin &&
-                 !void_pointee(type->pointee) &&
-                 !void_pointee(value.type->pointee))) {
-                fail(location, "meta data pointers require a compatible scalar or void pointer conversion without qualifier loss");
+                 (!explicit_cast &&
+                 !compatible_pointee(value.type->pointee, type->pointee))) {
+                fail(location, "meta data pointers require a compatible scalar, fixed-array, or void pointer conversion without qualifier loss");
                 return std::nullopt;
             }
             if (value.meta_pointer->mutable_buffer &&
@@ -4144,6 +4144,24 @@ private:
              type->builtin == BuiltinType::Fptr);
     }
 
+    static bool meta_object_type(const TypePtr& type) {
+        if (meta_scalar_type(type)) return true;
+        return type && type->kind == Type::Kind::Array && type->lanes != 0 &&
+            meta_object_type(type->element);
+    }
+
+    static bool meta_leaf_const(const TypePtr& type) {
+        return type && (type->is_const ||
+            (type->kind == Type::Kind::Array &&
+             meta_leaf_const(type->element)));
+    }
+
+    static bool meta_volatile_or_atomic(const TypePtr& type) {
+        return type && (type->is_volatile || type->is_atomic ||
+            (type->kind == Type::Kind::Array &&
+             meta_volatile_or_atomic(type->element)));
+    }
+
     static bool compatible_meta_type(BuiltinType stored, BuiltinType access) {
         if (stored == access) return true;
         switch (stored) {
@@ -4172,6 +4190,30 @@ private:
         return (bits + 7U) / 8U;
     }
 
+    std::optional<std::size_t> meta_object_size(const TypePtr& type) const {
+        if (!meta_object_type(type)) return std::nullopt;
+        if (type->kind != Type::Kind::Array) {
+            EvalValue value;
+            value.type = pointer_type(type);
+            return meta_scalar_size(value);
+        }
+        const auto element = meta_object_size(type->element);
+        if (!element || *element == 0 ||
+            type->lanes > std::numeric_limits<std::size_t>::max() / *element)
+            return std::nullopt;
+        return *element * type->lanes;
+    }
+
+    std::size_t meta_scalar_alignment(const TypePtr& type) const {
+        if (type->kind == Type::Kind::Array)
+            return meta_scalar_alignment(type->element);
+        const auto size = *meta_object_size(type);
+        return type->builtin == BuiltinType::F80
+            ? std::max<std::size_t>(1, program_.evaluation_layout.f80_alignment)
+            : std::max<std::size_t>(1, std::min<std::size_t>(size,
+                program_.evaluation_layout.natural_alignment_limit));
+    }
+
     bool live_meta_pointer(const EvalValue& value, SourceLocation location) {
         if (!value.meta_pointer || !value.type ||
             value.type->kind != Type::Kind::Pointer || !value.type->pointee) {
@@ -4195,6 +4237,16 @@ private:
         return true;
     }
 
+    bool sized_meta_pointer(const EvalValue& value, SourceLocation location) {
+        if (!live_meta_pointer(value, location)) return false;
+        if (!meta_object_type(value.type->pointee) ||
+            !meta_object_size(value.type->pointee)) {
+            fail(location, "meta pointer arithmetic requires a supported complete scalar or fixed-array type");
+            return false;
+        }
+        return true;
+    }
+
     std::optional<std::size_t> meta_access_index(const EvalValue& base,
                                                   SourceLocation location,
                                                   bool write = false) {
@@ -4208,12 +4260,7 @@ private:
             return std::nullopt;
         }
         const auto index = pointer.view_offset + pointer.position;
-        const auto alignment = base.type->pointee->builtin == BuiltinType::F80
-            ? std::max<std::size_t>(1,
-                program_.evaluation_layout.f80_alignment)
-            : std::max<std::size_t>(1,
-                std::min<std::size_t>(size,
-                    program_.evaluation_layout.natural_alignment_limit));
+        const auto alignment = meta_scalar_alignment(base.type->pointee);
         if (index % alignment != 0) {
             fail(location, "misaligned meta pointer access for target scalar type");
             return std::nullopt;
@@ -4221,11 +4268,40 @@ private:
         return index;
     }
 
+    std::optional<EvalValue> decay_meta_array(EvalValue base,
+                                              SourceLocation location) {
+        if (!sized_meta_pointer(base, location) ||
+            base.type->pointee->kind != Type::Kind::Array) return std::nullopt;
+        auto& pointer = *base.meta_pointer;
+        const auto size = *meta_object_size(base.type->pointee);
+        if (pointer.position > pointer.view_length ||
+            size > pointer.view_length - pointer.position) {
+            fail(location, "meta pointer read is outside its view");
+            return std::nullopt;
+        }
+        const auto offset = pointer.view_offset + pointer.position;
+        const auto alignment = meta_scalar_alignment(base.type->pointee);
+        if (offset % alignment != 0) {
+            fail(location, "misaligned meta pointer access for target scalar type");
+            return std::nullopt;
+        }
+        pointer.view_offset = offset;
+        pointer.view_length = size;
+        pointer.position = 0;
+        auto element = clone_type(base.type->pointee->element);
+        element->is_const = element->is_const || base.type->pointee->is_const;
+        element->is_volatile = element->is_volatile || base.type->pointee->is_volatile;
+        auto type = pointer_type(element);
+        type->address_space = base.type->address_space;
+        base.type = std::move(type);
+        return base;
+    }
+
     std::optional<EvalValue> meta_pointer_offset(EvalValue base,
                                                  const EvalValue& index,
                                                  bool subtract,
                                                  SourceLocation location) {
-        if (!scalar_meta_pointer(base, location)) return std::nullopt;
+        if (!sized_meta_pointer(base, location)) return std::nullopt;
         if (!is_integer(index.type)) {
             fail(location, "meta pointer offset requires an integer");
             return std::nullopt;
@@ -4244,7 +4320,7 @@ private:
         const bool backwards = subtract != negative;
         const auto available = backwards ? pointer.position
             : pointer.view_length - pointer.position;
-        const auto stride = meta_scalar_size(base);
+        const auto stride = *meta_object_size(base.type->pointee);
         if (amount > available / stride) {
             fail(location, "meta pointer offset is outside its view");
             return std::nullopt;
@@ -4272,18 +4348,20 @@ private:
             return EvalValue{UInt128{operation == "==" ? equal : !equal},
                              builtin_type(BuiltinType::Bool)};
         }
-        if (!scalar_meta_pointer(left, location) ||
-            !scalar_meta_pointer(right, location)) return std::nullopt;
+        if (!sized_meta_pointer(left, location) ||
+            !sized_meta_pointer(right, location)) return std::nullopt;
         if (!same_backing || a.view_offset != b.view_offset ||
             a.view_length != b.view_length ||
-            meta_scalar_size(left) != meta_scalar_size(right) ||
-            left.type->pointee->builtin != right.type->pointee->builtin ||
+            meta_object_size(left.type->pointee) !=
+                meta_object_size(right.type->pointee) ||
+            (!compatible_pointee(left.type->pointee, right.type->pointee) &&
+             !compatible_pointee(right.type->pointee, left.type->pointee)) ||
             left.type->address_space != right.type->address_space) {
             fail(location, "meta pointer ordering or subtraction requires one compatible view");
             return std::nullopt;
         }
         if (operation == "-") {
-            const auto stride = meta_scalar_size(left);
+            const auto stride = *meta_object_size(left.type->pointee);
             const auto distance = a_position > b_position
                 ? a_position - b_position : b_position - a_position;
             if (distance % stride != 0) {
@@ -4304,6 +4382,10 @@ private:
 
     std::optional<EvalValue> read_meta_pointer(const EvalValue& base,
                                                 SourceLocation location) {
+        if (base.type && base.type->kind == Type::Kind::Pointer &&
+            base.type->pointee &&
+            base.type->pointee->kind == Type::Kind::Array)
+            return decay_meta_array(base, location);
         const auto index = meta_access_index(base, location);
         if (!index) return std::nullopt;
         const auto& pointer = *base.meta_pointer;

@@ -116,6 +116,48 @@ static $::meta::bytes packed_words() {
     return $::meta::freeze(output, 8u32);
 }
 
+typedef u16 (*word_row)[2];
+typedef u16 (*word_grid)[2][2];
+typedef uptr (*pointer_row)[2];
+
+static $::meta::bytes packed_rows() {
+    $::meta::buffer output = $::meta::alloc(8u32);
+    word_row rows = (word_row)$::meta::data(output);
+    rows[0u32][0u32] = 0x1122u16;
+    rows[0u32][1u32] = 0x3344u16;
+    rows[1u32][0u32] = 0x5566u16;
+    rows[1u32][1u32] = 0x7788u16;
+    return $::meta::freeze(output, 8u32);
+}
+
+[[eval_only]] static uptr array_view_ok() {
+    $::meta::buffer output = $::meta::alloc(8u32);
+    word_row rows = (word_row)$::meta::data(output);
+    rows[0u32][0u32] = 0x1122u16;
+    rows[0u32][1u32] = 0x3344u16;
+    rows[1u32][0u32] = 0x5566u16;
+    rows[1u32][1u32] = 0x7788u16;
+    word_grid grid = (word_grid)$::meta::data(output);
+    u16 *start = rows[1u32];
+    u16 *end = start + 2u32;
+    u16 *first_end = rows[0u32] + 2u32;
+    return rows[0u32][1u32] == 0x3344u16 &&
+           rows[1u32][0u32] == 0x5566u16 &&
+           grid[0u32][1u32][1u32] == 0x7788u16 &&
+           rows + 2u32 - rows == 2iptr &&
+           end - start == 2iptr && start < end &&
+           first_end == start;
+}
+
+[[eval_only]] static uptr target_sized_array_ok() {
+    $::meta::buffer output = $::meta::alloc(2u32 * $::target::pointer_bytes);
+    pointer_row row = (pointer_row)$::meta::data(output);
+    row[0u32][0u32] = 3uptr;
+    row[0u32][1u32] = 5uptr;
+    return row[0u32][1u32] == 5uptr &&
+           row + 1u32 - row == 1iptr;
+}
+
 static $::meta::bytes signed_output() {
     $::meta::buffer output = $::meta::alloc(1u32);
     i8 *pointer = (i8 *)$::meta::data(output);
@@ -157,6 +199,9 @@ global u8 encoded[] = inverted($::embed("payload.bin"));
 global u8 encoded_slice[3] = inverted($::meta::slice($::embed("payload.bin"), 1u32, 3u32));
 global const u8 signed_encoded[] = signed_output();
 global const u8 words[] = packed_words();
+global const u8 rows[] = packed_rows();
+global uptr array_view_checked = array_view_ok();
+global uptr target_sized_array_checked = target_sized_array_ok();
 global const u8 float_bytes[] = packed_float();
 global const u8 double_bytes[] = packed_double();
 global const u8 quad_bytes[] = packed_quad();
