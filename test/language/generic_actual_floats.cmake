@@ -7,6 +7,18 @@ foreach(required CC SOURCE MODEL OUTPUT)
     endif()
 endforeach()
 
+set(abi_conflict "${OUTPUT}-abi-conflict.x")
+file(WRITE "${abi_conflict}"
+    "static T invoke_stack<T>(in T (*callback)(in T value) [[abi(\"stack_result_abi\")]], in T value) { return callback(value); }\n"
+    "[[abi(\"odd_abi\")]] static i32 odd(in i32 value) { return value; }\n"
+    "global i32 bad() { return invoke_stack(odd, 1i32); }\n")
+execute_process(COMMAND "${CC}" "--model=${MODEL}" -S "${abi_conflict}"
+    -o "${OUTPUT}-abi-conflict.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "generic type deduction requires an exact structural match")
+    message(FATAL_ERROR "different callback result transports were accepted\n${out}\n${err}")
+endif()
+
 foreach(target default mips-unknown-elf mipsel-unknown-elf
         mips64-unknown-elf mips64el-unknown-elf custom)
     set(flags -S -O0 -fno-eval-calls)
