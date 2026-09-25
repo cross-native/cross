@@ -2568,7 +2568,11 @@ public:
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller),
           current_namespace_(std::move(current_namespace)),
-          size_of_(size_of), align_of_(align_of), pointer_resolver_(pointer_resolver),
+          size_of_(size_of ? size_of :
+              (program.evaluation_size_of ? &program.evaluation_size_of : nullptr)),
+          align_of_(align_of ? align_of :
+              (program.evaluation_align_of ? &program.evaluation_align_of : nullptr)),
+          pointer_resolver_(pointer_resolver),
           procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)) {}
 
     bool charge_input_tokens(const TokenSequence& tokens, SourceLocation location) {
@@ -2875,12 +2879,13 @@ public:
                 return std::nullopt;
             }
             if (!query && meta_object_type(type)) {
-                const auto value = expression.kind == Expr::Kind::Sizeof
-                    ? meta_object_size(type)
-                    : std::optional<std::size_t>{meta_scalar_alignment(type)};
-                if (value)
-                    return EvalValue{UInt128{*value},
-                                     builtin_type(BuiltinType::Uptr)};
+                if (const auto size = meta_object_size(type)) {
+                    const auto value = expression.kind == Expr::Kind::Sizeof
+                        ? size : meta_object_alignment(type);
+                    if (value)
+                        return EvalValue{UInt128{*value},
+                                         builtin_type(BuiltinType::Uptr)};
+                }
             }
             if (!query) {
                 fail(expression.location,
@@ -3915,7 +3920,7 @@ private:
                 type->address_space != value.type->address_space ||
                  (!explicit_cast &&
                  !compatible_pointee(value.type->pointee, type->pointee))) {
-                fail(location, "meta data pointers require a compatible scalar, fixed-array, or void pointer conversion without qualifier loss");
+                fail(location, "meta data pointers require a compatible scalar, fixed-array, record, or void pointer conversion without qualifier loss");
                 return std::nullopt;
             }
             if (value.meta_pointer->mutable_buffer &&
@@ -4159,6 +4164,8 @@ private:
 
     static bool meta_object_type(const TypePtr& type) {
         if (meta_scalar_type(type)) return true;
+        if (type && type->kind == Type::Kind::Record && !type->is_union)
+            return true;
         return type && type->kind == Type::Kind::Array && type->lanes != 0 &&
             meta_object_type(type->element);
     }
@@ -4205,6 +4212,14 @@ private:
 
     std::optional<std::size_t> meta_object_size(const TypePtr& type) const {
         if (!meta_object_type(type)) return std::nullopt;
+        if (type->kind == Type::Kind::Record) {
+            if (!size_of_) return std::nullopt;
+            const auto size = (*size_of_)(type);
+            if (!size || *size == 0 ||
+                *size > std::numeric_limits<std::size_t>::max())
+                return std::nullopt;
+            return static_cast<std::size_t>(*size);
+        }
         if (type->kind != Type::Kind::Array) {
             EvalValue value;
             value.type = pointer_type(type);
@@ -4217,9 +4232,17 @@ private:
         return *element * type->lanes;
     }
 
-    std::size_t meta_scalar_alignment(const TypePtr& type) const {
+    std::optional<std::size_t> meta_object_alignment(const TypePtr& type) const {
         if (type->kind == Type::Kind::Array)
-            return meta_scalar_alignment(type->element);
+            return meta_object_alignment(type->element);
+        if (type->kind == Type::Kind::Record) {
+            if (!align_of_) return std::nullopt;
+            const auto alignment = (*align_of_)(type);
+            if (!alignment || *alignment == 0 ||
+                *alignment > std::numeric_limits<std::size_t>::max())
+                return std::nullopt;
+            return static_cast<std::size_t>(*alignment);
+        }
         const auto size = *meta_object_size(type);
         return type->builtin == BuiltinType::F80
             ? std::max<std::size_t>(1, program_.evaluation_layout.f80_alignment)
@@ -4273,8 +4296,8 @@ private:
             return std::nullopt;
         }
         const auto index = pointer.view_offset + pointer.position;
-        const auto alignment = meta_scalar_alignment(base.type->pointee);
-        if (index % alignment != 0) {
+        const auto alignment = meta_object_alignment(base.type->pointee);
+        if (!alignment || index % *alignment != 0) {
             fail(location, "misaligned meta pointer access for target scalar type");
             return std::nullopt;
         }
@@ -4293,8 +4316,8 @@ private:
             return std::nullopt;
         }
         const auto offset = pointer.view_offset + pointer.position;
-        const auto alignment = meta_scalar_alignment(base.type->pointee);
-        if (offset % alignment != 0) {
+        const auto alignment = meta_object_alignment(base.type->pointee);
+        if (!alignment || offset % *alignment != 0) {
             fail(location, "misaligned meta pointer access for target scalar type");
             return std::nullopt;
         }
@@ -4307,6 +4330,76 @@ private:
         auto type = pointer_type(element);
         type->address_space = base.type->address_space;
         base.type = std::move(type);
+        return base;
+    }
+
+    std::optional<EvalValue> meta_member_pointer(
+        const Expr& expression) {
+        if (!expression.left || !expression.right ||
+            expression.right->kind != Expr::Kind::Name)
+            return std::nullopt;
+        auto base = this->expression(*expression.left);
+        if (!base || !base->meta_pointer || !sized_meta_pointer(*base, expression.location) ||
+            base->type->pointee->kind != Type::Kind::Record ||
+            base->type->pointee->is_union) {
+            fail(expression.location,
+                 "meta record member access requires a supported structure pointer");
+            return std::nullopt;
+        }
+        const auto* member = selected_record_member(expression);
+        const auto layout = program_.evaluation_member_layout
+            ? program_.evaluation_member_layout(base->type->pointee,
+                                                 expression.right->text)
+            : std::nullopt;
+        if (!member || !layout || layout->bit_field ||
+            !meta_object_type(member->type) ||
+            meta_volatile_or_atomic(member->type)) {
+            fail(expression.location,
+                 "meta record member requires a non-bit-field supported object type");
+            return std::nullopt;
+        }
+        const auto member_size = meta_object_size(member->type);
+        const auto record_size = meta_object_size(base->type->pointee);
+        if (!member_size || !record_size ||
+            layout->offset > *record_size ||
+            *member_size > *record_size - layout->offset) {
+            fail(expression.location, "meta record member is outside its target layout");
+            return std::nullopt;
+        }
+        const auto member_alignment = meta_object_alignment(member->type);
+        const auto record_alignment =
+            meta_object_alignment(base->type->pointee);
+        if (!member_alignment || !record_alignment) {
+            fail(expression.location, "meta record alignment is unavailable");
+            return std::nullopt;
+        }
+        if (layout->alignment < *member_alignment) {
+            fail(expression.location,
+                 "packed meta record member access is not implemented");
+            return std::nullopt;
+        }
+        auto& pointer = *base->meta_pointer;
+        if (pointer.position > pointer.view_length ||
+            *record_size > pointer.view_length - pointer.position) {
+            fail(expression.location, "meta pointer read is outside its view");
+            return std::nullopt;
+        }
+        const auto record_offset = pointer.view_offset + pointer.position;
+        if (record_offset % *record_alignment != 0) {
+            fail(expression.location, "misaligned meta pointer access for target record type");
+            return std::nullopt;
+        }
+        pointer.view_offset = record_offset +
+            static_cast<std::size_t>(layout->offset);
+        pointer.view_length = *member_size;
+        pointer.position = 0;
+        auto type = clone_type(member->type);
+        type->is_const = type->is_const || base->type->pointee->is_const;
+        type->is_volatile = type->is_volatile ||
+            base->type->pointee->is_volatile;
+        auto pointer_type_value = pointer_type(type);
+        pointer_type_value->address_space = base->type->address_space;
+        base->type = std::move(pointer_type_value);
         return base;
     }
 
@@ -4547,6 +4640,11 @@ private:
     }
 
     std::optional<EvalValue> binary(const Expr& expression) {
+        if (expression.text == "pointer_member") {
+            auto pointer = meta_member_pointer(expression);
+            return pointer ? read_meta_pointer(*pointer, expression.location)
+                           : std::nullopt;
+        }
         auto left = this->expression(*expression.left);
         if (!left) return std::nullopt;
         if (left->tokens || left->bytes || left->buffer) {
@@ -4651,9 +4749,13 @@ private:
             designator = designator->left.get();
         if (designator &&
             ((designator->kind == Expr::Kind::Binary && designator->text == "index") ||
+             (designator->kind == Expr::Kind::Binary && designator->text == "pointer_member") ||
              (designator->kind == Expr::Kind::Unary && designator->text == "*"))) {
             std::optional<EvalValue> pointer;
-            if (designator->kind == Expr::Kind::Binary) {
+            if (designator->kind == Expr::Kind::Binary &&
+                designator->text == "pointer_member") {
+                pointer = meta_member_pointer(*designator);
+            } else if (designator->kind == Expr::Kind::Binary) {
                 auto base = this->expression(*designator->left);
                 auto index = this->expression(*designator->right);
                 if (!base || !index) return std::nullopt;
@@ -6914,7 +7016,8 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls, std::string_view mangling,
                       std::string_view default_abi,
                       const GenericPointerResolver& pointer_resolver,
-                      const GenericAbiCanonicalizer& canonical_abi) {
+                      const GenericAbiCanonicalizer& canonical_abi,
+                      const EvaluationLayoutInstaller& install_layout) {
     if (!validate_attribute_names(program, diagnostics)) return false;
     if (!evaluate_enumerations(program, diagnostics)) return false;
     materialize_enumerators(program);
@@ -6933,6 +7036,8 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
         }
         return false;
     }
+    if (install_layout) install_layout(program);
+    if (diagnostics.errors() != 0) return false;
     if (!expand_evaluation(program, diagnostics, evaluate_calls)) {
         if (diagnostics.errors() == 0) {
             diagnostics.command_error("compile-time evaluation failed without a diagnostic");

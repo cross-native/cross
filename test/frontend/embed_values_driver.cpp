@@ -15,6 +15,9 @@ extern const std::uint8_t words[8];
 extern const std::uint8_t rows[8];
 extern std::size_t array_view_checked;
 extern std::size_t target_sized_array_checked;
+extern std::size_t target_record_layout_checked;
+extern std::size_t record_member_checked;
+extern std::size_t record_array_member_checked;
 extern const std::uint8_t float_bytes[4];
 extern const std::uint8_t double_bytes[8];
 extern const std::uint8_t quad_bytes[16];
@@ -53,7 +56,9 @@ int main() {
         endian_read_ok != 1 || endian_write_ok != 1 ||
         float_value != 1.5f || extended_padding_ok != 1 ||
         meta_pointer_distance != 2 || meta_pointer_order_ok != 1 ||
-        array_view_checked != 1 || target_sized_array_checked != 1) return 1;
+        array_view_checked != 1 || target_sized_array_checked != 1 ||
+        target_record_layout_checked != 1 || record_member_checked != 1 ||
+        record_array_member_checked != 1) return 1;
     constexpr std::uint8_t expected_words[] =
         {0x78, 0x56, 0x34, 0x12, 0xf0, 0xde, 0xbc, 0x9a};
     for (std::size_t index = 0; index < 8; ++index)

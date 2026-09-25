@@ -219,6 +219,12 @@ public:
         return std::move(module_);
     }
 
+    Module record_layout_context() {
+        collect_record_shells();
+        finish_records();
+        return std::move(module_);
+    }
+
     void validate_address_spaces() {
         std::unordered_set<const cross::Type*> visited;
         std::unordered_set<std::string> reported;
@@ -2578,6 +2584,11 @@ Module build(Program& program, const CompilerOptions& options,
 Module build_constant_context(Program& program, const CompilerOptions& options,
                               const TargetInfo& target, Diagnostics& diagnostics) {
     return Builder(program, options, target, diagnostics).constant_context();
+}
+
+Module build_record_layout_context(Program& program, const CompilerOptions& options,
+                                   const TargetInfo& target, Diagnostics& diagnostics) {
+    return Builder(program, options, target, diagnostics).record_layout_context();
 }
 
 bool validate_source_address_spaces(Program& program,

@@ -120,6 +120,40 @@ typedef u16 (*word_row)[2];
 typedef u16 (*word_grid)[2][2];
 typedef uptr (*pointer_row)[2];
 typedef uptr pointer_pair[2];
+struct eval_pair { u8 tag; uptr value; };
+struct eval_packed [[packed]] { u8 tag; uptr value; };
+struct eval_collection { u8 tag; u16 values[2]; };
+
+[[eval_only]] static uptr target_record_layout_ok() {
+    return sizeof(struct eval_pair) == 2u32 * $::target::pointer_bytes &&
+           $::alignof(struct eval_pair) == $::target::pointer_bytes &&
+           sizeof(struct eval_packed) == 1u32 + $::target::pointer_bytes &&
+           $::alignof(struct eval_packed) == 1u32;
+}
+
+[[eval_only]] static uptr record_member_ok() {
+    $::meta::buffer output = $::meta::alloc(2u32 * sizeof(struct eval_pair));
+    struct eval_pair *first = (struct eval_pair *)$::meta::data(output);
+    struct eval_pair *second = first + 1u32;
+    first->tag = 7u8;
+    first->value = 11uptr;
+    second->tag = 13u8;
+    second->value = 17uptr;
+    return first->tag == 7u8 && first->value == 11uptr &&
+           second->tag == 13u8 && second->value == 17uptr &&
+           second - first == 1iptr;
+}
+
+[[eval_only]] static uptr record_array_member_ok() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_collection));
+    struct eval_collection *record =
+        (struct eval_collection *)$::meta::data(output);
+    record->tag = 3u8;
+    record->values[0u32] = 0x1122u16;
+    record->values[1u32] = 0x3344u16;
+    return record->tag == 3u8 && record->values[0u32] == 0x1122u16 &&
+           record->values[1u32] == 0x3344u16;
+}
 
 static $::meta::bytes packed_rows() {
     $::meta::buffer output = $::meta::alloc(8u32);
@@ -205,6 +239,9 @@ global const u8 words[] = packed_words();
 global const u8 rows[] = packed_rows();
 global uptr array_view_checked = array_view_ok();
 global uptr target_sized_array_checked = target_sized_array_ok();
+global uptr target_record_layout_checked = target_record_layout_ok();
+global uptr record_member_checked = record_member_ok();
+global uptr record_array_member_checked = record_array_member_ok();
 global const u8 float_bytes[] = packed_float();
 global const u8 double_bytes[] = packed_double();
 global const u8 quad_bytes[] = packed_quad();

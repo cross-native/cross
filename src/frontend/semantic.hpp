@@ -23,6 +23,7 @@ using GenericPointerResolver = std::function<bool(
     std::span<const NameKey>)>;
 using GenericAbiCanonicalizer =
     std::function<std::optional<std::string>(std::string_view)>;
+using EvaluationLayoutInstaller = std::function<void(Program&)>;
 
 // Expands explicit generic instances and deterministic translation-time calls.
 // Ordinary visible functions are evaluated opportunistically when requested;
@@ -33,7 +34,8 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       std::string_view mangling = "default",
                       std::string_view default_abi = "default",
                       const GenericPointerResolver& pointer_resolver = {},
-                      const GenericAbiCanonicalizer& canonical_abi = {});
+                      const GenericAbiCanonicalizer& canonical_abi = {},
+                      const EvaluationLayoutInstaller& install_layout = {});
 
 using LayoutQuery =
     std::function<std::optional<std::uint64_t>(const TypePtr&)>;

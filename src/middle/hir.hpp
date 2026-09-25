@@ -264,6 +264,10 @@ Module build(Program& program, const CompilerOptions& options,
 // bodies have been instantiated. Template declarations are deliberately absent.
 Module build_constant_context(Program& program, const CompilerOptions& options,
                               const TargetInfo& target, Diagnostics& diagnostics);
+// Early nominal layout without validating objects whose inferred bounds may
+// still be materialized by translation-time evaluation.
+Module build_record_layout_context(Program& program, const CompilerOptions& options,
+                                   const TargetInfo& target, Diagnostics& diagnostics);
 bool validate_source_address_spaces(Program& program,
                                     const CompilerOptions& options,
                                     const TargetInfo& target,

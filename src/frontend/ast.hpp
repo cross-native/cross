@@ -8,9 +8,11 @@
 #include "frontend/name.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -364,10 +366,24 @@ struct EvaluationLayout {
     unsigned f80_alignment{1};
 };
 
+struct EvaluationMemberLayout {
+    std::uint64_t offset{};
+    unsigned alignment{1};
+    bool bit_field{};
+};
+
 struct Program {
     unsigned address_bits{64};
     EvaluationLimits evaluation_limits;
     EvaluationLayout evaluation_layout;
+    // Installed after semantic declarations are available; the target owns
+    // nominal layout even when evaluation precedes final HIR lowering.
+    std::function<std::optional<std::uint64_t>(const TypePtr&)>
+        evaluation_size_of;
+    std::function<std::optional<std::uint64_t>(const TypePtr&)>
+        evaluation_align_of;
+    std::function<std::optional<EvaluationMemberLayout>(
+        const TypePtr&, std::string_view)> evaluation_member_layout;
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
     std::vector<StaticAssertDecl> static_assertions;

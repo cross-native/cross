@@ -145,7 +145,10 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         float_effective_type invalid_bool invalid_f80 unassigned_wide
         different_pointer_views array_row_overread array_row_write_overflow
         array_row_misaligned array_row_unassigned array_row_effective_type
-        array_row_views array_const_loss array_frozen)
+        array_row_views array_const_loss array_frozen record_misaligned
+        record_out_of_view record_packed_member record_unassigned
+        record_effective_type record_const_loss record_bit_field
+        record_array_overread)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -291,6 +294,58 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::bytes frozen = $::meta::freeze(value, 4u32);\n"
             "return rows[0u32][0u32];")
         set(expected "buffer data pointer was used after freeze")
+    elseif(case STREQUAL record_misaligned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair) + 1u32);\n"
+            "struct eval_pair *record = (struct eval_pair *)($::meta::data(value) + 1u32);\n"
+            "return record->value;")
+        set(expected "misaligned meta pointer access for target record type")
+    elseif(case STREQUAL record_out_of_view)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair) - 1u32);\n"
+            "struct eval_pair *record = (struct eval_pair *)$::meta::data(value);\n"
+            "return record->value;")
+        set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL record_packed_member)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_packed));\n"
+            "struct eval_packed *record = (struct eval_packed *)$::meta::data(value);\n"
+            "record->value = 7uptr;\n"
+            "return 0u32;")
+        set(expected "packed meta record member access is not implemented")
+    elseif(case STREQUAL record_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
+            "struct eval_pair *record = (struct eval_pair *)$::meta::data(value);\n"
+            "return record->value;")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL record_effective_type)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
+            "struct eval_pair *record = (struct eval_pair *)$::meta::data(value);\n"
+            "record->value = 7uptr;\n"
+            "const u16 *wrong = (const u16 *)($::meta::data(value) + $::target::pointer_bytes);\n"
+            "return wrong[0u32];")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL record_const_loss)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
+            "const struct eval_pair *readonly = (const struct eval_pair *)$::meta::data(value);\n"
+            "struct eval_pair *writable = (struct eval_pair *)readonly;\n"
+            "return 0u32;")
+        set(expected "conversion without qualifier loss")
+    elseif(case STREQUAL record_bit_field)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
+            "struct eval_bits *record = (struct eval_bits *)$::meta::data(value);\n"
+            "return record->value;")
+        set(expected "meta record member requires a non-bit-field")
+    elseif(case STREQUAL record_array_overread)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_collection));\n"
+            "struct eval_collection *record = (struct eval_collection *)$::meta::data(value);\n"
+            "return record->values[2u32];")
+        set(expected "meta pointer read is outside its view")
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -302,12 +357,16 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
             "return 0u32;")
-        set(expected "compatible scalar, fixed-array, or void pointer conversion")
+        set(expected "compatible scalar, fixed-array, record, or void pointer conversion")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"
         "typedef u16 (*word_row)[2];\n"
         "typedef const u16 (*const_word_row)[2];\n"
+        "struct eval_pair { u8 tag; uptr value; };\n"
+        "struct eval_packed [[packed]] { u8 tag; uptr value; };\n"
+        "struct eval_bits { u32 value : 3; };\n"
+        "struct eval_collection { u8 tag; u16 values[2]; };\n"
         "[[eval_only]] static uptr bad() { ${body} }\n"
         "global uptr result = bad();\n")
     execute_process(COMMAND "${CC}" -S "${input}"
@@ -386,6 +445,9 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "rows:\n[^\n]*[.]byte ${row_bytes}" OR
        NOT assembly MATCHES "array_view_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "target_sized_array_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "target_record_layout_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "record_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "record_array_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "float_bytes:\n[^\n]*[.]byte ${float_bytes}" OR
        NOT assembly MATCHES "double_bytes:\n[^\n]*[.]byte ${double_bytes}" OR
        NOT assembly MATCHES "quad_bytes:\n[^\n]*[.]byte ${quad_bytes}" OR

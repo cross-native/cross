@@ -34,6 +34,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -855,9 +856,31 @@ int cc_main(int argc, char** argv) {
             return abi ? std::optional<std::string>(abi->canonical_name)
                        : std::nullopt;
         };
+    const EvaluationLayoutInstaller install_layout = [&](Program& current) {
+        auto layout = std::make_shared<hir::Module>(
+            hir::build_record_layout_context(current, options, *target, diagnostics));
+        if (diagnostics.errors() != 0) return;
+        current.evaluation_size_of = [layout, target](const TypePtr& type) {
+            return hir::layout_size(*layout, layout->intern_type(type), *target);
+        };
+        current.evaluation_align_of = [layout, target](const TypePtr& type) {
+            return hir::layout_alignment(*layout, layout->intern_type(type), *target);
+        };
+        current.evaluation_member_layout = [layout](
+            const TypePtr& owner, std::string_view name)
+            -> std::optional<EvaluationMemberLayout> {
+            const auto id = layout->intern_type(owner);
+            const auto& type = layout->type(id);
+            if (!type.record) return std::nullopt;
+            const auto* member = layout->member(*type.record, name);
+            if (!member) return std::nullopt;
+            return EvaluationMemberLayout{
+                member->offset, member->alignment, member->bit_width.has_value()};
+        };
+    };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
                           options.mangling, options.abi, pointer_resolver,
-                          canonical_abi)) return 1;
+                          canonical_abi, install_layout)) return 1;
     const auto* backend = target_backend_for(*target);
     if (!backend) {
         diagnostics.command_error(
