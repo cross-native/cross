@@ -369,7 +369,8 @@ struct EvaluationLayout {
 struct EvaluationMemberLayout {
     std::uint64_t offset{};
     unsigned alignment{1};
-    bool bit_field{};
+    std::optional<unsigned> bit_width;
+    unsigned bit_offset{};
 };
 
 struct Program {

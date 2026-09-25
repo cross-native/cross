@@ -875,7 +875,8 @@ int cc_main(int argc, char** argv) {
             const auto* member = layout->member(*type.record, name);
             if (!member) return std::nullopt;
             return EvaluationMemberLayout{
-                member->offset, member->alignment, member->bit_width.has_value()};
+                member->offset, member->alignment,
+                member->bit_width, member->bit_offset};
         };
     };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,

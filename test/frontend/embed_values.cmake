@@ -148,6 +148,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         array_row_views array_const_loss array_frozen record_misaligned
         record_out_of_view packed_cast_misaligned record_unassigned
         record_effective_type record_const_loss record_bit_field
+        bit_field_partial_freeze bit_field_storage_read bit_field_const_write
         record_array_overread nested_record_overread nested_record_const_write
         union_unassigned union_invalid_bool union_ordinary_alias
         union_out_of_view union_array_overread)
@@ -342,7 +343,28 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
             "struct eval_bits *record = (struct eval_bits *)$::meta::data(value);\n"
             "return record->value;")
-        set(expected "meta record member requires a non-bit-field")
+        set(expected "read of unassigned buffer bit")
+    elseif(case STREQUAL bit_field_partial_freeze)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
+            "struct eval_bits *record = (struct eval_bits *)$::meta::data(value);\n"
+            "record->value = 5u32;\n"
+            "return $::meta::len($::meta::freeze(value, sizeof(struct eval_bits)));")
+        set(expected "freeze requires every prefix byte")
+    elseif(case STREQUAL bit_field_storage_read)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
+            "struct eval_bits *record = (struct eval_bits *)$::meta::data(value);\n"
+            "record->value = 5u32;\n"
+            "return ((u32 *)$::meta::data(value))[0u32];")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL bit_field_const_write)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
+            "const struct eval_bits *record = (const struct eval_bits *)$::meta::data(value);\n"
+            "record->value = 5u32;\n"
+            "return 0u32;")
+        set(expected "meta pointer write requires mutable scalar storage")
     elseif(case STREQUAL record_array_overread)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_collection));\n"
@@ -478,6 +500,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
         set(source_word "4286578753")
         set(float_bytes "0,0,192,63")
         set(union_bytes "0,0,192,63")
+        set(bit_field_bytes "141,171")
         set(double_bytes "0,0,0,0,0,0,0,128")
         set(quad_bytes "0,0,0,0,0,0,0,0,0,0,0,0,0,128,255,63")
         set(extended_bytes "0,0,0,0,0,0,0,192,255,63,0,0,0,0,0,0")
@@ -487,6 +510,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
         set(source_word "1090552063")
         set(float_bytes "63,192,0,0")
         set(union_bytes "63,192,0,0")
+        set(bit_field_bytes "177,171")
         set(double_bytes "128,0,0,0,0,0,0,0")
         set(quad_bytes "63,255,128,0,0,0,0,0,0,0,0,0,0,0,0,0")
         set(extended_bytes "0,0,0,0,0,0,63,255,192,0,0,0,0,0,0,0")
@@ -517,6 +541,8 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "union_bytes:\n[^\n]*[.]byte ${union_bytes}" OR
        NOT assembly MATCHES "union_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "nested_union_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "bit_fields:\n[^\n]*[.]byte ${bit_field_bytes}" OR
+       NOT assembly MATCHES "bit_field_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_array_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "nested_record_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "direct_nested_record_checked:\n[^\n]*${success_directive}" OR

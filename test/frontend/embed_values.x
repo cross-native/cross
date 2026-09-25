@@ -127,6 +127,8 @@ struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; }
 struct eval_packed_outer [[packed]] { u8 tag; struct eval_pair inner; };
 union eval_union { u32 word; f32 real; u8 bytes[4]; };
 struct eval_union_wrapper { u8 tag; union eval_union payload; };
+struct eval_bits { u16 a : 3; u16 b : 5; u16 c : 8; };
+struct eval_signed_bits { i16 value : 3; };
 
 static $::meta::bytes zero_outer_bytes() {
     $::meta::buffer output = $::meta::alloc(sizeof(struct eval_outer));
@@ -205,6 +207,29 @@ static $::meta::bytes union_reinterpreted_bytes() {
     value->tag = 7u8;
     value->payload.word = 0x3fc00000u32;
     return value->tag == 7u8 && value->payload.real == 1.5f32;
+}
+
+static $::meta::bytes bit_field_bytes() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_bits));
+    struct eval_bits *value = (struct eval_bits *)$::meta::data(output);
+    value->a = 5u16;
+    value->b = 17u16;
+    value->c = 0xabu16;
+    return $::meta::freeze(output, sizeof(struct eval_bits));
+}
+
+[[eval_only]] static uptr bit_field_ok() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_bits));
+    struct eval_bits *value = (struct eval_bits *)$::meta::data(output);
+    bool truncated = (value->a = 13u16) == 5u16;
+    value->b = 17u16;
+    value->c = 0xabu16;
+    $::meta::buffer signed_output = $::meta::alloc(sizeof(struct eval_signed_bits));
+    struct eval_signed_bits *signed_value =
+        (struct eval_signed_bits *)$::meta::data(signed_output);
+    signed_value->value = -1i16;
+    return truncated && value->a == 5u16 && value->b == 17u16 &&
+           value->c == 0xabu16 && signed_value->value == -1i16;
 }
 
 [[eval_only]] static uptr record_array_member_ok() {
@@ -325,6 +350,8 @@ global uptr nested_packed_record_checked = nested_packed_record_ok();
 global const u8 union_bytes[] = union_reinterpreted_bytes();
 global uptr union_member_checked = union_member_ok();
 global uptr nested_union_member_checked = nested_union_member_ok();
+global const u8 bit_fields[] = bit_field_bytes();
+global uptr bit_field_checked = bit_field_ok();
 global uptr record_array_member_checked = record_array_member_ok();
 global uptr nested_record_member_checked = nested_record_member_ok();
 global uptr direct_nested_record_checked =

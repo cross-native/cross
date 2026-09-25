@@ -2094,6 +2094,8 @@ bool bind_operators(Program& program, Diagnostics& diagnostics) {
 
 struct EvalBuffer {
     std::string data;
+    // Each bit records initialized object representation; full-byte stores
+    // set 0xff, while bit-field writes mark only the addressed field bits.
     std::vector<std::uint8_t> assigned;
     // Zero means raw byte storage; nonzero records the scalar lvalue that
     // established effective type for each byte of a typed write.
@@ -2113,6 +2115,11 @@ struct EvalMetaPointer {
     // Access through a union member may reinterpret another active member's
     // representation; ordinary pointer casts do not inherit this permission.
     bool union_member_view{};
+    struct BitField {
+        unsigned width{};
+        unsigned offset{};
+    };
+    std::optional<BitField> bit_field;
 };
 
 struct EvalValue {
@@ -3947,6 +3954,7 @@ private:
             if (!same_type(value.type->pointee, type->pointee)) {
                 value.meta_pointer->access_alignment.reset();
                 value.meta_pointer->union_member_view = false;
+                value.meta_pointer->bit_field.reset();
             }
             value.type = clone_type(type);
             return value;
@@ -4230,6 +4238,23 @@ private:
         return (bits + 7U) / 8U;
     }
 
+    static UInt128 meta_bit_field_mask(
+        const EvalMetaPointer::BitField& field) {
+        return shift_left(mask_to(bit_not(UInt128{}), field.width),
+                          field.offset);
+    }
+
+    UInt128 extract_meta_bit_field(UInt128 storage,
+                                   const EvalValue& base) const {
+        const auto& field = *base.meta_pointer->bit_field;
+        auto value = mask_to(shift_right(storage, field.offset), field.width);
+        const auto type = integer_type(base.type->pointee);
+        if (type.is_signed && bit(value, field.width - 1))
+            value = bit_or(value, bit_not(mask_to(bit_not(UInt128{}),
+                                                 field.width)));
+        return mask_to(value, type.bits);
+    }
+
     std::optional<std::size_t> meta_object_size(const TypePtr& type) const {
         if (!meta_object_type(type)) return std::nullopt;
         if (type->kind == Type::Kind::Record) {
@@ -4376,11 +4401,12 @@ private:
             ? program_.evaluation_member_layout(base->type->pointee,
                                                  expression.right->text)
             : std::nullopt;
-        if (!member || !layout || layout->bit_field ||
+        if (!member || !layout ||
             !meta_object_type(member->type) ||
+            (layout->bit_width && !is_integer(member->type)) ||
             meta_volatile_or_atomic(member->type)) {
             fail(expression.location,
-                 "meta record member requires a non-bit-field supported object type");
+                 "meta record member requires a supported non-volatile object type");
             return std::nullopt;
         }
         const auto member_size = meta_object_size(member->type);
@@ -4415,6 +4441,19 @@ private:
             effective_record_alignment,
             std::min<std::size_t>(layout->alignment, *member_alignment));
         pointer.union_member_view |= base->type->pointee->is_union;
+        if (layout->bit_width) {
+            const auto storage_bits = *member_size * 8U;
+            if (*layout->bit_width == 0 ||
+                *layout->bit_width > storage_bits ||
+                layout->bit_offset > storage_bits - *layout->bit_width) {
+                fail(expression.location, "meta bit-field has invalid target layout");
+                return std::nullopt;
+            }
+            pointer.bit_field = EvalMetaPointer::BitField{
+                *layout->bit_width, layout->bit_offset};
+        } else {
+            pointer.bit_field.reset();
+        }
         pointer.view_offset = record_offset +
             static_cast<std::size_t>(layout->offset);
         pointer.view_length = *member_size;
@@ -4548,18 +4587,30 @@ private:
         const auto size = meta_scalar_size(base);
         const auto access_type = base.type->pointee->builtin;
         UInt128 result;
+        const auto field_mask = pointer.bit_field
+            ? meta_bit_field_mask(*pointer.bit_field) : UInt128{};
         if (pointer.mutable_buffer) {
             for (std::size_t offset = 0; offset < size; ++offset) {
                 const bool f80_padding = access_type == BuiltinType::F80 &&
                     (program_.evaluation_layout.byte_order == EvaluationByteOrder::Little
                          ? offset >= size - 10 : offset < size - 10);
+                const auto lane = program_.evaluation_layout.byte_order ==
+                    EvaluationByteOrder::Little ? offset : size - 1 - offset;
+                const auto required = pointer.bit_field
+                    ? static_cast<std::uint8_t>(
+                        shift_right(field_mask,
+                            static_cast<unsigned>(lane * 8)).low & 0xffU)
+                    : static_cast<std::uint8_t>(0xffU);
                 if (!f80_padding &&
-                    !pointer.mutable_buffer->assigned[*index + offset]) {
-                    fail(location, "read of unassigned buffer byte");
+                    (pointer.mutable_buffer->assigned[*index + offset] & required) !=
+                        required) {
+                    fail(location, pointer.bit_field
+                        ? "read of unassigned buffer bit"
+                        : "read of unassigned buffer byte");
                     return std::nullopt;
                 }
                 const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
-                if (!pointer.union_member_view &&
+                if (!pointer.union_member_view && !pointer.bit_field &&
                     !byte_meta_type(access_type) && tag != 0 &&
                     !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
                                           access_type)) {
@@ -4578,6 +4629,8 @@ private:
                 UInt128{static_cast<unsigned char>(raw)},
                 static_cast<unsigned>(lane * 8)));
         }
+        if (pointer.bit_field)
+            result = extract_meta_bit_field(result, base);
         if (access_type == BuiltinType::Bool && result != UInt128{} &&
             result != UInt128{1}) {
             fail(location, "invalid bool representation in meta storage");
@@ -4824,7 +4877,8 @@ private:
             if (!offset) return std::nullopt;
             const auto size = meta_scalar_size(*pointer);
             const auto access_type = pointer->type->pointee->builtin;
-            if (!byte_meta_type(access_type) && !target.union_member_view) {
+            if (!byte_meta_type(access_type) && !target.union_member_view &&
+                !target.bit_field) {
                 for (std::size_t index = 0; index < size; ++index) {
                     const auto tag = target.mutable_buffer->effective_type[*offset + index];
                     if (tag != 0 &&
@@ -4843,13 +4897,45 @@ private:
             if (!source) return std::nullopt;
             const auto bits = source->floating ? source->floating->bits
                                                : source->integer;
+            if (target.bit_field) {
+                const auto field_mask = meta_bit_field_mask(*target.bit_field);
+                const auto inserted = shift_left(
+                    mask_to(bits, target.bit_field->width),
+                    target.bit_field->offset);
+                UInt128 previous;
+                for (std::size_t index = 0; index < size; ++index) {
+                    const auto lane = program_.evaluation_layout.byte_order ==
+                        EvaluationByteOrder::Little ? index : size - 1 - index;
+                    previous = bit_or(previous, shift_left(
+                        UInt128{static_cast<unsigned char>(
+                            target.mutable_buffer->data[*offset + index])},
+                        static_cast<unsigned>(lane * 8)));
+                }
+                const auto updated = bit_or(bit_and(previous,
+                    bit_not(field_mask)), inserted);
+                for (std::size_t index = 0; index < size; ++index) {
+                    const auto lane = program_.evaluation_layout.byte_order ==
+                        EvaluationByteOrder::Little ? index : size - 1 - index;
+                    const auto shift = static_cast<unsigned>(lane * 8);
+                    const auto mask_byte = static_cast<std::uint8_t>(
+                        shift_right(field_mask, shift).low & 0xffU);
+                    if (mask_byte == 0) continue;
+                    target.mutable_buffer->data[*offset + index] =
+                        static_cast<char>(shift_right(updated, shift).low & 0xffU);
+                    target.mutable_buffer->assigned[*offset + index] |= mask_byte;
+                    target.mutable_buffer->effective_type[*offset + index] =
+                        static_cast<std::uint8_t>(access_type) + 1;
+                }
+                return EvalValue{extract_meta_bit_field(inserted, *pointer),
+                                 clone_type(pointer->type->pointee)};
+            }
             for (std::size_t index = 0; index < size; ++index) {
                 const auto lane = program_.evaluation_layout.byte_order ==
                     EvaluationByteOrder::Little ? index : size - 1 - index;
                 target.mutable_buffer->data[*offset + index] = static_cast<char>(
                     shift_right(bits,
                         static_cast<unsigned>(lane * 8)).low & 0xffU);
-                target.mutable_buffer->assigned[*offset + index] = 1;
+                target.mutable_buffer->assigned[*offset + index] = 0xffU;
                 if (!byte_meta_type(access_type))
                     target.mutable_buffer->effective_type[*offset + index] =
                         static_cast<std::uint8_t>(access_type) + 1;
@@ -5130,9 +5216,10 @@ private:
                 return std::nullopt;
             }
             const auto count_bytes = static_cast<std::size_t>(length->integer.low);
-            if (std::find(handle->buffer->assigned.begin(),
-                          handle->buffer->assigned.begin() +
-                              static_cast<std::ptrdiff_t>(count_bytes), 0) !=
+            if (std::find_if(handle->buffer->assigned.begin(),
+                             handle->buffer->assigned.begin() +
+                                 static_cast<std::ptrdiff_t>(count_bytes),
+                             [](std::uint8_t bits) { return bits != 0xffU; }) !=
                 handle->buffer->assigned.begin() +
                     static_cast<std::ptrdiff_t>(count_bytes)) {
                 fail(expression.arguments[1]->location,
