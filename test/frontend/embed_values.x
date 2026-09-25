@@ -19,6 +19,14 @@ static uptr invert_bytes(in const u8 *source, in uptr length,
 }
 
 static u8 read_one(in const u8 *source) { return source[0u32]; }
+static i8 read_signed(in const i8 *source) { return source[0u32]; }
+
+static $::meta::bytes signed_output() {
+    $::meta::buffer output = $::meta::alloc(1u32);
+    i8 *pointer = (i8 *)$::meta::data(output);
+    pointer[0u32] = -1i8;
+    return $::meta::freeze(output, 1u32);
+}
 
 static $::meta::bytes inverted(in $::meta::bytes source) {
     $::meta::buffer output = $::meta::alloc($::meta::len(source));
@@ -52,6 +60,7 @@ global const u8 copied[] = copy_asset! { $::embed("payload.bin") };
 global u8 rotated[5] = rotate($::embed("payload.bin"));
 global u8 encoded[] = inverted($::embed("payload.bin"));
 global u8 encoded_slice[3] = inverted($::meta::slice($::embed("payload.bin"), 1u32, 3u32));
+global const u8 signed_encoded[] = signed_output();
 global uptr asset_size = $::meta::len($::embed("payload.bin"));
 global uptr static_size = sizeof(original);
 global uptr empty_capacity = empty_buffer_capacity();
@@ -59,3 +68,7 @@ global u8 first_byte = $::meta::at($::embed("payload.bin"), 0u32);
 global u8 zero_byte = $::meta::at($::embed("payload.bin"), 1u32);
 global u8 high_byte = $::meta::at($::embed("payload.bin"), 3u32);
 global u8 second_byte = read_one($::meta::data($::embed("payload.bin")) + 1u32);
+global i8 signed_high = read_signed((const i8 *)$::meta::data(
+    $::meta::slice($::embed("payload.bin"), 3u32, 1u32)));
+global i32 signed_extended = read_signed((const i8 *)$::meta::data(
+    $::meta::slice($::embed("payload.bin"), 3u32, 1u32)));

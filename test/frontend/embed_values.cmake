@@ -140,7 +140,7 @@ foreach(case unassigned_prefix double_freeze over_capacity nonstatic_buffer meta
     endif()
 endforeach()
 
-foreach(case unassigned_read frozen_pointer const_write view_overread integer_cast)
+foreach(case unassigned_read frozen_pointer const_write view_overread integer_cast non_byte_cast)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -161,19 +161,25 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const u8 *pointer = $::meta::data(value);\n"
             "pointer[0u32] = 7u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable u8 storage")
+        set(expected "meta pointer write requires mutable byte storage")
     elseif(case STREQUAL view_overread)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const u8 *pointer = $::meta::data($::meta::slice(value, 1u32, 2u32));\n"
             "return pointer[2u32];")
         set(expected "meta pointer read is outside its view")
-    else()
+    elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "uptr address = (uptr)$::meta::data(value);\n"
             "return address;")
         set(expected "meta data pointers cannot convert to integer")
+    else()
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const u16 *pointer = (const u16 *)$::meta::data(value);\n"
+            "return pointer[0u32];")
+        set(expected "non-byte pointer types")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"

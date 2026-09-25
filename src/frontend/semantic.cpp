@@ -3357,7 +3357,8 @@ private:
                 result_type->kind == Type::Kind::Pointer &&
                 result_type->pointee &&
                 result_type->pointee->kind == Type::Kind::Builtin &&
-                result_type->pointee->builtin == BuiltinType::U8;
+                (result_type->pointee->builtin == BuiltinType::U8 ||
+                 result_type->pointee->builtin == BuiltinType::I8);
             const bool pointer_operation = pointer_resolver_ && result_type &&
                 result_type->kind == Type::Kind::Pointer &&
                 (node.kind == Expr::Kind::Conditional || node.text == "+" || node.text == "-");
@@ -3587,7 +3588,8 @@ private:
             const auto byte_pointer = [](const TypePtr& type) {
                 return type->kind == Type::Kind::Pointer && type->pointee &&
                     type->pointee->kind == Type::Kind::Builtin &&
-                    type->pointee->builtin == BuiltinType::U8;
+                    (type->pointee->builtin == BuiltinType::U8 ||
+                     type->pointee->builtin == BuiltinType::I8);
             };
             if (pointer_resolver_ ||
                 ((byte_pointer(left) || byte_pointer(right)) &&
@@ -3730,12 +3732,13 @@ private:
         if (value.meta_pointer) {
             if (type->kind != Type::Kind::Pointer || !type->pointee ||
                 type->pointee->kind != Type::Kind::Builtin ||
-                type->pointee->builtin != BuiltinType::U8 ||
+                (type->pointee->builtin != BuiltinType::U8 &&
+                 type->pointee->builtin != BuiltinType::I8) ||
                 !value.type || value.type->kind != Type::Kind::Pointer ||
                 !value.type->pointee ||
                 (value.type->pointee->is_const && !type->pointee->is_const) ||
                 type->address_space != value.type->address_space) {
-                fail(location, "meta data pointers cannot convert to integer or non-u8 pointer types");
+                fail(location, "meta data pointers cannot convert to integer or non-byte pointer types");
                 return std::nullopt;
             }
             if (value.meta_pointer->mutable_buffer &&
@@ -3963,8 +3966,9 @@ private:
         if (!value.meta_pointer || !value.type ||
             value.type->kind != Type::Kind::Pointer || !value.type->pointee ||
             value.type->pointee->kind != Type::Kind::Builtin ||
-            value.type->pointee->builtin != BuiltinType::U8) {
-            fail(location, "only u8 meta pointer access is implemented");
+            (value.type->pointee->builtin != BuiltinType::U8 &&
+             value.type->pointee->builtin != BuiltinType::I8)) {
+            fail(location, "only byte-type meta pointer access is implemented");
             return false;
         }
         if (value.meta_pointer->mutable_buffer &&
@@ -4020,10 +4024,12 @@ private:
                 return std::nullopt;
             }
             return EvalValue{UInt128{static_cast<unsigned char>(
-                pointer.mutable_buffer->data[index])}, builtin_type(BuiltinType::U8)};
+                pointer.mutable_buffer->data[index])},
+                builtin_type(base.type->pointee->builtin)};
         }
         return EvalValue{UInt128{static_cast<unsigned char>(
-            (*pointer.immutable)[index])}, builtin_type(BuiltinType::U8)};
+            (*pointer.immutable)[index])},
+            builtin_type(base.type->pointee->builtin)};
     }
 
     std::optional<EvalValue> unary(const Expr& expression) {
@@ -4237,7 +4243,7 @@ private:
                 pointer->type->pointee->is_const ||
                 !pointer->meta_pointer->mutable_buffer) {
                 fail(designator->location,
-                    "meta pointer write requires mutable u8 storage and simple assignment");
+                    "meta pointer write requires mutable byte storage and simple assignment");
                 return std::nullopt;
             }
             const auto& target = *pointer->meta_pointer;
@@ -4247,7 +4253,7 @@ private:
             }
             auto source = this->expression(*expression.right);
             if (!source) return std::nullopt;
-            source = convert(*source, builtin_type(BuiltinType::U8),
+            source = convert(*source, builtin_type(pointer->type->pointee->builtin),
                              expression.right->location);
             if (!source) return std::nullopt;
             const auto offset = target.view_offset + target.position;
