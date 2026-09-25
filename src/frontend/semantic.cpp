@@ -2759,6 +2759,35 @@ private:
         return result;
     }
 
+    std::optional<std::vector<std::pair<std::size_t, std::size_t>>>
+    token_trees(const TokenSequence& tokens, SourceLocation location) {
+        std::vector<std::pair<std::size_t, std::size_t>> trees;
+        std::vector<std::string_view> closers;
+        std::size_t begin{};
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            if (closers.empty()) begin = index;
+            const auto& spelling = tokens[index].text;
+            if (spelling == "(") closers.push_back(")");
+            else if (spelling == "[") closers.push_back("]");
+            else if (spelling == "[[") closers.push_back("]]");
+            else if (spelling == "{") closers.push_back("}");
+            else if (spelling == ")" || spelling == "]" ||
+                     spelling == "]]" || spelling == "}") {
+                if (closers.empty() || closers.back() != spelling) {
+                    fail(location, "token sequence requires balanced token groups");
+                    return std::nullopt;
+                }
+                closers.pop_back();
+            }
+            if (closers.empty()) trees.emplace_back(begin, index + 1);
+        }
+        if (!closers.empty()) {
+            fail(location, "token sequence requires balanced token groups");
+            return std::nullopt;
+        }
+        return trees;
+    }
+
     bool append_tokens(TokenSequence& result, const TokenSequence& part, SourceLocation location) {
         // Charge materialized output, including intermediate copies, so a
         // bounded loop cannot grow token storage exponentially without limit.
@@ -3031,23 +3060,33 @@ private:
                 return true;
             }
             if (name == "$::meta::len" || name == "$::meta::at" ||
-                name == "$::meta::slice" ||
-                (name == "$::meta::concat" && !procedural_)) {
+                name == "$::meta::slice" || name == "$::meta::concat") {
                 const auto count = name == "$::meta::len" ? 1U
                     : name == "$::meta::at" || name == "$::meta::concat" ? 2U : 3U;
                 if (node.arguments.size() != count) {
                     fail(node.location, name + " requires " + std::to_string(count) + " arguments");
                     return false;
                 }
-                for (std::size_t index = 0; index < count; ++index) {
+                if (!validate_required_tree(*node.arguments.front())) return false;
+                const auto sequence = expression_type(*node.arguments.front());
+                if (!sequence || (sequence->kind != Type::Kind::Bytes &&
+                                  !(procedural_ && sequence->kind == Type::Kind::Tokens))) {
+                    fail(node.arguments.front()->location,
+                        name + " requires $::meta::bytes or $::meta::tokens");
+                    return false;
+                }
+                for (std::size_t index = 1; index < count; ++index) {
                     const auto& argument = *node.arguments[index];
                     if (!validate_required_tree(argument)) return false;
                     const auto type = expression_type(argument);
-                    const bool byte_argument = index == 0 || name == "$::meta::concat";
-                    if (!type || (byte_argument ? type->kind != Type::Kind::Bytes
-                                                : !is_integer(type))) {
+                    const bool sequence_argument = name == "$::meta::concat";
+                    if (!type || (sequence_argument
+                            ? type->kind != sequence->kind : !is_integer(type))) {
                         fail(argument.location, name +
-                            (byte_argument ? " requires $::meta::bytes" : " requires an integer index"));
+                            (sequence_argument ? (sequence->kind == Type::Kind::Tokens
+                                    ? " requires token values"
+                                    : " requires two values of the same meta-sequence type")
+                                               : " requires an integer index"));
                         return false;
                     }
                 }
@@ -3059,12 +3098,9 @@ private:
                 fail(node.location, name + " is not implemented for byte evaluation");
                 return false;
             }
-            if (procedural_ && (node.left->text == "$::meta::parse" ||
-                                node.left->text == "$::meta::concat")) {
-                const bool parse = node.left->text == "$::meta::parse";
-                if (node.arguments.size() != (parse ? 1U : 2U)) {
-                    fail(node.location, parse ? "$::meta::parse requires one string argument"
-                                              : "$::meta::concat requires two token arguments");
+            if (procedural_ && node.left->text == "$::meta::parse") {
+                if (node.arguments.size() != 1U) {
+                    fail(node.location, "$::meta::parse requires one string argument");
                     return false;
                 }
                 for (const auto& argument : node.arguments) {
@@ -3073,9 +3109,8 @@ private:
                     const bool string = type && type->kind == Type::Kind::Pointer &&
                         type->pointee && type->pointee->kind == Type::Kind::Builtin &&
                         type->pointee->builtin == BuiltinType::U8;
-                    if (parse ? !string : (!type || type->kind != Type::Kind::Tokens)) {
-                        fail(argument->location, parse ? "$::meta::parse requires a translation-time string"
-                                                       : "$::meta::concat requires token values");
+                    if (!string) {
+                        fail(argument->location, "$::meta::parse requires a translation-time string");
                         return false;
                     }
                 }
@@ -3452,15 +3487,22 @@ private:
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
-            if (expression.left->text == "$::embed" ||
-                expression.left->text == "$::meta::slice" ||
-                (expression.left->text == "$::meta::concat" && !procedural_)) return bytes_type();
+            if (expression.left->text == "$::embed") return bytes_type();
             if (expression.left->text == "$::meta::len")
                 return builtin_type(BuiltinType::Uptr);
-            if (expression.left->text == "$::meta::at")
-                return builtin_type(BuiltinType::U8);
-            if (procedural_ && (expression.left->text == "$::meta::parse" ||
-                                expression.left->text == "$::meta::concat")) return tokens_type();
+            if (expression.left->text == "$::meta::at" ||
+                expression.left->text == "$::meta::slice" ||
+                expression.left->text == "$::meta::concat") {
+                if (expression.arguments.empty()) return {};
+                const auto sequence = expression_type(*expression.arguments.front());
+                if (!sequence || (sequence->kind != Type::Kind::Bytes &&
+                                  sequence->kind != Type::Kind::Tokens)) return {};
+                return expression.left->text == "$::meta::at" &&
+                       sequence->kind == Type::Kind::Bytes
+                    ? builtin_type(BuiltinType::U8) : sequence;
+            }
+            if (procedural_ && expression.left->text == "$::meta::parse")
+                return tokens_type();
             if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
                 expression.arguments.size() == 1) return expression_type(*expression.arguments.front());
             if (const auto* callee = resolve_function(program_, current_function_, *expression.left,
@@ -3942,31 +3984,21 @@ private:
             fail(expression.location, "indirect calls are not permitted during translation-time evaluation");
             return std::nullopt;
         }
-        if (procedural_ && (expression.left->text == "$::meta::parse" ||
-                            expression.left->text == "$::meta::concat")) {
-            const bool parse = expression.left->text == "$::meta::parse";
-            if (expression.arguments.size() != (parse ? 1U : 2U)) {
-                fail(expression.location, parse ? "$::meta::parse requires one string argument"
-                                                : "$::meta::concat requires two token arguments");
+        if (procedural_ && expression.left->text == "$::meta::parse") {
+            if (expression.arguments.size() != 1U) {
+                fail(expression.location, "$::meta::parse requires one string argument");
+                return std::nullopt;
+            }
+            const auto& argument = *expression.arguments.front();
+            auto value = this->expression(argument);
+            if (!value || !value->string) {
+                fail(argument.location, "$::meta::parse requires a translation-time string");
                 return std::nullopt;
             }
             TokenSequence result;
-            for (const auto& argument : expression.arguments) {
-                auto value = this->expression(*argument);
-                if (!value) return std::nullopt;
-                if (parse ? !value->string : !value->tokens) {
-                    fail(argument->location, parse ? "$::meta::parse requires a translation-time string"
-                                                   : "$::meta::concat requires token values");
-                    return std::nullopt;
-                }
-                if (parse) {
-                    auto part = parse_tokens(std::string_view(*value->string).substr(value->offset,
-                        value->string->size() - value->offset - 1), argument->location);
-                    if (!part || !append_tokens(result, *part, argument->location)) return std::nullopt;
-                } else if (!append_tokens(result, *value->tokens, argument->location)) {
-                    return std::nullopt;
-                }
-            }
+            auto part = parse_tokens(std::string_view(*value->string).substr(value->offset,
+                value->string->size() - value->offset - 1), argument.location);
+            if (!part || !append_tokens(result, *part, argument.location)) return std::nullopt;
             return token_value(std::move(result));
         }
         const auto& name = expression.left->text;
@@ -4014,9 +4046,68 @@ private:
                 return std::nullopt;
             }
             auto source = this->expression(*expression.arguments[0]);
-            if (!source || !source->bytes) {
-                fail(expression.arguments[0]->location, name + " requires $::meta::bytes");
+            if (!source || (!source->bytes && !source->tokens)) {
+                fail(expression.arguments[0]->location,
+                     name + " requires $::meta::bytes or $::meta::tokens");
                 return std::nullopt;
+            }
+            if (source->tokens) {
+                const auto trees = token_trees(*source->tokens,
+                    expression.arguments[0]->location);
+                if (!trees) return std::nullopt;
+                if (name == "$::meta::len")
+                    return EvalValue{UInt128{trees->size()},
+                                     builtin_type(BuiltinType::Uptr)};
+                if (name == "$::meta::concat") {
+                    auto second = this->expression(*expression.arguments[1]);
+                    if (!second || !second->tokens) {
+                        fail(expression.arguments[1]->location,
+                             "$::meta::concat requires token values");
+                        return std::nullopt;
+                    }
+                    TokenSequence result;
+                    if (!append_tokens(result, *source->tokens, expression.location) ||
+                        !append_tokens(result, *second->tokens, expression.location))
+                        return std::nullopt;
+                    return token_value(std::move(result));
+                }
+                const auto index = this->expression(*expression.arguments[1]);
+                if (!index || !is_integer(index->type) ||
+                    integer_negative(index->integer, integer_type(index->type)) ||
+                    index->integer.high != 0 || index->integer.low > trees->size()) {
+                    fail(expression.arguments[1]->location,
+                         name + " index is outside the token sequence");
+                    return std::nullopt;
+                }
+                const auto offset = static_cast<std::size_t>(index->integer.low);
+                std::size_t end = offset + 1;
+                if (name == "$::meta::slice") {
+                    const auto length = this->expression(*expression.arguments[2]);
+                    if (!length || !is_integer(length->type) ||
+                        integer_negative(length->integer, integer_type(length->type)) ||
+                        length->integer.high != 0 ||
+                        length->integer.low > trees->size() - offset) {
+                        fail(expression.arguments[2]->location,
+                             "$::meta::slice length is outside the token sequence");
+                        return std::nullopt;
+                    }
+                    end = offset + static_cast<std::size_t>(length->integer.low);
+                } else if (offset == trees->size()) {
+                    fail(expression.arguments[1]->location,
+                         "$::meta::at index is outside the token sequence");
+                    return std::nullopt;
+                }
+                TokenSequence result;
+                if (offset != end) {
+                    const auto begin_token = (*trees)[offset].first;
+                    const auto end_token = (*trees)[end - 1].second;
+                    TokenSequence selected(source->tokens->begin() +
+                        static_cast<std::ptrdiff_t>(begin_token),
+                        source->tokens->begin() + static_cast<std::ptrdiff_t>(end_token));
+                    if (!append_tokens(result, selected, expression.location))
+                        return std::nullopt;
+                }
+                return token_value(std::move(result));
             }
             if (name == "$::meta::len")
                 return EvalValue{UInt128{source->byte_length}, builtin_type(BuiltinType::Uptr)};

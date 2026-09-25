@@ -2354,6 +2354,14 @@ if(BUILD_TESTING)
                 -DGENERATOR=${CMAKE_SOURCE_DIR}/test/frontend/embed_values_generator.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embed-values
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/embed_values.cmake")
+    add_test(NAME cross_meta_token_sequences
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/meta_token_sequences.x
+                -DDRIVER=${CMAKE_SOURCE_DIR}/test/frontend/meta_token_sequences_driver.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/meta-token-sequences
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/meta_token_sequences.cmake")
     add_test(NAME cross_diagnostic
         COMMAND $<TARGET_FILE:cross_cc> -emit-llvm
                 "${CMAKE_SOURCE_DIR}/test/frontend/diagnostic.x"
