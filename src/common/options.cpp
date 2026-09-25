@@ -486,6 +486,22 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.eval-calls", {}, OptionValueKind::Boolean, true, {}, 0, 0,
          OptionCategory::Semantic, false, OptionImplementation::Implemented,
          "opportunistic translation-time call evaluation"},
+        {"f.eval-byte-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{16 * 1024 * 1024}, {}, 0, 1024 * 1024 * 1024,
+         OptionCategory::Semantic, false, OptionImplementation::Implemented,
+         "maximum bytes in one translation-time sequence or buffer"},
+        {"f.eval-memory-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{64 * 1024 * 1024}, {}, 0, 1024 * 1024 * 1024,
+         OptionCategory::Semantic, false, OptionImplementation::Implemented,
+         "cumulative translation-time meta memory per evaluation"},
+        {"f.eval-step-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{1000000}, {}, 1, 100000000,
+         OptionCategory::Semantic, false, OptionImplementation::Implemented,
+         "maximum evaluator instructions per evaluation"},
+        {"f.eval-depth-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{256}, {}, 1, 512,
+         OptionCategory::Semantic, false, OptionImplementation::Implemented,
+         "maximum evaluator call depth"},
         {"f.function-sections", {}, OptionValueKind::Boolean, false, {}, 0,
          0, OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented, "one section per function"},
@@ -793,6 +809,10 @@ bool resolve_registered_options(
     options.private_abi = resolved_bool(options, "f.private-abi");
     options.ipa_cp_clone = resolved_bool(options, "f.ipa-cp-clone");
     options.evaluate_calls = resolved_bool(options, "f.eval-calls", true);
+    options.eval_byte_limit = resolved_unsigned(options, "f.eval-byte-limit", 16 * 1024 * 1024);
+    options.eval_memory_limit = resolved_unsigned(options, "f.eval-memory-limit", 64 * 1024 * 1024);
+    options.eval_step_limit = resolved_unsigned(options, "f.eval-step-limit", 1000000);
+    options.eval_depth_limit = static_cast<unsigned>(resolved_unsigned(options, "f.eval-depth-limit", 256));
     options.function_sections =
         resolved_bool(options, "f.function-sections");
     options.data_sections = resolved_bool(options, "f.data-sections");

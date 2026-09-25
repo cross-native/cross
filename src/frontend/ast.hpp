@@ -348,8 +348,16 @@ struct GlobalLabelDecl {
     std::vector<Attribute> attributes;
 };
 
+struct EvaluationLimits {
+    std::uint64_t bytes{16 * 1024 * 1024};
+    std::uint64_t memory{64 * 1024 * 1024};
+    std::uint64_t steps{1000000};
+    unsigned depth{256};
+};
+
 struct Program {
     unsigned address_bits{64};
+    EvaluationLimits evaluation_limits;
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
     std::vector<StaticAssertDecl> static_assertions;

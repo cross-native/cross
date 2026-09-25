@@ -789,6 +789,9 @@ int cc_main(int argc, char** argv) {
     if (!subtarget) return 1;
     Program program;
     program.address_bits = subtarget->abi_info().address_bits;
+    program.evaluation_limits = {
+        options.eval_byte_limit, options.eval_memory_limit,
+        options.eval_step_limit, options.eval_depth_limit};
     // Macro execution precedes source declarations. Scalar layout queries
     // nevertheless use the same target-owned context as later required folds.
     auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);
@@ -806,7 +809,8 @@ int cc_main(int argc, char** argv) {
     for (const auto* preprocessed_source : compilation_units) {
         const auto* source = expand_procedural_macros(
             sources, *preprocessed_source, diagnostics,
-            program.address_bits, macro_size, macro_align);
+            program.address_bits, macro_size, macro_align,
+            program.evaluation_limits);
         if (diagnostics.errors() != 0) return 1;
         if (!validate_embeds(*source, diagnostics)) return 1;
         Lexer lexer(*source, diagnostics);

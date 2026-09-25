@@ -43,7 +43,8 @@ using LayoutQuery =
 std::optional<TokenSequence> evaluate_procedural_body(
     const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
-    std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics);
+    std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
+    EvaluationLimits limits = {});
 
 // Static assertions are retained until target HIR has established nominal
 // layouts.  The callbacks keep target layout ownership out of the frontend.

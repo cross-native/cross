@@ -17,12 +17,14 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            Diagnostics& diagnostics,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
-                                           const LayoutQuery& align_of);
+                                           const LayoutQuery& align_of,
+                                           EvaluationLimits limits = {});
 const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            const SourceFile& source,
                                            Diagnostics& diagnostics,
                                            unsigned address_bits,
                                            const LayoutQuery& size_of,
-                                           const LayoutQuery& align_of);
+                                           const LayoutQuery& align_of,
+                                           EvaluationLimits limits = {});
 
 } // namespace cross

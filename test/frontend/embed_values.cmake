@@ -52,6 +52,48 @@ foreach(level O0 O2)
     endforeach()
 endforeach()
 
+set(limit_source "${directory}/limits.x")
+file(WRITE "${limit_source}"
+    "static uptr count(in $::meta::bytes value) { return $::meta::len(value); }\n"
+    "[[eval_only]] static uptr outer() { return count($::embed(\"payload.bin\")); }\n"
+    "global const u8 data[] = $::embed(\"payload.bin\");\n"
+    "global uptr size = outer();\n")
+foreach(case byte memory steps depth)
+    if(case STREQUAL byte)
+        set(option eval-byte-limit)
+        set(low 4)
+        set(high 5)
+        set(expected "embedded asset exceeds the target uptr or 4-byte limit")
+    elseif(case STREQUAL memory)
+        set(option eval-memory-limit)
+        set(low 9)
+        set(high 10)
+        set(expected "meta memory budget exceeded 9 bytes")
+    elseif(case STREQUAL steps)
+        set(option eval-step-limit)
+        set(low 1)
+        set(high 100)
+        set(expected "instruction budget exceeded 1")
+    else()
+        set(option eval-depth-limit)
+        set(low 1)
+        set(high 2)
+        set(expected "recursion depth exceeded 1")
+    endif()
+    execute_process(COMMAND "${CC}" -S "-f${option}=${low}"
+        "${limit_source}" -o "${OUTPUT}-${case}-low.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(status EQUAL 0 OR NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "${case} limit was not enforced\n${out}\n${err}")
+    endif()
+    execute_process(COMMAND "${CC}" -S "-f${option}=${high}"
+        "${limit_source}" -o "${OUTPUT}-${case}-high.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "${case} limit override did not compile\n${out}\n${err}")
+    endif()
+endforeach()
+
 foreach(case unassigned_prefix double_freeze over_capacity nonstatic_buffer meta_memory)
     if(case STREQUAL unassigned_prefix)
         string(CONCAT body "$::meta::buffer value = $::meta::alloc(1u32);\n"

@@ -32,6 +32,41 @@ foreach(level O0 O2)
     endif()
 endforeach()
 
+set(limit_input "${OUTPUT}-limits.x")
+file(WRITE "${limit_input}"
+    "[[macro]] static $::meta::tokens emit(in $::meta::tokens input) { return $::quote { global u32 emitted; }; }\n"
+    "emit! {}\n")
+foreach(case byte memory steps)
+    if(case STREQUAL byte)
+        set(option eval-byte-limit)
+        set(low 1)
+        set(high 4096)
+        set(expected "token construction budget exceeded 1 bytes")
+    elseif(case STREQUAL memory)
+        set(option eval-memory-limit)
+        set(low 1)
+        set(high 4096)
+        set(expected "meta memory budget exceeded 1 bytes")
+    else()
+        set(option eval-step-limit)
+        set(low 1)
+        set(high 100)
+        set(expected "instruction budget exceeded 1")
+    endif()
+    execute_process(COMMAND "${CC}" -S "-f${option}=${low}"
+        "${limit_input}" -o "${OUTPUT}-${case}-low.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(status EQUAL 0 OR NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "procedural ${case} limit was not enforced\n${out}\n${err}")
+    endif()
+    execute_process(COMMAND "${CC}" -S "-f${option}=${high}"
+        "${limit_input}" -o "${OUTPUT}-${case}-high.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "procedural ${case} override failed\n${out}\n${err}")
+    endif()
+endforeach()
+
 foreach(target mips-unknown-elf mipsel-unknown-elf mips64-unknown-elf)
     set(flags -target "${target}")
     if(target STREQUAL mips64-unknown-elf)

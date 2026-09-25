@@ -2443,6 +2443,22 @@ public:
           size_of_(size_of), align_of_(align_of), pointer_resolver_(pointer_resolver),
           procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)) {}
 
+    bool charge_input_tokens(const TokenSequence& tokens, SourceLocation location) {
+        constexpr std::size_t metadata_cost = 128;
+        std::size_t size = 0;
+        const auto byte_limit = static_cast<std::size_t>(program_.evaluation_limits.bytes);
+        for (const auto& token : tokens) {
+            if (size > byte_limit || token.text.size() > byte_limit - size ||
+                metadata_cost > byte_limit - size - token.text.size()) {
+                fail(location, "translation-time token input budget exceeded " +
+                    std::to_string(byte_limit) + " bytes");
+                return false;
+            }
+            size += token.text.size() + metadata_cost;
+        }
+        return charge_meta_bytes(size, location);
+    }
+
     std::unique_ptr<Expr> required_pointer(const Expr& source, const TypePtr& destination) {
         if (!validate_required_tree(source)) return {};
         auto value = expression(source);
@@ -2564,9 +2580,10 @@ public:
     std::optional<EvalValue> call(const FunctionDecl& function,
                                   const std::vector<EvalValue>& arguments,
                                   SourceLocation location) {
-        if (++depth_ > 256) {
+        if (++depth_ > program_.evaluation_limits.depth) {
             fail(location,
-                 "translation-time recursion depth exceeded 256");
+                 "translation-time recursion depth exceeded " +
+                     std::to_string(program_.evaluation_limits.depth));
             --depth_;
             return std::nullopt;
         }
@@ -2813,19 +2830,22 @@ private:
     bool append_tokens(TokenSequence& result, const TokenSequence& part, SourceLocation location) {
         // Charge materialized output, including intermediate copies, so a
         // bounded loop cannot grow token storage exponentially without limit.
-        constexpr std::size_t budget = 16 * 1024 * 1024;
+        const auto budget = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         // Logical metadata charge, not sizeof(MetaToken): resource decisions
         // must not depend on the host C++ library's string/pointer layout.
         constexpr std::size_t metadata_cost = 128;
         for (const auto& token : part) {
-            if (token.text.size() >= budget - token_bytes_ ||
+            if (token.text.size() > budget - token_bytes_ ||
                 metadata_cost > budget - token_bytes_ - token.text.size()) {
-                fail(location, "translation-time token construction budget exceeded 16777216 bytes");
+                fail(location, "translation-time token construction budget exceeded " +
+                    std::to_string(budget) + " bytes");
                 return false;
             }
+            const auto memory_budget = static_cast<std::size_t>(program_.evaluation_limits.memory);
             if (token.text.size() + metadata_cost >
-                64 * 1024 * 1024 - meta_bytes_ - token_bytes_) {
-                fail(location, "translation-time meta memory budget exceeded 67108864 bytes");
+                memory_budget - meta_bytes_ - token_bytes_) {
+                fail(location, "translation-time meta memory budget exceeded " +
+                    std::to_string(memory_budget) + " bytes");
                 return false;
             }
             token_bytes_ += token.text.size() + metadata_cost;
@@ -2835,10 +2855,11 @@ private:
     }
 
     bool charge_meta_bytes(std::size_t size, SourceLocation location) {
-        constexpr std::size_t budget = 64 * 1024 * 1024;
+        const auto budget = static_cast<std::size_t>(program_.evaluation_limits.memory);
         if (meta_bytes_ > budget - token_bytes_ ||
             size > budget - token_bytes_ - meta_bytes_) {
-            fail(location, "translation-time meta memory budget exceeded 67108864 bytes");
+            fail(location, "translation-time meta memory budget exceeded " +
+                std::to_string(budget) + " bytes");
             return false;
         }
         meta_bytes_ += size;
@@ -3873,10 +3894,11 @@ private:
     }
 
     bool step(SourceLocation location) {
-        if (++steps_ <= 1000000) return true;
+        if (++steps_ <= program_.evaluation_limits.steps) return true;
         if (!budget_diagnosed_) {
             fail(location,
-                 "translation-time instruction budget exceeded 1000000");
+                 "translation-time instruction budget exceeded " +
+                     std::to_string(program_.evaluation_limits.steps));
             budget_diagnosed_ = true;
         }
         return false;
@@ -4292,7 +4314,7 @@ private:
             return token_value(std::move(result));
         }
         const auto& name = expression.left->text;
-        constexpr std::size_t byte_budget = 16 * 1024 * 1024;
+        const auto byte_budget = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         if (name == "$::embed") {
             const auto identity = token_origin(expression.left->location).embed;
             if (expression.arguments.size() != 1 || !identity || !identity->snapshot ||
@@ -4310,7 +4332,8 @@ private:
                 const auto end = input.tellg();
                 if (end < 0 || static_cast<std::uint64_t>(end) > byte_budget ||
                     !fits_unsigned(UInt128{static_cast<std::uint64_t>(end)}, program_.address_bits)) {
-                    fail(expression.location, "embedded asset exceeds the target uptr or 16777216-byte limit");
+                    fail(expression.location, "embedded asset exceeds the target uptr or " +
+                        std::to_string(byte_budget) + "-byte limit");
                     return std::nullopt;
                 }
                 std::string data(static_cast<std::size_t>(end), '\0');
@@ -4413,7 +4436,8 @@ private:
                 if (second->byte_length > byte_budget - source->byte_length ||
                     !fits_unsigned(UInt128{source->byte_length + second->byte_length},
                                    program_.address_bits)) {
-                    fail(expression.location, "concatenated bytes exceed the target uptr or 16777216-byte limit");
+                    fail(expression.location, "concatenated bytes exceed the target uptr or " +
+                        std::to_string(byte_budget) + "-byte limit");
                     return std::nullopt;
                 }
                 if (!charge_meta_bytes(source->byte_length + second->byte_length,
@@ -4472,7 +4496,8 @@ private:
                     capacity->integer.high != 0 ||
                     capacity->integer.low > byte_budget) {
                     fail(expression.arguments[0]->location,
-                        "$::meta::alloc capacity exceeds target uptr or 16777216 bytes");
+                        "$::meta::alloc capacity exceeds target uptr or " +
+                        std::to_string(byte_budget) + " bytes");
                     return std::nullopt;
                 }
                 if (!charge_meta_bytes(
@@ -6563,12 +6588,18 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
 std::optional<TokenSequence> evaluate_procedural_body(
     const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
-    std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics) {
+    std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
+    EvaluationLimits limits) {
     Program context;
     context.address_bits = address_bits;
+    context.evaluation_limits = limits;
     const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &macro, macro.source_namespace,
                         &size_of, &align_of, nullptr, std::move(macro_context));
+    if (!evaluator.charge_input_tokens(input, invocation)) {
+        evaluator.diagnose(invocation);
+        return std::nullopt;
+    }
     if (!evaluator.validate_procedural_body(macro)) {
         evaluator.diagnose(macro.location);
         diagnostics.note(invocation, "while expanding procedural macro '" + macro.name + "'");

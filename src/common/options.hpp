@@ -128,6 +128,10 @@ struct CompilerOptions {
     bool finite_math_only{};
     bool signed_zeros{true};
     bool evaluate_calls{true};
+    std::uint64_t eval_byte_limit{16 * 1024 * 1024};
+    std::uint64_t eval_memory_limit{64 * 1024 * 1024};
+    std::uint64_t eval_step_limit{1000000};
+    unsigned eval_depth_limit{256};
     bool omit_frame_pointer{};
     bool tree_ccp{};
     bool tree_bit_ccp{};
