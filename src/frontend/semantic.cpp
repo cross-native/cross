@@ -2324,6 +2324,19 @@ TypePtr infer_generic_actual(const Expr& expression,
         return element ? vector_type(element, shape->lanes, shape->scalable)
                        : TypePtr{};
     };
+    const auto vector_mask = [&](const TypePtr& type) -> TypePtr {
+        if (!type || type->kind != Type::Kind::Vector || !type->element)
+            return {};
+        const auto bits = type->element->builtin == BuiltinType::Fptr
+            ? program.address_bits : type_bits(type->element);
+        const auto mask = bits == 8 ? BuiltinType::I8
+            : bits == 16 ? BuiltinType::I16
+            : bits == 32 ? BuiltinType::I32
+            : bits == 64 ? BuiltinType::I64
+            : BuiltinType::Void;
+        return mask == BuiltinType::Void ? TypePtr{}
+            : vector_type(builtin_type(mask), type->lanes, type->scalable);
+    };
     switch (expression.kind) {
     case Expr::Kind::Integer: {
         const auto value = parse_integer_value(expression);
@@ -2389,12 +2402,14 @@ TypePtr infer_generic_actual(const Expr& expression,
                                           state, false)
                    : TypePtr{};
     case Expr::Kind::Unary: {
-        if (expression.text == "!") return builtin_type(BuiltinType::Bool);
         if (!expression.left) return {};
         auto operand = infer_generic_actual(
             *expression.left, caller, program, state,
             expression.text != "&");
         if (!operand) return {};
+        if (expression.text == "!")
+            return operand->kind == Type::Kind::Vector
+                ? vector_mask(operand) : builtin_type(BuiltinType::Bool);
         if (expression.text == "&") return pointer_type(operand);
         if (expression.text == "*")
             return operand->kind == Type::Kind::Pointer
@@ -2455,16 +2470,7 @@ TypePtr infer_generic_actual(const Expr& expression,
             const auto common = common_numeric(compared_left, compared_right);
             if (!common || common->kind != Type::Kind::Vector ||
                 !common->element) return {};
-            const auto bits = common->element->builtin == BuiltinType::Fptr
-                ? program.address_bits : type_bits(common->element);
-            const auto mask = bits == 8 ? BuiltinType::I8
-                : bits == 16 ? BuiltinType::I16
-                : bits == 32 ? BuiltinType::I32
-                : bits == 64 ? BuiltinType::I64
-                : BuiltinType::Void;
-            return mask == BuiltinType::Void ? TypePtr{}
-                : vector_type(builtin_type(mask), common->lanes,
-                              common->scalable);
+            return vector_mask(common);
         }
         const auto left = infer_generic_actual(*expression.left, caller,
                                                program, state);
