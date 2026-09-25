@@ -19,6 +19,10 @@ static T first<T, U>(in T left, in U right) {
     return left;
 }
 
+static T same_shape<T>(in T left, in T right) {
+    return left;
+}
+
 static T *echo_pointer<T>(in T *value) {
     return value;
 }
@@ -81,6 +85,7 @@ namespace selected_import {
 typedef i32 (*generic_callback)(in i32 value) [[abi("ms_abi")]];
 typedef i32 (*generic_alias_callback)(in i32 value) [[abi("ms")]];
 typedef i32 i32x4 [[ext_vector_type(4)]];
+typedef f32 f32x4 [[ext_vector_type(4)]];
 struct generic_pair { i32 left; i32 right; };
 
 [[abi("ms_abi"), noinline]] static i32 callback_plus_two(in i32 value) {
@@ -98,6 +103,9 @@ global i32 generic_angle_entry() {
     i32x4 vector_pair_sum = first(vector + vector, 0i32);
     i32x4 vector_mask = first(vector & 1i32, 0i32);
     i32x4 vector_shift = first(vector << 1i32, 0i32);
+    i32x4 vector_compare = same_shape(vector + vector > vector, vector);
+    f32x4 float_vector = 1.5f32;
+    i32x4 float_compare = same_shape(float_vector > 1.0f32, vector);
     i32 output;
     assign(output, 17i32);
     i32 *pointer = echo_pointer(&output);
@@ -136,6 +144,7 @@ global i32 generic_angle_entry() {
            selected < counted && inferred == 11i32 && partial == 7i32 &&
            vector_sum[0] == 5i32 && vector_pair_sum[1] == 6i32 &&
            vector_mask[2] == 1i32 && vector_shift[3] == 6i32 &&
+           vector_compare[0] != 0i32 && float_compare[1] != 0i32 &&
            *pointer == 17i32 && advanced == sequence + 1i32 &&
            *advanced == 4i32 && pointer_distance &&
            copied(39i32) == 41i32 &&

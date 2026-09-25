@@ -2439,11 +2439,33 @@ TypePtr infer_generic_actual(const Expr& expression,
             result->is_volatile = result->is_volatile || base->is_volatile;
             return adjusted(result);
         }
+        if (expression.text == "&&" || expression.text == "||")
+            return builtin_type(BuiltinType::Bool);
         if (expression.text == "==" || expression.text == "!=" ||
             expression.text == "<" || expression.text == "<=" ||
-            expression.text == ">" || expression.text == ">=" ||
-            expression.text == "&&" || expression.text == "||")
-            return builtin_type(BuiltinType::Bool);
+            expression.text == ">" || expression.text == ">=") {
+            const auto compared_left = infer_generic_actual(
+                *expression.left, caller, program, state);
+            const auto compared_right = infer_generic_actual(
+                *expression.right, caller, program, state);
+            if (!compared_left || !compared_right) return {};
+            if (compared_left->kind != Type::Kind::Vector &&
+                compared_right->kind != Type::Kind::Vector)
+                return builtin_type(BuiltinType::Bool);
+            const auto common = common_numeric(compared_left, compared_right);
+            if (!common || common->kind != Type::Kind::Vector ||
+                !common->element) return {};
+            const auto bits = common->element->builtin == BuiltinType::Fptr
+                ? program.address_bits : type_bits(common->element);
+            const auto mask = bits == 8 ? BuiltinType::I8
+                : bits == 16 ? BuiltinType::I16
+                : bits == 32 ? BuiltinType::I32
+                : bits == 64 ? BuiltinType::I64
+                : BuiltinType::Void;
+            return mask == BuiltinType::Void ? TypePtr{}
+                : vector_type(builtin_type(mask), common->lanes,
+                              common->scalable);
+        }
         const auto left = infer_generic_actual(*expression.left, caller,
                                                program, state);
         if (expression.text == "index") {
