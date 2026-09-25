@@ -124,6 +124,7 @@ struct eval_pair { u8 tag; uptr value; };
 struct eval_packed [[packed]] { u8 tag; uptr value; };
 struct eval_collection { u8 tag; u16 values[2]; };
 struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; };
+struct eval_packed_outer [[packed]] { u8 tag; struct eval_pair inner; };
 
 static $::meta::bytes zero_outer_bytes() {
     $::meta::buffer output = $::meta::alloc(sizeof(struct eval_outer));
@@ -151,6 +152,32 @@ static $::meta::bytes zero_outer_bytes() {
     return first->tag == 7u8 && first->value == 11uptr &&
            second->tag == 13u8 && second->value == 17uptr &&
            second - first == 1iptr;
+}
+
+static $::meta::bytes packed_record_bytes() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_packed));
+    struct eval_packed *record =
+        (struct eval_packed *)$::meta::data(output);
+    record->tag = 0xa5u8;
+    record->value = 0x12345678uptr;
+    return $::meta::freeze(output, sizeof(struct eval_packed));
+}
+
+[[eval_only]] static uptr packed_record_member_ok() {
+    const struct eval_packed *record =
+        (const struct eval_packed *)$::meta::data(packed_record_bytes());
+    return record->tag == 0xa5u8 && record->value == 0x12345678uptr;
+}
+
+[[eval_only]] static uptr nested_packed_record_ok() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_packed_outer));
+    struct eval_packed_outer *outer =
+        (struct eval_packed_outer *)$::meta::data(output);
+    outer->tag = 3u8;
+    outer->inner.tag = 5u8;
+    outer->inner.value = 7uptr;
+    return outer->tag == 3u8 && outer->inner.tag == 5u8 &&
+           outer->inner.value == 7uptr;
 }
 
 [[eval_only]] static uptr record_array_member_ok() {
@@ -265,6 +292,9 @@ global uptr array_view_checked = array_view_ok();
 global uptr target_sized_array_checked = target_sized_array_ok();
 global uptr target_record_layout_checked = target_record_layout_ok();
 global uptr record_member_checked = record_member_ok();
+global const u8 packed_record[] = packed_record_bytes();
+global uptr packed_record_member_checked = packed_record_member_ok();
+global uptr nested_packed_record_checked = nested_packed_record_ok();
 global uptr record_array_member_checked = record_array_member_ok();
 global uptr nested_record_member_checked = nested_record_member_ok();
 global uptr direct_nested_record_checked =

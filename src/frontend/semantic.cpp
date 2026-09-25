@@ -2107,6 +2107,9 @@ struct EvalMetaPointer {
     std::size_t view_offset{};
     std::size_t view_length{};
     std::size_t position{};
+    // A projected packed member can be accessed at its declared placement
+    // alignment; changing pointee type drops this lvalue privilege.
+    std::optional<std::size_t> access_alignment;
 };
 
 struct EvalValue {
@@ -3938,6 +3941,8 @@ private:
                 fail(location, "buffer data pointer was used after freeze");
                 return std::nullopt;
             }
+            if (!same_type(value.type->pointee, type->pointee))
+                value.meta_pointer->access_alignment.reset();
             value.type = clone_type(type);
             return value;
         }
@@ -4306,7 +4311,9 @@ private:
             return std::nullopt;
         }
         const auto index = pointer.view_offset + pointer.position;
-        const auto alignment = meta_object_alignment(base.type->pointee);
+        const auto alignment = pointer.access_alignment
+            ? pointer.access_alignment
+            : meta_object_alignment(base.type->pointee);
         if (!alignment || index % *alignment != 0) {
             fail(location, "misaligned meta pointer access for target scalar type");
             return std::nullopt;
@@ -4326,7 +4333,9 @@ private:
             return std::nullopt;
         }
         const auto offset = pointer.view_offset + pointer.position;
-        const auto alignment = meta_object_alignment(base.type->pointee);
+        const auto alignment = pointer.access_alignment
+            ? pointer.access_alignment
+            : meta_object_alignment(base.type->pointee);
         if (!alignment || offset % *alignment != 0) {
             fail(location, "misaligned meta pointer access for target scalar type");
             return std::nullopt;
@@ -4385,11 +4394,6 @@ private:
             fail(expression.location, "meta record alignment is unavailable");
             return std::nullopt;
         }
-        if (layout->alignment < *member_alignment) {
-            fail(expression.location,
-                 "packed meta record member access is not implemented");
-            return std::nullopt;
-        }
         auto& pointer = *base->meta_pointer;
         if (pointer.position > pointer.view_length ||
             *record_size > pointer.view_length - pointer.position) {
@@ -4397,10 +4401,15 @@ private:
             return std::nullopt;
         }
         const auto record_offset = pointer.view_offset + pointer.position;
-        if (record_offset % *record_alignment != 0) {
+        const auto effective_record_alignment = pointer.access_alignment
+            .value_or(*record_alignment);
+        if (record_offset % effective_record_alignment != 0) {
             fail(expression.location, "misaligned meta pointer access for target record type");
             return std::nullopt;
         }
+        pointer.access_alignment = std::min<std::size_t>(
+            effective_record_alignment,
+            std::min<std::size_t>(layout->alignment, *member_alignment));
         pointer.view_offset = record_offset +
             static_cast<std::size_t>(layout->offset);
         pointer.view_length = *member_size;

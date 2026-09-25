@@ -146,7 +146,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         different_pointer_views array_row_overread array_row_write_overflow
         array_row_misaligned array_row_unassigned array_row_effective_type
         array_row_views array_const_loss array_frozen record_misaligned
-        record_out_of_view record_packed_member record_unassigned
+        record_out_of_view packed_cast_misaligned record_unassigned
         record_effective_type record_const_loss record_bit_field
         record_array_overread nested_record_overread nested_record_const_write)
     if(case STREQUAL unassigned_read)
@@ -306,13 +306,14 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "struct eval_pair *record = (struct eval_pair *)$::meta::data(value);\n"
             "return record->value;")
         set(expected "meta pointer read is outside its view")
-    elseif(case STREQUAL record_packed_member)
+    elseif(case STREQUAL packed_cast_misaligned)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_packed));\n"
             "struct eval_packed *record = (struct eval_packed *)$::meta::data(value);\n"
             "record->value = 7uptr;\n"
-            "return 0u32;")
-        set(expected "packed meta record member access is not implemented")
+            "uptr *ordinary = (uptr *)($::meta::data(value) + 1u32);\n"
+            "return ordinary[0u32];")
+        set(expected "misaligned meta pointer access")
     elseif(case STREQUAL record_unassigned)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
@@ -411,11 +412,21 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
         set(length_directive "[.]quad 5")
         set(success_directive "[.]quad 1")
         set(distance_directive "[.]quad 2")
+        if(target STREQUAL mips64el-unknown-elf)
+            set(packed_record_bytes "165,120,86,52,18,0,0,0,0")
+        else()
+            set(packed_record_bytes "165,0,0,0,0,18,52,86,120")
+        endif()
     else()
         list(APPEND flags -mabi=o32)
         set(length_directive "[.]long 5")
         set(success_directive "[.]long 1")
         set(distance_directive "[.]long 2")
+        if(target STREQUAL mipsel-unknown-elf)
+            set(packed_record_bytes "165,120,86,52,18")
+        else()
+            set(packed_record_bytes "165,18,52,86,120")
+        endif()
     endif()
     execute_process(COMMAND "${CC}" -S ${flags}
         "${directory}/embed_values.x" -o "${OUTPUT}-${target}.s"
@@ -461,6 +472,9 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "target_sized_array_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "target_record_layout_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "packed_record:\n[^\n]*[.]byte ${packed_record_bytes}" OR
+       NOT assembly MATCHES "packed_record_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "nested_packed_record_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_array_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "nested_record_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "direct_nested_record_checked:\n[^\n]*${success_directive}" OR
