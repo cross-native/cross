@@ -2288,8 +2288,8 @@ TypePtr infer_generic_actual(const Expr& expression,
             : (shape.is_signed ? BuiltinType::I128 : BuiltinType::U128);
         return builtin_type(kind);
     };
-    const auto common_numeric = [&](const TypePtr& left,
-                                    const TypePtr& right) -> TypePtr {
+    const auto common_scalar_numeric = [&](const TypePtr& left,
+                                           const TypePtr& right) -> TypePtr {
         if (!left || !right ||
             (!is_integer(left) && !is_floating(left)) ||
             (!is_integer(right) && !is_floating(right))) return {};
@@ -2306,6 +2306,23 @@ TypePtr infer_generic_actual(const Expr& expression,
         return integer_result(common_integer_type(integer_shape(left),
                                                   integer_shape(right)),
                               left, right);
+    };
+    const auto common_numeric = [&](const TypePtr& left,
+                                    const TypePtr& right) -> TypePtr {
+        if (!left || !right) return {};
+        const bool left_vector = left->kind == Type::Kind::Vector;
+        const bool right_vector = right->kind == Type::Kind::Vector;
+        if (!left_vector && !right_vector)
+            return common_scalar_numeric(left, right);
+        if (left_vector && right_vector &&
+            (left->lanes != right->lanes ||
+             left->scalable != right->scalable)) return {};
+        const auto& shape = left_vector ? left : right;
+        const auto element = common_scalar_numeric(
+            left_vector ? left->element : left,
+            right_vector ? right->element : right);
+        return element ? vector_type(element, shape->lanes, shape->scalable)
+                       : TypePtr{};
     };
     switch (expression.kind) {
     case Expr::Kind::Integer: {
@@ -2451,13 +2468,23 @@ TypePtr infer_generic_actual(const Expr& expression,
         if (expression.text == "-" && left->kind == Type::Kind::Pointer &&
             right->kind == Type::Kind::Pointer)
             return builtin_type(BuiltinType::Iptr);
+        const auto integer_or_integer_vector = [](const TypePtr& type) {
+            return is_integer(type) ||
+                   (type->kind == Type::Kind::Vector &&
+                    is_integer(type->element));
+        };
         if ((expression.text == "<<" || expression.text == ">>") &&
-            is_integer(left) && is_integer(right))
-            return integer_result(promote_integer(integer_shape(left)),
-                                  left, {});
+            integer_or_integer_vector(left) &&
+            integer_or_integer_vector(right))
+            return is_integer(left)
+                ? integer_result(promote_integer(integer_shape(left)),
+                                 left, {})
+                : vector_type(clone_type(left->element), left->lanes,
+                              left->scalable);
         if ((expression.text == "%" || expression.text == "&" ||
              expression.text == "|" || expression.text == "^") &&
-            (!is_integer(left) || !is_integer(right))) return {};
+            (!integer_or_integer_vector(left) ||
+             !integer_or_integer_vector(right))) return {};
         if (expression.text == "+" || expression.text == "-" ||
             expression.text == "*" || expression.text == "/" ||
             expression.text == "%" || expression.text == "&" ||
