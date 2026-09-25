@@ -148,7 +148,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         array_row_views array_const_loss array_frozen record_misaligned
         record_out_of_view record_packed_member record_unassigned
         record_effective_type record_const_loss record_bit_field
-        record_array_overread)
+        record_array_overread nested_record_overread nested_record_const_write)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -346,6 +346,19 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "struct eval_collection *record = (struct eval_collection *)$::meta::data(value);\n"
             "return record->values[2u32];")
         set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL nested_record_overread)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_outer));\n"
+            "struct eval_outer *outer = (struct eval_outer *)$::meta::data(value);\n"
+            "return outer->cells[2u32].value;")
+        set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL nested_record_const_write)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_outer));\n"
+            "const struct eval_outer *outer = (const struct eval_outer *)$::meta::data(value);\n"
+            "outer->inner.value = 7uptr;\n"
+            "return 0u32;")
+        set(expected "meta pointer write requires mutable scalar storage")
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -367,6 +380,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         "struct eval_packed [[packed]] { u8 tag; uptr value; };\n"
         "struct eval_bits { u32 value : 3; };\n"
         "struct eval_collection { u8 tag; u16 values[2]; };\n"
+        "struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; };\n"
         "[[eval_only]] static uptr bad() { ${body} }\n"
         "global uptr result = bad();\n")
     execute_process(COMMAND "${CC}" -S "${input}"
@@ -448,6 +462,8 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "target_record_layout_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_array_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "nested_record_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "direct_nested_record_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "float_bytes:\n[^\n]*[.]byte ${float_bytes}" OR
        NOT assembly MATCHES "double_bytes:\n[^\n]*[.]byte ${double_bytes}" OR
        NOT assembly MATCHES "quad_bytes:\n[^\n]*[.]byte ${quad_bytes}" OR

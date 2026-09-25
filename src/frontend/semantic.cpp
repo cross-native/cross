@@ -3484,7 +3484,10 @@ private:
                     return false;
                 }
             }
-            if (pointer_resolver_ && member) return true;
+            if (member && (pointer_resolver_ ||
+                           (selected_record_member(node) && node.left &&
+                            meta_pointer_source(*node.left))))
+                return true;
             const auto left = node.left ? expression_type(*node.left) : nullptr;
             const auto right = node.right ? expression_type(*node.right) : nullptr;
             const bool indexing = node.kind == Expr::Kind::Binary && node.text == "index";
@@ -3639,6 +3642,12 @@ private:
         if (source.kind == Expr::Kind::Parenthesized ||
             source.kind == Expr::Kind::Cast)
             return source.left && meta_pointer_source(*source.left);
+        if (source.kind == Expr::Kind::Unary && source.text == "*")
+            return source.left && meta_pointer_source(*source.left);
+        if (source.kind == Expr::Kind::Binary &&
+            (source.text == "index" || source.text == "member" ||
+             source.text == "pointer_member"))
+            return source.left && meta_pointer_source(*source.left);
         if (source.kind == Expr::Kind::Binary &&
             (source.text == "+" || source.text == "-"))
             return (source.left && meta_pointer_source(*source.left)) ||
@@ -3696,7 +3705,8 @@ private:
             auto type = expression_type(*expression.left, expression.text != "&");
             if (!type) return {};
             if (pointer_resolver_ && expression.text == "&") return pointer_type(type);
-            if (pointer_resolver_ && expression.text == "*" && type->kind == Type::Kind::Pointer)
+            if (expression.text == "*" && type->kind == Type::Kind::Pointer &&
+                (pointer_resolver_ || meta_pointer_source(*expression.left)))
                 return type->pointee;
             if (is_floating(type)) return type;
             if (!is_integer(type)) return {};
@@ -4338,7 +4348,9 @@ private:
         if (!expression.left || !expression.right ||
             expression.right->kind != Expr::Kind::Name)
             return std::nullopt;
-        auto base = this->expression(*expression.left);
+        auto base = expression.text == "member"
+            ? meta_designator_pointer(*expression.left)
+            : this->expression(*expression.left);
         if (!base || !base->meta_pointer || !sized_meta_pointer(*base, expression.location) ||
             base->type->pointee->kind != Type::Kind::Record ||
             base->type->pointee->is_union) {
@@ -4401,6 +4413,30 @@ private:
         pointer_type_value->address_space = base->type->address_space;
         base->type = std::move(pointer_type_value);
         return base;
+    }
+
+    std::optional<EvalValue> meta_designator_pointer(const Expr& source) {
+        const Expr* designator = &source;
+        while (designator->kind == Expr::Kind::Parenthesized &&
+               designator->left)
+            designator = designator->left.get();
+        if (designator->kind == Expr::Kind::Unary &&
+            designator->text == "*" && designator->left)
+            return this->expression(*designator->left);
+        if (designator->kind == Expr::Kind::Binary &&
+            (designator->text == "member" ||
+             designator->text == "pointer_member"))
+            return meta_member_pointer(*designator);
+        if (designator->kind == Expr::Kind::Binary &&
+            designator->text == "index" && designator->left &&
+            designator->right) {
+            auto base = this->expression(*designator->left);
+            auto index = this->expression(*designator->right);
+            if (!base || !index || !base->meta_pointer) return std::nullopt;
+            return meta_pointer_offset(*base, *index, false,
+                                       designator->location);
+        }
+        return std::nullopt;
     }
 
     std::optional<EvalValue> meta_pointer_offset(EvalValue base,
@@ -4640,7 +4676,8 @@ private:
     }
 
     std::optional<EvalValue> binary(const Expr& expression) {
-        if (expression.text == "pointer_member") {
+        if (expression.text == "pointer_member" ||
+            expression.text == "member") {
             auto pointer = meta_member_pointer(expression);
             return pointer ? read_meta_pointer(*pointer, expression.location)
                            : std::nullopt;
@@ -4748,23 +4785,12 @@ private:
         while (designator && designator->kind == Expr::Kind::Parenthesized)
             designator = designator->left.get();
         if (designator &&
-            ((designator->kind == Expr::Kind::Binary && designator->text == "index") ||
-             (designator->kind == Expr::Kind::Binary && designator->text == "pointer_member") ||
+            ((designator->kind == Expr::Kind::Binary &&
+              (designator->text == "index" ||
+               designator->text == "member" ||
+               designator->text == "pointer_member")) ||
              (designator->kind == Expr::Kind::Unary && designator->text == "*"))) {
-            std::optional<EvalValue> pointer;
-            if (designator->kind == Expr::Kind::Binary &&
-                designator->text == "pointer_member") {
-                pointer = meta_member_pointer(*designator);
-            } else if (designator->kind == Expr::Kind::Binary) {
-                auto base = this->expression(*designator->left);
-                auto index = this->expression(*designator->right);
-                if (!base || !index) return std::nullopt;
-                if (base->meta_pointer)
-                    pointer = meta_pointer_offset(*base, *index, false,
-                                                  designator->location);
-            } else {
-                pointer = this->expression(*designator->left);
-            }
+            auto pointer = meta_designator_pointer(*designator);
             if (!pointer || !pointer->meta_pointer) {
                 fail(designator->location,
                     "translation-time assignment requires a meta data pointer");

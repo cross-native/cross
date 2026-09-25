@@ -123,6 +123,15 @@ typedef uptr pointer_pair[2];
 struct eval_pair { u8 tag; uptr value; };
 struct eval_packed [[packed]] { u8 tag; uptr value; };
 struct eval_collection { u8 tag; u16 values[2]; };
+struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; };
+
+static $::meta::bytes zero_outer_bytes() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_outer));
+    u8 *data = $::meta::data(output);
+    for (uptr index = 0uptr; index < sizeof(struct eval_outer); ++index)
+        data[index] = 0u8;
+    return $::meta::freeze(output, sizeof(struct eval_outer));
+}
 
 [[eval_only]] static uptr target_record_layout_ok() {
     return sizeof(struct eval_pair) == 2u32 * $::target::pointer_bytes &&
@@ -153,6 +162,21 @@ struct eval_collection { u8 tag; u16 values[2]; };
     record->values[1u32] = 0x3344u16;
     return record->tag == 3u8 && record->values[0u32] == 0x1122u16 &&
            record->values[1u32] == 0x3344u16;
+}
+
+[[eval_only]] static uptr nested_record_member_ok() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_outer));
+    struct eval_outer *outer = (struct eval_outer *)$::meta::data(output);
+    outer->tag = 3u8;
+    outer->inner.tag = 5u8;
+    outer->inner.value = 7uptr;
+    outer->cells[0u32].tag = 11u8;
+    outer->cells[1u32].value = 13uptr;
+    return (*outer).tag == 3u8 &&
+           outer[0u32].inner.tag == 5u8 &&
+           (*outer).inner.value == 7uptr &&
+           outer->cells[0u32].tag == 11u8 &&
+           outer->cells[1u32].value == 13uptr;
 }
 
 static $::meta::bytes packed_rows() {
@@ -242,6 +266,9 @@ global uptr target_sized_array_checked = target_sized_array_ok();
 global uptr target_record_layout_checked = target_record_layout_ok();
 global uptr record_member_checked = record_member_ok();
 global uptr record_array_member_checked = record_array_member_ok();
+global uptr nested_record_member_checked = nested_record_member_ok();
+global uptr direct_nested_record_checked =
+    ((const struct eval_outer *)$::meta::data(zero_outer_bytes()))->inner.tag == 0u8;
 global const u8 float_bytes[] = packed_float();
 global const u8 double_bytes[] = packed_double();
 global const u8 quad_bytes[] = packed_quad();
