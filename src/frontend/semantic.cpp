@@ -2110,6 +2110,9 @@ struct EvalMetaPointer {
     // A projected packed member can be accessed at its declared placement
     // alignment; changing pointee type drops this lvalue privilege.
     std::optional<std::size_t> access_alignment;
+    // Access through a union member may reinterpret another active member's
+    // representation; ordinary pointer casts do not inherit this permission.
+    bool union_member_view{};
 };
 
 struct EvalValue {
@@ -3941,8 +3944,10 @@ private:
                 fail(location, "buffer data pointer was used after freeze");
                 return std::nullopt;
             }
-            if (!same_type(value.type->pointee, type->pointee))
+            if (!same_type(value.type->pointee, type->pointee)) {
                 value.meta_pointer->access_alignment.reset();
+                value.meta_pointer->union_member_view = false;
+            }
             value.type = clone_type(type);
             return value;
         }
@@ -4179,7 +4184,7 @@ private:
 
     static bool meta_object_type(const TypePtr& type) {
         if (meta_scalar_type(type)) return true;
-        if (type && type->kind == Type::Kind::Record && !type->is_union)
+        if (type && type->kind == Type::Kind::Record)
             return true;
         return type && type->kind == Type::Kind::Array && type->lanes != 0 &&
             meta_object_type(type->element);
@@ -4361,8 +4366,7 @@ private:
             ? meta_designator_pointer(*expression.left)
             : this->expression(*expression.left);
         if (!base || !base->meta_pointer || !sized_meta_pointer(*base, expression.location) ||
-            base->type->pointee->kind != Type::Kind::Record ||
-            base->type->pointee->is_union) {
+            base->type->pointee->kind != Type::Kind::Record) {
             fail(expression.location,
                  "meta record member access requires a supported structure pointer");
             return std::nullopt;
@@ -4410,6 +4414,7 @@ private:
         pointer.access_alignment = std::min<std::size_t>(
             effective_record_alignment,
             std::min<std::size_t>(layout->alignment, *member_alignment));
+        pointer.union_member_view |= base->type->pointee->is_union;
         pointer.view_offset = record_offset +
             static_cast<std::size_t>(layout->offset);
         pointer.view_length = *member_size;
@@ -4554,7 +4559,8 @@ private:
                     return std::nullopt;
                 }
                 const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
-                if (!byte_meta_type(access_type) && tag != 0 &&
+                if (!pointer.union_member_view &&
+                    !byte_meta_type(access_type) && tag != 0 &&
                     !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
                                           access_type)) {
                     fail(location, "meta pointer read violates effective type");
@@ -4818,7 +4824,7 @@ private:
             if (!offset) return std::nullopt;
             const auto size = meta_scalar_size(*pointer);
             const auto access_type = pointer->type->pointee->builtin;
-            if (!byte_meta_type(access_type)) {
+            if (!byte_meta_type(access_type) && !target.union_member_view) {
                 for (std::size_t index = 0; index < size; ++index) {
                     const auto tag = target.mutable_buffer->effective_type[*offset + index];
                     if (tag != 0 &&

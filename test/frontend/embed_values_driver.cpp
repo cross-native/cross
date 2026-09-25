@@ -20,6 +20,9 @@ extern std::size_t record_member_checked;
 extern const std::uint8_t packed_record[9];
 extern std::size_t packed_record_member_checked;
 extern std::size_t nested_packed_record_checked;
+extern const std::uint8_t union_bytes[4];
+extern std::size_t union_member_checked;
+extern std::size_t nested_union_member_checked;
 extern std::size_t record_array_member_checked;
 extern std::size_t nested_record_member_checked;
 extern std::size_t direct_nested_record_checked;
@@ -64,6 +67,7 @@ int main() {
         array_view_checked != 1 || target_sized_array_checked != 1 ||
         target_record_layout_checked != 1 || record_member_checked != 1 ||
         packed_record_member_checked != 1 || nested_packed_record_checked != 1 ||
+        union_member_checked != 1 || nested_union_member_checked != 1 ||
         record_array_member_checked != 1 || nested_record_member_checked != 1 ||
         direct_nested_record_checked != 1)
         return 1;
@@ -79,6 +83,9 @@ int main() {
         {0xa5, 0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0};
     for (std::size_t index = 0; index < 9; ++index)
         if (packed_record[index] != expected_packed_record[index]) return 13;
+    constexpr std::uint8_t expected_union_bytes[] = {0, 0, 0xc0, 0x3f};
+    for (std::size_t index = 0; index < 4; ++index)
+        if (union_bytes[index] != expected_union_bytes[index]) return 14;
     constexpr std::uint8_t expected_float[] = {0x00, 0x00, 0xc0, 0x3f};
     constexpr std::uint8_t expected_double[] = {0, 0, 0, 0, 0, 0, 0, 0x80};
     for (std::size_t index = 0; index < 4; ++index)

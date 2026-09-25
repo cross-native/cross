@@ -148,7 +148,9 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         array_row_views array_const_loss array_frozen record_misaligned
         record_out_of_view packed_cast_misaligned record_unassigned
         record_effective_type record_const_loss record_bit_field
-        record_array_overread nested_record_overread nested_record_const_write)
+        record_array_overread nested_record_overread nested_record_const_write
+        union_unassigned union_invalid_bool union_ordinary_alias
+        union_out_of_view union_array_overread)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -360,6 +362,39 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "outer->inner.value = 7uptr;\n"
             "return 0u32;")
         set(expected "meta pointer write requires mutable scalar storage")
+    elseif(case STREQUAL union_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(union eval_union));\n"
+            "union eval_union *cell = (union eval_union *)$::meta::data(value);\n"
+            "return cell->real == 0.0f32;")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL union_invalid_bool)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(union eval_bool));\n"
+            "union eval_bool *cell = (union eval_bool *)$::meta::data(value);\n"
+            "cell->byte = 2u8;\n"
+            "return cell->flag;")
+        set(expected "invalid bool representation")
+    elseif(case STREQUAL union_ordinary_alias)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(union eval_union));\n"
+            "union eval_union *cell = (union eval_union *)$::meta::data(value);\n"
+            "cell->word = 0x3fc00000u32;\n"
+            "const f32 *ordinary = (const f32 *)$::meta::data(value);\n"
+            "return ordinary[0u32] == 1.5f32;")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL union_out_of_view)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(union eval_union) - 1u32);\n"
+            "union eval_union *cell = (union eval_union *)$::meta::data(value);\n"
+            "return cell->word;")
+        set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL union_array_overread)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(union eval_union));\n"
+            "union eval_union *cell = (union eval_union *)$::meta::data(value);\n"
+            "return cell->bytes[4u32];")
+        set(expected "meta pointer read is outside its view")
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -382,6 +417,8 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         "struct eval_bits { u32 value : 3; };\n"
         "struct eval_collection { u8 tag; u16 values[2]; };\n"
         "struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; };\n"
+        "union eval_union { u32 word; f32 real; u8 bytes[4]; };\n"
+        "union eval_bool { u8 byte; bool flag; };\n"
         "[[eval_only]] static uptr bad() { ${body} }\n"
         "global uptr result = bad();\n")
     execute_process(COMMAND "${CC}" -S "${input}"
@@ -440,6 +477,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
         set(row_bytes "34,17,68,51,102,85,136,119")
         set(source_word "4286578753")
         set(float_bytes "0,0,192,63")
+        set(union_bytes "0,0,192,63")
         set(double_bytes "0,0,0,0,0,0,0,128")
         set(quad_bytes "0,0,0,0,0,0,0,0,0,0,0,0,0,128,255,63")
         set(extended_bytes "0,0,0,0,0,0,0,192,255,63,0,0,0,0,0,0")
@@ -448,6 +486,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
         set(row_bytes "17,34,51,68,85,102,119,136")
         set(source_word "1090552063")
         set(float_bytes "63,192,0,0")
+        set(union_bytes "63,192,0,0")
         set(double_bytes "128,0,0,0,0,0,0,0")
         set(quad_bytes "63,255,128,0,0,0,0,0,0,0,0,0,0,0,0,0")
         set(extended_bytes "0,0,0,0,0,0,63,255,192,0,0,0,0,0,0,0")
@@ -475,6 +514,9 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "packed_record:\n[^\n]*[.]byte ${packed_record_bytes}" OR
        NOT assembly MATCHES "packed_record_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "nested_packed_record_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "union_bytes:\n[^\n]*[.]byte ${union_bytes}" OR
+       NOT assembly MATCHES "union_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "nested_union_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_array_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "nested_record_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "direct_nested_record_checked:\n[^\n]*${success_directive}" OR

@@ -125,6 +125,8 @@ struct eval_packed [[packed]] { u8 tag; uptr value; };
 struct eval_collection { u8 tag; u16 values[2]; };
 struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; };
 struct eval_packed_outer [[packed]] { u8 tag; struct eval_pair inner; };
+union eval_union { u32 word; f32 real; u8 bytes[4]; };
+struct eval_union_wrapper { u8 tag; union eval_union payload; };
 
 static $::meta::bytes zero_outer_bytes() {
     $::meta::buffer output = $::meta::alloc(sizeof(struct eval_outer));
@@ -178,6 +180,31 @@ static $::meta::bytes packed_record_bytes() {
     outer->inner.value = 7uptr;
     return outer->tag == 3u8 && outer->inner.tag == 5u8 &&
            outer->inner.value == 7uptr;
+}
+
+static $::meta::bytes union_reinterpreted_bytes() {
+    $::meta::buffer output = $::meta::alloc(sizeof(union eval_union));
+    union eval_union *value = (union eval_union *)$::meta::data(output);
+    value->word = 0x3fc00000u32;
+    return $::meta::freeze(output, sizeof(union eval_union));
+}
+
+[[eval_only]] static uptr union_member_ok() {
+    $::meta::buffer output = $::meta::alloc(sizeof(union eval_union));
+    union eval_union *value = (union eval_union *)$::meta::data(output);
+    value->word = 0x3fc00000u32;
+    bool first = value->real == 1.5f32;
+    value->real = 2.0f32;
+    return first && value->word == 0x40000000u32;
+}
+
+[[eval_only]] static uptr nested_union_member_ok() {
+    $::meta::buffer output = $::meta::alloc(sizeof(struct eval_union_wrapper));
+    struct eval_union_wrapper *value =
+        (struct eval_union_wrapper *)$::meta::data(output);
+    value->tag = 7u8;
+    value->payload.word = 0x3fc00000u32;
+    return value->tag == 7u8 && value->payload.real == 1.5f32;
 }
 
 [[eval_only]] static uptr record_array_member_ok() {
@@ -295,6 +322,9 @@ global uptr record_member_checked = record_member_ok();
 global const u8 packed_record[] = packed_record_bytes();
 global uptr packed_record_member_checked = packed_record_member_ok();
 global uptr nested_packed_record_checked = nested_packed_record_ok();
+global const u8 union_bytes[] = union_reinterpreted_bytes();
+global uptr union_member_checked = union_member_ok();
+global uptr nested_union_member_checked = nested_union_member_ok();
 global uptr record_array_member_checked = record_array_member_ok();
 global uptr nested_record_member_checked = nested_record_member_ok();
 global uptr direct_nested_record_checked =
