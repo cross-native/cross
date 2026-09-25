@@ -23,6 +23,10 @@ static T *echo_pointer<T>(in T *value) {
     return value;
 }
 
+static bool same_generic<T>(in T left, in T right) {
+    return left == right;
+}
+
 static void assign<T>(out T destination, in T value) {
     destination = value;
 }
@@ -48,6 +52,10 @@ global i32 generic_angle_entry() {
     i32 output;
     assign(output, 17i32);
     i32 *pointer = echo_pointer(&output);
+    i32 sequence[2] = {3i32, 4i32};
+    i32 *advanced = echo_pointer(1i32 + sequence);
+    bool pointer_distance = same_generic((sequence + 1i32) - sequence,
+                                         (iptr)1i32);
     generic_callback callback = callback_plus_two;
     generic_callback copied = first(callback, 0i32);
     generic_alias_callback alias = callback_plus_two;
@@ -72,7 +80,9 @@ global i32 generic_angle_entry() {
     i32 after_shadow = choose<i32>(1 == 1, 13i32, 14i32);
     return counted == 11i32 && shifted == 11i32 &&
            selected < counted && inferred == 11i32 && partial == 7i32 &&
-           *pointer == 17i32 && copied(39i32) == 41i32 &&
+           *pointer == 17i32 && advanced == sequence + 1i32 &&
+           *advanced == 4i32 && pointer_distance &&
+           copied(39i32) == 41i32 &&
            alias_copy(40i32) == 42i32 &&
            member == 3i32 && called == 7i32 &&
            shadow == 1i32 && shadow_call == 41i32 &&

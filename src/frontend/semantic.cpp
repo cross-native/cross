@@ -2257,15 +2257,65 @@ TypePtr infer_generic_actual(const Expr& expression,
             return pointer_type(type);
         return type;
     };
+    const auto integer_shape = [&](const TypePtr& type) {
+        const auto kind = type->builtin;
+        const bool signed_type = kind == BuiltinType::I8 || kind == BuiltinType::I16 ||
+            kind == BuiltinType::I32 || kind == BuiltinType::I64 ||
+            kind == BuiltinType::I128 || kind == BuiltinType::Iptr;
+        const auto bits = kind == BuiltinType::Iptr || kind == BuiltinType::Uptr
+            ? program.address_bits : type_bits(type);
+        return IntegerType{bits, signed_type, kind == BuiltinType::Bool};
+    };
+    const auto integer_result = [&](IntegerType shape,
+                                    const TypePtr& left,
+                                    const TypePtr& right) -> TypePtr {
+        for (const auto& candidate : {left, right}) {
+            if (!is_integer(candidate)) continue;
+            const auto candidate_shape = integer_shape(candidate);
+            if (candidate_shape.bits >= 32 &&
+                candidate_shape.bits == shape.bits &&
+                candidate_shape.is_signed == shape.is_signed)
+                return builtin_type(candidate->builtin);
+        }
+        const auto kind = shape.bits == 8
+            ? (shape.is_signed ? BuiltinType::I8 : BuiltinType::U8)
+            : shape.bits == 16
+            ? (shape.is_signed ? BuiltinType::I16 : BuiltinType::U16)
+            : shape.bits == 32
+            ? (shape.is_signed ? BuiltinType::I32 : BuiltinType::U32)
+            : shape.bits == 64
+            ? (shape.is_signed ? BuiltinType::I64 : BuiltinType::U64)
+            : (shape.is_signed ? BuiltinType::I128 : BuiltinType::U128);
+        return builtin_type(kind);
+    };
+    const auto common_numeric = [&](const TypePtr& left,
+                                    const TypePtr& right) -> TypePtr {
+        if (!left || !right ||
+            (!is_integer(left) && !is_floating(left)) ||
+            (!is_integer(right) && !is_floating(right))) return {};
+        if (is_floating(left) || is_floating(right)) {
+            if (!is_floating(left)) return builtin_type(right->builtin);
+            if (!is_floating(right)) return builtin_type(left->builtin);
+            const auto rank = [&](const TypePtr& type) {
+                return type->builtin == BuiltinType::Fptr
+                    ? program.address_bits : type_bits(type);
+            };
+            return builtin_type(rank(left) >= rank(right)
+                ? left->builtin : right->builtin);
+        }
+        return integer_result(common_integer_type(integer_shape(left),
+                                                  integer_shape(right)),
+                              left, right);
+    };
     switch (expression.kind) {
     case Expr::Kind::Integer: {
         const auto value = parse_integer_value(expression);
         return value ? value->type : TypePtr{};
     }
     case Expr::Kind::Floating:
-        return builtin_type(expression.text.ends_with("f32")
-                                ? BuiltinType::F32
-                                : BuiltinType::F64);
+        return builtin_type(expression.evaluated_floating
+            ? expression.evaluated_floating->type
+            : floating_literal_type(expression.text));
     case Expr::Kind::Character:
         return builtin_type(BuiltinType::U32);
     case Expr::Kind::String:
@@ -2333,6 +2383,13 @@ TypePtr infer_generic_actual(const Expr& expression,
             return operand->kind == Type::Kind::Pointer
                        ? adjusted(operand->pointee)
                        : TypePtr{};
+        if ((expression.text == "+" || expression.text == "-" ||
+             expression.text == "~") && is_integer(operand))
+            return integer_result(promote_integer(integer_shape(operand)),
+                                  operand, {});
+        if (expression.text == "~") return {};
+        if ((expression.text == "+" || expression.text == "-") &&
+            is_floating(operand)) return builtin_type(operand->builtin);
         return operand;
     }
     case Expr::Kind::Binary: {
@@ -2373,7 +2430,9 @@ TypePtr infer_generic_actual(const Expr& expression,
         const auto left = infer_generic_actual(*expression.left, caller,
                                                program, state);
         if (expression.text == "index") {
-            if (!left) return {};
+            const auto index = infer_generic_actual(*expression.right, caller,
+                                                    program, state);
+            if (!left || !is_integer(index)) return {};
             return left->kind == Type::Kind::Pointer ||
                            left->kind == Type::Kind::Array
                        ? adjusted(left->kind == Type::Kind::Pointer
@@ -2387,6 +2446,23 @@ TypePtr infer_generic_actual(const Expr& expression,
         if ((expression.text == "+" || expression.text == "-") &&
             left->kind == Type::Kind::Pointer && is_integer(right))
             return left;
+        if (expression.text == "+" && is_integer(left) &&
+            right->kind == Type::Kind::Pointer) return right;
+        if (expression.text == "-" && left->kind == Type::Kind::Pointer &&
+            right->kind == Type::Kind::Pointer)
+            return builtin_type(BuiltinType::Iptr);
+        if ((expression.text == "<<" || expression.text == ">>") &&
+            is_integer(left) && is_integer(right))
+            return integer_result(promote_integer(integer_shape(left)),
+                                  left, {});
+        if ((expression.text == "%" || expression.text == "&" ||
+             expression.text == "|" || expression.text == "^") &&
+            (!is_integer(left) || !is_integer(right))) return {};
+        if (expression.text == "+" || expression.text == "-" ||
+            expression.text == "*" || expression.text == "/" ||
+            expression.text == "%" || expression.text == "&" ||
+            expression.text == "|" || expression.text == "^")
+            return common_numeric(left, right);
         return same_type(left, right) ? left : TypePtr{};
     }
     case Expr::Kind::Conditional: {
@@ -2395,7 +2471,8 @@ TypePtr infer_generic_actual(const Expr& expression,
                                               program, state);
         const auto no = infer_generic_actual(*expression.third, caller,
                                              program, state);
-        return same_type(yes, no) ? yes : TypePtr{};
+        if (same_type(yes, no)) return yes;
+        return common_numeric(yes, no);
     }
     case Expr::Kind::Call: {
         if (!expression.left) return {};
@@ -3629,8 +3706,11 @@ private:
             }
             if (!is_integer(left) || !is_integer(right)) return {};
             if (!conditional && (expression.text == "<<" || expression.text == ">>"))
-                return builtin_integer(promote_integer(integer_type(left)));
-            return builtin_integer(common_integer_type(integer_type(left), integer_type(right)));
+                return arithmetic_integer_result(
+                    promote_integer(integer_type(left)), left, {});
+            return arithmetic_integer_result(
+                common_integer_type(integer_type(left), integer_type(right)),
+                left, right);
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
@@ -3698,6 +3778,19 @@ private:
                         : type.bits == 64 ? (type.is_signed ? BuiltinType::I64 : BuiltinType::U64)
                                          : (type.is_signed ? BuiltinType::I128 : BuiltinType::U128);
         return builtin_type(kind);
+    }
+
+    TypePtr arithmetic_integer_result(IntegerType shape,
+                                      const TypePtr& left,
+                                      const TypePtr& right) const {
+        for (const auto& candidate : {left, right}) {
+            if (!is_integer(candidate)) continue;
+            const auto current = integer_type(candidate);
+            if (current.bits >= 32 && current.bits == shape.bits &&
+                current.is_signed == shape.is_signed)
+                return builtin_type(candidate->builtin);
+        }
+        return builtin_integer(shape);
     }
 
     TypePtr common_floating_type(const TypePtr& left,
@@ -3848,6 +3941,8 @@ private:
 
     std::optional<EvalValue> calculate(IntegerOperation operation, EvalValue left,
                                        EvalValue right, SourceLocation location) {
+        const auto left_type = left.type;
+        const auto right_type = right.type;
         const bool shift = operation == IntegerOperation::ShiftLeft ||
                            operation == IntegerOperation::ShiftRight;
         const auto type = shift ? promote_integer(integer_type(left.type))
@@ -3864,7 +3959,9 @@ private:
             return std::nullopt;
         }
         const bool comparison = operation >= IntegerOperation::Equal;
-        return EvalValue{result.value, comparison ? builtin_type(BuiltinType::Bool) : builtin_integer(type)};
+        return EvalValue{result.value, comparison ? builtin_type(BuiltinType::Bool)
+            : arithmetic_integer_result(type, left_type,
+                                        shift ? TypePtr{} : right_type)};
     }
 
     std::optional<EvalValue> calculate_floating(std::string_view operation,

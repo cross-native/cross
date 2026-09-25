@@ -264,6 +264,13 @@ if(BUILD_TESTING)
                      -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
                      -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/generic-angle-errors
                      -P "${CMAKE_SOURCE_DIR}/test/language/generic_angle_errors.cmake")
+    add_test(NAME cross_generic_actual_floats
+             COMMAND "${CMAKE_COMMAND}"
+                     -DCC=$<TARGET_FILE:cross_cc>
+                     -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_actual_floats.x
+                     -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-actual-floats
+                     -P "${CMAKE_SOURCE_DIR}/test/language/generic_actual_floats.cmake")
     foreach(level O0 O2)
         add_test(NAME cross_generic_group_runtime_${level}
                  COMMAND "${CMAKE_COMMAND}"
