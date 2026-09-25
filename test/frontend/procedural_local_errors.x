@@ -32,6 +32,16 @@ namespace invocations {
     static u64 only_at_call_site() { return 7u64; }
     $::static_assert(definitions::body!{} == 7u64, "definition context must not capture caller function");
 }
+#elif defined(QUOTED_GENERIC_CAPTURE)
+namespace definitions {
+    [[macro]] static $::meta::tokens body(in $::meta::tokens input) {
+        return $::quote { only_at_call_site<u64>(7u64) };
+    }
+}
+namespace invocations {
+    static T only_at_call_site<T>(in T value) { return value; }
+    global u64 subject = definitions::body!{};
+}
 #elif defined(OBJECT_SHADOWS_FUNCTION)
 static u64 callable() { return 7u64; }
 namespace inner {

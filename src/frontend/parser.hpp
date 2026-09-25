@@ -50,7 +50,7 @@ private:
     parse_angle_generic_parameters();
     std::vector<std::string> preview_angle_generic_types() const;
     bool consume_generic_close();
-    bool known_generic_name(std::string_view name) const;
+    bool known_generic_name(const Expr& name) const;
     void apply_callable_attributes(TypePtr& type,
                                    const std::vector<Attribute>& attributes);
     TypePtr parse_array_suffix(
@@ -111,7 +111,7 @@ private:
     std::vector<std::string> active_generic_types_;
     std::unordered_set<std::string> known_generic_functions_;
     std::unordered_set<std::string> known_ordinary_values_;
-    std::vector<std::unordered_set<std::string>> local_scopes_;
+    std::vector<NameSet> local_scopes_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
     struct RecordTag {

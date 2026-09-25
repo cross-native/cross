@@ -725,11 +725,11 @@ Parser::parse_angle_generic_parameters() {
     return result;
 }
 
-bool Parser::known_generic_name(std::string_view name) const {
-    if (name.find("::") == std::string_view::npos)
+bool Parser::known_generic_name(const Expr& name) const {
+    if (name.text.find("::") == std::string::npos)
         for (auto scope = local_scopes_.rbegin();
              scope != local_scopes_.rend(); ++scope)
-            if (scope->contains(std::string(name))) return false;
+            if (scope->contains(name_key(name))) return false;
     const auto lookup = [&](std::string_view candidate)
         -> std::optional<bool> {
         if (known_ordinary_values_.contains(std::string(candidate)))
@@ -1697,7 +1697,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
     if (!name) error_here("expected local variable name");
     else {
         declaration.name = *name;
-        if (!local_scopes_.empty()) local_scopes_.back().insert(*name);
+        if (!local_scopes_.empty()) local_scopes_.back().insert(name_key(declaration));
     }
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
@@ -1748,7 +1748,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     local_scopes_.emplace_back();
     if (local_scopes_.size() == 1 && active_function_)
         for (const auto& parameter : active_function_->parameters)
-            local_scopes_.back().insert(parameter.name);
+            local_scopes_.back().insert(name_key(parameter));
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Compound;
     statement->location = current().location;
@@ -2174,7 +2174,7 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
                                       current(1).is("<");
         const bool inferred_generic = current().is("<") && expression &&
                                       expression->kind == Expr::Kind::Name &&
-                                      known_generic_name(expression->text);
+                                      known_generic_name(*expression);
         if (explicit_generic || inferred_generic) {
             index_ += explicit_generic ? 2 : 1;
             if (consume(">")) {
@@ -2206,7 +2206,7 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
             call->location = expression->location;
             call->generic_visible_at_call =
                 expression->kind == Expr::Kind::Name &&
-                known_generic_name(expression->text);
+                known_generic_name(*expression);
             call->generic_arguments = std::move(expression->generic_arguments);
             call->left = std::move(expression);
             if (!consume(")")) {

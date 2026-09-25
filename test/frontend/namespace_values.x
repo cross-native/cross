@@ -74,6 +74,13 @@ namespace value_definition {
     global u64 cells[1] = { 37u64 };
     enum constants { marker = 41 };
     [[noinline]] static u64 helper() { return 43u64; }
+    static T generic_pick<T>(in T value) { return value + 5u64; }
+    [[macro]] static $::meta::tokens quoted_generic(in $::meta::tokens input) {
+        return $::quote { generic_pick<u64>(37u64) };
+    }
+    [[macro]] static $::meta::tokens parsed_generic(in $::meta::tokens input) {
+        return $::meta::parse("generic_pick<u64>(38u64)");
+    }
     [[macro]] static $::meta::tokens quoted(in $::meta::tokens input) {
         return $::quote { helper() + object + marker };
     }
@@ -109,6 +116,7 @@ namespace value_definition {
 namespace value_caller {
     global u64 object = 47u64;
     global u64 cells[1] = { 53u64 };
+    global u64 generic_pick = 2u64;
     enum constants { marker = 59 };
     [[noinline]] static u64 helper() { return 61u64; }
     global u64 *alias = value_definition::pointer!{};
@@ -118,8 +126,12 @@ namespace value_caller {
     $::static_assert(value_definition::required!{} == 84u64, "quote definition values");
     [[generic(u64 *address), noinline]] static u64 *identity() { return address; }
     [[noinline]] static i32 check() {
+        u64 generic_pick = 3u64;
         if (value_definition::quoted!{} != 115u64) return 1;
         if (value_definition::parsed!{} != 115u64) return 2;
+        if (value_definition::quoted_generic!{} != 42u64 ||
+            value_definition::parsed_generic!{} != 43u64 ||
+            generic_pick != 3u64) return 7;
         if (value_definition::copied!{helper() + object + marker} != 167u64) return 3;
         if (alias[0] != 37u64 || callback() != 43u64) return 4;
         if (generated::result != 61u64 || macro_generic::<5u64>() != 48u64) return 5;
