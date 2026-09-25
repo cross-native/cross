@@ -243,7 +243,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
             "return 0u32;")
-        set(expected "supported scalar pointer cast")
+        set(expected "compatible scalar or void pointer conversion")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"
@@ -256,6 +256,16 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
     endif()
 endforeach()
+
+set(void_escape "${directory}/void_escape.x")
+file(WRITE "${void_escape}"
+    "global const void *escaped = (const void *)$::meta::data($::embed(\"payload.bin\"));\n")
+execute_process(COMMAND "${CC}" -S "${void_escape}"
+    -o "${OUTPUT}-void-escape.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "translation-time pointer|runtime scalar|not a scalar translation-time value")
+    message(FATAL_ERROR "opaque meta pointer escaped to runtime storage\n${out}\n${err}")
+endif()
 
 # Byte materialization is independent of scalar byte order and target uptr
 # width. The scalar length still follows the selected target's layout.
@@ -316,6 +326,8 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "extended_bytes:\n[^\n]*[.]byte ${extended_bytes}" OR
        NOT assembly MATCHES "pointer_scalars:\n[^\n]*[.]byte ${pointer_scalars}" OR
        NOT assembly MATCHES "source_word:\n[^\n]*[.]long ${source_word}" OR
+       NOT assembly MATCHES "opaque_word:\n[^\n]*[.]long ${source_word}" OR
+       NOT assembly MATCHES "opaque_equal:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "endian_read_ok:\n[^\n]*[.]long 1" OR
        NOT assembly MATCHES "endian_write_ok:\n[^\n]*[.]long 1" OR
        NOT assembly MATCHES "extended_padding_ok:\n[^\n]*${success_directive}" OR

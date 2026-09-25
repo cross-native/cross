@@ -21,6 +21,8 @@ extern std::size_t extended_padding_ok;
 extern std::ptrdiff_t meta_pointer_distance;
 extern std::size_t meta_pointer_order_ok;
 extern std::uint32_t source_word;
+extern std::uint32_t opaque_word;
+extern std::size_t opaque_equal;
 extern float float_value;
 extern std::uint32_t endian_read_ok;
 extern std::uint32_t endian_write_ok;
@@ -44,6 +46,7 @@ int main() {
         zero_byte != 0 || high_byte != 0xff || second_byte != 0 ||
         signed_high != -1 || signed_extended != -1 ||
         signed_encoded[0] != 0xff || source_word != 0xff800041u ||
+        opaque_word != 0xff800041u || opaque_equal != 1 ||
         endian_read_ok != 1 || endian_write_ok != 1 ||
         float_value != 1.5f || extended_padding_ok != 1 ||
         meta_pointer_distance != 2 || meta_pointer_order_ok != 1) return 1;

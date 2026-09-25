@@ -21,6 +21,12 @@ static uptr invert_bytes(in const u8 *source, in uptr length,
 static u8 read_one(in const u8 *source) { return source[0u32]; }
 static i8 read_signed(in const i8 *source) { return source[0u32]; }
 static u32 read_word(in const u32 *source) { return source[0u32]; }
+static u32 read_opaque(in const void *source) {
+    return ((const u32 *)source)[0u32];
+}
+static uptr same_opaque(in const void *left, in const void *right) {
+    return left == right;
+}
 static f32 read_float(in const f32 *source) { return source[0u32]; }
 
 static $::meta::bytes packed_float() {
@@ -160,6 +166,10 @@ global uptr extended_padding_ok = read_extended_without_padding();
 global iptr meta_pointer_distance = pointer_distance();
 global uptr meta_pointer_order_ok = pointer_order();
 global u32 source_word = read_word((const u32 *)$::meta::data($::embed("payload.bin")));
+global u32 opaque_word = read_opaque($::meta::data($::embed("payload.bin")));
+global uptr opaque_equal = same_opaque(
+    $::meta::data($::embed("payload.bin")),
+    $::meta::data($::embed("payload.bin")));
 global f32 float_value = read_float((const f32 *)$::meta::data(packed_float()));
 global uptr asset_size = $::meta::len($::embed("payload.bin"));
 global uptr static_size = sizeof(original);

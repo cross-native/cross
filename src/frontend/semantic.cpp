@@ -3745,16 +3745,23 @@ private:
                 fail(location, "meta data pointers cannot convert to integer or other runtime values");
                 return std::nullopt;
             }
+            const auto void_pointee = [](const TypePtr& pointee) {
+                return pointee && pointee->kind == Type::Kind::Builtin &&
+                    pointee->builtin == BuiltinType::Void;
+            };
             if (!type->pointee ||
-                !meta_scalar_type(type->pointee) ||
+                (!meta_scalar_type(type->pointee) &&
+                 !void_pointee(type->pointee)) ||
                 type->pointee->is_volatile || type->pointee->is_atomic ||
                 !value.type || value.type->kind != Type::Kind::Pointer ||
                 !value.type->pointee ||
                 (value.type->pointee->is_const && !type->pointee->is_const) ||
                 type->address_space != value.type->address_space ||
                 (!explicit_cast &&
-                 type->pointee->builtin != value.type->pointee->builtin)) {
-                fail(location, "meta data pointers require an explicit supported scalar pointer cast without qualifier loss");
+                 type->pointee->builtin != value.type->pointee->builtin &&
+                 !void_pointee(type->pointee) &&
+                 !void_pointee(value.type->pointee))) {
+                fail(location, "meta data pointers require a compatible scalar or void pointer conversion without qualifier loss");
                 return std::nullopt;
             }
             if (value.meta_pointer->mutable_buffer &&
@@ -4020,16 +4027,24 @@ private:
         return (bits + 7U) / 8U;
     }
 
-    bool scalar_meta_pointer(const EvalValue& value, SourceLocation location) {
+    bool live_meta_pointer(const EvalValue& value, SourceLocation location) {
         if (!value.meta_pointer || !value.type ||
-            value.type->kind != Type::Kind::Pointer || !value.type->pointee ||
-            !meta_scalar_type(value.type->pointee)) {
-            fail(location, "meta pointer access requires a supported scalar type");
+            value.type->kind != Type::Kind::Pointer || !value.type->pointee) {
+            fail(location, "invalid meta pointer value");
             return false;
         }
         if (value.meta_pointer->mutable_buffer &&
             value.meta_pointer->mutable_buffer->frozen) {
             fail(location, "buffer data pointer was used after freeze");
+            return false;
+        }
+        return true;
+    }
+
+    bool scalar_meta_pointer(const EvalValue& value, SourceLocation location) {
+        if (!live_meta_pointer(value, location)) return false;
+        if (!meta_scalar_type(value.type->pointee)) {
+            fail(location, "meta pointer access requires a supported scalar type");
             return false;
         }
         return true;
@@ -4098,8 +4113,8 @@ private:
                                                    const EvalValue& right,
                                                    std::string_view operation,
                                                    SourceLocation location) {
-        if (!scalar_meta_pointer(left, location) ||
-            !scalar_meta_pointer(right, location)) return std::nullopt;
+        if (!live_meta_pointer(left, location) ||
+            !live_meta_pointer(right, location)) return std::nullopt;
         const auto& a = *left.meta_pointer;
         const auto& b = *right.meta_pointer;
         const bool same_backing = a.immutable
@@ -4112,6 +4127,8 @@ private:
             return EvalValue{UInt128{operation == "==" ? equal : !equal},
                              builtin_type(BuiltinType::Bool)};
         }
+        if (!scalar_meta_pointer(left, location) ||
+            !scalar_meta_pointer(right, location)) return std::nullopt;
         if (!same_backing || a.view_offset != b.view_offset ||
             a.view_length != b.view_length ||
             meta_scalar_size(left) != meta_scalar_size(right) ||
