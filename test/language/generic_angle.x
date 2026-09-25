@@ -104,6 +104,7 @@ global i32 generic_angle_entry() {
     i32x4 vector_mask = first(vector & 1i32, 0i32);
     i32x4 vector_shift = first(vector << 1i32, 0i32);
     i32x4 vector_compare = same_shape(vector + vector > vector, vector);
+    i32 vector_lane = first(vector_compare[0], 0i32);
     f32x4 float_vector = 1.5f32;
     i32x4 float_compare = same_shape(float_vector > 1.0f32, vector);
     i32 output;
@@ -144,7 +145,8 @@ global i32 generic_angle_entry() {
            selected < counted && inferred == 11i32 && partial == 7i32 &&
            vector_sum[0] == 5i32 && vector_pair_sum[1] == 6i32 &&
            vector_mask[2] == 1i32 && vector_shift[3] == 6i32 &&
-           vector_compare[0] != 0i32 && float_compare[1] != 0i32 &&
+           vector_compare[0] != 0i32 && vector_lane != 0i32 &&
+           float_compare[1] != 0i32 &&
            *pointer == 17i32 && advanced == sequence + 1i32 &&
            *advanced == 4i32 && pointer_distance &&
            copied(39i32) == 41i32 &&

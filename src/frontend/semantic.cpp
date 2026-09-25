@@ -2473,7 +2473,8 @@ TypePtr infer_generic_actual(const Expr& expression,
                                                     program, state);
             if (!left || !is_integer(index)) return {};
             return left->kind == Type::Kind::Pointer ||
-                           left->kind == Type::Kind::Array
+                           left->kind == Type::Kind::Array ||
+                           left->kind == Type::Kind::Vector
                        ? adjusted(left->kind == Type::Kind::Pointer
                                       ? left->pointee
                                       : left->element)
