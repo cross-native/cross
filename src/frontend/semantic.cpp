@@ -2092,6 +2092,20 @@ bool bind_operators(Program& program, Diagnostics& diagnostics) {
     return OperatorBinder(program, diagnostics).run();
 }
 
+struct EvalBuffer {
+    std::string data;
+    std::vector<std::uint8_t> assigned;
+    bool frozen{};
+};
+
+struct EvalMetaPointer {
+    std::shared_ptr<const std::string> immutable;
+    std::shared_ptr<EvalBuffer> mutable_buffer;
+    std::size_t view_offset{};
+    std::size_t view_length{};
+    std::size_t position{};
+};
+
 struct EvalValue {
     UInt128 integer{};
     TypePtr type;
@@ -2107,6 +2121,10 @@ struct EvalValue {
     std::shared_ptr<const std::string> bytes;
     std::size_t byte_offset{};
     std::size_t byte_length{};
+    // Mutable buffers are shared handles. Copying an EvalValue preserves
+    // aliasing; freeze invalidates all copies through this shared state.
+    std::shared_ptr<EvalBuffer> buffer;
+    std::optional<EvalMetaPointer> meta_pointer;
 
     EvalValue() = default;
     EvalValue(UInt128 integer_value, TypePtr value_type,
@@ -2117,7 +2135,9 @@ struct EvalValue {
     EvalValue(floating::Value floating_value, TypePtr value_type)
         : type(std::move(value_type)), floating(floating_value) {}
 
-    [[nodiscard]] bool pointer() const { return string != nullptr || address.has_value(); }
+    [[nodiscard]] bool pointer() const {
+        return string != nullptr || address.has_value() || meta_pointer.has_value();
+    }
     [[nodiscard]] bool truthy() const {
         return floating ? floating::nonzero(*floating) : integer != UInt128{};
     }
@@ -2469,8 +2489,8 @@ public:
                                                const TypePtr& destination) {
         if (!validate_required_tree(source)) return std::nullopt;
         auto value = expression(source);
-        if (value && value->bytes) {
-            fail(source.location, "translation-time bytes cannot be used as a runtime scalar");
+        if (value && (value->bytes || value->buffer)) {
+            fail(source.location, "meta byte values cannot be used as a runtime scalar");
             return std::nullopt;
         }
         if (!value || value->pointer() ||
@@ -2488,8 +2508,8 @@ public:
     std::optional<EvalValue> required_scalar(const Expr& source) {
         if (!validate_required_tree(source)) return std::nullopt;
         auto value = expression(source);
-        if (value && value->bytes) {
-            fail(source.location, "translation-time bytes cannot be used as a runtime scalar");
+        if (value && (value->bytes || value->buffer)) {
+            fail(source.location, "meta byte values cannot be used as a runtime scalar");
             return std::nullopt;
         }
         if (!value || value->pointer() ||
@@ -2511,6 +2531,8 @@ public:
                  type_name(value->type) + "'");
             return std::nullopt;
         }
+        if (!charge_meta_bytes(value->byte_length, source.location))
+            return std::nullopt;
         return value->bytes->substr(value->byte_offset, value->byte_length);
     }
 
@@ -2726,7 +2748,7 @@ public:
             const auto type = expression_type(expression);
             auto condition = this->expression(*expression.left);
             if (!condition || condition->pointer() || condition->tokens ||
-                condition->bytes || !type) return std::nullopt;
+                condition->bytes || condition->buffer || !type) return std::nullopt;
             auto value = this->expression(*(condition->truthy()
                                           ? expression.right
                                           : expression.third));
@@ -2801,9 +2823,25 @@ private:
                 fail(location, "translation-time token construction budget exceeded 16777216 bytes");
                 return false;
             }
+            if (token.text.size() + metadata_cost >
+                64 * 1024 * 1024 - meta_bytes_ - token_bytes_) {
+                fail(location, "translation-time meta memory budget exceeded 67108864 bytes");
+                return false;
+            }
             token_bytes_ += token.text.size() + metadata_cost;
         }
         result.insert(result.end(), part.begin(), part.end());
+        return true;
+    }
+
+    bool charge_meta_bytes(std::size_t size, SourceLocation location) {
+        constexpr std::size_t budget = 64 * 1024 * 1024;
+        if (meta_bytes_ > budget - token_bytes_ ||
+            size > budget - token_bytes_ - meta_bytes_) {
+            fail(location, "translation-time meta memory budget exceeded 67108864 bytes");
+            return false;
+        }
+        meta_bytes_ += size;
         return true;
     }
 
@@ -3092,6 +3130,44 @@ private:
                 }
                 return true;
             }
+            if (name == "$::meta::alloc" || name == "$::meta::cap" ||
+                name == "$::meta::freeze") {
+                const auto count = name == "$::meta::freeze" ? 2U : 1U;
+                if (node.arguments.size() != count) {
+                    fail(node.location, name + " requires " +
+                        std::to_string(count) + " arguments");
+                    return false;
+                }
+                for (std::size_t index = 0; index < count; ++index) {
+                    const auto& argument = *node.arguments[index];
+                    if (!validate_required_tree(argument)) return false;
+                    const auto type = expression_type(argument);
+                    const bool integer = name == "$::meta::alloc" || index == 1;
+                    if (!type || (integer ? !is_integer(type)
+                                          : type->kind != Type::Kind::Buffer)) {
+                        fail(argument.location, name +
+                            (integer ? " requires an integer capacity or length"
+                                     : " requires $::meta::buffer"));
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (name == "$::meta::data") {
+                if (node.arguments.size() != 1U ||
+                    !validate_required_tree(*node.arguments.front())) {
+                    fail(node.location, "$::meta::data requires one meta-byte value");
+                    return false;
+                }
+                const auto type = expression_type(*node.arguments.front());
+                if (!type || (type->kind != Type::Kind::Bytes &&
+                              type->kind != Type::Kind::Buffer)) {
+                    fail(node.arguments.front()->location,
+                        "$::meta::data requires $::meta::bytes or $::meta::buffer");
+                    return false;
+                }
+                return true;
+            }
             if (name.starts_with("$::meta::") &&
                 !(procedural_ && (name == "$::meta::parse" ||
                                   name == "$::meta::concat"))) {
@@ -3256,12 +3332,23 @@ private:
                 node.text == "<" || node.text == "<=" || node.text == ">" ||
                 node.text == ">=" || node.text == "&&" || node.text == "||";
             const auto result_type = expression_type(node);
+            const bool byte_pointer = result_type &&
+                result_type->kind == Type::Kind::Pointer &&
+                result_type->pointee &&
+                result_type->pointee->kind == Type::Kind::Builtin &&
+                result_type->pointee->builtin == BuiltinType::U8;
             const bool pointer_operation = pointer_resolver_ && result_type &&
                 result_type->kind == Type::Kind::Pointer &&
                 (node.kind == Expr::Kind::Conditional || node.text == "+" || node.text == "-");
+            const bool byte_pointer_operation = byte_pointer &&
+                node.kind == Expr::Kind::Binary &&
+                (node.text == "+" || node.text == "-") &&
+                ((node.left && meta_pointer_source(*node.left)) ||
+                 (node.right && meta_pointer_source(*node.right)));
             if (indexing ? (!left || left->kind != Type::Kind::Pointer ||
                             !right || !is_integer(right))
-                         : (!pointer_operation && (!scalar || (floating_operands && !floating_operator)))) {
+                         : (!pointer_operation && !byte_pointer_operation &&
+                            (!scalar || (floating_operands && !floating_operator)))) {
                 fail(node.location, "unsupported operation in required scalar expression");
                 return false;
             }
@@ -3365,6 +3452,24 @@ private:
         return valid;
     }
 
+    bool meta_pointer_source(const Expr& source) {
+        if (source.kind == Expr::Kind::Call && source.left &&
+            source.left->kind == Expr::Kind::Name &&
+            source.left->text == "$::meta::data") return true;
+        if (source.kind == Expr::Kind::Name) {
+            const auto* cell = lookup_mutable(source.text, source.location);
+            return cell && cell->value.meta_pointer.has_value();
+        }
+        if (source.kind == Expr::Kind::Parenthesized ||
+            source.kind == Expr::Kind::Cast)
+            return source.left && meta_pointer_source(*source.left);
+        if (source.kind == Expr::Kind::Binary &&
+            (source.text == "+" || source.text == "-"))
+            return (source.left && meta_pointer_source(*source.left)) ||
+                   (source.right && meta_pointer_source(*source.right));
+        return false;
+    }
+
     TypePtr expression_type(const Expr& expression, bool decay = true) {
         switch (expression.kind) {
         case Expr::Kind::Quote: return procedural_ ? tokens_type() : nullptr;
@@ -3458,7 +3563,15 @@ private:
             if (!left || !right) return {};
             if (procedural_ && conditional && left->kind == Type::Kind::Tokens &&
                 right->kind == Type::Kind::Tokens) return tokens_type();
-            if (pointer_resolver_) {
+            const auto byte_pointer = [](const TypePtr& type) {
+                return type->kind == Type::Kind::Pointer && type->pointee &&
+                    type->pointee->kind == Type::Kind::Builtin &&
+                    type->pointee->builtin == BuiltinType::U8;
+            };
+            if (pointer_resolver_ ||
+                ((byte_pointer(left) || byte_pointer(right)) &&
+                 ((expression.left && meta_pointer_source(*expression.left)) ||
+                  (expression.right && meta_pointer_source(*expression.right))))) {
                 if (conditional && left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer &&
                     left->address_space == right->address_space) {
                     if (compatible_pointee(left->pointee, right->pointee)) return right;
@@ -3490,6 +3603,20 @@ private:
             if (expression.left->text == "$::embed") return bytes_type();
             if (expression.left->text == "$::meta::len")
                 return builtin_type(BuiltinType::Uptr);
+            if (expression.left->text == "$::meta::alloc")
+                return buffer_type();
+            if (expression.left->text == "$::meta::cap")
+                return builtin_type(BuiltinType::Uptr);
+            if (expression.left->text == "$::meta::freeze")
+                return bytes_type();
+            if (expression.left->text == "$::meta::data") {
+                if (expression.arguments.size() != 1U) return {};
+                const auto sequence = expression_type(*expression.arguments.front());
+                if (!sequence || (sequence->kind != Type::Kind::Bytes &&
+                                  sequence->kind != Type::Kind::Buffer)) return {};
+                return pointer_type(builtin_type(BuiltinType::U8,
+                    sequence->kind == Type::Kind::Bytes));
+            }
             if (expression.left->text == "$::meta::at" ||
                 expression.left->text == "$::meta::slice" ||
                 expression.left->text == "$::meta::concat") {
@@ -3564,10 +3691,35 @@ private:
             value.type = clone_type(type);
             return value;
         }
-        if (value.bytes || type->kind == Type::Kind::Bytes ||
+        if (value.bytes || value.buffer || type->kind == Type::Kind::Bytes ||
             type->kind == Type::Kind::Buffer) {
-            if (!value.bytes || type->kind != Type::Kind::Bytes) {
-                fail(location, "translation-time bytes cannot be converted to a runtime type");
+            if ((value.bytes && type->kind != Type::Kind::Bytes) ||
+                (value.buffer && type->kind != Type::Kind::Buffer) ||
+                (!value.bytes && !value.buffer)) {
+                fail(location, "meta values cannot be converted to runtime types or other meta types");
+                return std::nullopt;
+            }
+            if (value.buffer && value.buffer->frozen) {
+                fail(location, "buffer handle was used after freeze");
+                return std::nullopt;
+            }
+            value.type = clone_type(type);
+            return value;
+        }
+        if (value.meta_pointer) {
+            if (type->kind != Type::Kind::Pointer || !type->pointee ||
+                type->pointee->kind != Type::Kind::Builtin ||
+                type->pointee->builtin != BuiltinType::U8 ||
+                !value.type || value.type->kind != Type::Kind::Pointer ||
+                !value.type->pointee ||
+                (value.type->pointee->is_const && !type->pointee->is_const) ||
+                type->address_space != value.type->address_space) {
+                fail(location, "meta data pointers cannot convert to integer or non-u8 pointer types");
+                return std::nullopt;
+            }
+            if (value.meta_pointer->mutable_buffer &&
+                value.meta_pointer->mutable_buffer->frozen) {
+                fail(location, "buffer data pointer was used after freeze");
                 return std::nullopt;
             }
             value.type = clone_type(type);
@@ -3751,6 +3903,10 @@ private:
                 fail(location, "volatile or atomic access is not permitted during translation-time evaluation");
                 return std::nullopt;
             }
+            if (cell->value.buffer && cell->value.buffer->frozen) {
+                fail(location, "buffer handle was used after freeze");
+                return std::nullopt;
+            }
             return cell->value;
         }
         if (const auto found = resolve_enumerator(
@@ -3781,8 +3937,84 @@ private:
         return std::nullopt;
     }
 
+    bool byte_meta_pointer(const EvalValue& value, SourceLocation location) {
+        if (!value.meta_pointer || !value.type ||
+            value.type->kind != Type::Kind::Pointer || !value.type->pointee ||
+            value.type->pointee->kind != Type::Kind::Builtin ||
+            value.type->pointee->builtin != BuiltinType::U8) {
+            fail(location, "only u8 meta pointer access is implemented");
+            return false;
+        }
+        if (value.meta_pointer->mutable_buffer &&
+            value.meta_pointer->mutable_buffer->frozen) {
+            fail(location, "buffer data pointer was used after freeze");
+            return false;
+        }
+        return true;
+    }
+
+    std::optional<EvalValue> meta_pointer_offset(EvalValue base,
+                                                 const EvalValue& index,
+                                                 bool subtract,
+                                                 SourceLocation location) {
+        if (!byte_meta_pointer(base, location)) return std::nullopt;
+        if (!is_integer(index.type)) {
+            fail(location, "meta pointer offset requires an integer");
+            return std::nullopt;
+        }
+        const auto type = integer_type(index.type);
+        const bool negative = integer_negative(index.integer, type);
+        const auto magnitude = negative
+            ? mask_to(negate(index.integer), type.bits) : index.integer;
+        if (magnitude.high != 0) {
+            fail(location, "meta pointer offset is outside its view");
+            return std::nullopt;
+        }
+        const auto amount = static_cast<std::size_t>(magnitude.low);
+        auto& pointer = *base.meta_pointer;
+        const bool backwards = subtract != negative;
+        if (backwards ? amount > pointer.position
+                      : amount > pointer.view_length - pointer.position) {
+            fail(location, "meta pointer offset is outside its view");
+            return std::nullopt;
+        }
+        pointer.position = backwards ? pointer.position - amount
+                                     : pointer.position + amount;
+        return base;
+    }
+
+    std::optional<EvalValue> read_meta_pointer(const EvalValue& base,
+                                                SourceLocation location) {
+        if (!byte_meta_pointer(base, location)) return std::nullopt;
+        const auto& pointer = *base.meta_pointer;
+        if (pointer.position >= pointer.view_length) {
+            fail(location, "meta pointer read is outside its view");
+            return std::nullopt;
+        }
+        const auto index = pointer.view_offset + pointer.position;
+        if (pointer.mutable_buffer) {
+            if (!pointer.mutable_buffer->assigned[index]) {
+                fail(location, "read of unassigned buffer byte");
+                return std::nullopt;
+            }
+            return EvalValue{UInt128{static_cast<unsigned char>(
+                pointer.mutable_buffer->data[index])}, builtin_type(BuiltinType::U8)};
+        }
+        return EvalValue{UInt128{static_cast<unsigned char>(
+            (*pointer.immutable)[index])}, builtin_type(BuiltinType::U8)};
+    }
+
     std::optional<EvalValue> unary(const Expr& expression) {
         if (!expression.left) return std::nullopt;
+        if (expression.text == "*") {
+            auto pointer = this->expression(*expression.left);
+            if (pointer && pointer->meta_pointer)
+                return read_meta_pointer(*pointer, expression.location);
+            if (pointer_resolver_)
+                fail(expression.location,
+                     "runtime/static storage cannot be read during translation-time evaluation");
+            return std::nullopt;
+        }
         if (pointer_resolver_ && expression.text == "&") {
             auto source = clone_expr(expression);
             source->left = address_designator(*expression.left);
@@ -3790,10 +4022,6 @@ private:
             auto value = resolve_pointer(std::move(source), expression_type(expression));
             if (value) value->function_designator = direct_function(expression) != nullptr;
             return value;
-        }
-        if (pointer_resolver_ && expression.text == "*") {
-            fail(expression.location, "runtime/static storage cannot be read during translation-time evaluation");
-            return std::nullopt;
         }
         if (expression.text == "++" || expression.text == "--" ||
             expression.text == "post++" || expression.text == "post--") {
@@ -3818,7 +4046,8 @@ private:
                 lookup_mutable(expression.left->text, expression.left->location)->value = *value;
                 return expression.text.starts_with("post") ? previous : value;
             }
-            if (previous->pointer() || previous->tokens || previous->bytes) return std::nullopt;
+            if (previous->pointer() || previous->tokens || previous->bytes ||
+                previous->buffer) return std::nullopt;
             auto value = previous->floating
                 ? calculate_floating(expression.text == "++" || expression.text == "post++"
                                          ? "+" : "-", *previous,
@@ -3835,7 +4064,8 @@ private:
             return expression.text.starts_with("post") ? previous : value;
         }
         auto value = this->expression(*expression.left);
-        if (!value || value->pointer() || value->tokens || value->bytes) return std::nullopt;
+        if (!value || value->pointer() || value->tokens || value->bytes ||
+            value->buffer) return std::nullopt;
         if (value->floating) {
             if (expression.text == "+") return value;
             if (expression.text == "-") {
@@ -3868,7 +4098,7 @@ private:
     std::optional<EvalValue> binary(const Expr& expression) {
         auto left = this->expression(*expression.left);
         if (!left) return std::nullopt;
-        if (left->tokens || left->bytes) {
+        if (left->tokens || left->bytes || left->buffer) {
             fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
         }
@@ -3882,17 +4112,24 @@ private:
                                  builtin_type(BuiltinType::Bool)};
             }
             auto right = this->expression(*expression.right);
-            if (!right || right->pointer() || right->tokens || right->bytes) return std::nullopt;
+            if (!right || right->pointer() || right->tokens || right->bytes ||
+                right->buffer) return std::nullopt;
             return EvalValue{{right->truthy(), 0},
                              builtin_type(BuiltinType::Bool)};
         }
         auto right = this->expression(*expression.right);
         if (!right) return std::nullopt;
-        if (right->tokens || right->bytes) {
+        if (right->tokens || right->bytes || right->buffer) {
             fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
         }
         if (expression.text == "index") {
+            if (left->meta_pointer) {
+                auto pointer = meta_pointer_offset(*left, *right, false,
+                                                   expression.location);
+                return pointer ? read_meta_pointer(*pointer, expression.location)
+                               : std::nullopt;
+            }
             if (!left->string || right->pointer() || right->integer.high != 0) {
                 if (left->address) fail(expression.location,
                     "runtime/static storage cannot be read during translation-time evaluation");
@@ -3908,6 +4145,12 @@ private:
             return EvalValue{{static_cast<unsigned char>((*left->string)[index]), 0},
                              builtin_type(BuiltinType::U8)};
         }
+        if ((operation == "+" || operation == "-") && left->meta_pointer)
+            return meta_pointer_offset(*left, *right, operation == "-",
+                                       expression.location);
+        if (operation == "+" && right->meta_pointer)
+            return meta_pointer_offset(*right, *left, false,
+                                       expression.location);
         if (pointer_resolver_ && (left->address || right->address) &&
             (operation == "+" || operation == "-")) {
             auto source = clone_expr(expression);
@@ -3942,11 +4185,58 @@ private:
     }
 
     std::optional<EvalValue> assign(const Expr& expression) {
-        if (!expression.left || expression.left->kind != Expr::Kind::Name ||
-            !expression.right) {
+        if (!expression.left || !expression.right) {
             return std::nullopt;
         }
-        auto* destination = lookup_mutable(expression.left->text, expression.left->location);
+        const Expr* designator = expression.left.get();
+        while (designator && designator->kind == Expr::Kind::Parenthesized)
+            designator = designator->left.get();
+        if (designator &&
+            ((designator->kind == Expr::Kind::Binary && designator->text == "index") ||
+             (designator->kind == Expr::Kind::Unary && designator->text == "*"))) {
+            std::optional<EvalValue> pointer;
+            if (designator->kind == Expr::Kind::Binary) {
+                auto base = this->expression(*designator->left);
+                auto index = this->expression(*designator->right);
+                if (!base || !index) return std::nullopt;
+                if (base->meta_pointer)
+                    pointer = meta_pointer_offset(*base, *index, false,
+                                                  designator->location);
+            } else {
+                pointer = this->expression(*designator->left);
+            }
+            if (!pointer || !pointer->meta_pointer) {
+                fail(designator->location,
+                    "translation-time assignment requires a meta data pointer");
+                return std::nullopt;
+            }
+            if (expression.text != "=" ||
+                !byte_meta_pointer(*pointer, designator->location) ||
+                pointer->type->pointee->is_const ||
+                !pointer->meta_pointer->mutable_buffer) {
+                fail(designator->location,
+                    "meta pointer write requires mutable u8 storage and simple assignment");
+                return std::nullopt;
+            }
+            const auto& target = *pointer->meta_pointer;
+            if (target.position >= target.view_length) {
+                fail(designator->location, "meta pointer write is outside its view");
+                return std::nullopt;
+            }
+            auto source = this->expression(*expression.right);
+            if (!source) return std::nullopt;
+            source = convert(*source, builtin_type(BuiltinType::U8),
+                             expression.right->location);
+            if (!source) return std::nullopt;
+            const auto offset = target.view_offset + target.position;
+            target.mutable_buffer->data[offset] =
+                static_cast<char>(source->integer.low);
+            target.mutable_buffer->assigned[offset] = 1;
+            return source;
+        }
+        if (!designator || designator->kind != Expr::Kind::Name)
+            return std::nullopt;
+        auto* destination = lookup_mutable(designator->text, designator->location);
         if (!destination) return std::nullopt;
         if (destination->read_only) {
             fail(expression.location, "cannot write a const cell");
@@ -3958,7 +4248,7 @@ private:
             if (!source) return std::nullopt;
             source = convert(*source, destination_type, expression.location);
             if (!source) return std::nullopt;
-            *lookup_mutable(expression.left->text, expression.left->location) = {*source, true, false};
+            *lookup_mutable(designator->text, designator->location) = {*source, true, false};
             return source;
         }
         Expr binary_expression;
@@ -3972,7 +4262,7 @@ private:
         if (!result) return std::nullopt;
         result = convert(*result, destination_type, expression.location);
         if (!result) return std::nullopt;
-        *lookup_mutable(expression.left->text, expression.left->location) = {*result, true, false};
+        *lookup_mutable(designator->text, designator->location) = {*result, true, false};
         return result;
     }
 
@@ -4032,6 +4322,9 @@ private:
                 }
                 snapshot.bytes = std::make_shared<const std::string>(std::move(data));
             }
+            if (counted_asset_backings_.insert(snapshot.bytes.get()).second &&
+                !charge_meta_bytes(snapshot.bytes->size(), expression.location))
+                return std::nullopt;
             EvalValue value{UInt128{}, bytes_type()};
             value.bytes = snapshot.bytes;
             value.byte_length = value.bytes->size();
@@ -4123,6 +4416,8 @@ private:
                     fail(expression.location, "concatenated bytes exceed the target uptr or 16777216-byte limit");
                     return std::nullopt;
                 }
+                if (!charge_meta_bytes(source->byte_length + second->byte_length,
+                                       expression.location)) return std::nullopt;
                 auto result = std::make_shared<std::string>();
                 result->reserve(source->byte_length + second->byte_length);
                 result->append(*source->bytes, source->byte_offset, source->byte_length);
@@ -4159,6 +4454,100 @@ private:
             source->byte_offset += offset;
             source->byte_length = static_cast<std::size_t>(length->integer.low);
             return source;
+        }
+        if (name == "$::meta::alloc" || name == "$::meta::cap" ||
+            name == "$::meta::freeze") {
+            const auto count = name == "$::meta::freeze" ? 2U : 1U;
+            if (expression.arguments.size() != count) {
+                fail(expression.location, name + " requires " +
+                    std::to_string(count) + " arguments");
+                return std::nullopt;
+            }
+            if (name == "$::meta::alloc") {
+                auto capacity = this->expression(*expression.arguments[0]);
+                if (!capacity || !is_integer(capacity->type) ||
+                    integer_negative(capacity->integer,
+                                     integer_type(capacity->type)) ||
+                    !fits_unsigned(capacity->integer, program_.address_bits) ||
+                    capacity->integer.high != 0 ||
+                    capacity->integer.low > byte_budget) {
+                    fail(expression.arguments[0]->location,
+                        "$::meta::alloc capacity exceeds target uptr or 16777216 bytes");
+                    return std::nullopt;
+                }
+                if (!charge_meta_bytes(
+                        static_cast<std::size_t>(capacity->integer.low) * 2,
+                        expression.location)) return std::nullopt;
+                auto storage = std::make_shared<EvalBuffer>();
+                storage->data.resize(static_cast<std::size_t>(capacity->integer.low));
+                storage->assigned.resize(storage->data.size());
+                EvalValue result{UInt128{}, buffer_type()};
+                result.buffer = std::move(storage);
+                return result;
+            }
+            auto handle = this->expression(*expression.arguments[0]);
+            if (!handle || !handle->buffer || handle->buffer->frozen) {
+                fail(expression.arguments[0]->location,
+                    "$::meta::buffer handle is invalid or was used after freeze");
+                return std::nullopt;
+            }
+            if (name == "$::meta::cap")
+                return EvalValue{UInt128{handle->buffer->data.size()},
+                                 builtin_type(BuiltinType::Uptr)};
+            auto length = this->expression(*expression.arguments[1]);
+            if (!length || !is_integer(length->type) ||
+                integer_negative(length->integer, integer_type(length->type)) ||
+                length->integer.high != 0 ||
+                length->integer.low > handle->buffer->data.size()) {
+                fail(expression.arguments[1]->location,
+                    "$::meta::freeze length exceeds buffer capacity");
+                return std::nullopt;
+            }
+            const auto count_bytes = static_cast<std::size_t>(length->integer.low);
+            if (std::find(handle->buffer->assigned.begin(),
+                          handle->buffer->assigned.begin() +
+                              static_cast<std::ptrdiff_t>(count_bytes), 0) !=
+                handle->buffer->assigned.begin() +
+                    static_cast<std::ptrdiff_t>(count_bytes)) {
+                fail(expression.arguments[1]->location,
+                    "$::meta::freeze requires every prefix byte to be assigned");
+                return std::nullopt;
+            }
+            if (!charge_meta_bytes(count_bytes, expression.location))
+                return std::nullopt;
+            auto storage = std::make_shared<const std::string>(
+                handle->buffer->data.substr(0, count_bytes));
+            handle->buffer->frozen = true;
+            EvalValue result{UInt128{}, bytes_type()};
+            result.bytes = std::move(storage);
+            result.byte_length = count_bytes;
+            return result;
+        }
+        if (name == "$::meta::data") {
+            if (expression.arguments.size() != 1U) {
+                fail(expression.location, "$::meta::data requires one meta-byte value");
+                return std::nullopt;
+            }
+            auto source = this->expression(*expression.arguments.front());
+            if (!source || (!source->bytes && !source->buffer) ||
+                (source->buffer && source->buffer->frozen)) {
+                fail(expression.arguments.front()->location,
+                    "$::meta::data requires live bytes or buffer storage");
+                return std::nullopt;
+            }
+            EvalValue result{UInt128{}, pointer_type(builtin_type(BuiltinType::U8,
+                source->bytes != nullptr))};
+            EvalMetaPointer pointer;
+            if (source->bytes) {
+                pointer.immutable = source->bytes;
+                pointer.view_offset = source->byte_offset;
+                pointer.view_length = source->byte_length;
+            } else {
+                pointer.mutable_buffer = source->buffer;
+                pointer.view_length = source->buffer->data.size();
+            }
+            result.meta_pointer = std::move(pointer);
+            return result;
         }
         if (name.starts_with("$::meta::")) {
             fail(expression.location, name + " is not implemented for byte evaluation");
@@ -4262,7 +4651,7 @@ private:
         case Statement::Kind::If: {
             auto condition = expression(*statement.condition);
             if (!condition || condition->pointer() || condition->tokens ||
-                condition->bytes) return {Flow::Failed};
+                condition->bytes || condition->buffer) return {Flow::Failed};
             if (condition->truthy()) {
                 return this->statement(*statement.first);
             }
@@ -4379,7 +4768,7 @@ private:
             while (true) {
                 auto condition = expression(*statement.condition);
                 if (!condition || condition->pointer() || condition->tokens ||
-                    condition->bytes) return {Flow::Failed};
+                    condition->bytes || condition->buffer) return {Flow::Failed};
                 if (!condition->truthy()) return {};
                 auto flow = this->statement(*statement.first);
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
@@ -4392,7 +4781,7 @@ private:
                 if (flow.kind == Flow::Break) return {};
                 auto condition = expression(*statement.condition);
                 if (!condition || condition->pointer() || condition->tokens ||
-                    condition->bytes) return {Flow::Failed};
+                    condition->bytes || condition->buffer) return {Flow::Failed};
                 if (!condition->truthy()) return {};
             } while (true);
         case Statement::Kind::For: {
@@ -4406,7 +4795,7 @@ private:
                 if (statement.condition) {
                     auto condition = expression(*statement.condition);
                     if (!condition || condition->pointer() || condition->tokens ||
-                        condition->bytes) {
+                        condition->bytes || condition->buffer) {
                         scopes_.pop_back();
                         return {Flow::Failed};
                     }
@@ -4449,6 +4838,8 @@ private:
     bool procedural_{};
     std::shared_ptr<const SyntaxContext> macro_context_;
     std::size_t token_bytes_{};
+    std::size_t meta_bytes_{};
+    std::unordered_set<const std::string*> counted_asset_backings_;
     std::vector<NameMap<Cell>> scopes_;
     std::size_t frame_base_{};
     std::uint64_t steps_{};
@@ -5135,9 +5526,9 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                 "a translation-time pointer cannot escape through $::eval");
             return;
         }
-        if (value->bytes) {
+        if (value->bytes || value->buffer) {
             diagnostics.error(expression->location,
-                "$::meta::bytes may only initialize a static u8 array");
+                "meta byte values cannot enter runtime expressions");
             return;
         }
         replace_eval_value(expression, *value);
@@ -5227,9 +5618,9 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
         }
         return;
     }
-    if (value->bytes) {
+    if (value->bytes || value->buffer) {
         diagnostics.error(expression->location,
-            "$::meta::bytes may only initialize a static u8 array");
+            "meta byte values cannot enter runtime expressions");
         return;
     }
     replace_eval_value(expression, *value);
@@ -5529,11 +5920,10 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
             if (statement.declaration) {
                 if (contains_meta(contains_meta, statement.declaration->type) &&
                     (!evaluation_only(*function) ||
-                     statement.declaration->type->kind != Type::Kind::Bytes)) {
+                     (statement.declaration->type->kind != Type::Kind::Bytes &&
+                      statement.declaration->type->kind != Type::Kind::Buffer))) {
                     diagnostics.error(statement.declaration->location,
-                        statement.declaration->type->kind == Type::Kind::Buffer
-                            ? "$::meta::buffer evaluation is not implemented yet"
-                            : "meta values cannot have runtime local storage");
+                        "meta values cannot have runtime local storage");
                 }
                 scopes.back()[name_key(*statement.declaration)] = statement.declaration->type->is_const;
                 check_expression(check_expression, statement.declaration->initializer.get());
@@ -5551,15 +5941,11 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     }
     if (diagnostics.errors() != 0) return false;
     for (const auto& function : program.functions) {
-        if (function->return_type && function->return_type->kind == Type::Kind::Buffer)
-            diagnostics.error(function->location, "$::meta::buffer evaluation is not implemented yet");
         if (contains_meta(contains_meta, function->return_type) &&
             function->return_type->kind != Type::Kind::Bytes &&
             function->return_type->kind != Type::Kind::Buffer)
             diagnostics.error(function->location, "meta types cannot be nested in runtime function types");
         for (const auto& parameter : function->parameters) {
-            if (parameter.type && parameter.type->kind == Type::Kind::Buffer)
-                diagnostics.error(parameter.location, "$::meta::buffer evaluation is not implemented yet");
             if (contains_meta(contains_meta, parameter.type) &&
                 parameter.type->kind != Type::Kind::Bytes &&
                 parameter.type->kind != Type::Kind::Buffer)
@@ -5571,14 +5957,18 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                 "a function cannot be both eval_only and runtime_only");
         }
         if (!evaluation_only(*function)) continue;
-        if ((function->return_type && function->return_type->kind == Type::Kind::Bytes) ||
+        if ((function->return_type &&
+             (function->return_type->kind == Type::Kind::Bytes ||
+              function->return_type->kind == Type::Kind::Buffer)) ||
             std::any_of(function->parameters.begin(), function->parameters.end(),
                 [](const ParameterDecl& parameter) {
-                    return parameter.type && parameter.type->kind == Type::Kind::Bytes;
+                    return parameter.type &&
+                        (parameter.type->kind == Type::Kind::Bytes ||
+                         parameter.type->kind == Type::Kind::Buffer);
                 })) {
             if (function->linkage != Linkage::Static)
                 diagnostics.error(function->location,
-                    "function with $::meta::bytes in its signature must be static");
+                    "function with a meta byte type in its signature must be static");
         }
         if (!function->body) {
             diagnostics.error(

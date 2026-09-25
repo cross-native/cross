@@ -52,6 +52,99 @@ foreach(level O0 O2)
     endforeach()
 endforeach()
 
+foreach(case unassigned_prefix double_freeze over_capacity nonstatic_buffer meta_memory)
+    if(case STREQUAL unassigned_prefix)
+        string(CONCAT body "$::meta::buffer value = $::meta::alloc(1u32);\n"
+                 "$::meta::bytes result = $::meta::freeze(value, 1u32);\n"
+                 "return $::meta::len(result);")
+        set(expected "freeze requires every prefix byte to be assigned")
+    elseif(case STREQUAL double_freeze)
+        string(CONCAT body "$::meta::buffer value = $::meta::alloc(0u32);\n"
+                 "$::meta::buffer alias = value;\n"
+                 "$::meta::bytes first = $::meta::freeze(value, 0u32);\n"
+                 "$::meta::bytes second = $::meta::freeze(alias, 0u32);\n"
+                 "return $::meta::len(first) + $::meta::len(second);")
+        set(expected "buffer handle was used after freeze")
+    elseif(case STREQUAL over_capacity)
+        string(CONCAT body "$::meta::buffer value = $::meta::alloc(0u32);\n"
+                 "$::meta::bytes result = $::meta::freeze(value, 1u32);\n"
+                 "return $::meta::len(result);")
+        set(expected "freeze length exceeds buffer capacity")
+    elseif(case STREQUAL meta_memory)
+        string(CONCAT body
+            "$::meta::buffer first = $::meta::alloc(16777216u32);\n"
+            "$::meta::buffer second = $::meta::alloc(16777216u32);\n"
+            "$::meta::buffer third = $::meta::alloc(1u32);\n"
+            "return $::meta::cap(third);")
+        set(expected "meta memory budget exceeded 67108864 bytes")
+    else()
+        set(body "")
+        set(expected "meta byte type in its signature must be static")
+    endif()
+    set(input "${directory}/${case}.x")
+    if(case STREQUAL nonstatic_buffer)
+        file(WRITE "${input}"
+            "global uptr bad(in $::meta::buffer value) { return $::meta::cap(value); }\n")
+    else()
+        file(WRITE "${input}"
+            "[[eval_only]] static uptr bad() { ${body} }\n"
+            "global uptr result = bad();\n")
+    endif()
+    execute_process(COMMAND "${CC}" -S "${input}"
+        -o "${OUTPUT}-${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(status EQUAL 0 OR NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
+    endif()
+endforeach()
+
+foreach(case unassigned_read frozen_pointer const_write view_overread integer_cast)
+    if(case STREQUAL unassigned_read)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(1u32);\n"
+            "u8 *pointer = $::meta::data(value);\n"
+            "return pointer[0u32];")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL frozen_pointer)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(1u32);\n"
+            "u8 *pointer = $::meta::data(value);\n"
+            "pointer[0u32] = 7u32;\n"
+            "$::meta::bytes frozen = $::meta::freeze(value, 1u32);\n"
+            "return pointer[0u32] + $::meta::len(frozen);")
+        set(expected "buffer data pointer was used after freeze")
+    elseif(case STREQUAL const_write)
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const u8 *pointer = $::meta::data(value);\n"
+            "pointer[0u32] = 7u32;\n"
+            "return 0u32;")
+        set(expected "meta pointer write requires mutable u8 storage")
+    elseif(case STREQUAL view_overread)
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "const u8 *pointer = $::meta::data($::meta::slice(value, 1u32, 2u32));\n"
+            "return pointer[2u32];")
+        set(expected "meta pointer read is outside its view")
+    else()
+        string(CONCAT body
+            "$::meta::bytes value = $::embed(\"payload.bin\");\n"
+            "uptr address = (uptr)$::meta::data(value);\n"
+            "return address;")
+        set(expected "meta data pointers cannot convert to integer")
+    endif()
+    set(input "${directory}/${case}.x")
+    file(WRITE "${input}"
+        "[[eval_only]] static uptr bad() { ${body} }\n"
+        "global uptr result = bad();\n")
+    execute_process(COMMAND "${CC}" -S "${input}"
+        -o "${OUTPUT}-${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(status EQUAL 0 OR NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
+    endif()
+endforeach()
+
 # Byte materialization is independent of scalar byte order and target uptr
 # width. The scalar length still follows the selected target's layout.
 foreach(target mips-unknown-elf mipsel-unknown-elf mips64-unknown-elf)
@@ -105,10 +198,10 @@ foreach(case bad_bound empty out_of_bounds pointer buffer)
         set(expected "outside the byte sequence")
     elseif(case STREQUAL pointer)
         set(source "static const u8 *value = $::embed(\"payload.bin\");\n")
-        set(expected "bytes")
+        set(expected "meta byte values cannot be used as a runtime scalar")
     else()
-        set(source "static $::meta::buffer invalid(in $::meta::buffer input) { return input; }\n")
-        set(expected "buffer evaluation is not implemented")
+        set(source "global $::meta::buffer invalid;\n")
+        set(expected "meta values cannot have runtime object storage")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}" "${source}")
