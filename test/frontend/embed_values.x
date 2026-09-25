@@ -119,6 +119,7 @@ static $::meta::bytes packed_words() {
 typedef u16 (*word_row)[2];
 typedef u16 (*word_grid)[2][2];
 typedef uptr (*pointer_row)[2];
+typedef uptr pointer_pair[2];
 
 static $::meta::bytes packed_rows() {
     $::meta::buffer output = $::meta::alloc(8u32);
@@ -150,11 +151,13 @@ static $::meta::bytes packed_rows() {
 }
 
 [[eval_only]] static uptr target_sized_array_ok() {
-    $::meta::buffer output = $::meta::alloc(2u32 * $::target::pointer_bytes);
+    $::meta::buffer output = $::meta::alloc(sizeof(pointer_pair));
     pointer_row row = (pointer_row)$::meta::data(output);
     row[0u32][0u32] = 3uptr;
     row[0u32][1u32] = 5uptr;
     return row[0u32][1u32] == 5uptr &&
+           sizeof(pointer_pair) == 2u32 * $::target::pointer_bytes &&
+           $::alignof(pointer_pair) == $::target::pointer_bytes &&
            row + 1u32 - row == 1iptr;
 }
 

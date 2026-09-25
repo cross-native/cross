@@ -2869,7 +2869,20 @@ public:
                 fail(expression.location, type_name(type) + " has no runtime size or alignment");
                 return std::nullopt;
             }
-            if (!type || !query) {
+            if (!type) {
+                fail(expression.location,
+                     "target layout is unavailable for this translation-time query");
+                return std::nullopt;
+            }
+            if (!query && meta_object_type(type)) {
+                const auto value = expression.kind == Expr::Kind::Sizeof
+                    ? meta_object_size(type)
+                    : std::optional<std::size_t>{meta_scalar_alignment(type)};
+                if (value)
+                    return EvalValue{UInt128{*value},
+                                     builtin_type(BuiltinType::Uptr)};
+            }
+            if (!query) {
                 fail(expression.location,
                      "target layout is unavailable for this translation-time query");
                 return std::nullopt;
