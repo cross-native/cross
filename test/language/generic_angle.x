@@ -35,6 +35,45 @@ static i32 shadow_parameter(in i32 choose) {
     return choose < 3i32 ? 1i32 : 2i32;
 }
 
+static T shadowed<T>(in T value) { return value; }
+namespace ordinary_import {
+    i32 shadowed = 2i32;
+}
+namespace ordinary_function {
+    static i32 shadowed(in i32 value) { return value + 1i32; }
+}
+namespace imported_generic {
+    static T shadowed<T>(in T value) { return value + 1i32; }
+}
+namespace lexical_shadow {
+    i32 shadowed = 2i32;
+    namespace inner {
+        using imported_generic;
+        static i32 check() { return shadowed < 3i32; }
+    }
+}
+namespace imported_shadow {
+    using ordinary_import;
+    static i32 check() { return shadowed < 3i32; }
+}
+namespace function_shadow {
+    using ordinary_function;
+    static i32 check() { return shadowed(40i32); }
+}
+namespace ordered_imports {
+    using ordinary_import;
+    using imported_generic;
+    static i32 check() { return shadowed < 3i32; }
+}
+namespace generic_before_global {
+    static T selected<T>(in T value) { return value + 1i32; }
+}
+i32 selected = 7i32;
+namespace selected_import {
+    using generic_before_global;
+    static i32 check() { return selected<i32>(40i32); }
+}
+
 typedef i32 (*generic_callback)(in i32 value) [[abi("ms_abi")]];
 typedef i32 (*generic_alias_callback)(in i32 value) [[abi("ms")]];
 struct generic_pair { i32 left; i32 right; };
@@ -87,6 +126,11 @@ global i32 generic_angle_entry() {
            member == 3i32 && called == 7i32 &&
            shadow == 1i32 && shadow_call == 41i32 &&
            iterations == 1i32 &&
-           after_shadow == 13i32 && shadow_parameter(2i32) == 1i32
+           after_shadow == 13i32 && shadow_parameter(2i32) == 1i32 &&
+           lexical_shadow::inner::check() == 1i32 &&
+           imported_shadow::check() == 1i32 &&
+           function_shadow::check() == 41i32 &&
+           ordered_imports::check() == 1i32 &&
+           selected_import::check() == 41i32
         ? 1i32 : 2i32;
 }

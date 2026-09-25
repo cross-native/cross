@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frontend/parser.hpp"
+#include "frontend/name.hpp"
 
 #include <algorithm>
 #include <array>
@@ -729,19 +730,18 @@ bool Parser::known_generic_name(std::string_view name) const {
         for (auto scope = local_scopes_.rbegin();
              scope != local_scopes_.rend(); ++scope)
             if (scope->contains(std::string(name))) return false;
-    if (known_generic_functions_.contains(std::string(name))) return true;
-    if (name.find("::") != std::string_view::npos) return false;
-    auto name_space = active_namespace_;
-    while (!name_space.empty()) {
-        if (known_generic_functions_.contains(join_namespace(name_space, name)))
+    const auto lookup = [&](std::string_view candidate)
+        -> std::optional<bool> {
+        if (known_ordinary_values_.contains(std::string(candidate)))
+            return false;
+        if (known_generic_functions_.contains(std::string(candidate)))
             return true;
-        const auto separator = name_space.rfind("::");
-        if (separator == std::string::npos) break;
-        name_space.resize(separator);
-    }
-    for (const auto& imported : active_imports_)
-        if (known_generic_functions_.contains(join_namespace(imported, name)))
-            return true;
+        return std::nullopt;
+    };
+    for (const auto& candidate : namespace_candidates(
+             NameUse{name}, active_namespace_, active_imports_))
+        if (const auto found = lookup(candidate))
+            return *found;
     return false;
 }
 
@@ -1274,6 +1274,8 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     if (type->kind == Type::Kind::Function && type->function) {
         if (!angle_parameters.empty() || !parameters.empty())
             known_generic_functions_.insert(*name);
+        else
+            known_ordinary_values_.insert(*name);
         auto signature = type->function;
         auto result_type = signature->result;
         auto function = parse_function(
@@ -1282,6 +1284,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
             std::move(angle_parameters));
         if (function) program.functions.push_back(std::move(function));
     } else {
+        known_ordinary_values_.insert(*name);
         if (!angle_parameters.empty())
             diagnostics_.error(location,
                                "angle generic parameters require a direct function declaration");
@@ -1382,6 +1385,7 @@ void Parser::parse_enum_declaration(Program& program,
                 EnumDecl::Enumerator enumerator;
                 enumerator.location = token->location;
                 enumerator.name = join_namespace(name_space, token->text);
+                known_ordinary_values_.insert(enumerator.name);
                 if (consume("=")) enumerator.initializer = parse_assignment();
                 declaration.enumerators.push_back(std::move(enumerator));
             }

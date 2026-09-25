@@ -8,9 +8,11 @@ foreach(required CC SOURCE_DIR OUTPUT_DIR)
 endforeach()
 file(MAKE_DIRECTORY "${OUTPUT_DIR}")
 set(cases generic_angle_conflict generic_angle_missing_value
-          generic_angle_mixed_declaration generic_angle_assertion)
+          generic_angle_mixed_declaration generic_angle_assertion
+          generic_angle_shadow_non_generic)
 set(patterns "conflicting deductions" "requires an explicit argument"
-             "cannot be combined" "static_assert failed")
+             "cannot be combined" "static_assert failed"
+             "generic arguments applied to non-generic function")
 list(LENGTH cases count)
 math(EXPR last "${count}-1")
 foreach(index RANGE ${last})
