@@ -148,7 +148,8 @@ private:
     void flatten_production(std::size_t event,
         std::size_t parent = std::numeric_limits<std::size_t>::max());
     std::shared_ptr<const SyntaxNode> public_node(std::size_t event) const;
-    void record_balanced_sequence(std::size_t first, std::size_t end);
+    void record_balanced_sequence(std::size_t first, std::size_t end,
+        SyntaxProduction production = SyntaxProduction::BalancedTokenSequence);
 
     std::vector<Token> tokens_;
     Diagnostics& diagnostics_;

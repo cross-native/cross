@@ -436,8 +436,25 @@ static $::meta::buffer make_empty_buffer() {
     return $::quote { $::unquote(input) };
 }
 
+[[syntax_expander]] static $::meta::tokens parsed_asset(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    $::meta::syntax embed = body;
+    while (!$::meta::is_production(embed, "embed_expression")) {
+        if ($::meta::child_count(embed) != 1uptr) return $::quote { invalid_embed_tree };
+        embed = $::meta::child(embed, 0uptr);
+    }
+    if ($::meta::child_count(embed) != 4uptr) return $::quote { invalid_embed_tree };
+    for (uptr at = 0uptr; at < 4uptr; ++at)
+        if (!$::meta::is_kind($::meta::child(embed, at), "token"))
+            return $::quote { invalid_embed_tree };
+    return $::meta::tokens(body);
+}
+syntax Asset : expression { prefix "asset"; match body:expr; expand parsed_asset; }
+syntax Asset;
+
 global const u8 original[] = $::embed("payload.bin");
 global const u8 copied[] = copy_asset! { $::embed("payload.bin") };
+global const u8 parsed[] = asset $::embed("payload.bin");
 global u8 rotated[5] = rotate($::embed("payload.bin"));
 global u8 encoded[] = inverted($::embed("payload.bin"));
 global u8 encoded_slice[3] = inverted($::meta::slice($::embed("payload.bin"), 1u32, 3u32));

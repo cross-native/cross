@@ -34,6 +34,19 @@ Node child(Node node, std::size_t at, SyntaxProduction expected, std::size_t chi
     require(at < node->children.size(), "missing public child");
     return production(node->children[at], expected, children);
 }
+Node descendant(Node node, SyntaxProduction expected) {
+    std::vector<Node> pending{std::move(node)};
+    while (!pending.empty()) {
+        auto current = std::move(pending.back());
+        pending.pop_back();
+        if (current->kind == SyntaxNode::Kind::Core && current->production == expected)
+            return current;
+        for (auto at = current->children.rbegin(); at != current->children.rend(); ++at)
+            pending.push_back(*at);
+    }
+    std::cerr << "missing descendant " << syntax_production_name(expected) << '\n';
+    std::abort();
+}
 }
 
 int main() {
@@ -213,5 +226,30 @@ int main() {
     item = child(child(declaration, 1, P::InitDeclaratorList, 1), 0, P::InitDeclarator, 5);
     child(item, 1, P::ObjectLocation, 1);
     child(item, 2, P::AttributeSpecifier, 3);
+
+    auto expression = parse("$::embed(\"unread-asset.bin\")", K::Expr);
+    auto embed = production(descendant(expression, P::EmbedExpression), P::EmbedExpression, 4);
+    token(embed->children[0], "$::embed");
+    token(embed->children[1], "(");
+    token(embed->children[2], "\"unread-asset.bin\"");
+    token(embed->children[3], ")");
+    expression = parse("$::quote { alien! ([x] { word }) $::unquote(no_such_macro! { foreign; }) }",
+                       K::Expr);
+    auto quote = production(descendant(expression, P::QuoteExpression), P::QuoteExpression, 4);
+    token(quote->children[0], "$::quote");
+    token(quote->children[1], "{");
+    auto contents = child(quote, 2, P::BalancedTokens, 5);
+    token(contents->children[0], "alien");
+    token(contents->children[1], "!");
+    child(contents, 2, P::BalancedTokenTree, 3);
+    token(contents->children[3], "$::unquote");
+    child(contents, 4, P::BalancedTokenTree, 3);
+    token(quote->children[3], "}");
+    expression = parse("$::quote {}", K::Expr);
+    quote = production(descendant(expression, P::QuoteExpression), P::QuoteExpression, 4);
+    contents = child(quote, 2, P::BalancedTokens, 0);
+    require(contents->span.first.offset == quote->children[3]->span.first.offset &&
+            contents->span.last.offset == contents->span.first.offset,
+            "empty quote content has the wrong boundary span");
     require(diagnostics.errors() == 0, "schema diagnostics escaped");
 }

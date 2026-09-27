@@ -7,6 +7,7 @@
 extern "C" {
 extern const std::uint8_t original[5];
 extern const std::uint8_t copied[5];
+extern const std::uint8_t parsed[5];
 extern std::uint8_t rotated[5];
 extern std::uint8_t encoded[5];
 extern std::uint8_t encoded_slice[3];
@@ -123,6 +124,7 @@ int main() {
         if (pointer_scalars[index] != expected_pointer_scalars[index]) return 11;
     for (std::size_t index = 0; index < 5; ++index) {
         if (original[index] != input[index] || copied[index] != input[index] ||
+            parsed[index] != input[index] ||
             rotated[index] != output[index] || encoded[index] != inverted[index])
             return 2;
     }

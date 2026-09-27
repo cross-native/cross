@@ -49,7 +49,7 @@ enum class SyntaxProduction {
     RelationalExpression, ShiftExpression, AdditiveExpression,
     MultiplicativeExpression, CastExpression, UnaryExpression,
     PostfixExpression, PrimaryExpression, ArgumentList, GenericArguments, GenericArgument,
-    BuiltinName, Literal, Count,
+    BuiltinName, Literal, EmbedExpression, QuoteExpression, Count,
 };
 std::string_view syntax_production_name(SyntaxProduction production);
 

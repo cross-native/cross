@@ -36,7 +36,7 @@ std::string_view syntax_production_name(SyntaxProduction production) {
         "relational_expression", "shift_expression", "additive_expression",
         "multiplicative_expression", "cast_expression", "unary_expression",
         "postfix_expression", "primary_expression", "argument_list", "generic_arguments", "generic_argument",
-        "builtin_name", "literal"};
+        "builtin_name", "literal", "embed_expression", "quote_expression"};
     static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Count));
     const auto index = static_cast<std::size_t>(production);
     return index < std::size(names) ? names[index] : std::string_view{};

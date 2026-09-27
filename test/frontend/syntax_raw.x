@@ -444,6 +444,7 @@ parsed_header [[noinline]] static RawResult header_function(in RawResult value) 
 }
 syntax flow::DropParsed, flow::Explode;
 drop_parsed no_such_macro! { owner drops this before lookup; };
+drop_parsed $::quote { syntax is a DSL; $::unquote(no_such_macro! { foreign input; }) };
 drop_parsed explode ();
 drop_parsed unexecuted::<nested::<3u32>>;
 copy_fn [[noinline]] static RawResult copied_function(in u32 value) { return forwarded! (value) + 17u32; }

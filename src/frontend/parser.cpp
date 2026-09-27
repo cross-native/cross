@@ -485,13 +485,15 @@ std::shared_ptr<const SyntaxNode> Parser::public_node(std::size_t event) const {
     return node;
 }
 
-void Parser::record_balanced_sequence(std::size_t first, std::size_t end) {
-    if (!recording_public_tree_ || public_tree_failed_ || first >= end ||
+void Parser::record_balanced_sequence(std::size_t first, std::size_t end,
+                                     SyntaxProduction root_production) {
+    if (!recording_public_tree_ || public_tree_failed_ || first > end ||
+        (first == end && root_production == SyntaxProduction::BalancedTokenSequence) ||
         end >= tokens_.size()) return;
     const auto saved_index = index_;
     index_ = first;
-    // Attribute arguments are a published raw-token grammar, regardless of
-    // how a particular attribute is interpreted by the typed parser.
+    // Raw public token productions are independent of typed interpretation;
+    // in particular, quote contents never expose evaluated unquote operands.
     std::function<void(SyntaxProduction, std::string_view)> sequence;
     sequence = [&](SyntaxProduction production, std::string_view close) {
         ProductionScope scope(*this, production);
@@ -518,7 +520,7 @@ void Parser::record_balanced_sequence(std::size_t first, std::size_t end) {
             } else ++index_;
         }
     };
-    sequence(SyntaxProduction::BalancedTokenSequence, {});
+    sequence(root_production, {});
     index_ = saved_index;
 }
 
@@ -3269,17 +3271,19 @@ std::unique_ptr<Statement> Parser::parse_procedural_body() {
 }
 
 std::unique_ptr<Expr> Parser::parse_quote() {
+    ProductionScope quote(*this, SyntaxProduction::QuoteExpression);
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::Quote;
     result->location = current().location;
-    if (!parsing_procedural_body_)
+    if (!parsing_procedural_body_ && !parsing_public_fragment_)
         error_here("$::quote is only available in translation-time macro bodies");
     ++index_;
     if (!expect("{", "after $::quote")) return result;
+    const auto content_first = index_;
     TokenSequence literal;
     std::vector<std::string_view> closers{"}"};
     while (current().kind != TokenKind::End) {
-        if (current().is("$::unquote")) {
+        if (!parsing_public_fragment_ && current().is("$::unquote")) {
             result->quote_fragments.push_back(std::move(literal));
             literal.clear();
             ++index_;
@@ -3301,6 +3305,7 @@ std::unique_ptr<Expr> Parser::parse_quote() {
             closers.pop_back();
             if (closers.empty()) {
                 result->quote_fragments.push_back(std::move(literal));
+                record_balanced_sequence(content_first, index_, SyntaxProduction::BalancedTokens);
                 ++index_;
                 return result;
             }
@@ -3340,6 +3345,34 @@ std::unique_ptr<Expr> Parser::parse_primary() {
     }
     const auto item = current();
     if (current().is("$::quote")) return parse_quote();
+    if (current().is("$::embed")) {
+        ProductionScope embed(*this, SyntaxProduction::EmbedExpression);
+        ++index_;
+        expect("(", "after $::embed");
+        auto result = std::make_unique<Expr>();
+        result->kind = Expr::Kind::Call;
+        result->location = item.location;
+        result->left = std::make_unique<Expr>();
+        result->left->kind = Expr::Kind::Name;
+        result->left->location = item.location;
+        result->left->text = std::string(item.text);
+        const auto* path = consume_kind(TokenKind::String);
+        if (!path) {
+            error_here("$::embed requires one string-literal path");
+        } else {
+            auto argument = std::make_unique<Expr>();
+            argument->kind = Expr::Kind::String;
+            argument->location = path->location;
+            argument->text = std::string(path->text);
+            if (const auto decoded = decode_string_literal(path->text))
+                argument->string_value = *decoded;
+            else
+                diagnostics_.error(path->location, "invalid UTF-8 string literal");
+            result->arguments.push_back(std::move(argument));
+        }
+        expect(")", "after embedded asset path");
+        return result;
+    }
     if (current().is("$::unquote"))
         error_here("$::unquote is only valid inside $::quote");
     if (current().is("$::alignof") && current(1).is("(")) {
