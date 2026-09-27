@@ -108,6 +108,7 @@ add_library(cross_frontend
     src/frontend/preprocessor_expression.cpp
     src/frontend/procedural.cpp
     src/frontend/semantic.cpp
+    src/frontend/syntax.cpp
 )
 target_link_libraries(cross_frontend PUBLIC cross_common cross_targets)
 cross_component(cross_frontend)
@@ -2366,6 +2367,15 @@ if(BUILD_TESTING)
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/meta_objects.x
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/meta-object-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/meta_objects.cmake")
+    add_test(NAME cross_syntax_raw_checks
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-raw-checks
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw.cmake")
+    add_executable(cross_syntax_state_test test/frontend/syntax_state_test.cpp)
+    target_link_libraries(cross_syntax_state_test PRIVATE cross_frontend)
+    cross_component(cross_syntax_state_test)
+    add_test(NAME cross_syntax_state COMMAND cross_syntax_state_test)
     if(WIN32)
         set(meta_vector_host_abi ms_abi)
     else()
@@ -2381,6 +2391,20 @@ if(BUILD_TESTING)
                     "--model=${CMAKE_SOURCE_DIR}/test/model/custom.y" -mabi=odd_abi
                     -DCUSTOM_META_ABI "-DHOST_ABI=\"${meta_vector_host_abi}\"")
             endif()
+            set(syntax_flags ${meta_vector_flags})
+            if(mode STREQUAL custom)
+                list(APPEND syntax_flags -DCUSTOM_SYNTAX_ABI)
+            endif()
+            add_test(NAME cross_syntax_raw_${level}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-raw-${level}-${mode}
+                        -DENTRY=syntax_raw_entry -DEXPECTED=61
+                        "-DCC_FLAGS=${syntax_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
             add_test(NAME cross_meta_objects_${level}_${mode}
                 COMMAND "${CMAKE_COMMAND}"
                         -DCC=$<TARGET_FILE:cross_cc>

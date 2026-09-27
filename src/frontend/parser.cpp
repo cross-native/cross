@@ -136,8 +136,11 @@ std::optional<std::int64_t> constant_value(const Expr& expression) {
 
 } // namespace
 
-Parser::Parser(std::vector<Token> tokens, Diagnostics& diagnostics)
-    : tokens_(std::move(tokens)), diagnostics_(diagnostics) {}
+Parser::Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
+               std::shared_ptr<SyntaxExecution> execution)
+    : tokens_(std::move(tokens)), diagnostics_(diagnostics) {
+    if (execution) syntax_.emplace(std::move(execution));
+}
 
 const Token& Parser::current(std::size_t lookahead) const {
     const auto position = index_ + lookahead;
@@ -173,6 +176,289 @@ void Parser::synchronize_external() {
         if (current().is("}")) return;
         ++index_;
     }
+}
+
+std::vector<SyntaxActivation> Parser::parse_syntax_entries(std::string_view end) {
+    std::vector<SyntaxActivation> entries;
+    do {
+        const auto location = current().location;
+        if (current().kind != TokenKind::Identifier || is_reserved_identifier(current().text)) {
+            error_here("expected nonreserved syntax entity name");
+            break;
+        }
+        auto name = parse_qualified_name();
+        if (!name) break;
+        SyntaxActivation entry{std::move(*name), {}, location};
+        if (consume("as")) {
+            if (current().kind != TokenKind::Identifier || is_reserved_identifier(current().text)) {
+                error_here("expected nonreserved syntax prefix alias");
+                break;
+            }
+            entry.alias = current().text;
+            ++index_;
+        }
+        entries.push_back(std::move(entry));
+    } while (consume(","));
+    expect(end, "after syntax activation list");
+    return entries;
+}
+
+bool Parser::parse_syntax_registration(Program* program) {
+    if (!current().is("syntax")) return false;
+    const auto location = current().location;
+    if (replacement_ || token_origin(location).context) {
+        error_here("expansion output cannot introduce syntax registration");
+        ++index_;
+        synchronize_external();
+        return true;
+    }
+    if (!syntax_) return false;
+    if (current(1).kind == TokenKind::Identifier && current(2).is(":")) {
+        const auto first = index_;
+        std::optional<std::size_t> declaration_end;
+        for (auto at = first; at < tokens_.size() && tokens_[at].kind != TokenKind::End; ++at) {
+            if (!tokens_[at].is("{")) continue;
+            unsigned depth = 1;
+            for (++at; at < tokens_.size() && tokens_[at].kind != TokenKind::End; ++at) {
+                if (tokens_[at].is("{")) ++depth;
+                else if (tokens_[at].is("}") && --depth == 0) { declaration_end = at + 1; break; }
+            }
+            break;
+        }
+        if (!program) {
+            error_here("syntax definitions are allowed only at item position");
+            if (declaration_end) index_ = *declaration_end;
+            else { ++index_; synchronize_external(); }
+        } else if (!syntax_->declare(tokens_, index_, active_namespace_, diagnostics_)) {
+            if (declaration_end) index_ = *declaration_end;
+            else synchronize_external();
+        }
+        return true;
+    }
+    ++index_;
+    const bool region = consume("(");
+    const auto errors = diagnostics_.errors();
+    auto entries = parse_syntax_entries(region ? ")" : ";");
+    if (region) {
+        if (!program) {
+            diagnostics_.error(location, "syntax regions are allowed only at item position");
+            synchronize_external();
+            return true;
+        }
+        syntax_->push_scope();
+    }
+    if (diagnostics_.errors() == errors)
+        (void)syntax_->activate(entries, active_namespace_, diagnostics_);
+    if (region) {
+        const auto saved_imports = active_imports_;
+        const auto saved_scope_imports = current_scope_imports_;
+        current_scope_imports_ = 0;
+        const auto region_namespace = active_namespace_;
+        if (expect("{", "after syntax region")) {
+            while (!current().is("}") && current().kind != TokenKind::End) {
+                const auto before = index_;
+                parse_external(*program, region_namespace);
+                if (before == index_) ++index_;
+            }
+            expect("}", "after syntax region items");
+        }
+        active_imports_ = saved_imports;
+        current_scope_imports_ = saved_scope_imports;
+        syntax_->pop_scope();
+    }
+    return true;
+}
+
+bool Parser::macro_start() const {
+    if (!syntax_ || current().kind != TokenKind::Identifier) return false;
+    auto at = index_ + 1;
+    while (at + 1 < tokens_.size() && tokens_[at].is("::") &&
+           tokens_[at + 1].kind == TokenKind::Identifier) at += 2;
+    return at + 1 < tokens_.size() && tokens_[at].is("!") &&
+        (tokens_[at + 1].is("(") || tokens_[at + 1].is("[") || tokens_[at + 1].is("{"));
+}
+
+const SyntaxDefinition* Parser::active_syntax(bool item) const {
+    if (!syntax_ || current().kind != TokenKind::Identifier ||
+        current(1).is("::") || current(1).is(":") || macro_start()) return nullptr;
+    return syntax_->selected(current(), item);
+}
+
+std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
+    const auto location = current().location;
+    const auto origin = token_origin(location);
+    const auto& name_space = origin.context ? origin.context->name_space : active_namespace_;
+    const auto& imports = origin.context ? origin.context->imports : active_imports_;
+    const auto bindings = origin.context ? origin.context->syntax_bindings : syntax_->bindings();
+    auto execution = syntax_->execution();
+    if (macro_start()) {
+        auto name = parse_qualified_name();
+        ++index_; // '!'
+        const auto opening = current().text;
+        std::vector<std::string_view> stack;
+        TokenSequence input;
+        ++index_;
+        stack.push_back(opening == "(" ? ")" : opening == "[" ? "]" : "}");
+        while (current().kind != TokenKind::End && !stack.empty()) {
+            if (!execution->work(current().location)) return {};
+            const auto spelling = current().text;
+            if (spelling == "(" || spelling == "[" || spelling == "[[" || spelling == "{")
+                stack.push_back(spelling == "(" ? ")" : spelling == "[" ? "]" : spelling == "[[" ? "]]" : "}");
+            else if (spelling == ")" || spelling == "]" || spelling == "]]" || spelling == "}") {
+                if (stack.back() != spelling) {
+                    error_here("mismatched procedural macro token-tree delimiter");
+                    ++index_;
+                    return {};
+                }
+                stack.pop_back();
+            }
+            if (!stack.empty()) input.emplace_back(current());
+            ++index_;
+        }
+        if (!stack.empty()) {
+            diagnostics_.error(location, "unterminated procedural macro token tree");
+            return {};
+        }
+        const auto search_imports = origin.context
+            ? std::vector<std::vector<std::string>>{imports} : syntax_->imports();
+        const auto function = execution->find_function(*name, name_space, search_imports, false);
+        if (!function) {
+            diagnostics_.error(location, "procedural macro is not visible: '" + *name + "'");
+            return {};
+        }
+        return execution->expand(*function, std::move(input), {}, location, name_space, imports, bindings);
+    }
+    const auto* definition = active_syntax(item);
+    if (!definition) return {};
+    const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_);
+    if (!matched) { ++index_; synchronize_external(); return {}; }
+    index_ = matched->end;
+    return execution->expand(matched->expander, {}, matched->value, location, name_space, imports, bindings);
+}
+
+std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output) const {
+    auto child = std::make_unique<Parser>(std::move(output.tokens), diagnostics_);
+    child->syntax_ = syntax_;
+    child->replacement_ = true;
+    child->active_imports_ = active_imports_;
+    child->current_scope_imports_ = current_scope_imports_;
+    child->active_generic_types_ = active_generic_types_;
+    child->known_generic_functions_ = known_generic_functions_;
+    child->known_ordinary_values_ = known_ordinary_values_;
+    child->local_scopes_ = local_scopes_;
+    child->active_namespace_ = active_namespace_;
+    child->enum_types_ = enum_types_;
+    child->record_types_ = record_types_;
+    child->type_aliases_ = type_aliases_;
+    child->active_function_ = active_function_;
+    // Caller angle-token fences cannot constrain an independently bounded
+    // replacement expression. Its own generic parses install their fences.
+    child->parsing_generic_argument_ = false;
+    child->parsing_procedural_body_ = parsing_procedural_body_;
+    child->switch_depth_ = switch_depth_;
+    child->switch_default_seen_ = switch_default_seen_;
+    return child;
+}
+
+void Parser::adopt_replacement(Parser& child) {
+    syntax_ = std::move(child.syntax_);
+    active_imports_ = std::move(child.active_imports_);
+    current_scope_imports_ = child.current_scope_imports_;
+    known_generic_functions_ = std::move(child.known_generic_functions_);
+    known_ordinary_values_ = std::move(child.known_ordinary_values_);
+    local_scopes_ = std::move(child.local_scopes_);
+    enum_types_ = std::move(child.enum_types_);
+    record_types_ = std::move(child.record_types_);
+    type_aliases_ = std::move(child.type_aliases_);
+    switch_default_seen_ = std::move(child.switch_default_seen_);
+    for (auto& assertion : child.static_assertions_)
+        static_assertions_.push_back(std::move(assertion));
+}
+
+std::unique_ptr<Statement> Parser::parse_statement_replacement() {
+    const auto location = current().location;
+    const bool macro = macro_start();
+    auto result = std::make_unique<Statement>();
+    result->kind = Statement::Kind::Empty;
+    result->location = location;
+    auto execution = syntax_->execution();
+    if (!execution->begin_replacement(location)) { ++index_; synchronize_external(); return result; }
+    struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
+    auto output = expand_at_position(false);
+    if (!output) return result;
+    auto child = replacement_parser(std::move(*output));
+    // A macro at statement start may produce an expression whose semicolon
+    // belongs to the caller. Custom statement syntax always owns a complete
+    // statement; neither path can borrow an outside else or adjacent tokens.
+    bool expression_macro = macro && child->current().kind != TokenKind::End &&
+        !child->current().is("{") && !child->local_declaration_start();
+    for (const auto keyword : {"return", "goto", "if", "switch", "while", "do", "for",
+                               "break", "continue", "case", "default", "label", ";", "[["})
+        if (child->current().is(keyword)) expression_macro = false;
+    if (child->macro_start()) expression_macro = false;
+    if (const auto* selected = child->active_syntax(false); selected && selected->kind == SyntaxKind::Statement)
+        expression_macro = false;
+    unsigned group_depth = 0;
+    for (const auto& token : child->tokens_) {
+        if (token.is("(") || token.is("[") || token.is("[[") || token.is("{")) ++group_depth;
+        else if ((token.is(")") || token.is("]") || token.is("]]") || token.is("}")) && group_depth) --group_depth;
+        else if (token.is(";") && group_depth == 0) expression_macro = false;
+    }
+    if (expression_macro) {
+        result->kind = Statement::Kind::Expression;
+        auto grouped = std::make_unique<Expr>();
+        grouped->kind = Expr::Kind::Parenthesized;
+        grouped->location = location;
+        grouped->left = child->parse_assignment();
+        result->expression = std::move(grouped);
+    } else if (child->current().kind == TokenKind::End) {
+        diagnostics_.error(location, "statement expansion must produce exactly one complete statement");
+    } else result = child->parse_statement();
+    if (child->current().kind != TokenKind::End)
+        child->error_here("statement expansion must produce exactly one complete statement");
+    const bool needs_semicolon = expression_macro || child->deferred_statement_semicolon_;
+    adopt_replacement(*child);
+    if (needs_semicolon) {
+        if (!macro) diagnostics_.error(location, "statement expansion must produce exactly one complete statement");
+        else {
+            result->expression = parse_expression(std::move(result->expression));
+            if (current().kind == TokenKind::End && replacement_) deferred_statement_semicolon_ = true;
+            else expect(";", "after procedural expression statement");
+        }
+    }
+    return result;
+}
+
+std::unique_ptr<Expr> Parser::parse_expression_replacement() {
+    const auto location = current().location;
+    auto result = std::make_unique<Expr>();
+    result->kind = Expr::Kind::Integer;
+    result->text = "0";
+    result->location = location;
+    if (const auto* definition = active_syntax(false); definition && definition->kind != SyntaxKind::Expression) {
+        error_here("statement syntax is not valid at expression position");
+        ++index_;
+        return result;
+    }
+    auto execution = syntax_->execution();
+    if (!execution->begin_replacement(location)) { ++index_; return result; }
+    struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
+    auto output = expand_at_position(false);
+    if (!output) return result;
+    auto child = replacement_parser(std::move(*output));
+    if (child->current().kind == TokenKind::End)
+        diagnostics_.error(location, "expression expansion must produce one assignment expression");
+    else result = child->parse_assignment();
+    if (child->current().kind != TokenKind::End)
+        child->error_here("expression expansion must produce one assignment expression without a semicolon");
+    adopt_replacement(*child);
+    // The parsed root is a subtree, so caller operators cannot reassociate
+    // across the expansion boundary (even without textual parentheses).
+    auto grouped = std::make_unique<Expr>();
+    grouped->kind = Expr::Kind::Parenthesized;
+    grouped->location = location;
+    grouped->left = std::move(result);
+    return grouped;
 }
 
 std::vector<Attribute> Parser::parse_attributes() {
@@ -449,6 +735,7 @@ bool Parser::type_start() const {
     const auto& token = current();
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
+           token.is("$::meta::syntax_match") ||
            token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
@@ -474,7 +761,14 @@ TypePtr Parser::parse_type() {
         }
     }
     TypePtr type;
-    if (current().is("$::meta::tokens")) {
+    if (current().is("$::meta::syntax_match")) {
+        if (!parsing_procedural_body_)
+            error_here("$::meta::syntax_match is only available in expansion functions");
+        type = syntax_match_type();
+        type->is_const = is_const;
+        type->is_volatile = is_volatile;
+        ++index_;
+    } else if (current().is("$::meta::tokens")) {
         if (!parsing_procedural_body_)
             error_here("$::meta::tokens is only available in translation-time macro bodies");
         ++index_;
@@ -1166,6 +1460,31 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         ~NamespaceRestore() { value = std::move(previous); }
     } restore{active_namespace_, active_namespace_};
     active_namespace_ = name_space;
+    if (syntax_ && current().is("[[") &&
+        (current(1).is("macro") || current(1).is("syntax_expander")) && current(2).is("]]")) {
+        if (replacement_) error_here("expansion output cannot introduce syntax registration");
+        else (void)syntax_->execution()->define_function(tokens_, index_, active_namespace_,
+            active_imports_, syntax_->bindings());
+        if (replacement_) { ++index_; synchronize_external(); }
+        return;
+    }
+    if (parse_syntax_registration(&program)) return;
+    if (syntax_ && (macro_start() || active_syntax(true))) {
+        const auto location = current().location;
+        auto execution = syntax_->execution();
+        if (!execution->begin_replacement(location)) { ++index_; synchronize_external(); return; }
+        struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
+        auto output = expand_at_position(true);
+        if (!output) return;
+        auto child = replacement_parser(std::move(*output));
+        while (child->current().kind != TokenKind::End) {
+            const auto before = child->index_;
+            child->parse_external(program, name_space);
+            if (before == child->index_) ++child->index_;
+        }
+        adopt_replacement(*child);
+        return;
+    }
     auto attributes = parse_attributes();
     if (current().is("$::static_assert")) {
         if (!attributes.empty()) error_here("attributes are not valid on $::static_assert");
@@ -1179,14 +1498,21 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         const auto saved_imports = active_imports_;
         const auto saved_scope_imports = current_scope_imports_;
         current_scope_imports_ = 0;
-        while (!current().is("}") && current().kind != TokenKind::End) parse_external(program, full);
+        if (syntax_) syntax_->push_scope();
+        while (!current().is("}") && current().kind != TokenKind::End) {
+            const auto before = index_;
+            parse_external(program, full);
+            if (before == index_) ++index_;
+        }
         expect("}");
+        if (syntax_) syntax_->pop_scope();
         active_imports_ = saved_imports;
         current_scope_imports_ = saved_scope_imports;
         return;
     }
     if (consume("using")) {
         if (auto imported = parse_qualified_name()) {
+            if (syntax_) syntax_->import(*imported);
             active_imports_.insert(active_imports_.begin() + static_cast<std::ptrdiff_t>(current_scope_imports_), std::move(*imported));
             ++current_scope_imports_;
         }
@@ -1746,6 +2072,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     const auto saved_scope_imports = current_scope_imports_;
     current_scope_imports_ = 0;
     local_scopes_.emplace_back();
+    if (syntax_) syntax_->push_scope();
     if (local_scopes_.size() == 1 && active_function_)
         for (const auto& parameter : active_function_->parameters)
             local_scopes_.back().insert(name_key(parameter));
@@ -1754,11 +2081,20 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     statement->location = current().location;
     expect("{");
     while (!current().is("}") && current().kind != TokenKind::End) {
-        if (consume("using")) {
+        const auto before = index_;
+        if (current().is("syntax") && (syntax_ || token_origin(current().location).context)) {
+            auto declaration = std::make_unique<Statement>();
+            declaration->kind = Statement::Kind::Empty;
+            declaration->location = current().location;
+            (void)parse_syntax_registration(nullptr);
+            statement->statements.push_back(std::move(declaration));
+        }
+        else if (consume("using")) {
             auto declaration = std::make_unique<Statement>();
             declaration->kind = Statement::Kind::Empty;
             declaration->location = tokens_[index_ - 1].location;
             if (auto imported = parse_qualified_name()) {
+                if (syntax_) syntax_->import(*imported);
                 active_imports_.insert(active_imports_.begin() +
                     static_cast<std::ptrdiff_t>(current_scope_imports_),
                     std::move(*imported));
@@ -1767,15 +2103,38 @@ std::unique_ptr<Statement> Parser::parse_compound() {
             expect(";", "after using declaration");
             statement->statements.push_back(std::move(declaration));
         } else statement->statements.push_back(parse_statement());
+        if (index_ == before && current().kind != TokenKind::End) ++index_;
     }
     expect("}");
     active_imports_ = saved_imports;
     current_scope_imports_ = saved_scope_imports;
     local_scopes_.pop_back();
+    if (syntax_) syntax_->pop_scope();
     return statement;
 }
 
 std::unique_ptr<Statement> Parser::parse_statement() {
+    if (current().is("syntax") && (syntax_ || token_origin(current().location).context)) {
+        auto statement = std::make_unique<Statement>();
+        statement->kind = Statement::Kind::Empty;
+        statement->location = current().location;
+        error_here(replacement_ || token_origin(current().location).context
+            ? "expansion output cannot introduce syntax registration"
+            : "syntax registration requires an external item or compound block item position");
+        ++index_;
+        synchronize_external();
+        return statement;
+    }
+    if (syntax_ && macro_start()) return parse_statement_replacement();
+    if (const auto* definition = active_syntax(false)) {
+        if (definition->kind == SyntaxKind::Statement) return parse_statement_replacement();
+        auto statement = std::make_unique<Statement>();
+        statement->kind = Statement::Kind::Expression;
+        statement->location = current().location;
+        statement->expression = parse_expression();
+        expect(";", "after expression statement");
+        return statement;
+    }
     if (current().is("{")) return parse_compound();
     if (current().is("[[")) {
         auto attributes = parse_attributes();
@@ -2002,7 +2361,9 @@ int Parser::precedence(std::string_view operation) {
     return -1;
 }
 
-std::unique_ptr<Expr> Parser::parse_expression() { return parse_assignment(); }
+std::unique_ptr<Expr> Parser::parse_expression(std::unique_ptr<Expr> seed) {
+    return parse_assignment(std::move(seed));
+}
 
 std::unique_ptr<Expr> Parser::parse_initializer() {
     if (!current().is("{")) return parse_assignment();
@@ -2044,8 +2405,8 @@ std::unique_ptr<Expr> Parser::parse_initializer() {
     return result;
 }
 
-std::unique_ptr<Expr> Parser::parse_assignment() {
-    auto left = parse_conditional();
+std::unique_ptr<Expr> Parser::parse_assignment(std::unique_ptr<Expr> seed) {
+    auto left = parse_conditional(std::move(seed));
     if (current().is("=") || current().is("+=") || current().is("-=") ||
         current().is("*=") || current().is("/=") || current().is("%=") ||
         current().is("<<=") || current().is(">>=") ||
@@ -2063,8 +2424,8 @@ std::unique_ptr<Expr> Parser::parse_assignment() {
     return left;
 }
 
-std::unique_ptr<Expr> Parser::parse_conditional() {
-    auto condition = parse_binary(1);
+std::unique_ptr<Expr> Parser::parse_conditional(std::unique_ptr<Expr> seed) {
+    auto condition = parse_binary(1, std::move(seed));
     if (!consume("?")) return condition;
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::Conditional;
@@ -2076,8 +2437,8 @@ std::unique_ptr<Expr> Parser::parse_conditional() {
     return result;
 }
 
-std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence) {
-    auto left = parse_cast();
+std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence, std::unique_ptr<Expr> seed) {
+    auto left = seed ? parse_postfix(std::move(seed)) : parse_cast();
     for (;;) {
         if (parsing_generic_argument_ &&
             (current().is(">") || current().is(">>"))) break;
@@ -2167,8 +2528,8 @@ std::unique_ptr<Expr> Parser::parse_unary() {
     return parse_postfix();
 }
 
-std::unique_ptr<Expr> Parser::parse_postfix() {
-    auto expression = parse_primary();
+std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
+    auto expression = seed ? std::move(seed) : parse_primary();
     for (;;) {
         const bool explicit_generic = current().is("::") &&
                                       current(1).is("<");
@@ -2322,6 +2683,17 @@ std::unique_ptr<Expr> Parser::parse_quote() {
 }
 
 std::unique_ptr<Expr> Parser::parse_primary() {
+    if (current().is("syntax") &&
+        (replacement_ || token_origin(current().location).context)) {
+        error_here("expansion output cannot introduce syntax registration");
+        auto result = std::make_unique<Expr>();
+        result->kind = Expr::Kind::Integer;
+        result->location = current().location;
+        result->text = "0";
+        ++index_;
+        return result;
+    }
+    if (syntax_ && (macro_start() || active_syntax(false))) return parse_expression_replacement();
     const auto item = current();
     if (current().is("$::quote")) return parse_quote();
     if (current().is("$::unquote"))

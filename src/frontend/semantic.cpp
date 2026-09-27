@@ -6,6 +6,7 @@
 #include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
 #include "frontend/lexer.hpp"
+#include "frontend/syntax.hpp"
 #include "model/model.hpp"
 
 #include <algorithm>
@@ -32,7 +33,7 @@ std::span<const std::string_view> core_attribute_names() {
         "musttail", "naked", "no_sanitize", "no_stack_protector", "noinit",
         "noinline", "noreturn", "operator", "packed", "raw_inline",
         "retain", "returns_twice", "runtime_only", "scalable_vector",
-        "section", "stack_cleanup", "thread_local", "tls_model",
+        "section", "stack_cleanup", "syntax_expander", "thread_local", "tls_model",
         "underlying", "used", "variadic", "vector_size", "visibility",
         "weak", "weakref",
     };
@@ -76,6 +77,9 @@ bool validate_attribute_names(const Program& program,
             if (!is_known_attribute(attribute.name)) {
                 diagnostics.error(attribute.location,
                                   "unknown attribute '" + attribute.name + "'");
+            } else if (attribute.name == "syntax_expander") {
+                diagnostics.error(attribute.location,
+                    "syntax_expander requires a dedicated static expansion-function declaration");
             }
         }
     };
@@ -137,6 +141,8 @@ TypePtr clone_type(const TypePtr& source,
         result = record_type(source->nominal_name, source->is_union);
     } else if (source->kind == Type::Kind::Tokens) {
         result = tokens_type();
+    } else if (source->kind == Type::Kind::SyntaxMatch) {
+        result = syntax_match_type();
     } else if (source->kind == Type::Kind::Bytes) {
         result = bytes_type();
     } else if (source->kind == Type::Kind::Buffer) {
@@ -2156,6 +2162,7 @@ struct EvalValue {
     bool function_designator{};
     // Immutable token storage is distinct from both strings and integers.
     std::shared_ptr<const TokenSequence> tokens;
+    std::shared_ptr<const SyntaxMatchValue> syntax_match;
     std::shared_ptr<const std::string> bytes;
     std::size_t byte_offset{};
     std::size_t byte_length{};
@@ -2633,6 +2640,17 @@ public:
         return charge_meta_bytes(size, location);
     }
 
+    bool charge_input_match(const SyntaxMatchValue& match, SourceLocation location) {
+        if (!charge_meta_bytes(128, location) || !charge_input_tokens(match.input, location)) return false;
+        for (const auto& field : match.fields) {
+            if (!charge_meta_bytes(64 + field.name.size(), location) ||
+                !charge_input_tokens(field.tokens, location)) return false;
+            for (const auto& record : field.records)
+                if (!charge_input_match(*record, location)) return false;
+        }
+        return true;
+    }
+
     std::unique_ptr<Expr> required_pointer(const Expr& source, const TypePtr& destination) {
         if (!validate_required_tree(source)) return {};
         auto value = expression(source);
@@ -2926,6 +2944,7 @@ public:
                                     ? size_of_
                                     : align_of_;
             if (type && (type->kind == Type::Kind::Tokens ||
+                         type->kind == Type::Kind::SyntaxMatch ||
                          type->kind == Type::Kind::Bytes ||
                          type->kind == Type::Kind::Buffer)) {
                 fail(expression.location, type_name(type) + " has no runtime size or alignment");
@@ -2990,6 +3009,7 @@ public:
 private:
     static bool contains_tokens(const TypePtr& type) {
         return type && (type->kind == Type::Kind::Tokens ||
+            type->kind == Type::Kind::SyntaxMatch ||
             contains_tokens(type->pointee) || contains_tokens(type->element) ||
             (type->function && (contains_tokens(type->function->result) ||
                 std::any_of(type->function->parameters.begin(), type->function->parameters.end(),
@@ -3297,7 +3317,7 @@ private:
                 const auto type = node.type ? node.type
                     : node.left ? expression_type(*node.left, false) : nullptr;
                 if (!type || contains_tokens(type)) {
-                    fail(node.location, "layout query requires a runtime object type, not tokens");
+                    fail(node.location, "layout query requires a runtime object type, not tokens or syntax matches");
                     return false;
                 }
             }
@@ -3326,6 +3346,27 @@ private:
                 return false;
             }
             const auto& name = node.left->text;
+            if (name.starts_with("$::syntax::")) {
+                const auto count = name == "$::syntax::input" ? 1U
+                    : name == "$::syntax::capture" || name == "$::syntax::count" ? 2U
+                    : name == "$::syntax::at" ? 3U : 0U;
+                if (!procedural_ || count == 0 || node.arguments.size() != count) {
+                    fail(node.location, "unsupported syntax operation or invalid argument count: " + name);
+                    return false;
+                }
+                for (const auto& argument : node.arguments)
+                    if (!validate_required_tree(*argument)) return false;
+                const auto first = expression_type(*node.arguments[0]);
+                const auto field = count > 1 ? expression_type(*node.arguments[1]) : nullptr;
+                if (!first || first->kind != Type::Kind::SyntaxMatch ||
+                    (count > 1 && (!field || field->kind != Type::Kind::Pointer || !field->pointee ||
+                                  field->pointee->builtin != BuiltinType::U8)) ||
+                    (count > 2 && !is_integer(expression_type(*node.arguments[2])))) {
+                    fail(node.location, "syntax operation requires a match, string field, and integer index as applicable");
+                    return false;
+                }
+                return true;
+            }
             if (name == "$::embed") {
                 if (node.arguments.size() != 1 ||
                     node.arguments.front()->kind != Expr::Kind::String ||
@@ -3633,6 +3674,8 @@ private:
         if (!from || !to) return false;
         if (from->kind == Type::Kind::Tokens || to->kind == Type::Kind::Tokens)
             return from->kind == to->kind;
+        if (from->kind == Type::Kind::SyntaxMatch || to->kind == Type::Kind::SyntaxMatch)
+            return from->kind == to->kind;
         if ((is_integer(from) || is_floating(from)) && (is_integer(to) || is_floating(to)))
             return true;
         return from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Pointer &&
@@ -3666,6 +3709,7 @@ private:
                     declaration.storage_register || declaration.storage_stack || declaration.location_name ||
                     !declaration.attributes.empty() || declaration.dynamic_array_bound ||
                     !(is_integer(type) || is_floating(type) || type->kind == Type::Kind::Tokens ||
+                      type->kind == Type::Kind::SyntaxMatch ||
                       (type->kind == Type::Kind::Pointer && type->pointee &&
                        type->pointee->kind == Type::Kind::Builtin && type->pointee->builtin == BuiltinType::U8))) {
                     fail(node.location, "procedural macro locals require ordinary scalar, string-pointer, or token cells without runtime storage qualifiers");
@@ -3906,6 +3950,10 @@ private:
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
+            if (procedural_ && expression.left->text == "$::syntax::at") return syntax_match_type();
+            if (procedural_ && expression.left->text == "$::syntax::count") return builtin_type(BuiltinType::Uptr);
+            if (procedural_ && (expression.left->text == "$::syntax::input" ||
+                expression.left->text == "$::syntax::capture")) return tokens_type();
             if (expression.left->text == "$::embed") return bytes_type();
             if (expression.left->text == "$::meta::len")
                 return builtin_type(BuiltinType::Uptr);
@@ -4198,6 +4246,14 @@ private:
                 return std::nullopt;
             }
             return EvalValue{UInt128{value.truthy()}, clone_type(type)};
+        }
+        if (value.syntax_match || type->kind == Type::Kind::SyntaxMatch) {
+            if (!procedural_ || !value.syntax_match || type->kind != Type::Kind::SyntaxMatch) {
+                fail(location, "syntax matches cannot convert to runtime or other meta values");
+                return std::nullopt;
+            }
+            value.type = clone_type(type);
+            return value;
         }
         if (value.tokens || type->kind == Type::Kind::Tokens) {
             if (!procedural_ || !value.tokens || type->kind != Type::Kind::Tokens) {
@@ -6106,6 +6162,66 @@ private:
         if (lookup_mutable(expression.left->text, expression.left->location)) {
             fail(expression.location, "indirect calls are not permitted during translation-time evaluation");
             return std::nullopt;
+        }
+        if (expression.left->text.starts_with("$::syntax::")) {
+            const auto& name = expression.left->text;
+            const auto count = name == "$::syntax::input" ? 1U
+                : name == "$::syntax::capture" || name == "$::syntax::count" ? 2U
+                : name == "$::syntax::at" ? 3U : 0U;
+            if (!procedural_ || count == 0 || expression.arguments.size() != count) {
+                fail(expression.location, "unsupported syntax operation or invalid argument count: " + name);
+                return std::nullopt;
+            }
+            auto match = this->expression(*expression.arguments[0]);
+            if (!match || !match->syntax_match) {
+                fail(expression.location, "syntax operation requires a syntax match");
+                return std::nullopt;
+            }
+            if (count == 1) {
+                TokenSequence output;
+                if (!append_tokens(output, match->syntax_match->input, expression.location)) return std::nullopt;
+                return token_value(std::move(output));
+            }
+            auto field = this->expression(*expression.arguments[1]);
+            if (!field || !field->string) {
+                fail(expression.location, "syntax field must be a translation-time string");
+                return std::nullopt;
+            }
+            if (field->offset >= field->string->size()) {
+                fail(expression.location, "syntax field string pointer is out of bounds");
+                return std::nullopt;
+            }
+            const auto written = std::string_view(*field->string).substr(field->offset,
+                field->string->size() - field->offset - 1);
+            const auto found = std::find_if(match->syntax_match->fields.begin(), match->syntax_match->fields.end(),
+                [&](const SyntaxMatchValue::Field& candidate) { return candidate.name == written; });
+            if (found == match->syntax_match->fields.end()) {
+                fail(expression.location, "syntax match has no field named '" + std::string(written) + "'");
+                return std::nullopt;
+            }
+            if (name == "$::syntax::capture") {
+                if (!found->records.empty()) {
+                    fail(expression.location, "syntax capture requires a primitive token field");
+                    return std::nullopt;
+                }
+                TokenSequence output;
+                if (!append_tokens(output, found->tokens, expression.location)) return std::nullopt;
+                return token_value(std::move(output));
+            }
+            if (found->records.empty()) {
+                fail(expression.location, "syntax count/at requires a nested record field");
+                return std::nullopt;
+            }
+            if (name == "$::syntax::count") return EvalValue{UInt128{found->records.size()}, builtin_type(BuiltinType::Uptr)};
+            auto index = this->expression(*expression.arguments[2]);
+            if (!index || !is_integer(index->type) || index->integer.high != 0 ||
+                index->integer.low >= found->records.size()) {
+                fail(expression.location, "syntax record index is out of range");
+                return std::nullopt;
+            }
+            EvalValue value{UInt128{}, syntax_match_type()};
+            value.syntax_match = found->records[static_cast<std::size_t>(index->integer.low)];
+            return value;
         }
         if (procedural_ && expression.left->text == "$::meta::parse") {
             if (expression.arguments.size() != 1U) {
@@ -8513,6 +8629,33 @@ std::optional<TokenSequence> evaluate_procedural_body(
     EvalValue argument{UInt128{}, tokens_type()};
     argument.tokens = std::make_shared<const TokenSequence>(input);
     const auto result = evaluator.call(macro, {argument}, invocation);
+    if (!result || !result->tokens) {
+        evaluator.diagnose(invocation);
+        return std::nullopt;
+    }
+    return *result->tokens;
+}
+
+std::optional<TokenSequence> evaluate_syntax_body(
+    const FunctionDecl& function, std::shared_ptr<const SyntaxMatchValue> input,
+    unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
+    EvaluationLimits limits, EvaluationLayout layout) {
+    Program context;
+    context.address_bits = address_bits;
+    context.evaluation_limits = limits;
+    context.evaluation_layout = layout;
+    const auto invocation = macro_context->invocation;
+    Evaluator evaluator(context, diagnostics, &function, function.source_namespace,
+                        &size_of, &align_of, nullptr, std::move(macro_context));
+    if (!input || !evaluator.charge_input_match(*input, invocation) ||
+        !evaluator.validate_procedural_body(function)) {
+        evaluator.diagnose(invocation);
+        return std::nullopt;
+    }
+    EvalValue argument{UInt128{}, syntax_match_type()};
+    argument.syntax_match = std::move(input);
+    const auto result = evaluator.call(function, {argument}, invocation);
     if (!result || !result->tokens) {
         evaluator.diagnose(invocation);
         return std::nullopt;

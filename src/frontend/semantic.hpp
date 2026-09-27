@@ -48,6 +48,13 @@ std::optional<TokenSequence> evaluate_procedural_body(
     std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
     EvaluationLimits limits = {}, EvaluationLayout layout = {});
 
+struct SyntaxMatchValue;
+std::optional<TokenSequence> evaluate_syntax_body(
+    const FunctionDecl& function, std::shared_ptr<const SyntaxMatchValue> input,
+    unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
+    EvaluationLimits limits, EvaluationLayout layout);
+
 // Static assertions are retained until target HIR has established nominal
 // layouts.  The callbacks keep target layout ownership out of the frontend.
 bool finalize_target_constants(Program& program, Diagnostics& diagnostics,

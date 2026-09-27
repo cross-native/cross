@@ -16,6 +16,29 @@ TypePtr tokens_type() {
     return type;
 }
 
+TypePtr syntax_match_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::SyntaxMatch;
+    return type;
+}
+
+std::span<const std::string_view> core_keyword_names() {
+    static constexpr std::string_view names[] = {
+        "bool", "break", "case", "const", "continue", "default", "do", "else",
+        "enum", "f32", "f64", "f80", "f128", "for", "fptr", "global", "goto",
+        "i8", "i16", "i32", "i64", "i128", "if", "in", "inline", "inout", "iptr",
+        "label", "namespace", "out", "register", "restrict", "return", "sizeof",
+        "stack", "static", "struct", "switch", "syntax", "typedef", "u8", "u16",
+        "u32", "u64", "union", "u128", "uptr", "using", "void", "volatile", "while"
+    };
+    return names;
+}
+
+bool is_reserved_identifier(std::string_view name) {
+    const auto names = core_keyword_names();
+    return std::find(names.begin(), names.end(), name) != names.end() || name.starts_with("$::");
+}
+
 TypePtr bytes_type() {
     auto type = std::make_shared<Type>();
     type->kind = Type::Kind::Bytes;
@@ -117,6 +140,7 @@ TypePtr enum_type(std::string name, BuiltinType underlying, bool is_const,
 std::string type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
     if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
+    if (type->kind == Type::Kind::SyntaxMatch) return "$::meta::syntax_match";
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     std::string prefix;
@@ -187,6 +211,7 @@ std::string type_name(const TypePtr& type) {
 std::string canonical_type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
     if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
+    if (type->kind == Type::Kind::SyntaxMatch) return "$::meta::syntax_match";
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     std::string result;
@@ -319,7 +344,7 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
         return left->is_union == right->is_union &&
                left->nominal_name == right->nominal_name;
     }
-    if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::Bytes ||
+    if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch || left->kind == Type::Kind::Bytes ||
         left->kind == Type::Kind::Buffer) return true;
     return left->builtin == right->builtin &&
            left->nominal_name == right->nominal_name;
@@ -394,7 +419,7 @@ unsigned type_bits(const TypePtr& type) {
     if (!type) return 0;
     if (type->kind == Type::Kind::Pointer) return 64;
     if (type->kind == Type::Kind::Generic || type->kind == Type::Kind::Function ||
-        type->kind == Type::Kind::Tokens || type->kind == Type::Kind::Bytes ||
+        type->kind == Type::Kind::Tokens || type->kind == Type::Kind::SyntaxMatch || type->kind == Type::Kind::Bytes ||
         type->kind == Type::Kind::Buffer)
         return 0;
     if (type->kind == Type::Kind::Vector) {

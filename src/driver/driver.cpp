@@ -18,6 +18,7 @@
 #include "frontend/preprocessor.hpp"
 #include "frontend/procedural.hpp"
 #include "frontend/semantic.hpp"
+#include "frontend/syntax.hpp"
 #include "middle/hir.hpp"
 #include "middle/initializer.hpp"
 #include "middle/codegen_module.hpp"
@@ -193,16 +194,7 @@ void print_registers(const CompilerOptions& options) {
 }
 
 void print_keywords() {
-    static constexpr std::string_view keywords[] = {
-        "bool", "break", "case", "const", "continue", "default", "do",
-        "else", "enum", "f32", "f64", "f80", "f128", "for", "fptr",
-        "global", "goto", "i8", "i16", "i32", "i64", "i128", "if",
-        "in", "inline", "inout", "iptr", "label", "namespace", "out",
-        "register", "restrict", "return", "sizeof", "stack", "static",
-        "struct", "switch", "typedef", "u8", "u16", "u32", "u64",
-        "union", "u128", "uptr", "using", "void", "volatile", "while",
-    };
-    for (const auto keyword : keywords) std::cout << keyword << '\n';
+    for (const auto keyword : core_keyword_names()) std::cout << keyword << '\n';
 }
 
 void print_target_instructions(const TargetInfo& target) {
@@ -230,6 +222,10 @@ void print_builtins(const CompilerOptions& options) {
                  "$::unquote procedural interpolation\n"
                  "$::meta::parse translation intrinsic\n"
                  "$::meta::concat translation intrinsic\n"
+                 "$::syntax::input translation intrinsic\n"
+                 "$::syntax::capture translation intrinsic\n"
+                 "$::syntax::count translation intrinsic\n"
+                 "$::syntax::at translation intrinsic\n"
                  "$::atomic_load atomic intrinsic\n"
                  "$::atomic_store atomic intrinsic\n"
                  "$::atomic_exchange atomic intrinsic\n"
@@ -815,14 +811,30 @@ int cc_main(int argc, char** argv) {
         compilation_units.insert(compilation_units.end(), sections.begin(), sections.end());
     }
     for (const auto* preprocessed_source : compilation_units) {
-        const auto* source = expand_procedural_macros(
-            sources, *preprocessed_source, diagnostics,
-            program.address_bits, macro_size, macro_align,
-            program.evaluation_limits, program.evaluation_layout);
+        auto tokens = Lexer(*preprocessed_source, diagnostics).lex();
+        bool uses_syntax = false;
+        for (std::size_t at = 0; at < tokens.size(); ++at)
+            if (tokens[at].is("syntax") ||
+                (tokens[at].is("[[") && at + 1 < tokens.size() && tokens[at + 1].is("syntax_expander")))
+                uses_syntax = true;
+        std::shared_ptr<SyntaxExecution> execution;
+        if (uses_syntax) {
+            // Owner expansion must precede macros nested in raw captures.
+            // Registration and replacement therefore run at parser positions.
+            if (!validate_embeds(*preprocessed_source, diagnostics)) return 1;
+            execution = std::make_shared<SyntaxExecution>(sources, diagnostics,
+                program.address_bits, macro_size, macro_align,
+                program.evaluation_limits, program.evaluation_layout);
+        } else {
+            const auto* source = expand_procedural_macros(
+                sources, *preprocessed_source, diagnostics,
+                program.address_bits, macro_size, macro_align,
+                program.evaluation_limits, program.evaluation_layout);
+            if (diagnostics.errors() != 0 || !validate_embeds(*source, diagnostics)) return 1;
+            tokens = Lexer(*source, diagnostics).lex();
+        }
         if (diagnostics.errors() != 0) return 1;
-        if (!validate_embeds(*source, diagnostics)) return 1;
-        Lexer lexer(*source, diagnostics);
-        Parser parser(lexer.lex(), diagnostics);
+        Parser parser(std::move(tokens), diagnostics, std::move(execution));
         auto unit = parser.parse();
         for (auto& record : unit.records) {
             program.records.push_back(std::move(record));

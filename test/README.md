@@ -3,7 +3,8 @@
 - `model/` covers compiler-definition parsing, ABI rules, mangling,
   optimization presets, typed profile options, and model diagnostics.
 - `language/` covers target-independent source-language behavior.
-- `frontend/` covers preprocessing, diagnostics, and procedural expansion.
+- `frontend/` covers preprocessing, diagnostics, procedural expansion, and
+  lexically activated raw-capture syntax.
 - `middle/` covers semantic expansion, evaluation, patch values, MIR,
   optimization flags, inlining, local DSE, conservative IPA purity, and
   surviving-call specialization.

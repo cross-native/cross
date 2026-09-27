@@ -4,6 +4,7 @@
 
 #include "frontend/ast.hpp"
 #include "frontend/lexer.hpp"
+#include "frontend/syntax.hpp"
 
 #include <optional>
 #include <string>
@@ -16,7 +17,8 @@ namespace cross {
 
 class Parser {
 public:
-    Parser(std::vector<Token> tokens, Diagnostics& diagnostics);
+    Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
+           std::shared_ptr<SyntaxExecution> execution = {});
     Program parse();
     // Parse a macro's braced body with the ordinary statement/expression
     // grammar, enabling translation-only token types and quotation.
@@ -29,6 +31,15 @@ private:
     bool expect(std::string_view spelling, std::string_view context = {});
     void error_here(std::string message);
     void synchronize_external();
+    bool parse_syntax_registration(Program* program);
+    std::vector<SyntaxActivation> parse_syntax_entries(std::string_view end);
+    const SyntaxDefinition* active_syntax(bool item) const;
+    bool macro_start() const;
+    std::optional<SyntaxExecution::Output> expand_at_position(bool item);
+    std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output) const;
+    void adopt_replacement(Parser& child);
+    std::unique_ptr<Statement> parse_statement_replacement();
+    std::unique_ptr<Expr> parse_expression_replacement();
 
     std::vector<Attribute> parse_attributes();
     void apply_type_attributes(
@@ -89,14 +100,14 @@ private:
     parse_local_declaration(std::vector<Attribute> attributes = {});
     bool local_declaration_start() const;
 
-    std::unique_ptr<Expr> parse_expression();
+    std::unique_ptr<Expr> parse_expression(std::unique_ptr<Expr> seed = {});
     std::unique_ptr<Expr> parse_initializer();
-    std::unique_ptr<Expr> parse_assignment();
-    std::unique_ptr<Expr> parse_conditional();
-    std::unique_ptr<Expr> parse_binary(int minimum_precedence);
+    std::unique_ptr<Expr> parse_assignment(std::unique_ptr<Expr> seed = {});
+    std::unique_ptr<Expr> parse_conditional(std::unique_ptr<Expr> seed = {});
+    std::unique_ptr<Expr> parse_binary(int minimum_precedence, std::unique_ptr<Expr> seed = {});
     std::unique_ptr<Expr> parse_cast();
     std::unique_ptr<Expr> parse_unary();
-    std::unique_ptr<Expr> parse_postfix();
+    std::unique_ptr<Expr> parse_postfix(std::unique_ptr<Expr> seed = {});
     std::unique_ptr<Expr> parse_primary();
     std::unique_ptr<Expr> parse_quote();
     std::vector<FunctionDecl::GenericParameter> generic_parameters(
@@ -106,6 +117,9 @@ private:
     std::vector<Token> tokens_;
     Diagnostics& diagnostics_;
     std::size_t index_{};
+    std::optional<SyntaxState> syntax_;
+    bool replacement_{};
+    bool deferred_statement_semicolon_{};
     std::vector<std::string> active_imports_;
     std::size_t current_scope_imports_{};
     std::vector<std::string> active_generic_types_;

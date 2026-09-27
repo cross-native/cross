@@ -24,6 +24,7 @@ struct TokenMacro {
     std::string name;
     FunctionDecl function;
     SourceLocation location;
+    bool syntax_expander{};
 };
 
 struct Replacement {
@@ -41,8 +42,10 @@ std::optional<std::size_t> matching_group(const std::vector<Token>& tokens,
     if (opening >= tokens.size()) return std::nullopt;
     const auto opener = tokens[opening].text;
     const auto closer = opener == "(" ? ")" : opener == "[" ? "]" :
-                        opener == "{" ? "}" : std::string_view{};
+                        opener == "[[" ? "]]" : opener == "{" ? "}" : std::string_view{};
     if (closer.empty()) return std::nullopt;
+    // Find the enclosing declaration/group without diagnosing its contents.
+    // Quote and raw-input validation own mixed-delimiter diagnostics later.
     unsigned depth = 0;
     for (std::size_t index = opening; index < tokens.size(); ++index) {
         if (tokens[index].text == opener) ++depth;
@@ -179,15 +182,20 @@ std::vector<std::string> active_imports(const std::vector<Token>& tokens,
 
 std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                        std::vector<Replacement>& removals,
-                                       Diagnostics& diagnostics) {
+                                       Diagnostics& diagnostics,
+                                       bool syntax_expanders = false) {
     std::vector<TokenMacro> macros;
     const auto regions = namespace_regions(tokens);
     for (std::size_t index = 0; index + 3 < tokens.size(); ++index) {
         if (tokens[index].text != "[[" ||
-            tokens[index + 1].text != "macro" ||
+            (tokens[index + 1].text != "macro" &&
+             !(syntax_expanders && tokens[index + 1].text == "syntax_expander")) ||
             tokens[index + 2].text != "]]") {
             continue;
         }
+        const bool syntax_expander = tokens[index + 1].text == "syntax_expander";
+        const auto role = syntax_expander ? "syntax_expander" : "macro";
+        const auto input_type = syntax_expander ? "$::meta::syntax_match" : "$::meta::tokens";
         const auto declaration_begin = tokens[index].location.offset;
         auto cursor = index + 3;
         bool static_storage = false;
@@ -205,13 +213,13 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         if (!static_storage || global_storage) {
             diagnostics.error(
                 tokens[index].location,
-                "'macro' functions must be static and cannot be global");
+                "'" + std::string(role) + "' functions must be static and cannot be global");
             continue;
         }
         if (cursor >= tokens.size() ||
             tokens[cursor].text != "$::meta::tokens") {
             diagnostics.error(tokens[index].location,
-                              "'macro' functions must return $::meta::tokens");
+                              "'" + std::string(role) + "' functions must return $::meta::tokens");
             continue;
         }
         ++cursor;
@@ -219,7 +227,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         if (name.empty() || cursor >= tokens.size() ||
             tokens[cursor].text != "(") {
             diagnostics.error(tokens[index].location,
-                              "malformed 'macro' declaration");
+                              "malformed '" + std::string(role) + "' declaration");
             continue;
         }
         const auto current_namespace = namespace_at(regions, index);
@@ -229,7 +237,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         const auto parameter_end = matching_group(tokens, cursor);
         if (!parameter_end) {
             diagnostics.error(tokens[cursor].location,
-                              "unterminated 'macro' parameter list");
+                              "unterminated '" + std::string(role) + "' parameter list");
             continue;
         }
         const bool valid_length =
@@ -238,8 +246,8 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         if (!valid_length) {
             diagnostics.error(
                 tokens[cursor].location,
-                "'macro' requires exactly one 'in [const] $::meta::tokens name' "
-                "parameter");
+                "'" + std::string(role) + "' requires exactly one 'in [const] " +
+                std::string(input_type) + " name' parameter");
             continue;
         }
         const bool local_const =
@@ -249,12 +257,12 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         const auto name_index = type_index + 1;
         if ((*parameter_end != cursor + 4 && !local_const) ||
             tokens[cursor + 1].text != "in" ||
-            tokens[type_index].text != "$::meta::tokens" ||
+            tokens[type_index].text != input_type ||
             tokens[name_index].kind != TokenKind::Identifier) {
             diagnostics.error(
                 tokens[cursor].location,
-                "'macro' requires exactly one 'in [const] $::meta::tokens name' "
-                "parameter");
+                "expansion function requires exactly one 'in [const] " +
+                    std::string(input_type) + " name' parameter");
             continue;
         }
         std::string parameter(tokens[name_index].text);
@@ -262,13 +270,13 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         if (parameter.empty() || cursor >= tokens.size() ||
             tokens[cursor].text != "{") {
             diagnostics.error(tokens[index].location,
-                              "'macro' requires one named token parameter and a body");
+                              "'" + std::string(role) + "' requires one named parameter and a body");
             continue;
         }
         const auto body_end = matching_group(tokens, cursor);
         if (!body_end) {
             diagnostics.error(tokens[cursor].location,
-                              "unterminated 'macro' body");
+                              "unterminated '" + std::string(role) + "' body");
             continue;
         }
         std::vector<Token> body_tokens(tokens.begin() + static_cast<std::ptrdiff_t>(cursor),
@@ -297,12 +305,13 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         function.source_namespace = current_namespace;
         function.imports = active_imports(tokens, index);
         function.linkage = Linkage::Static;
-        auto parameter_type = tokens_type();
+        auto parameter_type = syntax_expander ? syntax_match_type() : tokens_type();
         parameter_type->is_const = local_const;
         function.parameters.push_back({tokens[*parameter_end - 1].location,
             std::move(parameter), std::move(parameter_type), ParameterMode::In, true, {}});
         function.body = std::move(body);
-        macros.push_back({std::move(name), std::move(function), tokens[index].location});
+        macros.push_back({std::move(name), std::move(function), tokens[index].location,
+                          syntax_expander});
         index = *body_end;
     }
     return macros;
@@ -511,6 +520,29 @@ std::vector<SourceExpansion> remap_expansions(
 }
 
 } // namespace
+
+std::optional<ExpansionFunctionSource> parse_expansion_function(
+    const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics) {
+    const auto begin = index;
+    auto end = index;
+    for (auto at = index + 3; at < tokens.size() && tokens[at].kind != TokenKind::End; ++at) {
+        if (tokens[at].is("{")) {
+            const auto close = matching_group(tokens, at);
+            end = close ? *close + 1 : tokens.size() - 1;
+            break;
+        }
+        if (tokens[at].is(";")) { end = at + 1; break; }
+    }
+    if (end == begin) end = tokens.size() - 1;
+    std::vector<Token> bounded(tokens.begin() + static_cast<std::ptrdiff_t>(begin),
+                               tokens.begin() + static_cast<std::ptrdiff_t>(end));
+    bounded.push_back({TokenKind::End, {}, tokens[end < tokens.size() ? end : tokens.size() - 1].location});
+    index = end;
+    std::vector<Replacement> removals;
+    auto functions = collect_macros(bounded, removals, diagnostics, true);
+    if (functions.size() != 1 || diagnostics.errors() != 0) return {};
+    return ExpansionFunctionSource{std::move(functions.front().function), functions.front().syntax_expander};
+}
 
 const SourceFile* expand_procedural_macros(SourceManager& sources,
                                            const SourceFile& source,

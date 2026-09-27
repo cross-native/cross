@@ -9,6 +9,15 @@
 
 namespace cross {
 
+struct ExpansionFunctionSource {
+    FunctionDecl function;
+    bool syntax_expander{};
+};
+// Parse one original declaration selected by the item parser, never scan raw
+// captured inputs for declarations. Advances index past the bounded source.
+std::optional<ExpansionFunctionSource> parse_expansion_function(
+    const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics);
+
 // Executes explicit token macro invocations after ordinary preprocessing and
 // before the resulting token region is parsed as Cross.
 const SourceFile* expand_procedural_macros(SourceManager& sources,

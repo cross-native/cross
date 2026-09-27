@@ -46,6 +46,17 @@ struct SyntaxContext {
     SourceLocation invocation;
     std::string name_space;
     std::vector<std::string> imports;
+    struct EntityId {
+        std::uint32_t value{};
+        bool operator==(const EntityId&) const = default;
+    };
+    struct Binding {
+        enum class Family { Item, StatementExpression } family;
+        std::string prefix;
+        EntityId entity;
+        bool operator==(const Binding&) const = default;
+    };
+    std::vector<Binding> syntax_bindings;
 };
 
 struct EmbedSnapshot {
