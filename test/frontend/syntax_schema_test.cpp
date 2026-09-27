@@ -219,6 +219,18 @@ int main() {
     child(enumeration->children[4], 2, P::ConstantExpression, 1);
     child(enumeration, 6, P::Enumerator, 1);
 
+    declaration = production(parse("enum Inline [[underlying(u16)]] { low = 2u16, high, } value = high;",
+                                   K::Declaration), P::Declaration, 3);
+    enumeration = child(child(child(child(declaration, 0, P::DeclarationSpecifiers, 1),
+                                     0, P::DeclarationSpecifier, 1),
+                               0, P::TypeSpecifier, 1), 0, P::EnumSpecifier, 9);
+    child(enumeration, 4, P::Enumerator, 3);
+    child(enumeration, 6, P::Enumerator, 1);
+    item = child(child(declaration, 1, P::InitDeclaratorList, 1),
+                 0, P::InitDeclarator, 3);
+    child(item, 0, P::Declarator, 1);
+    child(item, 2, P::Initializer, 1);
+
     declaration = production(parse("struct Mixed { u32 *pointer, scalar; u32 bits : 3u32; };",
                                    K::Declaration), P::Declaration, 2);
     auto record = child(child(child(child(declaration, 0, P::DeclarationSpecifiers, 1),
@@ -231,6 +243,19 @@ int main() {
     child(child(member, 3, P::MemberDeclarator, 1), 0, P::Declarator, 1);
     member = child(record, 4, P::MemberDeclaration, 3);
     child(child(member, 1, P::MemberDeclarator, 3), 2, P::ConstantExpression, 1);
+
+    declaration = production(parse("struct InlineRecord { u32 first, second; } item = { 1u32, 2u32 };",
+                                   K::Declaration), P::Declaration, 3);
+    record = child(child(child(child(declaration, 0, P::DeclarationSpecifiers, 1),
+                                0, P::DeclarationSpecifier, 1),
+                          0, P::TypeSpecifier, 1), 0, P::StructOrUnionSpecifier, 5);
+    member = child(record, 3, P::MemberDeclaration, 5);
+    child(member, 1, P::MemberDeclarator, 1);
+    child(member, 3, P::MemberDeclarator, 1);
+    item = child(child(declaration, 1, P::InitDeclaratorList, 1),
+                 0, P::InitDeclarator, 3);
+    child(item, 0, P::Declarator, 1);
+    child(item, 2, P::Initializer, 5);
 
     definition = production(parse("global T identity<T, u32 N, u32 *P>(in T value) "
                                   "{ return value; }", K::FunctionDefinition), P::FunctionDefinition, 3);

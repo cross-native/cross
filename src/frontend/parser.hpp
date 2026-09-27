@@ -95,9 +95,13 @@ private:
                           const std::vector<Attribute>& attributes);
     void parse_enum_declaration(Program& program, const std::string& name_space,
                                 std::vector<Attribute> attributes);
+    void drain_pending_tags(Program& program);
+    BuiltinType enum_underlying(const std::vector<Attribute>& attributes);
+    void parse_enumerators(EnumDecl& declaration, const std::string& name_space);
     void parse_record_declaration(Program& program,
                                   const std::string& name_space,
                                   std::vector<Attribute> attributes);
+    void parse_record_members(RecordDecl& declaration);
     void parse_global_label_declaration(
         Program& program, const std::string& name_space,
         std::vector<Attribute> attributes);
@@ -179,6 +183,8 @@ private:
     std::vector<NameMap<TypePtr>> local_type_scopes_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
+    std::vector<EnumDecl> pending_enumerations_;
+    std::vector<RecordDecl> pending_records_;
     struct RecordTag {
         bool is_union{};
         bool complete{};

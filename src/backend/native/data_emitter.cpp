@@ -60,7 +60,7 @@ void emit_bits(std::ostringstream& out, UInt128 value, unsigned bytes,
                ByteOrder byte_order) {
     value = mask_to(value, bytes * 8);
     if (bytes == 1) out << "\t.byte " << value.low << '\n';
-    else if (bytes == 2) out << "\t.word " << value.low << '\n';
+    else if (bytes == 2) out << "\t.short " << value.low << '\n';
     else if (bytes == 4) out << "\t.long " << value.low << '\n';
     else if (bytes == 8) out << "\t.quad " << value.low << '\n';
     else if (bytes == 16 && byte_order == ByteOrder::Little) {
@@ -367,7 +367,7 @@ private:
             if (type.kind == hir::Type::Kind::Builtin &&
                 type.builtin == BuiltinType::F80 && object.size >= 10 &&
                 module_.data().byte_order == ByteOrder::Little) {
-                out_ << "\t.quad " << object.bits.low << "\n\t.word "
+                out_ << "\t.quad " << object.bits.low << "\n\t.short "
                      << (object.bits.high & 0xffffU) << '\n';
                 if (object.size > 10) {
                     out_ << "\t.zero " << object.size - 10 << '\n';

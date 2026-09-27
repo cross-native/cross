@@ -34,7 +34,7 @@ foreach(pattern
         ".long 3217031168"
         ".quad 13832806255468478464"
         ".quad 13835058055282163712"
-        ".word 49151"
+        ".short 49151"
         ".section \".cross.data\",\"aw\",@progbits"
         ".p2align 5"
         ".section \".data.retained_object\",\"awR\",@progbits"

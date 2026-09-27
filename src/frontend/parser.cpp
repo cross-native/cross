@@ -691,6 +691,12 @@ void Parser::adopt_replacement(Parser& child) {
     local_scopes_ = std::move(child.local_scopes_);
     local_type_scopes_ = std::move(child.local_type_scopes_);
     enum_types_ = std::move(child.enum_types_);
+    pending_enumerations_.insert(pending_enumerations_.end(),
+        std::make_move_iterator(child.pending_enumerations_.begin()),
+        std::make_move_iterator(child.pending_enumerations_.end()));
+    pending_records_.insert(pending_records_.end(),
+        std::make_move_iterator(child.pending_records_.begin()),
+        std::make_move_iterator(child.pending_records_.end()));
     record_types_ = std::move(child.record_types_);
     type_aliases_ = std::move(child.type_aliases_);
     switch_default_seen_ = std::move(child.switch_default_seen_);
@@ -1194,6 +1200,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             type->is_volatile = is_volatile;
         } else if (current().is("struct") || current().is("union")) {
             ProductionScope record(*this, SyntaxProduction::StructOrUnionSpecifier);
+            const auto location = current().location;
             const bool is_union = consume("union");
             if (!is_union)
                 consume("struct");
@@ -1203,72 +1210,131 @@ TypePtr Parser::parse_type(bool record_specifiers,
                            std::string(is_union ? "union" : "struct") + "'");
                 return {};
             }
-            auto canonical = *name;
-            auto found = record_types_.end();
-            if (name->find("::") != std::string::npos) {
-                found = record_types_.find(canonical);
-            } else {
-                auto current_namespace = active_namespace_;
-                while (!current_namespace.empty()) {
-                    canonical = join_namespace(current_namespace, *name);
-                    found = record_types_.find(canonical);
-                    if (found != record_types_.end())
-                        break;
-                    const auto separator = current_namespace.rfind("::");
-                    if (separator == std::string::npos)
-                        break;
-                    current_namespace.resize(separator);
+            auto record_attributes = parse_attributes();
+            if (consume("{")) {
+                RecordDecl declaration;
+                declaration.location = location;
+                declaration.name = join_namespace(active_namespace_, *name);
+                declaration.is_union = is_union;
+                declaration.complete = true;
+                if (declaration_attributes)
+                    declaration.attributes = *declaration_attributes;
+                declaration.attributes.insert(declaration.attributes.end(),
+                    std::make_move_iterator(record_attributes.begin()),
+                    std::make_move_iterator(record_attributes.end()));
+                auto [tag, inserted] = record_types_.emplace(
+                    declaration.name, RecordTag{is_union, true});
+                if (!inserted && tag->second.is_union != is_union) {
+                    diagnostics_.error(location, "record tag '" + declaration.name +
+                        "' was previously declared with the other record kind");
+                } else if (!inserted && tag->second.complete) {
+                    diagnostics_.error(location,
+                        "duplicate definition of record '" + declaration.name + "'");
                 }
-                for (const auto &imported : active_imports_) {
-                    if (found != record_types_.end())
-                        break;
-                    canonical = join_namespace(imported, *name);
+                tag->second.complete = true;
+                parse_record_members(declaration);
+                type = record_type(declaration.name, is_union, is_const, is_volatile);
+                pending_records_.push_back(std::move(declaration));
+            } else {
+                for (const auto& attribute : record_attributes)
+                    diagnostics_.error(attribute.location,
+                        "record attributes on a type use are not yet supported");
+                auto canonical = *name;
+                auto found = record_types_.end();
+                if (name->find("::") != std::string::npos) {
                     found = record_types_.find(canonical);
+                } else {
+                    auto current_namespace = active_namespace_;
+                    while (!current_namespace.empty()) {
+                        canonical = join_namespace(current_namespace, *name);
+                        found = record_types_.find(canonical);
+                        if (found != record_types_.end())
+                            break;
+                        const auto separator = current_namespace.rfind("::");
+                        if (separator == std::string::npos)
+                            break;
+                        current_namespace.resize(separator);
+                    }
+                    for (const auto &imported : active_imports_) {
+                        if (found != record_types_.end())
+                            break;
+                        canonical = join_namespace(imported, *name);
+                        found = record_types_.find(canonical);
+                    }
+                    if (found == record_types_.end()) {
+                        canonical = *name;
+                        found = record_types_.find(canonical);
+                    }
                 }
                 if (found == record_types_.end()) {
-                    canonical = *name;
-                    found = record_types_.find(canonical);
+                    canonical = name->find("::") == std::string::npos && !active_namespace_.empty()
+                                    ? join_namespace(active_namespace_, *name)
+                                    : *name;
+                    record_types_.emplace(canonical, RecordTag{is_union, false});
+                } else if (found->second.is_union != is_union) {
+                    diagnostics_.error(current().location,
+                                       "record tag '" + *name +
+                                           "' was previously declared with the other record kind");
                 }
+                type = record_type(canonical, is_union, is_const, is_volatile);
             }
-            if (found == record_types_.end()) {
-                canonical = name->find("::") == std::string::npos && !active_namespace_.empty()
-                                ? join_namespace(active_namespace_, *name)
-                                : *name;
-                record_types_.emplace(canonical, RecordTag{is_union, false});
-            } else if (found->second.is_union != is_union) {
-                diagnostics_.error(current().location,
-                                   "record tag '" + *name +
-                                       "' was previously declared with the other record kind");
-            }
-            type = record_type(canonical, is_union, is_const, is_volatile);
         } else if (current().is("enum")) {
             ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
+            const auto location = current().location;
             consume("enum");
             const auto name = parse_qualified_name();
             if (!name) {
                 error_here("expected enumeration name after 'enum'");
                 return {};
             }
-            auto canonical = *name;
-            auto found = enum_types_.find(canonical);
-            if (found == enum_types_.end() && canonical.find("::") == std::string::npos &&
-                !active_namespace_.empty()) {
-                canonical = join_namespace(active_namespace_, canonical);
-                found = enum_types_.find(canonical);
-            }
-            if (found == enum_types_.end() && name->find("::") == std::string::npos) {
-                for (const auto &imported : active_imports_) {
-                    canonical = join_namespace(imported, *name);
-                    found = enum_types_.find(canonical);
-                    if (found != enum_types_.end())
-                        break;
+            auto enum_attributes = parse_attributes();
+            if (current().is("{")) {
+                EnumDecl declaration;
+                declaration.location = location;
+                declaration.name = join_namespace(active_namespace_, *name);
+                if (declaration_attributes)
+                    declaration.attributes = *declaration_attributes;
+                declaration.attributes.insert(declaration.attributes.end(),
+                    std::make_move_iterator(enum_attributes.begin()),
+                    std::make_move_iterator(enum_attributes.end()));
+                declaration.underlying = enum_underlying(declaration.attributes);
+                parse_enumerators(declaration, active_namespace_);
+                const auto found = enum_types_.find(declaration.name);
+                if (found != enum_types_.end() && found->second != declaration.underlying) {
+                    diagnostics_.error(location, "enumeration '" + declaration.name +
+                        "' redeclared with a different underlying type");
+                } else {
+                    enum_types_[declaration.name] = declaration.underlying;
                 }
-            }
-            if (found == enum_types_.end()) {
-                diagnostics_.error(current().location, "unknown enumeration type '" + *name + "'");
-                type = enum_type(*name, BuiltinType::I32, is_const, is_volatile);
+                type = enum_type(declaration.name, declaration.underlying,
+                                 is_const, is_volatile);
+                pending_enumerations_.push_back(std::move(declaration));
             } else {
-                type = enum_type(canonical, found->second, is_const, is_volatile);
+                for (const auto& attribute : enum_attributes)
+                    diagnostics_.error(attribute.location,
+                        "enumeration attributes on a type use are not yet supported");
+                auto canonical = *name;
+                auto found = enum_types_.find(canonical);
+                if (found == enum_types_.end() && canonical.find("::") == std::string::npos &&
+                    !active_namespace_.empty()) {
+                    canonical = join_namespace(active_namespace_, canonical);
+                    found = enum_types_.find(canonical);
+                }
+                if (found == enum_types_.end() && name->find("::") == std::string::npos) {
+                    for (const auto &imported : active_imports_) {
+                        canonical = join_namespace(imported, *name);
+                        found = enum_types_.find(canonical);
+                        if (found != enum_types_.end())
+                            break;
+                    }
+                }
+                if (found == enum_types_.end()) {
+                    diagnostics_.error(current().location,
+                                       "unknown enumeration type '" + *name + "'");
+                    type = enum_type(*name, BuiltinType::I32, is_const, is_volatile);
+                } else {
+                    type = enum_type(canonical, found->second, is_const, is_volatile);
+                }
             }
         }
         const auto kind = type ? std::optional<BuiltinType>{} : builtin_kind(current().text);
@@ -1817,8 +1883,18 @@ Program Parser::parse() {
         // nested namespace, but it must not stall the outermost parse loop.
         if (index_ == before && current().kind != TokenKind::End) ++index_;
     }
+    drain_pending_tags(program);
     program.static_assertions = std::move(static_assertions_);
     return program;
+}
+
+void Parser::drain_pending_tags(Program& program) {
+    for (auto& enumeration : pending_enumerations_)
+        program.enumerations.push_back(std::move(enumeration));
+    pending_enumerations_.clear();
+    for (auto& record : pending_records_)
+        program.records.push_back(std::move(record));
+    pending_records_.clear();
 }
 
 void Parser::parse_typedef(const std::string& name_space,
@@ -1971,6 +2047,7 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
 }
 
 void Parser::parse_external(Program& program, const std::string& name_space) {
+    drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_
         ? SyntaxProduction::Declaration : SyntaxProduction::None);
     if (parsing_public_fragment_ && (current().is("syntax") ||
@@ -2048,17 +2125,39 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         expect(";");
         return;
     }
-    if (current().is("enum") &&
-        current(1).kind == TokenKind::Identifier &&
-        (current(2).is("{") || current(2).is("[[") ||
-         current(2).is(";"))) {
+    const auto standalone_tag = [&](std::string_view tag) {
+        if (!current().is(tag) || current(1).kind != TokenKind::Identifier)
+            return false;
+        std::size_t at = 2;
+        while (current(at).is("::") && current(at + 1).kind == TokenKind::Identifier)
+            at += 2;
+        while (current(at).is("[[")) {
+            unsigned depth = 1;
+            ++at;
+            while (depth && current(at).kind != TokenKind::End) {
+                if (current(at).is("[[")) ++depth;
+                else if (current(at).is("]]")) --depth;
+                ++at;
+            }
+            if (depth) return false;
+        }
+        if (current(at).is("{")) {
+            unsigned depth = 1;
+            ++at;
+            while (depth && current(at).kind != TokenKind::End) {
+                if (current(at).is("{")) ++depth;
+                else if (current(at).is("}")) --depth;
+                ++at;
+            }
+            if (depth) return false;
+        }
+        return current(at).is(";");
+    };
+    if (standalone_tag("enum")) {
         parse_enum_declaration(program, name_space, std::move(attributes));
         return;
     }
-    if ((current().is("struct") || current().is("union")) &&
-        current(1).kind == TokenKind::Identifier &&
-        (current(2).is("{") || current(2).is("[[") ||
-         current(2).is(";"))) {
+    if (standalone_tag("struct") || standalone_tag("union")) {
         parse_record_declaration(program, name_space, std::move(attributes));
         return;
     }
@@ -2264,6 +2363,31 @@ void Parser::parse_enum_declaration(Program& program,
                       std::make_move_iterator(trailing.begin()),
                       std::make_move_iterator(trailing.end()));
 
+    const auto underlying = enum_underlying(attributes);
+    EnumDecl declaration;
+    declaration.location = location;
+    declaration.name = *name;
+    declaration.underlying = underlying;
+    declaration.attributes = std::move(attributes);
+    parse_enumerators(declaration, name_space);
+    enumeration.finish();
+    type_specifier.finish();
+    specifier.finish();
+    specifiers.finish();
+    expect(";", "after enumeration declaration");
+
+    const auto found = enum_types_.find(*name);
+    if (found != enum_types_.end() && found->second != underlying) {
+        diagnostics_.error(location,
+                           "enumeration '" + *name +
+                               "' redeclared with a different underlying type");
+    } else {
+        enum_types_[*name] = underlying;
+    }
+    program.enumerations.push_back(std::move(declaration));
+}
+
+BuiltinType Parser::enum_underlying(const std::vector<Attribute>& attributes) {
     BuiltinType underlying = BuiltinType::I32;
     bool underlying_seen = false;
     for (const auto& attribute : attributes) {
@@ -2293,50 +2417,32 @@ void Parser::parse_enum_declaration(Program& program,
         }
         underlying = *kind;
     }
+    return underlying;
+}
 
-    EnumDecl declaration;
-    declaration.location = location;
-    declaration.name = *name;
-    declaration.underlying = underlying;
-    declaration.attributes = std::move(attributes);
-    if (consume("{")) {
-        while (!current().is("}") && current().kind != TokenKind::End) {
-            ProductionScope entry(*this, SyntaxProduction::Enumerator);
-            const auto* token = consume_kind(TokenKind::Identifier);
-            if (!token) {
-                error_here("expected enumerator name");
-                while (!current().is(",") && !current().is("}") &&
-                       current().kind != TokenKind::End) {
-                    ++index_;
-                }
-            } else {
-                EnumDecl::Enumerator enumerator;
-                enumerator.location = token->location;
-                enumerator.name = join_namespace(name_space, token->text);
-                known_ordinary_values_.insert(enumerator.name);
-                if (consume("=")) enumerator.initializer = parse_constant_expression();
-                declaration.enumerators.push_back(std::move(enumerator));
+void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_space) {
+    if (!consume("{")) return;
+    while (!current().is("}") && current().kind != TokenKind::End) {
+        ProductionScope entry(*this, SyntaxProduction::Enumerator);
+        const auto* token = consume_kind(TokenKind::Identifier);
+        if (!token) {
+            error_here("expected enumerator name");
+            while (!current().is(",") && !current().is("}") &&
+                   current().kind != TokenKind::End) {
+                ++index_;
             }
-            entry.finish();
-            if (!consume(",")) break;
+        } else {
+            EnumDecl::Enumerator enumerator;
+            enumerator.location = token->location;
+            enumerator.name = join_namespace(name_space, token->text);
+            known_ordinary_values_.insert(enumerator.name);
+            if (consume("=")) enumerator.initializer = parse_constant_expression();
+            declaration.enumerators.push_back(std::move(enumerator));
         }
-        expect("}", "after enumeration definition");
+        entry.finish();
+        if (!consume(",")) break;
     }
-    enumeration.finish();
-    type_specifier.finish();
-    specifier.finish();
-    specifiers.finish();
-    expect(";", "after enumeration declaration");
-
-    const auto found = enum_types_.find(*name);
-    if (found != enum_types_.end() && found->second != underlying) {
-        diagnostics_.error(location,
-                           "enumeration '" + *name +
-                               "' redeclared with a different underlying type");
-    } else {
-        enum_types_[*name] = underlying;
-    }
-    program.enumerations.push_back(std::move(declaration));
+    expect("}", "after enumeration definition");
 }
 
 void Parser::parse_record_declaration(
@@ -2381,56 +2487,7 @@ void Parser::parse_record_declaration(
                                "duplicate definition of record '" + *name + "'");
         }
         tag->second.complete = true;
-        while (!current().is("}") && current().kind != TokenKind::End) {
-            ProductionScope member(*this, SyntaxProduction::MemberDeclaration);
-            auto member_attributes = parse_attributes();
-            if (!type_start()) {
-                error_here("expected record member declaration");
-                while (!current().is(";") && !current().is("}") &&
-                       current().kind != TokenKind::End) {
-                    ++index_;
-                }
-                consume(";");
-                continue;
-            }
-            const auto member_location = current().location;
-            auto base_type = parse_type(true, {}, &member_attributes);
-            bool parsed_member = false;
-            do {
-                ProductionScope member_declarator(*this, SyntaxProduction::MemberDeclarator);
-                std::optional<std::string> member_name;
-                auto member_type = parse_declarator(copy_type(base_type), member_name);
-                auto item_attributes = parse_attributes();
-                item_attributes.insert(
-                    item_attributes.begin(), member_attributes.begin(),
-                    member_attributes.end());
-                std::unique_ptr<Expr> bit_width;
-                if (consume(":")) {
-                    bit_width = parse_constant_expression();
-                    auto trailing_attributes = parse_attributes();
-                    item_attributes.insert(
-                        item_attributes.end(),
-                        std::make_move_iterator(trailing_attributes.begin()),
-                        std::make_move_iterator(trailing_attributes.end()));
-                } else if (!member_name) {
-                    error_here("expected record member name");
-                    break;
-                }
-                declaration.members.push_back(
-                    {member_location, member_name.value_or(std::string{}),
-                     std::move(member_type), std::move(bit_width),
-                     std::move(item_attributes)});
-                parsed_member = true;
-            } while (consume(","));
-            if (!parsed_member) {
-                while (!current().is(";") && !current().is("}") &&
-                       current().kind != TokenKind::End) {
-                    ++index_;
-                }
-            }
-            expect(";", "after record member declaration");
-        }
-        expect("}", "after record definition");
+        parse_record_members(declaration);
     }
     record.finish();
     type_specifier.finish();
@@ -2438,6 +2495,59 @@ void Parser::parse_record_declaration(
     specifiers.finish();
     expect(";", "after record declaration");
     program.records.push_back(std::move(declaration));
+}
+
+void Parser::parse_record_members(RecordDecl& declaration) {
+    while (!current().is("}") && current().kind != TokenKind::End) {
+        ProductionScope member(*this, SyntaxProduction::MemberDeclaration);
+        auto member_attributes = parse_attributes();
+        if (!type_start()) {
+            error_here("expected record member declaration");
+            while (!current().is(";") && !current().is("}") &&
+                   current().kind != TokenKind::End) {
+                ++index_;
+            }
+            consume(";");
+            continue;
+        }
+        const auto member_location = current().location;
+        auto base_type = parse_type(true, {}, &member_attributes);
+        bool parsed_member = false;
+        do {
+            ProductionScope member_declarator(*this, SyntaxProduction::MemberDeclarator);
+            std::optional<std::string> member_name;
+            auto member_type = parse_declarator(copy_type(base_type), member_name);
+            auto item_attributes = parse_attributes();
+            item_attributes.insert(
+                item_attributes.begin(), member_attributes.begin(),
+                member_attributes.end());
+            std::unique_ptr<Expr> bit_width;
+            if (consume(":")) {
+                bit_width = parse_constant_expression();
+                auto trailing_attributes = parse_attributes();
+                item_attributes.insert(
+                    item_attributes.end(),
+                    std::make_move_iterator(trailing_attributes.begin()),
+                    std::make_move_iterator(trailing_attributes.end()));
+            } else if (!member_name) {
+                error_here("expected record member name");
+                break;
+            }
+            declaration.members.push_back(
+                {member_location, member_name.value_or(std::string{}),
+                 std::move(member_type), std::move(bit_width),
+                 std::move(item_attributes)});
+            parsed_member = true;
+        } while (consume(","));
+        if (!parsed_member) {
+            while (!current().is(";") && !current().is("}") &&
+                   current().kind != TokenKind::End) {
+                ++index_;
+            }
+        }
+        expect(";", "after record member declaration");
+    }
+    expect("}", "after record definition");
 }
 
 bool Parser::parse_static_assertion() {

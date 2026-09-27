@@ -100,6 +100,16 @@ reject(interleaved_typedef_attribute "not valid on a typedef"
     "u32 [[packed]] typedef Wrong;\n")
 reject(vector_size_overflow "vector size is out of range"
     "typedef u8 Huge [[vector_size(18446744073709551615)]];\n")
+reject(inline_enum_underlying_conflict "redeclared with a different underlying type"
+    "enum Kind [[underlying(u16)]] { first = 1u16 }; enum Kind [[underlying(u32)]] { second = 2u32 } value;\n")
+reject(inline_record_duplicate "duplicate definition of record"
+    "struct Cell { u32 value; }; struct Cell { u32 value; } object;\n")
+reject(inline_record_kind_conflict "previously declared with the other record kind"
+    "struct Cell { u32 value; }; union Cell { u32 value; } object;\n")
+reject(enum_use_attributes "enumeration attributes on a type use are not yet supported"
+    "enum Kind [[underlying(u16)]] { first = 1u16 }; enum Kind [[underlying(u16)]] value;\n")
+reject(record_use_attributes "record attributes on a type use are not yet supported"
+    "struct Cell { u32 value; }; struct Cell [[packed]] object;\n")
 reject(parsed_constant_assignment "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad $::static_assert(1u32 = 2u32, \"not conditional\"); return 0u32; }\n")
 reject(parsed_designator_assignment "syntax-match error for active prefix"

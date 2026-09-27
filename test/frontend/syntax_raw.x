@@ -427,6 +427,15 @@ syntax flow::ParsedDecl, flow::ParsedPrototype, flow::ParsedDefinition, flow::Pa
 syntax flow::ParsedGeneric, flow::DropGeneric;
 parsed_decl global u32 parsed_state = 19u32;
 parsed_decl global u32 parsed_first = 3u32, parsed_second = 4u32;
+parsed_decl enum InlineMode [[underlying(u16)]] { mode_first = 3u16, mode_second = 4u16 }
+    inline_mode = mode_second, inline_mode_copy = mode_first;
+parsed_decl typedef enum InlineAlias [[underlying(u16)]] { inline_alias_enumerator = 9u16 } InlineAliasType;
+parsed_decl global InlineAliasType inline_alias_value = inline_alias_enumerator;
+parsed_decl struct InlineRecord { u32 left, right; } inline_record = { 5u32, 6u32 };
+parsed_decl typedef struct InlineAliasRecord { u16 value; } InlineRecordAlias;
+parsed_decl global InlineRecordAlias inline_record_alias = { 7u16 };
+parsed_decl union InlineUnion { u32 value; u16 halves[2]; } inline_union = { .value = 8u32 };
+parsed_decl struct OuterInline { struct InnerInline { u16 value; } inner; } outer_inline = { { 9u16 } };
 parsed_decl struct ParsedMembers { u32 *pointer, scalar; };
 parsed_array global u32 parsed_array[3] = { [0] = 5u32, [2] = 7u32 };
 parsed_generic [[generic(T, u32 count), noinline]] static T parsed_generic(in T value) {
@@ -673,6 +682,14 @@ global u32 syntax_raw_entry() {
     if (parsed_expression() != 20u32 || sizeof(CapturedType) != 4uptr) return 0u32;
     if (parsed_function(4u32) != 12u32 || parsed_state != 19u32 ||
         parsed_first != 3u32 || parsed_second != 4u32 || parsed_members() != 15u32 ||
+        inline_mode != mode_second || inline_mode_copy != mode_first ||
+        sizeof(enum InlineMode) != 2uptr || sizeof(InlineAliasType) != 2uptr ||
+        inline_alias_value != inline_alias_enumerator ||
+        inline_record.left != 5u32 || inline_record.right != 6u32 ||
+        sizeof(struct InlineRecord) != 8uptr ||
+        inline_record_alias.value != 7u16 || sizeof(InlineRecordAlias) != 2uptr ||
+        inline_union.value != 8u32 || sizeof(union InlineUnion) != 4uptr ||
+        outer_inline.inner.value != 9u16 || sizeof(struct InnerInline) != 2uptr ||
         parsed_declaration_lists(3u32) != 19u32 || declaration_list_vlas() != 26u32 ||
         evaluated_declaration_lists != 10u32 || alias_shadowing() != 5u32 ||
         reordered_storage(3u32) != 13u32 || reordered_typedef(3u32) != 10u32 ||
