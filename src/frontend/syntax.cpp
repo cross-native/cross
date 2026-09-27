@@ -361,6 +361,8 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
                 else if (capture == "bracket") element.kind = K::Bracket;
                 else if (capture == "block") element.kind = K::Block;
                 else if (capture == "group") element.kind = K::Group;
+                else if (capture == "function" || capture == "function_raw")
+                    element.kind = K::FunctionRaw;
                 else if (capture == "rule") {
                     element.kind = K::Rule;
                     if (!take("(")) return error("expected '(' after rule");
@@ -511,7 +513,8 @@ const SyntaxDefinition* SyntaxState::selected(const Token& token, bool item) con
 }
 
 std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& definition,
-    const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics) const {
+    const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
+    const std::function<bool(std::size_t, std::size_t)>& function_header) const {
     std::size_t position = begin + 1;
     const auto previous_errors = diagnostics.errors();
     std::uint64_t storage{};
@@ -572,6 +575,22 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                     else ++position;
                 }
                 if (position == start || position >= tokens.size() || !tokens[position].is(";")) return {};
+            } else if (element.kind == K::FunctionRaw) {
+                // Find the first top-level body opener. Nested declarator,
+                // attribute, and parameter groups are part of the header;
+                // the brace body itself is never parsed by the core parser.
+                while (position < tokens.size() && tokens[position].kind != TokenKind::End &&
+                       !tokens[position].is("{") && !tokens[position].is(";")) {
+                    if (!execution_->work(tokens[position].location)) return {};
+                    if (const auto close = group_end(tokens, position, *execution_)) position = *close + 1;
+                    else if (!closer(tokens[position].text).empty() || closing(tokens[position].text)) return {};
+                    else ++position;
+                }
+                if (position >= tokens.size() || !tokens[position].is("{") ||
+                    !function_header || !function_header(start, position)) return {};
+                const auto close = group_end(tokens, position, *execution_);
+                if (!close) return {};
+                position = *close + 1;
             } else {
                 const auto opening = tokens[position].text;
                 if ((element.kind == K::Paren && opening != "(") ||

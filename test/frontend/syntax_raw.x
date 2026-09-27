@@ -53,6 +53,7 @@ namespace flow {
         };
     }
     syntax Make : item { prefix "make"; match name:ident value:literal ";"; expand make; }
+    syntax CopyFunction : item { prefix "copy_fn"; match body:function_raw; expand copy_body; }
     [[syntax_expander]] static $::meta::tokens target_size(in $::meta::syntax_match input) {
         if (sizeof(uptr) == 4uptr) return $::quote { 4u32 };
         return $::quote { 8u32 };
@@ -70,6 +71,7 @@ namespace flow {
     }
     syntax Drop : item { prefix "drop"; match body:block; expand empty; }
     syntax DropTokens : item { prefix "drop_tokens"; match body:tokens_until(";") ";"; expand empty; }
+    syntax DropFunction : item { prefix "drop_fn"; match body:function; expand empty; }
     [[syntax_expander]] static $::meta::tokens greater(in $::meta::syntax_match input) {
         return $::quote { 3u32 > 2u32 ? 9u32 : 0u32 };
     }
@@ -94,6 +96,10 @@ syntax(flow::Make, flow::Drop, flow::DropTokens) {
     drop { no_such_macro!(); [[syntax_expander]] not_a_declaration; }
     drop_tokens [[syntax_expander]] not_a_declaration;
 }
+typedef u32 RawResult;
+syntax flow::CopyFunction, flow::DropFunction;
+copy_fn [[noinline]] static RawResult copied_function(in u32 value) { return forwarded! (value) + 17u32; }
+drop_fn static u32 discarded_function(in u32 value) { no_such_macro!(); this is a foreign body; }
 namespace reopened {
     syntax flow::Chain;
     static u32 first() { return chain (2u32); }
@@ -177,6 +183,7 @@ global uptr syntax_width = width ();
 global u32 syntax_raw_entry() {
 #ifndef SYNTAX_COMPILE_ONLY
     if (generated() != 7u32) return 0u32;
+    if (copied_function(4u32) != 21u32) return 0u32;
     if (reopened::first() != 7u32 || reopened::second() != 4u32) return 0u32;
     if (dangling(0u32) != 5u32 || dangling(1u32) != 3u32 || dangling(2u32) != 7u32) return 0u32;
     if (lexical(1u32) != 136u32 || returned() != 11u32) return 0u32;

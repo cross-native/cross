@@ -60,6 +60,12 @@ reject(fence "followed immediately by terminal ';'"
     "${expander}syntax Bad : expression { prefix \"bad\"; match value:tokens_until(\";\"); expand expand; }\n")
 reject(match "syntax-match error for active prefix"
     "${expander}${definition}syntax Value; global u32 entry() { u32 value = 1u32; return value + 1u32; }\n")
+reject(function_raw_requires_definition "syntax-match error for active prefix"
+    "[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; } syntax Fn : item { prefix \"fn\"; match body:function_raw; expand drop; } syntax Fn; fn static u32 value;\n")
+reject(function_raw_header "expected ';' or function body"
+    "[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; } syntax Fn : item { prefix \"fn\"; match body:function; expand drop; } syntax Fn; fn static u32 bad(in u32 value) alien { foreign words; }\n")
+reject(function_raw_direct "requires a direct core function header"
+    "[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; } syntax Fn : item { prefix \"fn\"; match body:function_raw; expand drop; } syntax Fn; fn struct Record { u32 value; }\n")
 reject(missing_expander "syntax expander is not visible"
     "${definition}syntax Value;\n")
 reject(forward_expander "syntax expander is not visible"

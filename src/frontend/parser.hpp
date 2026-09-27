@@ -36,6 +36,9 @@ private:
     const SyntaxDefinition* active_syntax(bool item) const;
     bool macro_start() const;
     std::optional<SyntaxExecution::Output> expand_at_position(bool item);
+    bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
+                                         std::string_view name_space,
+                                         const std::vector<std::string>& imports) const;
     std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output) const;
     void adopt_replacement(Parser& child);
     std::unique_ptr<Statement> parse_statement_replacement();

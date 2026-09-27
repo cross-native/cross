@@ -4,6 +4,7 @@
 
 #include "frontend/semantic.hpp"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -34,7 +35,7 @@ struct SyntaxActivation {
 };
 struct SyntaxPatternElement {
     enum class Kind { Terminal, Ident, Name, Literal, Paren, Bracket, Block, Group,
-                      TokensUntil, Rule } kind;
+                      TokensUntil, FunctionRaw, Rule } kind;
     std::string field;
     MetaToken terminal;
     std::string rule_name;
@@ -126,7 +127,8 @@ public:
         SyntaxExecution::FunctionId expander;
     };
     std::optional<Match> match(const SyntaxDefinition& definition,
-        const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics) const;
+        const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
+        const std::function<bool(std::size_t, std::size_t)>& function_header = {}) const;
     std::shared_ptr<SyntaxExecution> execution() const { return execution_; }
 private:
     std::optional<SyntaxEntityId> lookup(std::string_view name, std::string_view name_space,

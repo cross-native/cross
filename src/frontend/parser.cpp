@@ -330,10 +330,39 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
     }
     const auto* definition = active_syntax(item);
     if (!definition) return {};
-    const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_);
+    const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_,
+        [&](std::size_t first, std::size_t body_open) {
+            return validate_syntax_function_header(first, body_open, name_space, imports);
+        });
     if (!matched) { ++index_; synchronize_external(); return {}; }
     index_ = matched->end;
     return execution->expand(matched->expander, {}, matched->value, location, name_space, imports, bindings);
+}
+
+bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body_open,
+    std::string_view name_space, const std::vector<std::string>& imports) const {
+    // Parse the actual header in the caller's type/name environment, with a
+    // synthetic empty body. A raw body belongs exclusively to the extension
+    // and must not be core-parsed (or expanded) during recognition.
+    std::vector<Token> header(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+                              tokens_.begin() + static_cast<std::ptrdiff_t>(body_open + 1));
+    header.push_back({TokenKind::Punctuator, "}", tokens_[body_open].location});
+    header.push_back({TokenKind::End, {}, tokens_[body_open].location});
+    auto child = replacement_parser({std::move(header), tokens_[first].location});
+    child->syntax_.reset();
+    child->replacement_ = false;
+    child->active_namespace_ = name_space;
+    child->active_imports_ = imports;
+    const auto errors = diagnostics_.errors();
+    Program parsed;
+    child->parse_external(parsed, std::string(name_space));
+    const bool direct = child->current().kind == TokenKind::End && parsed.functions.size() == 1 &&
+        parsed.functions.front()->body && parsed.objects.empty() &&
+        parsed.records.empty() && parsed.enumerations.empty() &&
+        parsed.global_labels.empty();
+    if (!direct) diagnostics_.error(tokens_[first].location,
+        "syntax function capture requires a direct core function header");
+    return direct && diagnostics_.errors() == errors;
 }
 
 std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output) const {
