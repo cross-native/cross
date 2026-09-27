@@ -311,29 +311,37 @@ namespace flow {
     syntax ExplodeStmt : statement { prefix "explode_stmt"; match body:block; expand explode; }
     [[syntax_expander]] static $::meta::tokens parsed_array(in $::meta::syntax_match input) {
         $::meta::syntax body = $::syntax::node(input, "body");
-        uptr found = 0uptr;
-        for (uptr at = 0uptr; at < $::meta::child_count(body); ++at) {
-            $::meta::syntax part = $::meta::child(body, at);
-            if ($::meta::is_production(part, "initializer")) {
-                if ($::meta::child_count(part) != 5uptr) return $::quote { public_schema_failure; };
-                $::meta::syntax entry = $::meta::child(part, 1uptr);
-                if (!$::meta::is_production(entry, "initializer_entry") ||
-                    $::meta::child_count(entry) != 3uptr) return $::quote { public_schema_failure; };
-                $::meta::syntax designator = $::meta::child(entry, 0uptr);
-                if (!$::meta::is_production(designator, "designator") ||
-                    $::meta::child_count(designator) != 3uptr ||
-                    !$::meta::is_production($::meta::child(designator, 1uptr), "constant_expression"))
-                    return $::quote { public_schema_failure; };
-                ++found;
-            }
-            if ($::meta::is_production(part, "array_suffix")) {
-                if ($::meta::child_count(part) != 3uptr ||
-                    !$::meta::is_production($::meta::child(part, 1uptr), "assignment_expression"))
-                    return $::quote { public_schema_failure; };
-                ++found;
-            }
-        }
-        if (found != 2uptr) return $::quote { public_schema_failure; };
+        if ($::meta::child_count(body) != 3uptr ||
+            !$::meta::is_production($::meta::child(body, 0uptr), "declaration_specifiers"))
+            return $::quote { public_schema_failure; };
+        $::meta::syntax list = $::meta::child(body, 1uptr);
+        if (!$::meta::is_production(list, "init_declarator_list") ||
+            $::meta::child_count(list) != 1uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax item = $::meta::child(list, 0uptr);
+        if (!$::meta::is_production(item, "init_declarator") ||
+            $::meta::child_count(item) != 3uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax declarator = $::meta::child(item, 0uptr);
+        if (!$::meta::is_production(declarator, "declarator") ||
+            $::meta::child_count(declarator) != 1uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax direct = $::meta::child(declarator, 0uptr);
+        if (!$::meta::is_production(direct, "direct_declarator") ||
+            $::meta::child_count(direct) != 2uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax suffix = $::meta::child(direct, 1uptr);
+        if (!$::meta::is_production(suffix, "array_suffix") ||
+            $::meta::child_count(suffix) != 3uptr ||
+            !$::meta::is_production($::meta::child(suffix, 1uptr), "assignment_expression"))
+            return $::quote { public_schema_failure; };
+        $::meta::syntax initializer = $::meta::child(item, 2uptr);
+        if (!$::meta::is_production(initializer, "initializer") ||
+            $::meta::child_count(initializer) != 5uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax entry = $::meta::child(initializer, 1uptr);
+        if (!$::meta::is_production(entry, "initializer_entry") ||
+            $::meta::child_count(entry) != 3uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax designator = $::meta::child(entry, 0uptr);
+        if (!$::meta::is_production(designator, "designator") ||
+            $::meta::child_count(designator) != 3uptr ||
+            !$::meta::is_production($::meta::child(designator, 1uptr), "constant_expression"))
+            return $::quote { public_schema_failure; };
         return $::meta::tokens(body);
     }
     syntax ParsedArray : item { prefix "parsed_array"; match body:declaration; expand parsed_array; }
@@ -416,6 +424,8 @@ emit_type u32;
 syntax flow::ParsedDecl, flow::ParsedPrototype, flow::ParsedDefinition, flow::ParsedHeader, flow::ParsedArray;
 syntax flow::ParsedGeneric, flow::DropGeneric;
 parsed_decl global u32 parsed_state = 19u32;
+parsed_decl global u32 parsed_first = 3u32, parsed_second = 4u32;
+parsed_decl struct ParsedMembers { u32 *pointer, scalar; };
 parsed_array global u32 parsed_array[3] = { [0] = 5u32, [2] = 7u32 };
 parsed_generic [[generic(T, u32 count), noinline]] static T parsed_generic(in T value) {
     return value + count;
@@ -564,6 +574,14 @@ namespace frozen {
     parsed_stmt while (total < 10u32) ++total;
     parsed_stmt return total;
 }
+[[noinline]] static u32 parsed_members() {
+    u32 target = 6u32;
+    u32 * [[address_space(0)]] const pointer = &target;
+    struct ParsedMembers value;
+    value.pointer = pointer;
+    value.scalar = 9u32;
+    return *value.pointer + value.scalar;
+}
 syntax flow::Width;
 global uptr syntax_width = width ();
 #ifdef CUSTOM_SYNTAX_ABI
@@ -585,6 +603,7 @@ global u32 syntax_raw_entry() {
     if (recursive_rules() != 27u32) return 0u32;
     if (parsed_expression() != 20u32 || sizeof(CapturedType) != 4uptr) return 0u32;
     if (parsed_function(4u32) != 12u32 || parsed_state != 19u32 ||
+        parsed_first != 3u32 || parsed_second != 4u32 || parsed_members() != 15u32 ||
         parsed_generic<u32, 4u32>(3u32) != 7u32 ||
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||
         header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||

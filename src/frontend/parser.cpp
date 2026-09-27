@@ -399,7 +399,12 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
 Parser::ProductionScope::ProductionScope(Parser& parser, SyntaxProduction production)
     : parser(parser), event(parser.begin_production(production)) {}
 
-Parser::ProductionScope::~ProductionScope() { parser.end_production(event); }
+Parser::ProductionScope::~ProductionScope() { finish(); }
+
+void Parser::ProductionScope::finish() {
+    parser.end_production(event);
+    event = std::numeric_limits<std::size_t>::max();
+}
 
 std::size_t Parser::begin_production(SyntaxProduction production) {
     if (!recording_public_tree_ || production == SyntaxProduction::None)
@@ -426,6 +431,22 @@ void Parser::end_production(std::size_t event) {
     if (event == std::numeric_limits<std::size_t>::max()) return;
     production_events_[event].end = index_;
     production_stack_.pop_back();
+}
+
+void Parser::flatten_production(std::size_t event, std::size_t parent) {
+    if (parent == std::numeric_limits<std::size_t>::max()) {
+        if (production_stack_.empty()) return;
+        parent = production_stack_.back();
+    }
+    if (event >= production_events_.size() || parent >= production_events_.size() ||
+        event == parent) return;
+    auto& children = production_events_[parent].children;
+    const auto found = std::find(children.begin(), children.end(), event);
+    if (found == children.end()) return;
+    const auto offset = static_cast<std::size_t>(found - children.begin());
+    children.erase(found);
+    const auto& nested = production_events_[event].children;
+    children.insert(children.begin() + static_cast<std::ptrdiff_t>(offset), nested.begin(), nested.end());
 }
 
 std::shared_ptr<const SyntaxNode> Parser::public_node(std::size_t event) const {
@@ -757,7 +778,7 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
     return grouped;
 }
 
-std::vector<Attribute> Parser::parse_attributes() {
+std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
     std::vector<Attribute> result;
     while (current().is("[[")) {
         ProductionScope attribute_specifier(*this, SyntaxProduction::AttributeSpecifier);
@@ -912,6 +933,7 @@ std::vector<Attribute> Parser::parse_attributes() {
             result.push_back(std::move(attribute));
         } while (consume(","));
         expect("]]", "to close attribute list");
+        if (one_specifier) break;
     }
     return result;
 }
@@ -921,7 +943,7 @@ void Parser::apply_type_attributes(
     std::optional<std::pair<std::uint32_t, SourceLocation>>*
         pending_address_space) {
     if (!current().is("[[")) return;
-    for (const auto& attribute : parse_attributes()) {
+    for (const auto& attribute : parse_attributes(true)) {
         if (attribute.name == "atomic") {
             if (!attribute.arguments.empty()) {
                 diagnostics_.error(attribute.location,
@@ -1057,15 +1079,20 @@ bool Parser::type_start() const {
            resolve_type_alias(peek_qualified_name()) != nullptr;
 }
 
-TypePtr Parser::parse_type() {
+TypePtr Parser::parse_type(bool record_specifiers) {
+    ProductionScope specifiers(*this, record_specifiers
+        ? SyntaxProduction::DeclarationSpecifiers : SyntaxProduction::None);
     bool is_const = false;
     bool is_volatile = false;
     bool is_restrict = false;
     std::optional<SourceLocation> restrict_location;
-    while (current().is("const") || current().is("volatile") ||
-           current().is("restrict")) {
-        if (consume("const")) is_const = true;
-        else if (consume("volatile")) is_volatile = true;
+    while (current().is("const") || current().is("volatile") || current().is("restrict")) {
+        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        ProductionScope qualifier(*this, SyntaxProduction::TypeQualifier);
+        if (consume("const"))
+            is_const = true;
+        else if (consume("volatile"))
+            is_volatile = true;
         else {
             restrict_location = current().location;
             consume("restrict");
@@ -1073,192 +1100,191 @@ TypePtr Parser::parse_type() {
         }
     }
     TypePtr type;
-    if (current().is("$::meta::span")) {
-        if (!parsing_procedural_body_)
-            error_here("$::meta::span is only available in expansion functions");
-        type = span_type();
-        type->is_const = is_const;
-        type->is_volatile = is_volatile;
-        ++index_;
-    } else if (current().is("$::meta::syntax")) {
-        if (!parsing_procedural_body_)
-            error_here("$::meta::syntax is only available in expansion functions");
-        type = syntax_type();
-        type->is_const = is_const;
-        type->is_volatile = is_volatile;
-        ++index_;
-    } else if (current().is("$::meta::syntax_match")) {
-        if (!parsing_procedural_body_)
-            error_here("$::meta::syntax_match is only available in expansion functions");
-        type = syntax_match_type();
-        type->is_const = is_const;
-        type->is_volatile = is_volatile;
-        ++index_;
-    } else if (current().is("$::meta::tokens")) {
-        if (!parsing_procedural_body_)
-            error_here("$::meta::tokens is only available in translation-time macro bodies");
-        ++index_;
-        type = tokens_type();
-        type->is_const = is_const;
-        type->is_volatile = is_volatile;
-    } else if (current().is("$::meta::bytes") ||
-               current().is("$::meta::buffer")) {
-        const bool bytes = consume("$::meta::bytes");
-        if (!bytes) consume("$::meta::buffer");
-        type = bytes ? bytes_type() : buffer_type();
-        type->is_const = is_const;
-        type->is_volatile = is_volatile;
-    } else if (current().is("struct") || current().is("union")) {
-        const bool is_union = consume("union");
-        if (!is_union) consume("struct");
-        const auto name = parse_qualified_name();
-        if (!name) {
-            error_here("expected record name after '" +
-                       std::string(is_union ? "union" : "struct") + "'");
-            return {};
-        }
-        auto canonical = *name;
-        auto found = record_types_.end();
-        if (name->find("::") != std::string::npos) {
-            found = record_types_.find(canonical);
-        } else {
-            auto current_namespace = active_namespace_;
-            while (!current_namespace.empty()) {
-                canonical = join_namespace(current_namespace, *name);
-                found = record_types_.find(canonical);
-                if (found != record_types_.end()) break;
-                const auto separator = current_namespace.rfind("::");
-                if (separator == std::string::npos) break;
-                current_namespace.resize(separator);
+    {
+        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        ProductionScope type_specifier(*this, SyntaxProduction::TypeSpecifier);
+        ProductionScope target_type(*this, current().kind == TokenKind::BuiltinName
+                                               ? SyntaxProduction::TargetScalarBuiltinName
+                                               : SyntaxProduction::None);
+        ProductionScope builtin(*this, current().kind == TokenKind::BuiltinName
+                                           ? SyntaxProduction::BuiltinName
+                                           : SyntaxProduction::None);
+        if (current().is("$::meta::span")) {
+            if (!parsing_procedural_body_)
+                error_here("$::meta::span is only available in expansion functions");
+            type = span_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+            ++index_;
+        } else if (current().is("$::meta::syntax")) {
+            if (!parsing_procedural_body_)
+                error_here("$::meta::syntax is only available in expansion functions");
+            type = syntax_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+            ++index_;
+        } else if (current().is("$::meta::syntax_match")) {
+            if (!parsing_procedural_body_)
+                error_here("$::meta::syntax_match is only available in expansion functions");
+            type = syntax_match_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+            ++index_;
+        } else if (current().is("$::meta::tokens")) {
+            if (!parsing_procedural_body_)
+                error_here("$::meta::tokens is only available in translation-time macro bodies");
+            ++index_;
+            type = tokens_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+        } else if (current().is("$::meta::bytes") || current().is("$::meta::buffer")) {
+            const bool bytes = consume("$::meta::bytes");
+            if (!bytes)
+                consume("$::meta::buffer");
+            type = bytes ? bytes_type() : buffer_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+        } else if (current().is("struct") || current().is("union")) {
+            ProductionScope record(*this, SyntaxProduction::StructOrUnionSpecifier);
+            const bool is_union = consume("union");
+            if (!is_union)
+                consume("struct");
+            const auto name = parse_qualified_name();
+            if (!name) {
+                error_here("expected record name after '" +
+                           std::string(is_union ? "union" : "struct") + "'");
+                return {};
             }
-            for (const auto& imported : active_imports_) {
-                if (found != record_types_.end()) break;
-                canonical = join_namespace(imported, *name);
+            auto canonical = *name;
+            auto found = record_types_.end();
+            if (name->find("::") != std::string::npos) {
                 found = record_types_.find(canonical);
+            } else {
+                auto current_namespace = active_namespace_;
+                while (!current_namespace.empty()) {
+                    canonical = join_namespace(current_namespace, *name);
+                    found = record_types_.find(canonical);
+                    if (found != record_types_.end())
+                        break;
+                    const auto separator = current_namespace.rfind("::");
+                    if (separator == std::string::npos)
+                        break;
+                    current_namespace.resize(separator);
+                }
+                for (const auto &imported : active_imports_) {
+                    if (found != record_types_.end())
+                        break;
+                    canonical = join_namespace(imported, *name);
+                    found = record_types_.find(canonical);
+                }
+                if (found == record_types_.end()) {
+                    canonical = *name;
+                    found = record_types_.find(canonical);
+                }
             }
             if (found == record_types_.end()) {
-                canonical = *name;
-                found = record_types_.find(canonical);
+                canonical = name->find("::") == std::string::npos && !active_namespace_.empty()
+                                ? join_namespace(active_namespace_, *name)
+                                : *name;
+                record_types_.emplace(canonical, RecordTag{is_union, false});
+            } else if (found->second.is_union != is_union) {
+                diagnostics_.error(current().location,
+                                   "record tag '" + *name +
+                                       "' was previously declared with the other record kind");
+            }
+            type = record_type(canonical, is_union, is_const, is_volatile);
+        } else if (current().is("enum")) {
+            ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
+            consume("enum");
+            const auto name = parse_qualified_name();
+            if (!name) {
+                error_here("expected enumeration name after 'enum'");
+                return {};
+            }
+            auto canonical = *name;
+            auto found = enum_types_.find(canonical);
+            if (found == enum_types_.end() && canonical.find("::") == std::string::npos &&
+                !active_namespace_.empty()) {
+                canonical = join_namespace(active_namespace_, canonical);
+                found = enum_types_.find(canonical);
+            }
+            if (found == enum_types_.end() && name->find("::") == std::string::npos) {
+                for (const auto &imported : active_imports_) {
+                    canonical = join_namespace(imported, *name);
+                    found = enum_types_.find(canonical);
+                    if (found != enum_types_.end())
+                        break;
+                }
+            }
+            if (found == enum_types_.end()) {
+                diagnostics_.error(current().location, "unknown enumeration type '" + *name + "'");
+                type = enum_type(*name, BuiltinType::I32, is_const, is_volatile);
+            } else {
+                type = enum_type(canonical, found->second, is_const, is_volatile);
             }
         }
-        if (found == record_types_.end()) {
-            canonical = name->find("::") == std::string::npos &&
-                                !active_namespace_.empty()
-                            ? join_namespace(active_namespace_, *name)
-                            : *name;
-            record_types_.emplace(canonical, RecordTag{is_union, false});
-        } else if (found->second.is_union != is_union) {
-            diagnostics_.error(
-                current().location,
-                "record tag '" + *name +
-                    "' was previously declared with the other record kind");
-        }
-        type = record_type(canonical, is_union, is_const, is_volatile);
-    } else if (consume("enum")) {
-        const auto name = parse_qualified_name();
-        if (!name) {
-            error_here("expected enumeration name after 'enum'");
+        const auto kind = type ? std::optional<BuiltinType>{} : builtin_kind(current().text);
+        const auto generic =
+            std::find(active_generic_types_.begin(), active_generic_types_.end(), current().text);
+        const auto alias_name = type ? std::string{} : peek_qualified_name();
+        const auto alias = alias_name.empty() ? TypePtr{} : resolve_type_alias(alias_name);
+        if (!type && !kind && generic == active_generic_types_.end() && !alias) {
+            if (const auto message = familiar_c_spelling(current().text)) {
+                error_here(*message);
+                ++index_;
+                return builtin_type(BuiltinType::I32, is_const, is_volatile);
+            }
+            error_here("expected Cross type");
             return {};
         }
-        auto canonical = *name;
-        auto found = enum_types_.find(canonical);
-        if (found == enum_types_.end() &&
-            canonical.find("::") == std::string::npos &&
-            !active_namespace_.empty()) {
-            canonical = join_namespace(active_namespace_, canonical);
-            found = enum_types_.find(canonical);
-        }
-        if (found == enum_types_.end() &&
-            name->find("::") == std::string::npos) {
-            for (const auto& imported : active_imports_) {
-                canonical = join_namespace(imported, *name);
-                found = enum_types_.find(canonical);
-                if (found != enum_types_.end()) break;
+        if (!type) {
+            if (alias) {
+                ProductionScope alias_production(*this, SyntaxProduction::TypedefName);
+                (void)parse_qualified_name();
+                type = copy_type(alias);
+                type->is_const = type->is_const || is_const;
+                type->is_volatile = type->is_volatile || is_volatile;
+            } else {
+                ProductionScope leaf(*this, kind ? SyntaxProduction::ScalarType
+                                                 : SyntaxProduction::TypedefName);
+                const auto spelling = std::string(current().text);
+                if (kind)
+                    ++index_;
+                else
+                    (void)parse_qualified_name();
+                type = kind ? builtin_type(*kind, is_const, is_volatile)
+                            : generic_type(spelling, is_const, is_volatile);
             }
         }
-        if (found == enum_types_.end()) {
-            diagnostics_.error(current().location,
-                               "unknown enumeration type '" + *name + "'");
-            type = enum_type(*name, BuiltinType::I32, is_const, is_volatile);
+    }
+    std::optional<std::pair<std::uint32_t, SourceLocation>> pending_address_space;
+    while (current().is("const") || current().is("volatile") || current().is("restrict") ||
+           current().is("[[")) {
+        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        if (current().is("[[")) {
+            // Each written attribute_specifier owns its own occurrence.
+            apply_type_attributes(type, &pending_address_space);
         } else {
-            type = enum_type(canonical, found->second, is_const, is_volatile);
+            ProductionScope qualifier(*this, SyntaxProduction::TypeQualifier);
+            if (consume("const"))
+                is_const = true;
+            else if (consume("volatile"))
+                is_volatile = true;
+            else {
+                restrict_location = current().location;
+                consume("restrict");
+                is_restrict = true;
+            }
         }
     }
-    const auto kind = type ? std::optional<BuiltinType>{}
-                           : builtin_kind(current().text);
-    const auto generic = std::find(active_generic_types_.begin(),
-                                   active_generic_types_.end(), current().text);
-    const auto alias_name = type ? std::string{} : peek_qualified_name();
-    const auto alias = alias_name.empty() ? TypePtr{}
-                                          : resolve_type_alias(alias_name);
-    if (!type && !kind && generic == active_generic_types_.end() && !alias) {
-        if (const auto message = familiar_c_spelling(current().text)) {
-            error_here(*message);
-            ++index_;
-            return builtin_type(BuiltinType::I32, is_const, is_volatile);
-        }
-        error_here("expected Cross type");
-        return {};
-    }
-    if (!type) {
-        if (alias) {
-            (void)parse_qualified_name();
-            type = std::make_shared<Type>(*alias);
-            type->is_const = type->is_const || is_const;
-            type->is_volatile = type->is_volatile || is_volatile;
-        } else {
-            const auto spelling = std::string(current().text);
-            ++index_;
-            type = kind ? builtin_type(*kind, is_const, is_volatile)
-                        : generic_type(spelling, is_const, is_volatile);
-        }
-    }
+    type->is_const = type->is_const || is_const;
+    type->is_volatile = type->is_volatile || is_volatile;
     type->is_restrict = type->is_restrict || is_restrict;
     if (type->is_restrict && type->kind != Type::Kind::Pointer) {
-        diagnostics_.error(
-            restrict_location.value_or(current().location),
-            "restrict qualifier requires a pointer type");
+        diagnostics_.error(restrict_location.value_or(current().location),
+                           "restrict qualifier requires a pointer type");
     }
-    std::optional<std::pair<std::uint32_t, SourceLocation>>
-        pending_address_space;
-    apply_type_attributes(type, &pending_address_space);
-    while (consume("*")) {
-        bool pointer_const = false;
-        bool pointer_volatile = false;
-        bool pointer_restrict = false;
-        while (current().is("const") || current().is("volatile") ||
-               current().is("restrict")) {
-            if (consume("const")) pointer_const = true;
-            else if (consume("volatile")) pointer_volatile = true;
-            else {
-                consume("restrict");
-                pointer_restrict = true;
-            }
-        }
-        type = pointer_type(type, pointer_const, pointer_volatile);
-        type->is_restrict = pointer_restrict;
-        if (pending_address_space) {
-            type->address_space = pending_address_space->first;
-            type->address_space_location = pending_address_space->second;
-            pending_address_space.reset();
-        }
-        apply_type_attributes(type);
-    }
-    if (pending_address_space) {
-        if (current().is("(") &&
-            (current(1).is("*") || current(1).is("("))) {
-            type->pending_address_space = pending_address_space;
-        } else if (type->kind != Type::Kind::Pointer) {
-            diagnostics_.error(pending_address_space->second,
-                               "address_space requires a pointer type");
-        } else if (type->address_space_location.valid()) {
-            diagnostics_.error(pending_address_space->second,
-                               "duplicate address_space type qualifier");
-        } else {
-            type->address_space = pending_address_space->first;
-            type->address_space_location = pending_address_space->second;
-        }
-    }
+    type->pending_address_space = pending_address_space;
     return type;
 }
 
@@ -1297,6 +1323,7 @@ std::vector<std::string> Parser::preview_angle_generic_types() const {
 
 std::vector<FunctionDecl::GenericParameter>
 Parser::parse_angle_generic_parameters() {
+    ProductionScope list(*this, SyntaxProduction::GenericParameterList);
     std::vector<FunctionDecl::GenericParameter> result;
     consume("<");
     if (consume(">")) {
@@ -1304,6 +1331,7 @@ Parser::parse_angle_generic_parameters() {
         return result;
     }
     for (;;) {
+        ProductionScope parameter(*this, SyntaxProduction::GenericParameter);
         const auto location = current().location;
         std::optional<std::string> name;
         TypePtr value_type;
@@ -1312,9 +1340,15 @@ Parser::parse_angle_generic_parameters() {
             name = std::string(current().text);
             ++index_;
         } else {
-            value_type = parse_type();
-            if (value_type)
-                value_type = parse_declarator(std::move(value_type), name);
+            {
+                ProductionScope type_name(*this, SyntaxProduction::TypeName);
+                value_type = parse_type();
+                if (value_type)
+                    value_type = parse_declarator(std::move(value_type), name, false,
+                                                  nullptr, nullptr, nullptr, true);
+            }
+            if (const auto* token = consume_kind(TokenKind::Identifier))
+                name = std::string(token->text);
             if (value_type && !is_integer(value_type) &&
                 value_type->kind != Type::Kind::Pointer &&
                 !(value_type->kind == Type::Kind::Builtin &&
@@ -1335,6 +1369,7 @@ Parser::parse_angle_generic_parameters() {
             if (!value_type) active_generic_types_.push_back(*name);
             result.push_back({std::move(*name), std::move(value_type), location});
         }
+        parameter.finish();
         if (!consume(",")) break;
         if (current().is(">")) {
             error_here("a generic parameter list cannot have a trailing comma");
@@ -1388,94 +1423,142 @@ bool Parser::consume_generic_close() {
     return true;
 }
 
-TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
-                                 bool parameter,
+TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name, bool parameter,
                                  std::unique_ptr<Expr>* dynamic_outer_bound,
                                  SourceLocation* name_location,
-                                 std::vector<FunctionDecl::GenericParameter>*
-                                     angle_parameters) {
-    while (consume("*")) {
-        bool is_const = false;
-        bool is_volatile = false;
-        bool is_restrict = false;
-        while (current().is("const") || current().is("volatile") ||
-               current().is("restrict")) {
+                                 std::vector<FunctionDecl::GenericParameter>* angle_parameters,
+                                 bool abstract_only) {
+    const bool written = current().is("*") || current().is("(") || current().is("[") ||
+                         (!abstract_only && current().kind == TokenKind::Identifier);
+    ProductionScope declarator(*this,
+                               written ? SyntaxProduction::Declarator : SyntaxProduction::None);
+    auto pending_address_space = base ? base->pending_address_space
+                                      : std::optional<std::pair<std::uint32_t, SourceLocation>>{};
+    if (pending_address_space) {
+        // A member list reuses its base specifiers for each declarator.
+        // Consuming one declarator must not mutate that shared base.
+        base = std::make_shared<Type>(*base);
+        base->pending_address_space.reset();
+    }
+    while (current().is("*")) {
+        ProductionScope pointer(*this, SyntaxProduction::PointerPart);
+        consume("*");
+        base = pointer_type(std::move(base));
+        if (pending_address_space) {
+            base->address_space = pending_address_space->first;
+            base->address_space_location = pending_address_space->second;
+            pending_address_space.reset();
+        }
+        while (current().is("const") || current().is("volatile") || current().is("restrict") ||
+               current().is("[[")) {
+            if (current().is("[[")) {
+                apply_type_attributes(base);
+                continue;
+            }
+            ProductionScope qualifier(*this, SyntaxProduction::TypeQualifier);
             if (consume("const"))
-                is_const = true;
-            else if (consume("volatile")) {
-                is_volatile = true;
-            } else {
+                base->is_const = true;
+            else if (consume("volatile"))
+                base->is_volatile = true;
+            else {
                 consume("restrict");
-                is_restrict = true;
+                base->is_restrict = true;
             }
         }
-        base = pointer_type(std::move(base), is_const, is_volatile);
-        base->is_restrict = is_restrict;
-        apply_type_attributes(base);
+    }
+    const bool grouped = current().is("(") && (current(1).is("*") || current(1).is("("));
+    if (pending_address_space) {
+        if (grouped)
+            base->pending_address_space = pending_address_space;
+        else if (base->kind != Type::Kind::Pointer)
+            diagnostics_.error(pending_address_space->second,
+                               "address_space requires a pointer type");
+        else if (base->address_space_location.valid())
+            diagnostics_.error(pending_address_space->second,
+                               "duplicate address_space type qualifier");
+        else {
+            base->address_space = pending_address_space->first;
+            base->address_space_location = pending_address_space->second;
+        }
     }
     TypePtr nested;
     TypePtr hole;
-    if (current().is("(") && (current(1).is("*") || current(1).is("("))) {
+    const auto direct_event =
+        begin_production(written ? SyntaxProduction::DirectDeclarator : SyntaxProduction::None);
+    if (grouped) {
         consume("(");
         hole = std::make_shared<Type>();
-        nested = parse_declarator(hole, name, parameter, nullptr,
-                                  name_location, angle_parameters);
+        nested = parse_declarator(hole, name, parameter, nullptr, name_location,
+                                   angle_parameters, abstract_only);
         expect(")", "after parenthesized declarator");
-    } else {
+    } else if (!abstract_only) {
         const auto location = current().location;
         name = parse_qualified_name();
-        if (name && name_location) *name_location = location;
+        if (name && name_location)
+            *name_location = location;
         if (name && angle_parameters && current().is("<"))
             *angle_parameters = parse_angle_generic_parameters();
     }
     if (current().is("[")) {
         base = parse_array_suffix(std::move(base), parameter, dynamic_outer_bound);
     }
-    if (consume("(")) {
+    if (current().is("(")) {
+        ProductionScope suffix(*this, SyntaxProduction::FunctionSuffix);
+        consume("(");
         std::vector<ParameterDecl> parameters;
         bool variadic = false;
-        if (!consume(")")) {
-            if (current().is("void") && current(1).is(")")) {
-                ++index_;
-            } else {
-                unsigned ordinal = 0;
-                for (;;) {
-                    if (consume("...")) {
-                        variadic = true;
-                        break;
+        {
+            ProductionScope list(*this, SyntaxProduction::ParameterList);
+            if (!current().is(")")) {
+                if (current().is("void") && current(1).is(")")) {
+                    ++index_;
+                } else {
+                    unsigned ordinal = 0;
+                    for (;;) {
+                        if (consume("...")) {
+                            variadic = true;
+                            break;
+                        }
+                        const auto before = index_;
+                        parameters.push_back(parse_parameter(ordinal++));
+                        if (index_ == before || !consume(","))
+                            break;
                     }
-                    const auto before = index_;
-                    parameters.push_back(parse_parameter(ordinal++));
-                    if (index_ == before || !consume(",")) break;
                 }
             }
-            expect(")", "after function parameters");
         }
+        expect(")", "after function parameters");
         base = function_type(std::move(base), std::move(parameters), variadic);
-        if (consume("->")) {
+        if (current().is("->")) {
+            ProductionScope result_location(*this, SyntaxProduction::ResultLocation);
+            consume("->");
             const auto* location_token = consume_kind(TokenKind::String);
             if (!location_token) {
                 error_here("expected result location string after '->'");
             } else {
-                base->function->result_location =
-                    decode_string_literal(location_token->text);
+                base->function->result_location = decode_string_literal(location_token->text);
                 if (!base->function->result_location)
-                    diagnostics_.error(location_token->location,
-                                       "invalid result location string");
+                    diagnostics_.error(location_token->location, "invalid result location string");
             }
         }
         // In a grouped declarator the attributes follow this function
         // suffix, even if another callable component surrounds it.
-        if (nested) {
+        if (nested || !name) {
             auto suffix_attributes = parse_attributes();
             apply_callable_attributes(base, suffix_attributes);
             for (const auto& attribute : suffix_attributes) {
                 if (attribute.name != "abi" && attribute.name != "clobber" &&
                     attribute.name != "stack_cleanup")
-                    diagnostics_.error(attribute.location,
-                                       "function-only attribute cannot qualify a nested callable type");
+                    diagnostics_.error(
+                        attribute.location,
+                        "function-only attribute cannot qualify a nested callable type");
             }
         }
+    }
+    end_production(direct_event);
+    if (recording_public_tree_ && declarator.event < production_events_.size() && !name) {
+        production_events_[declarator.event].production = SyntaxProduction::AbstractDeclarator;
+        flatten_production(direct_event);
     }
     if (nested) {
         // The inner declarator binds first. Fill its unique placeholder only
@@ -1491,7 +1574,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                 break;
             }
         }
-        auto pending_address_space = *attributed_base
+        auto nested_address_space = *attributed_base
             ? (*attributed_base)->pending_address_space
             : std::optional<std::pair<std::uint32_t, SourceLocation>>{};
         if (*attributed_base) {
@@ -1504,17 +1587,17 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
             }
             if (!type) return;
             if (type->kind == Type::Kind::Pointer) {
-                if (type->pointee == hole && pending_address_space) {
+                if (type->pointee == hole && nested_address_space) {
                     if (type->address_space_location.valid()) {
                         diagnostics_.error(
-                            pending_address_space->second,
+                            nested_address_space->second,
                             "duplicate address_space type qualifier");
                     } else {
-                        type->address_space = pending_address_space->first;
+                        type->address_space = nested_address_space->first;
                         type->address_space_location =
-                            pending_address_space->second;
+                            nested_address_space->second;
                     }
-                    pending_address_space.reset();
+                    nested_address_space.reset();
                 }
                 self(self, type->pointee);
             } else if (type->kind == Type::Kind::Array)
@@ -1523,8 +1606,8 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                 self(self, type->function->result);
         };
         fill(fill, nested);
-        if (pending_address_space) {
-            diagnostics_.error(pending_address_space->second,
+        if (nested_address_space) {
+            diagnostics_.error(nested_address_space->second,
                                "address_space requires a pointer type");
         }
         base = std::move(nested);
@@ -1690,12 +1773,20 @@ Program Parser::parse() {
 void Parser::parse_typedef(const std::string& name_space,
                            std::vector<Attribute> attributes) {
     const auto location = current().location;
+    ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
+    {
+        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        consume("typedef");
+    }
     if (!type_start()) {
         error_here("expected aliased type after 'typedef'");
         synchronize_external();
         return;
     }
-    auto type = parse_type();
+    auto type = parse_type(false);
+    specifiers.finish();
+    ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
+    ProductionScope item(*this, SyntaxProduction::InitDeclarator);
     std::optional<std::string> name;
     type = parse_declarator(std::move(type), name);
     if (!type || !name) {
@@ -1708,6 +1799,8 @@ void Parser::parse_typedef(const std::string& name_space,
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
                       std::make_move_iterator(trailing.end()));
+    item.finish();
+    list.finish();
     expect(";", "after typedef declaration");
     apply_callable_attributes(type, attributes);
 
@@ -1882,7 +1975,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         parse_record_declaration(program, name_space, std::move(attributes));
         return;
     }
-    if (consume("typedef")) {
+    if (current().is("typedef")) {
         parse_typedef(name_space, std::move(attributes));
         return;
     }
@@ -1890,7 +1983,9 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     Linkage linkage = Linkage::Group;
     bool linkage_seen = false;
     bool inline_hint = false;
+    ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
     while (current().is("global") || current().is("static") || current().is("inline")) {
+        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         if (consume("inline")) { inline_hint = true; continue; }
         Linkage selected;
         if (consume("global")) selected = Linkage::Global;
@@ -1933,47 +2028,86 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
     const auto location = current().location;
-    auto type = parse_type();
-    std::optional<std::string> name;
-    std::vector<FunctionDecl::GenericParameter> angle_parameters;
-    type = parse_declarator(std::move(type), name, false, nullptr, nullptr,
-                            &angle_parameters);
-    if (!type || !name) {
-        if (!name) error_here("expected declaration name");
-        synchronize_external();
-        active_generic_types_ = saved_generic_types;
-        return;
-    }
-    *name = join_namespace(name_space, *name);
-    if (type->kind == Type::Kind::Function && type->function) {
-        if (!angle_parameters.empty() || !parameters.empty())
-            known_generic_functions_.insert(*name);
-        else
-            known_ordinary_values_.insert(*name);
-        auto signature = type->function;
-        auto result_type = signature->result;
-        auto function = parse_function(
-            location, std::move(*name), name_space, std::move(result_type),
-            linkage, inline_hint, std::move(attributes), std::move(signature),
-            std::move(angle_parameters));
-        if (recording_public_tree_ && !public_tree_failed_ && function) {
-            production_events_[production.event].production =
-                parsing_public_function_header_ ? SyntaxProduction::FunctionHeader
-                : function->body ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration;
+    auto base_type = parse_type(false);
+    specifiers.finish();
+    ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
+    unsigned ordinal = 0;
+    bool last_function = false;
+    for (;;) {
+        ProductionScope item(*this, SyntaxProduction::InitDeclarator);
+        std::optional<std::string> name;
+        std::vector<FunctionDecl::GenericParameter> angle_parameters;
+        auto type = parse_declarator(copy_type(base_type), name, false, nullptr, nullptr,
+                                     &angle_parameters);
+        if (!type || !name) {
+            if (!name) error_here("expected declaration name");
+            synchronize_external();
+            active_generic_types_ = saved_generic_types;
+            return;
         }
-        if (function) program.functions.push_back(std::move(function));
+        *name = join_namespace(name_space, *name);
+        last_function = type->kind == Type::Kind::Function && type->function;
+        if (last_function) {
+            if (!angle_parameters.empty() || !parameters.empty())
+                known_generic_functions_.insert(*name);
+            else
+                known_ordinary_values_.insert(*name);
+            auto signature = type->function;
+            auto result_type = signature->result;
+            auto function = parse_function(
+                location, std::move(*name), name_space, std::move(result_type),
+                linkage, inline_hint, attributes, std::move(signature),
+                std::move(angle_parameters));
+            if (function && (parsing_public_function_header_ || current().is("{"))) {
+                if (ordinal != 0)
+                    error_here("a function definition requires a single declarator");
+                const auto item_event = item.event;
+                const auto list_event = list.event;
+                item.finish();
+                list.finish();
+                flatten_production(item_event, list_event);
+                flatten_production(list_event);
+                if (recording_public_tree_ && !public_tree_failed_)
+                    production_events_[production.event].production =
+                        parsing_public_function_header_ ? SyntaxProduction::FunctionHeader
+                                                        : SyntaxProduction::FunctionDefinition;
+                if (!parsing_public_function_header_) {
+                    auto* previous_function = active_function_;
+                    active_function_ = function.get();
+                    function->body = parse_compound();
+                    active_function_ = previous_function;
+                }
+                program.functions.push_back(std::move(function));
+                active_generic_types_ = saved_generic_types;
+                return;
+            }
+            if (function) program.functions.push_back(std::move(function));
+        } else {
+            known_ordinary_values_.insert(*name);
+            if (!angle_parameters.empty())
+                diagnostics_.error(location,
+                                   "angle generic parameters require a direct function declaration");
+            auto item_attributes = attributes;
+            auto trailing = parse_attributes();
+            item_attributes.insert(item_attributes.end(),
+                std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
+            apply_callable_attributes(type, item_attributes);
+            if (inline_hint)
+                diagnostics_.error(location, "'inline' is valid only on a function");
+            auto object = parse_object(location, std::move(*name), std::move(type),
+                                       linkage, std::move(item_attributes), false);
+            if (object) program.objects.push_back(std::move(object));
+        }
+        item.finish();
+        ++ordinal;
+        if (!consume(",")) break;
+    }
+    list.finish();
+    if (last_function && !current().is(";")) {
+        error_here("expected ';' or function body");
+        synchronize_external();
     } else {
-        known_ordinary_values_.insert(*name);
-        if (!angle_parameters.empty())
-            diagnostics_.error(location,
-                               "angle generic parameters require a direct function declaration");
-        apply_callable_attributes(type, attributes);
-        if (inline_hint)
-            diagnostics_.error(location,
-                               "'inline' is valid only on a function");
-        auto object = parse_object(location, std::move(*name), std::move(type),
-                                   linkage, std::move(attributes));
-        if (object) program.objects.push_back(std::move(object));
+        expect(";", "after declaration");
     }
     active_generic_types_ = saved_generic_types;
 }
@@ -2002,6 +2136,10 @@ void Parser::parse_global_label_declaration(
 void Parser::parse_enum_declaration(Program& program,
                                     const std::string& name_space,
                                     std::vector<Attribute> attributes) {
+    ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
+    ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+    ProductionScope type_specifier(*this, SyntaxProduction::TypeSpecifier);
+    ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
     const auto location = current().location;
     consume("enum");
     auto name = parse_qualified_name();
@@ -2053,6 +2191,7 @@ void Parser::parse_enum_declaration(Program& program,
     declaration.attributes = std::move(attributes);
     if (consume("{")) {
         while (!current().is("}") && current().kind != TokenKind::End) {
+            ProductionScope entry(*this, SyntaxProduction::Enumerator);
             const auto* token = consume_kind(TokenKind::Identifier);
             if (!token) {
                 error_here("expected enumerator name");
@@ -2068,10 +2207,15 @@ void Parser::parse_enum_declaration(Program& program,
                 if (consume("=")) enumerator.initializer = parse_constant_expression();
                 declaration.enumerators.push_back(std::move(enumerator));
             }
+            entry.finish();
             if (!consume(",")) break;
         }
         expect("}", "after enumeration definition");
     }
+    enumeration.finish();
+    type_specifier.finish();
+    specifier.finish();
+    specifiers.finish();
     expect(";", "after enumeration declaration");
 
     const auto found = enum_types_.find(*name);
@@ -2088,6 +2232,10 @@ void Parser::parse_enum_declaration(Program& program,
 void Parser::parse_record_declaration(
     Program& program, const std::string& name_space,
     std::vector<Attribute> attributes) {
+    ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
+    ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+    ProductionScope type_specifier(*this, SyntaxProduction::TypeSpecifier);
+    ProductionScope record(*this, SyntaxProduction::StructOrUnionSpecifier);
     const auto location = current().location;
     const bool is_union = consume("union");
     if (!is_union) consume("struct");
@@ -2124,6 +2272,7 @@ void Parser::parse_record_declaration(
         }
         tag->second.complete = true;
         while (!current().is("}") && current().kind != TokenKind::End) {
+            ProductionScope member(*this, SyntaxProduction::MemberDeclaration);
             auto member_attributes = parse_attributes();
             if (!type_start()) {
                 error_here("expected record member declaration");
@@ -2138,8 +2287,9 @@ void Parser::parse_record_declaration(
             auto base_type = parse_type();
             bool parsed_member = false;
             do {
+                ProductionScope member_declarator(*this, SyntaxProduction::MemberDeclarator);
                 std::optional<std::string> member_name;
-                auto member_type = parse_declarator(base_type, member_name);
+                auto member_type = parse_declarator(copy_type(base_type), member_name);
                 auto item_attributes = parse_attributes();
                 item_attributes.insert(
                     item_attributes.begin(), member_attributes.begin(),
@@ -2172,6 +2322,10 @@ void Parser::parse_record_declaration(
         }
         expect("}", "after record definition");
     }
+    record.finish();
+    type_specifier.finish();
+    specifier.finish();
+    specifiers.finish();
     expect(";", "after record declaration");
     program.records.push_back(std::move(declaration));
 }
@@ -2204,12 +2358,17 @@ bool Parser::parse_static_assertion() {
 }
 
 ParameterDecl Parser::parse_parameter(unsigned ordinal) {
+    ProductionScope production(*this, SyntaxProduction::ParameterDeclaration);
     ParameterDecl parameter;
     parameter.location = current().location;
     auto attributes = parse_attributes();
-    if (consume("in")) { parameter.mode = ParameterMode::In; parameter.explicit_mode = true; }
-    else if (consume("out")) { parameter.mode = ParameterMode::Out; parameter.explicit_mode = true; }
-    else if (consume("inout")) { parameter.mode = ParameterMode::InOut; parameter.explicit_mode = true; }
+    if (current().is("in") || current().is("out") || current().is("inout")) {
+        ProductionScope mode(*this, SyntaxProduction::ParameterMode);
+        if (consume("in")) parameter.mode = ParameterMode::In;
+        else if (consume("out")) parameter.mode = ParameterMode::Out;
+        else { consume("inout"); parameter.mode = ParameterMode::InOut; }
+        parameter.explicit_mode = true;
+    }
     parameter.type = parse_type();
     std::optional<std::string> name;
     parameter.type = parse_declarator(std::move(parameter.type), name, true,
@@ -2221,10 +2380,14 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     }
     parameter.name = name.value_or("_parameter" + std::to_string(ordinal));
     apply_callable_attributes(parameter.type, attributes);
-    if (const auto* location = consume_kind(TokenKind::String)) {
+    if (current().kind == TokenKind::String) {
+        ProductionScope location_production(*this, SyntaxProduction::Location);
+        const auto* location = consume_kind(TokenKind::String);
         parameter.location_name = decode_string_literal(location->text);
         if (!parameter.location_name) diagnostics_.error(location->location, "invalid location string");
     }
+    auto trailing = parse_attributes();
+    apply_callable_attributes(parameter.type, trailing);
     return parameter;
 }
 
@@ -2310,23 +2473,13 @@ Parser::parse_function(SourceLocation location, std::string name,
     function->attributes.insert(function->attributes.end(),
                                 std::make_move_iterator(trailing.begin()),
                                 std::make_move_iterator(trailing.end()));
-    if (parsing_public_function_header_) return function;
-    if (consume(";")) return function;
-    if (!current().is("{")) {
-        error_here("expected ';' or function body");
-        synchronize_external();
-        return function;
-    }
-    auto* previous_function = active_function_;
-    active_function_ = function.get();
-    function->body = parse_compound();
-    active_function_ = previous_function;
+    // The containing declaration owns its separators or the function body.
     return function;
 }
 
 std::unique_ptr<ObjectDecl> Parser::parse_object(
     SourceLocation location, std::string name, TypePtr type, Linkage linkage,
-    std::vector<Attribute> attributes) {
+    std::vector<Attribute> attributes, bool consume_semicolon) {
     auto object = std::make_unique<ObjectDecl>();
     object->location = location;
     object->name = std::move(name);
@@ -2350,7 +2503,7 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
         diagnostics_.error(location,
                            "an omitted array bound requires an initializer");
     }
-    expect(";");
+    if (consume_semicolon) expect(";");
     return object;
 }
 
@@ -2370,10 +2523,17 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
     statement->declaration = std::make_unique<VariableDecl>();
     auto& declaration = *statement->declaration;
     declaration.location = current().location;
-    if (consume("register")) declaration.storage_register = true;
-    else if (consume("stack")) declaration.storage_stack = true;
-    else if (consume("static")) declaration.storage_static = true;
-    declaration.type = parse_type();
+    ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
+    if (current().is("register") || current().is("stack") || current().is("static")) {
+        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        if (consume("register")) declaration.storage_register = true;
+        else if (consume("stack")) declaration.storage_stack = true;
+        else if (consume("static")) declaration.storage_static = true;
+    }
+    declaration.type = parse_type(false);
+    specifiers.finish();
+    ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
+    ProductionScope item(*this, SyntaxProduction::InitDeclarator);
     std::optional<std::string> name;
     declaration.type =
         parse_declarator(std::move(declaration.type), name, false,
@@ -2382,6 +2542,11 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
     else {
         declaration.name = *name;
         if (!local_scopes_.empty()) local_scopes_.back().insert(name_key(declaration));
+    }
+    if (current().kind == TokenKind::String) {
+        ProductionScope location_production(*this, SyntaxProduction::ObjectLocation);
+        const auto* location = consume_kind(TokenKind::String);
+        declaration.location_name = decode_string_literal(location->text);
     }
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
@@ -2398,9 +2563,6 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         }
         // Target-dependent constants are resolved after HIR has completed
         // nominal layouts and before this local is lowered to MIR.
-    }
-    if (const auto* location = consume_kind(TokenKind::String)) {
-        declaration.location_name = decode_string_literal(location->text);
     }
     if (consume("=")) declaration.initializer = parse_initializer();
     if (declaration.type && declaration.type->kind == Type::Kind::Array &&
@@ -2421,6 +2583,8 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         diagnostics_.error(declaration.location,
                            "an omitted array bound requires a u8 string initializer");
     }
+    item.finish();
+    list.finish();
     if (consume_semicolon) expect(";");
     return statement;
 }

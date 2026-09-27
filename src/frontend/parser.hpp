@@ -7,6 +7,7 @@
 #include "frontend/syntax.hpp"
 
 #include <optional>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -23,6 +24,10 @@ public:
     // Parse a macro's braced body with the ordinary statement/expression
     // grammar, enabling translation-only token types and quotation.
     std::unique_ptr<Statement> parse_procedural_body();
+    // Read-only, bounded recognition using the same core grammar. The returned
+    // tree preserves source tokens; speculative state never escapes this call.
+    std::optional<SyntaxParsedFragment> parse_syntax_fragment(
+        SyntaxPatternElement::Kind kind, std::size_t first) const;
 
 private:
     const Token& current(std::size_t lookahead = 0) const;
@@ -39,8 +44,6 @@ private:
     bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
                                          std::string_view name_space,
                                          const std::vector<std::string>& imports) const;
-    std::optional<SyntaxParsedFragment> parse_syntax_fragment(
-        SyntaxPatternElement::Kind kind, std::size_t first) const;
     std::shared_ptr<const SyntaxNode> parse_opaque_invocation(SyntaxKind category);
     std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output,
                                                 Diagnostics* diagnostics = nullptr) const;
@@ -48,7 +51,7 @@ private:
     std::unique_ptr<Statement> parse_statement_replacement();
     std::unique_ptr<Expr> parse_expression_replacement();
 
-    std::vector<Attribute> parse_attributes();
+    std::vector<Attribute> parse_attributes(bool one_specifier = false);
     void apply_type_attributes(
         TypePtr& type,
         std::optional<std::pair<std::uint32_t, SourceLocation>>*
@@ -57,14 +60,14 @@ private:
         SyntaxProduction production = SyntaxProduction::QualifiedName);
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
-    TypePtr parse_type();
+    TypePtr parse_type(bool record_specifiers = true);
     TypePtr
     parse_declarator(TypePtr base, std::optional<std::string>& name,
                      bool parameter = false,
                      std::unique_ptr<Expr>* dynamic_outer_bound = nullptr,
                      SourceLocation* name_location = nullptr,
                      std::vector<FunctionDecl::GenericParameter>*
-                         angle_parameters = nullptr);
+                         angle_parameters = nullptr, bool abstract_only = false);
     std::vector<FunctionDecl::GenericParameter>
     parse_angle_generic_parameters();
     std::vector<std::string> preview_angle_generic_types() const;
@@ -97,7 +100,7 @@ private:
                        angle_parameters = {});
     std::unique_ptr<ObjectDecl> parse_object(
         SourceLocation location, std::string name, TypePtr type, Linkage linkage,
-        std::vector<Attribute> attributes);
+        std::vector<Attribute> attributes, bool consume_semicolon = true);
     ParameterDecl parse_parameter(unsigned ordinal);
 
     std::unique_ptr<Statement> parse_statement();
@@ -138,9 +141,12 @@ private:
         std::size_t event;
         ProductionScope(Parser& parser, SyntaxProduction production);
         ~ProductionScope();
+        void finish();
     };
     std::size_t begin_production(SyntaxProduction production);
     void end_production(std::size_t event);
+    void flatten_production(std::size_t event,
+        std::size_t parent = std::numeric_limits<std::size_t>::max());
     std::shared_ptr<const SyntaxNode> public_node(std::size_t event) const;
     void record_balanced_sequence(std::size_t first, std::size_t end);
 

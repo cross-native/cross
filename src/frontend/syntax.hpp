@@ -30,6 +30,12 @@ inline constexpr std::uint64_t syntax_field_storage_bytes = 128;
 
 enum class SyntaxProduction {
     None, Declaration, FunctionHeader, FunctionDefinition, TypeName,
+    DeclarationSpecifiers, DeclarationSpecifier, TypeQualifier, TypeSpecifier,
+    ScalarType, StructOrUnionSpecifier, EnumSpecifier, TypedefName, TargetScalarBuiltinName,
+    Declarator, AbstractDeclarator, DirectDeclarator, PointerPart,
+    FunctionSuffix, ParameterList, ParameterDeclaration, ParameterMode,
+    Location, ObjectLocation, ResultLocation, GenericParameterList, GenericParameter,
+    InitDeclaratorList, InitDeclarator, MemberDeclaration, MemberDeclarator, Enumerator,
     AttributeSpecifier, Attribute, AttributeName, BalancedTokenSequence,
     BalancedTokenTree, BalancedTokens, QualifiedName, NamespaceName,
     Statement, UnattributedStatement, CompoundStatement, UsingDeclaration,

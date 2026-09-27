@@ -73,6 +73,9 @@ TypePtr tokens_type();
 TypePtr syntax_match_type();
 TypePtr syntax_type();
 TypePtr span_type();
+// Copy a mutable type graph without sharing nested callable/element state.
+// Preserve graph sharing inside the copy, including any recursive edges.
+TypePtr copy_type(const TypePtr& type);
 std::span<const std::string_view> core_keyword_names();
 bool is_reserved_identifier(std::string_view name);
 TypePtr bytes_type();

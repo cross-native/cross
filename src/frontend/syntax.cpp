@@ -17,6 +17,12 @@ namespace cross {
 std::string_view syntax_production_name(SyntaxProduction production) {
     static constexpr std::string_view names[] = {
         "", "declaration", "function_header", "function_definition", "type_name",
+        "declaration_specifiers", "declaration_specifier", "type_qualifier", "type_specifier",
+        "scalar_type", "struct_or_union_specifier", "enum_specifier", "typedef_name", "target_scalar_builtin_name",
+        "declarator", "abstract_declarator", "direct_declarator", "pointer_part",
+        "function_suffix", "parameter_list", "parameter_declaration", "parameter_mode",
+        "location", "object_location", "result_location", "generic_parameter_list", "generic_parameter",
+        "init_declarator_list", "init_declarator", "member_declaration", "member_declarator", "enumerator",
         "attribute_specifier", "attribute", "attribute_name", "balanced_token_sequence",
         "balanced_token_tree", "balanced_tokens", "qualified_name", "namespace_name",
         "statement", "unattributed_statement", "compound_statement", "using_declaration",

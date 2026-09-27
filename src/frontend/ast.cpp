@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <sstream>
+#include <unordered_map>
 
 namespace cross {
 
@@ -32,6 +33,35 @@ TypePtr span_type() {
     auto type = std::make_shared<Type>();
     type->kind = Type::Kind::Span;
     return type;
+}
+
+TypePtr copy_type(const TypePtr& type) {
+    if (!type) return {};
+    std::unordered_map<const Type*, TypePtr> copies;
+    std::vector<std::pair<TypePtr, TypePtr>> pending;
+    const auto copy = [&](const TypePtr& source) -> TypePtr {
+        if (!source) return {};
+        const auto found = copies.find(source.get());
+        if (found != copies.end()) return found->second;
+        auto destination = std::make_shared<Type>(*source);
+        copies.emplace(source.get(), destination);
+        pending.emplace_back(source, destination);
+        return destination;
+    };
+    auto result = copy(type);
+    while (!pending.empty()) {
+        const auto [source, destination] = std::move(pending.back());
+        pending.pop_back();
+        destination->pointee = copy(source->pointee);
+        destination->element = copy(source->element);
+        if (source->function) {
+            destination->function = std::make_shared<FunctionType>(*source->function);
+            destination->function->result = copy(source->function->result);
+            for (auto& parameter : destination->function->parameters)
+                parameter.type = copy(parameter.type);
+        }
+    }
+    return result;
 }
 
 std::span<const std::string_view> core_keyword_names() {
