@@ -481,6 +481,137 @@ int main() {
                             0, P::TypeSpecifier, 1), 0, P::TypedefName, 1);
     child(alias, 0, P::QualifiedName, 3);
 
+    {
+        const auto* source = sources.add("bounded-parse-context.x",
+            "typedef u32 Word; static T identity<T>(in T value) { return value; } "
+            "[[syntax_expander]] static $::meta::tokens never_run(in $::meta::syntax_match input) "
+            "{ uptr invalid = 1uptr / 0uptr; return $::quote { 0u32 }; } "
+            "syntax Trap : expression { prefix \"trap\"; match body:paren; expand never_run; } syntax Trap;");
+        auto input = Lexer(*source, diagnostics).lex();
+        Parser owner(input, diagnostics, execution, 32);
+        const auto early_context = owner.syntax_context(input.front().location);
+        (void)owner.parse();
+        const auto saved_context = owner.syntax_context(input.front().location);
+        require(diagnostics.errors() == 0, "bounded parse context fixture failed");
+        const auto saved_parse = [&](std::string_view text, SyntaxParseCategory category,
+                                     const std::shared_ptr<const SyntaxContext>& context) {
+            const auto* saved_source = sources.add("saved-context-input.x", std::string(text));
+            return Parser::parse_syntax_tokens(category,
+                Lexer(*saved_source, diagnostics).lex(), context, diagnostics);
+        };
+        require(early_context && saved_context && early_context->parse_environment &&
+                saved_context->parse_environment, "parser context has no immutable environment");
+        require(!saved_parse("Word", SyntaxParseCategory::Type, early_context),
+                "later typedef mutated a saved parser environment");
+        require(saved_parse("Word", SyntaxParseCategory::Type, saved_context) != nullptr,
+                "saved parser environment lost its alias");
+        const auto complete = [&](std::string_view text, std::string_view category) -> Node {
+            const auto parsed_category = syntax_parse_category(category);
+            if (!parsed_category) return {};
+            const auto* fragment_source = sources.add("bounded-parse.x", std::string(text));
+            auto fragment_input = Lexer(*fragment_source, diagnostics).lex();
+            const auto count = fragment_input.size() - 1;
+            auto node = owner.parse_syntax_tokens(*parsed_category, fragment_input);
+            if (node) {
+                const auto projected = syntax_node_tokens(*node);
+                require(projected.size() == count, "bounded parse projected only a prefix");
+                for (std::size_t at = 0; at < count; ++at)
+                    require(projected[at].kind == fragment_input[at].kind &&
+                            projected[at].text == fragment_input[at].text,
+                            "bounded parse changed lexical tokens");
+            }
+            require(diagnostics.errors() == 0, "bounded parse leaked speculative diagnostics");
+            return node;
+        };
+        production(complete("identity<Word>(3u32)", "expr"), P::AssignmentExpression, 1);
+        production(complete("{ Word value = 3u32; }", "stmt"), P::Statement, 1);
+        production(complete("Word (*)(in Word value) -> \"arbitrary.result\" [[abi(\"custom\")]]", "type"),
+                   P::TypeName, 2);
+        production(complete("Word value = 3u32;", "declaration"), P::Declaration, 3);
+        production(complete("static Word fn(in Word value) -> \"stack.result\"", "function_header"),
+                   P::FunctionHeader, 2);
+        production(complete("static Word fn(in Word value) -> \"memory.result\";", "function_decl"),
+                   P::Declaration, 3);
+        production(complete("static Word fn(in Word value) { return value; }", "function_def"),
+                   P::FunctionDefinition, 3);
+        require(complete("trap ()", "expr") != nullptr,
+                "bounded parse tried to execute a nested invocation");
+        require(complete("typedef u16 Temporary;", "declaration") != nullptr,
+                "bounded typedef recognition failed");
+        require(!saved_parse("Temporary", SyntaxParseCategory::Type, saved_context),
+                "speculative declaration changed a saved context");
+        auto scoped = production(complete("{ typedef u16 Local; { typedef u32 Other; Other nested; } Local value; }",
+                                          "stmt"), P::Statement, 1);
+        auto scoped_block = child(child(scoped, 0, P::UnattributedStatement, 1),
+                                  0, P::CompoundStatement, 5);
+        const auto outer_context = scoped_block->children[3]->context;
+        auto inner_block = child(child(scoped_block->children[2], 0, P::UnattributedStatement, 1),
+                                 0, P::CompoundStatement, 4);
+        const auto inner_context = inner_block->children[2]->context;
+        require(saved_parse("Local", SyntaxParseCategory::Type, outer_context) &&
+                saved_parse("Other", SyntaxParseCategory::Type, inner_context) &&
+                !saved_parse("Other", SyntaxParseCategory::Type, outer_context) &&
+                !saved_parse("Local", SyntaxParseCategory::Type, scoped->context),
+                "public nodes did not preserve their lexical alias scopes");
+        require(syntax_node_storage(*scoped) > syntax_node_count(*scoped) * 128,
+                "public tree storage omitted context snapshots");
+        auto early_trap = saved_parse("trap ()", SyntaxParseCategory::Expression, early_context);
+        auto saved_trap = saved_parse("trap ()", SyntaxParseCategory::Expression, saved_context);
+        const auto has_extension = [](Node node) {
+            std::vector<Node> pending{std::move(node)};
+            while (!pending.empty()) {
+                auto next = std::move(pending.back()); pending.pop_back();
+                if (next->kind == SyntaxNode::Kind::Extension) return true;
+                pending.insert(pending.end(), next->children.begin(), next->children.end());
+            }
+            return false;
+        };
+        require(early_trap && saved_trap && !has_extension(early_trap) && has_extension(saved_trap),
+                "later activation changed a saved context or nested expander executed");
+        for (const auto& [text, category] : std::vector<std::pair<std::string_view, std::string_view>>{
+                 {"", "expr"}, {"1u32, 2u32", "expr"}, {"1u32;", "expr"},
+                 {"Word;", "type"}, {"Word value", "type"}, {"Temporary", "type"},
+                 {"; ;", "stmt"}, {"if (1u32) ; else ; ;", "stmt"},
+                 {"syntax Trap;", "stmt"}, {"namespace ns {}", "declaration"},
+                 {"Word first; Word second;", "declaration"}, {"Word fn();", "function_header"},
+                 {"Word fn() {}", "function_header"}, {"Word fn() {}", "function_decl"},
+                 {"Word fn();", "function_def"}, {"Word (*pointer)();", "function_decl"},
+                 {"Word value;", "function_decl"}, {"1u32", "expression"}})
+            require(!complete(text, category), "invalid bounded category/input was accepted");
+        require(complete("trap ()", "expr") != nullptr,
+                "rejected registration damaged existing syntax activation");
+        require(!owner.parse_syntax_tokens(SyntaxParseCategory::None, input),
+                "empty parse category was accepted");
+        auto missing_end = Lexer(*source, diagnostics).lex();
+        missing_end.pop_back();
+        require(!owner.parse_syntax_tokens(SyntaxParseCategory::Statement, missing_end),
+                "unbounded input without an End fence was accepted");
+    }
+
+    {
+        std::weak_ptr<SyntaxExecution> executor_lifetime;
+        std::shared_ptr<const SyntaxContext> retained_context;
+        {
+            auto isolated_execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 32,
+                no_layout, no_layout, EvaluationLimits{}, EvaluationLayout{});
+            executor_lifetime = isolated_execution;
+            const auto* source = sources.add("context-lifetime.x",
+                "typedef u16 Word; [[syntax_expander]] static $::meta::tokens expand "
+                "(in $::meta::syntax_match input) { return $::quote { 1u32 }; }");
+            auto input = Lexer(*source, diagnostics).lex();
+            Parser owner(input, diagnostics, isolated_execution, 32);
+            (void)owner.parse();
+            retained_context = owner.syntax_context(input.front().location);
+            require(diagnostics.errors() == 0, "context lifetime fixture failed");
+        }
+        require(retained_context && retained_context->parse_environment && executor_lifetime.expired(),
+                "immutable parser contexts created an executor ownership cycle");
+        const auto* fragment = sources.add("expired-context.x", "Word");
+        require(!Parser::parse_syntax_tokens(SyntaxParseCategory::Type,
+                    Lexer(*fragment, diagnostics).lex(), retained_context, diagnostics),
+                "expired compiler context fell back to ambient parser state");
+    }
+
     auto statement = production(parse("{ register u32 value \"chosen.register\" [[aligned(4)]] = 3u32; }",
                                      K::Statement), P::Statement, 1);
     auto block = child(child(statement, 0, P::UnattributedStatement, 1),

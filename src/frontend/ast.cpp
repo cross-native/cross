@@ -35,6 +35,12 @@ TypePtr span_type() {
     return type;
 }
 
+TypePtr context_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::Context;
+    return type;
+}
+
 TypePtr copy_type(const TypePtr& type) {
     if (!type) return {};
     std::unordered_map<const Type*, TypePtr> copies;
@@ -185,6 +191,7 @@ std::string type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::SyntaxMatch) return "$::meta::syntax_match";
     if (type->kind == Type::Kind::Syntax) return "$::meta::syntax";
     if (type->kind == Type::Kind::Span) return "$::meta::span";
+    if (type->kind == Type::Kind::Context) return "$::meta::context";
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     std::string prefix;
@@ -258,6 +265,7 @@ std::string canonical_type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::SyntaxMatch) return "$::meta::syntax_match";
     if (type->kind == Type::Kind::Syntax) return "$::meta::syntax";
     if (type->kind == Type::Kind::Span) return "$::meta::span";
+    if (type->kind == Type::Kind::Context) return "$::meta::context";
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     std::string result;
@@ -391,7 +399,8 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
                left->nominal_name == right->nominal_name;
     }
     if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
-        left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span || left->kind == Type::Kind::Bytes ||
+        left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span ||
+        left->kind == Type::Kind::Context || left->kind == Type::Kind::Bytes ||
         left->kind == Type::Kind::Buffer) return true;
     return left->builtin == right->builtin &&
            left->nominal_name == right->nominal_name;
@@ -467,7 +476,8 @@ unsigned type_bits(const TypePtr& type) {
     if (type->kind == Type::Kind::Pointer) return 64;
     if (type->kind == Type::Kind::Generic || type->kind == Type::Kind::Function ||
         type->kind == Type::Kind::Tokens || type->kind == Type::Kind::SyntaxMatch ||
-        type->kind == Type::Kind::Syntax || type->kind == Type::Kind::Span || type->kind == Type::Kind::Bytes ||
+        type->kind == Type::Kind::Syntax || type->kind == Type::Kind::Span ||
+        type->kind == Type::Kind::Context || type->kind == Type::Kind::Bytes ||
         type->kind == Type::Kind::Buffer)
         return 0;
     if (type->kind == Type::Kind::Vector) {

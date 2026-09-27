@@ -4,6 +4,7 @@
 #include "frontend/embed.hpp"
 #include "frontend/lexer.hpp"
 #include "frontend/procedural.hpp"
+#include "frontend/parser.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -270,7 +271,8 @@ std::vector<Token> SyntaxExecution::prepare(const SourceFile& source) {
 }
 
 bool SyntaxExecution::define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
-    const std::vector<std::string>& imports, const std::vector<SyntaxBinding>& bindings) {
+    const std::vector<std::string>& imports, const std::vector<SyntaxBinding>& bindings,
+    std::shared_ptr<const SyntaxParseEnvironment> environment) {
     auto function = parse_expansion_function(tokens, index, diagnostics_,
                                              address_bits_);
     if (!function) return false;
@@ -283,7 +285,7 @@ bool SyntaxExecution::define_function(const std::vector<Token>& tokens, std::siz
         diagnostics_.error(declaration.location, "expansion function is defined more than once: '" + declaration.name + "'");
         return false;
     }
-    functions_.push_back({std::move(declaration), function->syntax_expander, bindings});
+    functions_.push_back({std::move(declaration), function->syntax_expander, bindings, std::move(environment)});
     return true;
 }
 
@@ -343,22 +345,25 @@ void SyntaxExecution::tree_limit_error(SourceLocation location) {
 
 std::shared_ptr<const SyntaxContext> SyntaxExecution::call_context(SourceLocation location,
     std::string_view name_space, const std::vector<std::string>& imports,
-    const std::vector<SyntaxBinding>& bindings) const {
+    const std::vector<SyntaxBinding>& bindings,
+    std::shared_ptr<const SyntaxParseEnvironment> environment) const {
     auto context = std::make_shared<SyntaxContext>();
     context->invocation = location;
     context->name_space = name_space;
     context->imports = imports;
     context->syntax_bindings = bindings;
+    context->parse_environment = std::move(environment);
     return context;
 }
 
 std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     TokenSequence input, std::shared_ptr<const SyntaxMatchValue> match, SourceLocation invocation,
     std::string_view name_space, const std::vector<std::string>& imports,
-    const std::vector<SyntaxBinding>& bindings) {
+    const std::vector<SyntaxBinding>& bindings,
+    std::shared_ptr<const SyntaxParseEnvironment> environment) {
     if (id.value >= functions_.size()) return {};
     const auto& function = functions_[id.value];
-    const auto call = call_context(invocation, name_space, imports, bindings);
+    const auto call = call_context(invocation, name_space, imports, bindings, std::move(environment));
     const auto attach = [&](TokenSequence& tokens) {
         for (auto& token : tokens) if (!token.origin.context) token.origin.context = call;
     };
@@ -375,6 +380,7 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     };
     contextualize_match = [&](const SyntaxMatchValue& source) -> std::shared_ptr<const SyntaxMatchValue> {
         auto value = std::make_shared<SyntaxMatchValue>(source);
+        if (!value->context) value->context = call;
         attach(value->input);
         for (auto& field : value->fields) {
             attach(field.tokens);
@@ -393,11 +399,16 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     definition->name_space = function.declaration.source_namespace;
     definition->imports = function.declaration.imports;
     definition->syntax_bindings = function.bindings;
+    definition->parse_environment = function.environment;
+    const SyntaxParseCallback parse = [&](SyntaxParseCategory category, const TokenSequence& tokens,
+        std::shared_ptr<const SyntaxContext> context, SourceLocation location) {
+        return parse_tokens(category, tokens, std::move(context), location);
+    };
     auto output = function.syntax_expander
         ? evaluate_syntax_body(function.declaration, std::move(match), address_bits_, size_of_, align_of_,
-                               definition, diagnostics_, limits_, layout_)
+                               definition, diagnostics_, limits_, layout_, parse)
         : evaluate_procedural_body(function.declaration, input, address_bits_, size_of_, align_of_,
-                                   definition, diagnostics_, limits_, layout_);
+                                   definition, diagnostics_, limits_, layout_, parse);
     if (!output) {
         diagnostics_.note(function.declaration.location, "expansion function is defined here");
         diagnostics_.note(invocation, "while expanding '" + function.declaration.name + "'");
@@ -427,6 +438,38 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     return Output{std::move(tokens), {source, 0, 1, 1}};
 }
 
+std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCategory category,
+    const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
+    SourceLocation location) {
+    if (!context || !context->parse_environment) return {};
+    std::string text;
+    std::vector<SourceTokenOrigin> origins;
+    for (const auto& token : input) {
+        if (!work(location)) return {};
+        if (token.kind == TokenKind::End || token.kind == TokenKind::Invalid ||
+            token.text.empty() || token.text.find('\0') != std::string::npos ||
+            token.text.size() + 1 > limits_.bytes - std::min<std::uint64_t>(text.size(), limits_.bytes)) return {};
+        const auto begin = text.size();
+        text += token.text;
+        auto origin = token.origin;
+        // Explicit-context parsing changes lookup, not identity or source span.
+        origin.context = context;
+        origins.push_back({begin, text.size(), std::move(origin)});
+        text += ' ';
+    }
+    const auto size = text.size();
+    const auto* source = sources_.add("<meta::parse>", std::move(text),
+        {{0, size, "$::meta::parse", location, context->definition}}, std::move(origins));
+    auto tokens = Lexer(*source, diagnostics_).lex();
+    if (tokens.size() != input.size() + 1) return {};
+    for (std::size_t at = 0; at < input.size(); ++at) {
+        if (tokens[at].kind != input[at].kind || tokens[at].text != input[at].text) return {};
+        tokens[at].split_source = input[at].split_source;
+        tokens[at].split_offset = input[at].split_offset;
+    }
+    return Parser::parse_syntax_tokens(category, std::move(tokens), std::move(context), diagnostics_);
+}
+
 std::optional<MetaToken> SyntaxExecution::terminal(std::string_view quoted, SourceLocation location) {
     const auto decoded = decode_string_literal(quoted);
     if (!decoded || decoded->empty() || decoded->size() > limits_.bytes || decoded->find('\0') != std::string::npos) {
@@ -446,6 +489,10 @@ std::optional<MetaToken> SyntaxExecution::terminal(std::string_view quoted, Sour
 
 SyntaxState::SyntaxState(std::shared_ptr<SyntaxExecution> execution)
     : execution_(std::move(execution)), definitions_(std::make_shared<std::vector<SyntaxDefinition>>()) {}
+
+SyntaxState::SyntaxState(const SyntaxState& snapshot, std::shared_ptr<SyntaxExecution> execution)
+    : execution_(std::move(execution)), definitions_(snapshot.definitions_),
+      imports_(snapshot.imports_), scopes_(snapshot.scopes_) {}
 
 void SyntaxState::push_scope() { scopes_.emplace_back(); imports_.emplace_back(); }
 void SyntaxState::pop_scope() { scopes_.pop_back(); imports_.pop_back(); }
@@ -1016,6 +1063,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         for (auto& candidate : active) {
             auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
             value->span = span(first, candidate.end);
+            value->context = token_origin(tokens[first].location).context;
             if (!copy_tokens(value->input, first, candidate.end)) { failed = true; return {}; }
             candidate.value = std::move(value);
         }

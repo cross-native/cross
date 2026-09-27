@@ -26,6 +26,7 @@ struct SyntaxSpan {
 
 // Logical evaluator accounting, independent of host/target runtime layout.
 inline constexpr std::uint64_t syntax_span_storage_bytes = 64;
+inline constexpr std::uint64_t syntax_context_handle_storage_bytes = 32;
 inline constexpr std::uint64_t syntax_match_storage_bytes = 192;
 inline constexpr std::uint64_t syntax_field_storage_bytes = 128;
 
@@ -58,6 +59,9 @@ enum class SyntaxParseCategory {
     None, Expression, Statement, Type, Declaration,
     FunctionHeader, FunctionDeclaration, FunctionDefinition,
 };
+std::optional<SyntaxParseCategory> syntax_parse_category(std::string_view name);
+std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment& environment);
+std::uint64_t syntax_context_storage(const SyntaxContext& context);
 
 // The public, versioned tree is independent of typed AST/HIR. Every node
 // owns its lexical identity and remains immutable after construction.
@@ -105,6 +109,7 @@ struct SyntaxMatchValue {
     std::optional<std::string> variant;
     std::vector<std::string> variant_labels;
     SyntaxSpan span;
+    std::shared_ptr<const SyntaxContext> context;
 };
 
 struct SyntaxFunctionId { std::uint32_t value{}; };
@@ -162,7 +167,8 @@ public:
     std::vector<Token> prepare(const SourceFile& source);
     bool define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
                           const std::vector<std::string>& imports,
-                          const std::vector<SyntaxBinding>& bindings);
+                          const std::vector<SyntaxBinding>& bindings,
+                          std::shared_ptr<const SyntaxParseEnvironment> environment = {});
     std::optional<FunctionId> find_function(std::string_view name, std::string_view name_space,
                                           const std::vector<std::vector<std::string>>& imports,
                                           bool syntax_expander) const;
@@ -173,7 +179,8 @@ public:
     std::optional<Output> expand(FunctionId function, TokenSequence input,
         std::shared_ptr<const SyntaxMatchValue> match, SourceLocation invocation,
         std::string_view name_space, const std::vector<std::string>& imports,
-        const std::vector<SyntaxBinding>& bindings);
+        const std::vector<SyntaxBinding>& bindings,
+        std::shared_ptr<const SyntaxParseEnvironment> environment = {});
     bool begin_replacement(SourceLocation location);
     void end_replacement();
     bool begin_fragment(SourceLocation location, std::size_t copied_tokens);
@@ -182,7 +189,11 @@ public:
     bool work(SourceLocation location, std::uint64_t amount = 1);
     std::shared_ptr<const SyntaxContext> call_context(SourceLocation location,
         std::string_view name_space, const std::vector<std::string>& imports,
-        const std::vector<SyntaxBinding>& bindings) const;
+        const std::vector<SyntaxBinding>& bindings,
+        std::shared_ptr<const SyntaxParseEnvironment> environment = {}) const;
+    std::shared_ptr<const SyntaxNode> parse_tokens(SyntaxParseCategory category,
+        const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
+        SourceLocation location);
     const EvaluationLimits& limits() const { return limits_; }
     std::optional<MetaToken> terminal(std::string_view quoted, SourceLocation location);
 private:
@@ -190,6 +201,7 @@ private:
         FunctionDecl declaration;
         bool syntax_expander{};
         std::vector<SyntaxBinding> bindings;
+        std::shared_ptr<const SyntaxParseEnvironment> environment;
     };
     SourceManager& sources_;
     Diagnostics& diagnostics_;
@@ -209,6 +221,7 @@ private:
 class SyntaxState {
 public:
     explicit SyntaxState(std::shared_ptr<SyntaxExecution> execution);
+    SyntaxState(const SyntaxState& snapshot, std::shared_ptr<SyntaxExecution> execution);
     void push_scope();
     void pop_scope();
     void import(std::string name);

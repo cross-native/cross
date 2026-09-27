@@ -13,6 +13,7 @@
 namespace cross {
 
 struct SourceFile;
+struct SyntaxParseEnvironment;
 
 struct SourceLocation {
     const SourceFile* file{};
@@ -57,6 +58,9 @@ struct SyntaxContext {
         bool operator==(const Binding&) const = default;
     };
     std::vector<Binding> syntax_bindings;
+    // Opaque frontend snapshot. Common source/provenance code does not know
+    // parser tables or source-language types.
+    std::shared_ptr<const SyntaxParseEnvironment> parse_environment;
 };
 
 struct EmbedSnapshot {

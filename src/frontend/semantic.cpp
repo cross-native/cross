@@ -147,6 +147,8 @@ TypePtr clone_type(const TypePtr& source,
         result = syntax_type();
     } else if (source->kind == Type::Kind::Span) {
         result = span_type();
+    } else if (source->kind == Type::Kind::Context) {
+        result = context_type();
     } else if (source->kind == Type::Kind::Bytes) {
         result = bytes_type();
     } else if (source->kind == Type::Kind::Buffer) {
@@ -2173,6 +2175,7 @@ struct EvalValue {
     std::shared_ptr<const SyntaxMatchValue> syntax_match;
     std::shared_ptr<const SyntaxNode> syntax_node;
     std::optional<SyntaxSpan> syntax_span;
+    std::shared_ptr<const SyntaxContext> syntax_context;
     std::shared_ptr<const std::string> bytes;
     std::size_t byte_offset{};
     std::size_t byte_length{};
@@ -2622,7 +2625,8 @@ public:
               const LayoutQuery* size_of = nullptr,
               const LayoutQuery* align_of = nullptr,
               const GenericPointerResolver* pointer_resolver = nullptr,
-              std::shared_ptr<const SyntaxContext> macro_context = {})
+              std::shared_ptr<const SyntaxContext> macro_context = {},
+              SyntaxParseCallback syntax_parse = {})
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller),
           current_namespace_(std::move(current_namespace)),
@@ -2632,13 +2636,15 @@ public:
               (program.evaluation_align_of ? &program.evaluation_align_of : nullptr)),
           pointer_resolver_(pointer_resolver ? pointer_resolver :
               (program.evaluation_pointer_resolver ? &program.evaluation_pointer_resolver : nullptr)),
-          procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)) {}
+          procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)),
+          syntax_parse_(std::move(syntax_parse)) {}
 
     bool charge_input_tokens(const TokenSequence& tokens, SourceLocation location) {
         constexpr std::size_t metadata_cost = 128;
         std::size_t size = 0;
         const auto byte_limit = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         for (const auto& token : tokens) {
+            if (!charge_input_context(token.origin.context, location)) return false;
             if (size > byte_limit || token.text.size() > byte_limit - size ||
                 metadata_cost > byte_limit - size - token.text.size()) {
                 fail(location, "translation-time token input budget exceeded " +
@@ -2651,7 +2657,8 @@ public:
     }
 
     bool charge_input_match(const SyntaxMatchValue& match, SourceLocation location) {
-        if (!charge_meta_bytes(syntax_match_storage_bytes, location) || !charge_input_tokens(match.input, location)) return false;
+        if (!charge_input_context(match.context, location) ||
+            !charge_meta_bytes(syntax_match_storage_bytes, location) || !charge_input_tokens(match.input, location)) return false;
         if (match.variant && !charge_meta_bytes(32 + match.variant->size(), location)) return false;
         for (const auto& label : match.variant_labels)
             if (!charge_meta_bytes(32 + label.size(), location)) return false;
@@ -2968,6 +2975,7 @@ public:
                          type->kind == Type::Kind::SyntaxMatch ||
                          type->kind == Type::Kind::Syntax ||
                          type->kind == Type::Kind::Span ||
+                         type->kind == Type::Kind::Context ||
                          type->kind == Type::Kind::Bytes ||
                          type->kind == Type::Kind::Buffer)) {
                 fail(expression.location, type_name(type) + " has no runtime size or alignment");
@@ -3030,11 +3038,25 @@ public:
     }
 
 private:
+    bool charge_input_context(const std::shared_ptr<const SyntaxContext>& context, SourceLocation location) {
+        if (!context || !charged_contexts_.insert(context.get()).second) return true;
+        auto size = syntax_context_storage(*context);
+        if (context->parse_environment &&
+            !charged_environments_.insert(context->parse_environment.get()).second)
+            size -= syntax_environment_storage(*context->parse_environment);
+        if (size > program_.evaluation_limits.bytes) {
+            fail(location, "translation-time syntax context byte budget exceeded");
+            return false;
+        }
+        return charge_meta_bytes(static_cast<std::size_t>(size), location);
+    }
+
     static bool contains_tokens(const TypePtr& type) {
         return type && (type->kind == Type::Kind::Tokens ||
             type->kind == Type::Kind::SyntaxMatch ||
             type->kind == Type::Kind::Syntax ||
             type->kind == Type::Kind::Span ||
+            type->kind == Type::Kind::Context ||
             contains_tokens(type->pointee) || contains_tokens(type->element) ||
             (type->function && (contains_tokens(type->function->result) ||
                 std::any_of(type->function->parameters.begin(), type->function->parameters.end(),
@@ -3055,6 +3077,19 @@ private:
         if (!charge_meta_bytes(syntax_span_storage_bytes, location)) return std::nullopt;
         EvalValue value{UInt128{}, span_type()};
         value.syntax_span = std::move(span);
+        return value;
+    }
+
+    std::optional<EvalValue> context_value(std::shared_ptr<const SyntaxContext> context,
+                                         SourceLocation location) {
+        if (!context) {
+            fail(location, "syntax value has no retained lookup context");
+            return std::nullopt;
+        }
+        if (!charge_meta_bytes(syntax_context_handle_storage_bytes, location))
+            return std::nullopt;
+        EvalValue value{UInt128{}, context_type()};
+        value.syntax_context = std::move(context);
         return value;
     }
 
@@ -3353,7 +3388,7 @@ private:
                 const auto type = node.type ? node.type
                     : node.left ? expression_type(*node.left, false) : nullptr;
                 if (!type || contains_tokens(type)) {
-                    fail(node.location, "layout query requires a runtime object type, not tokens or syntax matches");
+                    fail(node.location, "layout query requires a runtime object type, not translation-only meta values");
                     return false;
                 }
             }
@@ -3385,7 +3420,8 @@ private:
             if (name.starts_with("$::syntax::")) {
                 const bool diagnostic = name == "$::syntax::error" ||
                     name == "$::syntax::warning" || name == "$::syntax::note";
-                const auto count = name == "$::syntax::input" || name == "$::syntax::span" ? 1U
+                const bool context = name == "$::syntax::context";
+                const auto count = name == "$::syntax::input" || name == "$::syntax::span" || context ? 1U
                     : name == "$::syntax::capture" || name == "$::syntax::node" ||
                       name == "$::syntax::count" ||
                       name == "$::syntax::is_variant" || name == "$::syntax::capture_span" || diagnostic ? 2U
@@ -3398,11 +3434,15 @@ private:
                     if (!validate_required_tree(*argument)) return false;
                 const auto first = expression_type(*node.arguments[0]);
                 const auto field = count > 1 ? expression_type(*node.arguments[1]) : nullptr;
-                if (!first || first->kind != (diagnostic ? Type::Kind::Span : Type::Kind::SyntaxMatch) ||
+                const bool valid_first = first && (context
+                    ? first->kind == Type::Kind::SyntaxMatch || first->kind == Type::Kind::Syntax
+                    : first->kind == (diagnostic ? Type::Kind::Span : Type::Kind::SyntaxMatch));
+                if (!valid_first ||
                     (count > 1 && (!field || field->kind != Type::Kind::Pointer || !field->pointee ||
                                   field->pointee->builtin != BuiltinType::U8)) ||
                     (count > 2 && !is_integer(expression_type(*node.arguments[2])))) {
-                    fail(node.location, diagnostic ? "syntax diagnostic requires a span and string message"
+                    fail(node.location, context ? "$::syntax::context requires a syntax match or node"
+                        : diagnostic ? "syntax diagnostic requires a span and string message"
                         : "syntax operation requires a match, string field, and integer index as applicable");
                     return false;
                 }
@@ -3536,18 +3576,22 @@ private:
                 return false;
             }
             if (procedural_ && node.left->text == "$::meta::parse") {
-                if (node.arguments.size() != 1U) {
-                    fail(node.location, "$::meta::parse requires one string argument");
+                if (node.arguments.size() != 1U && node.arguments.size() != 3U) {
+                    fail(node.location, "$::meta::parse requires a string or category, tokens, and context");
                     return false;
                 }
-                for (const auto& argument : node.arguments) {
+                for (std::size_t at = 0; at < node.arguments.size(); ++at) {
+                    const auto& argument = node.arguments[at];
                     if (!validate_required_tree(*argument)) return false;
                     const auto type = expression_type(*argument);
                     const bool string = type && type->kind == Type::Kind::Pointer &&
                         type->pointee && type->pointee->kind == Type::Kind::Builtin &&
                         type->pointee->builtin == BuiltinType::U8;
-                    if (!string) {
-                        fail(argument->location, "$::meta::parse requires a translation-time string");
+                    if (at == 0 ? !string : !type || type->kind !=
+                        (at == 1 ? Type::Kind::Tokens : Type::Kind::Context)) {
+                        fail(argument->location, node.arguments.size() == 1U
+                            ? "$::meta::parse requires a translation-time string"
+                            : "$::meta::parse requires a string or category string, tokens, and context");
                         return false;
                     }
                 }
@@ -3685,8 +3729,9 @@ private:
                 const auto no = expression_type(*node.third);
                 if (yes && no && yes->kind == no->kind &&
                     (yes->kind == Type::Kind::Tokens || yes->kind == Type::Kind::SyntaxMatch ||
-                     yes->kind == Type::Kind::Syntax || yes->kind == Type::Kind::Span)) {
-                    if (is_integer(condition) || is_floating(condition)) return true;
+                     yes->kind == Type::Kind::Syntax || yes->kind == Type::Kind::Span ||
+                     yes->kind == Type::Kind::Context)) {
+                    if (is_scalar(condition)) return true;
                     fail(node.location, "procedural macro condition must be scalar");
                     return false;
                 }
@@ -3764,6 +3809,8 @@ private:
             return from->kind == to->kind;
         if (from->kind == Type::Kind::Span || to->kind == Type::Kind::Span)
             return from->kind == to->kind;
+        if (from->kind == Type::Kind::Context || to->kind == Type::Kind::Context)
+            return from->kind == to->kind;
         if ((is_integer(from) || is_floating(from)) && (is_integer(to) || is_floating(to)))
             return true;
         return from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Pointer &&
@@ -3800,9 +3847,10 @@ private:
                       type->kind == Type::Kind::SyntaxMatch ||
                       type->kind == Type::Kind::Syntax ||
                       type->kind == Type::Kind::Span ||
+                      type->kind == Type::Kind::Context ||
                       (type->kind == Type::Kind::Pointer && type->pointee &&
                        type->pointee->kind == Type::Kind::Builtin && type->pointee->builtin == BuiltinType::U8))) {
-                    fail(node.location, "procedural macro locals require ordinary scalar, string-pointer, or token cells without runtime storage qualifiers");
+                    fail(node.location, "procedural macro locals require ordinary scalar, string-pointer, or translation-only meta cells without runtime storage qualifiers");
                     return false;
                 }
                 if (scopes_.back().contains(name_key(declaration))) {
@@ -3834,7 +3882,7 @@ private:
             if (node.condition) {
                 if (!validate_required_tree(*node.condition)) return false;
                 const auto type = expression_type(*node.condition);
-                if (!is_integer(type) && (node.kind == Statement::Kind::Switch || !is_floating(type))) {
+                if (node.kind == Statement::Kind::Switch ? !is_integer(type) : !is_scalar(type)) {
                     fail(node.condition->location, "procedural macro condition must be scalar (integer for switch)");
                     return false;
                 }
@@ -3998,7 +4046,8 @@ private:
                 return builtin_type(BuiltinType::Bool);
             if (procedural_ && conditional && left->kind == right->kind &&
                 (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
-                 left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span)) {
+                 left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span ||
+                 left->kind == Type::Kind::Context)) {
                 auto result = clone_type(left);
                 result->is_const = false;
                 return result;
@@ -4048,6 +4097,7 @@ private:
             if (procedural_ && (expression.left->text == "$::syntax::at" ||
                 expression.left->text == "$::meta::extension_match")) return syntax_match_type();
             if (procedural_ && expression.left->text == "$::syntax::node") return syntax_type();
+            if (procedural_ && expression.left->text == "$::syntax::context") return context_type();
             if (procedural_ && (expression.left->text == "$::syntax::span" ||
                 expression.left->text == "$::syntax::capture_span" ||
                 expression.left->text == "$::meta::node_span")) return span_type();
@@ -4096,7 +4146,7 @@ private:
                     ? builtin_type(BuiltinType::U8) : sequence;
             }
             if (procedural_ && expression.left->text == "$::meta::parse")
-                return tokens_type();
+                return expression.arguments.size() == 3U ? syntax_type() : tokens_type();
             if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
                 expression.arguments.size() == 1) return expression_type(*expression.arguments.front());
             if (const auto* callee = resolve_function(program_, current_function_, *expression.left,
@@ -4379,6 +4429,15 @@ private:
         if (value.syntax_span || type->kind == Type::Kind::Span) {
             if (!procedural_ || !value.syntax_span || type->kind != Type::Kind::Span) {
                 fail(location, "syntax spans cannot convert to runtime or other meta values");
+                return std::nullopt;
+            }
+            value.type = clone_type(type);
+            return value;
+        }
+        if (value.syntax_context || type->kind == Type::Kind::Context ||
+            (value.type && value.type->kind == Type::Kind::Context)) {
+            if (!procedural_ || !value.syntax_context || type->kind != Type::Kind::Context) {
+                fail(location, "syntax contexts cannot convert to runtime or other meta values");
                 return std::nullopt;
             }
             value.type = clone_type(type);
@@ -6325,7 +6384,8 @@ private:
         }
         if (expression.left->text.starts_with("$::syntax::")) {
             const auto& name = expression.left->text;
-            const auto count = name == "$::syntax::input" || name == "$::syntax::span" ? 1U
+            const bool context = name == "$::syntax::context";
+            const auto count = name == "$::syntax::input" || name == "$::syntax::span" || context ? 1U
                 : name == "$::syntax::capture" || name == "$::syntax::node" ||
                   name == "$::syntax::count" ||
                   name == "$::syntax::is_variant" || name == "$::syntax::capture_span" ? 2U
@@ -6335,6 +6395,14 @@ private:
                 return std::nullopt;
             }
             auto match = this->expression(*expression.arguments[0]);
+            if (context) {
+                if (match && match->syntax_match)
+                    return context_value(match->syntax_match->context, expression.location);
+                if (match && match->syntax_node)
+                    return context_value(match->syntax_node->context, expression.location);
+                fail(expression.location, "$::syntax::context requires a syntax match or node");
+                return std::nullopt;
+            }
             if (!match || !match->syntax_match) {
                 fail(expression.location, "syntax operation requires a syntax match");
                 return std::nullopt;
@@ -6536,6 +6604,41 @@ private:
             return EvalValue{UInt128{node.kind == found->second}, builtin_type(BuiltinType::Bool)};
         }
         if (procedural_ && expression.left->text == "$::meta::parse") {
+            if (expression.arguments.size() == 3U) {
+                auto category = this->expression(*expression.arguments[0]);
+                auto input = this->expression(*expression.arguments[1]);
+                auto context = this->expression(*expression.arguments[2]);
+                if (!category || !category->string || category->offset >= category->string->size() ||
+                    !input || !input->tokens || !context || !context->syntax_context) {
+                    fail(expression.location, "$::meta::parse requires a category string, tokens, and context");
+                    return std::nullopt;
+                }
+                const auto written = std::string_view(*category->string).substr(category->offset,
+                    category->string->size() - category->offset - 1);
+                const auto selected = syntax_parse_category(written);
+                if (!selected) {
+                    fail(expression.arguments[0]->location, "invalid public syntax parse category: '" + std::string(written) + "'");
+                    return std::nullopt;
+                }
+                if (!syntax_parse_) {
+                    fail(expression.location, "public syntax parsing is unavailable in this translation context");
+                    return std::nullopt;
+                }
+                auto node = syntax_parse_(*selected, *input->tokens, context->syntax_context, expression.location);
+                if (!node) {
+                    fail(expression.location, "$::meta::parse could not recognize complete bounded input for '" + std::string(written) + "'");
+                    return std::nullopt;
+                }
+                const auto storage = syntax_node_storage(*node, program_.evaluation_limits.memory);
+                if (storage > program_.evaluation_limits.bytes) {
+                    fail(expression.location, "public syntax parse output byte budget exceeded");
+                    return std::nullopt;
+                }
+                if (!charge_meta_bytes(static_cast<std::size_t>(storage), expression.location)) return std::nullopt;
+                EvalValue value{UInt128{}, syntax_type()};
+                value.syntax_node = std::move(node);
+                return value;
+            }
             if (expression.arguments.size() != 1U) {
                 fail(expression.location, "$::meta::parse requires one string argument");
                 return std::nullopt;
@@ -7146,6 +7249,9 @@ private:
     const GenericPointerResolver* pointer_resolver_{};
     bool procedural_{};
     std::shared_ptr<const SyntaxContext> macro_context_;
+    SyntaxParseCallback syntax_parse_;
+    std::unordered_set<const SyntaxContext*> charged_contexts_;
+    std::unordered_set<const SyntaxParseEnvironment*> charged_environments_;
     std::size_t token_bytes_{};
     std::size_t meta_bytes_{};
     std::unordered_set<const std::string*> counted_asset_backings_;
@@ -8935,14 +9041,14 @@ std::optional<TokenSequence> evaluate_procedural_body(
     const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
-    EvaluationLimits limits, EvaluationLayout layout) {
+    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse) {
     Program context;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
     context.evaluation_layout = layout;
     const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &macro, macro.source_namespace,
-                        &size_of, &align_of, nullptr, std::move(macro_context));
+                        &size_of, &align_of, nullptr, std::move(macro_context), parse);
     if (!evaluator.charge_input_tokens(input, invocation)) {
         evaluator.diagnose(invocation);
         return std::nullopt;
@@ -8966,14 +9072,14 @@ std::optional<TokenSequence> evaluate_syntax_body(
     const FunctionDecl& function, std::shared_ptr<const SyntaxMatchValue> input,
     unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
-    EvaluationLimits limits, EvaluationLayout layout) {
+    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse) {
     Program context;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
     context.evaluation_layout = layout;
     const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &function, function.source_namespace,
-                        &size_of, &align_of, nullptr, std::move(macro_context));
+                        &size_of, &align_of, nullptr, std::move(macro_context), parse);
     if (!input || !evaluator.charge_input_match(*input, invocation) ||
         !evaluator.validate_procedural_body(function)) {
         evaluator.diagnose(invocation);

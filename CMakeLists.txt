@@ -104,6 +104,7 @@ add_library(cross_frontend
     src/frontend/embed.cpp
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
+    src/frontend/parser_context.cpp
     src/frontend/preprocessor.cpp
     src/frontend/preprocessor_expression.cpp
     src/frontend/procedural.cpp
@@ -2395,6 +2396,10 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-span-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_spans.cmake")
+    add_test(NAME cross_syntax_context_checks
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-context-checks
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_contexts.cmake")
     add_test(NAME cross_syntax_deferred_checks
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-deferred-checks

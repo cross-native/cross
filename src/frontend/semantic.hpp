@@ -40,20 +40,26 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
 using LayoutQuery =
     std::function<std::optional<std::uint64_t>(const TypePtr&)>;
 
+struct SyntaxNode;
+enum class SyntaxParseCategory;
+using SyntaxParseCallback = std::function<std::shared_ptr<const SyntaxNode>(
+    SyntaxParseCategory, const TokenSequence&, std::shared_ptr<const SyntaxContext>, SourceLocation)>;
+
 // Mandatory macro execution shares the bounded target-scalar evaluator.
 // Token values remain translation-only and cannot enter runtime lowering.
 std::optional<TokenSequence> evaluate_procedural_body(
     const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
-    EvaluationLimits limits = {}, EvaluationLayout layout = {});
+    EvaluationLimits limits = {}, EvaluationLayout layout = {},
+    const SyntaxParseCallback& parse = {});
 
 struct SyntaxMatchValue;
 std::optional<TokenSequence> evaluate_syntax_body(
     const FunctionDecl& function, std::shared_ptr<const SyntaxMatchValue> input,
     unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
-    EvaluationLimits limits, EvaluationLayout layout);
+    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse = {});
 
 // Static assertions are retained until target HIR has established nominal
 // layouts.  The callbacks keep target layout ownership out of the frontend.

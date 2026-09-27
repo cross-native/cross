@@ -295,6 +295,8 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
     const auto& name_space = origin.context ? origin.context->name_space : active_namespace_;
     const auto& imports = origin.context ? origin.context->imports : active_imports_;
     const auto bindings = origin.context ? origin.context->syntax_bindings : syntax_->bindings();
+    const auto context = syntax_context(location);
+    if (!context) { ++index_; synchronize_external(); return {}; }
     auto execution = syntax_->execution();
     if (macro_start()) {
         auto name = parse_qualified_name();
@@ -331,7 +333,8 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
             diagnostics_.error(location, "procedural macro is not visible: '" + *name + "'");
             return {};
         }
-        return execution->expand(*function, std::move(input), {}, location, name_space, imports, bindings);
+        return execution->expand(*function, std::move(input), {}, location, name_space, imports, bindings,
+                                 context->parse_environment);
     }
     const auto* definition = active_syntax(item);
     if (!definition) return {};
@@ -343,7 +346,8 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
         });
     if (!matched) { ++index_; synchronize_external(); return {}; }
     index_ = matched->end;
-    return execution->expand(matched->expander, {}, matched->value, location, name_space, imports, bindings);
+    return execution->expand(matched->expander, {}, matched->value, location, name_space, imports, bindings,
+                             context->parse_environment);
 }
 
 bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body_open,
@@ -424,7 +428,18 @@ std::size_t Parser::begin_production(SyntaxProduction production) {
         return std::numeric_limits<std::size_t>::max();
     }
     const auto event = production_events_.size();
-    production_events_.push_back({production, index_, index_, {}, {}});
+    // Reuse environments inside a core unit. Subsequent units capture the
+    // lexical state after preceding declarations/imports have changed it.
+    const bool boundary = production_stack_.empty() ||
+        production == SyntaxProduction::Statement || production == SyntaxProduction::Declaration ||
+        production == SyntaxProduction::FunctionHeader || production == SyntaxProduction::TypeName;
+    auto context = boundary ? syntax_context(current().location)
+        : production_events_[production_stack_.back()].context;
+    if (!context) {
+        public_tree_failed_ = true;
+        return std::numeric_limits<std::size_t>::max();
+    }
+    production_events_.push_back({production, index_, index_, {}, {}, std::move(context)});
     if (!production_stack_.empty())
         production_events_[production_stack_.back()].children.push_back(event);
     production_stack_.push_back(event);
@@ -465,11 +480,12 @@ std::shared_ptr<const SyntaxNode> Parser::public_node(std::size_t event) const {
     node->span = {token_origin(tokens_[source.first].location).span,
                   token_origin(tokens_[source.end == source.first ? source.first
                       : source.end - 1].location).span};
-    node->context = token_origin(tokens_[source.first].location).context;
+    node->context = source.context;
     const auto token_node = [&](std::size_t at) -> std::shared_ptr<const SyntaxNode> {
         auto leaf = std::make_shared<SyntaxNode>();
         leaf->kind = SyntaxNode::Kind::Token;
         leaf->tokens.emplace_back(tokens_[at]);
+        if (!leaf->tokens.front().origin.context) leaf->tokens.front().origin.context = source.context;
         leaf->span = {leaf->tokens.front().origin.span, leaf->tokens.front().origin.span};
         leaf->context = leaf->tokens.front().origin.context;
         return leaf;
@@ -649,6 +665,33 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         return {};
     }
     return SyntaxParsedFragment{child->public_input_indices_[child->index_], std::move(node)};
+}
+
+std::shared_ptr<const SyntaxNode> Parser::parse_syntax_tokens(
+    SyntaxParseCategory category, std::vector<Token> input) const {
+    using C = SyntaxParseCategory;
+    using K = SyntaxPatternElement::Kind;
+    K kind;
+    switch (category) {
+    case C::Expression: kind = K::Expr; break;
+    case C::Statement: kind = K::Statement; break;
+    case C::Type: kind = K::Type; break;
+    case C::Declaration: kind = K::Declaration; break;
+    case C::FunctionHeader: kind = K::FunctionHeader; break;
+    case C::FunctionDeclaration: kind = K::FunctionDeclaration; break;
+    case C::FunctionDefinition: kind = K::FunctionDefinition; break;
+    case C::None: return {};
+    default: return {};
+    }
+    if (input.size() < 2 || input.back().kind != TokenKind::End ||
+        std::any_of(input.begin(), input.end() - 1,
+                    [](const Token& token) { return token.kind == TokenKind::End; })) return {};
+    const auto end = input.size() - 1;
+    const auto location = input.front().location;
+    auto child = replacement_parser({std::move(input), location});
+    const auto fragment = child->parse_syntax_fragment(kind, 0);
+    if (!fragment || fragment->end != end) return {};
+    return fragment->node;
 }
 
 void Parser::require_public_name_context(std::string_view name, SourceLocation location) const {
@@ -860,10 +903,7 @@ std::optional<std::size_t> Parser::bounded_statement_end(std::size_t first, unsi
 }
 
 std::shared_ptr<const SyntaxContext> Parser::public_fragment_context(std::size_t first) const {
-    auto context = token_origin(tokens_[first].location).context;
-    if (!context && syntax_) context = syntax_->execution()->call_context(
-        tokens_[first].location, active_namespace_, active_imports_, syntax_->bindings());
-    return context;
+    return syntax_context(tokens_[first].location);
 }
 
 std::shared_ptr<const SyntaxNode> Parser::deferred_node(
@@ -971,9 +1011,8 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind cat
     }
     node->span = {token_origin(tokens_[first].location).span,
                   token_origin(tokens_[index_ - 1].location).span};
-    node->context = token_origin(tokens_[first].location).context;
-    if (!node->context) node->context = syntax_->execution()->call_context(
-        tokens_[first].location, active_namespace_, active_imports_, syntax_->bindings());
+    node->context = public_fragment_context(first);
+    if (!node->context) return {};
     for (auto at = first; at < index_; ++at) {
         MetaToken token(tokens_[at]);
         if (!token.origin.context) token.origin.context = node->context;
@@ -981,7 +1020,7 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind cat
     }
     if (recording_public_tree_) {
         const auto event = production_events_.size();
-        production_events_.push_back({SyntaxProduction::None, first, index_, {}, node});
+        production_events_.push_back({SyntaxProduction::None, first, index_, {}, node, node->context});
         if (!production_stack_.empty())
             production_events_[production_stack_.back()].children.push_back(event);
     }
@@ -1389,6 +1428,7 @@ bool Parser::type_start() const {
            token.is("$::meta::syntax_match") ||
            token.is("$::meta::syntax") ||
            token.is("$::meta::span") ||
+           token.is("$::meta::context") ||
            token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
@@ -1471,7 +1511,14 @@ TypePtr Parser::parse_type(bool record_specifiers,
         ProductionScope builtin(*this, current().kind == TokenKind::BuiltinName
                                            ? SyntaxProduction::BuiltinName
                                            : SyntaxProduction::None);
-        if (current().is("$::meta::span")) {
+        if (current().is("$::meta::context")) {
+            if (!parsing_procedural_body_)
+                error_here("$::meta::context is only available in expansion functions");
+            type = context_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+            ++index_;
+        } else if (current().is("$::meta::span")) {
             if (!parsing_procedural_body_)
                 error_here("$::meta::span is only available in expansion functions");
             type = span_type();
@@ -2469,8 +2516,12 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     if (syntax_ && current().is("[[") &&
         (current(1).is("macro") || current(1).is("syntax_expander")) && current(2).is("]]")) {
         if (replacement_) error_here("expansion output cannot introduce syntax registration");
-        else (void)syntax_->execution()->define_function(tokens_, index_, active_namespace_,
-            active_imports_, syntax_->bindings());
+        else {
+            const auto context = syntax_context(current().location);
+            if (context) (void)syntax_->execution()->define_function(tokens_, index_, active_namespace_,
+                active_imports_, syntax_->bindings(), context->parse_environment);
+            else { ++index_; synchronize_external(); }
+        }
         if (replacement_) { ++index_; synchronize_external(); }
         return;
     }

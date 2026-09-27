@@ -13,6 +13,9 @@
 #if !$::has_builtin($::meta::extension_match) || !$::has_intrinsic($::meta::extension_match)
 #error preserved extension matches must be discoverable
 #endif
+#if !$::has_builtin($::syntax::context) || !$::has_intrinsic($::syntax::context)
+#error opaque context access must be discoverable
+#endif
 
 [[macro]] static $::meta::tokens copied(in $::meta::tokens input) { return input; }
 [[macro]] static $::meta::tokens forwarded(in $::meta::tokens input) {
@@ -20,7 +23,9 @@
 }
 namespace flow {
     [[syntax_expander]] static $::meta::tokens five(in $::meta::syntax_match input) {
-        return $::quote { 5u32 };
+        $::meta::syntax parsed = $::meta::parse("expr", $::quote { 5u32 },
+                                               $::syntax::context(input));
+        return $::meta::tokens(parsed);
     }
     syntax Base : expression { prefix "base"; match body:paren; expand five; }
     syntax Base;
@@ -61,6 +66,9 @@ namespace flow {
     syntax Make : item { prefix "make"; match name:ident value:literal ";"; expand make; }
     syntax CopyFunction : item { prefix "copy_fn"; match body:function_raw; expand copy_body; }
     [[syntax_expander]] static $::meta::tokens target_size(in $::meta::syntax_match input) {
+        $::meta::syntax width_type = $::meta::parse("type", $::quote { uptr },
+                                                   $::syntax::context(input));
+        if (!$::meta::is_production(width_type, "type_name")) return $::quote { 0u32 };
         typedef uptr WidthVector [[vector_size(16)]];
         if (sizeof(WidthVector) != 16uptr) return $::quote { 0u32 };
         if (sizeof(uptr) == 4uptr) return $::quote { 4u32 };
@@ -76,6 +84,9 @@ namespace flow {
     [[syntax_expander]] static $::meta::tokens group_shape(in $::meta::syntax_match input) {
         $::meta::syntax root = $::syntax::node(input, "body");
         const $::meta::span original = $::syntax::span(input);
+        const $::meta::context original_context = $::syntax::context(input);
+        $::meta::context selected_context = 0u32 ? original_context : $::syntax::context(root);
+        selected_context = 1u32 ? selected_context : original_context;
         $::meta::span selected = 1u32 ? $::syntax::capture_span(input, "body") : original;
         selected = $::meta::node_span(root);
         if (!$::meta::is_kind(root, "group") || $::meta::child_count(root) != 6uptr)
@@ -109,6 +120,7 @@ namespace flow {
     syntax RawProject : expression { prefix "raw_project"; match body:paren; expand group_project; }
     [[syntax_expander]] static $::meta::tokens group_record(in $::meta::syntax_match input) {
         $::meta::syntax_match record = $::syntax::at(input, "record", 0uptr);
+        $::meta::context record_context = $::syntax::context(record);
         $::meta::span record_span = $::syntax::span(record);
         record_span = $::syntax::capture_span(input, "record");
         if (!$::syntax::is_variant(record, "group")) return $::quote { 0u32 };

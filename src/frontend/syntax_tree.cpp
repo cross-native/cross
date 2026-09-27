@@ -6,9 +6,30 @@
 #include <array>
 #include <iterator>
 #include <limits>
+#include <unordered_set>
 #include <utility>
 
 namespace cross {
+
+std::optional<SyntaxParseCategory> syntax_parse_category(std::string_view name) {
+    using C = SyntaxParseCategory;
+    static constexpr std::pair<std::string_view, C> categories[] = {
+        {"expr", C::Expression}, {"stmt", C::Statement}, {"type", C::Type},
+        {"declaration", C::Declaration}, {"function_header", C::FunctionHeader},
+        {"function_decl", C::FunctionDeclaration}, {"function_def", C::FunctionDefinition},
+    };
+    for (const auto& [spelling, category] : categories)
+        if (spelling == name) return category;
+    return {};
+}
+
+std::uint64_t syntax_context_storage(const SyntaxContext& context) {
+    std::uint64_t size = 128 + context.name_space.size();
+    for (const auto& entry : context.imports) size += 32 + entry.size();
+    for (const auto& binding : context.syntax_bindings) size += 48 + binding.prefix.size();
+    if (context.parse_environment) size += syntax_environment_storage(*context.parse_environment);
+    return size;
+}
 
 std::string_view syntax_production_name(SyntaxProduction production) {
     static constexpr std::string_view names[] = {
@@ -89,10 +110,20 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
         const auto maximum = std::numeric_limits<std::uint64_t>::max();
         size = amount > maximum - size ? maximum : size + amount;
     };
+    std::unordered_set<const SyntaxContext*> contexts;
+    std::unordered_set<const SyntaxParseEnvironment*> environments;
+    const auto context = [&](const std::shared_ptr<const SyntaxContext>& value) {
+        if (!value || !contexts.insert(value.get()).second) return;
+        auto amount = syntax_context_storage(*value);
+        if (value->parse_environment && !environments.insert(value->parse_environment.get()).second)
+            amount -= syntax_environment_storage(*value->parse_environment);
+        add(amount);
+    };
     const auto tokens = [&](const TokenSequence& sequence) {
         for (const auto& token : sequence) {
             if (size > stop_after) break;
             add(128); add(token.text.size());
+            context(token.origin.context);
             if (token.split_source) { add(32); add(token.split_source->spelling.size()); }
         }
     };
@@ -103,6 +134,7 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
             const auto* next = nodes.back();
             nodes.pop_back();
             add(128);
+            context(next->context);
             tokens(next->tokens);
             for (const auto& child : next->children) {
                 if (size > stop_after) break;
@@ -113,6 +145,7 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
             const auto* next = matches.back();
             matches.pop_back();
             add(syntax_match_storage_bytes);
+            context(next->context);
             tokens(next->input);
             if (next->variant) { add(32); add(next->variant->size()); }
             for (const auto& label : next->variant_labels) {

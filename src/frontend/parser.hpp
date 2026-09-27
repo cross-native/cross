@@ -30,8 +30,20 @@ public:
     // tree preserves source tokens; speculative state never escapes this call.
     std::optional<SyntaxParsedFragment> parse_syntax_fragment(
         SyntaxPatternElement::Kind kind, std::size_t first) const;
+    // Complete bounded input in this parser's environment. Unlike pattern
+    // recognition, no prefix may be accepted while leaving trailing input.
+    std::shared_ptr<const SyntaxNode> parse_syntax_tokens(
+        SyntaxParseCategory category, std::vector<Token> input) const;
+    static std::shared_ptr<const SyntaxNode> parse_syntax_tokens(
+        SyntaxParseCategory category, std::vector<Token> input,
+        std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics);
+    std::shared_ptr<const SyntaxContext> syntax_context(SourceLocation location) const;
 
 private:
+    friend struct SyntaxParseEnvironment;
+    std::shared_ptr<const SyntaxParseEnvironment> snapshot_environment() const;
+    void restore_environment(const SyntaxParseEnvironment& environment,
+                             const SyntaxContext& context);
     const Token& current(std::size_t lookahead = 0) const;
     bool consume(std::string_view spelling);
     const Token* consume_kind(TokenKind kind);
@@ -161,6 +173,7 @@ private:
         std::size_t end{};
         std::vector<std::size_t> children;
         std::shared_ptr<const SyntaxNode> opaque;
+        std::shared_ptr<const SyntaxContext> context;
     };
     struct ProductionScope {
         Parser& parser;
@@ -204,6 +217,9 @@ private:
     std::unordered_map<std::string, TypePtr> type_aliases_;
     std::vector<StaticAssertDecl> static_assertions_;
     FunctionDecl* active_function_{};
+    // Own a restored context's function metadata; never retain the original
+    // mutable function/AST when parsing through a saved environment.
+    std::unique_ptr<FunctionDecl> restored_function_context_;
     bool parsing_generic_argument_{};
     bool parsing_procedural_body_{};
     bool parsing_public_fragment_{};
@@ -217,6 +233,36 @@ private:
     std::vector<std::size_t> public_input_indices_;
     unsigned switch_depth_{};
     std::vector<bool> switch_default_seen_;
+};
+
+// Immutable once attached to a context. Types are detached graph copies, and
+// syntax state retains only stable registry identity and lexical activations.
+// Its weak executor link prevents contexts stored by expansion functions from
+// keeping their owning executor alive through a reference cycle.
+struct SyntaxParseEnvironment {
+private:
+    friend class Parser;
+    friend std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment&);
+    unsigned address_bits{};
+    std::optional<SyntaxState> syntax;
+    std::weak_ptr<SyntaxExecution> execution;
+    std::size_t scope_imports{};
+    std::vector<std::string> generic_types;
+    std::unordered_set<std::string> generic_functions;
+    std::unordered_set<std::string> ordinary_values;
+    std::vector<NameSet> values;
+    std::vector<NameMap<TypePtr>> local_aliases;
+    std::unordered_map<std::string, TypePtr> aliases;
+    std::unordered_map<std::string, BuiltinType> enumerations;
+    std::unordered_map<std::string, Parser::RecordTag> records;
+    std::vector<ParameterDecl> parameters;
+    std::vector<GenericParameter> generic_parameters;
+    std::vector<std::size_t> uncertain_depths;
+    bool function_context{};
+    bool procedural_body{};
+    unsigned switch_depth{};
+    std::vector<bool> switch_defaults;
+    std::uint64_t storage{};
 };
 
 } // namespace cross
