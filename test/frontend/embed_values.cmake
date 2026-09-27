@@ -527,7 +527,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::buffer value = $::meta::alloc(4u32);\n"
             "*((struct eval_scalar *)$::meta::data(value)) = snapshot;\n"
             "return ((f32 *)$::meta::data(value))[0u32] == 1.5f32;")
-        set(expected "meta pointer read violates effective type")
+        set(expected "meta pointer read violates aggregate effective type")
     elseif(case STREQUAL bit_field_alias OR case STREQUAL bit_field_alias_write)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
@@ -576,7 +576,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
             "return 0u32;")
-        set(expected "compatible scalar, fixed-array, record, fixed-vector, or void pointer conversion")
+        set(expected "without qualifier loss")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"
@@ -612,8 +612,12 @@ file(WRITE "${aggregate_escape}"
 execute_process(COMMAND "${CC}" -S "${aggregate_escape}"
     -o "${OUTPUT}-aggregate-escape.s"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(status EQUAL 0 OR NOT err MATCHES "aggregate runtime materialization is not implemented")
-    message(FATAL_ERROR "aggregate result entered the scalar replacement path\n${out}\n${err}")
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "aggregate result materialization failed\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}-aggregate-escape.s" materialized)
+if(NOT materialized MATCHES "escaped:\n[^\n]*[.]byte 7,0,0,0")
+    message(FATAL_ERROR "aggregate result did not preserve its representation\n${materialized}")
 endif()
 
 set(void_escape "${directory}/void_escape.x")

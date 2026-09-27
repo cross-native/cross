@@ -2361,6 +2361,11 @@ if(BUILD_TESTING)
                 -DGENERATOR=${CMAKE_SOURCE_DIR}/test/frontend/embed_values_generator.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embed-values
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/embed_values.cmake")
+    add_test(NAME cross_meta_object_checks
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/meta_objects.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/meta-object-checks
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/meta_objects.cmake")
     if(WIN32)
         set(meta_vector_host_abi ms_abi)
     else()
@@ -2376,6 +2381,16 @@ if(BUILD_TESTING)
                     "--model=${CMAKE_SOURCE_DIR}/test/model/custom.y" -mabi=odd_abi
                     -DCUSTOM_META_ABI "-DHOST_ABI=\"${meta_vector_host_abi}\"")
             endif()
+            add_test(NAME cross_meta_objects_${level}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/meta_objects.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/meta-objects-${level}-${mode}
+                        -DENTRY=meta_object_entry -DEXPECTED=53
+                        "-DCC_FLAGS=${meta_vector_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
             add_test(NAME cross_meta_vectors_${level}_${mode}
                 COMMAND "${CMAKE_COMMAND}"
                         -DCC=$<TARGET_FILE:cross_cc>

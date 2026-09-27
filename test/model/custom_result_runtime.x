@@ -20,9 +20,20 @@ struct custom_memory_result {
     u64 high;
 };
 
+[[eval_only]] static struct custom_bitfield_result evaluated_bitfields() {
+    struct custom_bitfield_result result = { .tag = 0u8, .first = 5u32,
+        .second = 17u32, .tail = 31u8 };
+    return result;
+}
+
+[[eval_only]] static struct custom_memory_result evaluated_memory() {
+    struct custom_memory_result result = { 0x100000000u64, 0x200000000u64 };
+    return result;
+}
+
 [[abi("odd_abi"), noinline]]
 static struct custom_bitfield_result register_bitfield_result(in u32 seed) {
-    struct custom_bitfield_result result;
+    struct custom_bitfield_result result = $::eval(evaluated_bitfields());
     result.tag = (u8)seed;
     result.first = 5u32;
     result.second = 17u32;
@@ -32,7 +43,7 @@ static struct custom_bitfield_result register_bitfield_result(in u32 seed) {
 
 [[abi("stack_result_abi"), noinline]]
 static struct custom_bitfield_result stack_bitfield_result(in u32 seed) {
-    struct custom_bitfield_result result;
+    struct custom_bitfield_result result = $::eval(evaluated_bitfields());
     result.tag = (u8)seed;
     result.first = 6u32;
     result.second = 19u32;
@@ -63,7 +74,7 @@ static u128 partial_wide_result(in u64 low, in u64 high) {
 
 [[abi("memory_result_abi"), noinline]]
 static struct custom_memory_result memory_result(in u32 seed) {
-    struct custom_memory_result result;
+    struct custom_memory_result result = $::eval(evaluated_memory());
     result.low = (u64)seed + 0x100000000u64;
     result.high = (u64)seed + 0x200000000u64;
     return result;

@@ -1044,6 +1044,36 @@ UInt128 load_bits(const std::vector<unsigned char>& bytes, unsigned offset,
     return value;
 }
 
+bool append_image_relocations(Object& result, const Expr& expression,
+                              unsigned offset, const hir::Module& module,
+                              const hir::Object& entity, const Subtarget& subtarget,
+                              Diagnostics& diagnostics) {
+    for (const auto& relocation : expression.object_relocations) {
+        if (relocation.offset > expression.string_value.size() ||
+            relocation.length > expression.string_value.size() - relocation.offset ||
+            relocation.offset + offset > result.size ||
+            relocation.length > result.size - relocation.offset - offset) {
+            diagnostics.error(expression.location, "evaluated object relocation exceeds target storage");
+            return false;
+        }
+        Expr source;
+        source.kind = Expr::Kind::Address;
+        source.location = expression.location;
+        source.type = relocation.type;
+        source.evaluated_address = relocation.address;
+        const auto address = relocatable_address(module,
+            {entity.source_name, entity.source_unit}, source, subtarget, false);
+        if (!address || (address->kind == AddressKind::Object && address->object &&
+                         module.object(*address->object).is_thread_local)) {
+            diagnostics.error(expression.location, "evaluated object pointer is not a static relocation");
+            return false;
+        }
+        result.relocations.push_back({offset + static_cast<unsigned>(relocation.offset),
+                                      static_cast<unsigned>(relocation.length), *address});
+    }
+    return true;
+}
+
 bool lower_initializer(Object& result, const hir::Module& module,
                        const hir::Object& entity,
                        const ObjectDecl& declaration,
@@ -1052,6 +1082,15 @@ bool lower_initializer(Object& result, const hir::Module& module,
     if (!declaration.initializer) return true;
     const auto& expression = *declaration.initializer;
     const auto& type = module.type(entity.type);
+    if (expression.kind == Expr::Kind::ByteSequence && expression.type) {
+        if (expression.string_value.size() != result.size) {
+            diagnostics.error(expression.location, "evaluated object representation does not match target storage");
+            return false;
+        }
+        result.initializer = InitializerKind::Aggregate;
+        result.bytes.assign(expression.string_value.begin(), expression.string_value.end());
+        return append_image_relocations(result, expression, 0, module, entity, subtarget, diagnostics);
+    }
     if (type.kind == hir::Type::Kind::Array && type.element &&
         module.type(*type.element).kind == hir::Type::Kind::Builtin &&
         module.type(*type.element).builtin == BuiltinType::U8 &&
@@ -1119,6 +1158,19 @@ bool lower_initializer(Object& result, const hir::Module& module,
             continue;
         }
         const auto& item_type = module.type(item.type);
+        if (item.expression->kind == Expr::Kind::ByteSequence && item.expression->type) {
+            if (item.expression->string_value.size() != *item_size) {
+                diagnostics.error(item.expression->location,
+                    "evaluated object representation does not match target storage");
+                valid = false;
+                continue;
+            }
+            std::copy(item.expression->string_value.begin(), item.expression->string_value.end(),
+                      result.bytes.begin() + static_cast<std::ptrdiff_t>(item.offset));
+            valid &= append_image_relocations(result, *item.expression,
+                static_cast<unsigned>(item.offset), module, entity, subtarget, diagnostics);
+            continue;
+        }
         if (item_type.kind == hir::Type::Kind::Array && item_type.element &&
             module.type(*item_type.element).kind == hir::Type::Kind::Builtin &&
             module.type(*item_type.element).builtin == BuiltinType::U8 &&
@@ -1204,6 +1256,8 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                                const CompilerOptions& options,
                                const Subtarget& subtarget,
                                Diagnostics& diagnostics) {
+    if (!expression || !destination || destination->kind != Type::Kind::Pointer)
+        return false;
     auto module = hir::build_constant_context(program, options, subtarget.target(),
                                                diagnostics);
     if (diagnostics.errors() != 0) return false;

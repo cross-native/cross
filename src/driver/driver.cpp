@@ -19,6 +19,7 @@
 #include "frontend/procedural.hpp"
 #include "frontend/semantic.hpp"
 #include "middle/hir.hpp"
+#include "middle/initializer.hpp"
 #include "middle/codegen_module.hpp"
 #include "middle/data_ir.hpp"
 #include "middle/mir.hpp"
@@ -856,6 +857,14 @@ int cc_main(int argc, char** argv) {
             return abi ? std::optional<std::string>(abi->canonical_name)
                        : std::nullopt;
         };
+    program.evaluation_pointer_resolver = [&](std::unique_ptr<Expr>& expression,
+        const TypePtr& destination, const FunctionDecl* caller, std::span<const NameKey> locals) {
+        // An automatic attempt may defer to runtime without speculative diagnostics.
+        std::ostringstream output;
+        Diagnostics quiet(output);
+        return data::normalize_generic_pointer(program, expression, destination,
+            caller, locals, options, *subtarget, quiet);
+    };
     const EvaluationLayoutInstaller install_layout = [&](Program& current) {
         auto layout = std::make_shared<hir::Module>(
             hir::build_record_layout_context(current, options, *target, diagnostics));
@@ -877,6 +886,41 @@ int cc_main(int argc, char** argv) {
             return EvaluationMemberLayout{
                 member->offset, member->alignment,
                 member->bit_width, member->bit_offset};
+        };
+        current.evaluation_initializer_plan = [layout, target, &current](
+            const Expr& expression, const TypePtr& destination) {
+            // The shared planner owns selection, duplicate checking, and
+            // physical placement; the evaluator consumes source types only.
+            const auto type_hash = [](hir::TypeId id) { return std::hash<std::uint32_t>{}(id.value); };
+            std::unordered_map<hir::TypeId, TypePtr, decltype(type_hash)> source_types(0, type_hash);
+            const auto visit = [&](const auto& self, const TypePtr& type) -> void {
+                if (!type) return;
+                const auto id = layout->intern_type(type);
+                if (!source_types.emplace(id, type).second) return;
+                self(self, type->element);
+                if (type->kind != Type::Kind::Record) return;
+                for (const auto& record : current.records) {
+                    if (record.name != type->nominal_name || !record.complete) continue;
+                    for (const auto& member : record.members) self(self, member.type);
+                    break;
+                }
+            };
+            visit(visit, destination);
+            std::ostringstream output;
+            Diagnostics quiet(output);
+            const auto plan = initializer::build(expression,
+                layout->intern_type(destination), *layout, *target, quiet);
+            EvaluationInitializerPlan result;
+            result.valid = plan.valid;
+            result.error_location = plan.error_location;
+            result.error_message = plan.error_message;
+            for (const auto& item : plan.items) {
+                const auto found = source_types.find(item.type);
+                if (found == source_types.end()) { result.valid = false; break; }
+                result.items.push_back({item.expression, found->second,
+                    {item.offset, item.alignment, item.bit_width, item.bit_offset}});
+            }
+            return result;
         };
     };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,

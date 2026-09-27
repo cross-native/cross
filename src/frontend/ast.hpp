@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -174,6 +175,14 @@ struct Expr {
     };
     std::optional<FloatingConstant> evaluated_floating;
     std::optional<AddressConstant> evaluated_address;
+    struct ObjectRelocation {
+        std::uint64_t offset{};
+        std::uint64_t length{};
+        TypePtr type;
+        AddressConstant address;
+    };
+    // Evaluated object images retain symbolic addresses, never host pointer bits.
+    std::vector<ObjectRelocation> object_relocations;
     // A source type operand retained for casts and type-form sizeof.  Keeping
     // this structured avoids reparsing a textual type in HIR/MIR lowering.
     TypePtr type;
@@ -373,6 +382,19 @@ struct EvaluationMemberLayout {
     unsigned bit_offset{};
 };
 
+struct EvaluationInitializerItem {
+    const Expr* expression{};
+    TypePtr type;
+    EvaluationMemberLayout layout;
+};
+
+struct EvaluationInitializerPlan {
+    std::vector<EvaluationInitializerItem> items;
+    bool valid{true};
+    SourceLocation error_location;
+    std::string error_message;
+};
+
 struct Program {
     unsigned address_bits{64};
     EvaluationLimits evaluation_limits;
@@ -385,6 +407,10 @@ struct Program {
         evaluation_align_of;
     std::function<std::optional<EvaluationMemberLayout>(
         const TypePtr&, std::string_view)> evaluation_member_layout;
+    std::function<EvaluationInitializerPlan(const Expr&, const TypePtr&)>
+        evaluation_initializer_plan;
+    std::function<bool(std::unique_ptr<Expr>&, const TypePtr&, const FunctionDecl*,
+                       std::span<const NameKey>)> evaluation_pointer_resolver;
     std::vector<RecordDecl> records;
     std::vector<EnumDecl> enumerations;
     std::vector<StaticAssertDecl> static_assertions;

@@ -83,7 +83,8 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             module.hir().type(*type.element).kind == hir::Type::Kind::Builtin &&
             module.hir().type(*type.element).builtin == BuiltinType::U8;
         const bool aggregate = type.kind == hir::Type::Kind::Array ||
-                               type.kind == hir::Type::Kind::Record;
+                               type.kind == hir::Type::Kind::Record ||
+                               (type.kind == hir::Type::Kind::Vector && !type.scalable);
         const bool declaration =
             object.initializer == data::InitializerKind::Declaration;
         if (declaration != (entity.definition == nullptr) ||

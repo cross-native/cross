@@ -29,7 +29,7 @@ reject(argument "static i32 helper(in i32 x) { return x; } global i32 value = 1 
 reject(pointer_argument "static i32 helper(in const u32 *x) { return 7; } global i32 value = 1 || helper(\"bad\");"
     "incompatible argument type")
 reject(dereference "global i32 value = 0 && *1;" "unsupported unary operand")
-reject(operand "global i32 value = 0 && (\"bad\" + 1);" "unsupported type|non-integer operation")
+reject(operand "global i32 value = 0 && (\"bad\" + 1);" "unsupported type|non-integer operation|unsupported operation")
 reject(conditional "global i32 value = 1 ? 7 : \"bad\";" "unsupported type")
 reject(runtime "global i32 value = $::runtime(7);" "runtime is invalid")
 reject(runtime_short "global i32 value = 1 || $::runtime(7);" "runtime is invalid")
@@ -37,7 +37,7 @@ reject(runtime_only "[[runtime_only]] static i32 seed() { return 1; } global i32
     "runtime-only function")
 reject(runtime_chain "[[runtime_only]] static i32 seed() { return 1; } static i32 helper() { return seed(); } global i32 value = helper();"
     "while evaluating call to 'helper'")
-reject(static_read "global i32 state = 7; global i32 value = state;" "not a translation-time value")
+reject(static_read "global i32 state = 7; global i32 value = state;" "not a translation-time value|runtime/static storage cannot be read")
 reject(unsigned "[[generic(u8 N)]] static i32 g() { return N; } global i32 f() { return g::<-1>(); }"
     "not representable in parameter type 'u8'")
 reject(narrow "[[generic(i8 N)]] static i32 g() { return N; } global i32 f() { return g::<128>(); }"

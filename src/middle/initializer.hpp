@@ -30,6 +30,8 @@ struct Plan {
     // explicit positional/designated destinations to exist.
     std::uint64_t minimum_elements{};
     bool valid{true};
+    SourceLocation error_location;
+    std::string error_message;
 };
 
 // Resolves successive and designated aggregate entries into typed byte-offset

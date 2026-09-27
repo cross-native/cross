@@ -49,7 +49,7 @@ public:
 
     Plan run(const Expr& source, hir::TypeId type) {
         if (source.kind != Expr::Kind::AggregateInitializer) {
-            diagnostics_.error(source.location,
+            error(source.location,
                                "aggregate initializer requires a brace list");
             result_.valid = false;
             return std::move(result_);
@@ -59,6 +59,15 @@ public:
     }
 
 private:
+    void error(SourceLocation location, std::string_view message) {
+        if (result_.error_message.empty()) {
+            result_.error_location = location;
+            result_.error_message = message;
+        }
+        diagnostics_.error(location, message);
+        result_.valid = false;
+    }
+
     struct Selection {
         hir::TypeId type;
         std::uint64_t offset{};
@@ -75,7 +84,7 @@ private:
         }
         if (!source->evaluated_integer ||
             source->evaluated_integer->value.high != 0) {
-            diagnostics_.error(
+            error(
                 expression.location,
                 "array initializer designator requires a nonnegative integer constant");
             result_.valid = false;
@@ -97,7 +106,7 @@ private:
                 : (std::uint64_t{1} << module_.address_bits) - 1U;
             if ((!dynamic && (type.lanes == 0 || index >= type.lanes)) ||
                 (dynamic && index >= maximum_count)) {
-                diagnostics_.error(location,
+                error(location,
                                    "array initializer designator is out of range");
                 result_.valid = false;
                 return std::nullopt;
@@ -109,7 +118,7 @@ private:
                 parent_offset >
                     std::numeric_limits<std::uint64_t>::max() -
                         index * *size) {
-                diagnostics_.error(location,
+                error(location,
                                    "array initializer offset overflows target storage");
                 result_.valid = false;
                 return std::nullopt;
@@ -138,7 +147,7 @@ private:
             }
             if (member == record.members.end() ||
                 (record.is_union && index != 0)) {
-                diagnostics_.error(location,
+                error(location,
                                    "excess entry in aggregate initializer");
                 result_.valid = false;
                 return std::nullopt;
@@ -151,7 +160,7 @@ private:
                              std::move(path), index, member->bit_width,
                              member->bit_offset};
         }
-        diagnostics_.error(location,
+        error(location,
                            "initializer designator requires an aggregate destination");
         result_.valid = false;
         return std::nullopt;
@@ -163,7 +172,7 @@ private:
         const auto& type = module_.type(parent);
         if (designator.kind == Expr::InitializerDesignator::Kind::Index) {
             if (type.kind != hir::Type::Kind::Array || !designator.index) {
-                diagnostics_.error(
+                error(
                     designator.location,
                     "array designator requires an array destination");
                 result_.valid = false;
@@ -178,7 +187,7 @@ private:
                          designator.location);
         }
         if (type.kind != hir::Type::Kind::Record || !type.record) {
-            diagnostics_.error(designator.location,
+            error(designator.location,
                                "member designator requires a record destination");
             result_.valid = false;
             return std::nullopt;
@@ -190,7 +199,7 @@ private:
                 return candidate.name == designator.member;
             });
         if (member == record.members.end()) {
-            diagnostics_.error(
+            error(
                 designator.location,
                 "record initializer has no member named '" +
                     designator.member + "'");
@@ -214,7 +223,7 @@ private:
         if (std::any_of(paths_.begin(), paths_.end(), [&](const Path& prior) {
                 return prefix(path, prior) || prefix(prior, path);
             })) {
-            diagnostics_.error(location,
+            error(location,
                                "duplicate destination in aggregate initializer");
             result_.valid = false;
             return true;
@@ -226,7 +235,7 @@ private:
     void list(const Expr& source, hir::TypeId type, std::uint64_t offset,
               Path path) {
         if (!aggregate(module_, type)) {
-            diagnostics_.error(source.location,
+            error(source.location,
                                "brace initializer requires an aggregate destination");
             result_.valid = false;
             return;
@@ -243,7 +252,7 @@ private:
                 continue;
             }
             if (is_union && union_entry) {
-                diagnostics_.error(entry.location,
+                error(entry.location,
                                    "excess entry in union initializer");
                 result_.valid = false;
                 continue;

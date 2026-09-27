@@ -124,7 +124,7 @@ foreach(case
         "VOID_ARITHMETIC|requires a complete object type and representable offset"
         "RUNTIME_CALL|call to runtime-only function"
         "STATIC_READ|runtime/static storage cannot be read"
-        "ESCAPE|automatic object address cannot escape"
+        "ESCAPE|object pointer cannot escape into a generic argument"
         "UNINITIALIZED|read of uninitialized value"
         "INDIRECT_CALL|indirect calls are not permitted"
         "CALL_QUALIFIERS|incompatible pointed-to type or qualifiers"
