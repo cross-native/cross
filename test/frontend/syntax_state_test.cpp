@@ -30,6 +30,8 @@ syntax Second : statement { prefix "same"; match body:block; expand expand; }
 syntax Item : item { prefix "same"; match body:block; expand expand; }
 syntax Rule : rule { match value:literal; }
 syntax Combined : expression { prefix "combined"; match rule(Rule); expand expand; }
+syntax BadRule : rule { match rule(BadRule) "x"; }
+syntax BadUse : expression { prefix "bad"; match rule(BadRule); expand expand; }
 syntax Pack : bundle { use First; use Item; }
 )");
     auto tokens = execution->prepare(*source);
@@ -69,6 +71,9 @@ syntax Pack : bundle { use First; use Item; }
     require(!activate({{"Combined", {}, {}}, {"Second", {}, {}}}), "later conflict succeeded");
     require(state.bindings() == before, "later conflict partially committed activation");
     require(activate({{"Combined", {}, {}}}), "failed activation poisoned later rule binding");
+    const auto before_cycle = state.bindings();
+    require(!activate({{"BadUse", {}, {}}}), "left-recursive rule activation succeeded");
+    require(state.bindings() == before_cycle, "failed recursive activation installed a binding");
 
     // Matching preserves the actual written prefix and its bounded input.
     const auto* invocation = sources.add("invocation.x", "same ()");

@@ -120,6 +120,38 @@ namespace flow {
         match "(" branch:choice(left:("left" number:literal) | right:("right" number:literal)) ")";
         expand selected;
     }
+    syntax Tree : rule {
+        match branch:choice(leaf:(value:literal) |
+                            pair:("(" left:rule(Tree) "+" right:rule(Tree) ")"));
+    }
+    [[syntax_expander]] static $::meta::tokens tree_shape(in $::meta::syntax_match input) {
+        $::meta::syntax_match root = $::syntax::at(input, "root", 0uptr);
+        $::meta::syntax_match branch = $::syntax::at(root, "branch", 0uptr);
+        if (!$::syntax::is_variant(branch, "pair")) return $::quote { 0u32 };
+        $::meta::syntax_match left = $::syntax::at(branch, "left", 0uptr);
+        $::meta::syntax_match left_branch = $::syntax::at(left, "branch", 0uptr);
+        if (!$::syntax::is_variant(left_branch, "pair")) return $::quote { 0u32 };
+        $::meta::syntax_match right = $::syntax::at(branch, "right", 0uptr);
+        $::meta::syntax_match right_branch = $::syntax::at(right, "branch", 0uptr);
+        if (!$::syntax::is_variant(right_branch, "leaf")) return $::quote { 0u32 };
+        return $::quote { 13u32 };
+    }
+    syntax TreeUse : expression { prefix "tree"; match root:rule(Tree); expand tree_shape; }
+    syntax MutualA : rule {
+        match branch:choice(leaf:(value:literal) | nested:("(" child:rule(MutualB) ")"));
+    }
+    syntax MutualB : rule { match "[" child:rule(MutualA) "]"; }
+    [[syntax_expander]] static $::meta::tokens mutual_shape(in $::meta::syntax_match input) {
+        $::meta::syntax_match root = $::syntax::at(input, "root", 0uptr);
+        $::meta::syntax_match branch = $::syntax::at(root, "branch", 0uptr);
+        if (!$::syntax::is_variant(branch, "nested")) return $::quote { 0u32 };
+        $::meta::syntax_match middle = $::syntax::at(branch, "child", 0uptr);
+        $::meta::syntax_match leaf = $::syntax::at(middle, "child", 0uptr);
+        $::meta::syntax_match leaf_branch = $::syntax::at(leaf, "branch", 0uptr);
+        if (!$::syntax::is_variant(leaf_branch, "leaf")) return $::quote { 0u32 };
+        return $::quote { 14u32 };
+    }
+    syntax MutualUse : expression { prefix "mutual"; match root:rule(MutualA); expand mutual_shape; }
 }
 namespace caller {
     global u32 number = 13u32;
@@ -226,6 +258,10 @@ namespace frozen {
            repeat_zero () + repeat_zero (a a) +
            select (left 6u32) + select (right 7u32);
 }
+[[noinline]] static u32 recursive_rules() {
+    syntax flow::TreeUse, flow::MutualUse;
+    return tree ((1u32 + 2u32) + 3u32) + mutual ([1u32]);
+}
 syntax flow::Width;
 global uptr syntax_width = width ();
 #ifdef CUSTOM_SYNTAX_ABI
@@ -243,6 +279,7 @@ global u32 syntax_raw_entry() {
     if (macro_statements() != 10u32) return 0u32;
     if (angle_boundary() != 9u32) return 0u32;
     if (combinators() != 50u32) return 0u32;
+    if (recursive_rules() != 27u32) return 0u32;
     if (syntax_width != sizeof(uptr)) return 0u32;
 #endif
     return 61u32;

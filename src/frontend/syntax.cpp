@@ -606,15 +606,19 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
     };
     std::vector<PendingRules> pending_rules;
     std::vector<std::pair<SyntaxEntityId, SyntaxFunctionId>> pending_expanders;
+    std::vector<SyntaxEntityId> resolving_rules;
     const auto validate_rules = [&](const auto& self, const SyntaxDefinition& definition) -> bool {
         if (definition.rules_bound || std::any_of(pending_rules.begin(), pending_rules.end(),
             [&](const auto& pending) { return pending.definition == definition.id; })) return true;
-        if (path.size() >= execution_->limits().depth ||
-            std::find(path.begin(), path.end(), definition.id) != path.end()) {
-            diagnostics.error(definition.location, "recursive syntax rules are not implemented yet");
+        // A cycle may be productive. Stage its stable IDs first, then reject
+        // only paths that can recurse without consuming input.
+        if (std::find(resolving_rules.begin(), resolving_rules.end(), definition.id) != resolving_rules.end())
+            return true;
+        if (resolving_rules.size() >= execution_->limits().depth) {
+            diagnostics.error(definition.location, "syntax rule binding depth exceeded");
             return false;
         }
-        path.push_back(definition.id);
+        resolving_rules.push_back(definition.id);
         PendingRules pending{definition.id, definition.pattern};
         const auto bind = [&](const auto& walk, std::vector<SyntaxPatternElement>& pattern) -> bool {
             for (auto& element : pattern) {
@@ -638,7 +642,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
             return true;
         };
         if (!bind(bind, pending.pattern)) return false;
-        path.pop_back();
+        resolving_rules.pop_back();
         pending_rules.push_back(std::move(pending));
         return true;
     };
@@ -697,6 +701,98 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
             if (pending.definition == id) return &pending.pattern;
         return id.value < definitions_->size() ? &(*definitions_)[id.value].pattern : nullptr;
     };
+    // Least fixed point of rule nullability. A recursive reference does not
+    // become nullable merely because it points back to itself; it needs a
+    // finite derivation that consumes no token.
+    std::vector<bool> nullable(definitions_->size());
+    bool analysis_failed{};
+    std::function<bool(const Pattern&)> sequence_nullable;
+    std::function<bool(const SyntaxPatternElement&)> element_nullable;
+    element_nullable = [&](const SyntaxPatternElement& element) {
+        if (!execution_->work(element.location)) {
+            analysis_failed = true;
+            return false;
+        }
+        using K = SyntaxPatternElement::Kind;
+        if (element.kind == K::Optional || element.kind == K::Repeat0 || element.kind == K::Separated0)
+            return true;
+        if (element.kind == K::Repeat1 || element.kind == K::Separated1)
+            return sequence_nullable(element.pattern);
+        if (element.kind == K::Choice)
+            return std::any_of(element.alternatives.begin(), element.alternatives.end(),
+                [&](const auto& alternative) { return sequence_nullable(alternative.pattern); });
+        if (element.kind == K::Rule && element.resolved_rule)
+            return static_cast<bool>(nullable[element.resolved_rule->value]);
+        return false;
+    };
+    sequence_nullable = [&](const Pattern& pattern) {
+        return std::all_of(pattern.begin(), pattern.end(), element_nullable);
+    };
+    for (std::size_t round = 0; round < definitions_->size(); ++round) {
+        bool changed = false;
+        for (const auto& definition : *definitions_) {
+            const bool available = definition.rules_bound || std::any_of(pending_rules.begin(), pending_rules.end(),
+                [&](const auto& pending) { return pending.definition == definition.id; });
+            if (!available || nullable[definition.id.value]) continue;
+            if (!execution_->work(definition.location)) return false;
+            if (sequence_nullable(*bound_pattern(definition.id))) {
+                nullable[definition.id.value] = true;
+                changed = true;
+            }
+            if (analysis_failed) return false;
+        }
+        if (!changed) break;
+    }
+    struct LeadingRule { SyntaxEntityId target; SourceLocation location; };
+    std::vector<std::vector<LeadingRule>> leading(definitions_->size());
+    std::function<void(const Pattern&, std::vector<LeadingRule>&)> collect_sequence;
+    std::function<void(const SyntaxPatternElement&, std::vector<LeadingRule>&)> collect_element;
+    collect_element = [&](const SyntaxPatternElement& element, std::vector<LeadingRule>& output) {
+        if (!execution_->work(element.location)) {
+            analysis_failed = true;
+            return;
+        }
+        using K = SyntaxPatternElement::Kind;
+        if (element.kind == K::Rule && element.resolved_rule)
+            output.push_back({*element.resolved_rule, element.location});
+        else if (element.kind == K::Optional || element.kind == K::Repeat0 ||
+                 element.kind == K::Repeat1 || element.kind == K::Separated0 ||
+                 element.kind == K::Separated1)
+            collect_sequence(element.pattern, output);
+        else if (element.kind == K::Choice)
+            for (const auto& alternative : element.alternatives)
+                collect_sequence(alternative.pattern, output);
+    };
+    collect_sequence = [&](const Pattern& pattern, std::vector<LeadingRule>& output) {
+        for (const auto& element : pattern) {
+            if (analysis_failed) return;
+            collect_element(element, output);
+            if (analysis_failed) return;
+            if (!element_nullable(element)) break;
+        }
+    };
+    for (const auto& pending : pending_rules) {
+        if (!execution_->work((*definitions_)[pending.definition.value].location)) return false;
+        collect_sequence(pending.pattern, leading[pending.definition.value]);
+        if (analysis_failed) return false;
+    }
+    std::vector<std::uint8_t> visited(definitions_->size());
+    const auto check_leading = [&](const auto& self, SyntaxEntityId id) -> bool {
+        if (visited[id.value] == 2) return true;
+        visited[id.value] = 1;
+        for (const auto& edge : leading[id.value]) {
+            if (!execution_->work(edge.location)) return false;
+            if (visited[edge.target.value] == 1) {
+                diagnostics.error(edge.location, "left-recursive or nullable syntax rule cycle");
+                return false;
+            }
+            if (visited[edge.target.value] == 0 && !self(self, edge.target)) return false;
+        }
+        visited[id.value] = 2;
+        return true;
+    };
+    for (const auto& pending : pending_rules)
+        if (visited[pending.definition.value] == 0 && !check_leading(check_leading, pending.definition)) return false;
     for (const auto& pending : pending_rules)
         if (!validate_pattern_progress(pending.pattern, bound_pattern, diagnostics)) return false;
     // Commit lookup identities together with the entire activation. Later
@@ -756,7 +852,6 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         bool nested{};
     };
     using K = SyntaxPatternElement::Kind;
-    using Pattern = std::vector<SyntaxPatternElement>;
     std::function<std::vector<Candidate>(const Pattern&, std::size_t, unsigned)> run;
     std::function<std::vector<Piece>(const SyntaxPatternElement&, std::size_t, unsigned)> pieces;
     run = [&](const Pattern& pattern, std::size_t first, unsigned depth) -> std::vector<Candidate> {

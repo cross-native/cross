@@ -112,8 +112,19 @@ reject(rule_activation "rule cannot be activated"
     "syntax Rule : rule { match value:literal; }\nsyntax Rule;\n")
 reject(rule_kind "must denote a syntax rule"
     "${expander}${definition}syntax Other : expression { prefix \"other\"; match rule(Value); expand expand; } syntax Other;\n")
-reject(rule_cycle "recursive syntax rules are not implemented yet"
-    "${expander}syntax Rule : rule { match \"(\" rule(Rule) \")\"; } syntax Other : expression { prefix \"other\"; match rule(Rule); expand expand; } syntax Other;\n")
+reject(rule_cycle "left-recursive or nullable syntax rule cycle"
+    "${expander}syntax Rule : rule { match rule(Rule) \"x\"; } syntax Other : expression { prefix \"other\"; match rule(Rule); expand expand; } syntax Other;\n")
+reject(mutual_rule_cycle "left-recursive or nullable syntax rule cycle"
+    "${expander}syntax A : rule { match rule(B) \"x\"; } syntax B : rule { match rule(A) \"y\"; } syntax Other : expression { prefix \"other\"; match rule(A); expand expand; } syntax Other;\n")
+reject(nullable_rule_cycle "left-recursive or nullable syntax rule cycle"
+    "${expander}syntax A : rule { match maybe:optional(\"x\") rule(A); } syntax Other : expression { prefix \"other\"; match rule(A); expand expand; } syntax Other;\n")
+reject(recursive_ambiguity "ambiguous syntax invocation"
+    "${expander}syntax Chain : rule { match branch:choice(stop:(\"x\") | again:(\"x\" rule(Chain))); } syntax Other : expression { prefix \"other\"; match child:rule(Chain); expand expand; } syntax Other; global u32 entry() { return other x x; }\n")
+string(REPEAT "(" 12 recursive_opens)
+string(REPEAT ")" 12 recursive_closes)
+reject(rule_depth "syntax pattern matching depth exceeded"
+    "${expander}syntax Tree : rule { match branch:choice(leaf:(value:literal) | nested:(\"(\" child:rule(Tree) \")\")); } syntax Other : expression { prefix \"other\"; match root:rule(Tree); expand expand; } syntax Other; global u32 entry() { return other ${recursive_opens}1u32${recursive_closes}; }\n"
+    -feval-depth-limit=12)
 reject(bundle_cycle "cyclic syntax bundle"
     "syntax One : bundle { use Two; } syntax Two : bundle { use One; } syntax One;\n")
 reject(bundle_alias "bundle cannot be aliased"
