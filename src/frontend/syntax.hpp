@@ -62,11 +62,12 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node);
 // Public match records are translation-only, not runtime records or typed HIR.
 struct SyntaxMatchValue {
     struct Field {
+        enum class Kind { Primitive, RawGroup, Parsed, Nested };
         std::string name;
         TokenSequence tokens;
         std::shared_ptr<const SyntaxNode> node;
         std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
-        bool nested{};
+        Kind kind{Kind::Primitive};
     };
     TokenSequence input;
     std::vector<Field> fields;

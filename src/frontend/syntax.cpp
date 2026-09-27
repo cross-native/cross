@@ -1025,11 +1025,47 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     };
     const auto copy_tokens = [&](TokenSequence& destination, std::size_t first, std::size_t last) {
         for (auto at = first; at < last; ++at) {
-            if (!charge(128 + tokens[at].text.size())) return false;
+            if (!charge(128 + tokens[at].text.size()) ||
+                (tokens[at].split_source &&
+                 !charge(32 + tokens[at].split_source->spelling.size()))) return false;
             destination.emplace_back(tokens[at]);
         }
         return true;
     };
+    const auto raw_group = [&](std::size_t first, std::size_t last)
+        -> std::shared_ptr<const SyntaxNode> {
+        std::shared_ptr<SyntaxNode> root;
+        std::vector<std::shared_ptr<SyntaxNode>> groups;
+        for (auto at = first; at < last; ++at) {
+            if (!execution_->work(tokens[at].location)) { failed = true; return {}; }
+            const auto origin = token_origin(tokens[at].location);
+            if (!closer(tokens[at].text).empty()) {
+                if (!execution_->work(tokens[at].location) || !charge(128) ||
+                    (!groups.empty() && !charge(16))) { failed = true; return {}; }
+                auto group = std::make_shared<SyntaxNode>();
+                group->kind = SyntaxNode::Kind::Group;
+                group->span = {origin.span, origin.span};
+                group->context = origin.context;
+                if (groups.empty()) root = group;
+                else groups.back()->children.push_back(group);
+                groups.push_back(std::move(group));
+            }
+            // group_end has already validated balance and depth. Build only
+            // public token/group nodes, never parsing or expanding contents.
+            if (groups.empty() || !charge(128 + 16)) { failed = true; return {}; }
+            auto leaf = std::make_shared<SyntaxNode>();
+            leaf->span = {origin.span, origin.span};
+            leaf->context = origin.context;
+            if (!copy_tokens(leaf->tokens, at, at + 1)) { failed = true; return {}; }
+            groups.back()->children.push_back(std::move(leaf));
+            if (closing(tokens[at].text)) {
+                groups.back()->span.last = origin.span;
+                groups.pop_back();
+            }
+        }
+        return root;
+    };
+    using FieldKind = SyntaxMatchValue::Field::Kind;
     struct Candidate {
         std::size_t end;
         std::shared_ptr<const SyntaxMatchValue> value;
@@ -1037,7 +1073,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     struct Piece {
         std::size_t end;
         std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
-        bool nested{};
+        FieldKind kind{FieldKind::Primitive};
         std::shared_ptr<const SyntaxNode> node;
     };
     using K = SyntaxPatternElement::Kind;
@@ -1062,9 +1098,9 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                     auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
                     if (!element.field.empty()) {
                         SyntaxMatchValue::Field field{element.field, {}, std::move(part.node),
-                            std::move(part.records), part.nested};
+                            std::move(part.records), part.kind};
                         if (!charge(64 + field.name.size())) { failed = true; break; }
-                        if (!part.nested && !field.node &&
+                        if ((part.kind == FieldKind::Primitive || part.kind == FieldKind::RawGroup) &&
                             !copy_tokens(field.tokens, candidate.end, part.end)) {
                             failed = true; break;
                         }
@@ -1095,7 +1131,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             if (!element.resolved_rule) return {};
             std::vector<Piece> output;
             for (auto& candidate : nested((*definitions_)[element.resolved_rule->value].pattern, start))
-                output.push_back({candidate.end, {candidate.value}, true, {}});
+                output.push_back({candidate.end, {candidate.value}, FieldKind::Nested, {}});
             return output;
         }
         if (element.kind == K::Choice) {
@@ -1109,14 +1145,14 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                         if (!charge(32 + possible.label.size())) { failed = true; return {}; }
                         value->variant_labels.push_back(possible.label);
                     }
-                    output.push_back({candidate.end, {std::move(value)}, true, {}});
+                    output.push_back({candidate.end, {std::move(value)}, FieldKind::Nested, {}});
                 }
             return output;
         }
         if (element.kind == K::Optional) {
-            std::vector<Piece> output{{start, {}, true, {}}};
+            std::vector<Piece> output{{start, {}, FieldKind::Nested, {}}};
             for (auto& candidate : nested(element.pattern, start))
-                if (candidate.end > start) output.push_back({candidate.end, {candidate.value}, true, {}});
+                if (candidate.end > start) output.push_back({candidate.end, {candidate.value}, FieldKind::Nested, {}});
             return output;
         }
         if (element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
@@ -1134,7 +1170,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 }
                 if (!require_one || !records.empty()) {
                     if (!charge(128 + 16 * records.size())) { failed = true; return; }
-                    output.push_back({at, records, true, {}});
+                    output.push_back({at, records, FieldKind::Nested, {}});
                 }
                 std::size_t body = at;
                 if (separated && !records.empty()) {
@@ -1227,7 +1263,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 failed = true;
                 return {};
             }
-            return {{parsed->end, {}, false, std::move(parsed->node)}};
+            return {{parsed->end, {}, FieldKind::Parsed, std::move(parsed->node)}};
         } else {
             const auto opening = tokens[position].text;
             if ((element.kind == K::Paren && opening != "(") ||
@@ -1236,9 +1272,12 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             const auto close = group_end(tokens, position, *execution_);
             if (!close) return {};
             position = *close + 1;
+            auto node = raw_group(start, position);
+            if (!node) return {};
+            return {{position, {}, FieldKind::RawGroup, std::move(node)}};
         }
         if (!execution_->work(tokens[start].location, position - start)) { failed = true; return {}; }
-        return {{position, {}, false, {}}};
+        return {{position, {}, FieldKind::Primitive, {}}};
     };
     auto matches = run(definition.pattern, begin + 1, 0);
     if (matches.empty() || failed) {

@@ -58,8 +58,16 @@ reject(parsed_expression_malformed "syntax-match error for active prefix"
     "${expander}syntax Bad : expression { prefix \"bad\"; match value:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32 + ; }\n")
 reject(parsed_expression_infix "requires a semicolon, comma, or closing-delimiter fence"
     "${expander}syntax Bad : expression { prefix \"bad\"; match left:expr \"+\" right:expr; expand expand; }\n")
-reject(parsed_node_on_raw "requires a parsed capture field"
-    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax node = $::syntax::node(input, \"body\"); return $::meta::tokens(node); } syntax Bad : expression { prefix \"bad\"; match body:paren; expand expand; } syntax Bad; global u32 entry() { return bad (1u32); }\n")
+reject(node_on_primitive "requires a parsed or raw-group capture field"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax node = $::syntax::node(input, \"body\"); return $::meta::tokens(node); } syntax Bad : expression { prefix \"bad\"; match body:literal; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(raw_group_count "syntax count/at requires a nested record field"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { uptr count = $::syntax::count(input, \"body\"); return $::quote { 1u32 }; } syntax Bad : expression { prefix \"bad\"; match body:group; expand expand; } syntax Bad; global u32 entry() { return bad (); }\n")
+reject(raw_group_storage "syntax match record byte or memory budget exceeded"
+    "${expander}${definition}syntax Value; global u32 entry() { return value (word (nested) [other] {raw}); }\n"
+    -feval-memory-limit=4096)
+reject(raw_group_depth "syntax-match error for active prefix"
+    "${expander}${definition}syntax Value; global u32 entry() { return value ((((())))); }\n"
+    -feval-depth-limit=4)
 reject(parsed_statement_incomplete "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad if (1u32) }\n")
 reject(parsed_for_initializer "syntax-match error for active prefix"

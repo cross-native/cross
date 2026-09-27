@@ -65,6 +65,47 @@ namespace flow {
     syntax Lit : expression { prefix "lit"; match body:literal; expand primitive; }
     syntax Name : expression { prefix "named"; match body:name; expand primitive; }
     syntax Bracket : expression { prefix "bracket"; match body:bracket; expand five; }
+    [[syntax_expander]] static $::meta::tokens group_shape(in $::meta::syntax_match input) {
+        $::meta::syntax root = $::syntax::node(input, "body");
+        if (!$::meta::is_kind(root, "group") || $::meta::child_count(root) != 6uptr)
+            return $::quote { 0u32 };
+        if (!$::meta::is_kind($::meta::child(root, 0uptr), "token") ||
+            !$::meta::is_kind($::meta::child(root, 5uptr), "token"))
+            return $::quote { 0u32 };
+        $::meta::syntax body = $::meta::child(root, 3uptr);
+        if (!$::meta::is_kind(body, "group") || $::meta::child_count(body) != 5uptr)
+            return $::quote { 0u32 };
+        for (uptr at = 1uptr; at < 4uptr; ++at)
+            if (!$::meta::is_kind($::meta::child(body, at), "group")) return $::quote { 0u32 };
+        if ($::meta::child_count($::meta::child(body, 1uptr)) != 3uptr ||
+            $::meta::child_count($::meta::child(body, 2uptr)) != 3uptr ||
+            $::meta::child_count($::meta::child(body, 3uptr)) != 2uptr)
+            return $::quote { 0u32 };
+        // Token-sequence len counts token trees, so the complete balanced
+        // group is one element even though its projection owns 15 tokens.
+        if ($::meta::len($::meta::tokens(root)) != 1uptr ||
+            $::meta::len($::syntax::capture(input, "body")) != 1uptr)
+            return $::quote { 0u32 };
+        return $::quote { 31u32 };
+    }
+    syntax RawParen : expression { prefix "raw_paren"; match body:paren; expand group_shape; }
+    syntax RawBracket : expression { prefix "raw_bracket"; match body:bracket; expand group_shape; }
+    syntax RawBlock : expression { prefix "raw_block"; match body:block; expand group_shape; }
+    syntax RawGroup : expression { prefix "raw_group"; match body:group; expand group_shape; }
+    [[syntax_expander]] static $::meta::tokens group_project(in $::meta::syntax_match input) {
+        return $::meta::tokens($::syntax::node(input, "body"));
+    }
+    syntax RawProject : expression { prefix "raw_project"; match body:paren; expand group_project; }
+    [[syntax_expander]] static $::meta::tokens group_record(in $::meta::syntax_match input) {
+        $::meta::syntax_match record = $::syntax::at(input, "record", 0uptr);
+        if (!$::syntax::is_variant(record, "group")) return $::quote { 0u32 };
+        if (!$::meta::is_kind($::syntax::node(record, "body"), "group") ||
+            $::meta::len($::syntax::capture(record, "body")) != 1uptr) return $::quote { 0u32 };
+        return $::meta::tokens($::syntax::node(record, "body"));
+    }
+    syntax RawRecord : expression {
+        prefix "raw_record"; match record:choice(group:(body:group)); expand group_record;
+    }
     syntax Bang : expression { prefix "bang"; match "!" body:literal; expand primitive; }
     [[syntax_expander]] static $::meta::tokens empty(in $::meta::syntax_match input) {
         return $::quote {};
@@ -462,6 +503,15 @@ namespace frozen {
     forwarded! { value += 4u32; }
     forwarded! { return value; }
 }
+[[noinline]] static u32 raw_groups() {
+    syntax flow::RawParen, flow::RawBracket, flow::RawBlock, flow::RawGroup, flow::RawProject, flow::RawRecord;
+    if (raw_paren (alien! { [[arbitrary]] [x] () } tail) != 31u32) return 0u32;
+    if (raw_bracket [alien! { [[arbitrary]] [x] () } tail] != 31u32) return 0u32;
+    if (raw_block {alien! { [[arbitrary]] [x] () } tail} != 31u32) return 0u32;
+    if (raw_group [[alien! { [[arbitrary]] [x] () } tail]] != 31u32) return 0u32;
+    if (raw_record (5u32 + 6u32) != 11u32) return 0u32;
+    return raw_project (3u32 + 4u32) * 2u32;
+}
 [[generic(u32 number), noinline]] static u32 actual() { return number; }
 [[noinline]] static u32 angle_boundary() {
     syntax flow::Greater;
@@ -524,6 +574,7 @@ global u32 syntax_raw_entry() {
     if (imports() != 105u32 || frozen::result() != 1u32) return 0u32;
     if (primitives() != 26u32) return 0u32;
     if (macro_statements() != 10u32) return 0u32;
+    if (raw_groups() != 14u32) return 0u32;
     if (angle_boundary() != 9u32) return 0u32;
     if (combinators() != 50u32) return 0u32;
     if (recursive_rules() != 27u32) return 0u32;

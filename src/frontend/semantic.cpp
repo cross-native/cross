@@ -6289,7 +6289,8 @@ private:
                 return std::nullopt;
             }
             if (name == "$::syntax::capture") {
-                if (found->nested || found->node) {
+                if (found->kind != SyntaxMatchValue::Field::Kind::Primitive &&
+                    found->kind != SyntaxMatchValue::Field::Kind::RawGroup) {
                     fail(expression.location, "syntax capture requires a primitive token field");
                     return std::nullopt;
                 }
@@ -6299,14 +6300,14 @@ private:
             }
             if (name == "$::syntax::node") {
                 if (!found->node) {
-                    fail(expression.location, "syntax node requires a parsed capture field");
+                    fail(expression.location, "syntax node requires a parsed or raw-group capture field");
                     return std::nullopt;
                 }
                 EvalValue value{UInt128{}, syntax_type()};
                 value.syntax_node = found->node;
                 return value;
             }
-            if (!found->nested) {
+            if (found->kind != SyntaxMatchValue::Field::Kind::Nested) {
                 fail(expression.location, "syntax count/at requires a nested record field");
                 return std::nullopt;
             }

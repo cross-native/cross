@@ -83,11 +83,57 @@ syntax Pack : bundle { use First; use Item; }
     const auto match = state.match(*selected, invocation_tokens, 0, diagnostics);
     require(match && match->end == 3 && match->value->input.front().text == "same",
             "raw input omitted its actual prefix or boundary");
+    require(match->value->fields.front().kind == SyntaxMatchValue::Field::Kind::RawGroup &&
+            match->value->fields.front().tokens.size() == 2 &&
+            match->value->fields.front().node->kind == SyntaxNode::Kind::Group &&
+            match->value->fields.front().node->children.size() == 2,
+            "empty raw capture lost either its tokens or delimiter tree");
     const auto errors = diagnostics.errors();
     auto output = execution->expand(match->expander, {}, match->value, invocation_tokens.front().location,
         "", {}, state.bindings());
     require(output && diagnostics.errors() == errors && output->tokens.front().text == "1u32",
             "target-independent syntax evaluation failed");
+
+    const auto* raw_source = sources.add("raw-group.x", "same (alien! { [[arbitrary]] [x] () } tail)");
+    auto raw_tokens = Lexer(*raw_source, diagnostics).lex();
+    const auto raw = state.match(*selected, raw_tokens, 0, diagnostics);
+    require(raw && diagnostics.errors() == errors, "raw sublanguage was parsed or expanded");
+    const auto& raw_field = raw->value->fields.front();
+    require(raw_field.kind == SyntaxMatchValue::Field::Kind::RawGroup && raw_field.node &&
+            raw_field.node->production == SyntaxProduction::None && raw_field.node->children.size() == 6,
+            "raw group has the wrong public schema");
+    const auto& block = *raw_field.node->children[3];
+    require(block.kind == SyntaxNode::Kind::Group && block.children.size() == 5 &&
+            block.children[1]->kind == SyntaxNode::Kind::Group &&
+            block.children[1]->children.size() == 3 &&
+            block.children[2]->children.size() == 3 && block.children[3]->children.size() == 2,
+            "nested raw delimiters were flattened");
+    require(raw_field.node->span.first.file == raw_source &&
+            raw_field.node->span.first.offset == raw_tokens[1].location.offset &&
+            raw_field.node->span.last.offset == raw_tokens[raw->end - 1].location.offset,
+            "raw group did not retain its original source span");
+    const auto projection = syntax_node_tokens(*raw_field.node);
+    require(projection.size() == raw_field.tokens.size() && projection.size() == raw->end - 1,
+            "raw group projection changed its bounded token count");
+    for (std::size_t at = 0; at < projection.size(); ++at) {
+        require(projection[at].kind == raw_tokens[at + 1].kind &&
+                projection[at].text == raw_tokens[at + 1].text &&
+                projection[at].origin.span.file == raw_source &&
+                projection[at].origin.span.offset == raw_tokens[at + 1].location.offset,
+                "raw group projection changed a source token");
+    }
+    raw_tokens[2].text = "changed";
+    require(syntax_node_tokens(*raw_field.node)[1].text == "alien" && raw_field.tokens[1].text == "alien",
+            "raw group or capture retained mutable lexer storage");
+    auto copied_origin = token_origin(raw_tokens[2].location);
+    copied_origin.context = origin.context;
+    const auto* contextual_source = sources.add("raw-group-context.x", raw_source->text, {},
+        {{raw_tokens[2].location.offset, raw_tokens[2].location.offset + 5, copied_origin}});
+    const auto contextual_tokens = Lexer(*contextual_source, diagnostics).lex();
+    const auto contextual_match = state.match(*selected, contextual_tokens, 0, diagnostics);
+    require(contextual_match && contextual_match->value->fields.front().node->children[1]->context == origin.context &&
+            syntax_node_tokens(*contextual_match->value->fields.front().node)[1].origin.context == origin.context,
+            "raw group lost a copied child's immutable lookup context");
 
     // Generic-close terminal fragments project back to the original lexical
     // token only when every adjacent piece has the same source identity.
