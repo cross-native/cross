@@ -2652,9 +2652,12 @@ public:
             if (!charge_meta_bytes(64 + field.name.size(), location) ||
                 !charge_input_tokens(field.tokens, location)) return false;
             if (field.node) {
-                const auto count = syntax_node_count(*field.node);
-                if (count > program_.evaluation_limits.memory / 128 ||
-                    !charge_meta_bytes(count * 128, location)) return false;
+                const auto size = syntax_node_storage(*field.node);
+                if (size > std::numeric_limits<std::size_t>::max()) {
+                    fail(location, "public syntax tree exceeds translation-time storage capacity");
+                    return false;
+                }
+                if (!charge_meta_bytes(static_cast<std::size_t>(size), location)) return false;
             }
             for (const auto& record : field.records)
                 if (!charge_input_match(*record, location)) return false;
@@ -3646,7 +3649,9 @@ private:
                 const auto condition = expression_type(*node.left);
                 const auto yes = expression_type(*node.right);
                 const auto no = expression_type(*node.third);
-                if (yes && no && yes->kind == Type::Kind::Tokens && no->kind == Type::Kind::Tokens) {
+                if (yes && no && yes->kind == no->kind &&
+                    (yes->kind == Type::Kind::Tokens || yes->kind == Type::Kind::SyntaxMatch ||
+                     yes->kind == Type::Kind::Syntax)) {
                     if (is_integer(condition) || is_floating(condition)) return true;
                     fail(node.location, "procedural macro condition must be scalar");
                     return false;
@@ -3954,8 +3959,13 @@ private:
                 expression.text == "<" || expression.text == ">" || expression.text == "<=" ||
                 expression.text == ">=" || expression.text == "&&" || expression.text == "||"))
                 return builtin_type(BuiltinType::Bool);
-            if (procedural_ && conditional && left->kind == Type::Kind::Tokens &&
-                right->kind == Type::Kind::Tokens) return tokens_type();
+            if (procedural_ && conditional && left->kind == right->kind &&
+                (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
+                 left->kind == Type::Kind::Syntax)) {
+                auto result = clone_type(left);
+                result->is_const = false;
+                return result;
+            }
             const auto object_pointer = [](const TypePtr& type) {
                 return type->kind == Type::Kind::Pointer && type->pointee &&
                     meta_object_type(type->pointee);
@@ -6357,7 +6367,7 @@ private:
                 argument->string->size() - argument->offset - 1);
             if (name == "$::meta::is_production")
                 return EvalValue{UInt128{node.kind == SyntaxNode::Kind::Core &&
-                    node.production == written}, builtin_type(BuiltinType::Bool)};
+                    syntax_production_name(node.production) == written}, builtin_type(BuiltinType::Bool)};
             static constexpr std::pair<std::string_view, SyntaxNode::Kind> kinds[] = {
                 {"token", SyntaxNode::Kind::Token}, {"group", SyntaxNode::Kind::Group},
                 {"core", SyntaxNode::Kind::Core}, {"extension", SyntaxNode::Kind::Extension},

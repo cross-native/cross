@@ -144,6 +144,7 @@ Parser::Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
 }
 
 const Token& Parser::current(std::size_t lookahead) const {
+    if (public_tree_failed_) return tokens_.back();
     const auto position = index_ + lookahead;
     return tokens_[position < tokens_.size() ? position : tokens_.size() - 1];
 }
@@ -394,16 +395,26 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     return child;
 }
 
-Parser::ProductionScope::ProductionScope(Parser& parser, std::string_view production)
+Parser::ProductionScope::ProductionScope(Parser& parser, SyntaxProduction production)
     : parser(parser), event(parser.begin_production(production)) {}
 
 Parser::ProductionScope::~ProductionScope() { parser.end_production(event); }
 
-std::size_t Parser::begin_production(std::string_view name) {
-    if (!recording_public_tree_ || name.empty())
+std::size_t Parser::begin_production(SyntaxProduction production) {
+    if (!recording_public_tree_ || production == SyntaxProduction::None)
         return std::numeric_limits<std::size_t>::max();
+    if (public_tree_failed_) return std::numeric_limits<std::size_t>::max();
+    const auto limits = syntax_ ? syntax_->execution()->limits() : EvaluationLimits{};
+    if (production_stack_.size() >= limits.depth ||
+        production_events_.size() >= std::min(limits.bytes, limits.memory) / 128 ||
+        (syntax_ && !syntax_->execution()->work(current().location))) {
+        if (syntax_) syntax_->execution()->tree_limit_error(current().location);
+        error_here("public syntax tree depth, work, or storage budget exceeded");
+        public_tree_failed_ = true;
+        return std::numeric_limits<std::size_t>::max();
+    }
     const auto event = production_events_.size();
-    production_events_.push_back({name, index_, index_, {}});
+    production_events_.push_back({production, index_, index_, {}, {}});
     if (!production_stack_.empty())
         production_events_[production_stack_.back()].children.push_back(event);
     production_stack_.push_back(event);
@@ -419,6 +430,7 @@ void Parser::end_production(std::size_t event) {
 std::shared_ptr<const SyntaxNode> Parser::public_node(std::size_t event) const {
     if (event >= production_events_.size()) return {};
     const auto& source = production_events_[event];
+    if (source.opaque) return source.opaque;
     if (source.first > source.end || source.end > tokens_.size() ||
         source.first >= tokens_.size()) return {};
     auto node = std::make_shared<SyntaxNode>();
@@ -455,6 +467,12 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     SyntaxPatternElement::Kind kind, std::size_t first) const {
     using K = SyntaxPatternElement::Kind;
     if (first >= tokens_.size() || tokens_[first].kind == TokenKind::End) return {};
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    if (execution && !execution->begin_fragment(tokens_[first].location, tokens_.size())) return {};
+    struct FragmentEnd {
+        SyntaxExecution* execution;
+        ~FragmentEnd() { if (execution) execution->end_fragment(); }
+    } end{execution.get()};
     // Speculative alternatives must not emit diagnostics or mutate the owner's
     // parser. A child receives the same caller-side type and syntax environment.
     std::ostringstream output;
@@ -463,27 +481,134 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     child->index_ = first;
     child->parsing_public_fragment_ = true;
     child->recording_public_tree_ = true;
+    const auto origin = token_origin(tokens_[first].location);
+    if (origin.context) {
+        child->active_namespace_ = origin.context->name_space;
+        child->active_imports_ = origin.context->imports;
+    }
     if (kind == K::Expr) {
         (void)child->parse_assignment();
     } else if (kind == K::Type) {
-        ProductionScope scope(*child, "type_name");
+        ProductionScope scope(*child, SyntaxProduction::TypeName);
         if (!child->type_start()) return {};
         auto type = child->parse_type();
         std::optional<std::string> name;
         (void)child->parse_declarator(std::move(type), name);
         if (name) return {};
+    } else if (kind == K::Statement) {
+        (void)child->parse_statement();
+    } else if (kind == K::Declaration || kind == K::FunctionHeader ||
+               kind == K::FunctionDeclaration || kind == K::FunctionDefinition) {
+        // These categories exclude namespaces, registration, and invocations
+        // standing in place of the direct declaration/header itself.
+        if (child->current().is("namespace") || child->current().is("using") ||
+            child->current().is("syntax") || child->macro_start() ||
+            child->active_syntax(true)) return {};
+        child->parsing_public_function_header_ = kind == K::FunctionHeader;
+        Program parsed;
+        child->parse_external(parsed, child->active_namespace_);
+        const bool direct_function = parsed.functions.size() == 1 &&
+            parsed.objects.empty() && parsed.records.empty() &&
+            parsed.enumerations.empty() && parsed.global_labels.empty();
+        if (kind == K::FunctionHeader) {
+            if (!direct_function || (!child->current().is(";") &&
+                                     !child->current().is("{"))) return {};
+        } else if (kind == K::FunctionDeclaration) {
+            if (!direct_function || parsed.functions.front()->body) return {};
+        } else if (kind == K::FunctionDefinition) {
+            if (!direct_function || !parsed.functions.front()->body) return {};
+        } else if (std::any_of(parsed.functions.begin(), parsed.functions.end(),
+                   [](const auto& function) { return function->body != nullptr; })) return {};
     } else {
+        return {};
+    }
+    if (child->public_tree_failed_) {
+        if (!execution) diagnostics_.error(tokens_[first].location,
+            "public syntax tree depth, work, or storage budget exceeded");
         return {};
     }
     if (local.errors() != 0 || child->index_ <= first ||
         child->production_events_.empty()) return {};
-    const auto& next = child->current();
-    if (next.kind != TokenKind::End && !next.is(";") && !next.is(",") &&
-        !next.is(")") && !next.is("]") && !next.is("]]") &&
-        !next.is("}")) return {};
+    if (kind == K::Expr || kind == K::Type) {
+        const auto& next = child->current();
+        if (next.kind != TokenKind::End && !next.is(";") && !next.is(",") &&
+            !next.is(")") && !next.is("]") && !next.is("]]") &&
+            !next.is("}")) return {};
+    }
     auto node = child->public_node(0);
     if (!node) return {};
     return SyntaxParsedFragment{child->index_, std::move(node)};
+}
+
+std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(bool item) {
+    if (!syntax_) return {};
+    const auto first = index_;
+    auto node = std::make_shared<SyntaxNode>();
+    if (macro_start()) {
+        node->kind = SyntaxNode::Kind::Macro;
+        ++index_;
+        while (current().is("::")) index_ += 2;
+        expect("!");
+        const auto opening = current().text;
+        if (opening != "(" && opening != "[" && opening != "{") return {};
+        std::vector<std::string_view> closers;
+        do {
+            if (!syntax_->execution()->work(current().location)) return {};
+            const auto text = current().text;
+            if (text == "(" || text == "[" || text == "[[" || text == "{") {
+                if (closers.size() >= syntax_->execution()->limits().depth) {
+                    error_here("opaque macro token-tree depth exceeded");
+                    return {};
+                }
+                closers.push_back(text == "(" ? ")" : text == "[" ? "]" : text == "[[" ? "]]" : "}");
+            } else if (text == ")" || text == "]" || text == "]]" || text == "}") {
+                if (closers.empty() || closers.back() != text) {
+                    error_here("mismatched opaque macro token-tree delimiter");
+                    return {};
+                }
+                closers.pop_back();
+            }
+            ++index_;
+        } while (!closers.empty() && current().kind != TokenKind::End);
+        if (!closers.empty()) {
+            error_here("unterminated opaque macro token tree");
+            return {};
+        }
+    } else {
+        const auto* definition = active_syntax(item);
+        if (!definition) return {};
+        if (!item && definition->kind != SyntaxKind::Expression) {
+            error_here("statement syntax is not valid at expression position");
+            ++index_;
+            return {};
+        }
+        const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_,
+            [&](std::size_t begin, std::size_t body_open) {
+                return validate_syntax_function_header(begin, body_open, active_namespace_, active_imports_);
+            }, [&](SyntaxPatternElement::Kind kind, std::size_t begin) {
+                return parse_syntax_fragment(kind, begin);
+            });
+        if (!matched) return {};
+        node->kind = SyntaxNode::Kind::Extension;
+        node->definition = definition->id;
+        node->match = matched->value;
+        index_ = matched->end;
+    }
+    node->span = {token_origin(tokens_[first].location).span,
+                  token_origin(tokens_[index_ - 1].location).span};
+    node->context = token_origin(tokens_[first].location).context;
+    if (!node->context) node->context = syntax_->execution()->call_context(
+        tokens_[first].location, active_namespace_, active_imports_, syntax_->bindings());
+    for (auto at = first; at < index_; ++at) {
+        MetaToken token(tokens_[at]);
+        if (!token.origin.context) token.origin.context = node->context;
+        node->tokens.push_back(std::move(token));
+    }
+    const auto event = production_events_.size();
+    production_events_.push_back({SyntaxProduction::None, first, index_, {}, node});
+    if (!production_stack_.empty())
+        production_events_[production_stack_.back()].children.push_back(event);
+    return node;
 }
 
 void Parser::adopt_replacement(Parser& child) {
@@ -589,8 +714,11 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
 
 std::vector<Attribute> Parser::parse_attributes() {
     std::vector<Attribute> result;
-    while (consume("[[")) {
+    while (current().is("[[")) {
+        ProductionScope attribute_specifier(*this, SyntaxProduction::AttributeSpecifier);
+        consume("[[");
         do {
+            ProductionScope attribute_production(*this, SyntaxProduction::Attribute);
             if (current().kind == TokenKind::BuiltinName) {
                 diagnostics_.error(
                     current().location,
@@ -599,8 +727,10 @@ std::vector<Attribute> Parser::parse_attributes() {
                 while (!current().is("]]" ) && current().kind != TokenKind::End) ++index_;
                 break;
             }
+            const auto name_event = begin_production(SyntaxProduction::AttributeName);
             const auto* first = consume_kind(TokenKind::Identifier);
             if (!first) {
+                end_production(name_event);
                 error_here("expected attribute name");
                 while (!current().is("]]" ) && current().kind != TokenKind::End) ++index_;
                 break;
@@ -615,6 +745,7 @@ std::vector<Attribute> Parser::parse_attributes() {
                 name += "::";
                 name += component->text;
             }
+            end_production(name_event);
             Attribute attribute{std::move(name), {}, first->location};
             if (consume("(")) {
                 if (attribute.name == "generic") {
@@ -806,7 +937,7 @@ void Parser::apply_type_attributes(
 
 std::optional<std::string> Parser::parse_qualified_name() {
     if (current().kind != TokenKind::Identifier) return std::nullopt;
-    ProductionScope production(*this, "qualified_name");
+    ProductionScope production(*this, SyntaxProduction::QualifiedName);
     const auto* first = consume_kind(TokenKind::Identifier);
     if (!first) return std::nullopt;
     std::string name(first->text);
@@ -1590,6 +1721,17 @@ void Parser::parse_typedef(const std::string& name_space,
 }
 
 void Parser::parse_external(Program& program, const std::string& name_space) {
+    ProductionScope production(*this, parsing_public_fragment_
+        ? SyntaxProduction::Declaration : SyntaxProduction::None);
+    if (parsing_public_fragment_ && (current().is("syntax") ||
+        current().is("namespace") || current().is("using") ||
+        current().is("$::static_assert") || macro_start() || active_syntax(true) ||
+        (current().is("[[") && (current(1).is("macro") ||
+         current(1).is("syntax_expander"))))) {
+        error_here("parsed declaration requires a direct core declaration");
+        ++index_;
+        return;
+    }
     struct NamespaceRestore {
         std::string& value;
         std::string previous;
@@ -1744,6 +1886,11 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
             location, std::move(*name), name_space, std::move(result_type),
             linkage, inline_hint, std::move(attributes), std::move(signature),
             std::move(angle_parameters));
+        if (recording_public_tree_ && !public_tree_failed_ && function) {
+            production_events_[production.event].production =
+                parsing_public_function_header_ ? SyntaxProduction::FunctionHeader
+                : function->body ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration;
+        }
         if (function) program.functions.push_back(std::move(function));
     } else {
         known_ordinary_values_.insert(*name);
@@ -1960,6 +2107,7 @@ void Parser::parse_record_declaration(
 }
 
 bool Parser::parse_static_assertion() {
+    ProductionScope production(*this, SyntaxProduction::StaticAssertDeclaration);
     const auto location = current().location;
     consume("$::static_assert");
     expect("(");
@@ -2092,6 +2240,7 @@ Parser::parse_function(SourceLocation location, std::string name,
     function->attributes.insert(function->attributes.end(),
                                 std::make_move_iterator(trailing.begin()),
                                 std::make_move_iterator(trailing.end()));
+    if (parsing_public_function_header_) return function;
     if (consume(";")) return function;
     if (!current().is("{")) {
         error_here("expected ';' or function body");
@@ -2142,6 +2291,7 @@ bool Parser::local_declaration_start() const {
 
 std::unique_ptr<Statement>
 Parser::parse_local_declaration(std::vector<Attribute> attributes) {
+    ProductionScope production(*this, SyntaxProduction::Declaration);
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Declaration;
     statement->location = current().location;
@@ -2204,6 +2354,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
 }
 
 std::unique_ptr<Statement> Parser::parse_compound() {
+    ProductionScope production(*this, SyntaxProduction::CompoundStatement);
     const auto saved_imports = active_imports_;
     const auto saved_scope_imports = current_scope_imports_;
     current_scope_imports_ = 0;
@@ -2225,7 +2376,9 @@ std::unique_ptr<Statement> Parser::parse_compound() {
             (void)parse_syntax_registration(nullptr);
             statement->statements.push_back(std::move(declaration));
         }
-        else if (consume("using")) {
+        else if (current().is("using")) {
+            ProductionScope using_declaration(*this, SyntaxProduction::UsingDeclaration);
+            consume("using");
             auto declaration = std::make_unique<Statement>();
             declaration->kind = Statement::Kind::Empty;
             declaration->location = tokens_[index_ - 1].location;
@@ -2250,6 +2403,49 @@ std::unique_ptr<Statement> Parser::parse_compound() {
 }
 
 std::unique_ptr<Statement> Parser::parse_statement() {
+    ProductionScope production(*this, SyntaxProduction::Statement);
+    auto attributes = parse_attributes();
+    return parse_unattributed_statement(std::move(attributes));
+}
+
+std::unique_ptr<Statement> Parser::parse_unattributed_statement(
+    std::vector<Attribute> attributes) {
+    ProductionScope production(*this, SyntaxProduction::UnattributedStatement);
+    if (!attributes.empty()) {
+        if (current().is("global") && current(1).is("label") &&
+            current(2).kind == TokenKind::Identifier && current(3).is(":"))
+            return parse_global_label_statement(std::move(attributes));
+        if (local_declaration_start())
+            return parse_local_declaration(std::move(attributes));
+        if (current().is("return")) {
+            bool musttail_seen = false;
+            std::vector<Attribute> valid;
+            for (auto& attribute : attributes) {
+                if (attribute.name != "musttail") {
+                    diagnostics_.error(attribute.location, "attribute '" + attribute.name +
+                        "' is not valid on a return statement");
+                    continue;
+                }
+                if (!attribute.arguments.empty()) {
+                    diagnostics_.error(attribute.location, "musttail does not take arguments");
+                    continue;
+                }
+                if (musttail_seen) {
+                    diagnostics_.error(attribute.location,
+                        "a return statement has at most one musttail attribute");
+                    continue;
+                }
+                musttail_seen = true;
+                valid.push_back(std::move(attribute));
+            }
+            attributes = std::move(valid);
+        } else {
+            for (const auto& attribute : attributes)
+                diagnostics_.error(attribute.location, "attribute '" + attribute.name +
+                    "' is not valid on this statement");
+            attributes.clear();
+        }
+    }
     if (current().is("syntax") && (syntax_ || token_origin(current().location).context)) {
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Empty;
@@ -2260,6 +2456,14 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         ++index_;
         synchronize_external();
         return statement;
+    }
+    if (parsing_public_fragment_ && (macro_start() || active_syntax(false))) {
+        error_here("nested expansion requires an opaque public statement node");
+        auto placeholder = std::make_unique<Statement>();
+        placeholder->kind = Statement::Kind::Empty;
+        placeholder->location = current().location;
+        ++index_;
+        return placeholder;
     }
     if (syntax_ && macro_start()) return parse_statement_replacement();
     if (const auto* definition = active_syntax(false)) {
@@ -2272,49 +2476,6 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         return statement;
     }
     if (current().is("{")) return parse_compound();
-    if (current().is("[[")) {
-        auto attributes = parse_attributes();
-        if (current().is("global") && current(1).is("label") &&
-            current(2).kind == TokenKind::Identifier && current(3).is(":")) {
-            return parse_global_label_statement(std::move(attributes));
-        }
-        if (local_declaration_start()) {
-            return parse_local_declaration(std::move(attributes));
-        }
-        if (current().is("return")) {
-            auto statement = parse_statement();
-            bool musttail_seen = false;
-            for (auto& attribute : attributes) {
-                if (attribute.name != "musttail") {
-                    diagnostics_.error(
-                        attribute.location,
-                        "attribute '" + attribute.name +
-                            "' is not valid on a return statement");
-                    continue;
-                }
-                if (!attribute.arguments.empty()) {
-                    diagnostics_.error(attribute.location,
-                                       "musttail does not take arguments");
-                    continue;
-                }
-                if (musttail_seen) {
-                    diagnostics_.error(attribute.location,
-                                       "a return statement has at most one musttail attribute");
-                    continue;
-                }
-                musttail_seen = true;
-                statement->attributes.push_back(std::move(attribute));
-            }
-            return statement;
-        }
-        for (const auto& attribute : attributes) {
-            diagnostics_.error(
-                attribute.location,
-                "attribute '" + attribute.name +
-                    "' is not valid on this statement");
-        }
-        return parse_statement();
-    }
     if (current().is("$::static_assert")) {
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Empty;
@@ -2328,6 +2489,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
     }
     if ((current().kind == TokenKind::Identifier && !current().is("default") && current(1).is(":")) ||
         (current().is("label") && current(1).kind == TokenKind::Identifier && current(2).is(":"))) {
+        ProductionScope labeled_statement(*this, SyntaxProduction::LabeledStatement);
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Label;
         statement->location = current().location;
@@ -2335,15 +2497,26 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         else statement->label_name = std::string(current().text);
         ++index_;
         expect(":");
+        if (parsing_public_fragment_) statement->first = parse_statement();
         return statement;
     }
     if (local_declaration_start()) return parse_local_declaration();
+    const auto selected_production = current().is("if") || current().is("switch")
+        ? SyntaxProduction::SelectionStatement
+        : current().is("while") || current().is("do") || current().is("for")
+            ? SyntaxProduction::IterationStatement
+        : current().is("return") || current().is("goto") || current().is("break") ||
+          current().is("continue") ? SyntaxProduction::JumpStatement
+        : current().is("case") || current().is("default") ? SyntaxProduction::LabeledStatement
+        : SyntaxProduction::ExpressionStatement;
+    ProductionScope selected(*this, selected_production);
     const auto location = current().location;
     auto statement = std::make_unique<Statement>();
     statement->location = location;
     if (consume(";")) { statement->kind = Statement::Kind::Empty; return statement; }
     if (consume("return")) {
         statement->kind = Statement::Kind::Return;
+        statement->attributes = std::move(attributes);
         if (!current().is(";")) statement->expression = parse_expression();
         expect(";");
         return statement;
@@ -2396,12 +2569,12 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         } else if (local_declaration_start()) {
             statement->first = parse_local_declaration();
         } else if (current().is("[[")) {
-            auto attributes = parse_attributes();
+            auto initializer_attributes = parse_attributes();
             if (local_declaration_start()) {
                 statement->first =
-                    parse_local_declaration(std::move(attributes));
+                    parse_local_declaration(std::move(initializer_attributes));
             } else {
-                for (const auto& attribute : attributes) {
+                for (const auto& attribute : initializer_attributes) {
                     diagnostics_.error(
                         attribute.location,
                         "attribute '" + attribute.name +
@@ -2466,6 +2639,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
 
 std::unique_ptr<Statement> Parser::parse_global_label_statement(
     std::vector<Attribute> attributes) {
+    ProductionScope production(*this, SyntaxProduction::LabeledStatement);
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Label;
     statement->location = current().location;
@@ -2480,6 +2654,7 @@ std::unique_ptr<Statement> Parser::parse_global_label_statement(
         statement->label_name = std::string(name->text);
     }
     expect(":", "after global label name");
+    if (parsing_public_fragment_) statement->first = parse_statement();
     return statement;
 }
 
@@ -2498,7 +2673,7 @@ int Parser::precedence(std::string_view operation) {
 }
 
 std::unique_ptr<Expr> Parser::parse_expression(std::unique_ptr<Expr> seed) {
-    ProductionScope production(*this, "expression");
+    ProductionScope production(*this, SyntaxProduction::Expression);
     return parse_assignment(std::move(seed));
 }
 
@@ -2543,7 +2718,7 @@ std::unique_ptr<Expr> Parser::parse_initializer() {
 }
 
 std::unique_ptr<Expr> Parser::parse_assignment(std::unique_ptr<Expr> seed) {
-    ProductionScope production(*this, "assignment_expression");
+    ProductionScope production(*this, SyntaxProduction::AssignmentExpression);
     auto left = parse_conditional(std::move(seed));
     if (current().is("=") || current().is("+=") || current().is("-=") ||
         current().is("*=") || current().is("/=") || current().is("%=") ||
@@ -2552,7 +2727,7 @@ std::unique_ptr<Expr> Parser::parse_assignment(std::unique_ptr<Expr> seed) {
         current().is("|=")) {
         const auto operation = current();
         {
-            ProductionScope assignment_operator(*this, "assignment_operator");
+            ProductionScope assignment_operator(*this, SyntaxProduction::AssignmentOperator);
             ++index_;
         }
         auto result = std::make_unique<Expr>();
@@ -2567,7 +2742,7 @@ std::unique_ptr<Expr> Parser::parse_assignment(std::unique_ptr<Expr> seed) {
 }
 
 std::unique_ptr<Expr> Parser::parse_conditional(std::unique_ptr<Expr> seed) {
-    ProductionScope production(*this, "conditional_expression");
+    ProductionScope production(*this, SyntaxProduction::ConditionalExpression);
     auto condition = parse_binary(1, std::move(seed));
     if (!consume("?")) return condition;
     auto result = std::make_unique<Expr>();
@@ -2581,11 +2756,13 @@ std::unique_ptr<Expr> Parser::parse_conditional(std::unique_ptr<Expr> seed) {
 }
 
 std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence, std::unique_ptr<Expr> seed) {
-    static constexpr std::string_view productions[] = {
-        "", "logical_or_expression", "logical_and_expression",
-        "inclusive_or_expression", "exclusive_or_expression",
-        "and_expression", "equality_expression", "relational_expression",
-        "shift_expression", "additive_expression", "multiplicative_expression"};
+    static constexpr SyntaxProduction productions[] = {
+        SyntaxProduction::None, SyntaxProduction::LogicalOrExpression,
+        SyntaxProduction::LogicalAndExpression, SyntaxProduction::InclusiveOrExpression,
+        SyntaxProduction::ExclusiveOrExpression, SyntaxProduction::AndExpression,
+        SyntaxProduction::EqualityExpression, SyntaxProduction::RelationalExpression,
+        SyntaxProduction::ShiftExpression, SyntaxProduction::AdditiveExpression,
+        SyntaxProduction::MultiplicativeExpression};
     ProductionScope production(*this, productions[minimum_precedence]);
     auto left = minimum_precedence == 10
         ? (seed ? parse_postfix(std::move(seed)) : parse_cast())
@@ -2610,7 +2787,7 @@ std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence, std::unique_p
 }
 
 std::unique_ptr<Expr> Parser::parse_cast() {
-    ProductionScope production(*this, "cast_expression");
+    ProductionScope production(*this, SyntaxProduction::CastExpression);
     if (current().is("(")) {
         const auto saved = index_;
         ++index_;
@@ -2622,7 +2799,7 @@ std::unique_ptr<Expr> Parser::parse_cast() {
             TypePtr type;
             std::optional<std::string> name;
             {
-                ProductionScope type_name(*this, "type_name");
+                ProductionScope type_name(*this, SyntaxProduction::TypeName);
                 type = parse_type();
                 type = parse_declarator(std::move(type), name);
             }
@@ -2643,7 +2820,7 @@ std::unique_ptr<Expr> Parser::parse_cast() {
 }
 
 std::unique_ptr<Expr> Parser::parse_unary() {
-    ProductionScope production(*this, "unary_expression");
+    ProductionScope production(*this, SyntaxProduction::UnaryExpression);
     if (current().is("sizeof")) {
         const auto location = current().location;
         consume("sizeof");
@@ -2659,7 +2836,7 @@ std::unique_ptr<Expr> Parser::parse_unary() {
                 consume("(");
                 std::optional<std::string> name;
                 {
-                    ProductionScope type_name(*this, "type_name");
+                    ProductionScope type_name(*this, SyntaxProduction::TypeName);
                     result->type = parse_type();
                     result->type = parse_declarator(std::move(result->type), name);
                 }
@@ -2690,7 +2867,7 @@ std::unique_ptr<Expr> Parser::parse_unary() {
 }
 
 std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
-    ProductionScope production(*this, "postfix_expression");
+    ProductionScope production(*this, SyntaxProduction::PostfixExpression);
     auto expression = seed ? std::move(seed) : parse_primary();
     for (;;) {
         const bool explicit_generic = current().is("::") &&
@@ -2699,7 +2876,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                                       expression->kind == Expr::Kind::Name &&
                                       known_generic_name(*expression);
         if (explicit_generic || inferred_generic) {
-            ProductionScope generic_arguments(*this, "generic_arguments");
+            ProductionScope generic_arguments(*this, SyntaxProduction::GenericArguments);
             index_ += explicit_generic ? 2 : 1;
             if (consume(">")) {
                 error_here("a generic argument list cannot be empty");
@@ -2734,7 +2911,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
             call->generic_arguments = std::move(expression->generic_arguments);
             call->left = std::move(expression);
             {
-                ProductionScope argument_list(*this, "argument_list");
+                ProductionScope argument_list(*this, SyntaxProduction::ArgumentList);
                 if (!current().is(")")) {
                     do { call->arguments.push_back(parse_assignment()); } while (consume(","));
                 }
@@ -2849,7 +3026,7 @@ std::unique_ptr<Expr> Parser::parse_quote() {
 }
 
 std::unique_ptr<Expr> Parser::parse_primary() {
-    ProductionScope production(*this, "primary_expression");
+    ProductionScope production(*this, SyntaxProduction::PrimaryExpression);
     if (current().is("syntax") &&
         (replacement_ || token_origin(current().location).context)) {
         error_here("expansion output cannot introduce syntax registration");
@@ -2862,12 +3039,14 @@ std::unique_ptr<Expr> Parser::parse_primary() {
     }
     if (syntax_ && (macro_start() || active_syntax(false))) {
         if (parsing_public_fragment_) {
-            error_here("nested expansion requires a deferred public fragment");
             auto placeholder = std::make_unique<Expr>();
             placeholder->kind = Expr::Kind::Integer;
             placeholder->text = "0";
             placeholder->location = current().location;
-            ++index_;
+            if (!parse_opaque_invocation(false)) {
+                error_here("could not recognize a bounded opaque expression invocation");
+                if (index_ < tokens_.size() && current().kind != TokenKind::End) ++index_;
+            }
             return placeholder;
         }
         return parse_expression_replacement();
@@ -2882,7 +3061,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         result->kind = Expr::Kind::Alignof;
         result->location = item.location;
         if (type_start()) {
-            ProductionScope type_name(*this, "type_name");
+            ProductionScope type_name(*this, SyntaxProduction::TypeName);
             result->type = parse_type();
             std::optional<std::string> name;
             result->type = parse_declarator(std::move(result->type), name);
@@ -2910,11 +3089,11 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         return result;
     }
     auto result = std::make_unique<Expr>();
-    const auto atom = item.kind == TokenKind::Identifier ? std::string_view{}
-        : item.kind == TokenKind::BuiltinName ? std::string_view{"builtin_name"}
+    const auto atom = item.kind == TokenKind::Identifier ? SyntaxProduction::None
+        : item.kind == TokenKind::BuiltinName ? SyntaxProduction::BuiltinName
         : item.kind == TokenKind::Integer || item.kind == TokenKind::Floating ||
           item.kind == TokenKind::String || item.kind == TokenKind::Character
-            ? std::string_view{"literal"} : std::string_view{};
+            ? SyntaxProduction::Literal : SyntaxProduction::None;
     ProductionScope atom_production(*this, atom);
     result->location = item.location;
     result->text = std::string(item.text);

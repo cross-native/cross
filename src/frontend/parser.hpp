@@ -41,6 +41,7 @@ private:
                                          const std::vector<std::string>& imports) const;
     std::optional<SyntaxParsedFragment> parse_syntax_fragment(
         SyntaxPatternElement::Kind kind, std::size_t first) const;
+    std::shared_ptr<const SyntaxNode> parse_opaque_invocation(bool item);
     std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output,
                                                 Diagnostics* diagnostics = nullptr) const;
     void adopt_replacement(Parser& child);
@@ -99,6 +100,7 @@ private:
     ParameterDecl parse_parameter(unsigned ordinal);
 
     std::unique_ptr<Statement> parse_statement();
+    std::unique_ptr<Statement> parse_unattributed_statement(std::vector<Attribute> attributes);
     std::unique_ptr<Statement>
     parse_global_label_statement(std::vector<Attribute> attributes = {});
     std::unique_ptr<Statement> parse_compound();
@@ -121,18 +123,19 @@ private:
     static int precedence(std::string_view operation);
 
     struct ProductionEvent {
-        std::string_view production;
+        SyntaxProduction production;
         std::size_t first{};
         std::size_t end{};
         std::vector<std::size_t> children;
+        std::shared_ptr<const SyntaxNode> opaque;
     };
     struct ProductionScope {
         Parser& parser;
         std::size_t event;
-        ProductionScope(Parser& parser, std::string_view production);
+        ProductionScope(Parser& parser, SyntaxProduction production);
         ~ProductionScope();
     };
-    std::size_t begin_production(std::string_view name);
+    std::size_t begin_production(SyntaxProduction production);
     void end_production(std::size_t event);
     std::shared_ptr<const SyntaxNode> public_node(std::size_t event) const;
 
@@ -161,7 +164,9 @@ private:
     bool parsing_generic_argument_{};
     bool parsing_procedural_body_{};
     bool parsing_public_fragment_{};
+    bool parsing_public_function_header_{};
     bool recording_public_tree_{};
+    bool public_tree_failed_{};
     std::vector<ProductionEvent> production_events_;
     std::vector<std::size_t> production_stack_;
     unsigned switch_depth_{};

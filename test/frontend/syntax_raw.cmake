@@ -56,8 +56,36 @@ reject(clause "requires prefix, match, and expand in order"
     "${expander}syntax Bad : expression { match body:paren; prefix \"bad\"; expand expand; }\n")
 reject(parsed_expression_malformed "syntax-match error for active prefix"
     "${expander}syntax Bad : expression { prefix \"bad\"; match value:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32 + ; }\n")
+reject(parsed_expression_infix "requires a semicolon, comma, or closing-delimiter fence"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match left:expr \"+\" right:expr; expand expand; }\n")
 reject(parsed_node_on_raw "requires a parsed capture field"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax node = $::syntax::node(input, \"body\"); return $::meta::tokens(node); } syntax Bad : expression { prefix \"bad\"; match body:paren; expand expand; } syntax Bad; global u32 entry() { return bad (1u32); }\n")
+reject(parsed_statement_incomplete "syntax-match error for active prefix"
+    "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad if (1u32) }\n")
+reject(parsed_declaration_definition "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match body:declaration; expand expand; } syntax Bad; bad static u32 value() { return 1u32; }\n")
+reject(parsed_definition_prototype "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match body:function_def; expand expand; } syntax Bad; bad static u32 value();\n")
+reject(parsed_prototype_definition "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match body:function_decl; expand expand; } syntax Bad; bad static u32 value() { return 1u32; }\n")
+reject(parsed_header_object "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match header:function_header body:block; expand expand; } syntax Bad; bad static u32 value { raw; }\n")
+reject(parsed_declaration_namespace "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match body:declaration; expand expand; } syntax Bad; bad namespace named {}\n")
+reject(parsed_tree_depth "public syntax tree depth, work, or storage budget exceeded"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n"
+    -feval-depth-limit=8)
+reject(parsed_tree_storage "syntax match record byte or memory budget exceeded|public syntax tree depth, work, or storage budget exceeded"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n"
+    -feval-memory-limit=2048)
+reject(parsed_tree_layout "layout query requires a runtime object type"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { uptr width = sizeof($::meta::syntax); return $::quote { 1u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(parsed_child_bounds "syntax child index is out of range"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::meta::tokens($::meta::child($::syntax::node(input, \"body\"), 100uptr)); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(parsed_primitive_field "syntax capture requires a primitive token field"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::syntax::capture(input, \"body\"); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(parsed_unknown_kind "unknown public syntax node kind"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_kind($::syntax::node(input, \"body\"), \"unknown\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(fence "followed immediately by terminal ';'"
     "${expander}syntax Bad : expression { prefix \"bad\"; match value:tokens_until(\";\"); expand expand; }\n")
 reject(match "syntax-match error for active prefix"

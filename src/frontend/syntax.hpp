@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cross {
@@ -22,11 +23,27 @@ struct SyntaxSpan {
     SourceLocation last;
 };
 
+enum class SyntaxProduction {
+    None, Declaration, FunctionHeader, FunctionDefinition, TypeName,
+    AttributeSpecifier, Attribute, AttributeName, QualifiedName,
+    Statement, UnattributedStatement, CompoundStatement, UsingDeclaration,
+    LabeledStatement, SelectionStatement, IterationStatement, JumpStatement,
+    ExpressionStatement, StaticAssertDeclaration,
+    Expression, AssignmentExpression, AssignmentOperator, ConditionalExpression,
+    LogicalOrExpression, LogicalAndExpression, InclusiveOrExpression,
+    ExclusiveOrExpression, AndExpression, EqualityExpression,
+    RelationalExpression, ShiftExpression, AdditiveExpression,
+    MultiplicativeExpression, CastExpression, UnaryExpression,
+    PostfixExpression, PrimaryExpression, ArgumentList, GenericArguments,
+    BuiltinName, Literal,
+};
+std::string_view syntax_production_name(SyntaxProduction production);
+
 // The public, versioned tree is independent of typed AST/HIR. Every node
 // owns its lexical identity and remains immutable after construction.
 struct SyntaxNode {
     enum class Kind { Token, Group, Core, Extension, Macro, Deferred } kind{Kind::Token};
-    std::string production;
+    SyntaxProduction production{SyntaxProduction::None};
     TokenSequence tokens;
     std::vector<std::shared_ptr<const SyntaxNode>> children;
     SyntaxSpan span;
@@ -37,6 +54,7 @@ struct SyntaxNode {
 
 TokenSequence syntax_node_tokens(const SyntaxNode& node);
 std::size_t syntax_node_count(const SyntaxNode& node);
+std::uint64_t syntax_node_storage(const SyntaxNode& node);
 
 // Public match records are translation-only, not runtime records or typed HIR.
 struct SyntaxMatchValue {
@@ -122,6 +140,9 @@ public:
         const std::vector<SyntaxBinding>& bindings);
     bool begin_replacement(SourceLocation location);
     void end_replacement();
+    bool begin_fragment(SourceLocation location, std::size_t copied_tokens);
+    void end_fragment();
+    void tree_limit_error(SourceLocation location);
     bool work(SourceLocation location, std::uint64_t amount = 1);
     std::shared_ptr<const SyntaxContext> call_context(SourceLocation location,
         std::string_view name_space, const std::vector<std::string>& imports,
@@ -143,6 +164,7 @@ private:
     std::vector<Function> functions_;
     std::uint64_t work_{};
     unsigned depth_{};
+    unsigned fragment_depth_{};
     unsigned expansions_{};
 };
 

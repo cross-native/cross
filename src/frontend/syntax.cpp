@@ -7,10 +7,31 @@
 
 #include <algorithm>
 #include <functional>
+#include <iterator>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 
 namespace cross {
+
+std::string_view syntax_production_name(SyntaxProduction production) {
+    static constexpr std::string_view names[] = {
+        "", "declaration", "function_header", "function_definition", "type_name",
+        "attribute_specifier", "attribute", "attribute_name", "qualified_name",
+        "statement", "unattributed_statement", "compound_statement", "using_declaration",
+        "labeled_statement", "selection_statement", "iteration_statement", "jump_statement",
+        "expression_statement", "static_assert_declaration",
+        "expression", "assignment_expression", "assignment_operator", "conditional_expression",
+        "logical_or_expression", "logical_and_expression", "inclusive_or_expression",
+        "exclusive_or_expression", "and_expression", "equality_expression",
+        "relational_expression", "shift_expression", "additive_expression",
+        "multiplicative_expression", "cast_expression", "unary_expression",
+        "postfix_expression", "primary_expression", "argument_list", "generic_arguments",
+        "builtin_name", "literal"};
+    static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Literal) + 1);
+    const auto index = static_cast<std::size_t>(production);
+    return index < std::size(names) ? names[index] : std::string_view{};
+}
 
 TokenSequence syntax_node_tokens(const SyntaxNode& node) {
     TokenSequence result;
@@ -41,6 +62,42 @@ std::size_t syntax_node_count(const SyntaxNode& node) {
         for (const auto& child : next->children) pending.push_back(child.get());
     }
     return count;
+}
+
+std::uint64_t syntax_node_storage(const SyntaxNode& node) {
+    std::uint64_t size{};
+    const auto add = [&](std::uint64_t amount) {
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        size = amount > maximum - size ? maximum : size + amount;
+    };
+    const auto tokens = [&](const TokenSequence& sequence) {
+        for (const auto& token : sequence) { add(128); add(token.text.size()); }
+    };
+    std::vector<const SyntaxNode*> nodes{&node};
+    std::vector<const SyntaxMatchValue*> matches;
+    while (!nodes.empty() || !matches.empty()) {
+        if (!nodes.empty()) {
+            const auto* next = nodes.back();
+            nodes.pop_back();
+            add(128);
+            tokens(next->tokens);
+            for (const auto& child : next->children) { add(16); nodes.push_back(child.get()); }
+            if (next->match) matches.push_back(next->match.get());
+        } else {
+            const auto* next = matches.back();
+            matches.pop_back();
+            add(128);
+            tokens(next->input);
+            if (next->variant) { add(32); add(next->variant->size()); }
+            for (const auto& label : next->variant_labels) { add(32); add(label.size()); }
+            for (const auto& field : next->fields) {
+                add(64); add(field.name.size()); tokens(field.tokens);
+                if (field.node) nodes.push_back(field.node.get());
+                for (const auto& child : field.records) { add(16); matches.push_back(child.get()); }
+            }
+        }
+    }
+    return size;
 }
 
 namespace {
@@ -114,6 +171,7 @@ struct FirstSet {
     std::vector<MetaToken> exact;
     bool identifier{};
     bool literal{};
+    bool builtin{};
     bool any{};
 };
 
@@ -121,6 +179,7 @@ void merge_first(FirstSet& into, const FirstSet& from) {
     into.exact.insert(into.exact.end(), from.exact.begin(), from.exact.end());
     into.identifier |= from.identifier;
     into.literal |= from.literal;
+    into.builtin |= from.builtin;
     into.any |= from.any;
 }
 
@@ -129,6 +188,7 @@ bool first_accepts(const FirstSet& set, const MetaToken& token) {
     if (set.identifier && token.kind == TokenKind::Identifier && !is_reserved_identifier(token.text)) return true;
     if (set.literal && (token.kind == TokenKind::Integer || token.kind == TokenKind::Floating ||
                         token.kind == TokenKind::String || token.kind == TokenKind::Character)) return true;
+    if (set.builtin && token.kind == TokenKind::BuiltinName) return true;
     return std::any_of(set.exact.begin(), set.exact.end(), [&](const auto& candidate) {
         return candidate.kind == token.kind && candidate.text == token.text;
     });
@@ -136,10 +196,11 @@ bool first_accepts(const FirstSet& set, const MetaToken& token) {
 
 bool first_overlap(const FirstSet& left, const FirstSet& right) {
     const auto nonempty = [](const FirstSet& set) {
-        return set.any || set.identifier || set.literal || !set.exact.empty();
+        return set.any || set.identifier || set.literal || set.builtin || !set.exact.empty();
     };
     if ((left.any && nonempty(right)) || (right.any && nonempty(left)) ||
-        (left.identifier && right.identifier) || (left.literal && right.literal)) return true;
+        (left.identifier && right.identifier) || (left.literal && right.literal) ||
+        (left.builtin && right.builtin)) return true;
     for (const auto& token : left.exact) if (first_accepts(right, token)) return true;
     for (const auto& token : right.exact) if (first_accepts(left, token)) return true;
     return false;
@@ -176,6 +237,37 @@ FirstSet pattern_first(const Pattern& pattern, std::size_t begin, const RulePatt
         case K::Terminal: current.exact.push_back(element.terminal); break;
         case K::Ident: case K::Name: current.identifier = true; break;
         case K::Literal: current.literal = true; break;
+        case K::Expr:
+            current.identifier = current.literal = current.builtin = true;
+            for (const auto spelling : {"(", "++", "--", "&", "*", "+", "-", "~", "!", "sizeof"}) {
+                MetaToken token;
+                token.kind = spelling == std::string_view("sizeof")
+                    ? TokenKind::Identifier : TokenKind::Punctuator;
+                token.text = spelling;
+                current.exact.push_back(std::move(token));
+            }
+            break;
+        case K::Type: case K::Declaration: case K::FunctionHeader:
+        case K::FunctionDeclaration: case K::FunctionDefinition: case K::FunctionRaw:
+            current.identifier = current.builtin = true;
+            for (const auto spelling : {"void", "bool", "i8", "i16", "i32", "i64", "i128", "iptr",
+                                       "u8", "u16", "u32", "u64", "u128", "uptr", "f32", "f64",
+                                       "f80", "f128", "fptr", "label", "const", "volatile", "restrict",
+                                       "struct", "union", "enum"}) {
+                MetaToken token;
+                token.kind = TokenKind::Identifier;
+                token.text = spelling;
+                current.exact.push_back(std::move(token));
+            }
+            if (element.kind != K::Type)
+                for (const auto spelling : {"typedef", "static", "global", "inline", "[["}) {
+                    MetaToken token;
+                    token.kind = spelling == std::string_view("[[")
+                        ? TokenKind::Punctuator : TokenKind::Identifier;
+                    token.text = spelling;
+                    current.exact.push_back(std::move(token));
+                }
+            break;
         case K::Paren: case K::Bracket: case K::Block: case K::Group:
             for (const auto opener : {"(", "[", "[[", "{"})
                 if (element.kind == K::Group ||
@@ -212,6 +304,15 @@ bool validate_pattern_progress(const Pattern& pattern, const RulePattern& rule,
     using K = SyntaxPatternElement::Kind;
     for (std::size_t at = 0; at < pattern.size(); ++at) {
         const auto& element = pattern[at];
+        if ((element.kind == K::Expr || element.kind == K::Type) && at + 1 < pattern.size()) {
+            const auto& fence = pattern[at + 1];
+            if (fence.kind != K::Terminal || (fence.terminal.text != ";" &&
+                fence.terminal.text != "," && !closing(fence.terminal.text))) {
+                diagnostics.error(element.location,
+                    "parsed expression/type capture requires a semicolon, comma, or closing-delimiter fence");
+                return false;
+            }
+        }
         if ((element.kind == K::Optional || element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
              element.kind == K::Separated0 || element.kind == K::Separated1) &&
             pattern_nullable(element.pattern, rule)) {
@@ -309,6 +410,22 @@ bool SyntaxExecution::begin_replacement(SourceLocation location) {
 
 void SyntaxExecution::end_replacement() { --depth_; }
 
+bool SyntaxExecution::begin_fragment(SourceLocation location, std::size_t copied_tokens) {
+    if (fragment_depth_ >= limits_.depth) {
+        diagnostics_.error(location, "public syntax fragment nesting depth exceeded");
+        return false;
+    }
+    if (!work(location, copied_tokens + 1)) return false;
+    ++fragment_depth_;
+    return true;
+}
+
+void SyntaxExecution::end_fragment() { --fragment_depth_; }
+
+void SyntaxExecution::tree_limit_error(SourceLocation location) {
+    diagnostics_.error(location, "public syntax tree depth, work, or storage budget exceeded");
+}
+
 std::shared_ptr<const SyntaxContext> SyntaxExecution::call_context(SourceLocation location,
     std::string_view name_space, const std::vector<std::string>& imports,
     const std::vector<SyntaxBinding>& bindings) const {
@@ -331,26 +448,27 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
         for (auto& token : tokens) if (!token.origin.context) token.origin.context = call;
     };
     attach(input);
-    const auto contextualize_node = [&](const auto& self, const SyntaxNode& source)
-        -> std::shared_ptr<const SyntaxNode> {
+    std::function<std::shared_ptr<const SyntaxNode>(const SyntaxNode&)> contextualize_node;
+    std::function<std::shared_ptr<const SyntaxMatchValue>(const SyntaxMatchValue&)> contextualize_match;
+    contextualize_node = [&](const SyntaxNode& source) -> std::shared_ptr<const SyntaxNode> {
         auto node = std::make_shared<SyntaxNode>(source);
         if (!node->context) node->context = call;
         attach(node->tokens);
-        for (auto& child : node->children) child = self(self, *child);
+        for (auto& child : node->children) child = contextualize_node(*child);
+        if (node->match) node->match = contextualize_match(*node->match);
         return node;
     };
-    const auto contextualize = [&](const auto& self, const SyntaxMatchValue& source)
-        -> std::shared_ptr<const SyntaxMatchValue> {
+    contextualize_match = [&](const SyntaxMatchValue& source) -> std::shared_ptr<const SyntaxMatchValue> {
         auto value = std::make_shared<SyntaxMatchValue>(source);
         attach(value->input);
         for (auto& field : value->fields) {
             attach(field.tokens);
-            if (field.node) field.node = contextualize_node(contextualize_node, *field.node);
-            for (auto& record : field.records) record = self(self, *record);
+            if (field.node) field.node = contextualize_node(*field.node);
+            for (auto& record : field.records) record = contextualize_match(*record);
         }
         return value;
     };
-    if (match) match = contextualize(contextualize, *match);
+    if (match) match = contextualize_match(*match);
     const auto expansion = sources_.next_expansion();
     auto definition = std::make_shared<SyntaxContext>();
     definition->kind = SyntaxContext::Kind::DefinitionSite;
@@ -926,7 +1044,8 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                         SyntaxMatchValue::Field field{element.field, {}, std::move(part.node),
                             std::move(part.records), part.nested};
                         if (!charge(64 + field.name.size())) { failed = true; break; }
-                        if (!part.nested && !copy_tokens(field.tokens, candidate.end, part.end)) {
+                        if (!part.nested && !field.node &&
+                            !copy_tokens(field.tokens, candidate.end, part.end)) {
                             failed = true; break;
                         }
                         value->fields.push_back(std::move(field));
@@ -1084,7 +1203,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 failed = true;
                 return {};
             }
-            if (!charge(128 * syntax_node_count(*parsed->node))) {
+            if (!charge(syntax_node_storage(*parsed->node))) {
                 failed = true;
                 return {};
             }

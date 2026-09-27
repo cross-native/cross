@@ -169,6 +169,64 @@ namespace flow {
         return $::quote { typedef $::unquote($::meta::tokens(body)) CapturedType; };
     }
     syntax ParsedType : item { prefix "emit_type"; match body:type ";"; expand parsed_type; }
+    [[syntax_expander]] static $::meta::tokens parsed_statement(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        if (!$::meta::is_production(body, "statement")) return $::quote { ; };
+        $::meta::syntax ordinary = $::meta::child(body, 0uptr);
+        if (!$::meta::is_production(ordinary, "unattributed_statement")) return $::quote { ; };
+        $::meta::syntax form = 1u32 ? $::meta::child(ordinary, 0uptr) : ordinary;
+        if ($::meta::is_production(form, "selection_statement") &&
+            $::meta::child_count(form) != 7uptr) return $::quote { ; };
+        return $::meta::tokens(body);
+    }
+    syntax ParsedStmt : statement { prefix "parsed_stmt"; match body:stmt; expand parsed_statement; }
+    [[syntax_expander]] static $::meta::tokens parsed_declaration(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        if (!$::meta::is_production(body, "declaration")) return $::quote {};
+        return $::meta::tokens(body);
+    }
+    syntax ParsedDecl : item { prefix "parsed_decl"; match body:declaration; expand parsed_declaration; }
+    syntax ParsedPrototype : item { prefix "parsed_prototype"; match body:function_decl; expand parsed_declaration; }
+    [[syntax_expander]] static $::meta::tokens parsed_definition(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        if (!$::meta::is_production(body, "function_definition")) return $::quote {};
+        return $::meta::tokens(body);
+    }
+    syntax ParsedDefinition : item { prefix "parsed_definition"; match body:function_def; expand parsed_definition; }
+    [[syntax_expander]] static $::meta::tokens parsed_header(in $::meta::syntax_match input) {
+        $::meta::syntax header = $::syntax::node(input, "header");
+        if (!$::meta::is_production(header, "function_header")) return $::quote {};
+        return $::quote {
+            $::unquote($::meta::tokens(header))
+            $::unquote($::syntax::capture(input, "body"))
+        };
+    }
+    syntax ParsedHeader : item { prefix "parsed_header"; match header:function_header body:block; expand parsed_header; }
+    syntax DropParsed : item { prefix "drop_parsed"; match body:expr ";"; expand empty; }
+    [[syntax_expander]] static $::meta::tokens opaque_macro(in $::meta::syntax_match input) {
+        $::meta::syntax root = $::syntax::node(input, "body");
+        $::meta::syntax leaf = root;
+        while ($::meta::is_kind(leaf, "core") && $::meta::child_count(leaf) == 1uptr)
+            leaf = $::meta::child(leaf, 0uptr);
+        if (!$::meta::is_kind(leaf, "macro") || $::meta::child_count(leaf) != 0uptr)
+            return $::quote { 0u32 };
+        return $::meta::tokens(root);
+    }
+    syntax ParsedMacro : expression { prefix "parsed_macro"; match body:expr; expand opaque_macro; }
+    [[syntax_expander]] static $::meta::tokens explode(in $::meta::syntax_match input) {
+        uptr invalid = 1uptr / 0uptr;
+        return $::quote { 0u32 };
+    }
+    syntax Explode : expression { prefix "explode"; match body:paren; expand explode; }
+    [[syntax_expander]] static $::meta::tokens parsed_list(in $::meta::syntax_match input) {
+        $::meta::syntax_match left = $::syntax::at(input, "values", 0uptr);
+        $::meta::syntax_match right = $::syntax::at(input, "values", 1uptr);
+        return $::quote {
+            ($::unquote($::meta::tokens($::syntax::node(left, "value")))) +
+            ($::unquote($::meta::tokens($::syntax::node(right, "value"))))
+        };
+    }
+    syntax ParsedList : expression { prefix "parsed_list"; match "(" values:separated1(value:expr, ",") ")"; expand parsed_list; }
 }
 namespace caller {
     global u32 number = 13u32;
@@ -193,6 +251,20 @@ typedef u32 RawResult;
 syntax flow::CopyFunction, flow::DropFunction;
 syntax flow::ParsedType;
 emit_type u32;
+syntax flow::ParsedDecl, flow::ParsedPrototype, flow::ParsedDefinition, flow::ParsedHeader;
+parsed_decl global u32 parsed_state = 19u32;
+parsed_prototype static RawResult parsed_function(in RawResult value);
+parsed_definition [[noinline]] static RawResult parsed_function(in RawResult value) {
+    RawResult total = 0u32;
+    for (u32 at = 0u32; at < value; ++at) total += 3u32;
+    return total;
+}
+parsed_header [[noinline]] static RawResult header_function(in RawResult value) {
+    return copied! (value) + 2u32;
+}
+syntax flow::DropParsed, flow::Explode;
+drop_parsed no_such_macro! { owner drops this before lookup; };
+drop_parsed explode ();
 copy_fn [[noinline]] static RawResult copied_function(in u32 value) { return forwarded! (value) + 17u32; }
 drop_fn static u32 discarded_function(in u32 value) { no_such_macro!(); this is a foreign body; }
 namespace reopened {
@@ -282,8 +354,19 @@ namespace frozen {
     return tree ((1u32 + 2u32) + 3u32) + mutual ([1u32]);
 }
 [[noinline]] static u32 parsed_expression() {
-    syntax flow::ParsedExpr;
+    syntax flow::ParsedExpr, flow::ParsedMacro, flow::ParsedList, flow::Base;
+    if ((parsed_macro copied! (9u32)) != 9u32) return 0u32;
+    if ((parsed base () + 3u32) != 8u32) return 0u32;
+    if (parsed_list (2u32 + 3u32, 4u32 * 5u32) != 25u32) return 0u32;
     return parsed (2u32 + 3u32) * 4u32;
+}
+[[noinline]] static u32 parsed_statements(in u32 value) {
+    syntax flow::ParsedStmt;
+    u32 total = 0u32;
+    parsed_stmt if (value) { total += 3u32; } else { total += 5u32; }
+    parsed_stmt { label next: total += 7u32; }
+    parsed_stmt while (total < 10u32) ++total;
+    parsed_stmt return total;
 }
 syntax flow::Width;
 global uptr syntax_width = width ();
@@ -304,6 +387,9 @@ global u32 syntax_raw_entry() {
     if (combinators() != 50u32) return 0u32;
     if (recursive_rules() != 27u32) return 0u32;
     if (parsed_expression() != 20u32 || sizeof(CapturedType) != 4uptr) return 0u32;
+    if (parsed_function(4u32) != 12u32 || parsed_state != 19u32 ||
+        header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||
+        parsed_statements(1u32) != 10u32) return 0u32;
     if (syntax_width != sizeof(uptr)) return 0u32;
 #endif
     return 61u32;
