@@ -183,6 +183,7 @@ std::vector<std::string> active_imports(const std::vector<Token>& tokens,
 std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                        std::vector<Replacement>& removals,
                                        Diagnostics& diagnostics,
+                                       unsigned address_bits,
                                        bool syntax_expanders = false) {
     std::vector<TokenMacro> macros;
     const auto regions = namespace_regions(tokens);
@@ -282,7 +283,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         std::vector<Token> body_tokens(tokens.begin() + static_cast<std::ptrdiff_t>(cursor),
             tokens.begin() + static_cast<std::ptrdiff_t>(*body_end + 1));
         body_tokens.push_back({TokenKind::End, {}, tokens[*body_end].location});
-        Parser parser(std::move(body_tokens), diagnostics);
+        Parser parser(std::move(body_tokens), diagnostics, {}, address_bits);
         auto body = parser.parse_procedural_body();
         if (!body) continue;
         const auto declaration_end =
@@ -522,7 +523,8 @@ std::vector<SourceExpansion> remap_expansions(
 } // namespace
 
 std::optional<ExpansionFunctionSource> parse_expansion_function(
-    const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics) {
+    const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
+    unsigned address_bits) {
     const auto begin = index;
     auto end = index;
     for (auto at = index + 3; at < tokens.size() && tokens[at].kind != TokenKind::End; ++at) {
@@ -539,7 +541,8 @@ std::optional<ExpansionFunctionSource> parse_expansion_function(
     bounded.push_back({TokenKind::End, {}, tokens[end < tokens.size() ? end : tokens.size() - 1].location});
     index = end;
     std::vector<Replacement> removals;
-    auto functions = collect_macros(bounded, removals, diagnostics, true);
+    auto functions = collect_macros(bounded, removals, diagnostics,
+                                    address_bits, true);
     if (functions.size() != 1 || diagnostics.errors() != 0) return {};
     return ExpansionFunctionSource{std::move(functions.front().function), functions.front().syntax_expander};
 }
@@ -557,7 +560,8 @@ const SourceFile* expand_procedural_macros(SourceManager& sources,
     Lexer definition_lexer(*definition_file, diagnostics);
     const auto definition_tokens = definition_lexer.lex();
     std::vector<Replacement> removals;
-    auto macros = collect_macros(definition_tokens, removals, diagnostics);
+    auto macros = collect_macros(definition_tokens, removals, diagnostics,
+                                 address_bits);
     if (diagnostics.errors() != 0) return definition_file;
     if (macros.empty()) return definition_file;
     std::vector<SourceTokenOrigin> token_origins;

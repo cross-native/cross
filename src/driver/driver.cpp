@@ -841,7 +841,8 @@ int cc_main(int argc, char** argv) {
             tokens = Lexer(*source, diagnostics).lex();
         }
         if (diagnostics.errors() != 0) return 1;
-        Parser parser(std::move(tokens), diagnostics, std::move(execution));
+        Parser parser(std::move(tokens), diagnostics, std::move(execution),
+                      program.address_bits);
         auto unit = parser.parse();
         for (auto& record : unit.records) {
             program.records.push_back(std::move(record));

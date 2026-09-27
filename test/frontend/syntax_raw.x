@@ -55,6 +55,8 @@ namespace flow {
     syntax Make : item { prefix "make"; match name:ident value:literal ";"; expand make; }
     syntax CopyFunction : item { prefix "copy_fn"; match body:function_raw; expand copy_body; }
     [[syntax_expander]] static $::meta::tokens target_size(in $::meta::syntax_match input) {
+        typedef uptr WidthVector [[vector_size(16)]];
+        if (sizeof(WidthVector) != 16uptr) return $::quote { 0u32 };
         if (sizeof(uptr) == 4uptr) return $::quote { 4u32 };
         return $::quote { 8u32 };
     }
@@ -623,6 +625,10 @@ global u32 evaluated_declaration_lists = evaluate_declaration_lists();
 u32 global reordered_storage_value = 6u32;
 u32 [[aligned(16)]] global interleaved_aligned = 3u32;
 u32 typedef ReorderedWord, *ReorderedPointer;
+typedef uptr WidthVector [[vector_size(16)]];
+typedef iptr SignedWidthVector [[vector_size(16)]];
+$::static_assert(sizeof(WidthVector) == 16uptr, "vector_size must use target uptr width");
+$::static_assert(sizeof(SignedWidthVector) == 16uptr, "vector_size must use target iptr width");
 [[noinline]] u32 static reordered_storage(in u32 input) {
     const static u32 fixed = 4u32;
     u32 register dynamic = input + fixed;

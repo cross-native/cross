@@ -139,8 +139,10 @@ std::optional<std::int64_t> constant_value(const Expr& expression) {
 } // namespace
 
 Parser::Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
-               std::shared_ptr<SyntaxExecution> execution)
-    : tokens_(std::move(tokens)), diagnostics_(diagnostics) {
+               std::shared_ptr<SyntaxExecution> execution,
+               unsigned address_bits)
+    : tokens_(std::move(tokens)), diagnostics_(diagnostics),
+      address_bits_(address_bits) {
     if (execution) syntax_.emplace(std::move(execution));
 }
 
@@ -373,7 +375,7 @@ bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body
 std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output,
     Diagnostics* diagnostics) const {
     auto child = std::make_unique<Parser>(std::move(output.tokens),
-                                          diagnostics ? *diagnostics : diagnostics_);
+        diagnostics ? *diagnostics : diagnostics_, nullptr, address_bits_);
     child->syntax_ = syntax_;
     child->replacement_ = true;
     child->active_imports_ = active_imports_;
@@ -1901,9 +1903,24 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
                     "'" + vector_attribute->name +
                         "' requires one positive integer argument");
             } else {
-                const auto element_bits = type_bits(type);
                 std::uint64_t lanes = amount;
                 if (vector_attribute->name == "vector_size") {
+                    auto element_bits = type_bits(type);
+                    if (type->kind == Type::Kind::Builtin &&
+                        (type->builtin == BuiltinType::Iptr ||
+                         type->builtin == BuiltinType::Uptr)) {
+                        if (address_bits_ == 0) {
+                            diagnostics_.error(vector_attribute->location,
+                                "vector_size of a target-sized element requires a resolved target");
+                            return;
+                        }
+                        element_bits = address_bits_;
+                    }
+                    if (amount > std::numeric_limits<std::uint64_t>::max() / 8U) {
+                        diagnostics_.error(vector_attribute->location,
+                                           "vector size is out of range");
+                        return;
+                    }
                     const auto total_bits = amount * 8U;
                     if (element_bits == 0 || total_bits % element_bits != 0) {
                         diagnostics_.error(

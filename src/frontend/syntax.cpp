@@ -383,7 +383,8 @@ std::vector<Token> SyntaxExecution::prepare(const SourceFile& source) {
 
 bool SyntaxExecution::define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
     const std::vector<std::string>& imports, const std::vector<SyntaxBinding>& bindings) {
-    auto function = parse_expansion_function(tokens, index, diagnostics_);
+    auto function = parse_expansion_function(tokens, index, diagnostics_,
+                                             address_bits_);
     if (!function) return false;
     auto& declaration = function->function;
     declaration.name = join(name_space, declaration.name);

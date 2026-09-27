@@ -49,6 +49,8 @@ static $::meta::tokens accumulate(in $::meta::tokens input) {
 
 [[macro]]
 static $::meta::tokens typed(in $::meta::tokens input) {
+    typedef uptr WidthVector [[vector_size(16)]];
+    typedef iptr SignedWidthVector [[vector_size(16)]];
     u128 wide = (1u128 << 100u32) + 17u128;
     f128 exact = 1.25f128 * 4.0f128;
     fptr rounded = 16777216.0fptr + 1.0fptr;
@@ -56,6 +58,8 @@ static $::meta::tokens typed(in $::meta::tokens input) {
     bool width32 = sizeof(uptr) == 4uptr;
     bool correct = width32 ? maximum == 4294967295u64 : maximum == 18446744073709551615u64;
     correct = correct && (width32 ? rounded == 16777216.0fptr : rounded == 16777217.0fptr);
+    correct = correct && sizeof(WidthVector) == 16uptr &&
+        sizeof(SignedWidthVector) == 16uptr;
     correct = correct && sizeof(fptr) == sizeof(uptr) && sizeof(u8*) == sizeof(uptr);
     correct = correct && $::alignof(uptr) == sizeof(uptr);
     u32 true = 1u32; // Ordinary identifier, not a magic boolean spelling.

@@ -20,7 +20,8 @@ namespace cross {
 class Parser {
 public:
     Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
-           std::shared_ptr<SyntaxExecution> execution = {});
+           std::shared_ptr<SyntaxExecution> execution = {},
+           unsigned address_bits = 0);
     Program parse();
     // Parse a macro's braced body with the ordinary statement/expression
     // grammar, enabling translation-only token types and quotation.
@@ -163,6 +164,8 @@ private:
 
     std::vector<Token> tokens_;
     Diagnostics& diagnostics_;
+    // Zero means a standalone parser has no resolved target layout.
+    unsigned address_bits_{};
     std::size_t index_{};
     std::optional<SyntaxState> syntax_;
     bool replacement_{};

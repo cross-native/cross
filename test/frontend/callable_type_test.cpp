@@ -173,4 +173,29 @@ int main() {
     require(interleaved.records[0].members.size() == 1 &&
             interleaved.records[0].members[0].attributes.size() == 1 &&
             interleaved.records[0].members[0].attributes[0].name == "aligned");
+
+    const auto* target_vector_source = sources.add("target-vector-size.x", R"(
+        typedef uptr WidthVector [[vector_size(16)]];
+        typedef iptr SignedWidthVector [[vector_size(16)]];
+        WidthVector value;
+        SignedWidthVector signed_value;
+    )");
+    for (const auto [address_bits, expected_lanes] :
+         std::vector<std::pair<unsigned, std::uint32_t>>{{32, 4}, {64, 2}}) {
+        Parser width_parser(Lexer(*target_vector_source, diagnostics).lex(),
+                            diagnostics, {}, address_bits);
+        auto width_program = width_parser.parse();
+        require(diagnostics.errors() == 0 && width_program.objects.size() == 2);
+        for (const auto& object : width_program.objects) {
+            require(object->type->kind == Type::Kind::Vector);
+            require(object->type->lanes == expected_lanes);
+        }
+    }
+    std::ostringstream unresolved_output;
+    Diagnostics unresolved_diagnostics(unresolved_output);
+    Parser unresolved_parser(Lexer(*target_vector_source, unresolved_diagnostics).lex(),
+                             unresolved_diagnostics);
+    (void)unresolved_parser.parse();
+    require(unresolved_diagnostics.errors() != 0 &&
+            unresolved_output.str().find("requires a resolved target") != std::string::npos);
 }
