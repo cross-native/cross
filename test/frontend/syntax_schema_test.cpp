@@ -294,6 +294,178 @@ int main() {
                  0, P::InitDeclarator, 2);
     child(item, 1, P::AttributeSpecifier, 3);
 
+    const LayoutQuery no_layout = [](const TypePtr&) -> std::optional<std::uint64_t> { return {}; };
+    auto execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 32,
+        no_layout, no_layout, EvaluationLimits{}, EvaluationLayout{});
+    for (const auto text : {
+             "{ future!{}; NewType item = 3u32; }",
+             "{ future!{}; return (NewType)3u32; }",
+             "{ future!{}; return introduced<u32>(3u32); }",
+             "{ future!{}; for (NewType item = 0u32; ; ) {} }",
+             "{ future!{}; struct Introduced value; }",
+             "{ future!{}; enum Introduced value; }",
+             "{ old::<nested::<3u32>>; future!{}; NewType item; }"}) {
+        const auto* source = sources.add("deferred-schema.x", text);
+        auto input = Lexer(*source, diagnostics).lex();
+        Parser deferred_parser(input, diagnostics, execution, 32);
+        const auto fragment = deferred_parser.parse_syntax_fragment(K::Statement, 0);
+        require(fragment.has_value(), "name-sensitive compound capture failed");
+        auto ordinary = child(fragment->node, 0, P::UnattributedStatement, 1);
+        auto deferred = ordinary->children[0];
+        require(deferred->kind == SyntaxNode::Kind::Deferred && deferred->children.empty(),
+                "name-sensitive block was prematurely classified");
+        require(deferred->slot_production == P::CompoundStatement &&
+                deferred->deferred_category == SyntaxParseCategory::Statement,
+                "deferred block lost its category/grammar slot");
+        require(deferred->context && deferred->span.first.file == source &&
+                deferred->span.last.file == source, "deferred block lost source context");
+        const auto projected = syntax_node_tokens(*fragment->node);
+        require(projected.size() == input.size() - 1 && fragment->end == input.size() - 1,
+                "deferred block boundary/projection changed");
+        for (std::size_t at = 0; at < projected.size(); ++at)
+            require(projected[at].kind == input[at].kind && projected[at].text == input[at].text,
+                    "deferred block token projection changed");
+        std::string error;
+        require(syntax_validate_node(*fragment->node, error), "deferred block shape failed validation");
+        auto replacement = std::make_shared<SyntaxNode>(*deferred);
+        auto replaced = syntax_replace_child(*ordinary, 0, replacement, error);
+        require(replaced && replaced->children[0] == replacement &&
+                ordinary->children[0] == deferred, "deferred leaf replacement lost identity");
+        replacement = std::make_shared<SyntaxNode>(*deferred);
+        replacement->deferred_category = SyntaxParseCategory::Type;
+        require(!syntax_validate_node(*replacement, error), "incompatible deferred category was accepted");
+        replacement->deferred_category = SyntaxParseCategory::Statement;
+        replacement->tokens.pop_back();
+        require(!syntax_validate_node(*replacement, error), "unbounded deferred input was accepted");
+        EvaluationLimits validation_limits;
+        validation_limits.steps = 2;
+        SyntaxTreeValidationError failure;
+        require(!syntax_validate_node(*deferred, error, validation_limits, nullptr, &failure) &&
+                failure == SyntaxTreeValidationError::WorkLimit, "deferred payload escaped work accounting");
+        validation_limits.steps = EvaluationLimits{}.steps;
+        validation_limits.depth = 1;
+        require(!syntax_validate_node(*deferred, error, validation_limits, nullptr, &failure) &&
+                failure == SyntaxTreeValidationError::DepthLimit, "deferred payload escaped depth accounting");
+    }
+    for (const auto text : {
+             "{ future!{}; return 3u32; }",
+             "{ typedef u32 Word; future!{}; Word item = 3u32; }",
+             "{ u32 value = 3u32; future!{}; return value + 1u32; }",
+             "{ { future!{}; } ordinary(3u32); }"}) {
+        const auto* source = sources.add("known-schema.x", text);
+        auto input = Lexer(*source, diagnostics).lex();
+        Parser known_parser(input, diagnostics, execution, 32);
+        const auto fragment = known_parser.parse_syntax_fragment(K::Statement, 0);
+        require(fragment.has_value(), "known binding capture failed");
+        auto ordinary = child(fragment->node, 0, P::UnattributedStatement, 1);
+        require(ordinary->children[0]->kind == SyntaxNode::Kind::Core &&
+                ordinary->children[0]->production == P::CompoundStatement,
+                "opaque invocation invalidated an established binding or escaped its scope");
+    }
+    {
+        const auto* source = sources.add("nested-deferred-schema.x",
+            "{ typedef u32 Word; { future!{}; Word item = 3u32; } Word after; }");
+        auto input = Lexer(*source, diagnostics).lex();
+        Parser nested_parser(input, diagnostics, execution, 32);
+        const auto fragment = nested_parser.parse_syntax_fragment(K::Statement, 0);
+        require(fragment.has_value(), "nested uncertainty capture failed");
+        auto outer = child(child(fragment->node, 0, P::UnattributedStatement, 1),
+                           0, P::CompoundStatement, 5);
+        auto nested = child(child(outer, 2, P::Statement, 1), 0, P::UnattributedStatement, 1);
+        require(nested->children[0]->kind == SyntaxNode::Kind::Deferred,
+                "closer unknown binding did not defer an outer alias use");
+        child(child(child(outer, 3, P::Statement, 1), 0, P::UnattributedStatement, 1),
+              0, P::Declaration, 3);
+    }
+    for (const auto text : {
+             "{ u32 = ; future!{}; NewType item; }",
+             "{ future!{}; NewType item;",
+             "{ future!{}; NewType item; ) }"}) {
+        const auto* source = sources.add("invalid-deferred-schema.x", text);
+        auto input = Lexer(*source, diagnostics).lex();
+        Parser invalid_parser(input, diagnostics, execution, 32);
+        require(!invalid_parser.parse_syntax_fragment(K::Statement, 0),
+                "deferral hid an already-known error or an invalid boundary");
+    }
+    {
+        const auto* source = sources.add("nested-capture-definitions.x",
+            "[[syntax_expander]] static $::meta::tokens unused(in $::meta::syntax_match input) "
+            "{ return $::quote { ; }; } "
+            "syntax Type : statement { prefix \"with_type\"; match value:type \";\"; expand unused; } "
+            "syntax Expr : statement { prefix \"with_expr\"; match value:expr \";\"; expand unused; } "
+            "syntax Stmt : statement { prefix \"with_stmt\"; match value:stmt; expand unused; } "
+            "syntax Type, Expr, Stmt;");
+        auto input = Lexer(*source, diagnostics).lex();
+        std::vector<std::pair<std::size_t, SyntaxParseCategory>> cases;
+        const auto add_case = [&](std::string_view text, SyntaxParseCategory category) {
+            const auto* capture = sources.add("nested-capture-schema.x", std::string(text));
+            auto tokens = Lexer(*capture, diagnostics).lex();
+            cases.emplace_back(input.size(), category);
+            input.insert(input.end(), tokens.begin(), tokens.end());
+        };
+        using C = SyntaxParseCategory;
+        add_case("{ future!{}; with_type NewType *; }", C::Type);
+        add_case("{ future!{}; with_expr (NewType)3u32; }", C::Expression);
+        add_case("{ future!{}; with_expr introduced<u32>(3u32); }", C::Expression);
+        add_case("{ future!{}; with_expr introduced::<NewType, u32>(3u32); }", C::Expression);
+        add_case("{ future!{}; with_stmt NewType item = 3u32; }", C::Statement);
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) NewType first; else NewType second; }", C::Statement);
+        add_case("{ future!{}; with_stmt [[musttail]] return (NewType)3u32; }", C::Statement);
+        add_case("{ future!{}; with_stmt for (NewType i = 0u32; ; ) {} }", C::Statement);
+        add_case("{ future!{}; with_stmt while ((NewType)1u32) NewType item; }", C::Statement);
+        add_case("{ future!{}; with_stmt do NewType item; while ((NewType)1u32); }", C::Statement);
+        add_case("{ future!{}; with_stmt label tagged: NewType item; }", C::Statement);
+        add_case("{ future!{}; with_stmt switch ((NewType)1u32) {} }", C::Statement);
+        add_case("{ future!{}; with_expr introduced<NewType, u32>(3u32); }", C::None);
+        add_case("{ future!{}; with_stmt if (1u32) NewType item else second; }", C::None);
+        Parser nested_parser(input, diagnostics, execution, 32);
+        (void)nested_parser.parse(); // Stop at the definitions' End boundary.
+        require(diagnostics.errors() == 0, "nested-capture declarations failed");
+        for (const auto& [first, category] : cases) {
+            const auto fragment = nested_parser.parse_syntax_fragment(K::Statement, first);
+            if (category == C::None) {
+                require(!fragment, "an ambiguous or incomplete nested capture boundary was guessed");
+                continue;
+            }
+            require(fragment.has_value(), "independently bounded nested capture failed");
+            std::vector<Node> pending{fragment->node};
+            Node extension;
+            while (!pending.empty()) {
+                auto node = std::move(pending.back());
+                pending.pop_back();
+                if (node->kind == SyntaxNode::Kind::Extension) { extension = node; break; }
+                pending.insert(pending.end(), node->children.begin(), node->children.end());
+            }
+            require(extension && extension->match && extension->match->fields.size() == 1,
+                    "bounded extension match record was not preserved");
+            const auto value = extension->match->fields[0].node;
+            require(value && value->kind == SyntaxNode::Kind::Deferred && value->children.empty() &&
+                    value->deferred_category == category && value->context,
+                    "nested capture did not preserve its opaque deferred category/context");
+            std::string error;
+            require(syntax_validate_node(*value, error), "nested deferred node failed validation");
+            const auto projected = syntax_node_tokens(*fragment->node);
+            require(projected.size() == fragment->end - first, "nested deferred projection changed its boundary");
+            for (std::size_t at = 0; at < projected.size(); ++at)
+                require(projected[at].kind == input[first + at].kind &&
+                        projected[at].text == input[first + at].text, "nested deferred projection changed a token");
+        }
+    }
+    for (unsigned depth = 1; depth <= 4; ++depth) {
+        SourceManager limit_sources;
+        std::ostringstream limit_messages;
+        Diagnostics limit_diagnostics(limit_messages);
+        const auto* source = limit_sources.add("deferred-limits.x", "{ future!{}; NewType value; }");
+        auto input = Lexer(*source, limit_diagnostics).lex();
+        EvaluationLimits limits;
+        limits.depth = depth;
+        auto limited_execution = std::make_shared<SyntaxExecution>(limit_sources, limit_diagnostics, 32,
+            no_layout, no_layout, limits, EvaluationLayout{});
+        Parser limited_parser(input, limit_diagnostics, limited_execution, 32);
+        require(!limited_parser.parse_syntax_fragment(K::Statement, 0) &&
+                limit_diagnostics.errors() != 0, "exhausted deferred construction published a tree");
+    }
+
     const auto* alias_source = sources.add("alias-schema.x",
         "namespace ns { typedef u32 Word; } ns::Word value;");
     auto alias_tokens = Lexer(*alias_source, diagnostics).lex();

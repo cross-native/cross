@@ -493,6 +493,11 @@ namespace ReorderedGeneric {
     }
     T after = 5u8;
 }
+static T discard_parsed_assertion<T>(in T value) {
+    syntax flow::DropStmt;
+    drop_stmt { $::static_assert(0u32, "discarded capture must not escape"); }
+    return value;
+}
 parsed_prototype static RawResult parsed_function(in RawResult value);
 parsed_definition [[noinline]] static RawResult parsed_function(in RawResult value) {
     RawResult total = 0u32;
@@ -754,6 +759,7 @@ global u32 syntax_raw_entry() {
         ReorderedGeneric::trailing(300u32) != 302u32 ||
         ReorderedGeneric::recursive<u32>(300u32, 3u32) != 303u32 ||
         sizeof(ReorderedGeneric::T) != 1uptr || ReorderedGeneric::after != 5u8 ||
+        discard_parsed_assertion(311u32) != 311u32 ||
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||
         header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||
         parsed_statements(1u32) != 10u32) return 0u32;

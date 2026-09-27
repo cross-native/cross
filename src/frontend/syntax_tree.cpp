@@ -364,6 +364,21 @@ bool delimiter(std::string_view text) {
            text == "[[" || text == "]]" || text == "{" || text == "}";
 }
 
+bool deferred_slot(SyntaxParseCategory category, SyntaxProduction slot) {
+    using C = SyntaxParseCategory;
+    using P = SyntaxProduction;
+    switch (category) {
+    case C::Expression: return slot == P::AssignmentExpression;
+    case C::Statement: return slot == P::Statement || slot == P::CompoundStatement;
+    case C::Type: return slot == P::TypeName;
+    case C::Declaration: case C::FunctionDeclaration: return slot == P::Declaration;
+    case C::FunctionHeader: return slot == P::FunctionHeader;
+    case C::FunctionDefinition: return slot == P::FunctionDefinition;
+    case C::None: return false;
+    }
+    return false;
+}
+
 struct TreeValidator {
     const EvaluationLimits& limits;
     std::uint64_t work{};
@@ -443,6 +458,43 @@ struct TreeValidator {
                 return false;
             }
             if (node->kind == SyntaxNode::Kind::Token || opaque_kind(node->kind)) {
+                if (node->kind == SyntaxNode::Kind::Deferred) {
+                    if (!deferred_slot(node->deferred_category, node->slot_production) ||
+                        node->production != SyntaxProduction::None || !node->context ||
+                        node->tokens.empty()) {
+                        error = "deferred syntax node requires a compatible category/grammar slot, context, and bounded input";
+                        return false;
+                    }
+                    std::vector<std::string_view> closers;
+                    for (const auto& token : node->tokens) {
+                        if (!step()) break;
+                        const auto text = std::string_view(token.text);
+                        if (token.kind == TokenKind::Invalid || token.kind == TokenKind::End) {
+                            error = "deferred syntax input contains an invalid or boundary token";
+                            return false;
+                        }
+                        if (text == "(" || text == "[" || text == "[[" || text == "{") {
+                            if (closers.size() >= limits.depth) {
+                                failure = SyntaxTreeValidationError::DepthLimit;
+                                error = "deferred syntax input exceeds delimiter depth budget";
+                                return false;
+                            }
+                            closers.push_back(text == "(" ? ")" : text == "[" ? "]" :
+                                              text == "[[" ? "]]" : "}");
+                        } else if (text == ")" || text == "]" || text == "]]" || text == "}") {
+                            if (closers.empty() || closers.back() != text) {
+                                error = "deferred syntax input has an unmatched delimiter";
+                                return false;
+                            }
+                            closers.pop_back();
+                        }
+                    }
+                    if (exhausted) break;
+                    if (!closers.empty()) {
+                        error = "deferred syntax input has an unterminated delimiter group";
+                        return false;
+                    }
+                }
                 if (!node->children.empty() || (node->kind == SyntaxNode::Kind::Token &&
                     (node->tokens.size() != 1 || node->tokens.front().kind == TokenKind::Invalid ||
                      node->tokens.front().kind == TokenKind::End))) {

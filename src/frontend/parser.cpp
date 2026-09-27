@@ -394,6 +394,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     // replacement expression. Its own generic parses install their fences.
     child->parsing_generic_argument_ = false;
     child->parsing_procedural_body_ = parsing_procedural_body_;
+    child->public_uncertain_binding_depths_ = public_uncertain_binding_depths_;
     child->switch_depth_ = switch_depth_;
     child->switch_default_seen_ = switch_default_seen_;
     return child;
@@ -542,6 +543,15 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     std::ostringstream output;
     Diagnostics local(output);
     auto child = replacement_parser({tokens_, tokens_[first].location}, &local);
+    // Capture recognition may record generic static assertions, but it must
+    // never append them to the actual caller. Only these context fields are
+    // read by the statement parser; all speculative assertions stay private.
+    FunctionDecl function_context;
+    if (active_function_) {
+        function_context.parameters = active_function_->parameters;
+        function_context.generic_parameters = active_function_->generic_parameters;
+        child->active_function_ = &function_context;
+    }
     child->index_ = first;
     child->parsing_public_fragment_ = true;
     child->recording_public_tree_ = true;
@@ -553,42 +563,61 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         child->active_namespace_ = origin.context->name_space;
         child->active_imports_ = origin.context->imports;
     }
-    if (kind == K::Expr) {
-        (void)child->parse_assignment();
-    } else if (kind == K::Type) {
-        ProductionScope scope(*child, SyntaxProduction::TypeName);
-        if (!child->type_start()) return {};
-        auto type = child->parse_type();
-        std::optional<std::string> name;
-        (void)child->parse_declarator(std::move(type), name);
-        if (name) return {};
-    } else if (kind == K::Statement) {
-        (void)child->parse_statement();
-    } else if (kind == K::Declaration || kind == K::FunctionHeader ||
-               kind == K::FunctionDeclaration || kind == K::FunctionDefinition) {
-        // These categories exclude namespaces, registration, and invocations
-        // standing in place of the direct declaration/header itself.
-        if (child->current().is("namespace") || child->current().is("using") ||
-            child->current().is("syntax") || child->macro_start() ||
-            child->active_syntax(true)) return {};
-        child->parsing_public_function_header_ = kind == K::FunctionHeader;
-        Program parsed;
-        child->parse_external(parsed, child->active_namespace_);
-        const bool direct_function = parsed.functions.size() == 1 &&
-            parsed.objects.empty() && parsed.records.empty() &&
-            parsed.enumerations.empty() && parsed.global_labels.empty();
-        if (kind == K::FunctionHeader) {
-            if (!direct_function || (!child->current().is(";") &&
-                                     !child->current().is("{") &&
-                                     child->current().kind != TokenKind::End)) return {};
-        } else if (kind == K::FunctionDeclaration) {
-            if (!direct_function || parsed.functions.front()->body) return {};
-        } else if (kind == K::FunctionDefinition) {
-            if (!direct_function || !parsed.functions.front()->body) return {};
-        } else if (std::any_of(parsed.functions.begin(), parsed.functions.end(),
-                   [](const auto& function) { return function->body != nullptr; })) return {};
-    } else {
-        return {};
+    std::shared_ptr<const SyntaxNode> deferred_root;
+    try {
+        if (kind == K::Expr) {
+            (void)child->parse_assignment();
+        } else if (kind == K::Type) {
+            ProductionScope scope(*child, SyntaxProduction::TypeName);
+            if (!child->type_start()) return {};
+            auto type = child->parse_type();
+            std::optional<std::string> name;
+            (void)child->parse_declarator(std::move(type), name);
+            if (name) return {};
+        } else if (kind == K::Statement) {
+            (void)child->parse_statement();
+        } else if (kind == K::Declaration || kind == K::FunctionHeader ||
+                   kind == K::FunctionDeclaration || kind == K::FunctionDefinition) {
+            // These categories exclude namespaces, registration, and invocations
+            // standing in place of the direct declaration/header itself.
+            if (child->current().is("namespace") || child->current().is("using") ||
+                child->current().is("syntax") || child->macro_start() ||
+                child->active_syntax(true)) return {};
+            child->parsing_public_function_header_ = kind == K::FunctionHeader;
+            Program parsed;
+            child->parse_external(parsed, child->active_namespace_);
+            const bool direct_function = parsed.functions.size() == 1 &&
+                parsed.objects.empty() && parsed.records.empty() &&
+                parsed.enumerations.empty() && parsed.global_labels.empty();
+            if (kind == K::FunctionHeader) {
+                if (!direct_function || (!child->current().is(";") &&
+                                         !child->current().is("{") &&
+                                         child->current().kind != TokenKind::End)) return {};
+            } else if (kind == K::FunctionDeclaration) {
+                if (!direct_function || parsed.functions.front()->body) return {};
+            } else if (kind == K::FunctionDefinition) {
+                if (!direct_function || !parsed.functions.front()->body) return {};
+            } else if (std::any_of(parsed.functions.begin(), parsed.functions.end(),
+                       [](const auto& function) { return function->body != nullptr; })) return {};
+        } else {
+            return {};
+        }
+    } catch (const DeferredNameRecognition&) {
+        // A nested capture can inherit uncertainty from an earlier opaque
+        // invocation in its enclosing block. Prove its boundary lexically,
+        // independently of the unresolved type/generic lookup.
+        const auto fragment_end = kind == K::Expr || kind == K::Type
+            ? child->fenced_fragment_end(first, kind == K::Expr)
+            : kind == K::Statement ? child->bounded_statement_end(first)
+                                  : std::optional<std::size_t>{};
+        if (!fragment_end) return {};
+        const auto slot = kind == K::Expr ? SyntaxProduction::AssignmentExpression
+            : kind == K::Type ? SyntaxProduction::TypeName : SyntaxProduction::Statement;
+        const auto category = kind == K::Expr ? SyntaxParseCategory::Expression
+            : kind == K::Type ? SyntaxParseCategory::Type : SyntaxParseCategory::Statement;
+        deferred_root = child->deferred_node(first, *fragment_end, slot, category,
+                                             child->public_fragment_context(first));
+        child->index_ = *fragment_end;
     }
     if (child->public_tree_failed_) {
         if (!execution) diagnostics_.error(tokens_[first].location,
@@ -596,14 +625,14 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         return {};
     }
     if (local.errors() != 0 || child->index_ <= first ||
-        child->production_events_.empty()) return {};
+        (!deferred_root && child->production_events_.empty())) return {};
     if (kind == K::Expr || kind == K::Type) {
         const auto& next = child->current();
         if (next.kind != TokenKind::End && !next.is(";") && !next.is(",") &&
             !next.is(")") && !next.is("]") && !next.is("]]") &&
             !next.is("}")) return {};
     }
-    auto node = child->public_node(0);
+    auto node = deferred_root ? std::move(deferred_root) : child->public_node(0);
     if (!node) return {};
     std::string shape_error;
     std::uint64_t validation_work{};
@@ -620,6 +649,263 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         return {};
     }
     return SyntaxParsedFragment{child->public_input_indices_[child->index_], std::move(node)};
+}
+
+void Parser::require_public_name_context(std::string_view name, SourceLocation location) const {
+    if (!parsing_public_fragment_ || public_uncertain_binding_depths_.empty() ||
+        name.empty() || is_reserved_identifier(name)) return;
+    if (name.find("::") == std::string_view::npos) {
+        const NameKey key(name, location.valid() ? location : current().location);
+        for (auto depth = local_scopes_.size(); depth != 0; --depth) {
+            if (!local_scopes_[depth - 1].contains(key) &&
+                !local_type_scopes_[depth - 1].contains(key)) continue;
+            // A closer or same-scope established binding cannot be legally
+            // retargeted by an opaque declaration in an outer/same scope.
+            if (std::none_of(public_uncertain_binding_depths_.begin(),
+                            public_uncertain_binding_depths_.end(),
+                            [&](std::size_t uncertain) { return uncertain > depth; })) return;
+            break;
+        }
+    }
+    throw DeferredNameRecognition{};
+}
+
+void Parser::mark_public_binding_uncertainty() {
+    const auto depth = local_scopes_.size();
+    if (std::find(public_uncertain_binding_depths_.begin(),
+                  public_uncertain_binding_depths_.end(), depth) ==
+        public_uncertain_binding_depths_.end())
+        public_uncertain_binding_depths_.push_back(depth);
+}
+
+std::optional<std::size_t> Parser::bounded_group_end(std::size_t first) {
+    const auto closer = [](std::string_view text) -> std::string_view {
+        if (text == "(") return ")";
+        if (text == "[") return "]";
+        if (text == "[[") return "]]";
+        if (text == "{") return "}";
+        return {};
+    };
+    if (first >= tokens_.size() || closer(tokens_[first].text).empty()) return {};
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    const auto limits = execution ? execution->limits() : EvaluationLimits{};
+    std::vector<std::string_view> stack;
+    for (auto at = first; at < tokens_.size() && tokens_[at].kind != TokenKind::End; ++at) {
+        if (execution && !execution->work(tokens_[at].location)) {
+            public_tree_failed_ = true;
+            return {};
+        }
+        const auto text = tokens_[at].text;
+        if (const auto close = closer(text); !close.empty()) {
+            if (stack.size() >= limits.depth) {
+                public_tree_failed_ = true;
+                if (execution) execution->tree_limit_error(tokens_[at].location);
+                return {};
+            }
+            stack.push_back(close);
+        } else if (text == ")" || text == "]" || text == "]]" || text == "}") {
+            if (stack.empty() || stack.back() != text) return {};
+            stack.pop_back();
+            if (stack.empty()) return at + 1;
+        }
+    }
+    return {};
+}
+
+std::optional<std::size_t> Parser::fenced_fragment_end(std::size_t first, bool expression) {
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    const auto limits = execution ? execution->limits() : EvaluationLimits{};
+    // Explicit ::< selects generic grammar without a name lookup. Bare <
+    // does not: a comma before its possible closer may be either an argument
+    // separator or this capture's fence, so that boundary cannot be guessed.
+    std::vector<bool> explicit_angles;
+    for (auto at = first; at < tokens_.size(); ++at) {
+        if (execution && !execution->work(tokens_[at].location)) {
+            public_tree_failed_ = true;
+            return {};
+        }
+        const auto text = tokens_[at].text;
+        const bool closing = text == ")" || text == "]" || text == "]]" || text == "}";
+        if (tokens_[at].kind == TokenKind::End || text == ";" || closing) {
+            if (at == first || (!explicit_angles.empty() && explicit_angles.front())) return {};
+            return at;
+        }
+        if (text == ",") {
+            if (explicit_angles.empty()) return at == first ? std::optional<std::size_t>{} : at;
+            if (!explicit_angles.front()) return {};
+        }
+        if (text == "(" || text == "[" || text == "[[" || text == "{") {
+            const auto end = bounded_group_end(at);
+            if (!end) return {};
+            at = *end - 1;
+        } else if (expression && text == "<") {
+            if (explicit_angles.size() >= limits.depth) {
+                public_tree_failed_ = true;
+                if (execution) execution->tree_limit_error(tokens_[at].location);
+                return {};
+            }
+            explicit_angles.push_back(at != first && tokens_[at - 1].is("::"));
+        } else if (expression && (text == ">" || text == ">>")) {
+            unsigned count = text == ">>" ? 2 : 1;
+            while (count-- && !explicit_angles.empty()) explicit_angles.pop_back();
+        }
+    }
+    return {};
+}
+
+std::optional<std::size_t> Parser::bounded_statement_end(std::size_t first, unsigned depth) {
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    const auto limits = execution ? execution->limits() : EvaluationLimits{};
+    if (first >= tokens_.size() || tokens_[first].kind == TokenKind::End) return {};
+    if (depth >= limits.depth) {
+        public_tree_failed_ = true;
+        if (execution) execution->tree_limit_error(tokens_[first].location);
+        return {};
+    }
+    if (execution && !execution->work(tokens_[first].location)) {
+        public_tree_failed_ = true;
+        return {};
+    }
+    auto at = first;
+    while (tokens_[at].is("[[")) {
+        const auto end = bounded_group_end(at);
+        if (!end || *end >= tokens_.size()) return {};
+        at = *end;
+    }
+    if (tokens_[at].is("{")) return bounded_group_end(at);
+    const auto head = tokens_[at].text;
+    if (head == "if" || head == "switch" || head == "while" || head == "for") {
+        if (at + 1 >= tokens_.size() || !tokens_[at + 1].is("(")) return {};
+        const auto condition_end = bounded_group_end(at + 1);
+        if (!condition_end) return {};
+        auto end = bounded_statement_end(*condition_end, depth + 1);
+        if (end && head == "if" && *end < tokens_.size() && tokens_[*end].is("else"))
+            end = bounded_statement_end(*end + 1, depth + 1);
+        return end;
+    }
+    if (head == "do") {
+        const auto body_end = bounded_statement_end(at + 1, depth + 1);
+        if (!body_end || *body_end + 1 >= tokens_.size() ||
+            !tokens_[*body_end].is("while") || !tokens_[*body_end + 1].is("(")) return {};
+        const auto condition_end = bounded_group_end(*body_end + 1);
+        if (!condition_end || *condition_end >= tokens_.size() ||
+            !tokens_[*condition_end].is(";")) return {};
+        return *condition_end + 1;
+    }
+    if (head == "label" && at + 2 < tokens_.size() &&
+        tokens_[at + 1].kind == TokenKind::Identifier && tokens_[at + 2].is(":"))
+        return bounded_statement_end(at + 3, depth + 1);
+    if (tokens_[at].kind == TokenKind::Identifier && at + 1 < tokens_.size() &&
+        tokens_[at + 1].is(":")) return bounded_statement_end(at + 2, depth + 1);
+    if (head == "case") {
+        unsigned conditional_depth{};
+        for (++at; at < tokens_.size(); ++at) {
+            if (execution && !execution->work(tokens_[at].location)) {
+                public_tree_failed_ = true;
+                return {};
+            }
+            const auto text = tokens_[at].text;
+            if (tokens_[at].kind == TokenKind::End || text == ";" || text == "}") return {};
+            if (text == "(" || text == "[" || text == "[[" || text == "{") {
+                const auto end = bounded_group_end(at);
+                if (!end) return {};
+                at = *end - 1;
+            } else if (text == "?") ++conditional_depth;
+            else if (text == ":") {
+                if (conditional_depth) --conditional_depth;
+                else return bounded_statement_end(at + 1, depth + 1);
+            }
+        }
+        return {};
+    }
+    // An already-active syntax prefix or explicit macro token-tree is bounded
+    // by its own pattern/group. Recognition remains read-only; no expander is
+    // run to discover a statement's endpoint.
+    struct RestoreProbe {
+        Parser& parser;
+        std::size_t index;
+        bool recording;
+        ~RestoreProbe() { parser.index_ = index; parser.recording_public_tree_ = recording; }
+    } restore{*this, index_, recording_public_tree_};
+    index_ = at;
+    recording_public_tree_ = false;
+    const auto unit_first = at;
+    const auto* definition = active_syntax(false);
+    if (definition && definition->kind == SyntaxKind::Statement) {
+        if (!parse_opaque_invocation(SyntaxKind::Statement)) return {};
+        return index_;
+    }
+    if (macro_start()) {
+        if (!parse_opaque_invocation(SyntaxKind::Statement)) return {};
+        if (!opaque_statement_has_expression_continuation()) return index_;
+    }
+    for (; at < tokens_.size(); ++at) {
+        if (execution && !execution->work(tokens_[at].location)) {
+            public_tree_failed_ = true;
+            return {};
+        }
+        const auto text = tokens_[at].text;
+        if (tokens_[at].kind == TokenKind::End || text == "}" || text == ")" ||
+            text == "]" || text == "]]" || text == "else" ||
+            (at != unit_first && (text == "if" || text == "for" || text == "while" ||
+                             text == "do" || text == "switch" || text == "return"))) return {};
+        if (text == ";") return at + 1;
+        if (text == "(" || text == "[" || text == "[[" || text == "{") {
+            const auto end = bounded_group_end(at);
+            if (!end) return {};
+            at = *end - 1;
+        }
+    }
+    return {};
+}
+
+std::shared_ptr<const SyntaxContext> Parser::public_fragment_context(std::size_t first) const {
+    auto context = token_origin(tokens_[first].location).context;
+    if (!context && syntax_) context = syntax_->execution()->call_context(
+        tokens_[first].location, active_namespace_, active_imports_, syntax_->bindings());
+    return context;
+}
+
+std::shared_ptr<const SyntaxNode> Parser::deferred_node(
+    std::size_t first, std::size_t end, SyntaxProduction slot,
+    SyntaxParseCategory category, std::shared_ptr<const SyntaxContext> context) {
+    if (first >= end || end > tokens_.size()) return {};
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    const auto limits = execution ? execution->limits() : EvaluationLimits{};
+    auto node = std::make_shared<SyntaxNode>();
+    node->kind = SyntaxNode::Kind::Deferred;
+    node->slot_production = slot;
+    node->deferred_category = category;
+    node->span = {token_origin(tokens_[first].location).span,
+                  token_origin(tokens_[end - 1].location).span};
+    node->context = std::move(context);
+    std::uint64_t storage = 128;
+    for (auto at = first; at < end; ++at) {
+        if (execution && !execution->work(tokens_[at].location)) {
+            public_tree_failed_ = true;
+            return {};
+        }
+        storage += 128 + tokens_[at].text.size();
+        if (storage > std::min(limits.bytes, limits.memory)) {
+            public_tree_failed_ = true;
+            if (execution) execution->tree_limit_error(tokens_[at].location);
+            return {};
+        }
+        MetaToken token(tokens_[at]);
+        if (!token.origin.context) token.origin.context = node->context;
+        node->tokens.push_back(std::move(token));
+    }
+    return node;
+}
+
+bool Parser::opaque_statement_has_expression_continuation() const {
+    const auto suffix = current().text;
+    return precedence(suffix) > 0 || suffix == "=" || suffix == "+=" || suffix == "-=" ||
+        suffix == "*=" || suffix == "/=" || suffix == "%=" || suffix == "<<=" ||
+        suffix == ">>=" || suffix == "&=" || suffix == "^=" || suffix == "|=" ||
+        suffix == "?" || suffix == "(" || suffix == "[" || suffix == "." ||
+        suffix == "->" || suffix == "++" || suffix == "--" ||
+        (suffix == "::" && current(1).is("<"));
 }
 
 std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind category) {
@@ -1072,6 +1358,7 @@ std::string Parser::peek_qualified_name() const {
 }
 
 TypePtr Parser::resolve_type_alias(std::string_view name) const {
+    require_public_name_context(name);
     if (name.find("::") == std::string_view::npos) {
         const NameKey key(name, current().location);
         for (auto scope = local_type_scopes_.size(); scope != 0; --scope) {
@@ -1096,6 +1383,7 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
 
 bool Parser::type_start() const {
     const auto& token = current();
+    if (token.kind == TokenKind::Identifier) require_public_name_context(token.text);
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
@@ -1224,6 +1512,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             const bool is_union = consume("union");
             if (!is_union)
                 consume("struct");
+            const auto name_location = current().location;
             const auto name = parse_qualified_name();
             if (!name) {
                 error_here("expected record name after '" +
@@ -1256,6 +1545,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 type = record_type(declaration.name, is_union, is_const, is_volatile);
                 pending_records_.push_back(std::move(declaration));
             } else {
+                require_public_name_context(*name, name_location);
                 for (const auto& attribute : record_attributes)
                     diagnostics_.error(attribute.location,
                         "record attributes on a type use are not yet supported");
@@ -1302,6 +1592,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
             const auto location = current().location;
             consume("enum");
+            const auto name_location = current().location;
             const auto name = parse_qualified_name();
             if (!name) {
                 error_here("expected enumeration name after 'enum'");
@@ -1330,6 +1621,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                                  is_const, is_volatile);
                 pending_enumerations_.push_back(std::move(declaration));
             } else {
+                require_public_name_context(*name, name_location);
                 for (const auto& attribute : enum_attributes)
                     diagnostics_.error(attribute.location,
                         "enumeration attributes on a type use are not yet supported");
@@ -1606,6 +1898,7 @@ Parser::parse_angle_generic_parameters() {
 }
 
 bool Parser::known_generic_name(const Expr& name) const {
+    if (current().is("<")) require_public_name_context(name.text, name.location);
     if (name.text.find("::") == std::string::npos)
         for (auto scope = local_scopes_.rbegin();
              scope != local_scopes_.rend(); ++scope)
@@ -2955,8 +3248,34 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
 
 std::unique_ptr<Statement> Parser::parse_compound() {
     ProductionScope production(*this, SyntaxProduction::CompoundStatement);
+    const auto first = index_;
+    const auto production_depth = production_stack_.size();
+    std::optional<std::size_t> end_input;
+    std::shared_ptr<const SyntaxContext> context;
+    if (parsing_public_fragment_ && !public_tree_failed_) {
+        if (const auto end = bounded_group_end(first)) end_input = public_input_indices_[*end];
+        context = public_fragment_context(first);
+    }
+    if (parsing_public_fragment_ && public_tree_failed_) {
+        // A failed ProductionScope has no event ID. Do not publish or index
+        // a deferred event after resource exhaustion; the caller reports it.
+        auto failed = std::make_unique<Statement>();
+        failed->kind = Statement::Kind::Compound;
+        failed->location = current().location;
+        return failed;
+    }
     const auto saved_imports = active_imports_;
     const auto saved_scope_imports = current_scope_imports_;
+    const auto saved_values_depth = local_scopes_.size();
+    const auto saved_types_depth = local_type_scopes_.size();
+    const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
+    const auto saved_recording = recording_public_tree_;
+    const auto saved_generic_argument = parsing_generic_argument_;
+    const auto saved_generic_types = parsing_public_fragment_
+        ? active_generic_types_ : std::vector<std::string>{};
+    const auto saved_switch_depth = switch_depth_;
+    const auto saved_switch_defaults = parsing_public_fragment_
+        ? switch_default_seen_ : std::vector<bool>{};
     current_scope_imports_ = 0;
     local_scopes_.emplace_back();
     local_type_scopes_.emplace_back();
@@ -2967,39 +3286,71 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Compound;
     statement->location = current().location;
-    expect("{");
-    while (!current().is("}") && current().kind != TokenKind::End) {
-        const auto before = index_;
-        if (current().is("syntax") && (syntax_ || token_origin(current().location).context)) {
-            auto declaration = std::make_unique<Statement>();
-            declaration->kind = Statement::Kind::Empty;
-            declaration->location = current().location;
-            (void)parse_syntax_registration(nullptr);
-            statement->statements.push_back(std::move(declaration));
+    try {
+        expect("{");
+        while (!current().is("}") && current().kind != TokenKind::End) {
+            const auto before = index_;
+            if (current().is("syntax") && (syntax_ || token_origin(current().location).context)) {
+                auto declaration = std::make_unique<Statement>();
+                declaration->kind = Statement::Kind::Empty;
+                declaration->location = current().location;
+                (void)parse_syntax_registration(nullptr);
+                statement->statements.push_back(std::move(declaration));
+            } else if (current().is("using")) {
+                ProductionScope using_declaration(*this, SyntaxProduction::UsingDeclaration);
+                consume("using");
+                auto declaration = std::make_unique<Statement>();
+                declaration->kind = Statement::Kind::Empty;
+                declaration->location = tokens_[index_ - 1].location;
+                if (auto imported = parse_qualified_name(SyntaxProduction::NamespaceName)) {
+                    if (syntax_) syntax_->import(*imported);
+                    active_imports_.insert(active_imports_.begin() +
+                        static_cast<std::ptrdiff_t>(current_scope_imports_),
+                        std::move(*imported));
+                    ++current_scope_imports_;
+                } else error_here("expected namespace name after 'using'");
+                expect(";", "after using declaration");
+                statement->statements.push_back(std::move(declaration));
+            } else statement->statements.push_back(parse_statement());
+            if (index_ == before && current().kind != TokenKind::End) ++index_;
         }
-        else if (current().is("using")) {
-            ProductionScope using_declaration(*this, SyntaxProduction::UsingDeclaration);
-            consume("using");
-            auto declaration = std::make_unique<Statement>();
-            declaration->kind = Statement::Kind::Empty;
-            declaration->location = tokens_[index_ - 1].location;
-            if (auto imported = parse_qualified_name(SyntaxProduction::NamespaceName)) {
-                if (syntax_) syntax_->import(*imported);
-                active_imports_.insert(active_imports_.begin() +
-                    static_cast<std::ptrdiff_t>(current_scope_imports_),
-                    std::move(*imported));
-                ++current_scope_imports_;
-            } else error_here("expected namespace name after 'using'");
-            expect(";", "after using declaration");
-            statement->statements.push_back(std::move(declaration));
-        } else statement->statements.push_back(parse_statement());
-        if (index_ == before && current().kind != TokenKind::End) ++index_;
+        expect("}");
+    } catch (const DeferredNameRecognition&) {
+        // The complete brace unit is independently bounded. Stop before
+        // deciding any name-sensitive grammar; inspection must not execute
+        // the invocations that may establish those bindings.
+        recording_public_tree_ = saved_recording;
+        parsing_generic_argument_ = saved_generic_argument;
+        active_generic_types_ = saved_generic_types;
+        switch_depth_ = saved_switch_depth;
+        switch_default_seen_ = saved_switch_defaults;
+        production_stack_.resize(production_depth);
+        if (public_tree_failed_) {
+            // Keep the budget failure; no partially recorded tree is usable.
+        } else if (!end_input) {
+            error_here("name-sensitive capture boundary requires a raw bounded group");
+        } else {
+            const auto end = std::find(public_input_indices_.begin() +
+                static_cast<std::ptrdiff_t>(first), public_input_indices_.end(), *end_input);
+            if (end == public_input_indices_.end()) {
+                error_here("deferred syntax boundary lost its source index");
+            } else {
+                index_ = static_cast<std::size_t>(end - public_input_indices_.begin());
+                auto opaque = deferred_node(first, index_, SyntaxProduction::CompoundStatement,
+                                             SyntaxParseCategory::Statement, std::move(context));
+                production_events_.resize(production.event + 1);
+                auto& event = production_events_[production.event];
+                event.children.clear();
+                event.opaque = std::move(opaque);
+                statement->statements.clear();
+            }
+        }
     }
-    expect("}");
     active_imports_ = saved_imports;
     current_scope_imports_ = saved_scope_imports;
-    local_scopes_.pop_back();
-    local_type_scopes_.pop_back();
+    local_scopes_.resize(saved_values_depth);
+    local_type_scopes_.resize(saved_types_depth);
+    public_uncertain_binding_depths_.resize(saved_uncertain_count);
     if (syntax_) syntax_->pop_scope();
     return statement;
 }
@@ -3072,14 +3423,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         // An explicit operator/suffix after a macro places it inside a core
         // expression statement. A standalone invocation stays opaque; its
         // output is classified only after the owner has expanded.
-        const auto suffix = current().text;
-        const bool expression_continues = precedence(suffix) > 0 || suffix == "=" ||
-            suffix == "+=" || suffix == "-=" || suffix == "*=" || suffix == "/=" ||
-            suffix == "%=" || suffix == "<<=" || suffix == ">>=" || suffix == "&=" ||
-            suffix == "^=" || suffix == "|=" || suffix == "?" || suffix == "(" ||
-            suffix == "[" || suffix == "." || suffix == "->" || suffix == "++" ||
-            suffix == "--" || (suffix == "::" && current(1).is("<"));
-        if (expression_continues) {
+        if (opaque_statement_has_expression_continuation()) {
             index_ = first;
             production_events_.resize(events);
             if (!production_stack_.empty())
@@ -3088,7 +3432,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
             placeholder->kind = Statement::Kind::Expression;
             placeholder->expression = parse_expression();
             expect(";", "after expression statement");
-        }
+        } else mark_public_binding_uncertainty();
         return placeholder;
     }
     if (syntax_ && macro_start()) return parse_statement_replacement();
@@ -3100,6 +3444,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
             placeholder->location = current().location;
             if (!parse_opaque_invocation(SyntaxKind::Statement))
                 error_here("could not recognize a bounded opaque statement invocation");
+            mark_public_binding_uncertainty();
             return placeholder;
         }
         ProductionScope expression_statement(*this, SyntaxProduction::ExpressionStatement);
@@ -3197,6 +3542,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
     }
     if (consume("for")) {
         statement->kind = Statement::Kind::For;
+        const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
         local_scopes_.emplace_back();
         local_type_scopes_.emplace_back();
         expect("(");
@@ -3240,6 +3586,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         statement->second = parse_statement();
         local_scopes_.pop_back();
         local_type_scopes_.pop_back();
+        public_uncertain_binding_depths_.resize(saved_uncertain_count);
         return statement;
     }
     if (consume("break")) {

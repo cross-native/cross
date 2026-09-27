@@ -54,6 +54,11 @@ enum class SyntaxProduction {
 };
 std::string_view syntax_production_name(SyntaxProduction production);
 
+enum class SyntaxParseCategory {
+    None, Expression, Statement, Type, Declaration,
+    FunctionHeader, FunctionDeclaration, FunctionDefinition,
+};
+
 // The public, versioned tree is independent of typed AST/HIR. Every node
 // owns its lexical identity and remains immutable after construction.
 struct SyntaxNode {
@@ -62,6 +67,7 @@ struct SyntaxNode {
     // Expected grammar slot for an opaque extension/macro/deferred node.
     // It is not exposed as a core production by the public query API.
     SyntaxProduction slot_production{SyntaxProduction::None};
+    SyntaxParseCategory deferred_category{SyntaxParseCategory::None};
     TokenSequence tokens;
     std::vector<std::shared_ptr<const SyntaxNode>> children;
     SyntaxSpan span;

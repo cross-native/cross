@@ -47,6 +47,17 @@ private:
                                          std::string_view name_space,
                                          const std::vector<std::string>& imports) const;
     std::shared_ptr<const SyntaxNode> parse_opaque_invocation(SyntaxKind category);
+    bool opaque_statement_has_expression_continuation() const;
+    struct DeferredNameRecognition {};
+    void require_public_name_context(std::string_view name, SourceLocation location = {}) const;
+    void mark_public_binding_uncertainty();
+    std::optional<std::size_t> bounded_group_end(std::size_t first);
+    std::optional<std::size_t> fenced_fragment_end(std::size_t first, bool expression);
+    std::optional<std::size_t> bounded_statement_end(std::size_t first, unsigned depth = 0);
+    std::shared_ptr<const SyntaxContext> public_fragment_context(std::size_t first) const;
+    std::shared_ptr<const SyntaxNode> deferred_node(std::size_t first, std::size_t end,
+        SyntaxProduction slot, SyntaxParseCategory category,
+        std::shared_ptr<const SyntaxContext> context);
     std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output,
                                                 Diagnostics* diagnostics = nullptr) const;
     void adopt_replacement(Parser& child);
@@ -199,6 +210,7 @@ private:
     bool parsing_public_function_header_{};
     bool recording_public_tree_{};
     bool public_tree_failed_{};
+    std::vector<std::size_t> public_uncertain_binding_depths_;
     std::vector<ProductionEvent> production_events_;
     std::vector<std::size_t> production_stack_;
     // Public-fragment token splitting must not move the owner's match boundary.
