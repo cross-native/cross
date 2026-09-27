@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant) || !$::has_builtin($::syntax::node) || !$::has_intrinsic($::meta::child)
+#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant) || !$::has_builtin($::syntax::node) || !$::has_intrinsic($::meta::child) || !$::has_builtin($::syntax::span) || !$::has_intrinsic($::syntax::capture_span) || !$::has_builtin($::meta::node_span) || !$::has_intrinsic($::syntax::warning) || !$::has_builtin($::syntax::error) || !$::has_builtin($::syntax::note)
 #error implemented syntax operations must be discoverable
 #endif
 #if $::has_feature($::feature::syntax_extensions)
@@ -67,6 +67,9 @@ namespace flow {
     syntax Bracket : expression { prefix "bracket"; match body:bracket; expand five; }
     [[syntax_expander]] static $::meta::tokens group_shape(in $::meta::syntax_match input) {
         $::meta::syntax root = $::syntax::node(input, "body");
+        const $::meta::span original = $::syntax::span(input);
+        $::meta::span selected = 1u32 ? $::syntax::capture_span(input, "body") : original;
+        selected = $::meta::node_span(root);
         if (!$::meta::is_kind(root, "group") || $::meta::child_count(root) != 6uptr)
             return $::quote { 0u32 };
         if (!$::meta::is_kind($::meta::child(root, 0uptr), "token") ||
@@ -98,6 +101,8 @@ namespace flow {
     syntax RawProject : expression { prefix "raw_project"; match body:paren; expand group_project; }
     [[syntax_expander]] static $::meta::tokens group_record(in $::meta::syntax_match input) {
         $::meta::syntax_match record = $::syntax::at(input, "record", 0uptr);
+        $::meta::span record_span = $::syntax::span(record);
+        record_span = $::syntax::capture_span(input, "record");
         if (!$::syntax::is_variant(record, "group")) return $::quote { 0u32 };
         if (!$::meta::is_kind($::syntax::node(record, "body"), "group") ||
             $::meta::len($::syntax::capture(record, "body")) != 1uptr) return $::quote { 0u32 };

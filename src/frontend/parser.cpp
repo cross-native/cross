@@ -1047,6 +1047,7 @@ bool Parser::type_start() const {
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
            token.is("$::meta::syntax") ||
+           token.is("$::meta::span") ||
            token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
@@ -1072,7 +1073,14 @@ TypePtr Parser::parse_type() {
         }
     }
     TypePtr type;
-    if (current().is("$::meta::syntax")) {
+    if (current().is("$::meta::span")) {
+        if (!parsing_procedural_body_)
+            error_here("$::meta::span is only available in expansion functions");
+        type = span_type();
+        type->is_const = is_const;
+        type->is_volatile = is_volatile;
+        ++index_;
+    } else if (current().is("$::meta::syntax")) {
         if (!parsing_procedural_body_)
             error_here("$::meta::syntax is only available in expansion functions");
         type = syntax_type();

@@ -145,6 +145,8 @@ TypePtr clone_type(const TypePtr& source,
         result = syntax_match_type();
     } else if (source->kind == Type::Kind::Syntax) {
         result = syntax_type();
+    } else if (source->kind == Type::Kind::Span) {
+        result = span_type();
     } else if (source->kind == Type::Kind::Bytes) {
         result = bytes_type();
     } else if (source->kind == Type::Kind::Buffer) {
@@ -2166,6 +2168,7 @@ struct EvalValue {
     std::shared_ptr<const TokenSequence> tokens;
     std::shared_ptr<const SyntaxMatchValue> syntax_match;
     std::shared_ptr<const SyntaxNode> syntax_node;
+    std::optional<SyntaxSpan> syntax_span;
     std::shared_ptr<const std::string> bytes;
     std::size_t byte_offset{};
     std::size_t byte_length{};
@@ -2644,12 +2647,12 @@ public:
     }
 
     bool charge_input_match(const SyntaxMatchValue& match, SourceLocation location) {
-        if (!charge_meta_bytes(128, location) || !charge_input_tokens(match.input, location)) return false;
+        if (!charge_meta_bytes(syntax_match_storage_bytes, location) || !charge_input_tokens(match.input, location)) return false;
         if (match.variant && !charge_meta_bytes(32 + match.variant->size(), location)) return false;
         for (const auto& label : match.variant_labels)
             if (!charge_meta_bytes(32 + label.size(), location)) return false;
         for (const auto& field : match.fields) {
-            if (!charge_meta_bytes(64 + field.name.size(), location) ||
+            if (!charge_meta_bytes(syntax_field_storage_bytes + field.name.size(), location) ||
                 !charge_input_tokens(field.tokens, location)) return false;
             if (field.node) {
                 const auto size = syntax_node_storage(*field.node);
@@ -2772,9 +2775,7 @@ public:
     void diagnose(SourceLocation fallback) const {
         diagnostics_.error(
             failure_location_.valid() ? failure_location_ : fallback,
-            failure_reason_.empty()
-                ? "expression is not a translation-time value"
-                : failure_reason_);
+            failure_reason_.value_or("expression is not a translation-time value"));
         for (auto frame = failure_trace_.rbegin();
              frame != failure_trace_.rend(); ++frame) {
             diagnostics_.note(
@@ -2960,6 +2961,7 @@ public:
             if (type && (type->kind == Type::Kind::Tokens ||
                          type->kind == Type::Kind::SyntaxMatch ||
                          type->kind == Type::Kind::Syntax ||
+                         type->kind == Type::Kind::Span ||
                          type->kind == Type::Kind::Bytes ||
                          type->kind == Type::Kind::Buffer)) {
                 fail(expression.location, type_name(type) + " has no runtime size or alignment");
@@ -3026,6 +3028,7 @@ private:
         return type && (type->kind == Type::Kind::Tokens ||
             type->kind == Type::Kind::SyntaxMatch ||
             type->kind == Type::Kind::Syntax ||
+            type->kind == Type::Kind::Span ||
             contains_tokens(type->pointee) || contains_tokens(type->element) ||
             (type->function && (contains_tokens(type->function->result) ||
                 std::any_of(type->function->parameters.begin(), type->function->parameters.end(),
@@ -3036,6 +3039,17 @@ private:
         EvalValue result{UInt128{}, tokens_type()};
         result.tokens = std::make_shared<const TokenSequence>(std::move(tokens));
         return result;
+    }
+
+    std::optional<EvalValue> span_value(SyntaxSpan span, SourceLocation location) {
+        if (!span.first.valid() || !span.last.valid()) {
+            fail(location, "syntax span has no retained source location");
+            return std::nullopt;
+        }
+        if (!charge_meta_bytes(syntax_span_storage_bytes, location)) return std::nullopt;
+        EvalValue value{UInt128{}, span_type()};
+        value.syntax_span = std::move(span);
+        return value;
     }
 
     std::optional<std::vector<std::pair<std::size_t, std::size_t>>>
@@ -3363,10 +3377,12 @@ private:
             }
             const auto& name = node.left->text;
             if (name.starts_with("$::syntax::")) {
-                const auto count = name == "$::syntax::input" ? 1U
+                const bool diagnostic = name == "$::syntax::error" ||
+                    name == "$::syntax::warning" || name == "$::syntax::note";
+                const auto count = name == "$::syntax::input" || name == "$::syntax::span" ? 1U
                     : name == "$::syntax::capture" || name == "$::syntax::node" ||
                       name == "$::syntax::count" ||
-                      name == "$::syntax::is_variant" ? 2U
+                      name == "$::syntax::is_variant" || name == "$::syntax::capture_span" || diagnostic ? 2U
                     : name == "$::syntax::at" ? 3U : 0U;
                 if (!procedural_ || count == 0 || node.arguments.size() != count) {
                     fail(node.location, "unsupported syntax operation or invalid argument count: " + name);
@@ -3376,19 +3392,20 @@ private:
                     if (!validate_required_tree(*argument)) return false;
                 const auto first = expression_type(*node.arguments[0]);
                 const auto field = count > 1 ? expression_type(*node.arguments[1]) : nullptr;
-                if (!first || first->kind != Type::Kind::SyntaxMatch ||
+                if (!first || first->kind != (diagnostic ? Type::Kind::Span : Type::Kind::SyntaxMatch) ||
                     (count > 1 && (!field || field->kind != Type::Kind::Pointer || !field->pointee ||
                                   field->pointee->builtin != BuiltinType::U8)) ||
                     (count > 2 && !is_integer(expression_type(*node.arguments[2])))) {
-                    fail(node.location, "syntax operation requires a match, string field, and integer index as applicable");
+                    fail(node.location, diagnostic ? "syntax diagnostic requires a span and string message"
+                        : "syntax operation requires a match, string field, and integer index as applicable");
                     return false;
                 }
                 return true;
             }
-            if (name == "$::meta::tokens" || name == "$::meta::child_count" ||
+            if (name == "$::meta::tokens" || name == "$::meta::node_span" || name == "$::meta::child_count" ||
                 name == "$::meta::child" || name == "$::meta::is_kind" ||
                 name == "$::meta::is_production") {
-                const auto count = name == "$::meta::tokens" ||
+                const auto count = name == "$::meta::tokens" || name == "$::meta::node_span" ||
                     name == "$::meta::child_count" ? 1U : 2U;
                 if (!procedural_ || node.arguments.size() != count) {
                     fail(node.location, "unsupported syntax-tree operation or invalid argument count: " + name);
@@ -3651,7 +3668,7 @@ private:
                 const auto no = expression_type(*node.third);
                 if (yes && no && yes->kind == no->kind &&
                     (yes->kind == Type::Kind::Tokens || yes->kind == Type::Kind::SyntaxMatch ||
-                     yes->kind == Type::Kind::Syntax)) {
+                     yes->kind == Type::Kind::Syntax || yes->kind == Type::Kind::Span)) {
                     if (is_integer(condition) || is_floating(condition)) return true;
                     fail(node.location, "procedural macro condition must be scalar");
                     return false;
@@ -3728,6 +3745,8 @@ private:
             return from->kind == to->kind;
         if (from->kind == Type::Kind::Syntax || to->kind == Type::Kind::Syntax)
             return from->kind == to->kind;
+        if (from->kind == Type::Kind::Span || to->kind == Type::Kind::Span)
+            return from->kind == to->kind;
         if ((is_integer(from) || is_floating(from)) && (is_integer(to) || is_floating(to)))
             return true;
         return from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Pointer &&
@@ -3763,6 +3782,7 @@ private:
                     !(is_integer(type) || is_floating(type) || type->kind == Type::Kind::Tokens ||
                       type->kind == Type::Kind::SyntaxMatch ||
                       type->kind == Type::Kind::Syntax ||
+                      type->kind == Type::Kind::Span ||
                       (type->kind == Type::Kind::Pointer && type->pointee &&
                        type->pointee->kind == Type::Kind::Builtin && type->pointee->builtin == BuiltinType::U8))) {
                     fail(node.location, "procedural macro locals require ordinary scalar, string-pointer, or token cells without runtime storage qualifiers");
@@ -3961,7 +3981,7 @@ private:
                 return builtin_type(BuiltinType::Bool);
             if (procedural_ && conditional && left->kind == right->kind &&
                 (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
-                 left->kind == Type::Kind::Syntax)) {
+                 left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span)) {
                 auto result = clone_type(left);
                 result->is_const = false;
                 return result;
@@ -4010,6 +4030,12 @@ private:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
             if (procedural_ && expression.left->text == "$::syntax::at") return syntax_match_type();
             if (procedural_ && expression.left->text == "$::syntax::node") return syntax_type();
+            if (procedural_ && (expression.left->text == "$::syntax::span" ||
+                expression.left->text == "$::syntax::capture_span" ||
+                expression.left->text == "$::meta::node_span")) return span_type();
+            if (procedural_ && (expression.left->text == "$::syntax::error" ||
+                expression.left->text == "$::syntax::warning" ||
+                expression.left->text == "$::syntax::note")) return builtin_type(BuiltinType::Void);
             if (procedural_ && expression.left->text == "$::syntax::count") return builtin_type(BuiltinType::Uptr);
             if (procedural_ && expression.left->text == "$::syntax::is_variant")
                 return builtin_type(BuiltinType::Bool);
@@ -4331,6 +4357,14 @@ private:
             value.type = clone_type(type);
             return value;
         }
+        if (value.syntax_span || type->kind == Type::Kind::Span) {
+            if (!procedural_ || !value.syntax_span || type->kind != Type::Kind::Span) {
+                fail(location, "syntax spans cannot convert to runtime or other meta values");
+                return std::nullopt;
+            }
+            value.type = clone_type(type);
+            return value;
+        }
         if (value.tokens || type->kind == Type::Kind::Tokens) {
             if (!procedural_ || !value.tokens || type->kind != Type::Kind::Tokens) {
                 fail(location, "token values cannot be converted to or from runtime types");
@@ -4602,7 +4636,7 @@ private:
     };
 
     void fail(SourceLocation location, std::string reason) {
-        if (!failure_reason_.empty()) return;
+        if (failure_reason_) return;
         failure_location_ = location;
         failure_reason_ = std::move(reason);
         failure_trace_ = call_stack_;
@@ -6239,12 +6273,43 @@ private:
             fail(expression.location, "indirect calls are not permitted during translation-time evaluation");
             return std::nullopt;
         }
+        if (expression.left->text == "$::syntax::error" ||
+            expression.left->text == "$::syntax::warning" ||
+            expression.left->text == "$::syntax::note") {
+            const auto& name = expression.left->text;
+            if (!procedural_ || expression.arguments.size() != 2) {
+                fail(expression.location, "syntax diagnostic requires a span and string message");
+                return std::nullopt;
+            }
+            auto span = this->expression(*expression.arguments[0]);
+            if (!span) return std::nullopt;
+            auto message = this->expression(*expression.arguments[1]);
+            if (!span->syntax_span || !message || !message->string ||
+                message->offset >= message->string->size()) {
+                fail(expression.location, "syntax diagnostic requires a span and string message");
+                return std::nullopt;
+            }
+            const auto text = std::string_view(*message->string).substr(message->offset,
+                message->string->size() - message->offset - 1);
+            if (!charge_meta_bytes(32 + text.size(), expression.location)) return std::nullopt;
+            if (name == "$::syntax::error") {
+                fail(span->syntax_span->first, std::string(text));
+                return std::nullopt;
+            }
+            diagnostics_.report(name == "$::syntax::warning" ? DiagnosticLevel::Warning
+                : DiagnosticLevel::Note, span->syntax_span->first, text);
+            for (auto frame = call_stack_.rbegin(); frame != call_stack_.rend(); ++frame)
+                diagnostics_.note(frame->location, "while evaluating call to '" + frame->function + "'");
+            diagnostics_.note(macro_context_->definition, "expansion function is defined here");
+            diagnostics_.note(macro_context_->invocation, "while executing this expansion");
+            return EvalValue{UInt128{}, builtin_type(BuiltinType::Void)};
+        }
         if (expression.left->text.starts_with("$::syntax::")) {
             const auto& name = expression.left->text;
-            const auto count = name == "$::syntax::input" ? 1U
+            const auto count = name == "$::syntax::input" || name == "$::syntax::span" ? 1U
                 : name == "$::syntax::capture" || name == "$::syntax::node" ||
                   name == "$::syntax::count" ||
-                  name == "$::syntax::is_variant" ? 2U
+                  name == "$::syntax::is_variant" || name == "$::syntax::capture_span" ? 2U
                 : name == "$::syntax::at" ? 3U : 0U;
             if (!procedural_ || count == 0 || expression.arguments.size() != count) {
                 fail(expression.location, "unsupported syntax operation or invalid argument count: " + name);
@@ -6256,6 +6321,7 @@ private:
                 return std::nullopt;
             }
             if (count == 1) {
+                if (name == "$::syntax::span") return span_value(match->syntax_match->span, expression.location);
                 TokenSequence output;
                 if (!append_tokens(output, match->syntax_match->input, expression.location)) return std::nullopt;
                 return token_value(std::move(output));
@@ -6288,6 +6354,7 @@ private:
                 fail(expression.location, "syntax match has no field named '" + std::string(written) + "'");
                 return std::nullopt;
             }
+            if (name == "$::syntax::capture_span") return span_value(found->span, expression.location);
             if (name == "$::syntax::capture") {
                 if (found->kind != SyntaxMatchValue::Field::Kind::Primitive &&
                     found->kind != SyntaxMatchValue::Field::Kind::RawGroup) {
@@ -6323,12 +6390,13 @@ private:
             return value;
         }
         if (procedural_ && (expression.left->text == "$::meta::tokens" ||
+            expression.left->text == "$::meta::node_span" ||
             expression.left->text == "$::meta::child_count" ||
             expression.left->text == "$::meta::child" ||
             expression.left->text == "$::meta::is_kind" ||
             expression.left->text == "$::meta::is_production")) {
             const auto& name = expression.left->text;
-            const auto count = name == "$::meta::tokens" ||
+            const auto count = name == "$::meta::tokens" || name == "$::meta::node_span" ||
                 name == "$::meta::child_count" ? 1U : 2U;
             if (expression.arguments.size() != count) {
                 fail(expression.location, name + " requires " + std::to_string(count) + " arguments");
@@ -6340,6 +6408,7 @@ private:
                 return std::nullopt;
             }
             const auto& node = *source->syntax_node;
+            if (name == "$::meta::node_span") return span_value(node.span, expression.location);
             if (name == "$::meta::tokens") {
                 TokenSequence result;
                 const auto flattened = syntax_node_tokens(node);
@@ -6987,7 +7056,7 @@ private:
     unsigned depth_{};
     bool budget_diagnosed_{};
     SourceLocation failure_location_;
-    std::string failure_reason_;
+    std::optional<std::string> failure_reason_;
     std::vector<CallFrame> call_stack_;
     std::vector<CallFrame> failure_trace_;
 };

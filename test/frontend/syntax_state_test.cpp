@@ -30,6 +30,7 @@ syntax Second : statement { prefix "same"; match body:block; expand expand; }
 syntax Item : item { prefix "same"; match body:block; expand expand; }
 syntax Rule : rule { match value:literal; }
 syntax Combined : expression { prefix "combined"; match rule(Rule); expand expand; }
+syntax Optional : expression { prefix "optional"; match part:optional("x"); expand expand; }
 syntax BadRule : rule { match rule(BadRule) "x"; }
 syntax BadUse : expression { prefix "bad"; match rule(BadRule); expand expand; }
 syntax Pack : bundle { use First; use Item; }
@@ -112,6 +113,11 @@ syntax Pack : bundle { use First; use Item; }
             raw_field.node->span.first.offset == raw_tokens[1].location.offset &&
             raw_field.node->span.last.offset == raw_tokens[raw->end - 1].location.offset,
             "raw group did not retain its original source span");
+    require(raw->value->span.first.offset == 0 &&
+            raw->value->span.last.offset == raw_field.node->span.last.offset &&
+            raw_field.span.first.offset == raw_field.node->span.first.offset &&
+            raw_field.span.last.offset == raw_field.node->span.last.offset,
+            "match or capture span lost its original endpoints");
     const auto projection = syntax_node_tokens(*raw_field.node);
     require(projection.size() == raw_field.tokens.size() && projection.size() == raw->end - 1,
             "raw group projection changed its bounded token count");
@@ -134,6 +140,15 @@ syntax Pack : bundle { use First; use Item; }
     require(contextual_match && contextual_match->value->fields.front().node->children[1]->context == origin.context &&
             syntax_node_tokens(*contextual_match->value->fields.front().node)[1].origin.context == origin.context,
             "raw group lost a copied child's immutable lookup context");
+    require(activate({{"Optional", {}, {}}}), "optional test syntax did not activate");
+    const auto* empty_source = sources.add("empty-span.x", "optional ;");
+    const auto empty_tokens = Lexer(*empty_source, diagnostics).lex();
+    const auto empty_match = state.match(*state.selected(empty_tokens.front(), false), empty_tokens, 0, diagnostics);
+    require(empty_match && empty_match->end == 1 &&
+            empty_match->value->span.first.offset == 0 && empty_match->value->span.last.offset == 0 &&
+            empty_match->value->fields.front().span.first.offset == empty_tokens[1].location.offset &&
+            empty_match->value->fields.front().span.last.offset == empty_tokens[1].location.offset,
+            "empty optional span was not anchored at its capture boundary");
 
     // Generic-close terminal fragments project back to the original lexical
     // token only when every adjacent piece has the same source identity.

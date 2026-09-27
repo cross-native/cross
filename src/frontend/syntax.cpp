@@ -106,12 +106,12 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node) {
         } else {
             const auto* next = matches.back();
             matches.pop_back();
-            add(128);
+            add(syntax_match_storage_bytes);
             tokens(next->input);
             if (next->variant) { add(32); add(next->variant->size()); }
             for (const auto& label : next->variant_labels) { add(32); add(label.size()); }
             for (const auto& field : next->fields) {
-                add(64); add(field.name.size()); tokens(field.tokens);
+                add(syntax_field_storage_bytes); add(field.name.size()); tokens(field.tokens);
                 if (field.node) nodes.push_back(field.node.get());
                 for (const auto& child : field.records) { add(16); matches.push_back(child.get()); }
             }
@@ -1066,6 +1066,10 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         return root;
     };
     using FieldKind = SyntaxMatchValue::Field::Kind;
+    const auto span = [&](std::size_t first, std::size_t last) {
+        return SyntaxSpan{token_origin(tokens[first].location).span,
+            token_origin(tokens[last == first ? first : last - 1].location).span};
+    };
     struct Candidate {
         std::size_t end;
         std::shared_ptr<const SyntaxMatchValue> value;
@@ -1086,7 +1090,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             failed = true;
             return {};
         }
-        if (!charge(128)) { failed = true; return {}; }
+        if (!charge(syntax_match_storage_bytes)) { failed = true; return {}; }
         std::vector<Candidate> active{{first, std::make_shared<SyntaxMatchValue>()}};
         for (const auto& element : pattern) {
             std::vector<Candidate> next;
@@ -1094,12 +1098,13 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 if (candidate.end >= tokens.size() || failed) continue;
                 if (!execution_->work(tokens[candidate.end].location)) { failed = true; break; }
                 for (auto part : pieces(element, candidate.end, depth + 1)) {
-                    if (failed || !charge(128 + 64 * candidate.value->fields.size())) { failed = true; break; }
+                    if (failed || !charge(syntax_match_storage_bytes +
+                        syntax_field_storage_bytes * candidate.value->fields.size())) { failed = true; break; }
                     auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
                     if (!element.field.empty()) {
                         SyntaxMatchValue::Field field{element.field, {}, std::move(part.node),
-                            std::move(part.records), part.kind};
-                        if (!charge(64 + field.name.size())) { failed = true; break; }
+                            std::move(part.records), part.kind, span(candidate.end, part.end)};
+                        if (!charge(syntax_field_storage_bytes + field.name.size())) { failed = true; break; }
                         if ((part.kind == FieldKind::Primitive || part.kind == FieldKind::RawGroup) &&
                             !copy_tokens(field.tokens, candidate.end, part.end)) {
                             failed = true; break;
@@ -1115,6 +1120,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         }
         for (auto& candidate : active) {
             auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
+            value->span = span(first, candidate.end);
             if (!copy_tokens(value->input, first, candidate.end)) { failed = true; return {}; }
             candidate.value = std::move(value);
         }
@@ -1138,7 +1144,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             std::vector<Piece> output;
             for (const auto& alternative : element.alternatives)
                 for (auto& candidate : nested(alternative.pattern, start)) {
-                    if (!charge(128 + alternative.label.size())) { failed = true; return {}; }
+                    if (!charge(syntax_match_storage_bytes + alternative.label.size())) { failed = true; return {}; }
                     auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
                     value->variant = alternative.label;
                     for (const auto& possible : element.alternatives) {
@@ -1294,6 +1300,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     auto root = std::make_shared<SyntaxMatchValue>(*matches.front().value);
     if (!charge(128 + tokens[begin].text.size())) return {};
     root->input.insert(root->input.begin(), MetaToken(tokens[begin]));
+    root->span = span(begin, matches.front().end);
     if (!definition.bound_expander) return {};
     return Match{std::move(root), matches.front().end, *definition.bound_expander};
 }

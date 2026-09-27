@@ -23,6 +23,11 @@ struct SyntaxSpan {
     SourceLocation last;
 };
 
+// Logical evaluator accounting, independent of host/target runtime layout.
+inline constexpr std::uint64_t syntax_span_storage_bytes = 64;
+inline constexpr std::uint64_t syntax_match_storage_bytes = 192;
+inline constexpr std::uint64_t syntax_field_storage_bytes = 128;
+
 enum class SyntaxProduction {
     None, Declaration, FunctionHeader, FunctionDefinition, TypeName,
     AttributeSpecifier, Attribute, AttributeName, BalancedTokenSequence,
@@ -68,11 +73,13 @@ struct SyntaxMatchValue {
         std::shared_ptr<const SyntaxNode> node;
         std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
         Kind kind{Kind::Primitive};
+        SyntaxSpan span;
     };
     TokenSequence input;
     std::vector<Field> fields;
     std::optional<std::string> variant;
     std::vector<std::string> variant_labels;
+    SyntaxSpan span;
 };
 
 struct SyntaxFunctionId { std::uint32_t value{}; };

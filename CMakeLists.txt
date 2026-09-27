@@ -2372,6 +2372,10 @@ if(BUILD_TESTING)
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw.x
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-raw-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw.cmake")
+    add_test(NAME cross_syntax_span_checks
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-span-checks
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_spans.cmake")
     add_executable(cross_syntax_state_test test/frontend/syntax_state_test.cpp)
     target_link_libraries(cross_syntax_state_test PRIVATE cross_frontend)
     cross_component(cross_syntax_state_test)
