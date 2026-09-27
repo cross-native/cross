@@ -621,10 +621,20 @@ namespace frozen {
 }
 global u32 evaluated_declaration_lists = evaluate_declaration_lists();
 u32 global reordered_storage_value = 6u32;
+u32 [[aligned(16)]] global interleaved_aligned = 3u32;
+u32 typedef ReorderedWord, *ReorderedPointer;
 [[noinline]] u32 static reordered_storage(in u32 input) {
     const static u32 fixed = 4u32;
     u32 register dynamic = input + fixed;
     return dynamic + reordered_storage_value;
+}
+[[noinline]] static u32 reordered_typedef(in u32 input) {
+    u32 typedef Word, *Pointer;
+    Word first = input + 1u32, second = first + 2u32;
+    Pointer destination = &second;
+    *destination += first;
+    for (u16 typedef LoopWord; 0u32;) { LoopWord ignored; }
+    return second;
 }
 typedef u32 ShadowName;
 [[noinline]] static u32 alias_shadowing() {
@@ -641,6 +651,8 @@ global uptr syntax_width = width ();
 global u32 syntax_raw_entry() {
 #ifndef SYNTAX_COMPILE_ONLY
     if (generated() != 7u32) return 0u32;
+    if (((uptr)&interleaved_aligned & 15uptr) != 0uptr || interleaved_aligned != 3u32)
+        return 0u32;
     if (copied_function(4u32) != 21u32) return 0u32;
     if (reopened::first() != 7u32 || reopened::second() != 4u32) return 0u32;
     if (dangling(0u32) != 5u32 || dangling(1u32) != 3u32 || dangling(2u32) != 7u32) return 0u32;
@@ -657,7 +669,7 @@ global u32 syntax_raw_entry() {
         parsed_first != 3u32 || parsed_second != 4u32 || parsed_members() != 15u32 ||
         parsed_declaration_lists(3u32) != 19u32 || declaration_list_vlas() != 26u32 ||
         evaluated_declaration_lists != 10u32 || alias_shadowing() != 5u32 ||
-        reordered_storage(3u32) != 13u32 ||
+        reordered_storage(3u32) != 13u32 || reordered_typedef(3u32) != 10u32 ||
         static_declaration_lists() != 5u32 || static_declaration_lists() != 8u32 ||
         parsed_generic<u32, 4u32>(3u32) != 7u32 ||
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||

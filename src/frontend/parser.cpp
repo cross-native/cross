@@ -947,69 +947,67 @@ void Parser::apply_type_attributes(
     std::optional<std::pair<std::uint32_t, SourceLocation>>*
         pending_address_space) {
     if (!current().is("[[")) return;
-    for (const auto& attribute : parse_attributes(true)) {
-        if (attribute.name == "atomic") {
-            if (!attribute.arguments.empty()) {
-                diagnostics_.error(attribute.location,
-                                   "'atomic' takes no arguments");
-            } else if (type->is_atomic) {
-                diagnostics_.error(attribute.location,
-                                   "duplicate 'atomic' type qualifier");
-            } else {
-                type->is_atomic = true;
-            }
-            continue;
+    for (const auto& attribute : parse_attributes(true))
+        apply_type_attribute(type, attribute, pending_address_space);
+}
+
+void Parser::apply_type_attribute(
+    TypePtr& type, const Attribute& attribute,
+    std::optional<std::pair<std::uint32_t, SourceLocation>>*
+        pending_address_space) {
+    if (attribute.name == "atomic") {
+        if (!attribute.arguments.empty())
+            diagnostics_.error(attribute.location, "'atomic' takes no arguments");
+        else if (type->is_atomic)
+            diagnostics_.error(attribute.location, "duplicate 'atomic' type qualifier");
+        else type->is_atomic = true;
+        return;
+    }
+    if (attribute.name == "address_space") {
+        if (attribute.arguments.size() != 1) {
+            diagnostics_.error(attribute.location,
+                               "address_space requires one target registry number");
+            return;
         }
-        if (attribute.name == "address_space") {
-            if (attribute.arguments.size() != 1) {
-                diagnostics_.error(attribute.location,
-                                   "address_space requires one target registry number");
-                continue;
-            }
-            auto digits = attribute.arguments.front();
-            digits.erase(std::remove(digits.begin(), digits.end(), '_'),
-                         digits.end());
-            int base = 10;
-            if (digits.starts_with("0x") || digits.starts_with("0X")) {
-                digits.erase(0, 2);
-                base = 16;
-            } else if (digits.starts_with("0b") || digits.starts_with("0B")) {
-                digits.erase(0, 2);
-                base = 2;
-            }
-            std::uint32_t number{};
-            const auto parsed = std::from_chars(
-                digits.data(), digits.data() + digits.size(), number, base);
-            if (digits.empty() || parsed.ec != std::errc{} ||
-                parsed.ptr != digits.data() + digits.size()) {
-                diagnostics_.error(attribute.location,
-                                   "address_space requires a nonnegative target registry number");
-                continue;
-            }
-            if (pending_address_space) {
-                if (*pending_address_space) {
-                    diagnostics_.error(attribute.location,
-                                       "duplicate address_space type qualifier");
-                } else {
-                    *pending_address_space =
-                        std::pair{number, attribute.location};
-                }
-            } else if (type->kind != Type::Kind::Pointer) {
-                diagnostics_.error(attribute.location,
-                                   "address_space requires a pointer type");
-            } else if (type->address_space_location.valid()) {
+        auto digits = attribute.arguments.front();
+        digits.erase(std::remove(digits.begin(), digits.end(), '_'), digits.end());
+        int base = 10;
+        if (digits.starts_with("0x") || digits.starts_with("0X")) {
+            digits.erase(0, 2);
+            base = 16;
+        } else if (digits.starts_with("0b") || digits.starts_with("0B")) {
+            digits.erase(0, 2);
+            base = 2;
+        }
+        std::uint32_t number{};
+        const auto parsed = std::from_chars(
+            digits.data(), digits.data() + digits.size(), number, base);
+        if (digits.empty() || parsed.ec != std::errc{} ||
+            parsed.ptr != digits.data() + digits.size()) {
+            diagnostics_.error(attribute.location,
+                               "address_space requires a nonnegative target registry number");
+            return;
+        }
+        if (pending_address_space) {
+            if (*pending_address_space)
                 diagnostics_.error(attribute.location,
                                    "duplicate address_space type qualifier");
-            } else {
-                type->address_space = number;
-                type->address_space_location = attribute.location;
-            }
-            continue;
+            else *pending_address_space = std::pair{number, attribute.location};
+        } else if (type->kind != Type::Kind::Pointer) {
+            diagnostics_.error(attribute.location,
+                               "address_space requires a pointer type");
+        } else if (type->address_space_location.valid()) {
+            diagnostics_.error(attribute.location,
+                               "duplicate address_space type qualifier");
+        } else {
+            type->address_space = number;
+            type->address_space_location = attribute.location;
         }
-        diagnostics_.error(attribute.location,
-                           "attribute '" + attribute.name +
-                               "' is not valid as a type qualifier here");
+        return;
     }
+    diagnostics_.error(attribute.location,
+                       "attribute '" + attribute.name +
+                           "' is not valid as a type qualifier here");
 }
 
 std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction production_name) {
@@ -1085,13 +1083,40 @@ bool Parser::type_start() const {
 }
 
 TypePtr Parser::parse_type(bool record_specifiers,
-                           std::function<bool()> storage_specifier) {
+                           std::function<bool()> storage_specifier,
+                           std::vector<Attribute>* declaration_attributes) {
     ProductionScope specifiers(*this, record_specifiers
         ? SyntaxProduction::DeclarationSpecifiers : SyntaxProduction::None);
     bool is_const = false;
     bool is_volatile = false;
     bool is_restrict = false;
     std::optional<SourceLocation> restrict_location;
+    std::optional<std::pair<std::uint32_t, SourceLocation>> pending_address_space;
+    std::vector<Attribute> deferred_type_attributes;
+    if (declaration_attributes) {
+        std::vector<Attribute> leading_attributes;
+        leading_attributes.swap(*declaration_attributes);
+        for (auto& attribute : leading_attributes) {
+            if (attribute.name == "atomic" || attribute.name == "address_space")
+                deferred_type_attributes.push_back(std::move(attribute));
+            else declaration_attributes->push_back(std::move(attribute));
+        }
+    }
+    const auto consume_specifier_attributes = [&](TypePtr* built_type) {
+        for (auto& attribute : parse_attributes(true)) {
+            if (attribute.name == "atomic" || attribute.name == "address_space") {
+                if (built_type)
+                    apply_type_attribute(*built_type, attribute, &pending_address_space);
+                else deferred_type_attributes.push_back(std::move(attribute));
+            } else if (declaration_attributes) {
+                declaration_attributes->push_back(std::move(attribute));
+            } else {
+                diagnostics_.error(attribute.location,
+                    "attribute '" + attribute.name +
+                        "' is not valid as a type qualifier here");
+            }
+        }
+    };
     const auto storage_start = [&] {
         return storage_specifier &&
             (current().is("typedef") || current().is("static") ||
@@ -1099,10 +1124,14 @@ TypePtr Parser::parse_type(bool record_specifiers,
              current().is("stack") || current().is("inline"));
     };
     while (current().is("const") || current().is("volatile") ||
-           current().is("restrict") || storage_start()) {
+           current().is("restrict") || current().is("[[") || storage_start()) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         if (storage_start()) {
             if (!storage_specifier()) break;
+            continue;
+        }
+        if (current().is("[[")) {
+            consume_specifier_attributes(nullptr);
             continue;
         }
         ProductionScope qualifier(*this, SyntaxProduction::TypeQualifier);
@@ -1274,7 +1303,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
             }
         }
     }
-    std::optional<std::pair<std::uint32_t, SourceLocation>> pending_address_space;
+    for (const auto& attribute : deferred_type_attributes)
+        apply_type_attribute(type, attribute, &pending_address_space);
     while (current().is("const") || current().is("volatile") ||
            current().is("restrict") || current().is("[[") || storage_start()) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
@@ -1282,7 +1312,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             if (!storage_specifier()) break;
         } else if (current().is("[[")) {
             // Each written attribute_specifier owns its own occurrence.
-            apply_type_attributes(type, &pending_address_space);
+            consume_specifier_attributes(&type);
         } else {
             ProductionScope qualifier(*this, SyntaxProduction::TypeQualifier);
             if (consume("const"))
@@ -1790,20 +1820,8 @@ Program Parser::parse() {
 }
 
 void Parser::parse_typedef(const std::string& name_space,
-                           std::vector<Attribute> attributes, bool consume_semicolon) {
-    const auto location = current().location;
-    ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
-    {
-        ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
-        consume("typedef");
-    }
-    if (!type_start()) {
-        error_here("expected aliased type after 'typedef'");
-        synchronize_external();
-        return;
-    }
-    auto base_type = parse_type(false);
-    specifiers.finish();
+                           std::vector<Attribute> attributes, TypePtr base_type,
+                           SourceLocation location, bool consume_semicolon) {
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
     do {
         ProductionScope item(*this, SyntaxProduction::InitDeclarator);
@@ -1835,6 +1853,13 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
 
     const Attribute* vector_attribute = nullptr;
     for (const auto& attribute : attributes) {
+        if (attribute.name != "aligned" && attribute.name != "abi" &&
+            attribute.name != "clobber" && attribute.name != "stack_cleanup" &&
+            attribute.name != "vector_size" &&
+            attribute.name != "ext_vector_type" &&
+            attribute.name != "scalable_vector")
+            diagnostics_.error(attribute.location,
+                "attribute '" + attribute.name + "' is not valid on a typedef");
         if (attribute.name != "vector_size" &&
             attribute.name != "ext_vector_type" &&
             attribute.name != "scalable_vector") {
@@ -2020,21 +2045,30 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         parse_record_declaration(program, name_space, std::move(attributes));
         return;
     }
-    if (current().is("typedef")) {
-        parse_typedef(name_space, std::move(attributes));
-        return;
-    }
-
     Linkage linkage = Linkage::Group;
     bool linkage_seen = false;
     bool inline_hint = false;
+    bool typedef_seen = false;
     const auto consume_storage = [&]() -> bool {
-        if (consume("inline")) { inline_hint = true; return true; }
         const auto location = current().location;
+        if (consume("typedef")) {
+            if (typedef_seen || linkage_seen || inline_hint)
+                diagnostics_.error(location, "typedef cannot combine with another storage specifier");
+            typedef_seen = true;
+            return true;
+        }
+        if (consume("inline")) {
+            if (typedef_seen)
+                diagnostics_.error(location, "typedef cannot combine with another storage specifier");
+            inline_hint = true;
+            return true;
+        }
         Linkage selected;
         if (consume("global")) selected = Linkage::Global;
         else if (consume("static")) selected = Linkage::Static;
         else return false;
+        if (typedef_seen)
+            diagnostics_.error(location, "typedef cannot combine with another storage specifier");
         if (linkage_seen && linkage != selected)
             diagnostics_.error(location, "declaration cannot be both 'global' and 'static'");
         linkage = selected;
@@ -2042,12 +2076,13 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return true;
     };
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
-    while (current().is("global") || current().is("static") || current().is("inline")) {
+    while (current().is("typedef") || current().is("global") ||
+           current().is("static") || current().is("inline")) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         (void)consume_storage();
     }
 
-    if (linkage == Linkage::Global && current().is("label") &&
+    if (!typedef_seen && linkage == Linkage::Global && current().is("label") &&
         current(1).kind == TokenKind::Identifier && current(2).is("::")) {
         if (inline_hint) {
             diagnostics_.error(current().location,
@@ -2069,19 +2104,25 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                       name) == active_generic_types_.end())
             active_generic_types_.push_back(name);
     }
-    if (!type_start()) {
+    if (!type_start() && !current().is("[[")) {
         if (const auto message = familiar_c_spelling(current().text)) {
             error_here(*message);
         } else {
-            error_here("expected declaration");
+            error_here(typedef_seen ? "expected aliased type after 'typedef'"
+                                    : "expected declaration");
         }
         synchronize_external();
         active_generic_types_ = saved_generic_types;
         return;
     }
     const auto location = current().location;
-    auto base_type = parse_type(false, consume_storage);
+    auto base_type = parse_type(false, consume_storage, &attributes);
     specifiers.finish();
+    if (typedef_seen) {
+        parse_typedef(name_space, std::move(attributes), std::move(base_type), location);
+        active_generic_types_ = saved_generic_types;
+        return;
+    }
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
     unsigned ordinal = 0;
     bool last_function = false;
@@ -2336,7 +2377,7 @@ void Parser::parse_record_declaration(
                 continue;
             }
             const auto member_location = current().location;
-            auto base_type = parse_type();
+            auto base_type = parse_type(true, {}, &member_attributes);
             bool parsed_member = false;
             do {
                 ProductionScope member_declarator(*this, SyntaxProduction::MemberDeclarator);
@@ -2421,7 +2462,7 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
         else { consume("inout"); parameter.mode = ParameterMode::InOut; }
         parameter.explicit_mode = true;
     }
-    parameter.type = parse_type();
+    parameter.type = parse_type(true, {}, &attributes);
     std::optional<std::string> name;
     parameter.type = parse_declarator(std::move(parameter.type), name, true,
                                       nullptr, &parameter.location);
@@ -2570,17 +2611,20 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
                                 SyntaxProduction production_name) {
     ProductionScope production(*this, production_name);
     const auto location = current().location;
-    if (current().is("typedef")) {
-        parse_typedef({}, std::move(attributes), consume_semicolon);
-        auto statement = std::make_unique<Statement>();
-        statement->kind = Statement::Kind::Empty;
-        statement->location = location;
-        return statement;
-    }
     bool storage_register = false;
     bool storage_stack = false;
     bool storage_static = false;
+    bool typedef_seen = false;
     const auto consume_storage = [&]() -> bool {
+        if (current().is("typedef")) {
+            const auto storage_location = current().location;
+            ++index_;
+            if (typedef_seen || storage_register || storage_stack || storage_static)
+                diagnostics_.error(storage_location,
+                    "typedef cannot combine with another storage specifier");
+            typedef_seen = true;
+            return true;
+        }
         bool* selected = nullptr;
         if (current().is("register")) selected = &storage_register;
         else if (current().is("stack")) selected = &storage_stack;
@@ -2588,18 +2632,29 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         if (!selected) return false;
         const auto location = current().location;
         ++index_;
-        if (storage_register || storage_stack || storage_static)
+        if (typedef_seen)
+            diagnostics_.error(location, "typedef cannot combine with another storage specifier");
+        else if (storage_register || storage_stack || storage_static)
             diagnostics_.error(location, "local declaration has more than one storage specifier");
         *selected = true;
         return true;
     };
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
-    if (current().is("register") || current().is("stack") || current().is("static")) {
+    if (current().is("typedef") || current().is("register") ||
+        current().is("stack") || current().is("static")) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         (void)consume_storage();
     }
-    auto base_type = parse_type(false, consume_storage);
+    auto base_type = parse_type(false, consume_storage, &attributes);
     specifiers.finish();
+    if (typedef_seen) {
+        parse_typedef({}, std::move(attributes), std::move(base_type), location,
+                      consume_semicolon);
+        auto statement = std::make_unique<Statement>();
+        statement->kind = Statement::Kind::Empty;
+        statement->location = location;
+        return statement;
+    }
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
     auto result = std::make_unique<Statement>();
     result->kind = Statement::Kind::DeclarationList;

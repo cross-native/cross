@@ -143,4 +143,34 @@ int main() {
     require(pointers.statements[1]->declaration->type->kind == Type::Kind::Pointer);
     require(body.statements[3]->statements[1]->declaration->type->builtin == BuiltinType::U64);
     require(body.statements[4]->declaration->type->builtin == BuiltinType::U32);
+
+    const auto* interleaved_source = sources.add("interleaved-specifiers.x", R"(
+        typedef u32 [[ext_vector_type(4)]] LaneGroup;
+        LaneGroup lanes;
+        [[atomic]] u32 counter;
+        u32 [[address_space(0)]] *pointer;
+        u32 [[aligned(8)]] object;
+        u32 [[atomic, aligned(8)]] combined;
+        const [[atomic]] u32 qualified;
+        struct Fields { const [[aligned(8)]] u32 value; };
+    )");
+    Parser interleaved_parser(Lexer(*interleaved_source, diagnostics).lex(), diagnostics);
+    auto interleaved = interleaved_parser.parse();
+    require(diagnostics.errors() == 0);
+    require(interleaved.objects.size() == 6 && interleaved.records.size() == 1);
+    require(interleaved.objects[0]->type->kind == Type::Kind::Vector);
+    require(interleaved.objects[0]->type->lanes == 4);
+    require(interleaved.objects[1]->type->is_atomic);
+    require(interleaved.objects[2]->type->kind == Type::Kind::Pointer);
+    require(interleaved.objects[2]->type->address_space_location.valid());
+    require(interleaved.objects[3]->attributes.size() == 1 &&
+            interleaved.objects[3]->attributes[0].name == "aligned");
+    require(interleaved.objects[4]->type->is_atomic &&
+            interleaved.objects[4]->attributes.size() == 1 &&
+            interleaved.objects[4]->attributes[0].name == "aligned");
+    require(interleaved.objects[5]->type->is_const &&
+            interleaved.objects[5]->type->is_atomic);
+    require(interleaved.records[0].members.size() == 1 &&
+            interleaved.records[0].members[0].attributes.size() == 1 &&
+            interleaved.records[0].members[0].attributes[0].name == "aligned");
 }

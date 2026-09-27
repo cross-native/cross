@@ -153,9 +153,32 @@ int main() {
     child(child(specifiers, 0, P::DeclarationSpecifier, 1), 0, P::TypeSpecifier, 1);
     token(child(specifiers, 1, P::DeclarationSpecifier, 1)->children[0], "static");
 
+    declaration = production(parse("global const [[aligned(8)]] u32 aligned;",
+                                   K::Declaration), P::Declaration, 3);
+    specifiers = child(declaration, 0, P::DeclarationSpecifiers, 4);
+    token(child(specifiers, 0, P::DeclarationSpecifier, 1)->children[0], "global");
+    child(child(specifiers, 1, P::DeclarationSpecifier, 1), 0, P::TypeQualifier, 1);
+    child(child(specifiers, 2, P::DeclarationSpecifier, 1), 0, P::AttributeSpecifier, 3);
+    child(child(specifiers, 3, P::DeclarationSpecifier, 1), 0, P::TypeSpecifier, 1);
+
+    declaration = production(parse("[[atomic]] u32 counter;", K::Declaration),
+                             P::Declaration, 4);
+    child(declaration, 0, P::AttributeSpecifier, 3);
+    specifiers = child(declaration, 1, P::DeclarationSpecifiers, 1);
+    child(child(specifiers, 0, P::DeclarationSpecifier, 1), 0, P::TypeSpecifier, 1);
+
     declaration = production(parse("typedef u32 Word, *Pointer;", K::Declaration), P::Declaration, 3);
     specifiers = child(declaration, 0, P::DeclarationSpecifiers, 2);
     token(child(specifiers, 0, P::DeclarationSpecifier, 1)->children[0], "typedef");
+    list = child(declaration, 1, P::InitDeclaratorList, 3);
+    child(child(list, 0, P::InitDeclarator, 1), 0, P::Declarator, 1);
+    child(child(list, 2, P::InitDeclarator, 1), 0, P::Declarator, 2);
+
+    declaration = production(parse("u32 typedef Reordered, *ReorderedPointer;",
+                                   K::Declaration), P::Declaration, 3);
+    specifiers = child(declaration, 0, P::DeclarationSpecifiers, 2);
+    child(child(specifiers, 0, P::DeclarationSpecifier, 1), 0, P::TypeSpecifier, 1);
+    token(child(specifiers, 1, P::DeclarationSpecifier, 1)->children[0], "typedef");
     list = child(declaration, 1, P::InitDeclaratorList, 3);
     child(child(list, 0, P::InitDeclarator, 1), 0, P::Declarator, 1);
     child(child(list, 2, P::InitDeclarator, 1), 0, P::Declarator, 2);

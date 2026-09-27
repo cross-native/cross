@@ -90,6 +90,14 @@ reject(local_declarator_const "cannot write a const cell"
     "[[eval_only]] static u32 evaluate() { const u32 first = 1u32, second = 2u32; second = 3u32; return first + second; } global u32 value = evaluate();\n")
 reject(local_storage_conflict "more than one storage specifier"
     "global u32 entry() { u32 register stack value = 1u32; return value; }\n")
+reject(local_typedef_storage_conflict "typedef cannot combine with another storage specifier"
+    "global u32 entry() { u32 static typedef Word; return 0u32; }\n")
+reject(file_typedef_storage_conflict "typedef cannot combine with another storage specifier"
+    "u32 typedef global Word;\n")
+reject(reordered_const_typedef "cannot write a const cell"
+    "[[eval_only]] static u32 evaluate() { const typedef u32 Word; Word value = 1u32; value = 2u32; return value; } global u32 result = evaluate();\n")
+reject(interleaved_typedef_attribute "not valid on a typedef"
+    "u32 [[packed]] typedef Wrong;\n")
 reject(parsed_constant_assignment "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad $::static_assert(1u32 = 2u32, \"not conditional\"); return 0u32; }\n")
 reject(parsed_designator_assignment "syntax-match error for active prefix"

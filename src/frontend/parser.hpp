@@ -57,12 +57,17 @@ private:
         TypePtr& type,
         std::optional<std::pair<std::uint32_t, SourceLocation>>*
             pending_address_space = nullptr);
+    void apply_type_attribute(
+        TypePtr& type, const Attribute& attribute,
+        std::optional<std::pair<std::uint32_t, SourceLocation>>*
+            pending_address_space = nullptr);
     std::optional<std::string> parse_qualified_name(
         SyntaxProduction production = SyntaxProduction::QualifiedName);
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
     TypePtr parse_type(bool record_specifiers = true,
-                       std::function<bool()> storage_specifier = {});
+                       std::function<bool()> storage_specifier = {},
+                       std::vector<Attribute>* declaration_attributes = nullptr);
     TypePtr
     parse_declarator(TypePtr base, std::optional<std::string>& name,
                      bool parameter = false,
@@ -83,7 +88,8 @@ private:
     bool type_start() const;
     void parse_external(Program& program, const std::string& name_space);
     void parse_typedef(const std::string& name_space,
-                       std::vector<Attribute> attributes, bool consume_semicolon = true);
+                       std::vector<Attribute> attributes, TypePtr base_type,
+                       SourceLocation location, bool consume_semicolon = true);
     void register_typedef(SourceLocation location, std::string name, TypePtr type,
                           const std::vector<Attribute>& attributes);
     void parse_enum_declaration(Program& program, const std::string& name_space,
