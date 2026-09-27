@@ -53,7 +53,8 @@ private:
         TypePtr& type,
         std::optional<std::pair<std::uint32_t, SourceLocation>>*
             pending_address_space = nullptr);
-    std::optional<std::string> parse_qualified_name();
+    std::optional<std::string> parse_qualified_name(
+        SyntaxProduction production = SyntaxProduction::QualifiedName);
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
     TypePtr parse_type();
@@ -105,10 +106,13 @@ private:
     parse_global_label_statement(std::vector<Attribute> attributes = {});
     std::unique_ptr<Statement> parse_compound();
     std::unique_ptr<Statement>
-    parse_local_declaration(std::vector<Attribute> attributes = {});
+    parse_local_declaration(std::vector<Attribute> attributes = {},
+                            bool consume_semicolon = true,
+                            SyntaxProduction production = SyntaxProduction::Declaration);
     bool local_declaration_start() const;
 
     std::unique_ptr<Expr> parse_expression(std::unique_ptr<Expr> seed = {});
+    std::unique_ptr<Expr> parse_constant_expression();
     std::unique_ptr<Expr> parse_initializer();
     std::unique_ptr<Expr> parse_assignment(std::unique_ptr<Expr> seed = {});
     std::unique_ptr<Expr> parse_conditional(std::unique_ptr<Expr> seed = {});
@@ -138,6 +142,7 @@ private:
     std::size_t begin_production(SyntaxProduction production);
     void end_production(std::size_t event);
     std::shared_ptr<const SyntaxNode> public_node(std::size_t event) const;
+    void record_balanced_sequence(std::size_t first, std::size_t end);
 
     std::vector<Token> tokens_;
     Diagnostics& diagnostics_;

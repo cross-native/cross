@@ -17,18 +17,21 @@ namespace cross {
 std::string_view syntax_production_name(SyntaxProduction production) {
     static constexpr std::string_view names[] = {
         "", "declaration", "function_header", "function_definition", "type_name",
-        "attribute_specifier", "attribute", "attribute_name", "qualified_name",
+        "attribute_specifier", "attribute", "attribute_name", "balanced_token_sequence",
+        "balanced_token_tree", "balanced_tokens", "qualified_name", "namespace_name",
         "statement", "unattributed_statement", "compound_statement", "using_declaration",
         "labeled_statement", "selection_statement", "iteration_statement", "jump_statement",
-        "expression_statement", "static_assert_declaration",
-        "expression", "assignment_expression", "assignment_operator", "conditional_expression",
+        "expression_statement", "static_assert_declaration", "for_initializer",
+        "declaration_without_final_semicolon", "array_suffix",
+        "initializer", "initializer_entry", "designator",
+        "expression", "constant_expression", "assignment_expression", "assignment_operator", "conditional_expression",
         "logical_or_expression", "logical_and_expression", "inclusive_or_expression",
         "exclusive_or_expression", "and_expression", "equality_expression",
         "relational_expression", "shift_expression", "additive_expression",
         "multiplicative_expression", "cast_expression", "unary_expression",
-        "postfix_expression", "primary_expression", "argument_list", "generic_arguments",
+        "postfix_expression", "primary_expression", "argument_list", "generic_arguments", "generic_argument",
         "builtin_name", "literal"};
-    static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Literal) + 1);
+    static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Count));
     const auto index = static_cast<std::size_t>(production);
     return index < std::size(names) ? names[index] : std::string_view{};
 }

@@ -718,8 +718,9 @@ bool eligible_statement(const Statement& statement) {
                statement.second && eligible_statement(*statement.second);
     case Statement::Kind::Break:
     case Statement::Kind::Continue:
-    case Statement::Kind::Label:
         return true;
+    case Statement::Kind::Label:
+        return !statement.first || eligible_statement(*statement.first);
     case Statement::Kind::Case:
     case Statement::Kind::Default:
         return !statement.first || eligible_statement(*statement.first);
@@ -5939,6 +5940,7 @@ private:
                           std::nullopt, {found->second});
             }
             enter(found->second);
+            if (statement.first) lower_statement(*statement.first);
             return;
         }
         case Statement::Kind::Goto: {

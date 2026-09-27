@@ -7,6 +7,7 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -463,6 +464,43 @@ std::shared_ptr<const SyntaxNode> Parser::public_node(std::size_t event) const {
     return node;
 }
 
+void Parser::record_balanced_sequence(std::size_t first, std::size_t end) {
+    if (!recording_public_tree_ || public_tree_failed_ || first >= end ||
+        end >= tokens_.size()) return;
+    const auto saved_index = index_;
+    index_ = first;
+    // Attribute arguments are a published raw-token grammar, regardless of
+    // how a particular attribute is interpreted by the typed parser.
+    std::function<void(SyntaxProduction, std::string_view)> sequence;
+    sequence = [&](SyntaxProduction production, std::string_view close) {
+        ProductionScope scope(*this, production);
+        while (index_ < end && !public_tree_failed_) {
+            if (syntax_ && !syntax_->execution()->work(current().location)) {
+                public_tree_failed_ = true;
+                return;
+            }
+            const auto text = current().text;
+            if (!close.empty() && text == close) return;
+            if (text == "(" || text == "[" || text == "{") {
+                ProductionScope tree(*this, SyntaxProduction::BalancedTokenTree);
+                ++index_;
+                const auto expected = text == "(" ? ")" : text == "[" ? "]" : "}";
+                sequence(SyntaxProduction::BalancedTokens, expected);
+                if (!public_tree_failed_ && index_ < end && current().is(expected)) ++index_;
+                else if (!public_tree_failed_) {
+                    error_here("unterminated balanced attribute token tree");
+                    return;
+                }
+            } else if (text == ")" || text == "]" || text == "}") {
+                error_here("mismatched balanced attribute token-tree delimiter");
+                return;
+            } else ++index_;
+        }
+    };
+    sequence(SyntaxProduction::BalancedTokenSequence, {});
+    index_ = saved_index;
+}
+
 std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     SyntaxPatternElement::Kind kind, std::size_t first) const {
     using K = SyntaxPatternElement::Kind;
@@ -609,10 +647,12 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind cat
         if (!token.origin.context) token.origin.context = node->context;
         node->tokens.push_back(std::move(token));
     }
-    const auto event = production_events_.size();
-    production_events_.push_back({SyntaxProduction::None, first, index_, {}, node});
-    if (!production_stack_.empty())
-        production_events_[production_stack_.back()].children.push_back(event);
+    if (recording_public_tree_) {
+        const auto event = production_events_.size();
+        production_events_.push_back({SyntaxProduction::None, first, index_, {}, node});
+        if (!production_stack_.empty())
+            production_events_[production_stack_.back()].children.push_back(event);
+    }
     return node;
 }
 
@@ -753,6 +793,9 @@ std::vector<Attribute> Parser::parse_attributes() {
             end_production(name_event);
             Attribute attribute{std::move(name), {}, first->location};
             if (consume("(")) {
+                const auto argument_first = index_;
+                const auto recording = recording_public_tree_;
+                recording_public_tree_ = false;
                 if (attribute.name == "generic") {
                     const auto saved_generic_types = active_generic_types_;
                     while (!current().is(")") &&
@@ -862,6 +905,9 @@ std::vector<Attribute> Parser::parse_attributes() {
                         ++index_;
                     }
                 }
+                recording_public_tree_ = recording;
+                if (index_ > argument_first && tokens_[index_ - 1].is(")"))
+                    record_balanced_sequence(argument_first, index_ - 1);
             }
             result.push_back(std::move(attribute));
         } while (consume(","));
@@ -940,9 +986,9 @@ void Parser::apply_type_attributes(
     }
 }
 
-std::optional<std::string> Parser::parse_qualified_name() {
+std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction production_name) {
     if (current().kind != TokenKind::Identifier) return std::nullopt;
-    ProductionScope production(*this, SyntaxProduction::QualifiedName);
+    ProductionScope production(*this, production_name);
     const auto* first = consume_kind(TokenKind::Identifier);
     if (!first) return std::nullopt;
     std::string name(first->text);
@@ -1558,7 +1604,9 @@ TypePtr Parser::parse_array_suffix(
     TypePtr element, bool parameter,
     std::unique_ptr<Expr>* dynamic_outer_bound) {
     std::vector<std::uint32_t> bounds;
-    while (consume("[")) {
+    while (current().is("[")) {
+        ProductionScope array_suffix(*this, SyntaxProduction::ArraySuffix);
+        consume("[");
         if (consume("]")) {
             if (parameter) {
                 diagnostics_.error(
@@ -1571,7 +1619,7 @@ TypePtr Parser::parse_array_suffix(
             continue;
         }
         const auto location = current().location;
-        auto expression = parse_expression();
+        auto expression = parse_assignment();
         expect("]", "after array bound");
         const auto value = expression ? constant_value(*expression)
                                       : std::nullopt;
@@ -2009,7 +2057,7 @@ void Parser::parse_enum_declaration(Program& program,
                 enumerator.location = token->location;
                 enumerator.name = join_namespace(name_space, token->text);
                 known_ordinary_values_.insert(enumerator.name);
-                if (consume("=")) enumerator.initializer = parse_assignment();
+                if (consume("=")) enumerator.initializer = parse_constant_expression();
                 declaration.enumerators.push_back(std::move(enumerator));
             }
             if (!consume(",")) break;
@@ -2090,7 +2138,7 @@ void Parser::parse_record_declaration(
                     member_attributes.end());
                 std::unique_ptr<Expr> bit_width;
                 if (consume(":")) {
-                    bit_width = parse_expression();
+                    bit_width = parse_constant_expression();
                     auto trailing_attributes = parse_attributes();
                     item_attributes.insert(
                         item_attributes.end(),
@@ -2125,7 +2173,7 @@ bool Parser::parse_static_assertion() {
     const auto location = current().location;
     consume("$::static_assert");
     expect("(");
-    auto condition = parse_expression();
+    auto condition = parse_constant_expression();
     expect(",");
     const auto* message_token = consume_kind(TokenKind::String);
     if (!message_token) error_here("expected diagnostic string in $::static_assert");
@@ -2304,8 +2352,10 @@ bool Parser::local_declaration_start() const {
 }
 
 std::unique_ptr<Statement>
-Parser::parse_local_declaration(std::vector<Attribute> attributes) {
-    ProductionScope production(*this, SyntaxProduction::Declaration);
+Parser::parse_local_declaration(std::vector<Attribute> attributes,
+                                bool consume_semicolon,
+                                SyntaxProduction production_name) {
+    ProductionScope production(*this, production_name);
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Declaration;
     statement->location = current().location;
@@ -2363,7 +2413,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes) {
         diagnostics_.error(declaration.location,
                            "an omitted array bound requires a u8 string initializer");
     }
-    expect(";");
+    if (consume_semicolon) expect(";");
     return statement;
 }
 
@@ -2396,7 +2446,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
             auto declaration = std::make_unique<Statement>();
             declaration->kind = Statement::Kind::Empty;
             declaration->location = tokens_[index_ - 1].location;
-            if (auto imported = parse_qualified_name()) {
+            if (auto imported = parse_qualified_name(SyntaxProduction::NamespaceName)) {
                 if (syntax_) syntax_->import(*imported);
                 active_imports_.insert(active_imports_.begin() +
                     static_cast<std::ptrdiff_t>(current_scope_imports_),
@@ -2544,7 +2594,9 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         else statement->label_name = std::string(current().text);
         ++index_;
         expect(":");
-        if (parsing_public_fragment_) statement->first = parse_statement();
+        if (parsing_public_fragment_ ||
+            (current().kind != TokenKind::End && !current().is("}")))
+            statement->first = parse_statement();
         return statement;
     }
     if (local_declaration_start()) return parse_local_declaration();
@@ -2570,7 +2622,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
     }
     if (consume("goto")) {
         statement->kind = Statement::Kind::Goto;
-        statement->expression = parse_expression();
+        statement->expression = parse_assignment();
         expect(";");
         return statement;
     }
@@ -2609,37 +2661,39 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         statement->kind = Statement::Kind::For;
         local_scopes_.emplace_back();
         expect("(");
-        if (consume(";")) {
-            statement->first = std::make_unique<Statement>();
-            statement->first->kind = Statement::Kind::Empty;
-            statement->first->location = location;
-        } else if (local_declaration_start()) {
-            statement->first = parse_local_declaration();
-        } else if (current().is("[[")) {
-            auto initializer_attributes = parse_attributes();
-            if (local_declaration_start()) {
-                statement->first =
-                    parse_local_declaration(std::move(initializer_attributes));
-            } else {
-                for (const auto& attribute : initializer_attributes) {
-                    diagnostics_.error(
-                        attribute.location,
-                        "attribute '" + attribute.name +
-                            "' is not valid on a for initializer");
+        {
+            ProductionScope initializer(*this, SyntaxProduction::ForInitializer);
+            if (current().is(";")) {
+                statement->first = std::make_unique<Statement>();
+                statement->first->kind = Statement::Kind::Empty;
+                statement->first->location = location;
+            } else if (local_declaration_start()) {
+                statement->first = parse_local_declaration({}, false,
+                    SyntaxProduction::DeclarationWithoutFinalSemicolon);
+            } else if (current().is("[[")) {
+                ProductionScope declaration(*this, SyntaxProduction::DeclarationWithoutFinalSemicolon);
+                auto initializer_attributes = parse_attributes();
+                if (local_declaration_start()) {
+                    statement->first = parse_local_declaration(
+                        std::move(initializer_attributes), false, SyntaxProduction::None);
+                } else {
+                    for (const auto& attribute : initializer_attributes) {
+                        diagnostics_.error(attribute.location,
+                            "attribute '" + attribute.name + "' is not valid on a for initializer");
+                    }
+                    statement->first = std::make_unique<Statement>();
+                    statement->first->kind = Statement::Kind::Expression;
+                    statement->first->location = current().location;
+                    statement->first->expression = parse_expression();
                 }
+            } else {
                 statement->first = std::make_unique<Statement>();
                 statement->first->kind = Statement::Kind::Expression;
                 statement->first->location = current().location;
                 statement->first->expression = parse_expression();
-                expect(";");
             }
-        } else {
-            statement->first = std::make_unique<Statement>();
-            statement->first->kind = Statement::Kind::Expression;
-            statement->first->location = current().location;
-            statement->first->expression = parse_expression();
-            expect(";");
         }
+        expect(";");
         if (!current().is(";")) statement->condition = parse_expression();
         expect(";");
         if (!current().is(")")) statement->increment = parse_expression();
@@ -2659,7 +2713,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         if (switch_depth_ == 0) {
             error_here("case label is not inside a switch");
         }
-        statement->expression = parse_expression();
+        statement->expression = parse_constant_expression();
         expect(":");
         if (!current().is("}")) statement->first = parse_statement();
         return statement;
@@ -2701,7 +2755,9 @@ std::unique_ptr<Statement> Parser::parse_global_label_statement(
         statement->label_name = std::string(name->text);
     }
     expect(":", "after global label name");
-    if (parsing_public_fragment_) statement->first = parse_statement();
+    if (parsing_public_fragment_ ||
+        (current().kind != TokenKind::End && !current().is("}")))
+        statement->first = parse_statement();
     return statement;
 }
 
@@ -2724,39 +2780,44 @@ std::unique_ptr<Expr> Parser::parse_expression(std::unique_ptr<Expr> seed) {
     return parse_assignment(std::move(seed));
 }
 
+std::unique_ptr<Expr> Parser::parse_constant_expression() {
+    ProductionScope production(*this, SyntaxProduction::ConstantExpression);
+    return parse_conditional();
+}
+
 std::unique_ptr<Expr> Parser::parse_initializer() {
+    ProductionScope production(*this, SyntaxProduction::Initializer);
     if (!current().is("{")) return parse_assignment();
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::AggregateInitializer;
     result->location = current().location;
     consume("{");
     while (!current().is("}") && current().kind != TokenKind::End) {
-        Expr::InitializerEntry entry;
-        entry.location = current().location;
-        while (current().is(".") || current().is("[")) {
-            Expr::InitializerDesignator designator;
-            designator.location = current().location;
-            if (consume(".")) {
-                designator.kind =
-                    Expr::InitializerDesignator::Kind::Member;
-                const auto* member = consume_kind(TokenKind::Identifier);
-                if (!member) {
-                    error_here("expected member name after '.' in initializer");
+        {
+            ProductionScope initializer_entry(*this, SyntaxProduction::InitializerEntry);
+            Expr::InitializerEntry entry;
+            entry.location = current().location;
+            while (current().is(".") || current().is("[")) {
+                ProductionScope designator_production(*this, SyntaxProduction::Designator);
+                Expr::InitializerDesignator designator;
+                designator.location = current().location;
+                if (consume(".")) {
+                    designator.kind = Expr::InitializerDesignator::Kind::Member;
+                    const auto* member = consume_kind(TokenKind::Identifier);
+                    if (!member) error_here("expected member name after '.' in initializer");
+                    else designator.member = std::string(member->text);
                 } else {
-                    designator.member = std::string(member->text);
+                    consume("[");
+                    designator.kind = Expr::InitializerDesignator::Kind::Index;
+                    designator.index = parse_constant_expression();
+                    expect("]", "after initializer designator");
                 }
-            } else {
-                consume("[");
-                designator.kind =
-                    Expr::InitializerDesignator::Kind::Index;
-                designator.index = parse_assignment();
-                expect("]", "after initializer designator");
+                entry.designators.push_back(std::move(designator));
             }
-            entry.designators.push_back(std::move(designator));
+            if (!entry.designators.empty()) consume("=");
+            entry.value = parse_initializer();
+            result->initializer_entries.push_back(std::move(entry));
         }
-        if (!entry.designators.empty()) consume("=");
-        entry.value = parse_initializer();
-        result->initializer_entries.push_back(std::move(entry));
         if (!consume(",")) break;
         if (current().is("}")) break;
     }
@@ -2929,16 +2990,23 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                 error_here("a generic argument list cannot be empty");
             } else {
                 for (;;) {
-                    Expr::GenericArgument argument;
-                    if (type_start()) {
-                        argument.type = parse_type();
-                    } else {
-                        const bool previous = parsing_generic_argument_;
-                        parsing_generic_argument_ = true;
-                        argument.value = parse_assignment();
-                        parsing_generic_argument_ = previous;
+                    {
+                        ProductionScope generic_argument(*this, SyntaxProduction::GenericArgument);
+                        Expr::GenericArgument argument;
+                        if (type_start()) {
+                            ProductionScope type_name(*this, SyntaxProduction::TypeName);
+                            argument.type = parse_type();
+                            std::optional<std::string> declared;
+                            argument.type = parse_declarator(std::move(argument.type), declared);
+                            if (declared) error_here("a generic type argument cannot declare an object");
+                        } else {
+                            const bool previous = parsing_generic_argument_;
+                            parsing_generic_argument_ = true;
+                            argument.value = parse_constant_expression();
+                            parsing_generic_argument_ = previous;
+                        }
+                        expression->generic_arguments.push_back(std::move(argument));
                     }
-                    expression->generic_arguments.push_back(std::move(argument));
                     if (!consume(",")) break;
                 }
                 if (!consume_generic_close())

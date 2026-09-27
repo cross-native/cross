@@ -859,6 +859,7 @@ private:
                                    "labels are not raw-compatible managed control flow");
             } else {
                 activate_label(statement);
+                if (statement.first) lower_statement(*statement.first);
             }
             return;
         }

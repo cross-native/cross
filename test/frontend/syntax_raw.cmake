@@ -62,6 +62,16 @@ reject(parsed_node_on_raw "requires a parsed capture field"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax node = $::syntax::node(input, \"body\"); return $::meta::tokens(node); } syntax Bad : expression { prefix \"bad\"; match body:paren; expand expand; } syntax Bad; global u32 entry() { return bad (1u32); }\n")
 reject(parsed_statement_incomplete "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad if (1u32) }\n")
+reject(parsed_for_initializer "syntax-match error for active prefix"
+    "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad for (u32 at = ; at < 2u32; ++at) {} return 0u32; }\n")
+reject(parsed_constant_assignment "syntax-match error for active prefix"
+    "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad $::static_assert(1u32 = 2u32, \"not conditional\"); return 0u32; }\n")
+reject(parsed_designator_assignment "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match body:declaration; expand expand; } syntax Bad; bad global u32 values[3] = { [1u32 = 2u32] = 3u32 };\n")
+reject(parsed_generic_named_type "syntax-match error for active prefix"
+    "${expander}syntax Bad : item { prefix \"bad\"; match body:expr \";\"; expand expand; } syntax Bad; bad unknown::<u32 object>;\n")
+reject(generic_named_type "generic type argument cannot declare an object"
+    "static T identity<T>(in T value) { return value; } global u32 entry() { return identity<u32 object>(1u32); }\n")
 reject(parsed_declaration_definition "syntax-match error for active prefix"
     "${expander}syntax Bad : item { prefix \"bad\"; match body:declaration; expand expand; } syntax Bad; bad static u32 value() { return 1u32; }\n")
 reject(parsed_definition_prototype "syntax-match error for active prefix"

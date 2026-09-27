@@ -177,6 +177,21 @@ namespace flow {
         $::meta::syntax form = 1u32 ? $::meta::child(ordinary, 0uptr) : ordinary;
         if ($::meta::is_production(form, "selection_statement") &&
             $::meta::child_count(form) != 7uptr) return $::quote { ; };
+        if ($::meta::is_production(form, "iteration_statement")) {
+            for (uptr at = 0uptr; at < $::meta::child_count(form); ++at) {
+                $::meta::syntax part = $::meta::child(form, at);
+                if ($::meta::is_production(part, "for_initializer")) {
+                    if ($::meta::child_count(part) > 1uptr)
+                        return $::quote { public_schema_failure(); };
+                    if ($::meta::child_count(part) == 1uptr) {
+                        $::meta::syntax init = $::meta::child(part, 0uptr);
+                        if (!$::meta::is_production(init, "expression") &&
+                            !$::meta::is_production(init, "declaration_without_final_semicolon"))
+                            return $::quote { public_schema_failure(); };
+                    }
+                }
+            }
+        }
         return $::meta::tokens(body);
     }
     syntax ParsedStmt : statement { prefix "parsed_stmt"; match body:stmt; expand parsed_statement; }
@@ -228,13 +243,106 @@ namespace flow {
     }
     syntax ParsedList : expression { prefix "parsed_list"; match "(" values:separated1(value:expr, ",") ")"; expand parsed_list; }
     [[syntax_expander]] static $::meta::tokens generic_shape(in $::meta::syntax_match input) {
-        uptr length = $::meta::len($::meta::tokens($::syntax::node(input, "body")));
+        $::meta::syntax body = $::syntax::node(input, "body");
+        $::meta::syntax postfix = body;
+        while ($::meta::is_kind(postfix, "core") && $::meta::child_count(postfix) == 1uptr)
+            postfix = $::meta::child(postfix, 0uptr);
+        if (!$::meta::is_production(postfix, "postfix_expression")) return $::quote { 0u32 };
+        $::meta::syntax arguments = $::meta::child(postfix, 1uptr);
+        if (!$::meta::is_production(arguments, "generic_arguments") ||
+            $::meta::child_count(arguments) != 4uptr) return $::quote { 0u32 };
+        $::meta::syntax argument = $::meta::child(arguments, 2uptr);
+        if (!$::meta::is_production(argument, "generic_argument") ||
+            $::meta::child_count(argument) != 1uptr) return $::quote { 0u32 };
+        if (!$::meta::is_production($::meta::child(argument, 0uptr), "constant_expression"))
+            return $::quote { 0u32 };
+        uptr length = $::meta::len($::meta::tokens(body));
         if (length == 8uptr || length == 12uptr) return $::quote { 23u32 };
         return $::quote { 0u32 };
     }
     syntax GenericShape : expression { prefix "generic_shape"; match body:expr; expand generic_shape; }
     syntax DropStmt : statement { prefix "drop_stmt"; match body:stmt; expand discard; }
     syntax ExplodeStmt : statement { prefix "explode_stmt"; match body:block; expand explode; }
+    [[syntax_expander]] static $::meta::tokens parsed_array(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        uptr found = 0uptr;
+        for (uptr at = 0uptr; at < $::meta::child_count(body); ++at) {
+            $::meta::syntax part = $::meta::child(body, at);
+            if ($::meta::is_production(part, "initializer")) {
+                if ($::meta::child_count(part) != 5uptr) return $::quote { public_schema_failure; };
+                $::meta::syntax entry = $::meta::child(part, 1uptr);
+                if (!$::meta::is_production(entry, "initializer_entry") ||
+                    $::meta::child_count(entry) != 3uptr) return $::quote { public_schema_failure; };
+                $::meta::syntax designator = $::meta::child(entry, 0uptr);
+                if (!$::meta::is_production(designator, "designator") ||
+                    $::meta::child_count(designator) != 3uptr ||
+                    !$::meta::is_production($::meta::child(designator, 1uptr), "constant_expression"))
+                    return $::quote { public_schema_failure; };
+                ++found;
+            }
+            if ($::meta::is_production(part, "array_suffix")) {
+                if ($::meta::child_count(part) != 3uptr ||
+                    !$::meta::is_production($::meta::child(part, 1uptr), "assignment_expression"))
+                    return $::quote { public_schema_failure; };
+                ++found;
+            }
+        }
+        if (found != 2uptr) return $::quote { public_schema_failure; };
+        return $::meta::tokens(body);
+    }
+    syntax ParsedArray : item { prefix "parsed_array"; match body:declaration; expand parsed_array; }
+    [[syntax_expander]] static $::meta::tokens parsed_generic(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        $::meta::syntax attributes = $::meta::child(body, 0uptr);
+        if (!$::meta::is_production(attributes, "attribute_specifier") ||
+            $::meta::child_count(attributes) != 5uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax attribute = $::meta::child(attributes, 1uptr);
+        if (!$::meta::is_production(attribute, "attribute") ||
+            $::meta::child_count(attribute) != 4uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax arguments = $::meta::child(attribute, 2uptr);
+        if (!$::meta::is_production(arguments, "balanced_token_sequence") ||
+            $::meta::child_count(arguments) != 4uptr) return $::quote { public_schema_failure; };
+        for (uptr at = 0uptr; at < 4uptr; ++at)
+            if (!$::meta::is_kind($::meta::child(arguments, at), "token"))
+                return $::quote { public_schema_failure; };
+        return $::meta::tokens(body);
+    }
+    syntax ParsedGeneric : item { prefix "parsed_generic"; match body:function_def; expand parsed_generic; }
+    [[syntax_expander]] static $::meta::tokens drop_generic(in $::meta::syntax_match input) {
+        $::meta::syntax attributes = $::meta::child($::syntax::node(input, "body"), 0uptr);
+        $::meta::syntax attribute = $::meta::child(attributes, 1uptr);
+        $::meta::syntax arguments = $::meta::child(attribute, 2uptr);
+        if (!$::meta::is_production(arguments, "balanced_token_sequence") ||
+            $::meta::child_count(arguments) != 5uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax group = $::meta::child(arguments, 3uptr);
+        if (!$::meta::is_production(group, "balanced_token_tree") ||
+            $::meta::child_count(group) != 3uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax contents = $::meta::child(group, 1uptr);
+        if (!$::meta::is_production(contents, "balanced_tokens") ||
+            $::meta::child_count(contents) != 2uptr) return $::quote { public_schema_failure; };
+        return $::quote {};
+    }
+    syntax DropGeneric : item { prefix "drop_generic"; match body:function_def; expand drop_generic; }
+    [[syntax_expander]] static $::meta::tokens parsed_label(in $::meta::syntax_match input) {
+        $::meta::syntax ordinary = $::meta::child($::syntax::node(input, "body"), 0uptr);
+        $::meta::syntax form = $::meta::child(ordinary, 0uptr);
+        if (!$::meta::is_production(form, "labeled_statement") ||
+            $::meta::child_count(form) != 4uptr ||
+            !$::meta::is_production($::meta::child(form, 3uptr), "statement"))
+            return $::quote { public_schema_failure(); };
+        return $::meta::tokens($::syntax::node(input, "body"));
+    }
+    syntax ParsedLabel : statement { prefix "parsed_label"; match body:stmt; expand parsed_label; }
+    [[syntax_expander]] static $::meta::tokens parsed_goto(in $::meta::syntax_match input) {
+        $::meta::syntax ordinary = $::meta::child($::syntax::node(input, "body"), 0uptr);
+        $::meta::syntax form = $::meta::child(ordinary, 0uptr);
+        if (!$::meta::is_production(form, "jump_statement") ||
+            $::meta::child_count(form) != 3uptr ||
+            !$::meta::is_production($::meta::child(form, 1uptr), "assignment_expression"))
+            return $::quote { public_schema_failure(); };
+        return $::meta::tokens($::syntax::node(input, "body"));
+    }
+    syntax ParsedGoto : statement { prefix "parsed_goto"; match body:stmt; expand parsed_goto; }
 }
 namespace caller {
     global u32 number = 13u32;
@@ -259,8 +367,16 @@ typedef u32 RawResult;
 syntax flow::CopyFunction, flow::DropFunction;
 syntax flow::ParsedType;
 emit_type u32;
-syntax flow::ParsedDecl, flow::ParsedPrototype, flow::ParsedDefinition, flow::ParsedHeader;
+syntax flow::ParsedDecl, flow::ParsedPrototype, flow::ParsedDefinition, flow::ParsedHeader, flow::ParsedArray;
+syntax flow::ParsedGeneric, flow::DropGeneric;
 parsed_decl global u32 parsed_state = 19u32;
+parsed_array global u32 parsed_array[3] = { [0] = 5u32, [2] = 7u32 };
+parsed_generic [[generic(T, u32 count), noinline]] static T parsed_generic(in T value) {
+    return value + count;
+}
+drop_generic [[generic(T, u32 (*callback)(in u32 value))]] static T discarded_generic(in T value) {
+    return value;
+}
 parsed_prototype static RawResult parsed_function(in RawResult value);
 parsed_definition [[noinline]] static RawResult parsed_function(in RawResult value) {
     RawResult total = 0u32;
@@ -372,13 +488,22 @@ namespace frozen {
     return parsed (2u32 + 3u32) * 4u32;
 }
 [[noinline]] static u32 parsed_statements(in u32 value) {
-    syntax flow::ParsedStmt, flow::Run, flow::DropStmt, flow::ExplodeStmt;
+    syntax flow::ParsedStmt, flow::Run, flow::DropStmt, flow::ExplodeStmt, flow::ParsedLabel, flow::ParsedGoto;
     u32 total = 0u32;
     drop_stmt no_such_macro! { opaque foreign body; }
     drop_stmt explode_stmt { deliberately not executed; }
     parsed_stmt run { total += 0u32; }
     parsed_stmt forwarded! { total += 0u32; }
     parsed_stmt { copied! (total) += 0u32; }
+    parsed_stmt for (u32 at = 0u32; at < 2u32; ++at) total += 0u32;
+    parsed_stmt for ([[aligned(4)]] u32 at = 0u32; at < 2u32; ++at) total += 0u32;
+    parsed_stmt for (total += 0u32; total < 0u32;) ++total;
+    parsed_stmt for (; total < 0u32;) ++total;
+    parsed_goto goto after_capture;
+    total = 99u32;
+    parsed_label label after_capture: total += 0u32;
+    parsed_label label declare_cell: u32 from_label = value + 1u32;
+    total += from_label - value - 1u32;
     parsed_stmt if (value) { total += 3u32; } else { total += 5u32; }
     parsed_stmt { label next: total += 7u32; }
     parsed_stmt while (total < 10u32) ++total;
@@ -404,6 +529,8 @@ global u32 syntax_raw_entry() {
     if (recursive_rules() != 27u32) return 0u32;
     if (parsed_expression() != 20u32 || sizeof(CapturedType) != 4uptr) return 0u32;
     if (parsed_function(4u32) != 12u32 || parsed_state != 19u32 ||
+        parsed_generic<u32, 4u32>(3u32) != 7u32 ||
+        parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||
         header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||
         parsed_statements(1u32) != 10u32) return 0u32;
     if (syntax_width != sizeof(uptr)) return 0u32;

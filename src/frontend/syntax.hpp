@@ -25,17 +25,20 @@ struct SyntaxSpan {
 
 enum class SyntaxProduction {
     None, Declaration, FunctionHeader, FunctionDefinition, TypeName,
-    AttributeSpecifier, Attribute, AttributeName, QualifiedName,
+    AttributeSpecifier, Attribute, AttributeName, BalancedTokenSequence,
+    BalancedTokenTree, BalancedTokens, QualifiedName, NamespaceName,
     Statement, UnattributedStatement, CompoundStatement, UsingDeclaration,
     LabeledStatement, SelectionStatement, IterationStatement, JumpStatement,
-    ExpressionStatement, StaticAssertDeclaration,
-    Expression, AssignmentExpression, AssignmentOperator, ConditionalExpression,
+    ExpressionStatement, StaticAssertDeclaration, ForInitializer,
+    DeclarationWithoutFinalSemicolon, ArraySuffix,
+    Initializer, InitializerEntry, Designator,
+    Expression, ConstantExpression, AssignmentExpression, AssignmentOperator, ConditionalExpression,
     LogicalOrExpression, LogicalAndExpression, InclusiveOrExpression,
     ExclusiveOrExpression, AndExpression, EqualityExpression,
     RelationalExpression, ShiftExpression, AdditiveExpression,
     MultiplicativeExpression, CastExpression, UnaryExpression,
-    PostfixExpression, PrimaryExpression, ArgumentList, GenericArguments,
-    BuiltinName, Literal,
+    PostfixExpression, PrimaryExpression, ArgumentList, GenericArguments, GenericArgument,
+    BuiltinName, Literal, Count,
 };
 std::string_view syntax_production_name(SyntaxProduction production);
 
