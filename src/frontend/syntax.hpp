@@ -5,6 +5,7 @@
 #include "frontend/semantic.hpp"
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -58,6 +59,9 @@ std::string_view syntax_production_name(SyntaxProduction production);
 struct SyntaxNode {
     enum class Kind { Token, Group, Core, Extension, Macro, Deferred } kind{Kind::Token};
     SyntaxProduction production{SyntaxProduction::None};
+    // Expected grammar slot for an opaque extension/macro/deferred node.
+    // It is not exposed as a core production by the public query API.
+    SyntaxProduction slot_production{SyntaxProduction::None};
     TokenSequence tokens;
     std::vector<std::shared_ptr<const SyntaxNode>> children;
     SyntaxSpan span;
@@ -68,7 +72,16 @@ struct SyntaxNode {
 
 TokenSequence syntax_node_tokens(const SyntaxNode& node);
 std::size_t syntax_node_count(const SyntaxNode& node);
-std::uint64_t syntax_node_storage(const SyntaxNode& node);
+std::uint64_t syntax_node_storage(const SyntaxNode& node,
+    std::uint64_t stop_after = std::numeric_limits<std::uint64_t>::max());
+enum class SyntaxTreeValidationError { None, Shape, DepthLimit, WorkLimit };
+bool syntax_validate_node(const SyntaxNode& node, std::string& error,
+    EvaluationLimits limits = {}, std::uint64_t* work = nullptr,
+    SyntaxTreeValidationError* failure = nullptr);
+std::shared_ptr<const SyntaxNode> syntax_replace_child(
+    const SyntaxNode& parent, std::size_t index,
+    std::shared_ptr<const SyntaxNode> replacement, std::string& error,
+    EvaluationLimits limits = {}, std::uint64_t* work = nullptr);
 
 // Public match records are translation-only, not runtime records or typed HIR.
 struct SyntaxMatchValue {

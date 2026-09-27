@@ -100,6 +100,9 @@ syntax Pack : bundle { use First; use Item; }
     const auto raw = state.match(*selected, raw_tokens, 0, diagnostics);
     require(raw && diagnostics.errors() == errors, "raw sublanguage was parsed or expanded");
     const auto& raw_field = raw->value->fields.front();
+    std::string shape_error;
+    require(syntax_validate_node(*raw_field.node, shape_error),
+            "raw group has a structurally invalid shape");
     require(raw_field.kind == SyntaxMatchValue::Field::Kind::RawGroup && raw_field.node &&
             raw_field.node->production == SyntaxProduction::None && raw_field.node->children.size() == 6,
             "raw group has the wrong public schema");
@@ -140,6 +143,15 @@ syntax Pack : bundle { use First; use Item; }
     require(contextual_match && contextual_match->value->fields.front().node->children[1]->context == origin.context &&
             syntax_node_tokens(*contextual_match->value->fields.front().node)[1].origin.context == origin.context,
             "raw group lost a copied child's immutable lookup context");
+    auto replacement = contextual_match->value->fields.front().node->children[1];
+    const auto reconstructed = syntax_replace_child(*raw_field.node, 1, replacement, shape_error);
+    require(reconstructed && reconstructed->children[1] == replacement &&
+            reconstructed->children[1]->context == origin.context &&
+            reconstructed->span.first.file == raw_field.node->span.first.file,
+            "raw child replacement lost its original or copied context/span");
+    const auto mismatched = syntax_replace_child(*raw_field.node, 0,
+        raw_field.node->children.back(), shape_error);
+    require(!mismatched, "raw child replacement broke delimiter balance");
     require(activate({{"Optional", {}, {}}}), "optional test syntax did not activate");
     const auto* empty_source = sources.add("empty-span.x", "optional ;");
     const auto empty_tokens = Lexer(*empty_source, diagnostics).lex();

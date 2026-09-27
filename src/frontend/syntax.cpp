@@ -14,118 +14,6 @@
 
 namespace cross {
 
-std::string_view syntax_production_name(SyntaxProduction production) {
-    static constexpr std::string_view names[] = {
-        "", "declaration", "function_header", "function_definition", "type_name",
-        "declaration_specifiers", "declaration_specifier", "type_qualifier", "type_specifier",
-        "scalar_type", "struct_or_union_specifier", "enum_specifier", "typedef_name", "target_scalar_builtin_name",
-        "declarator", "abstract_declarator", "direct_declarator", "pointer_part",
-        "function_suffix", "parameter_list", "parameter_declaration", "parameter_mode",
-        "location", "object_location", "result_location", "generic_parameter_list", "generic_parameter",
-        "init_declarator_list", "init_declarator", "member_declaration", "member_declarator", "enumerator",
-        "attribute_specifier", "attribute", "attribute_name", "balanced_token_sequence",
-        "balanced_token_tree", "balanced_tokens", "qualified_name", "namespace_name",
-        "statement", "unattributed_statement", "compound_statement", "using_declaration",
-        "labeled_statement", "selection_statement", "iteration_statement", "jump_statement",
-        "expression_statement", "static_assert_declaration", "for_initializer",
-        "declaration_without_final_semicolon", "array_suffix",
-        "initializer", "initializer_entry", "designator",
-        "expression", "constant_expression", "assignment_expression", "assignment_operator", "conditional_expression",
-        "logical_or_expression", "logical_and_expression", "inclusive_or_expression",
-        "exclusive_or_expression", "and_expression", "equality_expression",
-        "relational_expression", "shift_expression", "additive_expression",
-        "multiplicative_expression", "cast_expression", "unary_expression",
-        "postfix_expression", "primary_expression", "argument_list", "generic_arguments", "generic_argument",
-        "builtin_name", "literal", "embed_expression", "quote_expression"};
-    static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Count));
-    const auto index = static_cast<std::size_t>(production);
-    return index < std::size(names) ? names[index] : std::string_view{};
-}
-
-TokenSequence syntax_node_tokens(const SyntaxNode& node) {
-    TokenSequence result;
-    const auto append = [&](const MetaToken& token) {
-        if (!result.empty() && token.split_source &&
-            result.back().split_source == token.split_source &&
-            result.back().origin.context == token.origin.context &&
-            result.back().split_offset + result.back().text.size() == token.split_offset) {
-            auto& prior = result.back();
-            prior.text += token.text;
-            if (prior.split_offset == 0 && prior.text.size() == prior.split_source->spelling.size()) {
-                prior.kind = prior.split_source->kind;
-                prior.text = prior.split_source->spelling;
-                prior.split_source.reset();
-            }
-        } else result.push_back(token);
-    };
-    std::vector<const SyntaxNode*> pending{&node};
-    while (!pending.empty()) {
-        const auto* next = pending.back();
-        pending.pop_back();
-        if (next->kind == SyntaxNode::Kind::Token ||
-            next->kind == SyntaxNode::Kind::Extension ||
-            next->kind == SyntaxNode::Kind::Macro ||
-            next->kind == SyntaxNode::Kind::Deferred) {
-            for (const auto& token : next->tokens) append(token);
-        } else {
-            for (auto at = next->children.rbegin(); at != next->children.rend(); ++at)
-                pending.push_back(at->get());
-        }
-    }
-    return result;
-}
-
-std::size_t syntax_node_count(const SyntaxNode& node) {
-    std::size_t count{};
-    std::vector<const SyntaxNode*> pending{&node};
-    while (!pending.empty()) {
-        const auto* next = pending.back();
-        pending.pop_back();
-        ++count;
-        for (const auto& child : next->children) pending.push_back(child.get());
-    }
-    return count;
-}
-
-std::uint64_t syntax_node_storage(const SyntaxNode& node) {
-    std::uint64_t size{};
-    const auto add = [&](std::uint64_t amount) {
-        const auto maximum = std::numeric_limits<std::uint64_t>::max();
-        size = amount > maximum - size ? maximum : size + amount;
-    };
-    const auto tokens = [&](const TokenSequence& sequence) {
-        for (const auto& token : sequence) {
-            add(128); add(token.text.size());
-            if (token.split_source) { add(32); add(token.split_source->spelling.size()); }
-        }
-    };
-    std::vector<const SyntaxNode*> nodes{&node};
-    std::vector<const SyntaxMatchValue*> matches;
-    while (!nodes.empty() || !matches.empty()) {
-        if (!nodes.empty()) {
-            const auto* next = nodes.back();
-            nodes.pop_back();
-            add(128);
-            tokens(next->tokens);
-            for (const auto& child : next->children) { add(16); nodes.push_back(child.get()); }
-            if (next->match) matches.push_back(next->match.get());
-        } else {
-            const auto* next = matches.back();
-            matches.pop_back();
-            add(syntax_match_storage_bytes);
-            tokens(next->input);
-            if (next->variant) { add(32); add(next->variant->size()); }
-            for (const auto& label : next->variant_labels) { add(32); add(label.size()); }
-            for (const auto& field : next->fields) {
-                add(syntax_field_storage_bytes); add(field.name.size()); tokens(field.tokens);
-                if (field.node) nodes.push_back(field.node.get());
-                for (const auto& child : field.records) { add(16); matches.push_back(child.get()); }
-            }
-        }
-    }
-    return size;
-}
-
 namespace {
 
 std::string join(std::string_view prefix, std::string_view name) {
@@ -1272,7 +1160,8 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 failed = true;
                 return {};
             }
-            if (!charge(syntax_node_storage(*parsed->node))) {
+            if (!charge(syntax_node_storage(*parsed->node,
+                std::min(execution_->limits().bytes, execution_->limits().memory)))) {
                 failed = true;
                 return {};
             }

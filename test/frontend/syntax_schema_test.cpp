@@ -63,6 +63,11 @@ int main() {
             std::abort();
         }
         require(diagnostics.errors() == 0, "speculative diagnostics escaped");
+        std::string shape_error;
+        if (!syntax_validate_node(*fragment->node, shape_error)) {
+            std::cerr << "invalid public shape: " << text << '\n' << shape_error << '\n';
+            std::abort();
+        }
         auto projected = syntax_node_tokens(*fragment->node);
         require(projected.size() == fragment->end, "projection omitted source terminals");
         for (std::size_t at = 0; at < projected.size(); ++at) {
@@ -308,6 +313,85 @@ int main() {
     }
 
     auto expression = parse("$::embed(\"unread-asset.bin\")", K::Expr);
+    auto left_expression = production(parse("2u32 + 3u32", K::Expr),
+                                      P::AssignmentExpression, 1);
+    auto right_expression = production(parse("7u32 * 4u32", K::Expr),
+                                       P::AssignmentExpression, 1);
+    std::string replacement_error;
+    auto replaced = syntax_replace_child(*left_expression, 0,
+        right_expression->children[0], replacement_error);
+    require(replaced && replacement_error.empty(), "compatible syntax child replacement failed");
+    auto changed_tokens = syntax_node_tokens(*replaced);
+    require(changed_tokens.size() == 3 && changed_tokens[0].text == "7u32" &&
+            changed_tokens[1].text == "*" && changed_tokens[2].text == "4u32",
+            "syntax child replacement did not preserve the new concrete subtree");
+    require(syntax_node_tokens(*left_expression)[0].text == "2u32",
+            "syntax child replacement mutated its input");
+    require(syntax_node_storage(*replaced, 127) > 127 &&
+            syntax_node_storage(*replaced, 127) < syntax_node_storage(*replaced),
+            "syntax storage traversal did not stop at its exceeded limit");
+    require(!syntax_replace_child(*left_expression, 0, right_expression,
+                                  replacement_error) &&
+            replacement_error.find("grammar production") != std::string::npos,
+            "incompatible syntax production was accepted");
+    require(!syntax_replace_child(*left_expression, 1, right_expression->children[0],
+                                  replacement_error) &&
+            replacement_error.find("index") != std::string::npos,
+            "out-of-range syntax replacement was accepted");
+    auto opaque = std::make_shared<SyntaxNode>();
+    opaque->kind = SyntaxNode::Kind::Macro;
+    opaque->slot_production = P::ConditionalExpression;
+    require(syntax_replace_child(*left_expression, 0, opaque, replacement_error) != nullptr,
+            "opaque syntax node with the matching grammar slot was rejected");
+    opaque->slot_production = P::PrimaryExpression;
+    require(!syntax_replace_child(*left_expression, 0, opaque, replacement_error),
+            "opaque syntax node with the wrong grammar slot was accepted");
+    auto addition = descendant(left_expression, P::AdditiveExpression);
+    auto subtraction = descendant(parse("8u32 - 1u32", K::Expr), P::AdditiveExpression);
+    require(syntax_replace_child(*addition, 1, subtraction->children[1], replacement_error) != nullptr,
+            "another operator in the same grammar alternative was rejected");
+    auto multiplication = descendant(right_expression, P::MultiplicativeExpression);
+    require(!syntax_replace_child(*addition, 1, multiplication->children[1], replacement_error),
+            "an operator from another precedence production was accepted");
+    auto integer_literal = descendant(left_expression, P::Literal);
+    auto string_literal = descendant(parse("\"text\"", K::Expr), P::Literal);
+    require(syntax_replace_child(*integer_literal, 0, string_literal->children[0], replacement_error) != nullptr,
+            "another literal token kind was rejected");
+    auto source_type = descendant(parse("u32", K::Type), P::TypeSpecifier);
+    auto record_type_node = descendant(parse("struct NewTag", K::Type), P::StructOrUnionSpecifier);
+    require(syntax_replace_child(*source_type, 0, record_type_node, replacement_error) != nullptr,
+            "another type-specifier production alternative was rejected");
+    auto first_scalar = descendant(source_type, P::ScalarType);
+    auto second_scalar = descendant(parse("u16", K::Type), P::ScalarType);
+    require(syntax_replace_child(*first_scalar, 0, second_scalar->children[0], replacement_error) != nullptr,
+            "another scalar keyword was rejected");
+    auto limited = EvaluationLimits{};
+    limited.depth = 1;
+    require(!syntax_replace_child(*left_expression, 0, right_expression->children[0],
+                                  replacement_error, limited) &&
+            replacement_error.find("depth budget") != std::string::npos,
+            "syntax replacement did not enforce its depth budget");
+    limited = EvaluationLimits{};
+    limited.steps = 4;
+    std::uint64_t validation_work{};
+    require(!syntax_replace_child(*left_expression, 0, right_expression->children[0],
+                                  replacement_error, limited, &validation_work) &&
+            replacement_error.find("work budget") != std::string::npos && validation_work == 4,
+            "syntax replacement did not enforce its work budget");
+    // Exercise production alternatives through the same structural validator,
+    // without relying on private AST types or semantic constant folding.
+    for (const auto text : {"a = b += c ? d : e", "a || b && c | d ^ e & f == g < h << i + j * k",
+                            "++value + -other + sizeof(value)", "(u32)value", "fn(a, b)[2u32].field++",
+                            "\"first\" \"second\"", "callee::<u32, 3u32>(4u32)"})
+        (void)parse(text, K::Expr);
+    for (const auto text : {"u32 (*)(in u16 value)", "u32 *[3u32]", "u32 (*)[3u32]"})
+        (void)parse(text, K::Type);
+    for (const auto text : {"if (a) return b; else return c;", "switch (a) { case 1u32: break; default: return a; }",
+                            "while (a) { continue; }", "do { a -= 1u32; } while (a);", "for (;;) break;",
+                            "for (u32 i = 0u32; i < 2u32; ++i) continue;", "label point: goto point;",
+                            "{ using ns; ; }", "$::static_assert(1u32, \"ok\");"})
+        (void)parse(text, K::Statement);
+    (void)parse("struct Bits { u32 : 0u32; u32 value : 4u32; };", K::Declaration);
     auto embed = production(descendant(expression, P::EmbedExpression), P::EmbedExpression, 4);
     token(embed->children[0], "$::embed");
     token(embed->children[1], "(");

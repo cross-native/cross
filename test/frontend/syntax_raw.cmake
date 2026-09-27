@@ -138,10 +138,23 @@ reject(parsed_tree_layout "layout query requires a runtime object type"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { uptr width = sizeof($::meta::syntax); return $::quote { 1u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(parsed_child_bounds "syntax child index is out of range"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::meta::tokens($::meta::child($::syntax::node(input, \"body\"), 100uptr)); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(replace_child_shape "syntax replacement changes the grammar production"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax body = $::syntax::node(input, \"body\"); return $::meta::tokens($::meta::replace_child(body, 0uptr, body)); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(replace_child_type "requires a syntax replacement node"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::meta::tokens($::meta::replace_child($::syntax::node(input, \"body\"), 0uptr, 1u32)); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(replace_child_index "syntax child index is out of range"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax body = $::syntax::node(input, \"body\"); return $::meta::tokens($::meta::replace_child(body, 99uptr, body)); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(replace_child_work "validation work budget|translation-time instruction budget"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax body = $::syntax::node(input, \"body\"); for (uptr at = 0uptr; at < 1000uptr; ++at) body = $::meta::replace_child(body, 0uptr, $::meta::child(body, 0uptr)); return $::meta::tokens(body); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n"
+    -feval-step-limit=3000)
 reject(parsed_primitive_field "syntax capture requires a primitive token field"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::syntax::capture(input, \"body\"); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(parsed_unknown_kind "unknown public syntax node kind"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_kind($::syntax::node(input, \"body\"), \"unknown\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(parsed_unknown_production "unknown public syntax production"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_production($::syntax::node(input, \"body\"), \"unknown\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(extension_match_core "extension_match requires an extension node"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax_match nested = $::meta::extension_match($::syntax::node(input, \"body\")); return $::syntax::input(nested); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(fence "followed immediately by terminal ';'"
     "${expander}syntax Bad : expression { prefix \"bad\"; match value:tokens_until(\";\"); expand expand; }\n")
 reject(match "syntax-match error for active prefix"

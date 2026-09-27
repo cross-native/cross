@@ -109,6 +109,7 @@ add_library(cross_frontend
     src/frontend/procedural.cpp
     src/frontend/semantic.cpp
     src/frontend/syntax.cpp
+    src/frontend/syntax_tree.cpp
 )
 target_link_libraries(cross_frontend PUBLIC cross_common cross_targets)
 cross_component(cross_frontend)

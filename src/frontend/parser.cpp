@@ -604,6 +604,20 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     }
     auto node = child->public_node(0);
     if (!node) return {};
+    std::string shape_error;
+    std::uint64_t validation_work{};
+    SyntaxTreeValidationError failure{};
+    const auto valid = syntax_validate_node(*node, shape_error,
+        execution ? execution->limits() : EvaluationLimits{}, &validation_work, &failure);
+    if (execution && !execution->work(tokens_[first].location, validation_work)) return {};
+    if (!valid) {
+        if (failure == SyntaxTreeValidationError::DepthLimit ||
+            failure == SyntaxTreeValidationError::WorkLimit) {
+            if (execution) execution->tree_limit_error(tokens_[first].location);
+            else diagnostics_.error(tokens_[first].location, shape_error);
+        }
+        return {};
+    }
     return SyntaxParsedFragment{child->public_input_indices_[child->index_], std::move(node)};
 }
 
@@ -611,6 +625,11 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind cat
     if (!syntax_) return {};
     const auto first = index_;
     auto node = std::make_shared<SyntaxNode>();
+    node->slot_production = category == SyntaxKind::Expression
+        ? SyntaxProduction::PrimaryExpression
+        : category == SyntaxKind::Statement
+            ? SyntaxProduction::UnattributedStatement
+            : SyntaxProduction::Declaration;
     if (macro_start()) {
         node->kind = SyntaxNode::Kind::Macro;
         ++index_;

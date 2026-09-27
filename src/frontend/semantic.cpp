@@ -2659,8 +2659,10 @@ public:
             if (!charge_meta_bytes(syntax_field_storage_bytes + field.name.size(), location) ||
                 !charge_input_tokens(field.tokens, location)) return false;
             if (field.node) {
-                const auto size = syntax_node_storage(*field.node);
-                if (size > std::numeric_limits<std::size_t>::max()) {
+                const auto size = syntax_node_storage(*field.node,
+                    std::min(program_.evaluation_limits.bytes, program_.evaluation_limits.memory));
+                if (size > program_.evaluation_limits.bytes ||
+                    size > std::numeric_limits<std::size_t>::max()) {
                     fail(location, "public syntax tree exceeds translation-time storage capacity");
                     return false;
                 }
@@ -3408,9 +3410,11 @@ private:
             }
             if (name == "$::meta::tokens" || name == "$::meta::node_span" || name == "$::meta::child_count" ||
                 name == "$::meta::child" || name == "$::meta::is_kind" ||
-                name == "$::meta::is_production") {
+                name == "$::meta::is_production" || name == "$::meta::replace_child" ||
+                name == "$::meta::extension_match") {
                 const auto count = name == "$::meta::tokens" || name == "$::meta::node_span" ||
-                    name == "$::meta::child_count" ? 1U : 2U;
+                    name == "$::meta::child_count" || name == "$::meta::extension_match" ? 1U :
+                    name == "$::meta::replace_child" ? 3U : 2U;
                 if (!procedural_ || node.arguments.size() != count) {
                     fail(node.location, "unsupported syntax-tree operation or invalid argument count: " + name);
                     return false;
@@ -3422,15 +3426,24 @@ private:
                     fail(node.arguments[0]->location, name + " requires $::meta::syntax");
                     return false;
                 }
-                if (count == 2) {
+                if (count >= 2) {
                     const auto second = expression_type(*node.arguments[1]);
-                    const bool integer = name == "$::meta::child";
+                    const bool integer = name == "$::meta::child" ||
+                        name == "$::meta::replace_child";
                     const bool string = second && second->kind == Type::Kind::Pointer &&
                         second->pointee && second->pointee->kind == Type::Kind::Builtin &&
                         second->pointee->builtin == BuiltinType::U8;
                     if (!second || (integer ? !is_integer(second) : !string)) {
                         fail(node.arguments[1]->location, name +
                             (integer ? " requires an integer child index" : " requires a string name"));
+                        return false;
+                    }
+                }
+                if (count == 3) {
+                    const auto third = expression_type(*node.arguments[2]);
+                    if (!third || third->kind != Type::Kind::Syntax) {
+                        fail(node.arguments[2]->location,
+                            "$::meta::replace_child requires a syntax replacement node");
                         return false;
                     }
                 }
@@ -4032,7 +4045,8 @@ private:
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
-            if (procedural_ && expression.left->text == "$::syntax::at") return syntax_match_type();
+            if (procedural_ && (expression.left->text == "$::syntax::at" ||
+                expression.left->text == "$::meta::extension_match")) return syntax_match_type();
             if (procedural_ && expression.left->text == "$::syntax::node") return syntax_type();
             if (procedural_ && (expression.left->text == "$::syntax::span" ||
                 expression.left->text == "$::syntax::capture_span" ||
@@ -4046,7 +4060,8 @@ private:
             if (procedural_ && (expression.left->text == "$::syntax::input" ||
                 expression.left->text == "$::syntax::capture")) return tokens_type();
             if (procedural_ && expression.left->text == "$::meta::tokens") return tokens_type();
-            if (procedural_ && expression.left->text == "$::meta::child") return syntax_type();
+            if (procedural_ && (expression.left->text == "$::meta::child" ||
+                expression.left->text == "$::meta::replace_child")) return syntax_type();
             if (procedural_ && expression.left->text == "$::meta::child_count")
                 return builtin_type(BuiltinType::Uptr);
             if (procedural_ && (expression.left->text == "$::meta::is_kind" ||
@@ -6398,10 +6413,13 @@ private:
             expression.left->text == "$::meta::child_count" ||
             expression.left->text == "$::meta::child" ||
             expression.left->text == "$::meta::is_kind" ||
-            expression.left->text == "$::meta::is_production")) {
+            expression.left->text == "$::meta::is_production" ||
+            expression.left->text == "$::meta::replace_child" ||
+            expression.left->text == "$::meta::extension_match")) {
             const auto& name = expression.left->text;
             const auto count = name == "$::meta::tokens" || name == "$::meta::node_span" ||
-                name == "$::meta::child_count" ? 1U : 2U;
+                name == "$::meta::child_count" || name == "$::meta::extension_match" ? 1U :
+                name == "$::meta::replace_child" ? 3U : 2U;
             if (expression.arguments.size() != count) {
                 fail(expression.location, name + " requires " + std::to_string(count) + " arguments");
                 return std::nullopt;
@@ -6412,6 +6430,15 @@ private:
                 return std::nullopt;
             }
             const auto& node = *source->syntax_node;
+            if (name == "$::meta::extension_match") {
+                if (node.kind != SyntaxNode::Kind::Extension || !node.definition || !node.match) {
+                    fail(expression.location, "$::meta::extension_match requires an extension node");
+                    return std::nullopt;
+                }
+                EvalValue value{UInt128{}, syntax_match_type()};
+                value.syntax_match = node.match;
+                return value;
+            }
             if (name == "$::meta::node_span") return span_value(node.span, expression.location);
             if (name == "$::meta::tokens") {
                 TokenSequence result;
@@ -6423,6 +6450,48 @@ private:
                 return EvalValue{UInt128{node.children.size()}, builtin_type(BuiltinType::Uptr)};
             auto argument = this->expression(*expression.arguments[1]);
             if (!argument) return std::nullopt;
+            if (name == "$::meta::replace_child") {
+                if (!is_integer(argument->type) || argument->integer.high != 0 ||
+                    argument->integer.low > std::numeric_limits<std::size_t>::max()) {
+                    fail(expression.arguments[1]->location,
+                         "$::meta::replace_child requires an integer child index");
+                    return std::nullopt;
+                }
+                auto replacement = this->expression(*expression.arguments[2]);
+                if (!replacement || !replacement->syntax_node) {
+                    fail(expression.arguments[2]->location,
+                         "$::meta::replace_child requires a syntax replacement node");
+                    return std::nullopt;
+                }
+                std::string error;
+                auto limits = program_.evaluation_limits;
+                limits.steps -= std::min(steps_, limits.steps);
+                std::uint64_t validation_work{};
+                auto replaced = syntax_replace_child(node,
+                    static_cast<std::size_t>(argument->integer.low),
+                    replacement->syntax_node, error, limits, &validation_work);
+                steps_ += validation_work;
+                if (!replaced) {
+                    fail(expression.location, std::move(error));
+                    return std::nullopt;
+                }
+                const auto memory_remaining = program_.evaluation_limits.memory -
+                    std::min<std::uint64_t>(program_.evaluation_limits.memory, meta_bytes_ + token_bytes_);
+                const auto storage = syntax_node_storage(*replaced,
+                    std::min(program_.evaluation_limits.bytes, memory_remaining));
+                if (storage > program_.evaluation_limits.bytes ||
+                    storage > std::numeric_limits<std::size_t>::max() ||
+                    !charge_meta_bytes(static_cast<std::size_t>(storage), expression.location)) {
+                    if (storage > program_.evaluation_limits.bytes ||
+                        storage > std::numeric_limits<std::size_t>::max())
+                        fail(expression.location,
+                             "public syntax replacement exceeds translation-time storage budget");
+                    return std::nullopt;
+                }
+                EvalValue value{UInt128{}, syntax_type()};
+                value.syntax_node = std::move(replaced);
+                return value;
+            }
             if (name == "$::meta::child") {
                 if (!is_integer(argument->type) || argument->integer.high != 0 ||
                     argument->integer.low >= node.children.size()) {
@@ -6439,9 +6508,21 @@ private:
             }
             const auto written = std::string_view(*argument->string).substr(argument->offset,
                 argument->string->size() - argument->offset - 1);
-            if (name == "$::meta::is_production")
+            if (name == "$::meta::is_production") {
+                bool known = false;
+                for (std::size_t at = 1; at < static_cast<std::size_t>(SyntaxProduction::Count); ++at)
+                    if (syntax_production_name(static_cast<SyntaxProduction>(at)) == written) {
+                        known = true;
+                        break;
+                    }
+                if (!known) {
+                    fail(expression.location,
+                        "unknown public syntax production '" + std::string(written) + "'");
+                    return std::nullopt;
+                }
                 return EvalValue{UInt128{node.kind == SyntaxNode::Kind::Core &&
                     syntax_production_name(node.production) == written}, builtin_type(BuiltinType::Bool)};
+            }
             static constexpr std::pair<std::string_view, SyntaxNode::Kind> kinds[] = {
                 {"token", SyntaxNode::Kind::Token}, {"group", SyntaxNode::Kind::Group},
                 {"core", SyntaxNode::Kind::Core}, {"extension", SyntaxNode::Kind::Extension},

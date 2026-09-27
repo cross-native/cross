@@ -7,6 +7,12 @@
 #if $::has_feature($::feature::syntax_extensions)
 #error full public-tree syntax support is not implemented yet
 #endif
+#if !$::has_builtin($::meta::replace_child) || !$::has_intrinsic($::meta::replace_child)
+#error syntax child replacement must be discoverable
+#endif
+#if !$::has_builtin($::meta::extension_match) || !$::has_intrinsic($::meta::extension_match)
+#error preserved extension matches must be discoverable
+#endif
 
 [[macro]] static $::meta::tokens copied(in $::meta::tokens input) { return input; }
 [[macro]] static $::meta::tokens forwarded(in $::meta::tokens input) {
@@ -414,6 +420,34 @@ namespace forwarding {
     }
 }
 
+[[syntax_expander]] static $::meta::tokens replace_expression_child(in $::meta::syntax_match input) {
+    $::meta::syntax before = $::syntax::node(input, "before");
+    $::meta::syntax after = $::syntax::node(input, "after");
+    $::meta::syntax updated = $::meta::replace_child(before, 0uptr,
+        $::meta::child(after, 0uptr));
+    return $::meta::tokens(updated);
+}
+syntax Rebuild : expression {
+    prefix "rebuild"; match "(" before:expr "," after:expr ")";
+    expand replace_expression_child;
+}
+syntax Rebuild;
+[[syntax_expander]] static $::meta::tokens inspect_extension(in $::meta::syntax_match input) {
+    $::meta::syntax root = $::syntax::node(input, "body");
+    $::meta::syntax leaf = root;
+    while ($::meta::is_kind(leaf, "core") && $::meta::child_count(leaf) == 1uptr)
+        leaf = $::meta::child(leaf, 0uptr);
+    $::meta::syntax_match nested = $::meta::extension_match(leaf);
+    if ($::meta::len($::syntax::input(nested)) != 2uptr ||
+        $::meta::len($::syntax::capture(nested, "body")) != 1uptr)
+        return $::quote { public_schema_failure(); };
+    return $::meta::tokens(root);
+}
+syntax InspectExtension : expression {
+    prefix "inspect_extension"; match body:expr; expand inspect_extension;
+}
+syntax InspectExtension;
+
 syntax(flow::Make, flow::Drop, flow::DropTokens) {
     make generated 7u32;
     drop { no_such_macro!(); [[syntax_expander]] not_a_declaration; }
@@ -665,6 +699,12 @@ global uptr syntax_width = width ();
 #endif
 global u32 syntax_raw_entry() {
 #ifndef SYNTAX_COMPILE_ONLY
+    syntax flow::Base;
+    if (rebuild (2u32 + 3u32, 7u32 * 4u32) != 28u32) return 0u32;
+    if (rebuild (unknown_discarded_macro! { not source; }, copied! (9u32)) != 9u32)
+        return 0u32;
+    if (rebuild (1u32, base ()) != 5u32) return 0u32;
+    if ((inspect_extension base ()) != 5u32) return 0u32;
     if (generated() != 7u32) return 0u32;
     if (((uptr)&interleaved_aligned & 15uptr) != 0uptr || interleaved_aligned != 3u32)
         return 0u32;
