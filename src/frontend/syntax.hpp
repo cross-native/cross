@@ -13,11 +13,37 @@
 
 namespace cross {
 
+using SyntaxEntityId = SyntaxContext::EntityId;
+using SyntaxBinding = SyntaxContext::Binding;
+struct SyntaxMatchValue;
+
+struct SyntaxSpan {
+    SourceLocation first;
+    SourceLocation last;
+};
+
+// The public, versioned tree is independent of typed AST/HIR. Every node
+// owns its lexical identity and remains immutable after construction.
+struct SyntaxNode {
+    enum class Kind { Token, Group, Core, Extension, Macro, Deferred } kind{Kind::Token};
+    std::string production;
+    TokenSequence tokens;
+    std::vector<std::shared_ptr<const SyntaxNode>> children;
+    SyntaxSpan span;
+    std::shared_ptr<const SyntaxContext> context;
+    std::optional<SyntaxEntityId> definition;
+    std::shared_ptr<const SyntaxMatchValue> match;
+};
+
+TokenSequence syntax_node_tokens(const SyntaxNode& node);
+std::size_t syntax_node_count(const SyntaxNode& node);
+
 // Public match records are translation-only, not runtime records or typed HIR.
 struct SyntaxMatchValue {
     struct Field {
         std::string name;
         TokenSequence tokens;
+        std::shared_ptr<const SyntaxNode> node;
         std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
         bool nested{};
     };
@@ -27,8 +53,6 @@ struct SyntaxMatchValue {
     std::vector<std::string> variant_labels;
 };
 
-using SyntaxEntityId = SyntaxContext::EntityId;
-using SyntaxBinding = SyntaxContext::Binding;
 struct SyntaxFunctionId { std::uint32_t value{}; };
 enum class SyntaxKind { Item, Statement, Expression, Rule, Bundle };
 struct SyntaxActivation {
@@ -36,10 +60,16 @@ struct SyntaxActivation {
     std::optional<std::string> alias;
     SourceLocation location;
 };
+struct SyntaxParsedFragment {
+    std::size_t end{};
+    std::shared_ptr<const SyntaxNode> node;
+};
 struct SyntaxPatternElement {
     enum class Kind { Terminal, Ident, Name, Literal, Paren, Bracket, Block, Group,
-                      TokensUntil, FunctionRaw, Rule, Optional, Repeat0, Repeat1,
-                      Separated0, Separated1, Choice } kind;
+                      TokensUntil, FunctionRaw, Expr, Statement, Type, Declaration,
+                      FunctionHeader, FunctionDeclaration, FunctionDefinition,
+                      Rule, Optional, Repeat0, Repeat1, Separated0, Separated1,
+                      Choice } kind;
     struct Alternative {
         std::string label;
         std::vector<SyntaxPatternElement> pattern;
@@ -138,7 +168,9 @@ public:
     };
     std::optional<Match> match(const SyntaxDefinition& definition,
         const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
-        const std::function<bool(std::size_t, std::size_t)>& function_header = {}) const;
+        const std::function<bool(std::size_t, std::size_t)>& function_header = {},
+        const std::function<std::optional<SyntaxParsedFragment>(
+            SyntaxPatternElement::Kind, std::size_t)>& parse_fragment = {}) const;
     std::shared_ptr<SyntaxExecution> execution() const { return execution_; }
 private:
     std::optional<SyntaxEntityId> lookup(std::string_view name, std::string_view name_space,

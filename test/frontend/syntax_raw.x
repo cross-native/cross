@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant)
+#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant) || !$::has_builtin($::syntax::node) || !$::has_intrinsic($::meta::child)
 #error implemented syntax operations must be discoverable
 #endif
 #if $::has_feature($::feature::syntax_extensions)
@@ -152,6 +152,23 @@ namespace flow {
         return $::quote { 14u32 };
     }
     syntax MutualUse : expression { prefix "mutual"; match root:rule(MutualA); expand mutual_shape; }
+    [[syntax_expander]] static $::meta::tokens parsed_expression(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        if (!$::meta::is_kind(body, "core") ||
+            !$::meta::is_production(body, "assignment_expression") ||
+            $::meta::child_count(body) != 1uptr) return $::quote { 0u32 };
+        $::meta::syntax conditional = $::meta::child(body, 0uptr);
+        if (!$::meta::is_production(conditional, "conditional_expression"))
+            return $::quote { 0u32 };
+        return $::meta::tokens(body);
+    }
+    syntax ParsedExpr : expression { prefix "parsed"; match body:expr; expand parsed_expression; }
+    [[syntax_expander]] static $::meta::tokens parsed_type(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        if (!$::meta::is_production(body, "type_name")) return $::quote { typedef u16 CapturedType; };
+        return $::quote { typedef $::unquote($::meta::tokens(body)) CapturedType; };
+    }
+    syntax ParsedType : item { prefix "emit_type"; match body:type ";"; expand parsed_type; }
 }
 namespace caller {
     global u32 number = 13u32;
@@ -174,6 +191,8 @@ syntax(flow::Make, flow::Drop, flow::DropTokens) {
 }
 typedef u32 RawResult;
 syntax flow::CopyFunction, flow::DropFunction;
+syntax flow::ParsedType;
+emit_type u32;
 copy_fn [[noinline]] static RawResult copied_function(in u32 value) { return forwarded! (value) + 17u32; }
 drop_fn static u32 discarded_function(in u32 value) { no_such_macro!(); this is a foreign body; }
 namespace reopened {
@@ -262,6 +281,10 @@ namespace frozen {
     syntax flow::TreeUse, flow::MutualUse;
     return tree ((1u32 + 2u32) + 3u32) + mutual ([1u32]);
 }
+[[noinline]] static u32 parsed_expression() {
+    syntax flow::ParsedExpr;
+    return parsed (2u32 + 3u32) * 4u32;
+}
 syntax flow::Width;
 global uptr syntax_width = width ();
 #ifdef CUSTOM_SYNTAX_ABI
@@ -280,6 +303,7 @@ global u32 syntax_raw_entry() {
     if (angle_boundary() != 9u32) return 0u32;
     if (combinators() != 50u32) return 0u32;
     if (recursive_rules() != 27u32) return 0u32;
+    if (parsed_expression() != 20u32 || sizeof(CapturedType) != 4uptr) return 0u32;
     if (syntax_width != sizeof(uptr)) return 0u32;
 #endif
     return 61u32;

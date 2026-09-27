@@ -40,6 +40,7 @@ struct Type {
         // Translation-only; never assigned a runtime layout or ABI channel.
         Tokens,
         SyntaxMatch,
+        Syntax,
         Bytes,
         Buffer
     } kind{Kind::Builtin};
@@ -69,6 +70,7 @@ TypePtr builtin_type(BuiltinType kind, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
 TypePtr tokens_type();
 TypePtr syntax_match_type();
+TypePtr syntax_type();
 std::span<const std::string_view> core_keyword_names();
 bool is_reserved_identifier(std::string_view name);
 TypePtr bytes_type();

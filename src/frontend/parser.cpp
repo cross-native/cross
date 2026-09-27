@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 namespace cross {
@@ -333,6 +334,8 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
     const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_,
         [&](std::size_t first, std::size_t body_open) {
             return validate_syntax_function_header(first, body_open, name_space, imports);
+        }, [&](SyntaxPatternElement::Kind kind, std::size_t first) {
+            return parse_syntax_fragment(kind, first);
         });
     if (!matched) { ++index_; synchronize_external(); return {}; }
     index_ = matched->end;
@@ -365,8 +368,10 @@ bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body
     return direct && diagnostics_.errors() == errors;
 }
 
-std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output) const {
-    auto child = std::make_unique<Parser>(std::move(output.tokens), diagnostics_);
+std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output,
+    Diagnostics* diagnostics) const {
+    auto child = std::make_unique<Parser>(std::move(output.tokens),
+                                          diagnostics ? *diagnostics : diagnostics_);
     child->syntax_ = syntax_;
     child->replacement_ = true;
     child->active_imports_ = active_imports_;
@@ -387,6 +392,98 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->switch_depth_ = switch_depth_;
     child->switch_default_seen_ = switch_default_seen_;
     return child;
+}
+
+Parser::ProductionScope::ProductionScope(Parser& parser, std::string_view production)
+    : parser(parser), event(parser.begin_production(production)) {}
+
+Parser::ProductionScope::~ProductionScope() { parser.end_production(event); }
+
+std::size_t Parser::begin_production(std::string_view name) {
+    if (!recording_public_tree_ || name.empty())
+        return std::numeric_limits<std::size_t>::max();
+    const auto event = production_events_.size();
+    production_events_.push_back({name, index_, index_, {}});
+    if (!production_stack_.empty())
+        production_events_[production_stack_.back()].children.push_back(event);
+    production_stack_.push_back(event);
+    return event;
+}
+
+void Parser::end_production(std::size_t event) {
+    if (event == std::numeric_limits<std::size_t>::max()) return;
+    production_events_[event].end = index_;
+    production_stack_.pop_back();
+}
+
+std::shared_ptr<const SyntaxNode> Parser::public_node(std::size_t event) const {
+    if (event >= production_events_.size()) return {};
+    const auto& source = production_events_[event];
+    if (source.first > source.end || source.end > tokens_.size() ||
+        source.first >= tokens_.size()) return {};
+    auto node = std::make_shared<SyntaxNode>();
+    node->kind = SyntaxNode::Kind::Core;
+    node->production = source.production;
+    node->span = {token_origin(tokens_[source.first].location).span,
+                  token_origin(tokens_[source.end == source.first ? source.first
+                      : source.end - 1].location).span};
+    node->context = token_origin(tokens_[source.first].location).context;
+    const auto token_node = [&](std::size_t at) -> std::shared_ptr<const SyntaxNode> {
+        auto leaf = std::make_shared<SyntaxNode>();
+        leaf->kind = SyntaxNode::Kind::Token;
+        leaf->tokens.emplace_back(tokens_[at]);
+        leaf->span = {leaf->tokens.front().origin.span, leaf->tokens.front().origin.span};
+        leaf->context = leaf->tokens.front().origin.context;
+        return leaf;
+    };
+    auto cursor = source.first;
+    for (const auto child : source.children) {
+        const auto& range = production_events_[child];
+        if (range.first < cursor || range.first > range.end || range.end > source.end)
+            return {};
+        while (cursor < range.first) node->children.push_back(token_node(cursor++));
+        auto built = public_node(child);
+        if (!built) return {};
+        node->children.push_back(std::move(built));
+        cursor = range.end;
+    }
+    while (cursor < source.end) node->children.push_back(token_node(cursor++));
+    return node;
+}
+
+std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
+    SyntaxPatternElement::Kind kind, std::size_t first) const {
+    using K = SyntaxPatternElement::Kind;
+    if (first >= tokens_.size() || tokens_[first].kind == TokenKind::End) return {};
+    // Speculative alternatives must not emit diagnostics or mutate the owner's
+    // parser. A child receives the same caller-side type and syntax environment.
+    std::ostringstream output;
+    Diagnostics local(output);
+    auto child = replacement_parser({tokens_, tokens_[first].location}, &local);
+    child->index_ = first;
+    child->parsing_public_fragment_ = true;
+    child->recording_public_tree_ = true;
+    if (kind == K::Expr) {
+        (void)child->parse_assignment();
+    } else if (kind == K::Type) {
+        ProductionScope scope(*child, "type_name");
+        if (!child->type_start()) return {};
+        auto type = child->parse_type();
+        std::optional<std::string> name;
+        (void)child->parse_declarator(std::move(type), name);
+        if (name) return {};
+    } else {
+        return {};
+    }
+    if (local.errors() != 0 || child->index_ <= first ||
+        child->production_events_.empty()) return {};
+    const auto& next = child->current();
+    if (next.kind != TokenKind::End && !next.is(";") && !next.is(",") &&
+        !next.is(")") && !next.is("]") && !next.is("]]") &&
+        !next.is("}")) return {};
+    auto node = child->public_node(0);
+    if (!node) return {};
+    return SyntaxParsedFragment{child->index_, std::move(node)};
 }
 
 void Parser::adopt_replacement(Parser& child) {
@@ -708,6 +805,8 @@ void Parser::apply_type_attributes(
 }
 
 std::optional<std::string> Parser::parse_qualified_name() {
+    if (current().kind != TokenKind::Identifier) return std::nullopt;
+    ProductionScope production(*this, "qualified_name");
     const auto* first = consume_kind(TokenKind::Identifier);
     if (!first) return std::nullopt;
     std::string name(first->text);
@@ -765,6 +864,7 @@ bool Parser::type_start() const {
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
+           token.is("$::meta::syntax") ||
            token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
@@ -790,7 +890,14 @@ TypePtr Parser::parse_type() {
         }
     }
     TypePtr type;
-    if (current().is("$::meta::syntax_match")) {
+    if (current().is("$::meta::syntax")) {
+        if (!parsing_procedural_body_)
+            error_here("$::meta::syntax is only available in expansion functions");
+        type = syntax_type();
+        type->is_const = is_const;
+        type->is_volatile = is_volatile;
+        ++index_;
+    } else if (current().is("$::meta::syntax_match")) {
         if (!parsing_procedural_body_)
             error_here("$::meta::syntax_match is only available in expansion functions");
         type = syntax_match_type();
@@ -2391,6 +2498,7 @@ int Parser::precedence(std::string_view operation) {
 }
 
 std::unique_ptr<Expr> Parser::parse_expression(std::unique_ptr<Expr> seed) {
+    ProductionScope production(*this, "expression");
     return parse_assignment(std::move(seed));
 }
 
@@ -2435,13 +2543,18 @@ std::unique_ptr<Expr> Parser::parse_initializer() {
 }
 
 std::unique_ptr<Expr> Parser::parse_assignment(std::unique_ptr<Expr> seed) {
+    ProductionScope production(*this, "assignment_expression");
     auto left = parse_conditional(std::move(seed));
     if (current().is("=") || current().is("+=") || current().is("-=") ||
         current().is("*=") || current().is("/=") || current().is("%=") ||
         current().is("<<=") || current().is(">>=") ||
         current().is("&=") || current().is("^=") ||
         current().is("|=")) {
-        const auto operation = current(); ++index_;
+        const auto operation = current();
+        {
+            ProductionScope assignment_operator(*this, "assignment_operator");
+            ++index_;
+        }
         auto result = std::make_unique<Expr>();
         result->kind = Expr::Kind::Assign;
         result->location = operation.location;
@@ -2454,6 +2567,7 @@ std::unique_ptr<Expr> Parser::parse_assignment(std::unique_ptr<Expr> seed) {
 }
 
 std::unique_ptr<Expr> Parser::parse_conditional(std::unique_ptr<Expr> seed) {
+    ProductionScope production(*this, "conditional_expression");
     auto condition = parse_binary(1, std::move(seed));
     if (!consume("?")) return condition;
     auto result = std::make_unique<Expr>();
@@ -2467,14 +2581,23 @@ std::unique_ptr<Expr> Parser::parse_conditional(std::unique_ptr<Expr> seed) {
 }
 
 std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence, std::unique_ptr<Expr> seed) {
-    auto left = seed ? parse_postfix(std::move(seed)) : parse_cast();
+    static constexpr std::string_view productions[] = {
+        "", "logical_or_expression", "logical_and_expression",
+        "inclusive_or_expression", "exclusive_or_expression",
+        "and_expression", "equality_expression", "relational_expression",
+        "shift_expression", "additive_expression", "multiplicative_expression"};
+    ProductionScope production(*this, productions[minimum_precedence]);
+    auto left = minimum_precedence == 10
+        ? (seed ? parse_postfix(std::move(seed)) : parse_cast())
+        : parse_binary(minimum_precedence + 1, std::move(seed));
     for (;;) {
         if (parsing_generic_argument_ &&
             (current().is(">") || current().is(">>"))) break;
         const int current_precedence = precedence(current().text);
-        if (current_precedence < minimum_precedence) break;
+        if (current_precedence != minimum_precedence) break;
         const auto operation = current(); ++index_;
-        auto right = parse_binary(current_precedence + 1);
+        auto right = minimum_precedence == 10 ? parse_cast()
+            : parse_binary(minimum_precedence + 1);
         auto result = std::make_unique<Expr>();
         result->kind = Expr::Kind::Binary;
         result->location = operation.location;
@@ -2487,6 +2610,7 @@ std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence, std::unique_p
 }
 
 std::unique_ptr<Expr> Parser::parse_cast() {
+    ProductionScope production(*this, "cast_expression");
     if (current().is("(")) {
         const auto saved = index_;
         ++index_;
@@ -2495,9 +2619,13 @@ std::unique_ptr<Expr> Parser::parse_cast() {
         if (begins_type) {
             const auto location = current().location;
             consume("(");
-            auto type = parse_type();
+            TypePtr type;
             std::optional<std::string> name;
-            type = parse_declarator(std::move(type), name);
+            {
+                ProductionScope type_name(*this, "type_name");
+                type = parse_type();
+                type = parse_declarator(std::move(type), name);
+            }
             if (name) {
                 diagnostics_.error(location,
                                    "a cast type name cannot declare an object");
@@ -2515,6 +2643,7 @@ std::unique_ptr<Expr> Parser::parse_cast() {
 }
 
 std::unique_ptr<Expr> Parser::parse_unary() {
+    ProductionScope production(*this, "unary_expression");
     if (current().is("sizeof")) {
         const auto location = current().location;
         consume("sizeof");
@@ -2528,9 +2657,12 @@ std::unique_ptr<Expr> Parser::parse_unary() {
             index_ = saved;
             if (begins_type) {
                 consume("(");
-                result->type = parse_type();
                 std::optional<std::string> name;
-                result->type = parse_declarator(std::move(result->type), name);
+                {
+                    ProductionScope type_name(*this, "type_name");
+                    result->type = parse_type();
+                    result->type = parse_declarator(std::move(result->type), name);
+                }
                 if (name) {
                     diagnostics_.error(
                         location,
@@ -2558,6 +2690,7 @@ std::unique_ptr<Expr> Parser::parse_unary() {
 }
 
 std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
+    ProductionScope production(*this, "postfix_expression");
     auto expression = seed ? std::move(seed) : parse_primary();
     for (;;) {
         const bool explicit_generic = current().is("::") &&
@@ -2566,6 +2699,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                                       expression->kind == Expr::Kind::Name &&
                                       known_generic_name(*expression);
         if (explicit_generic || inferred_generic) {
+            ProductionScope generic_arguments(*this, "generic_arguments");
             index_ += explicit_generic ? 2 : 1;
             if (consume(">")) {
                 error_here("a generic argument list cannot be empty");
@@ -2599,10 +2733,13 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                 known_generic_name(*expression);
             call->generic_arguments = std::move(expression->generic_arguments);
             call->left = std::move(expression);
-            if (!consume(")")) {
-                do { call->arguments.push_back(parse_assignment()); } while (consume(","));
-                expect(")");
+            {
+                ProductionScope argument_list(*this, "argument_list");
+                if (!current().is(")")) {
+                    do { call->arguments.push_back(parse_assignment()); } while (consume(","));
+                }
             }
+            expect(")");
             parsing_generic_argument_ = previous;
             expression = std::move(call);
             continue;
@@ -2712,6 +2849,7 @@ std::unique_ptr<Expr> Parser::parse_quote() {
 }
 
 std::unique_ptr<Expr> Parser::parse_primary() {
+    ProductionScope production(*this, "primary_expression");
     if (current().is("syntax") &&
         (replacement_ || token_origin(current().location).context)) {
         error_here("expansion output cannot introduce syntax registration");
@@ -2722,7 +2860,18 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         ++index_;
         return result;
     }
-    if (syntax_ && (macro_start() || active_syntax(false))) return parse_expression_replacement();
+    if (syntax_ && (macro_start() || active_syntax(false))) {
+        if (parsing_public_fragment_) {
+            error_here("nested expansion requires a deferred public fragment");
+            auto placeholder = std::make_unique<Expr>();
+            placeholder->kind = Expr::Kind::Integer;
+            placeholder->text = "0";
+            placeholder->location = current().location;
+            ++index_;
+            return placeholder;
+        }
+        return parse_expression_replacement();
+    }
     const auto item = current();
     if (current().is("$::quote")) return parse_quote();
     if (current().is("$::unquote"))
@@ -2733,6 +2882,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         result->kind = Expr::Kind::Alignof;
         result->location = item.location;
         if (type_start()) {
+            ProductionScope type_name(*this, "type_name");
             result->type = parse_type();
             std::optional<std::string> name;
             result->type = parse_declarator(std::move(result->type), name);
@@ -2760,6 +2910,12 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         return result;
     }
     auto result = std::make_unique<Expr>();
+    const auto atom = item.kind == TokenKind::Identifier ? std::string_view{}
+        : item.kind == TokenKind::BuiltinName ? std::string_view{"builtin_name"}
+        : item.kind == TokenKind::Integer || item.kind == TokenKind::Floating ||
+          item.kind == TokenKind::String || item.kind == TokenKind::Character
+            ? std::string_view{"literal"} : std::string_view{};
+    ProductionScope atom_production(*this, atom);
     result->location = item.location;
     result->text = std::string(item.text);
     if (item.kind == TokenKind::Integer) result->kind = Expr::Kind::Integer;

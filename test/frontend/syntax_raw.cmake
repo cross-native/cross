@@ -54,8 +54,10 @@ reject(fields "duplicate syntax capture field"
     "${expander}syntax Bad : expression { prefix \"bad\"; match a:ident a:ident; expand expand; }\n")
 reject(clause "requires prefix, match, and expand in order"
     "${expander}syntax Bad : expression { match body:paren; prefix \"bad\"; expand expand; }\n")
-reject(parsed_capture "capture 'expr' is not implemented yet"
-    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" value:expr \")\"; expand expand; }\n")
+reject(parsed_expression_malformed "syntax-match error for active prefix"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match value:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32 + ; }\n")
+reject(parsed_node_on_raw "requires a parsed capture field"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax node = $::syntax::node(input, \"body\"); return $::meta::tokens(node); } syntax Bad : expression { prefix \"bad\"; match body:paren; expand expand; } syntax Bad; global u32 entry() { return bad (1u32); }\n")
 reject(fence "followed immediately by terminal ';'"
     "${expander}syntax Bad : expression { prefix \"bad\"; match value:tokens_until(\";\"); expand expand; }\n")
 reject(match "syntax-match error for active prefix"

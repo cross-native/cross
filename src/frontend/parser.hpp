@@ -39,7 +39,10 @@ private:
     bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
                                          std::string_view name_space,
                                          const std::vector<std::string>& imports) const;
-    std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output) const;
+    std::optional<SyntaxParsedFragment> parse_syntax_fragment(
+        SyntaxPatternElement::Kind kind, std::size_t first) const;
+    std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output,
+                                                Diagnostics* diagnostics = nullptr) const;
     void adopt_replacement(Parser& child);
     std::unique_ptr<Statement> parse_statement_replacement();
     std::unique_ptr<Expr> parse_expression_replacement();
@@ -117,6 +120,22 @@ private:
         const std::vector<Attribute>& attributes);
     static int precedence(std::string_view operation);
 
+    struct ProductionEvent {
+        std::string_view production;
+        std::size_t first{};
+        std::size_t end{};
+        std::vector<std::size_t> children;
+    };
+    struct ProductionScope {
+        Parser& parser;
+        std::size_t event;
+        ProductionScope(Parser& parser, std::string_view production);
+        ~ProductionScope();
+    };
+    std::size_t begin_production(std::string_view name);
+    void end_production(std::size_t event);
+    std::shared_ptr<const SyntaxNode> public_node(std::size_t event) const;
+
     std::vector<Token> tokens_;
     Diagnostics& diagnostics_;
     std::size_t index_{};
@@ -141,6 +160,10 @@ private:
     FunctionDecl* active_function_{};
     bool parsing_generic_argument_{};
     bool parsing_procedural_body_{};
+    bool parsing_public_fragment_{};
+    bool recording_public_tree_{};
+    std::vector<ProductionEvent> production_events_;
+    std::vector<std::size_t> production_stack_;
     unsigned switch_depth_{};
     std::vector<bool> switch_default_seen_;
 };
