@@ -15,10 +15,24 @@ enum class TokenKind {
     Punctuator, Invalid,
 };
 
+// A grammar may consume the two characters of a lexical >> separately.
+// Preserve their common source identity so a complete projection can recover
+// the original token, while either terminal remains inspectable on its own.
+struct SplitTokenSource {
+    TokenKind kind;
+    std::string spelling;
+};
+
 struct Token {
     TokenKind kind{TokenKind::Invalid};
     std::string_view text;
     SourceLocation location;
+    std::shared_ptr<const SplitTokenSource> split_source;
+    std::size_t split_offset{};
+
+    Token() = default;
+    Token(TokenKind kind, std::string_view text, SourceLocation location)
+        : kind(kind), text(text), location(location) {}
 
     [[nodiscard]] bool is(std::string_view spelling) const { return text == spelling; }
 };
@@ -29,10 +43,13 @@ struct MetaToken {
     TokenKind kind{TokenKind::Invalid};
     std::string text;
     TokenOrigin origin;
+    std::shared_ptr<const SplitTokenSource> split_source;
+    std::size_t split_offset{};
 
     MetaToken() = default;
     explicit MetaToken(const Token& token)
-        : kind(token.kind), text(token.text), origin(token_origin(token.location)) {}
+        : kind(token.kind), text(token.text), origin(token_origin(token.location)),
+          split_source(token.split_source), split_offset(token.split_offset) {}
 };
 
 using TokenSequence = std::vector<MetaToken>;

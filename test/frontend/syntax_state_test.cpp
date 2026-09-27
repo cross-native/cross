@@ -88,4 +88,27 @@ syntax Pack : bundle { use First; use Item; }
         "", {}, state.bindings());
     require(output && diagnostics.errors() == errors && output->tokens.front().text == "1u32",
             "target-independent syntax evaluation failed");
+
+    // Generic-close terminal fragments project back to the original lexical
+    // token only when every adjacent piece has the same source identity.
+    auto split = std::make_shared<const SplitTokenSource>(SplitTokenSource{TokenKind::Punctuator, ">>"});
+    auto first_close = std::make_shared<SyntaxNode>();
+    first_close->tokens.resize(1);
+    first_close->tokens.front().kind = TokenKind::Punctuator;
+    first_close->tokens.front().text = ">";
+    first_close->tokens.front().split_source = split;
+    auto second_close = std::make_shared<SyntaxNode>(*first_close);
+    second_close->tokens.front().split_offset = 1;
+    SyntaxNode generic;
+    generic.kind = SyntaxNode::Kind::Core;
+    generic.children = {first_close, second_close};
+    const auto lexical = syntax_node_tokens(generic);
+    require(lexical.size() == 1 && lexical.front().text == ">>" &&
+            !lexical.front().split_source, "complete generic closes were not lossless");
+    require(syntax_node_tokens(*second_close).front().text == ">",
+            "one generic-close terminal exposed the entire source token");
+    second_close->tokens.front().split_source =
+        std::make_shared<const SplitTokenSource>(SplitTokenSource{TokenKind::Punctuator, ">>"});
+    require(syntax_node_tokens(generic).size() == 2,
+            "distinct generic-close source tokens were accidentally joined");
 }

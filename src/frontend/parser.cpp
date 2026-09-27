@@ -481,6 +481,9 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     child->index_ = first;
     child->parsing_public_fragment_ = true;
     child->recording_public_tree_ = true;
+    child->public_input_indices_.reserve(tokens_.size());
+    for (std::size_t at = 0; at < tokens_.size(); ++at)
+        child->public_input_indices_.push_back(at);
     const auto origin = token_origin(tokens_[first].location);
     if (origin.context) {
         child->active_namespace_ = origin.context->name_space;
@@ -537,10 +540,10 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     }
     auto node = child->public_node(0);
     if (!node) return {};
-    return SyntaxParsedFragment{child->index_, std::move(node)};
+    return SyntaxParsedFragment{child->public_input_indices_[child->index_], std::move(node)};
 }
 
-std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(bool item) {
+std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind category) {
     if (!syntax_) return {};
     const auto first = index_;
     auto node = std::make_shared<SyntaxNode>();
@@ -557,6 +560,8 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(bool item) {
             const auto text = current().text;
             if (text == "(" || text == "[" || text == "[[" || text == "{") {
                 if (closers.size() >= syntax_->execution()->limits().depth) {
+                    syntax_->execution()->tree_limit_error(current().location);
+                    public_tree_failed_ = true;
                     error_here("opaque macro token-tree depth exceeded");
                     return {};
                 }
@@ -575,10 +580,10 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(bool item) {
             return {};
         }
     } else {
-        const auto* definition = active_syntax(item);
+        const auto* definition = active_syntax(category == SyntaxKind::Item);
         if (!definition) return {};
-        if (!item && definition->kind != SyntaxKind::Expression) {
-            error_here("statement syntax is not valid at expression position");
+        if (definition->kind != category) {
+            error_here("opaque syntax invocation has the wrong surrounding category");
             ++index_;
             return {};
         }
@@ -1309,13 +1314,22 @@ bool Parser::known_generic_name(const Expr& name) const {
 bool Parser::consume_generic_close() {
     if (consume(">")) return true;
     if (!current().is(">>")) return false;
+    const auto source = current().split_source ? current().split_source
+        : std::make_shared<const SplitTokenSource>(SplitTokenSource{
+            current().kind, std::string(current().text)});
     auto remainder = current();
     remainder.text = ">";
+    remainder.split_source = source;
+    remainder.split_offset = current().split_offset + 1;
     ++remainder.location.offset;
     ++remainder.location.column;
     tokens_[index_].text = ">";
+    tokens_[index_].split_source = source;
     tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(index_) + 1,
                    remainder);
+    if (recording_public_tree_)
+        public_input_indices_.insert(public_input_indices_.begin() +
+            static_cast<std::ptrdiff_t>(index_) + 1, public_input_indices_[index_]);
     ++index_;
     return true;
 }
@@ -2457,17 +2471,50 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         synchronize_external();
         return statement;
     }
-    if (parsing_public_fragment_ && (macro_start() || active_syntax(false))) {
-        error_here("nested expansion requires an opaque public statement node");
+    if (parsing_public_fragment_ && macro_start()) {
         auto placeholder = std::make_unique<Statement>();
         placeholder->kind = Statement::Kind::Empty;
         placeholder->location = current().location;
-        ++index_;
+        const auto first = index_;
+        const auto events = production_events_.size();
+        if (!parse_opaque_invocation(SyntaxKind::Statement)) {
+            error_here("could not recognize a bounded opaque statement invocation");
+            return placeholder;
+        }
+        // An explicit operator/suffix after a macro places it inside a core
+        // expression statement. A standalone invocation stays opaque; its
+        // output is classified only after the owner has expanded.
+        const auto suffix = current().text;
+        const bool expression_continues = precedence(suffix) > 0 || suffix == "=" ||
+            suffix == "+=" || suffix == "-=" || suffix == "*=" || suffix == "/=" ||
+            suffix == "%=" || suffix == "<<=" || suffix == ">>=" || suffix == "&=" ||
+            suffix == "^=" || suffix == "|=" || suffix == "?" || suffix == "(" ||
+            suffix == "[" || suffix == "." || suffix == "->" || suffix == "++" ||
+            suffix == "--" || (suffix == "::" && current(1).is("<"));
+        if (expression_continues) {
+            index_ = first;
+            production_events_.resize(events);
+            if (!production_stack_.empty())
+                production_events_[production_stack_.back()].children.pop_back();
+            ProductionScope expression_statement(*this, SyntaxProduction::ExpressionStatement);
+            placeholder->kind = Statement::Kind::Expression;
+            placeholder->expression = parse_expression();
+            expect(";", "after expression statement");
+        }
         return placeholder;
     }
     if (syntax_ && macro_start()) return parse_statement_replacement();
     if (const auto* definition = active_syntax(false)) {
-        if (definition->kind == SyntaxKind::Statement) return parse_statement_replacement();
+        if (definition->kind == SyntaxKind::Statement) {
+            if (!parsing_public_fragment_) return parse_statement_replacement();
+            auto placeholder = std::make_unique<Statement>();
+            placeholder->kind = Statement::Kind::Empty;
+            placeholder->location = current().location;
+            if (!parse_opaque_invocation(SyntaxKind::Statement))
+                error_here("could not recognize a bounded opaque statement invocation");
+            return placeholder;
+        }
+        ProductionScope expression_statement(*this, SyntaxProduction::ExpressionStatement);
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Expression;
         statement->location = current().location;
@@ -3043,7 +3090,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
             placeholder->kind = Expr::Kind::Integer;
             placeholder->text = "0";
             placeholder->location = current().location;
-            if (!parse_opaque_invocation(false)) {
+            if (!parse_opaque_invocation(SyntaxKind::Expression)) {
                 error_here("could not recognize a bounded opaque expression invocation");
                 if (index_ < tokens_.size() && current().kind != TokenKind::End) ++index_;
             }

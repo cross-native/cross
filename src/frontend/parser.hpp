@@ -41,7 +41,7 @@ private:
                                          const std::vector<std::string>& imports) const;
     std::optional<SyntaxParsedFragment> parse_syntax_fragment(
         SyntaxPatternElement::Kind kind, std::size_t first) const;
-    std::shared_ptr<const SyntaxNode> parse_opaque_invocation(bool item);
+    std::shared_ptr<const SyntaxNode> parse_opaque_invocation(SyntaxKind category);
     std::unique_ptr<Parser> replacement_parser(SyntaxExecution::Output output,
                                                 Diagnostics* diagnostics = nullptr) const;
     void adopt_replacement(Parser& child);
@@ -169,6 +169,8 @@ private:
     bool public_tree_failed_{};
     std::vector<ProductionEvent> production_events_;
     std::vector<std::size_t> production_stack_;
+    // Public-fragment token splitting must not move the owner's match boundary.
+    std::vector<std::size_t> public_input_indices_;
     unsigned switch_depth_{};
     std::vector<bool> switch_default_seen_;
 };

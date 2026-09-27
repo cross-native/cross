@@ -35,6 +35,20 @@ std::string_view syntax_production_name(SyntaxProduction production) {
 
 TokenSequence syntax_node_tokens(const SyntaxNode& node) {
     TokenSequence result;
+    const auto append = [&](const MetaToken& token) {
+        if (!result.empty() && token.split_source &&
+            result.back().split_source == token.split_source &&
+            result.back().origin.context == token.origin.context &&
+            result.back().split_offset + result.back().text.size() == token.split_offset) {
+            auto& prior = result.back();
+            prior.text += token.text;
+            if (prior.split_offset == 0 && prior.text.size() == prior.split_source->spelling.size()) {
+                prior.kind = prior.split_source->kind;
+                prior.text = prior.split_source->spelling;
+                prior.split_source.reset();
+            }
+        } else result.push_back(token);
+    };
     std::vector<const SyntaxNode*> pending{&node};
     while (!pending.empty()) {
         const auto* next = pending.back();
@@ -43,7 +57,7 @@ TokenSequence syntax_node_tokens(const SyntaxNode& node) {
             next->kind == SyntaxNode::Kind::Extension ||
             next->kind == SyntaxNode::Kind::Macro ||
             next->kind == SyntaxNode::Kind::Deferred) {
-            result.insert(result.end(), next->tokens.begin(), next->tokens.end());
+            for (const auto& token : next->tokens) append(token);
         } else {
             for (auto at = next->children.rbegin(); at != next->children.rend(); ++at)
                 pending.push_back(at->get());
@@ -71,7 +85,10 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node) {
         size = amount > maximum - size ? maximum : size + amount;
     };
     const auto tokens = [&](const TokenSequence& sequence) {
-        for (const auto& token : sequence) { add(128); add(token.text.size()); }
+        for (const auto& token : sequence) {
+            add(128); add(token.text.size());
+            if (token.split_source) { add(32); add(token.split_source->spelling.size()); }
+        }
     };
     std::vector<const SyntaxNode*> nodes{&node};
     std::vector<const SyntaxMatchValue*> matches;

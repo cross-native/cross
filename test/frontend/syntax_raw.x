@@ -227,6 +227,14 @@ namespace flow {
         };
     }
     syntax ParsedList : expression { prefix "parsed_list"; match "(" values:separated1(value:expr, ",") ")"; expand parsed_list; }
+    [[syntax_expander]] static $::meta::tokens generic_shape(in $::meta::syntax_match input) {
+        uptr length = $::meta::len($::meta::tokens($::syntax::node(input, "body")));
+        if (length == 8uptr || length == 12uptr) return $::quote { 23u32 };
+        return $::quote { 0u32 };
+    }
+    syntax GenericShape : expression { prefix "generic_shape"; match body:expr; expand generic_shape; }
+    syntax DropStmt : statement { prefix "drop_stmt"; match body:stmt; expand discard; }
+    syntax ExplodeStmt : statement { prefix "explode_stmt"; match body:block; expand explode; }
 }
 namespace caller {
     global u32 number = 13u32;
@@ -265,6 +273,7 @@ parsed_header [[noinline]] static RawResult header_function(in RawResult value) 
 syntax flow::DropParsed, flow::Explode;
 drop_parsed no_such_macro! { owner drops this before lookup; };
 drop_parsed explode ();
+drop_parsed unexecuted::<nested::<3u32>>;
 copy_fn [[noinline]] static RawResult copied_function(in u32 value) { return forwarded! (value) + 17u32; }
 drop_fn static u32 discarded_function(in u32 value) { no_such_macro!(); this is a foreign body; }
 namespace reopened {
@@ -354,15 +363,22 @@ namespace frozen {
     return tree ((1u32 + 2u32) + 3u32) + mutual ([1u32]);
 }
 [[noinline]] static u32 parsed_expression() {
-    syntax flow::ParsedExpr, flow::ParsedMacro, flow::ParsedList, flow::Base;
+    syntax flow::ParsedExpr, flow::ParsedMacro, flow::ParsedList, flow::Base, flow::GenericShape;
     if ((parsed_macro copied! (9u32)) != 9u32) return 0u32;
     if ((parsed base () + 3u32) != 8u32) return 0u32;
     if (parsed_list (2u32 + 3u32, 4u32 * 5u32) != 25u32) return 0u32;
+    if ((generic_shape unexecuted::<nested::<3u32>>) != 23u32) return 0u32;
+    if ((generic_shape unexecuted::<nested::<inner::<3u32>>>) != 23u32) return 0u32;
     return parsed (2u32 + 3u32) * 4u32;
 }
 [[noinline]] static u32 parsed_statements(in u32 value) {
-    syntax flow::ParsedStmt;
+    syntax flow::ParsedStmt, flow::Run, flow::DropStmt, flow::ExplodeStmt;
     u32 total = 0u32;
+    drop_stmt no_such_macro! { opaque foreign body; }
+    drop_stmt explode_stmt { deliberately not executed; }
+    parsed_stmt run { total += 0u32; }
+    parsed_stmt forwarded! { total += 0u32; }
+    parsed_stmt { copied! (total) += 0u32; }
     parsed_stmt if (value) { total += 3u32; } else { total += 5u32; }
     parsed_stmt { label next: total += 7u32; }
     parsed_stmt while (total < 10u32) ++total;
