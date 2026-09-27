@@ -140,6 +140,19 @@ int main() {
     child(item, 2, P::Initializer, 1);
     token(declaration->children[2], ";");
 
+    declaration = production(parse("const global u32 ordered = 5u32;", K::Declaration),
+                             P::Declaration, 3);
+    specifiers = child(declaration, 0, P::DeclarationSpecifiers, 3);
+    child(child(specifiers, 0, P::DeclarationSpecifier, 1), 0, P::TypeQualifier, 1);
+    token(child(specifiers, 1, P::DeclarationSpecifier, 1)->children[0], "global");
+    child(child(specifiers, 2, P::DeclarationSpecifier, 1), 0, P::TypeSpecifier, 1);
+
+    declaration = production(parse("u32 static trailing_storage;", K::Declaration),
+                             P::Declaration, 3);
+    specifiers = child(declaration, 0, P::DeclarationSpecifiers, 2);
+    child(child(specifiers, 0, P::DeclarationSpecifier, 1), 0, P::TypeSpecifier, 1);
+    token(child(specifiers, 1, P::DeclarationSpecifier, 1)->children[0], "static");
+
     declaration = production(parse("typedef u32 Word, *Pointer;", K::Declaration), P::Declaration, 3);
     specifiers = child(declaration, 0, P::DeclarationSpecifiers, 2);
     token(child(specifiers, 0, P::DeclarationSpecifier, 1)->children[0], "typedef");

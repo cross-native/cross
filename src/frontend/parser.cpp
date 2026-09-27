@@ -1084,15 +1084,27 @@ bool Parser::type_start() const {
            resolve_type_alias(peek_qualified_name()) != nullptr;
 }
 
-TypePtr Parser::parse_type(bool record_specifiers) {
+TypePtr Parser::parse_type(bool record_specifiers,
+                           std::function<bool()> storage_specifier) {
     ProductionScope specifiers(*this, record_specifiers
         ? SyntaxProduction::DeclarationSpecifiers : SyntaxProduction::None);
     bool is_const = false;
     bool is_volatile = false;
     bool is_restrict = false;
     std::optional<SourceLocation> restrict_location;
-    while (current().is("const") || current().is("volatile") || current().is("restrict")) {
+    const auto storage_start = [&] {
+        return storage_specifier &&
+            (current().is("typedef") || current().is("static") ||
+             current().is("global") || current().is("register") ||
+             current().is("stack") || current().is("inline"));
+    };
+    while (current().is("const") || current().is("volatile") ||
+           current().is("restrict") || storage_start()) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        if (storage_start()) {
+            if (!storage_specifier()) break;
+            continue;
+        }
         ProductionScope qualifier(*this, SyntaxProduction::TypeQualifier);
         if (consume("const"))
             is_const = true;
@@ -1263,10 +1275,12 @@ TypePtr Parser::parse_type(bool record_specifiers) {
         }
     }
     std::optional<std::pair<std::uint32_t, SourceLocation>> pending_address_space;
-    while (current().is("const") || current().is("volatile") || current().is("restrict") ||
-           current().is("[[")) {
+    while (current().is("const") || current().is("volatile") ||
+           current().is("restrict") || current().is("[[") || storage_start()) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
-        if (current().is("[[")) {
+        if (storage_start()) {
+            if (!storage_specifier()) break;
+        } else if (current().is("[[")) {
             // Each written attribute_specifier owns its own occurrence.
             apply_type_attributes(type, &pending_address_space);
         } else {
@@ -2014,16 +2028,23 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     Linkage linkage = Linkage::Group;
     bool linkage_seen = false;
     bool inline_hint = false;
+    const auto consume_storage = [&]() -> bool {
+        if (consume("inline")) { inline_hint = true; return true; }
+        const auto location = current().location;
+        Linkage selected;
+        if (consume("global")) selected = Linkage::Global;
+        else if (consume("static")) selected = Linkage::Static;
+        else return false;
+        if (linkage_seen && linkage != selected)
+            diagnostics_.error(location, "declaration cannot be both 'global' and 'static'");
+        linkage = selected;
+        linkage_seen = true;
+        return true;
+    };
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
     while (current().is("global") || current().is("static") || current().is("inline")) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
-        if (consume("inline")) { inline_hint = true; continue; }
-        Linkage selected;
-        if (consume("global")) selected = Linkage::Global;
-        else { consume("static"); selected = Linkage::Static; }
-        if (linkage_seen && linkage != selected) error_here("declaration cannot be both 'global' and 'static'");
-        linkage = selected;
-        linkage_seen = true;
+        (void)consume_storage();
     }
 
     if (linkage == Linkage::Global && current().is("label") &&
@@ -2059,7 +2080,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
     const auto location = current().location;
-    auto base_type = parse_type(false);
+    auto base_type = parse_type(false, consume_storage);
     specifiers.finish();
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
     unsigned ordinal = 0;
@@ -2559,14 +2580,25 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
     bool storage_register = false;
     bool storage_stack = false;
     bool storage_static = false;
+    const auto consume_storage = [&]() -> bool {
+        bool* selected = nullptr;
+        if (current().is("register")) selected = &storage_register;
+        else if (current().is("stack")) selected = &storage_stack;
+        else if (current().is("static")) selected = &storage_static;
+        if (!selected) return false;
+        const auto location = current().location;
+        ++index_;
+        if (storage_register || storage_stack || storage_static)
+            diagnostics_.error(location, "local declaration has more than one storage specifier");
+        *selected = true;
+        return true;
+    };
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
     if (current().is("register") || current().is("stack") || current().is("static")) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
-        if (consume("register")) storage_register = true;
-        else if (consume("stack")) storage_stack = true;
-        else if (consume("static")) storage_static = true;
+        (void)consume_storage();
     }
-    auto base_type = parse_type(false);
+    auto base_type = parse_type(false, consume_storage);
     specifiers.finish();
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
     auto result = std::make_unique<Statement>();

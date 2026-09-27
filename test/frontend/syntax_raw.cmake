@@ -88,6 +88,8 @@ reject(local_typedef_trailing_comma "expected typedef name|expected.*declarator"
     "global u32 entry() { typedef u32 Word,; return 0u32; }\n")
 reject(local_declarator_const "cannot write a const cell"
     "[[eval_only]] static u32 evaluate() { const u32 first = 1u32, second = 2u32; second = 3u32; return first + second; } global u32 value = evaluate();\n")
+reject(local_storage_conflict "more than one storage specifier"
+    "global u32 entry() { u32 register stack value = 1u32; return value; }\n")
 reject(parsed_constant_assignment "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad $::static_assert(1u32 = 2u32, \"not conditional\"); return 0u32; }\n")
 reject(parsed_designator_assignment "syntax-match error for active prefix"

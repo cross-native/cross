@@ -620,6 +620,12 @@ namespace frozen {
     return second;
 }
 global u32 evaluated_declaration_lists = evaluate_declaration_lists();
+u32 global reordered_storage_value = 6u32;
+[[noinline]] u32 static reordered_storage(in u32 input) {
+    const static u32 fixed = 4u32;
+    u32 register dynamic = input + fixed;
+    return dynamic + reordered_storage_value;
+}
 typedef u32 ShadowName;
 [[noinline]] static u32 alias_shadowing() {
     u32 ShadowName = 2u32;
@@ -651,6 +657,7 @@ global u32 syntax_raw_entry() {
         parsed_first != 3u32 || parsed_second != 4u32 || parsed_members() != 15u32 ||
         parsed_declaration_lists(3u32) != 19u32 || declaration_list_vlas() != 26u32 ||
         evaluated_declaration_lists != 10u32 || alias_shadowing() != 5u32 ||
+        reordered_storage(3u32) != 13u32 ||
         static_declaration_lists() != 5u32 || static_declaration_lists() != 8u32 ||
         parsed_generic<u32, 4u32>(3u32) != 7u32 ||
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||

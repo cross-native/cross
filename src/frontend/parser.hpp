@@ -6,6 +6,7 @@
 #include "frontend/lexer.hpp"
 #include "frontend/syntax.hpp"
 
+#include <functional>
 #include <optional>
 #include <limits>
 #include <string>
@@ -60,7 +61,8 @@ private:
         SyntaxProduction production = SyntaxProduction::QualifiedName);
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
-    TypePtr parse_type(bool record_specifiers = true);
+    TypePtr parse_type(bool record_specifiers = true,
+                       std::function<bool()> storage_specifier = {});
     TypePtr
     parse_declarator(TypePtr base, std::optional<std::string>& name,
                      bool parameter = false,
