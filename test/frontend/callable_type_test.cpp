@@ -104,6 +104,37 @@ int main() {
     require(isolation.records[0].members[1].type->kind == Type::Kind::Builtin);
     require(isolation.records[0].members[1].type->builtin == BuiltinType::U32);
 
+    const auto* late_generic_source = sources.add("late-generic.x", R"(
+        namespace T { typedef u16 Word; }
+        namespace Aliased {
+        typedef u8 T;
+        static T [[generic(T), noinline]] interleaved(in T value) { return value; }
+        static T trailing(in T value) [[generic(T), noinline]] { return value; }
+        [[generic(T *pointer, T)]] static T forward(in T value) { return value; }
+        static T angle<T>(in T value) { return value; }
+        T after;
+        }
+        static T::Word qualified<T>(in T value) { return 1u16; }
+    )");
+    Parser late_generic_parser(Lexer(*late_generic_source, diagnostics).lex(), diagnostics);
+    auto late_generic = late_generic_parser.parse();
+    require(diagnostics.errors() == 0 && late_generic.functions.size() == 5);
+    for (std::size_t index = 0; index < 4; ++index) {
+        const auto& declaration = *late_generic.functions[index];
+        require(!declaration.generic_parameters.empty());
+        require(declaration.return_type->kind == Type::Kind::Generic);
+        require(declaration.return_type->generic_name == "T");
+        require(declaration.parameters[0].type->kind == Type::Kind::Generic);
+    }
+    const auto& forward = *late_generic.functions[2];
+    require(forward.generic_parameters.size() == 2);
+    require(forward.generic_parameters[0].value_type->kind == Type::Kind::Pointer);
+    require(forward.generic_parameters[0].value_type->pointee->kind == Type::Kind::Generic);
+    require(late_generic.functions[4]->return_type->kind == Type::Kind::Builtin);
+    require(late_generic.functions[4]->return_type->builtin == BuiltinType::U16);
+    require(late_generic.objects[0]->type->kind == Type::Kind::Builtin);
+    require(late_generic.objects[0]->type->builtin == BuiltinType::U8);
+
     const auto* lists_source = sources.add("declaration-lists.x", R"(
         typedef u8 Word;
         namespace nested {

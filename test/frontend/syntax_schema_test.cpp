@@ -275,6 +275,25 @@ int main() {
     child(type, 1, P::AbstractDeclarator, 1);
     token(generic_parameter->children[1], "P");
 
+    definition = production(parse("static T [[generic(T), noinline]] "
+                                  "identity(in T value) { return value; }",
+                                  K::FunctionDefinition), P::FunctionDefinition, 3);
+    specifiers = child(definition, 0, P::DeclarationSpecifiers, 3);
+    auto interleaved = child(specifiers, 2, P::DeclarationSpecifier, 1);
+    child(interleaved, 0, P::AttributeSpecifier, 5);
+    definition = production(parse("static T identity(in T value) "
+                                  "[[noinline, generic(T, T *pointer)]] { return value; }",
+                                  K::FunctionDefinition), P::FunctionDefinition, 4);
+    child(definition, 2, P::AttributeSpecifier, 5);
+    header = production(parse("static T identity(in T value) [[generic(T)]]",
+                              K::FunctionHeader), P::FunctionHeader, 3);
+    child(header, 2, P::AttributeSpecifier, 3);
+    declaration = production(parse("static T identity(in T value) [[generic(T)]];",
+                                   K::FunctionDeclaration), P::Declaration, 3);
+    item = child(child(declaration, 1, P::InitDeclaratorList, 1),
+                 0, P::InitDeclarator, 2);
+    child(item, 1, P::AttributeSpecifier, 3);
+
     const auto* alias_source = sources.add("alias-schema.x",
         "namespace ns { typedef u32 Word; } ns::Word value;");
     auto alias_tokens = Lexer(*alias_source, diagnostics).lex();

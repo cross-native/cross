@@ -78,7 +78,7 @@ private:
                          angle_parameters = nullptr, bool abstract_only = false);
     std::vector<FunctionDecl::GenericParameter>
     parse_angle_generic_parameters();
-    std::vector<std::string> preview_angle_generic_types() const;
+    std::vector<std::string> preview_generic_types();
     bool consume_generic_close();
     bool known_generic_name(const Expr& name) const;
     void apply_callable_attributes(TypePtr& type,

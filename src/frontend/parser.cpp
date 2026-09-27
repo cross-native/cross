@@ -579,7 +579,8 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
             parsed.enumerations.empty() && parsed.global_labels.empty();
         if (kind == K::FunctionHeader) {
             if (!direct_function || (!child->current().is(";") &&
-                                     !child->current().is("{"))) return {};
+                                     !child->current().is("{") &&
+                                     child->current().kind != TokenKind::End)) return {};
         } else if (kind == K::FunctionDeclaration) {
             if (!direct_function || parsed.functions.front()->body) return {};
         } else if (kind == K::FunctionDefinition) {
@@ -1105,7 +1106,7 @@ bool Parser::type_start() const {
            token.is("struct") || token.is("union") ||
            builtin_kind(token.text).has_value() ||
            std::find(active_generic_types_.begin(), active_generic_types_.end(),
-                     token.text) != active_generic_types_.end() ||
+                     peek_qualified_name()) != active_generic_types_.end() ||
            resolve_type_alias(peek_qualified_name()) != nullptr;
 }
 
@@ -1357,10 +1358,11 @@ TypePtr Parser::parse_type(bool record_specifiers,
             }
         }
         const auto kind = type ? std::optional<BuiltinType>{} : builtin_kind(current().text);
-        const auto generic =
-            std::find(active_generic_types_.begin(), active_generic_types_.end(), current().text);
         const auto alias_name = type ? std::string{} : peek_qualified_name();
-        const auto alias = alias_name.empty() ? TypePtr{} : resolve_type_alias(alias_name);
+        const auto generic = std::find(active_generic_types_.begin(),
+                                       active_generic_types_.end(), alias_name);
+        const auto alias = alias_name.empty() || generic != active_generic_types_.end()
+            ? TypePtr{} : resolve_type_alias(alias_name);
         if (!type && !kind && generic == active_generic_types_.end() && !alias) {
             if (const auto message = familiar_c_spelling(current().text)) {
                 error_here(*message);
@@ -1424,37 +1426,124 @@ TypePtr Parser::parse_type(bool record_specifiers,
     return type;
 }
 
-std::vector<std::string> Parser::preview_angle_generic_types() const {
-    for (auto cursor = index_; cursor < tokens_.size(); ++cursor) {
-        if (tokens_[cursor].is(";") || tokens_[cursor].is("{") ||
-            tokens_[cursor].is("=")) break;
-        if (!tokens_[cursor].is("<") || cursor == 0 ||
-            tokens_[cursor - 1].kind != TokenKind::Identifier) continue;
-        unsigned depth = 1;
-        auto close = cursor + 1;
-        for (; close < tokens_.size(); ++close) {
-            if (tokens_[close].is("<")) ++depth;
-            else if (tokens_[close].is(">")) --depth;
-            else if (tokens_[close].is(">>")) {
-                if (depth < 2) break;
-                depth -= 2;
+std::vector<std::string> Parser::preview_generic_types() {
+    // Generic bindings cover the complete function header, even when written
+    // after the result type. Only discover bare type parameters here; normal
+    // parsing still validates the declaration and every parameter. Do not
+    // inspect a body, initializer, parameter attribute, or next declarator.
+    std::vector<std::string> result;
+    const auto execution = syntax_ && (recording_public_tree_ || replacement_)
+        ? syntax_->execution() : nullptr;
+    const auto work = [&](std::size_t at) {
+        if (!execution || execution->work(tokens_[at].location)) return true;
+        if (recording_public_tree_) public_tree_failed_ = true;
+        return false;
+    };
+    const auto closer = [](std::string_view text) -> std::string_view {
+        if (text == "(") return ")";
+        if (text == "[") return "]";
+        if (text == "{") return "}";
+        if (text == "[[") return "]]";
+        return {};
+    };
+    const auto group_end = [&](std::size_t first) -> std::optional<std::size_t> {
+        std::vector<std::string_view> closes{closer(tokens_[first].text)};
+        for (auto at = first + 1; at < tokens_.size(); ++at) {
+            if (!work(at)) return {};
+            if (tokens_[at].kind == TokenKind::End) return {};
+            if (const auto close = closer(tokens_[at].text); !close.empty()) {
+                if (execution && closes.size() >= execution->limits().depth) {
+                    execution->tree_limit_error(tokens_[at].location);
+                    if (recording_public_tree_) public_tree_failed_ = true;
+                    return {};
+                }
+                closes.push_back(close);
+            } else if (tokens_[at].is(")") || tokens_[at].is("]") ||
+                       tokens_[at].is("}") || tokens_[at].is("]]")) {
+                if (closes.back() != tokens_[at].text) return {};
+                closes.pop_back();
+                if (closes.empty()) return at;
             }
-            if (depth == 0) break;
         }
-        if (depth != 0 || close + 1 >= tokens_.size() ||
-            !tokens_[close + 1].is("(")) continue;
-        std::vector<std::string> result;
-        auto begin = cursor + 1;
-        for (auto index = begin; index <= close; ++index) {
-            if (index != close && !tokens_[index].is(",")) continue;
-            if (index == begin + 1 &&
-                tokens_[begin].kind == TokenKind::Identifier)
+        return {};
+    };
+    const auto append_types = [&](std::size_t first, std::size_t end) {
+        auto begin = first;
+        for (auto at = first; at <= end; ++at) {
+            if (at != end) {
+                if (!work(at)) return;
+                if (!closer(tokens_[at].text).empty()) {
+                    const auto close = group_end(at);
+                    if (!close || *close >= end) return;
+                    at = *close;
+                    continue;
+                }
+                if (!tokens_[at].is(",")) continue;
+            }
+            if (at == begin + 1 && tokens_[begin].kind == TokenKind::Identifier &&
+                std::find(result.begin(), result.end(), tokens_[begin].text) == result.end())
                 result.emplace_back(tokens_[begin].text);
-            begin = index + 1;
+            begin = at + 1;
         }
-        return result;
+    };
+    for (auto cursor = index_; cursor < tokens_.size(); ++cursor) {
+        if (!work(cursor)) break;
+        if (tokens_[cursor].kind == TokenKind::End || tokens_[cursor].is(";") ||
+            tokens_[cursor].is("{") || tokens_[cursor].is("=") ||
+            tokens_[cursor].is(",")) break;
+        if (tokens_[cursor].is("[[")) {
+            const auto close = group_end(cursor);
+            if (!close) break;
+            auto at = cursor + 1;
+            while (at < *close && tokens_[at].kind == TokenKind::Identifier) {
+                const auto name = at++;
+                bool qualified = false;
+                while (at + 1 < *close && tokens_[at].is("::") &&
+                       tokens_[at + 1].kind == TokenKind::Identifier) {
+                    qualified = true;
+                    at += 2;
+                }
+                if (at < *close && tokens_[at].is("(")) {
+                    const auto arguments_end = group_end(at);
+                    if (!arguments_end || *arguments_end >= *close) break;
+                    if (!qualified && tokens_[name].is("generic"))
+                        append_types(at + 1, *arguments_end);
+                    at = *arguments_end + 1;
+                }
+                if (at == *close || !tokens_[at].is(",")) break;
+                ++at;
+            }
+            cursor = *close;
+        } else if (tokens_[cursor].is("<") && cursor != 0 &&
+                   tokens_[cursor - 1].kind == TokenKind::Identifier) {
+            unsigned depth = 1;
+            auto close = cursor + 1;
+            for (; close < tokens_.size(); ++close) {
+                if (!work(close)) return result;
+                if (!closer(tokens_[close].text).empty()) {
+                    const auto end = group_end(close);
+                    if (!end) return result;
+                    close = *end;
+                } else if (tokens_[close].is("<")) ++depth;
+                else if (tokens_[close].is(">")) --depth;
+                else if (tokens_[close].is(">>")) {
+                    if (depth < 2) break;
+                    depth -= 2;
+                } else if (tokens_[close].kind == TokenKind::End ||
+                           tokens_[close].is(";") || tokens_[close].is("=")) break;
+                if (depth == 0) break;
+            }
+            if (depth != 0 || close + 1 >= tokens_.size() ||
+                !tokens_[close + 1].is("(")) break;
+            append_types(cursor + 1, close);
+            cursor = close;
+        } else if (!closer(tokens_[cursor].text).empty()) {
+            const auto close = group_end(cursor);
+            if (!close) break;
+            cursor = *close;
+        }
     }
-    return {};
+    return result;
 }
 
 std::vector<FunctionDecl::GenericParameter>
@@ -2109,6 +2198,12 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         adopt_replacement(*child);
         return;
     }
+    struct GenericTypesRestore {
+        std::vector<std::string>& value;
+        std::vector<std::string> previous;
+        ~GenericTypesRestore() { value = std::move(previous); }
+    } generic_restore{active_generic_types_, active_generic_types_};
+    active_generic_types_ = preview_generic_types();
     auto attributes = parse_attributes();
     if (current().is("$::static_assert")) {
         if (!attributes.empty()) error_here("attributes are not valid on $::static_assert");
@@ -2228,17 +2323,6 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
 
-    const auto parameters = generic_parameters(attributes);
-    const auto saved_generic_types = active_generic_types_;
-    active_generic_types_.clear();
-    for (const auto& parameter : parameters) {
-        if (!parameter.value_type) active_generic_types_.push_back(parameter.name);
-    }
-    for (const auto& name : preview_angle_generic_types()) {
-        if (std::find(active_generic_types_.begin(), active_generic_types_.end(),
-                      name) == active_generic_types_.end())
-            active_generic_types_.push_back(name);
-    }
     if (!type_start() && !current().is("[[")) {
         if (const auto message = familiar_c_spelling(current().text)) {
             error_here(*message);
@@ -2247,7 +2331,6 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                                     : "expected declaration");
         }
         synchronize_external();
-        active_generic_types_ = saved_generic_types;
         return;
     }
     const auto location = current().location;
@@ -2255,7 +2338,6 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     specifiers.finish();
     if (typedef_seen) {
         parse_typedef(name_space, std::move(attributes), std::move(base_type), location);
-        active_generic_types_ = saved_generic_types;
         return;
     }
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
@@ -2270,22 +2352,23 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         if (!type || !name) {
             if (!name) error_here("expected declaration name");
             synchronize_external();
-            active_generic_types_ = saved_generic_types;
             return;
         }
         *name = join_namespace(name_space, *name);
         last_function = type->kind == Type::Kind::Function && type->function;
         if (last_function) {
-            if (!angle_parameters.empty() || !parameters.empty())
-                known_generic_functions_.insert(*name);
-            else
-                known_ordinary_values_.insert(*name);
             auto signature = type->function;
             auto result_type = signature->result;
             auto function = parse_function(
                 location, std::move(*name), name_space, std::move(result_type),
                 linkage, inline_hint, attributes, std::move(signature),
                 std::move(angle_parameters));
+            if (function) {
+                if (!function->generic_parameters.empty())
+                    known_generic_functions_.insert(function->name);
+                else
+                    known_ordinary_values_.insert(function->name);
+            }
             if (function && (parsing_public_function_header_ || current().is("{"))) {
                 if (ordinal != 0)
                     error_here("a function definition requires a single declarator");
@@ -2306,7 +2389,6 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                     active_function_ = previous_function;
                 }
                 program.functions.push_back(std::move(function));
-                active_generic_types_ = saved_generic_types;
                 return;
             }
             if (function) program.functions.push_back(std::move(function));
@@ -2337,7 +2419,6 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     } else {
         expect(";", "after declaration");
     }
-    active_generic_types_ = saved_generic_types;
 }
 
 void Parser::parse_global_label_declaration(
@@ -2649,14 +2730,6 @@ Parser::parse_function(SourceLocation location, std::string name,
     function->linkage = linkage;
     function->inline_hint = inline_hint;
     function->attributes = std::move(attributes);
-    function->generic_parameters = generic_parameters(function->attributes);
-    if (!angle_parameters.empty()) {
-        if (!function->generic_parameters.empty())
-            diagnostics_.error(location,
-                               "angle generic parameters cannot be combined with [[generic]]");
-        else
-            function->generic_parameters = std::move(angle_parameters);
-    }
     if (signature) {
         function->parameters = signature->parameters;
         function->variadic = signature->variadic;
@@ -2712,6 +2785,14 @@ Parser::parse_function(SourceLocation location, std::string name,
     function->attributes.insert(function->attributes.end(),
                                 std::make_move_iterator(trailing.begin()),
                                 std::make_move_iterator(trailing.end()));
+    function->generic_parameters = generic_parameters(function->attributes);
+    if (!angle_parameters.empty()) {
+        if (!function->generic_parameters.empty())
+            diagnostics_.error(location,
+                               "angle generic parameters cannot be combined with [[generic]]");
+        else
+            function->generic_parameters = std::move(angle_parameters);
+    }
     // The containing declaration owns its separators or the function body.
     return function;
 }

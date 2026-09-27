@@ -77,7 +77,7 @@ enum class LoweringPass : std::uint16_t {
     ClusterSharedCompareSelects,
     SelectRematerialization,
     AllocateRegisters,
-    PreserveCallerContract,
+    PreserveBoundaryContract,
     CreateWidePhiTemporary,
     FinalizeFrame,
 };
@@ -853,12 +853,12 @@ private:
         current_.stack_slots.push_back(std::move(save));
     }
 
-    // A call may expose a broader clobber set than this function's own
-    // registered boundary permits. Preserve that difference once in the
-    // caller frame. This applies even at -O0 and when allocation is disabled,
-    // and makes arbitrary model pairs bridge correctly without ABI-name
-    // special cases.
-    void preserve_stronger_caller_contract() {
+    // Selected instructions and calls may write fixed scratch registers that
+    // this function's registered boundary preserves. Save that difference
+    // once in the frame, independently of allocation and optimization. ABI
+    // clobbers describe the externally visible contract, not the emitter's
+    // scratch choices; do not widen them to conceal a preservation violation.
+    void preserve_boundary_contract() {
         if (current_.frame.elide_incoming_saves) return;
         std::unordered_set<std::uint16_t> explicitly_preserved;
         for (const auto& slot : current_.stack_slots) {
@@ -876,9 +876,6 @@ private:
         std::unordered_set<std::uint32_t> required;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
-                if (instruction.kind != machine::InstructionKind::Call) {
-                    continue;
-                }
                 for (const auto& clobber : instruction.clobbers) {
                     if (clobber.kind !=
                         machine::RegisterKind::Physical) {
@@ -9153,9 +9150,9 @@ private:
             &MachineLowerer::select_rematerialization);
         add(LoweringPass::AllocateRegisters, Stage::RegisterAllocation,
             "allocate-registers", &MachineLowerer::allocate_registers);
-        add(LoweringPass::PreserveCallerContract,
-            Stage::RegisterAllocation, "preserve-caller-contract",
-            &MachineLowerer::preserve_stronger_caller_contract);
+        add(LoweringPass::PreserveBoundaryContract,
+            Stage::RegisterAllocation, "preserve-boundary-contract",
+            &MachineLowerer::preserve_boundary_contract);
         add(LoweringPass::CreateWidePhiTemporary,
             Stage::RegisterAllocation, "create-wide-phi-temporary",
             &MachineLowerer::create_wide_phi_temporary_if_needed);

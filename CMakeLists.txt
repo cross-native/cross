@@ -266,6 +266,24 @@ if(BUILD_TESTING)
                      -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
                      -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/generic-angle-errors
                      -P "${CMAKE_SOURCE_DIR}/test/language/generic_angle_errors.cmake")
+    foreach(profile host odd)
+        set(generic_attribute_flags
+            "--model=${CMAKE_SOURCE_DIR}/test/model/custom.y"
+            -O2 -fno-register-allocation -fno-eval-calls)
+        if(profile STREQUAL odd)
+            list(APPEND generic_attribute_flags -mabi=odd_abi)
+        endif()
+        add_test(NAME cross_runtime_generic_attribute_noalloc_${profile}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_angle_custom_abi.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-attribute-noalloc-${profile}
+                -DENTRY=generic_angle_custom_abi_entry -DEXPECTED=1
+                "-DCC_FLAGS=${generic_attribute_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    endforeach()
     add_test(NAME cross_generic_actual_floats
              COMMAND "${CMAKE_COMMAND}"
                      -DCC=$<TARGET_FILE:cross_cc>

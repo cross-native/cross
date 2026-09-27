@@ -478,6 +478,21 @@ parsed_generic [[generic(T, u32 count), noinline]] static T parsed_generic(in T 
 drop_generic [[generic(T, u32 (*callback)(in u32 value))]] static T discarded_generic(in T value) {
     return value;
 }
+namespace ReorderedGeneric {
+    typedef u8 T;
+    parsed_definition static T [[noinline, generic(T)]] interleaved(in T value) {
+        return value + 1u32;
+    }
+    parsed_prototype static T trailing(in T value) [[generic(T), noinline]];
+    parsed_definition static T trailing(in T value) [[generic(T), noinline]] {
+        return value + 2u32;
+    }
+    parsed_header static T recursive(in T value, in u32 depth) [[noinline, generic(T)]] {
+        if (depth == 0u32) return value;
+        return recursive<T>(value + 1u32, depth - 1u32);
+    }
+    T after = 5u8;
+}
 parsed_prototype static RawResult parsed_function(in RawResult value);
 parsed_definition [[noinline]] static RawResult parsed_function(in RawResult value) {
     RawResult total = 0u32;
@@ -735,6 +750,10 @@ global u32 syntax_raw_entry() {
         reordered_storage(3u32) != 13u32 || reordered_typedef(3u32) != 10u32 ||
         static_declaration_lists() != 5u32 || static_declaration_lists() != 8u32 ||
         parsed_generic<u32, 4u32>(3u32) != 7u32 ||
+        ReorderedGeneric::interleaved<u32>(300u32) != 301u32 ||
+        ReorderedGeneric::trailing(300u32) != 302u32 ||
+        ReorderedGeneric::recursive<u32>(300u32, 3u32) != 303u32 ||
+        sizeof(ReorderedGeneric::T) != 1uptr || ReorderedGeneric::after != 5u8 ||
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||
         header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||
         parsed_statements(1u32) != 10u32) return 0u32;

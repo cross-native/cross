@@ -118,6 +118,20 @@ reject(parsed_generic_named_type "syntax-match error for active prefix"
     "${expander}syntax Bad : item { prefix \"bad\"; match body:expr \";\"; expand expand; } syntax Bad; bad unknown::<u32 object>;\n")
 reject(generic_named_type "generic type argument cannot declare an object"
     "static T identity<T>(in T value) { return value; } global u32 entry() { return identity<u32 object>(1u32); }\n")
+reject(generic_attribute_duplicate "at most one 'generic' attribute"
+    "[[generic(T)]] static T duplicate(in T value) [[generic(T)]] { return value; }\n")
+reject(generic_attribute_mixed "cannot be combined"
+    "static T mixed<T>(in T value) [[generic(T)]] { return value; }\n")
+reject(generic_attribute_body_scope "expected declaration|expected.*type"
+    "static T invalid() { [[generic(T)]] u32 (*nested)(in u32 value); return 0u32; }\n")
+reject(generic_attribute_parameter_scope "expected declaration|expected.*type"
+    "static T invalid(in u32 (*nested)(in u32 value) [[generic(T)]]) { return 0u32; }\n")
+reject(generic_attribute_next_scope "expected declaration|expected.*type"
+    "static T invalid; static U valid(in U value) [[generic(U, T)]] { return value; }\n")
+reject(generic_attribute_qualified_scope "expected declaration|expected.*type"
+    "static T invalid(in T value) [[vendor::generic(T)]] { return value; }\n")
+reject(generic_attribute_escape "expected declaration|expected.*type"
+    "static T valid(in T value) [[generic(T)]] { return value; } T invalid;\n")
 reject(parsed_declaration_definition "syntax-match error for active prefix"
     "${expander}syntax Bad : item { prefix \"bad\"; match body:declaration; expand expand; } syntax Bad; bad static u32 value() { return 1u32; }\n")
 reject(parsed_definition_prototype "syntax-match error for active prefix"

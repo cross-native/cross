@@ -12,6 +12,14 @@ static T copy<T>(in T value) {
     return value;
 }
 
+static T [[noinline, generic(T)]] copy_interleaved(in T value) {
+    return value;
+}
+
+static T copy_trailing(in T value) [[generic(T), noinline]] {
+    return value;
+}
+
 static T invoke_stack<T>(
     in T (*callback)(in T value) [[abi("stack_result_abi")]],
     in T value) {
@@ -50,17 +58,23 @@ static struct generic_memory_pair make_memory_pair(in u32 value) {
     odd_callback explicit_type = copy<odd_callback>(callback);
     stack_callback stacked = copy<stack_callback>(add_eleven);
     stack_callback inferred_stack = copy(stacked);
+    stack_callback late_stack = copy_trailing(stacked);
     memory_callback memory = make_memory_pair;
     memory_callback inferred_memory = copy(memory);
+    memory_callback late_memory = copy_interleaved(memory);
     struct generic_memory_pair pair = inferred_memory(5u32);
     struct generic_memory_pair inferred_pair = invoke_memory(memory, 7u32);
+    struct generic_memory_pair late_pair = late_memory(9u32);
+    struct generic_memory_pair copied_pair = copy_trailing(late_pair);
     default_callback selected_default = add_nine;
     default_callback default_inferred = copy(selected_default);
     return inferred(34i32) == 41i32 &&
            explicit_type(35i32) == 42i32 &&
            inferred_stack(30i32) == 41i32 &&
            invoke_stack(add_eleven, 31i32) == 42i32 &&
+           late_stack(32i32) == 43i32 &&
            pair.low == 22u64 && pair.high == 28u64 &&
            inferred_pair.low == 24u64 && inferred_pair.high == 30u64 &&
+           copied_pair.low == 26u64 && copied_pair.high == 32u64 &&
            default_inferred(36i32) == 45i32 ? 1i32 : 2i32;
 }
