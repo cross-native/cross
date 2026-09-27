@@ -382,6 +382,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->known_generic_functions_ = known_generic_functions_;
     child->known_ordinary_values_ = known_ordinary_values_;
     child->local_scopes_ = local_scopes_;
+    child->local_type_scopes_ = local_type_scopes_;
     child->active_namespace_ = active_namespace_;
     child->enum_types_ = enum_types_;
     child->record_types_ = record_types_;
@@ -686,6 +687,7 @@ void Parser::adopt_replacement(Parser& child) {
     known_generic_functions_ = std::move(child.known_generic_functions_);
     known_ordinary_values_ = std::move(child.known_ordinary_values_);
     local_scopes_ = std::move(child.local_scopes_);
+    local_type_scopes_ = std::move(child.local_type_scopes_);
     enum_types_ = std::move(child.enum_types_);
     record_types_ = std::move(child.record_types_);
     type_aliases_ = std::move(child.type_aliases_);
@@ -1044,23 +1046,24 @@ std::string Parser::peek_qualified_name() const {
 }
 
 TypePtr Parser::resolve_type_alias(std::string_view name) const {
+    if (name.find("::") == std::string_view::npos) {
+        const NameKey key(name, current().location);
+        for (auto scope = local_type_scopes_.size(); scope != 0; --scope) {
+            const auto found = local_type_scopes_[scope - 1].find(key);
+            if (found != local_type_scopes_[scope - 1].end()) return found->second;
+            if (local_scopes_[scope - 1].contains(key)) return {};
+        }
+    }
     const auto find = [&](std::string_view candidate) -> TypePtr {
         const auto found = type_aliases_.find(std::string(candidate));
         return found == type_aliases_.end() ? TypePtr{} : found->second;
     };
-    if (const auto exact = find(name)) return exact;
-    if (name.find("::") != std::string_view::npos) return {};
-    auto current_namespace = active_namespace_;
-    while (!current_namespace.empty()) {
-        if (const auto local = find(join_namespace(current_namespace, name))) {
-            return local;
-        }
-        const auto separator = current_namespace.rfind("::");
-        if (separator == std::string::npos) break;
-        current_namespace.resize(separator);
-    }
-    for (const auto& imported : active_imports_) {
-        if (const auto type = find(join_namespace(imported, name))) return type;
+    const auto origin = token_origin(current().location);
+    for (const auto& candidate : namespace_candidates(NameUse(name),
+            origin.context ? origin.context->name_space : active_namespace_,
+            origin.context ? origin.context->imports : active_imports_)) {
+        if (const auto type = find(candidate)) return type;
+        if (known_ordinary_values_.contains(candidate)) return {};
     }
     return {};
 }
@@ -1773,7 +1776,7 @@ Program Parser::parse() {
 }
 
 void Parser::parse_typedef(const std::string& name_space,
-                           std::vector<Attribute> attributes) {
+                           std::vector<Attribute> attributes, bool consume_semicolon) {
     const auto location = current().location;
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
     {
@@ -1785,25 +1788,35 @@ void Parser::parse_typedef(const std::string& name_space,
         synchronize_external();
         return;
     }
-    auto type = parse_type(false);
+    auto base_type = parse_type(false);
     specifiers.finish();
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
-    ProductionScope item(*this, SyntaxProduction::InitDeclarator);
-    std::optional<std::string> name;
-    type = parse_declarator(std::move(type), name);
-    if (!type || !name) {
-        if (!name) error_here("expected typedef name");
-        synchronize_external();
-        return;
-    }
-    *name = join_namespace(name_space, *name);
-    auto trailing = parse_attributes();
-    attributes.insert(attributes.end(),
-                      std::make_move_iterator(trailing.begin()),
-                      std::make_move_iterator(trailing.end()));
-    item.finish();
+    do {
+        ProductionScope item(*this, SyntaxProduction::InitDeclarator);
+        std::optional<std::string> name;
+        auto name_location = location;
+        auto type = parse_declarator(copy_type(base_type), name, false,
+                                     nullptr, &name_location);
+        if (!type || !name) {
+            if (!name) error_here("expected typedef name");
+            synchronize_external();
+            return;
+        }
+        if (local_type_scopes_.empty()) *name = join_namespace(name_space, *name);
+        else if (name->find("::") != std::string::npos)
+            diagnostics_.error(name_location, "a local typedef name must be unqualified");
+        auto item_attributes = attributes;
+        auto trailing = parse_attributes();
+        item_attributes.insert(item_attributes.end(),
+            std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
+        register_typedef(name_location, std::move(*name), std::move(type), item_attributes);
+    } while (consume(","));
     list.finish();
-    expect(";", "after typedef declaration");
+    if (consume_semicolon) expect(";", "after typedef declaration");
+}
+
+void Parser::register_typedef(SourceLocation location, std::string name, TypePtr type,
+                              const std::vector<Attribute>& attributes) {
     apply_callable_attributes(type, attributes);
 
     const Attribute* vector_attribute = nullptr;
@@ -1875,14 +1888,30 @@ void Parser::parse_typedef(const std::string& name_space,
         }
     }
 
-    const auto found = type_aliases_.find(*name);
-    if (found != type_aliases_.end() && !same_type(found->second, type)) {
+    auto& aliases = type_aliases_;
+    if (!local_type_scopes_.empty()) {
+        const NameKey key(name, location);
+        if (local_scopes_.back().contains(key)) {
+            diagnostics_.error(location, "typedef '" + name + "' conflicts with a local value");
+            return;
+        }
+        auto& local = local_type_scopes_.back();
+        const auto found = local.find(key);
+        if (found != local.end() && !same_type(found->second, type)) {
+            diagnostics_.error(location, "typedef '" + name + "' redeclared with a different type");
+            return;
+        }
+        local[key] = std::move(type);
+        return;
+    }
+    const auto found = aliases.find(name);
+    if (found != aliases.end() && !same_type(found->second, type)) {
         diagnostics_.error(location,
-                           "typedef '" + *name +
+                           "typedef '" + name +
                                "' redeclared with a different type");
         return;
     }
-    type_aliases_[*name] = std::move(type);
+    aliases[std::move(name)] = std::move(type);
 }
 
 void Parser::parse_external(Program& program, const std::string& name_space) {
@@ -2511,7 +2540,7 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
 
 bool Parser::local_declaration_start() const {
     return current().is("register") || current().is("stack") ||
-           current().is("static") || type_start();
+           current().is("static") || current().is("typedef") || type_start();
 }
 
 std::unique_ptr<Statement>
@@ -2519,76 +2548,95 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
                                 bool consume_semicolon,
                                 SyntaxProduction production_name) {
     ProductionScope production(*this, production_name);
-    auto statement = std::make_unique<Statement>();
-    statement->kind = Statement::Kind::Declaration;
-    statement->location = current().location;
-    statement->declaration = std::make_unique<VariableDecl>();
-    auto& declaration = *statement->declaration;
-    declaration.location = current().location;
+    const auto location = current().location;
+    if (current().is("typedef")) {
+        parse_typedef({}, std::move(attributes), consume_semicolon);
+        auto statement = std::make_unique<Statement>();
+        statement->kind = Statement::Kind::Empty;
+        statement->location = location;
+        return statement;
+    }
+    bool storage_register = false;
+    bool storage_stack = false;
+    bool storage_static = false;
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
     if (current().is("register") || current().is("stack") || current().is("static")) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
-        if (consume("register")) declaration.storage_register = true;
-        else if (consume("stack")) declaration.storage_stack = true;
-        else if (consume("static")) declaration.storage_static = true;
+        if (consume("register")) storage_register = true;
+        else if (consume("stack")) storage_stack = true;
+        else if (consume("static")) storage_static = true;
     }
-    declaration.type = parse_type(false);
+    auto base_type = parse_type(false);
     specifiers.finish();
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
-    ProductionScope item(*this, SyntaxProduction::InitDeclarator);
-    std::optional<std::string> name;
-    declaration.type =
-        parse_declarator(std::move(declaration.type), name, false,
-                         &declaration.dynamic_array_bound, &declaration.location);
-    if (!name) error_here("expected local variable name");
-    else {
-        declaration.name = *name;
-        if (!local_scopes_.empty()) local_scopes_.back().insert(name_key(declaration));
-    }
-    if (current().kind == TokenKind::String) {
-        ProductionScope location_production(*this, SyntaxProduction::ObjectLocation);
-        const auto* location = consume_kind(TokenKind::String);
-        declaration.location_name = decode_string_literal(location->text);
-    }
-    auto trailing = parse_attributes();
-    attributes.insert(attributes.end(),
-                      std::make_move_iterator(trailing.begin()),
-                      std::make_move_iterator(trailing.end()));
-    declaration.attributes = std::move(attributes);
-    for (const auto& attribute : declaration.attributes) {
-        if (attribute.name != "aligned") {
-            diagnostics_.error(
-                attribute.location,
-                "attribute '" + attribute.name +
-                    "' is not valid on a local object");
-            continue;
+    auto result = std::make_unique<Statement>();
+    result->kind = Statement::Kind::DeclarationList;
+    result->location = location;
+    do {
+        ProductionScope item(*this, SyntaxProduction::InitDeclarator);
+        auto statement = std::make_unique<Statement>();
+        statement->kind = Statement::Kind::Declaration;
+        statement->location = current().location;
+        statement->declaration = std::make_unique<VariableDecl>();
+        auto& declaration = *statement->declaration;
+        declaration.location = current().location;
+        declaration.storage_register = storage_register;
+        declaration.storage_stack = storage_stack;
+        declaration.storage_static = storage_static;
+        std::optional<std::string> name;
+        declaration.type = parse_declarator(copy_type(base_type), name, false,
+            &declaration.dynamic_array_bound, &declaration.location);
+        if (!name) error_here("expected local variable name");
+        else {
+            declaration.name = *name;
+            if (!local_scopes_.empty()) {
+                const auto key = name_key(declaration);
+                if (local_type_scopes_.back().contains(key))
+                    diagnostics_.error(declaration.location,
+                        "local value '" + declaration.name + "' conflicts with a typedef");
+                local_scopes_.back().insert(key);
+            }
         }
-        // Target-dependent constants are resolved after HIR has completed
-        // nominal layouts and before this local is lowered to MIR.
-    }
-    if (consume("=")) declaration.initializer = parse_initializer();
-    if (declaration.type && declaration.type->kind == Type::Kind::Array &&
-        declaration.type->lanes == 0 && !declaration.dynamic_array_bound &&
-        declaration.initializer &&
-        declaration.initializer->kind == Expr::Kind::String &&
-        declaration.type->element &&
-        declaration.type->element->kind == Type::Kind::Builtin &&
-        declaration.type->element->builtin == BuiltinType::U8) {
-        declaration.type->lanes = static_cast<std::uint32_t>(
-            declaration.initializer->string_value.size() + 1);
-    }
-    if (declaration.type && declaration.type->kind == Type::Kind::Array &&
-        declaration.type->lanes == 0 && !declaration.dynamic_array_bound &&
-        (!declaration.initializer ||
-         declaration.initializer->kind !=
-             Expr::Kind::AggregateInitializer)) {
-        diagnostics_.error(declaration.location,
-                           "an omitted array bound requires a u8 string initializer");
-    }
-    item.finish();
+        if (current().kind == TokenKind::String) {
+            ProductionScope location_production(*this, SyntaxProduction::ObjectLocation);
+            const auto* location_token = consume_kind(TokenKind::String);
+            declaration.location_name = decode_string_literal(location_token->text);
+            if (!declaration.location_name)
+                diagnostics_.error(location_token->location, "invalid location string");
+        }
+        declaration.attributes = attributes;
+        auto trailing = parse_attributes();
+        declaration.attributes.insert(declaration.attributes.end(),
+            std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
+        for (const auto& attribute : declaration.attributes) {
+            if (attribute.name != "aligned") {
+                diagnostics_.error(attribute.location,
+                    "attribute '" + attribute.name + "' is not valid on a local object");
+            }
+            // Target-dependent constants are resolved after nominal HIR layout.
+        }
+        if (consume("=")) declaration.initializer = parse_initializer();
+        if (declaration.type && declaration.type->kind == Type::Kind::Array &&
+            declaration.type->lanes == 0 && !declaration.dynamic_array_bound &&
+            declaration.initializer && declaration.initializer->kind == Expr::Kind::String &&
+            declaration.type->element && declaration.type->element->kind == Type::Kind::Builtin &&
+            declaration.type->element->builtin == BuiltinType::U8) {
+            declaration.type->lanes = static_cast<std::uint32_t>(
+                declaration.initializer->string_value.size() + 1);
+        }
+        if (declaration.type && declaration.type->kind == Type::Kind::Array &&
+            declaration.type->lanes == 0 && !declaration.dynamic_array_bound &&
+            (!declaration.initializer ||
+             declaration.initializer->kind != Expr::Kind::AggregateInitializer)) {
+            diagnostics_.error(declaration.location,
+                               "an omitted array bound requires a u8 string initializer");
+        }
+        result->statements.push_back(std::move(statement));
+    } while (consume(","));
     list.finish();
     if (consume_semicolon) expect(";");
-    return statement;
+    if (result->statements.size() == 1) return std::move(result->statements.front());
+    return result;
 }
 
 std::unique_ptr<Statement> Parser::parse_compound() {
@@ -2597,6 +2645,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     const auto saved_scope_imports = current_scope_imports_;
     current_scope_imports_ = 0;
     local_scopes_.emplace_back();
+    local_type_scopes_.emplace_back();
     if (syntax_) syntax_->push_scope();
     if (local_scopes_.size() == 1 && active_function_)
         for (const auto& parameter : active_function_->parameters)
@@ -2636,6 +2685,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     active_imports_ = saved_imports;
     current_scope_imports_ = saved_scope_imports;
     local_scopes_.pop_back();
+    local_type_scopes_.pop_back();
     if (syntax_) syntax_->pop_scope();
     return statement;
 }
@@ -2834,6 +2884,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
     if (consume("for")) {
         statement->kind = Statement::Kind::For;
         local_scopes_.emplace_back();
+        local_type_scopes_.emplace_back();
         expect("(");
         {
             ProductionScope initializer(*this, SyntaxProduction::ForInitializer);
@@ -2874,6 +2925,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         expect(")");
         statement->second = parse_statement();
         local_scopes_.pop_back();
+        local_type_scopes_.pop_back();
         return statement;
     }
     if (consume("break")) {

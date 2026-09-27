@@ -864,6 +864,9 @@ private:
             return;
         }
         switch (statement.kind) {
+        case Statement::Kind::DeclarationList:
+            for (const auto& child : statement.statements) lower_statement(*child);
+            return;
         case Statement::Kind::Compound:
             if (inline_frames_.empty()) {
                 for (const auto& child : statement.statements) {
@@ -3283,7 +3286,8 @@ private:
 
     static void flatten_switch_body(const Statement& statement,
                                     std::vector<const Statement*>& sequence) {
-        if (statement.kind == Statement::Kind::Compound) {
+        if (statement.kind == Statement::Kind::Compound ||
+            statement.kind == Statement::Kind::DeclarationList) {
             for (const auto& child : statement.statements) {
                 flatten_switch_body(*child, sequence);
             }

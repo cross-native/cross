@@ -81,7 +81,9 @@ private:
     bool type_start() const;
     void parse_external(Program& program, const std::string& name_space);
     void parse_typedef(const std::string& name_space,
-                       std::vector<Attribute> attributes);
+                       std::vector<Attribute> attributes, bool consume_semicolon = true);
+    void register_typedef(SourceLocation location, std::string name, TypePtr type,
+                          const std::vector<Attribute>& attributes);
     void parse_enum_declaration(Program& program, const std::string& name_space,
                                 std::vector<Attribute> attributes);
     void parse_record_declaration(Program& program,
@@ -163,6 +165,7 @@ private:
     std::unordered_set<std::string> known_generic_functions_;
     std::unordered_set<std::string> known_ordinary_values_;
     std::vector<NameSet> local_scopes_;
+    std::vector<NameMap<TypePtr>> local_type_scopes_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
     struct RecordTag {

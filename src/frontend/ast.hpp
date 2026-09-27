@@ -251,11 +251,12 @@ struct VariableDecl {
 
 struct Statement {
     enum class Kind {
-        Compound, Declaration, Expression, Return, If, Switch, Case, Default,
+        Compound, DeclarationList, Declaration, Expression, Return, If, Switch, Case, Default,
         While, DoWhile, For, Break, Continue, Label, Goto, Empty,
     } kind{Kind::Empty};
     SourceLocation location;
     std::vector<std::unique_ptr<Statement>> statements;
+    // DeclarationList is ordered, like Compound, but introduces no scope.
     std::unique_ptr<VariableDecl> declaration;
     std::unique_ptr<Expr> expression;
     std::unique_ptr<Expr> condition;

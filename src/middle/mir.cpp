@@ -656,6 +656,7 @@ bool eligible_array_element_type(const TypePtr& type) {
 bool eligible_statement(const Statement& statement) {
     switch (statement.kind) {
     case Statement::Kind::Compound:
+    case Statement::Kind::DeclarationList:
         return std::all_of(statement.statements.begin(), statement.statements.end(),
                            [](const auto& child) { return eligible_statement(*child); });
     case Statement::Kind::Empty:
@@ -984,6 +985,11 @@ private:
         const Statement& statement, hir::FunctionId function,
         std::size_t scope_depth,
         std::vector<ActiveDynamicArray>& dynamic_arrays) {
+        if (statement.kind == Statement::Kind::DeclarationList) {
+            for (const auto& child : statement.statements)
+                collect_control_points(*child, function, scope_depth, dynamic_arrays);
+            return;
+        }
         if (statement.kind == Statement::Kind::Compound) {
             const auto retained = dynamic_arrays.size();
             for (const auto& child : statement.statements) {
@@ -5551,6 +5557,11 @@ private:
     void lower_statement(const Statement& statement) {
         if (failed_) return;
         switch (statement.kind) {
+        case Statement::Kind::DeclarationList:
+            for (const auto& child : statement.statements) {
+                if (current_block_) lower_statement(*child);
+            }
+            return;
         case Statement::Kind::Compound: {
             scopes_.emplace_back();
             for (const auto& child : statement.statements) {
@@ -6070,7 +6081,8 @@ private:
                 if (node.first) self(self, *node.first, false);
                 return;
             }
-            nested_control |= node.kind != Statement::Kind::Compound;
+            nested_control |= node.kind != Statement::Kind::Compound &&
+                              node.kind != Statement::Kind::DeclarationList;
             for (const auto& child : node.statements) self(self, *child, nested_control);
             if (node.first) self(self, *node.first, nested_control);
             if (node.second) self(self, *node.second, nested_control);

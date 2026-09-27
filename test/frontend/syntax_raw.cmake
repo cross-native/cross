@@ -72,6 +72,22 @@ reject(parsed_statement_incomplete "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad if (1u32) }\n")
 reject(parsed_for_initializer "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad for (u32 at = ; at < 2u32; ++at) {} return 0u32; }\n")
+reject(local_typedef_escape "expected declaration|expected.*type|unknown type"
+    "global u32 entry() { { typedef u32 Local; Local inside = 1u32; } Local outside = 2u32; return outside; }\n")
+reject(local_typedef_value_collision "conflicts with a typedef"
+    "global u32 entry() { typedef u32 Word; u32 Word = 1u32; return Word; }\n")
+reject(local_value_typedef_collision "conflicts with a local value"
+    "global u32 entry() { u32 Word = 1u32; typedef u32 Word; return Word; }\n")
+reject(local_typedef_incompatible "redeclared with a different type"
+    "global u32 entry() { typedef u32 Word; typedef u16 Word; return 0u32; }\n")
+reject(local_typedef_qualified "local typedef name must be unqualified"
+    "global u32 entry() { typedef u32 outer::Word; return 0u32; }\n")
+reject(local_declarator_trailing_comma "expected.*declarator|expected local variable name"
+    "global u32 entry() { u32 first = 1u32,; return first; }\n")
+reject(local_typedef_trailing_comma "expected typedef name|expected.*declarator"
+    "global u32 entry() { typedef u32 Word,; return 0u32; }\n")
+reject(local_declarator_const "cannot write a const cell"
+    "[[eval_only]] static u32 evaluate() { const u32 first = 1u32, second = 2u32; second = 3u32; return first + second; } global u32 value = evaluate();\n")
 reject(parsed_constant_assignment "syntax-match error for active prefix"
     "${expander}syntax Bad : statement { prefix \"bad\"; match body:stmt; expand expand; } syntax Bad; global u32 entry() { bad $::static_assert(1u32 = 2u32, \"not conditional\"); return 0u32; }\n")
 reject(parsed_designator_assignment "syntax-match error for active prefix"

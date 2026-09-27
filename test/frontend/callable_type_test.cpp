@@ -103,4 +103,44 @@ int main() {
     require(isolation.records[0].members[0].type->kind == Type::Kind::Pointer);
     require(isolation.records[0].members[1].type->kind == Type::Kind::Builtin);
     require(isolation.records[0].members[1].type->builtin == BuiltinType::U32);
+
+    const auto* lists_source = sources.add("declaration-lists.x", R"(
+        typedef u8 Word;
+        namespace nested {
+            typedef u16 Word;
+            Word namespace_value;
+            global u32 lists() {
+                typedef u32 Word, *Pointer;
+                Word first = 3u32, second = first + 4u32;
+                Pointer p = &first, q = &second;
+                { typedef u64 Word; Word inner; }
+                Word after;
+                return second;
+            }
+        }
+        Word global_value;
+        typedef u32 Scalar [[aligned(8)]], Vector [[ext_vector_type(4)]];
+        Scalar scalar;
+        Vector vector;
+    )");
+    Parser lists_parser(Lexer(*lists_source, diagnostics).lex(), diagnostics);
+    auto lists = lists_parser.parse();
+    require(diagnostics.errors() == 0);
+    require(lists.objects.size() == 4 && lists.functions.size() == 1);
+    require(lists.objects[0]->type->builtin == BuiltinType::U16);
+    require(lists.objects[1]->type->builtin == BuiltinType::U8);
+    require(lists.objects[2]->type->kind == Type::Kind::Builtin);
+    require(lists.objects[3]->type->kind == Type::Kind::Vector);
+    auto& body = *lists.functions[0]->body;
+    require(body.statements.size() == 6);
+    const auto& values = *body.statements[1];
+    require(values.kind == Statement::Kind::DeclarationList && values.statements.size() == 2);
+    require(values.statements[0]->declaration->type->builtin == BuiltinType::U32);
+    require(values.statements[1]->declaration->type->builtin == BuiltinType::U32);
+    const auto& pointers = *body.statements[2];
+    require(pointers.kind == Statement::Kind::DeclarationList && pointers.statements.size() == 2);
+    require(pointers.statements[0]->declaration->type->kind == Type::Kind::Pointer);
+    require(pointers.statements[1]->declaration->type->kind == Type::Kind::Pointer);
+    require(body.statements[3]->statements[1]->declaration->type->builtin == BuiltinType::U64);
+    require(body.statements[4]->declaration->type->builtin == BuiltinType::U32);
 }

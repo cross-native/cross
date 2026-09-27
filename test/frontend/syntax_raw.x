@@ -583,6 +583,50 @@ namespace frozen {
     value.scalar = 9u32;
     return *value.pointer + value.scalar;
 }
+[[noinline]] static u32 parsed_declaration_lists(in u32 input) {
+    syntax flow::ParsedStmt;
+    parsed_stmt typedef u32 Word, *Pointer;
+    parsed_stmt Word first = input + 1u32, second = first + 2u32;
+    parsed_stmt Pointer p = &first, q = &second;
+    *q += *p;
+    for (Word at = 0u32, limit = 2u32; at < limit; ++at) second += at;
+    { typedef u16 Word; Word inner = 7u16, next = inner + 1u16; second += next; }
+    Word after = second;
+    for (typedef u16 LoopWord; 0u32;) { LoopWord ignored; }
+    return after;
+}
+[[noinline]] static u32 static_declaration_lists() {
+    static u32 first = 1u32, second = 3u32;
+    ++first;
+    second += first;
+    return second;
+}
+[[noinline]] static u32 declaration_list_vlas() {
+    u32 bound = 1u32;
+    u32 first[++bound], second[++bound];
+    first[0] = 7u32;
+    second[0] = 11u32;
+    goto after_arrays;
+    first[0] = 99u32;
+    label after_arrays: ;
+    return (u32)(sizeof(first) / sizeof(u32) + sizeof(second) / sizeof(u32)) +
+        bound + first[0] + second[0];
+}
+[[eval_only]] static u32 evaluate_declaration_lists() {
+    typedef u32 Word, *Pointer;
+    Word first = 3u32, second = first + 4u32;
+    Pointer p = &first, q = &second;
+    *q += *p;
+    return second;
+}
+global u32 evaluated_declaration_lists = evaluate_declaration_lists();
+typedef u32 ShadowName;
+[[noinline]] static u32 alias_shadowing() {
+    u32 ShadowName = 2u32;
+    ShadowName += 3u32;
+    { typedef u16 ShadowName; ShadowName middle = 4u16; if (middle != 4u16) return 0u32; }
+    return ShadowName;
+}
 syntax flow::Width;
 global uptr syntax_width = width ();
 #ifdef CUSTOM_SYNTAX_ABI
@@ -605,6 +649,9 @@ global u32 syntax_raw_entry() {
     if (parsed_expression() != 20u32 || sizeof(CapturedType) != 4uptr) return 0u32;
     if (parsed_function(4u32) != 12u32 || parsed_state != 19u32 ||
         parsed_first != 3u32 || parsed_second != 4u32 || parsed_members() != 15u32 ||
+        parsed_declaration_lists(3u32) != 19u32 || declaration_list_vlas() != 26u32 ||
+        evaluated_declaration_lists != 10u32 || alias_shadowing() != 5u32 ||
+        static_declaration_lists() != 5u32 || static_declaration_lists() != 8u32 ||
         parsed_generic<u32, 4u32>(3u32) != 7u32 ||
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||
         header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||

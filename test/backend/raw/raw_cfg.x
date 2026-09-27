@@ -44,9 +44,7 @@ second:
 
 [[naked, link_name("raw_structured"), clobber("flags")]]
 global u64 raw_structured() -> "rax" {
-    register u64 result "rax" = 0;
-    register u64 index "rcx" = 0;
-    register u64 iteration "rdx" = 0;
+    register u64 result "rax" = 0, index "rcx" = 0, iteration "rdx" = 0;
     register i64 signed_value "r8" = 1;
 
     while (index < 8) {

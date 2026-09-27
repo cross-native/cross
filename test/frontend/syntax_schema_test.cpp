@@ -140,6 +140,13 @@ int main() {
     child(item, 2, P::Initializer, 1);
     token(declaration->children[2], ";");
 
+    declaration = production(parse("typedef u32 Word, *Pointer;", K::Declaration), P::Declaration, 3);
+    specifiers = child(declaration, 0, P::DeclarationSpecifiers, 2);
+    token(child(specifiers, 0, P::DeclarationSpecifier, 1)->children[0], "typedef");
+    list = child(declaration, 1, P::InitDeclaratorList, 3);
+    child(child(list, 0, P::InitDeclarator, 1), 0, P::Declarator, 1);
+    child(child(list, 2, P::InitDeclarator, 1), 0, P::Declarator, 2);
+
     declaration = production(parse("[[aligned(4)]] static u32 table[2] = { [1] = 3u32 };",
                                    K::Declaration), P::Declaration, 4);
     child(declaration, 0, P::AttributeSpecifier, 3);
@@ -226,6 +233,18 @@ int main() {
     item = child(child(declaration, 1, P::InitDeclaratorList, 1), 0, P::InitDeclarator, 5);
     child(item, 1, P::ObjectLocation, 1);
     child(item, 2, P::AttributeSpecifier, 3);
+
+    statement = production(parse("{ typedef u32 Word, *Pointer; "
+                                 "Word left = 3u32, right = left + 4u32; "
+                                 "Pointer p = &left, q = &right; right += *p; }", K::Statement),
+                           P::Statement, 1);
+    block = child(child(statement, 0, P::UnattributedStatement, 1), 0, P::CompoundStatement, 6);
+    for (std::size_t at = 1; at <= 3; ++at) {
+        declaration = child(child(child(block, at, P::Statement, 1),
+                                   0, P::UnattributedStatement, 1), 0, P::Declaration, 3);
+        list = child(declaration, 1, P::InitDeclaratorList, 3);
+        token(list->children[1], ",");
+    }
 
     auto expression = parse("$::embed(\"unread-asset.bin\")", K::Expr);
     auto embed = production(descendant(expression, P::EmbedExpression), P::EmbedExpression, 4);

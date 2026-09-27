@@ -2061,6 +2061,10 @@ private:
     }
 
     void rewrite_statement(Statement& statement) {
+        if (statement.kind == Statement::Kind::DeclarationList) {
+            for (auto& child : statement.statements) rewrite_statement(*child);
+            return;
+        }
         if (statement.kind == Statement::Kind::Compound) {
             scopes_.emplace_back();
             for (auto& child : statement.statements) {
@@ -6787,6 +6791,12 @@ private:
     Flow statement(const Statement& statement) {
         if (!step(statement.location)) return {Flow::Failed};
         switch (statement.kind) {
+        case Statement::Kind::DeclarationList:
+            for (const auto& child : statement.statements) {
+                auto flow = this->statement(*child);
+                if (flow.kind != Flow::Normal) return flow;
+            }
+            return {};
         case Statement::Kind::Compound: {
             scopes_.emplace_back();
             for (const auto& child : statement.statements) {
@@ -6894,7 +6904,8 @@ private:
                         labels.push_back(node);
                         return self(self, node->first.get(), false);
                     }
-                    nested |= node->kind != Statement::Kind::Compound;
+                    nested |= node->kind != Statement::Kind::Compound &&
+                              node->kind != Statement::Kind::DeclarationList;
                     for (const auto& child : node->statements)
                         if (!self(self, child.get(), nested)) return false;
                     return self(self, node->first.get(), nested) &&
@@ -6953,6 +6964,13 @@ private:
                 if (!node) return {};
                 if (node == selected_label) active = true;
                 if (active) return this->statement(*node);
+                if (node->kind == Statement::Kind::DeclarationList) {
+                    for (const auto& child : node->statements) {
+                        auto flow = self(self, child.get());
+                        if (flow.kind != Flow::Normal) return flow;
+                    }
+                    return {};
+                }
                 if (node->kind == Statement::Kind::Compound) {
                     scopes_.emplace_back();
                     Flow flow;
