@@ -130,12 +130,116 @@ struct eval_union_wrapper { u8 tag; union eval_union payload; };
 struct eval_bits { u16 a : 3; u16 b : 5; u16 c : 8; };
 struct eval_signed_bits { i16 value : 3; };
 
+[[eval_only]] static uptr meta_modifying_operators_ok() {
+    $::meta::buffer output = $::meta::alloc(6u32);
+    u16 *words = (u16 *)$::meta::data(output);
+    words[0u32] = 3u16; words[1u32] = 8u16; words[2u32] = 11u16;
+    uptr index = 0uptr;
+    words[index++] += 4u16;
+    words[0u32] *= 2u16;
+    u16 old = words[0u32]++;
+    u16 now = ++words[0u32];
+    words[0u32] >>= 1u32;
+    u16 *cursor = words;
+    u16 *before = cursor++;
+    ++cursor;
+    *cursor -= 3u16;
+    --cursor;
+    (*cursor)++;
+    cursor -= 1u32;
+    $::meta::buffer fields = $::meta::alloc(sizeof(struct eval_bits));
+    struct eval_bits *bits = (struct eval_bits *)$::meta::data(fields);
+    bits->a = 5u16;
+    u16 old_field = bits->a++;
+    bits->a += 5u16;
+    --bits->a;
+    $::meta::buffer floats = $::meta::alloc(4u32);
+    f32 *real = (f32 *)$::meta::data(floats);
+    *real = 1.5f32;
+    *real += 2.0f32;
+    f32 old_real = (*real)++;
+    return index == 1uptr && old == 14u16 && now == 16u16 &&
+           before == words && cursor == words && words[0u32] == 8u16 &&
+           words[1u32] == 9u16 && words[2u32] == 8u16 &&
+           old_field == 5u16 && bits->a == 2u16 &&
+           old_real == 3.5f32 && *real == 4.5f32;
+}
+
+[[eval_only]] static struct eval_pair changed_pair(in struct eval_pair input) {
+    input.tag = 9u8;
+    return input;
+}
+
+[[eval_only]] static uptr record_value_copy_ok() {
+    $::meta::buffer source = $::meta::alloc(sizeof(struct eval_pair));
+    struct eval_pair *first = (struct eval_pair *)$::meta::data(source);
+    first->tag = 7u8;
+    first->value = 29uptr;
+    struct eval_pair local = *first;
+    first->value = 41uptr;
+    struct eval_pair changed = changed_pair(local);
+    $::meta::buffer destination = $::meta::alloc(sizeof(struct eval_pair));
+    struct eval_pair *second = (struct eval_pair *)$::meta::data(destination);
+    *second = changed;
+    return first->value == 41uptr && local.value == 29uptr &&
+           local.tag == 7u8 && changed.tag == 9u8 &&
+           second->tag == 9u8 && second->value == 29uptr;
+}
+
+[[eval_only]] static uptr packed_record_value_ok() {
+    $::meta::buffer source = $::meta::alloc(sizeof(struct eval_packed));
+    struct eval_packed *first = (struct eval_packed *)$::meta::data(source);
+    first->tag = 7u8;
+    first->value = 29uptr;
+    struct eval_packed value = *first;
+    $::meta::buffer destination = $::meta::alloc(sizeof(struct eval_packed));
+    struct eval_packed *second = (struct eval_packed *)$::meta::data(destination);
+    *second = value;
+    return second->tag == 7u8 && second->value == 29uptr;
+}
+
+[[eval_only]] static uptr union_record_value_ok() {
+    $::meta::buffer source = $::meta::alloc(sizeof(union eval_union));
+    union eval_union *first = (union eval_union *)$::meta::data(source);
+    first->word = 0x3fc00000u32;
+    union eval_union value = *first;
+    $::meta::buffer destination = $::meta::alloc(sizeof(union eval_union));
+    union eval_union *second = (union eval_union *)$::meta::data(destination);
+    *second = value;
+    return value.real == 1.5f32 && second->real == 1.5f32;
+}
+
+[[eval_only]] static uptr bit_field_record_value_ok() {
+    struct eval_bits value;
+    value.a = 5u16;
+    value.b = 17u16;
+    value.c = 0xabu16;
+    $::meta::buffer destination = $::meta::alloc(sizeof(struct eval_bits));
+    struct eval_bits *second = (struct eval_bits *)$::meta::data(destination);
+    *second = value;
+    return second->a == 5u16 && second->b == 17u16 && second->c == 0xabu16;
+}
+
 static $::meta::bytes zero_outer_bytes() {
     $::meta::buffer output = $::meta::alloc(sizeof(struct eval_outer));
     u8 *data = $::meta::data(output);
     for (uptr index = 0uptr; index < sizeof(struct eval_outer); ++index)
         data[index] = 0u8;
     return $::meta::freeze(output, sizeof(struct eval_outer));
+}
+
+[[eval_only]] static uptr nested_record_value_ok() {
+    const struct eval_outer *initial =
+        (const struct eval_outer *)$::meta::data(zero_outer_bytes());
+    struct eval_outer value = *initial;
+    value.inner.value = 23uptr;
+    value.cells[1u32] = changed_pair(value.inner);
+    $::meta::buffer destination = $::meta::alloc(sizeof(struct eval_outer));
+    struct eval_outer *second = (struct eval_outer *)$::meta::data(destination);
+    *second = value;
+    struct eval_pair inner = second->cells[1u32];
+    return initial->inner.value == 0uptr && inner.tag == 9u8 &&
+           inner.value == 23uptr && second->inner.value == 23uptr;
 }
 
 [[eval_only]] static uptr target_record_layout_ok() {
@@ -350,6 +454,12 @@ global uptr nested_packed_record_checked = nested_packed_record_ok();
 global const u8 union_bytes[] = union_reinterpreted_bytes();
 global uptr union_member_checked = union_member_ok();
 global uptr nested_union_member_checked = nested_union_member_ok();
+global uptr record_value_copy_checked = record_value_copy_ok();
+global uptr packed_record_value_checked = packed_record_value_ok();
+global uptr union_record_value_checked = union_record_value_ok();
+global uptr bit_field_record_value_checked = bit_field_record_value_ok();
+global uptr nested_record_value_checked = nested_record_value_ok();
+global uptr meta_modifying_operators_checked = meta_modifying_operators_ok();
 global const u8 bit_fields[] = bit_field_bytes();
 global uptr bit_field_checked = bit_field_ok();
 global uptr record_array_member_checked = record_array_member_ok();

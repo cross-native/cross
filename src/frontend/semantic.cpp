@@ -2097,9 +2097,17 @@ struct EvalBuffer {
     // Each bit records initialized object representation; full-byte stores
     // set 0xff, while bit-field writes mark only the addressed field bits.
     std::vector<std::uint8_t> assigned;
-    // Zero means raw byte storage; nonzero records the scalar lvalue that
-    // established effective type for each byte of a typed write.
+    // Zero means raw byte storage; scalar tags record acquired leaf types.
+    // 0xff retains aggregate-only storage such as padding or copied unions.
     std::vector<std::uint8_t> effective_type;
+    struct TypedObject {
+        std::size_t offset{};
+        std::size_t length{};
+        TypePtr type;
+    };
+    // Whole-record stores additionally retain nominal aggregate identity;
+    // leaf tags alone cannot distinguish two records with identical fields.
+    std::vector<TypedObject> typed_objects;
     bool frozen{};
 };
 
@@ -2118,6 +2126,8 @@ struct EvalMetaPointer {
     struct BitField {
         unsigned width{};
         unsigned offset{};
+        TypePtr owner;
+        std::size_t owner_offset{};
     };
     std::optional<BitField> bit_field;
 };
@@ -2140,6 +2150,9 @@ struct EvalValue {
     // Mutable buffers are shared handles. Copying an EvalValue preserves
     // aliasing; freeze invalidates all copies through this shared state.
     std::shared_ptr<EvalBuffer> buffer;
+    // Non-scalar values own a snapshot, rather than aliasing the lvalue
+    // from which they were read. Local lvalues keep their own storage cell.
+    std::shared_ptr<EvalBuffer> object;
     std::optional<EvalMetaPointer> meta_pointer;
 
     EvalValue() = default;
@@ -2924,7 +2937,8 @@ public:
             const auto type = expression_type(expression);
             auto condition = this->expression(*expression.left);
             if (!condition || condition->pointer() || condition->tokens ||
-                condition->bytes || condition->buffer || !type) return std::nullopt;
+                condition->bytes || condition->buffer || condition->object || !type)
+                return std::nullopt;
             auto value = this->expression(*(condition->truthy()
                                           ? expression.right
                                           : expression.third));
@@ -3536,7 +3550,8 @@ private:
                  node.text == "<" || node.text == "<=" ||
                  node.text == ">" || node.text == ">=");
             if (indexing ? (!left || (left->kind != Type::Kind::Pointer &&
-                                     left->kind != Type::Kind::Array) ||
+                                     left->kind != Type::Kind::Array &&
+                                     left->kind != Type::Kind::Vector) ||
                             !right || !is_integer(right))
                          : (!pointer_operation && !meta_pointer_operation &&
                             !meta_pointer_pair &&
@@ -3650,7 +3665,8 @@ private:
             source.left->text == "$::meta::data") return true;
         if (source.kind == Expr::Kind::Name) {
             const auto* cell = lookup_mutable(source.text, source.location);
-            return cell && cell->value.meta_pointer.has_value();
+            return cell && (cell->value.meta_pointer.has_value() ||
+                            cell->value.object != nullptr);
         }
         if (source.kind == Expr::Kind::Parenthesized ||
             source.kind == Expr::Kind::Cast)
@@ -3721,6 +3737,10 @@ private:
             if (expression.text == "*" && type->kind == Type::Kind::Pointer &&
                 (pointer_resolver_ || meta_pointer_source(*expression.left)))
                 return type->pointee;
+            if (type->kind == Type::Kind::Pointer &&
+                (expression.text == "++" || expression.text == "--" ||
+                 expression.text == "post++" || expression.text == "post--") &&
+                meta_pointer_source(*expression.left)) return type;
             if (is_floating(type)) return type;
             if (!is_integer(type)) return {};
             if (expression.text == "++" || expression.text == "--" || expression.text.starts_with("post")) return type;
@@ -3751,7 +3771,9 @@ private:
             if (!conditional && expression.text == "index") {
                 const auto base = expression_type(*expression.left);
                 return base && base->kind == Type::Kind::Pointer ? base->pointee
-                    : base && base->kind == Type::Kind::Array ? base->element : nullptr;
+                    : base && (base->kind == Type::Kind::Array ||
+                               base->kind == Type::Kind::Vector)
+                        ? base->element : nullptr;
             }
             if (!conditional && (expression.text == "==" || expression.text == "!=" ||
                 expression.text == "<" || expression.text == ">" || expression.text == "<=" ||
@@ -3923,6 +3945,46 @@ private:
             value.type = clone_type(type);
             return value;
         }
+        if (value.object || type->kind == Type::Kind::Vector ||
+            type->kind == Type::Kind::Record) {
+            if (!value.object || !value.type ||
+                (value.type->kind != Type::Kind::Vector &&
+                 value.type->kind != Type::Kind::Record) ||
+                value.type->kind != type->kind) {
+                fail(location, "translation-time aggregate conversion requires a matching value");
+                return std::nullopt;
+            }
+            auto from = clone_type(value.type);
+            auto to = clone_type(type);
+            from->is_const = to->is_const = false;
+            if (!same_type(from, to) || from->scalable || to->scalable) {
+                fail(location, "translation-time aggregate conversion requires the same complete type");
+                return std::nullopt;
+            }
+            const auto size = value.object->data.size();
+            EvalValue object_pointer{UInt128{}, pointer_type(clone_type(value.type))};
+            EvalMetaPointer pointer;
+            pointer.mutable_buffer = value.object;
+            pointer.view_length = size;
+            object_pointer.meta_pointer = std::move(pointer);
+            if (!validate_meta_object_value(object_pointer, location))
+                return std::nullopt;
+            if (size > std::numeric_limits<std::size_t>::max() / 3)
+                return std::nullopt;
+            auto cost = size * 3;
+            for (const auto& object : value.object->typed_objects) {
+                const auto metadata = 24 + type_name(object.type).size();
+                if (metadata > std::numeric_limits<std::size_t>::max() - cost)
+                    return std::nullopt;
+                cost += metadata;
+            }
+            if (!charge_meta_bytes(cost, location)) return std::nullopt;
+            value.object = std::make_shared<EvalBuffer>(*value.object);
+            value.type = clone_type(type);
+            if (!stamp_meta_object_types(*value.object, value.type, 0, location))
+                return std::nullopt;
+            return value;
+        }
         if (value.meta_pointer) {
             if (type->kind != Type::Kind::Pointer) {
                 fail(location, "meta data pointers cannot convert to integer or other runtime values");
@@ -3943,7 +4005,7 @@ private:
                 type->address_space != value.type->address_space ||
                  (!explicit_cast &&
                  !compatible_pointee(value.type->pointee, type->pointee))) {
-                fail(location, "meta data pointers require a compatible scalar, fixed-array, record, or void pointer conversion without qualifier loss");
+                fail(location, "meta data pointers require a compatible scalar, fixed-array, record, fixed-vector, or void pointer conversion without qualifier loss");
                 return std::nullopt;
             }
             if (value.meta_pointer->mutable_buffer &&
@@ -4192,7 +4254,8 @@ private:
 
     static bool meta_object_type(const TypePtr& type) {
         if (meta_scalar_type(type)) return true;
-        if (type && type->kind == Type::Kind::Record)
+        if (type && (type->kind == Type::Kind::Record ||
+                     (type->kind == Type::Kind::Vector && !type->scalable)))
             return true;
         return type && type->kind == Type::Kind::Array && type->lanes != 0 &&
             meta_object_type(type->element);
@@ -4257,7 +4320,8 @@ private:
 
     std::optional<std::size_t> meta_object_size(const TypePtr& type) const {
         if (!meta_object_type(type)) return std::nullopt;
-        if (type->kind == Type::Kind::Record) {
+        if (type->kind == Type::Kind::Record ||
+            type->kind == Type::Kind::Vector) {
             if (!size_of_) return std::nullopt;
             const auto size = (*size_of_)(type);
             if (!size || *size == 0 ||
@@ -4280,7 +4344,8 @@ private:
     std::optional<std::size_t> meta_object_alignment(const TypePtr& type) const {
         if (type->kind == Type::Kind::Array)
             return meta_object_alignment(type->element);
-        if (type->kind == Type::Kind::Record) {
+        if (type->kind == Type::Kind::Record ||
+            type->kind == Type::Kind::Vector) {
             if (!align_of_) return std::nullopt;
             const auto alignment = (*align_of_)(type);
             if (!alignment || *alignment == 0 ||
@@ -4293,6 +4358,283 @@ private:
             ? std::max<std::size_t>(1, program_.evaluation_layout.f80_alignment)
             : std::max<std::size_t>(1, std::min<std::size_t>(size,
                 program_.evaluation_layout.natural_alignment_limit));
+    }
+
+    static bool same_meta_object_type(const TypePtr& left, const TypePtr& right) {
+        auto a = clone_type(left);
+        auto b = clone_type(right);
+        a->is_const = b->is_const = false;
+        return same_type(a, b);
+    }
+
+    bool meta_record_subobject(const TypePtr& owner, std::size_t offset,
+                               const TypePtr& requested, std::size_t length) const {
+        const auto size = meta_object_size(owner);
+        if (!size || offset > *size || length > *size - offset) return false;
+        if (offset == 0 && length == *size && same_meta_object_type(owner, requested))
+            return true;
+        if (owner->kind == Type::Kind::Array) {
+            const auto stride = meta_object_size(owner->element);
+            return stride && *stride != 0 &&
+                meta_record_subobject(owner->element, offset % *stride,
+                                      requested, length);
+        }
+        if (owner->kind != Type::Kind::Record || owner->is_union) return false;
+        const auto record = std::find_if(program_.records.begin(), program_.records.end(),
+            [&](const RecordDecl& candidate) {
+                return candidate.name == owner->nominal_name && candidate.complete;
+            });
+        if (record == program_.records.end()) return false;
+        for (const auto& member : record->members) {
+            if (member.name.empty() || member.bit_width) continue;
+            const auto layout = program_.evaluation_member_layout
+                ? program_.evaluation_member_layout(owner, member.name) : std::nullopt;
+            const auto member_size = meta_object_size(member.type);
+            if (layout && member_size && layout->offset <= offset &&
+                offset - layout->offset <= *member_size &&
+                length <= *member_size - (offset - layout->offset) &&
+                meta_record_subobject(member.type,
+                    offset - static_cast<std::size_t>(layout->offset),
+                    requested, length)) return true;
+        }
+        return false;
+    }
+
+    bool meta_record_effective_access(const EvalValue& base,
+                                      SourceLocation location, bool write = false) {
+        if (!base.meta_pointer || !base.meta_pointer->mutable_buffer ||
+            base.meta_pointer->union_member_view) return true;
+        const auto index = meta_access_index(base, location, write);
+        const auto size = meta_object_size(base.type->pointee);
+        if (!index || !size) return false;
+        for (const auto& object : base.meta_pointer->mutable_buffer->typed_objects) {
+            if (*index >= object.offset + object.length ||
+                object.offset >= *index + *size) continue;
+            const bool contained = *index >= object.offset &&
+                *index - object.offset <= object.length &&
+                *size <= object.length - (*index - object.offset) &&
+                meta_record_subobject(object.type, *index - object.offset,
+                                      base.type->pointee, *size);
+            const bool containing = object.offset >= *index &&
+                object.offset - *index <= *size &&
+                object.length <= *size - (object.offset - *index) &&
+                meta_record_subobject(base.type->pointee, object.offset - *index,
+                                      object.type, object.length);
+            if (!contained && !containing) {
+                fail(location, write ? "meta pointer write violates aggregate effective type"
+                                     : "meta pointer read violates aggregate effective type");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool register_meta_record(EvalBuffer& storage, std::size_t offset,
+                              const TypePtr& type, SourceLocation location) {
+        if (type->kind != Type::Kind::Record) return true;
+        const auto size = meta_object_size(type);
+        if (!size) return false;
+        for (const auto& object : storage.typed_objects)
+            if (offset >= object.offset && offset - object.offset <= object.length &&
+                *size <= object.length - (offset - object.offset)) return true;
+        // Account for logical range and type identity, not host shared_ptr size.
+        if (!charge_meta_bytes(24 + type_name(type).size(), location)) return false;
+        std::erase_if(storage.typed_objects, [&](const EvalBuffer::TypedObject& object) {
+            return object.offset >= offset && object.offset - offset <= *size &&
+                object.length <= *size - (object.offset - offset);
+        });
+        storage.typed_objects.push_back({offset, *size, clone_type(type)});
+        return true;
+    }
+
+    bool meta_bit_field_record_view(const EvalMetaPointer& pointer) const {
+        if (!pointer.bit_field || !pointer.bit_field->owner ||
+            !pointer.mutable_buffer) return false;
+        const auto& field = *pointer.bit_field;
+        const auto size = meta_object_size(field.owner);
+        if (!size) return false;
+        for (const auto& object : pointer.mutable_buffer->typed_objects)
+            if (field.owner_offset >= object.offset &&
+                field.owner_offset - object.offset <= object.length &&
+                *size <= object.length - (field.owner_offset - object.offset) &&
+                meta_record_subobject(object.type, field.owner_offset - object.offset,
+                                      field.owner, *size)) return true;
+        return false;
+    }
+
+    bool meta_object_accepts_tag_at(const TypePtr& type, std::size_t offset,
+                                    std::uint8_t tag) const {
+        const auto size = meta_object_size(type);
+        if (!size || offset >= *size) return false;
+        if (meta_scalar_type(type))
+            return tag != 0xffU && compatible_meta_type(
+                static_cast<BuiltinType>(tag - 1), type->builtin);
+        if (type->kind == Type::Kind::Array || type->kind == Type::Kind::Vector) {
+            const auto stride = meta_object_size(type->element);
+            return stride && *stride != 0 &&
+                meta_object_accepts_tag_at(type->element, offset % *stride, tag);
+        }
+        if (type->kind != Type::Kind::Record) return false;
+        if (type->is_union) return true;
+        const auto record = std::find_if(program_.records.begin(), program_.records.end(),
+            [&](const RecordDecl& candidate) {
+                return candidate.name == type->nominal_name && candidate.complete;
+            });
+        if (record == program_.records.end()) return false;
+        for (const auto& member : record->members) {
+            if (member.name.empty()) continue;
+            const auto layout = program_.evaluation_member_layout
+                ? program_.evaluation_member_layout(type, member.name) : std::nullopt;
+            const auto member_size = meta_object_size(member.type);
+            if (layout && member_size && layout->offset <= offset &&
+                offset - layout->offset < *member_size &&
+                meta_object_accepts_tag_at(member.type,
+                    offset - static_cast<std::size_t>(layout->offset), tag)) return true;
+        }
+        return tag == 0xffU; // Padding already belonging to an aggregate.
+    }
+
+    // A whole aggregate write establishes the declared leaf types. Padding
+    // and unions retain an aggregate tag rather than becoming raw storage;
+    // projected union members still have their explicit reinterpretation rule.
+    bool stamp_meta_object_types(EvalBuffer& storage, const TypePtr& type,
+                                 std::size_t offset, SourceLocation location) {
+        const auto size = meta_object_size(type);
+        if (!size || offset > storage.data.size() ||
+            *size > storage.data.size() - offset ||
+            meta_volatile_or_atomic(type)) {
+            fail(location, "meta aggregate requires supported non-volatile object members");
+            return false;
+        }
+        if (meta_scalar_type(type)) {
+            std::fill_n(storage.effective_type.begin() +
+                            static_cast<std::ptrdiff_t>(offset), *size,
+                        static_cast<std::uint8_t>(
+                            static_cast<std::uint8_t>(type->builtin) + 1));
+            return true;
+        }
+        if (type->kind == Type::Kind::Array ||
+            type->kind == Type::Kind::Vector) {
+            const auto stride = meta_object_size(type->element);
+            if (!stride) return false;
+            for (std::size_t lane = 0; lane < type->lanes; ++lane)
+                if (!stamp_meta_object_types(storage, type->element,
+                        offset + lane * *stride, location)) return false;
+            return true;
+        }
+        if (type->kind != Type::Kind::Record) return false;
+        std::fill_n(storage.effective_type.begin() +
+                        static_cast<std::ptrdiff_t>(offset), *size,
+                    static_cast<std::uint8_t>(0xffU));
+        if (type->is_union) return true;
+        const auto record = std::find_if(program_.records.begin(), program_.records.end(),
+            [&](const RecordDecl& candidate) {
+                return candidate.name == type->nominal_name && candidate.complete;
+            });
+        if (record == program_.records.end()) return false;
+        for (const auto& member : record->members) {
+            if (member.name.empty()) continue;
+            const auto layout = program_.evaluation_member_layout
+                ? program_.evaluation_member_layout(type, member.name) : std::nullopt;
+            if (!layout || layout->offset > *size ||
+                !stamp_meta_object_types(storage, member.type,
+                    offset + static_cast<std::size_t>(layout->offset), location))
+                return false;
+        }
+        return true;
+    }
+
+    bool validate_meta_object_value(const EvalValue& base,
+                                    SourceLocation location) {
+        const auto index = meta_access_index(base, location);
+        if (!index) return false;
+        const auto type = base.type->pointee;
+        if (meta_volatile_or_atomic(type)) {
+            fail(location, "volatile or atomic access is not permitted during translation-time evaluation");
+            return false;
+        }
+        if (meta_scalar_type(type))
+            return read_meta_pointer(base, location).has_value();
+        if (type->kind == Type::Kind::Record &&
+            !meta_record_effective_access(base, location)) return false;
+        // Union assignment copies its representation, including indeterminate
+        // inactive storage. A later selected-member read validates that value.
+        if (type->kind == Type::Kind::Record && type->is_union) return true;
+        const auto project = [&](const TypePtr& child, std::size_t offset,
+                                 std::size_t alignment,
+                                 std::optional<EvalMetaPointer::BitField> field = {}) {
+            EvalValue value = base;
+            value.type = pointer_type(clone_type(child));
+            auto& pointer = *value.meta_pointer;
+            pointer.view_offset = *index + offset;
+            pointer.view_length = meta_object_size(child).value_or(0);
+            pointer.position = 0;
+            pointer.access_alignment = std::min<std::size_t>(
+                base.meta_pointer->access_alignment.value_or(
+                    *meta_object_alignment(type)), alignment);
+            pointer.bit_field = field;
+            return value;
+        };
+        if (type->kind == Type::Kind::Array ||
+            type->kind == Type::Kind::Vector) {
+            const auto stride = meta_object_size(type->element);
+            const auto alignment = meta_object_alignment(type->element);
+            if (!stride || !alignment) return false;
+            if (type->kind == Type::Kind::Vector &&
+                base.meta_pointer->mutable_buffer &&
+                !base.meta_pointer->union_member_view) {
+                const auto& tags = base.meta_pointer->mutable_buffer->effective_type;
+                for (std::size_t byte = 0; byte < *meta_object_size(type); ++byte) {
+                    const auto tag = tags[*index + byte];
+                    if (tag != 0 && !compatible_meta_type(
+                            static_cast<BuiltinType>(tag - 1), type->element->builtin)) {
+                        fail(location, "meta pointer read violates effective type");
+                        return false;
+                    }
+                }
+            }
+            for (std::size_t lane = 0; lane < type->lanes; ++lane)
+                if (!validate_meta_object_value(
+                        project(type->element, lane * *stride, *alignment), location))
+                    return false;
+            return true;
+        }
+        if (type->kind != Type::Kind::Record) return false;
+        const auto record = std::find_if(program_.records.begin(), program_.records.end(),
+            [&](const RecordDecl& candidate) {
+                return candidate.name == type->nominal_name && candidate.complete;
+            });
+        if (record == program_.records.end()) return false;
+        for (const auto& member : record->members) {
+            if (member.name.empty()) continue;
+            const auto layout = program_.evaluation_member_layout
+                ? program_.evaluation_member_layout(type, member.name) : std::nullopt;
+            const auto alignment = meta_object_type(member.type)
+                ? meta_object_alignment(member.type) : std::nullopt;
+            const auto size = meta_object_size(member.type);
+            const auto record_size = meta_object_size(type);
+            if (!layout || !alignment || !size || !record_size ||
+                layout->offset > *record_size ||
+                *size > *record_size - layout->offset) {
+                fail(location, "meta aggregate requires supported complete object members");
+                return false;
+            }
+            std::optional<EvalMetaPointer::BitField> field;
+            if (layout->bit_width) {
+                if (*layout->bit_width == 0 || *layout->bit_width > *size * 8U ||
+                    layout->bit_offset > *size * 8U - *layout->bit_width) {
+                    fail(location, "meta bit-field has invalid target layout");
+                    return false;
+                }
+                field = EvalMetaPointer::BitField{*layout->bit_width,
+                    layout->bit_offset, clone_type(type), *index};
+            }
+            if (!validate_meta_object_value(project(member.type,
+                    static_cast<std::size_t>(layout->offset),
+                    std::min<std::size_t>(layout->alignment, *alignment), field),
+                    location)) return false;
+        }
+        return true;
     }
 
     bool live_meta_pointer(const EvalValue& value, SourceLocation location) {
@@ -4322,7 +4664,7 @@ private:
         if (!live_meta_pointer(value, location)) return false;
         if (!meta_object_type(value.type->pointee) ||
             !meta_object_size(value.type->pointee)) {
-            fail(location, "meta pointer arithmetic requires a supported complete scalar or fixed-array type");
+            fail(location, "meta pointer arithmetic requires a supported complete object type");
             return false;
         }
         return true;
@@ -4331,9 +4673,9 @@ private:
     std::optional<std::size_t> meta_access_index(const EvalValue& base,
                                                   SourceLocation location,
                                                   bool write = false) {
-        if (!scalar_meta_pointer(base, location)) return std::nullopt;
+        if (!sized_meta_pointer(base, location)) return std::nullopt;
         const auto& pointer = *base.meta_pointer;
-        const auto size = meta_scalar_size(base);
+        const auto size = *meta_object_size(base.type->pointee);
         if (pointer.position > pointer.view_length ||
             size > pointer.view_length - pointer.position) {
             fail(location, write ? "meta pointer write is outside its view"
@@ -4345,7 +4687,11 @@ private:
             ? pointer.access_alignment
             : meta_object_alignment(base.type->pointee);
         if (!alignment || index % *alignment != 0) {
-            fail(location, "misaligned meta pointer access for target scalar type");
+            fail(location, base.type->pointee->kind == Type::Kind::Vector
+                ? "misaligned meta pointer access for target vector type"
+                : base.type->pointee->kind == Type::Kind::Record
+                    ? "misaligned meta pointer access for target record type"
+                : "misaligned meta pointer access for target scalar type");
             return std::nullopt;
         }
         return index;
@@ -4396,6 +4742,8 @@ private:
                  "meta record member access requires a supported structure pointer");
             return std::nullopt;
         }
+        if (!meta_record_effective_access(*base, expression.location))
+            return std::nullopt;
         const auto* member = selected_record_member(expression);
         const auto layout = program_.evaluation_member_layout
             ? program_.evaluation_member_layout(base->type->pointee,
@@ -4450,7 +4798,8 @@ private:
                 return std::nullopt;
             }
             pointer.bit_field = EvalMetaPointer::BitField{
-                *layout->bit_width, layout->bit_offset};
+                *layout->bit_width, layout->bit_offset,
+                clone_type(base->type->pointee), record_offset};
         } else {
             pointer.bit_field.reset();
         }
@@ -4473,6 +4822,19 @@ private:
         while (designator->kind == Expr::Kind::Parenthesized &&
                designator->left)
             designator = designator->left.get();
+        if (designator->kind == Expr::Kind::Name) {
+            auto* cell = lookup_mutable(designator->text, designator->location);
+            if (cell && cell->value.object && cell->value.type &&
+                (cell->value.type->kind == Type::Kind::Vector ||
+                 cell->value.type->kind == Type::Kind::Record)) {
+                EvalValue value{UInt128{}, pointer_type(clone_type(cell->value.type))};
+                EvalMetaPointer pointer;
+                pointer.mutable_buffer = cell->value.object;
+                pointer.view_length = cell->value.object->data.size();
+                value.meta_pointer = std::move(pointer);
+                return value;
+            }
+        }
         if (designator->kind == Expr::Kind::Unary &&
             designator->text == "*" && designator->left)
             return this->expression(*designator->left);
@@ -4483,13 +4845,76 @@ private:
         if (designator->kind == Expr::Kind::Binary &&
             designator->text == "index" && designator->left &&
             designator->right) {
+            const auto owner = expression_type(*designator->left);
+            if (owner && owner->kind == Type::Kind::Vector)
+                return meta_vector_lane_pointer(*designator);
             auto base = this->expression(*designator->left);
             auto index = this->expression(*designator->right);
             if (!base || !index || !base->meta_pointer) return std::nullopt;
             return meta_pointer_offset(*base, *index, false,
                                        designator->location);
         }
+        auto value = this->expression(*designator);
+        if (value && value->object && value->type &&
+            (value->type->kind == Type::Kind::Vector ||
+             value->type->kind == Type::Kind::Record)) {
+            auto owner = clone_type(value->type);
+            owner->is_const = true;
+            EvalValue pointer_value{UInt128{}, pointer_type(owner)};
+            EvalMetaPointer pointer;
+            pointer.mutable_buffer = value->object;
+            pointer.view_length = value->object->data.size();
+            pointer_value.meta_pointer = std::move(pointer);
+            return pointer_value;
+        }
         return std::nullopt;
+    }
+
+    std::optional<EvalValue> meta_vector_lane_pointer(const Expr& source) {
+        if (!source.left || !source.right) return std::nullopt;
+        auto base = meta_designator_pointer(*source.left);
+        if (!base) {
+            auto value = this->expression(*source.left);
+            if (!value || !value->object || !value->type ||
+                value->type->kind != Type::Kind::Vector) return std::nullopt;
+            auto owner = clone_type(value->type);
+            owner->is_const = true;
+            base = EvalValue{UInt128{}, pointer_type(owner)};
+            EvalMetaPointer pointer;
+            pointer.mutable_buffer = value->object;
+            pointer.view_length = value->object->data.size();
+            base->meta_pointer = std::move(pointer);
+        }
+        if (!base->meta_pointer || !base->type ||
+            base->type->kind != Type::Kind::Pointer ||
+            !base->type->pointee ||
+            base->type->pointee->kind != Type::Kind::Vector) return std::nullopt;
+        const auto vector_type = base->type->pointee;
+        const auto offset = meta_access_index(*base, source.location);
+        if (!offset) return std::nullopt;
+        auto lane = this->expression(*source.right);
+        if (!lane || !is_integer(lane->type) ||
+            integer_negative(lane->integer, integer_type(lane->type)) ||
+            lane->integer.high != 0 || lane->integer.low >= vector_type->lanes) {
+            fail(source.right->location, "meta vector lane index is outside its view");
+            return std::nullopt;
+        }
+        const auto lane_size = meta_object_size(vector_type->element);
+        const auto lane_alignment = meta_object_alignment(vector_type->element);
+        if (!lane_size || !lane_alignment) return std::nullopt;
+        auto& pointer = *base->meta_pointer;
+        pointer.view_offset = *offset +
+            static_cast<std::size_t>(lane->integer.low) * *lane_size;
+        pointer.view_length = *lane_size;
+        pointer.position = 0;
+        pointer.access_alignment = std::min<std::size_t>(
+            pointer.access_alignment.value_or(*meta_object_alignment(vector_type)),
+            *lane_alignment);
+        pointer.bit_field.reset();
+        auto element = clone_type(vector_type->element);
+        element->is_const = element->is_const || vector_type->is_const;
+        base->type = pointer_type(element);
+        return base;
     }
 
     std::optional<EvalValue> meta_pointer_offset(EvalValue base,
@@ -4581,6 +5006,44 @@ private:
             base.type->pointee &&
             base.type->pointee->kind == Type::Kind::Array)
             return decay_meta_array(base, location);
+        if (base.type && base.type->kind == Type::Kind::Pointer &&
+            base.type->pointee &&
+            (base.type->pointee->kind == Type::Kind::Vector ||
+             base.type->pointee->kind == Type::Kind::Record)) {
+            const auto index = meta_access_index(base, location);
+            if (!index) return std::nullopt;
+            if (!validate_meta_object_value(base, location)) return std::nullopt;
+            const auto size = *meta_object_size(base.type->pointee);
+            const auto& pointer = *base.meta_pointer;
+            if (size > std::numeric_limits<std::size_t>::max() / 3 ||
+                !charge_meta_bytes(size * 3, location)) return std::nullopt;
+            EvalValue value{UInt128{}, clone_type(base.type->pointee)};
+            value.object = std::make_shared<EvalBuffer>();
+            value.object->data = pointer.mutable_buffer
+                ? pointer.mutable_buffer->data.substr(*index, size)
+                : pointer.immutable->substr(*index, size);
+            if (pointer.mutable_buffer) {
+                value.object->assigned.assign(
+                    pointer.mutable_buffer->assigned.begin() +
+                        static_cast<std::ptrdiff_t>(*index),
+                    pointer.mutable_buffer->assigned.begin() +
+                        static_cast<std::ptrdiff_t>(*index + size));
+                value.object->effective_type.assign(
+                    pointer.mutable_buffer->effective_type.begin() +
+                        static_cast<std::ptrdiff_t>(*index),
+                    pointer.mutable_buffer->effective_type.begin() +
+                        static_cast<std::ptrdiff_t>(*index + size));
+            } else {
+                value.object->assigned.assign(size, 0xffU);
+                value.object->effective_type.assign(size, 0);
+            }
+            if (!stamp_meta_object_types(*value.object, value.type, 0, location))
+                return std::nullopt;
+            if (!register_meta_record(*value.object, 0, value.type, location))
+                return std::nullopt;
+            return value;
+        }
+        if (!scalar_meta_pointer(base, location)) return std::nullopt;
         const auto index = meta_access_index(base, location);
         if (!index) return std::nullopt;
         const auto& pointer = *base.meta_pointer;
@@ -4610,7 +5073,8 @@ private:
                     return std::nullopt;
                 }
                 const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
-                if (!pointer.union_member_view && !pointer.bit_field &&
+                if (required != 0 && !pointer.union_member_view &&
+                    (!pointer.bit_field || !meta_bit_field_record_view(pointer)) &&
                     !byte_meta_type(access_type) && tag != 0 &&
                     !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
                                           access_type)) {
@@ -4673,7 +5137,20 @@ private:
         }
         if (expression.text == "++" || expression.text == "--" ||
             expression.text == "post++" || expression.text == "post--") {
-            if (expression.left->kind != Expr::Kind::Name) return std::nullopt;
+            if (expression.left->kind != Expr::Kind::Name) {
+                Expr assignment;
+                assignment.kind = Expr::Kind::Assign;
+                assignment.location = expression.location;
+                assignment.text = expression.text.ends_with("++") ? "+=" : "-=";
+                assignment.left = clone_expr(*expression.left);
+                assignment.right = std::make_unique<Expr>();
+                assignment.right->kind = Expr::Kind::Integer;
+                assignment.right->location = expression.location;
+                assignment.right->text = "1i32";
+                std::optional<EvalValue> previous;
+                auto value = assign(assignment, &previous);
+                return value && expression.text.starts_with("post") ? previous : value;
+            }
             auto* cell = lookup_mutable(expression.left->text, expression.left->location);
             if (!cell) return std::nullopt;
             if (cell->read_only) {
@@ -4682,6 +5159,14 @@ private:
             }
             const auto previous = lookup(*expression.left);
             if (!previous) return std::nullopt;
+            if (previous->meta_pointer) {
+                auto value = meta_pointer_offset(*previous,
+                    EvalValue{UInt128{1}, builtin_type(BuiltinType::I32)},
+                    expression.text.ends_with("--"), expression.location);
+                if (!value) return std::nullopt;
+                lookup_mutable(expression.left->text, expression.left->location)->value = *value;
+                return expression.text.starts_with("post") ? previous : value;
+            }
             if (previous->address && pointer_resolver_) {
                 auto source = std::make_unique<Expr>();
                 source->kind = Expr::Kind::Binary;
@@ -4695,7 +5180,7 @@ private:
                 return expression.text.starts_with("post") ? previous : value;
             }
             if (previous->pointer() || previous->tokens || previous->bytes ||
-                previous->buffer) return std::nullopt;
+                previous->buffer || previous->object) return std::nullopt;
             auto value = previous->floating
                 ? calculate_floating(expression.text == "++" || expression.text == "post++"
                                          ? "+" : "-", *previous,
@@ -4713,7 +5198,7 @@ private:
         }
         auto value = this->expression(*expression.left);
         if (!value || value->pointer() || value->tokens || value->bytes ||
-            value->buffer) return std::nullopt;
+            value->buffer || value->object) return std::nullopt;
         if (value->floating) {
             if (expression.text == "+") return value;
             if (expression.text == "-") {
@@ -4750,9 +5235,17 @@ private:
             return pointer ? read_meta_pointer(*pointer, expression.location)
                            : std::nullopt;
         }
+        if (expression.text == "index") {
+            const auto owner = expression_type(*expression.left);
+            if (owner && owner->kind == Type::Kind::Vector) {
+                auto pointer = meta_vector_lane_pointer(expression);
+                return pointer ? read_meta_pointer(*pointer, expression.location)
+                               : std::nullopt;
+            }
+        }
         auto left = this->expression(*expression.left);
         if (!left) return std::nullopt;
-        if (left->tokens || left->bytes || left->buffer) {
+        if (left->tokens || left->bytes || left->buffer || left->object) {
             fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
         }
@@ -4767,7 +5260,7 @@ private:
             }
             auto right = this->expression(*expression.right);
             if (!right || right->pointer() || right->tokens || right->bytes ||
-                right->buffer) return std::nullopt;
+                right->buffer || right->object) return std::nullopt;
             return EvalValue{{right->truthy(), 0},
                              builtin_type(BuiltinType::Bool)};
         }
@@ -4780,7 +5273,7 @@ private:
              expression.text == ">="))
             return compare_meta_pointers(*left, *right, expression.text,
                                          expression.location);
-        if (right->tokens || right->bytes || right->buffer) {
+        if (right->tokens || right->bytes || right->buffer || right->object) {
             fail(expression.location, "meta values do not support scalar operators");
             return std::nullopt;
         }
@@ -4826,10 +5319,19 @@ private:
             fail(expression.location, "emitted object addresses cannot be inspected during translation-time evaluation");
             return std::nullopt;
         }
-        if (left->floating || right->floating) {
-            return calculate_floating(operation, *left, *right,
-                                      expression.location);
+        return scalar_binary_values(operation, *left, *right, expression.location);
+    }
+
+    std::optional<EvalValue> scalar_binary_values(std::string_view operation,
+        const EvalValue& left, const EvalValue& right, SourceLocation location) {
+        if (left.pointer() || right.pointer() ||
+            (!is_integer(left.type) && !is_floating(left.type)) ||
+            (!is_integer(right.type) && !is_floating(right.type))) {
+            fail(location, "translation-time scalar operator requires numeric operands");
+            return std::nullopt;
         }
+        if (left.floating || right.floating)
+            return calculate_floating(operation, left, right, location);
         static constexpr std::pair<std::string_view, IntegerOperation> operations[] = {
             {"+", IntegerOperation::Add}, {"-", IntegerOperation::Subtract},
             {"*", IntegerOperation::Multiply}, {"/", IntegerOperation::Divide},
@@ -4841,11 +5343,12 @@ private:
             {">", IntegerOperation::Greater}, {">=", IntegerOperation::GreaterEqual},
         };
         for (const auto& [token, opcode] : operations)
-            if (operation == token) return calculate(opcode, *left, *right, expression.location);
+            if (operation == token) return calculate(opcode, left, right, location);
         return std::nullopt;
     }
 
-    std::optional<EvalValue> assign(const Expr& expression) {
+    std::optional<EvalValue> assign(const Expr& expression,
+                                  std::optional<EvalValue>* previous_value = nullptr) {
         if (!expression.left || !expression.right) {
             return std::nullopt;
         }
@@ -4864,22 +5367,82 @@ private:
                     "translation-time assignment requires a meta data pointer");
                 return std::nullopt;
             }
-            if (expression.text != "=" ||
-                !scalar_meta_pointer(*pointer, designator->location) ||
+            if (!sized_meta_pointer(*pointer, designator->location) ||
                 pointer->type->pointee->is_const ||
                 !pointer->meta_pointer->mutable_buffer) {
                 fail(designator->location,
-                    "meta pointer write requires mutable scalar storage and simple assignment");
+                    "meta pointer write requires mutable supported storage");
                 return std::nullopt;
             }
             const auto& target = *pointer->meta_pointer;
             const auto offset = meta_access_index(*pointer, designator->location, true);
             if (!offset) return std::nullopt;
+            std::optional<EvalValue> prior_value;
+            if (expression.text != "=") {
+                if (!scalar_meta_pointer(*pointer, designator->location)) {
+                    fail(designator->location,
+                         "meta aggregate compound assignment requires an implemented value operator");
+                    return std::nullopt;
+                }
+                prior_value = read_meta_pointer(*pointer, designator->location);
+                if (!prior_value) return std::nullopt;
+                if (previous_value) *previous_value = prior_value;
+            }
+            auto source = this->expression(*expression.right);
+            if (!source) return std::nullopt;
+            if (prior_value) {
+                source = scalar_binary_values(
+                    expression.text.substr(0, expression.text.size() - 1),
+                    *prior_value, *source, expression.location);
+                if (!source) return std::nullopt;
+            }
+            if (pointer->type->pointee->kind == Type::Kind::Record ||
+                pointer->type->pointee->kind == Type::Kind::Vector) {
+                if (pointer->type->pointee->kind == Type::Kind::Record &&
+                    !meta_record_effective_access(*pointer, designator->location, true))
+                    return std::nullopt;
+                source = convert(*source, pointer->type->pointee,
+                                 expression.right->location);
+                if (!source || !source->object) return std::nullopt;
+                const auto size = *meta_object_size(pointer->type->pointee);
+                for (std::size_t byte = 0; byte < size; ++byte) {
+                    const auto incoming = source->object->effective_type[byte];
+                    const auto previous = target.mutable_buffer->effective_type[*offset + byte];
+                    if (!target.union_member_view && incoming != 0 && previous != 0 &&
+                        incoming != previous &&
+                        (incoming == 0xffU || previous == 0xffU ||
+                         !compatible_meta_type(
+                             static_cast<BuiltinType>(previous - 1),
+                             static_cast<BuiltinType>(incoming - 1)))) {
+                        fail(designator->location,
+                             "meta pointer write violates effective type");
+                        return std::nullopt;
+                    }
+                }
+                for (std::size_t byte = 0; byte < size; ++byte) {
+                    target.mutable_buffer->data[*offset + byte] = source->object->data[byte];
+                    target.mutable_buffer->assigned[*offset + byte] = source->object->assigned[byte];
+                    target.mutable_buffer->effective_type[*offset + byte] =
+                        source->object->effective_type[byte];
+                }
+                if (!register_meta_record(*target.mutable_buffer, *offset,
+                        pointer->type->pointee, designator->location))
+                    return std::nullopt;
+                return source;
+            }
+            if (!scalar_meta_pointer(*pointer, designator->location)) return std::nullopt;
             const auto size = meta_scalar_size(*pointer);
             const auto access_type = pointer->type->pointee->builtin;
             if (!byte_meta_type(access_type) && !target.union_member_view &&
-                !target.bit_field) {
+                (!target.bit_field || !meta_bit_field_record_view(target))) {
                 for (std::size_t index = 0; index < size; ++index) {
+                    if (target.bit_field) {
+                        const auto lane = program_.evaluation_layout.byte_order ==
+                            EvaluationByteOrder::Little ? index : size - 1 - index;
+                        if ((shift_right(meta_bit_field_mask(*target.bit_field),
+                                static_cast<unsigned>(lane * 8)).low & 0xffU) == 0)
+                            continue;
+                    }
                     const auto tag = target.mutable_buffer->effective_type[*offset + index];
                     if (tag != 0 &&
                         !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
@@ -4890,14 +5453,31 @@ private:
                     }
                 }
             }
-            auto source = this->expression(*expression.right);
-            if (!source) return std::nullopt;
             source = convert(*source, builtin_type(pointer->type->pointee->builtin),
                              expression.right->location);
             if (!source) return std::nullopt;
             const auto bits = source->floating ? source->floating->bits
                                                : source->integer;
             if (target.bit_field) {
+                if (target.bit_field->owner && !target.union_member_view &&
+                    !meta_bit_field_record_view(target)) {
+                    const auto owner_size = meta_object_size(target.bit_field->owner);
+                    if (!owner_size) return std::nullopt;
+                    for (std::size_t byte = 0; byte < *owner_size; ++byte) {
+                        const auto tag = target.mutable_buffer->effective_type[
+                            target.bit_field->owner_offset + byte];
+                        if (tag != 0 && !meta_object_accepts_tag_at(
+                                target.bit_field->owner, byte, tag)) {
+                            fail(designator->location,
+                                 "meta pointer write violates aggregate effective type");
+                            return std::nullopt;
+                        }
+                    }
+                }
+                if (target.bit_field->owner &&
+                    !register_meta_record(*target.mutable_buffer,
+                        target.bit_field->owner_offset, target.bit_field->owner,
+                        designator->location)) return std::nullopt;
                 const auto field_mask = meta_bit_field_mask(*target.bit_field);
                 const auto inserted = shift_left(
                     mask_to(bits, target.bit_field->width),
@@ -4958,6 +5538,10 @@ private:
             if (!source) return std::nullopt;
             *lookup_mutable(designator->text, designator->location) = {*source, true, false};
             return source;
+        }
+        if (previous_value) {
+            *previous_value = lookup(*designator);
+            if (!*previous_value) return std::nullopt;
         }
         Expr binary_expression;
         binary_expression.kind = Expr::Kind::Binary;
@@ -5339,8 +5923,23 @@ private:
                 return {Flow::Failed};
             }
             EvalValue value{UInt128{}, clone_type(statement.declaration->type)};
+            if ((value.type->kind == Type::Kind::Vector && !value.type->scalable) ||
+                value.type->kind == Type::Kind::Record) {
+                const auto size = meta_object_size(value.type);
+                if (!size || *size > std::numeric_limits<std::size_t>::max() / 3 ||
+                    !charge_meta_bytes(*size * 3, statement.location))
+                    return {Flow::Failed};
+                value.object = std::make_shared<EvalBuffer>();
+                value.object->data.resize(*size, '\0');
+                value.object->assigned.resize(*size, 0);
+                value.object->effective_type.resize(*size, 0);
+                if (value.type->kind == Type::Kind::Record &&
+                    (!stamp_meta_object_types(*value.object, value.type, 0, statement.location) ||
+                     !register_meta_record(*value.object, 0, value.type, statement.location)))
+                    return {Flow::Failed};
+            }
             scopes_.back()[name_key(*statement.declaration)] = {
-                value, false, statement.declaration->type->is_const};
+                value, value.object != nullptr, statement.declaration->type->is_const};
             if (statement.declaration->initializer) {
                 auto initializer = expression(*statement.declaration->initializer);
                 if (!initializer) return {Flow::Failed};
@@ -5364,7 +5963,7 @@ private:
         case Statement::Kind::If: {
             auto condition = expression(*statement.condition);
             if (!condition || condition->pointer() || condition->tokens ||
-                condition->bytes || condition->buffer) return {Flow::Failed};
+                condition->bytes || condition->buffer || condition->object) return {Flow::Failed};
             if (condition->truthy()) {
                 return this->statement(*statement.first);
             }
@@ -5481,7 +6080,7 @@ private:
             while (true) {
                 auto condition = expression(*statement.condition);
                 if (!condition || condition->pointer() || condition->tokens ||
-                    condition->bytes || condition->buffer) return {Flow::Failed};
+                    condition->bytes || condition->buffer || condition->object) return {Flow::Failed};
                 if (!condition->truthy()) return {};
                 auto flow = this->statement(*statement.first);
                 if (flow.kind == Flow::Return || flow.kind == Flow::Failed) return flow;
@@ -5494,7 +6093,7 @@ private:
                 if (flow.kind == Flow::Break) return {};
                 auto condition = expression(*statement.condition);
                 if (!condition || condition->pointer() || condition->tokens ||
-                    condition->bytes || condition->buffer) return {Flow::Failed};
+                    condition->bytes || condition->buffer || condition->object) return {Flow::Failed};
                 if (!condition->truthy()) return {};
             } while (true);
         case Statement::Kind::For: {
@@ -5508,7 +6107,7 @@ private:
                 if (statement.condition) {
                     auto condition = expression(*statement.condition);
                     if (!condition || condition->pointer() || condition->tokens ||
-                        condition->bytes || condition->buffer) {
+                        condition->bytes || condition->buffer || condition->object) {
                         scopes_.pop_back();
                         return {Flow::Failed};
                     }
@@ -5835,6 +6434,9 @@ bool runtime_only(const FunctionDecl& function) {
 
 void replace_eval_value(std::unique_ptr<Expr>& expression,
                         const EvalValue& value) {
+    // Owned object representations are not scalar constants. Their eventual
+    // serializer must preserve full layout, padding, and union state.
+    if (value.object) return;
     auto replacement = std::make_unique<Expr>();
     replacement->location = expression->location;
     if (value.floating) {
@@ -6244,6 +6846,11 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                 "meta byte values cannot enter runtime expressions");
             return;
         }
+        if (value->object) {
+            diagnostics.error(expression->location,
+                "translation-time aggregate runtime materialization is not implemented");
+            return;
+        }
         replace_eval_value(expression, *value);
         return;
     }
@@ -6334,6 +6941,12 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
     if (value->bytes || value->buffer) {
         diagnostics.error(expression->location,
             "meta byte values cannot enter runtime expressions");
+        return;
+    }
+    if (value->object) {
+        if (required)
+            diagnostics.error(expression->location,
+                "translation-time aggregate runtime materialization is not implemented");
         return;
     }
     replace_eval_value(expression, *value);

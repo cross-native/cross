@@ -23,6 +23,12 @@ extern std::size_t nested_packed_record_checked;
 extern const std::uint8_t union_bytes[4];
 extern std::size_t union_member_checked;
 extern std::size_t nested_union_member_checked;
+extern std::size_t record_value_copy_checked;
+extern std::size_t packed_record_value_checked;
+extern std::size_t union_record_value_checked;
+extern std::size_t bit_field_record_value_checked;
+extern std::size_t nested_record_value_checked;
+extern std::size_t meta_modifying_operators_checked;
 extern const std::uint8_t bit_fields[2];
 extern std::size_t bit_field_checked;
 extern std::size_t record_array_member_checked;
@@ -70,6 +76,11 @@ int main() {
         target_record_layout_checked != 1 || record_member_checked != 1 ||
         packed_record_member_checked != 1 || nested_packed_record_checked != 1 ||
         union_member_checked != 1 || nested_union_member_checked != 1 ||
+        record_value_copy_checked != 1 ||
+        packed_record_value_checked != 1 || union_record_value_checked != 1 ||
+        bit_field_record_value_checked != 1 ||
+        nested_record_value_checked != 1 ||
+        meta_modifying_operators_checked != 1 ||
         bit_field_checked != 1 ||
         record_array_member_checked != 1 || nested_record_member_checked != 1 ||
         direct_nested_record_checked != 1)

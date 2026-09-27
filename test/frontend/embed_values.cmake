@@ -151,7 +151,14 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         bit_field_partial_freeze bit_field_storage_read bit_field_const_write
         record_array_overread nested_record_overread nested_record_const_write
         union_unassigned union_invalid_bool union_ordinary_alias
-        union_out_of_view union_array_overread)
+        union_out_of_view union_array_overread
+        vector_unassigned vector_lane_unassigned vector_misaligned
+        vector_effective_type vector_const_write vector_out_of_view
+        vector_lane_out_of_view record_value_unassigned record_value_alias
+        record_value_invalid_bool record_value_nominal record_value_nominal_write
+        record_value_padding_freeze record_value_scalar_alias
+        bit_field_alias bit_field_alias_write compound_unassigned
+        compound_invalid_operand pointer_increment_overflow bit_field_foreign_unit)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -172,7 +179,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const u8 *pointer = $::meta::data(value);\n"
             "pointer[0u32] = 7u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable scalar storage")
+        set(expected "meta pointer write requires mutable supported storage")
     elseif(case STREQUAL view_overread)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -364,7 +371,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const struct eval_bits *record = (const struct eval_bits *)$::meta::data(value);\n"
             "record->value = 5u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable scalar storage")
+        set(expected "meta pointer write requires mutable supported storage")
     elseif(case STREQUAL record_array_overread)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_collection));\n"
@@ -383,7 +390,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const struct eval_outer *outer = (const struct eval_outer *)$::meta::data(value);\n"
             "outer->inner.value = 7uptr;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable scalar storage")
+        set(expected "meta pointer write requires mutable supported storage")
     elseif(case STREQUAL union_unassigned)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(union eval_union));\n"
@@ -417,6 +424,147 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "union eval_union *cell = (union eval_union *)$::meta::data(value);\n"
             "return cell->bytes[4u32];")
         set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL vector_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(16u32);\n"
+            "u32x4 *vectors = (u32x4 *)$::meta::data(value);\n"
+            "u32x4 snapshot = vectors[0u32];\n"
+            "return snapshot[0u32];")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL vector_lane_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(16u32);\n"
+            "u32x4 *vectors = (u32x4 *)$::meta::data(value);\n"
+            "vectors[0u32][0u32] = 1u32;\n"
+            "return vectors[0u32][1u32];")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL vector_misaligned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(17u32);\n"
+            "u32x4 *vectors = (u32x4 *)($::meta::data(value) + 1u32);\n"
+            "return vectors[0u32][0u32];")
+        set(expected "misaligned meta pointer access for target vector type")
+    elseif(case STREQUAL vector_effective_type)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(16u32);\n"
+            "f32 *real = (f32 *)$::meta::data(value);\n"
+            "real[0u32] = 1.0f32; real[1u32] = 2.0f32;\n"
+            "real[2u32] = 3.0f32; real[3u32] = 4.0f32;\n"
+            "u32x4 *vectors = (u32x4 *)$::meta::data(value);\n"
+            "u32x4 snapshot = vectors[0u32];\n"
+            "return snapshot[0u32];")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL vector_const_write)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(16u32);\n"
+            "const u32x4 *vectors = (const u32x4 *)$::meta::data(value);\n"
+            "vectors[0u32][0u32] = 1u32;\n"
+            "return 0u32;")
+        set(expected "meta pointer write requires mutable supported storage")
+    elseif(case STREQUAL vector_out_of_view)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(15u32);\n"
+            "u32x4 *vectors = (u32x4 *)$::meta::data(value);\n"
+            "return vectors[0u32][0u32];")
+        set(expected "meta pointer read is outside its view")
+    elseif(case STREQUAL vector_lane_out_of_view)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(16u32);\n"
+            "u32x4 *vectors = (u32x4 *)$::meta::data(value);\n"
+            "uptr index = 4uptr;\n"
+            "return vectors[0u32][index];")
+        set(expected "meta vector lane index is outside its view")
+    elseif(case STREQUAL record_value_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
+            "struct eval_pair *record = (struct eval_pair *)$::meta::data(value);\n"
+            "record->tag = 7u8;\n"
+            "struct eval_pair snapshot = *record;\n"
+            "return snapshot.tag;")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL record_value_alias)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "((f32 *)$::meta::data(value))[0u32] = 1.5f32;\n"
+            "struct eval_scalar snapshot = *((struct eval_scalar *)$::meta::data(value));\n"
+            "return snapshot.value;")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL record_value_invalid_bool)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(1u32);\n"
+            "$::meta::data(value)[0u32] = 2u8;\n"
+            "struct eval_bool_record snapshot = *((struct eval_bool_record *)$::meta::data(value));\n"
+            "return snapshot.flag;")
+        set(expected "invalid bool representation")
+    elseif(case STREQUAL record_value_nominal OR case STREQUAL record_value_nominal_write)
+        string(CONCAT body
+            "struct eval_pair source; source.tag = 7u8; source.value = 29uptr;\n"
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
+            "*((struct eval_pair *)$::meta::data(value)) = source;\n"
+            "struct eval_other *wrong = (struct eval_other *)$::meta::data(value);\n")
+        if(case STREQUAL record_value_nominal)
+            string(APPEND body "return wrong->value;")
+            set(expected "meta pointer read violates aggregate effective type")
+        else()
+            string(APPEND body
+                "struct eval_other replacement; replacement.tag = 1u8; replacement.value = 2uptr;\n"
+                "*wrong = replacement; return 0u32;")
+            set(expected "meta pointer write violates aggregate effective type")
+        endif()
+    elseif(case STREQUAL record_value_padding_freeze)
+        string(CONCAT body
+            "struct eval_pair source; source.tag = 7u8; source.value = 29uptr;\n"
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
+            "*((struct eval_pair *)$::meta::data(value)) = source;\n"
+            "return $::meta::len($::meta::freeze(value, sizeof(struct eval_pair)));")
+        set(expected "freeze requires every prefix byte")
+    elseif(case STREQUAL record_value_scalar_alias)
+        string(CONCAT body
+            "$::meta::buffer source = $::meta::alloc(4u32);\n"
+            "u8 *bytes = $::meta::data(source);\n"
+            "bytes[0u32] = 0u8; bytes[1u32] = 0u8; bytes[2u32] = 0xc0u8; bytes[3u32] = 0x3fu8;\n"
+            "struct eval_scalar snapshot = *((struct eval_scalar *)bytes);\n"
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "*((struct eval_scalar *)$::meta::data(value)) = snapshot;\n"
+            "return ((f32 *)$::meta::data(value))[0u32] == 1.5f32;")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL bit_field_alias OR case STREQUAL bit_field_alias_write)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
+            "((f32 *)$::meta::data(value))[0u32] = 1.5f32;\n"
+            "struct eval_bits *record = (struct eval_bits *)$::meta::data(value);\n")
+        if(case STREQUAL bit_field_alias)
+            string(APPEND body "return record->value;")
+            set(expected "meta pointer read violates effective type")
+        else()
+            string(APPEND body "record->value = 5u32; return 0u32;")
+            set(expected "meta pointer write violates effective type")
+        endif()
+    elseif(case STREQUAL compound_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "u32 *word = (u32 *)$::meta::data(value);\n"
+            "word[0u32] += 1u32; return 0u32;")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL compound_invalid_operand)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "u32 *word = (u32 *)$::meta::data(value);\n"
+            "word[0u32] = 7u32; word[0u32] += word; return 0u32;")
+        set(expected "scalar operator requires numeric operands")
+    elseif(case STREQUAL pointer_increment_overflow)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(4u32);\n"
+            "u32 *word = (u32 *)$::meta::data(value);\n"
+            "++word; ++word; return 0u32;")
+        set(expected "meta pointer offset is outside its view")
+    elseif(case STREQUAL bit_field_foreign_unit)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bit_units));\n"
+            "((f32 *)$::meta::data(value))[1u32] = 1.5f32;\n"
+            "struct eval_bit_units *record = (struct eval_bit_units *)$::meta::data(value);\n"
+            "record->first = 5u32; return 0u32;")
+        set(expected "meta pointer write violates aggregate effective type")
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -428,19 +576,24 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
             "return 0u32;")
-        set(expected "compatible scalar, fixed-array, record, or void pointer conversion")
+        set(expected "compatible scalar, fixed-array, record, fixed-vector, or void pointer conversion")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"
         "typedef u16 (*word_row)[2];\n"
         "typedef const u16 (*const_word_row)[2];\n"
         "struct eval_pair { u8 tag; uptr value; };\n"
+        "struct eval_other { u8 tag; uptr value; };\n"
+        "struct eval_scalar { u32 value; };\n"
+        "struct eval_bool_record { bool flag; };\n"
         "struct eval_packed [[packed]] { u8 tag; uptr value; };\n"
         "struct eval_bits { u32 value : 3; };\n"
+        "struct eval_bit_units { u32 first : 3; u32 second : 32; };\n"
         "struct eval_collection { u8 tag; u16 values[2]; };\n"
         "struct eval_outer { u8 tag; struct eval_pair inner; struct eval_pair cells[2]; };\n"
         "union eval_union { u32 word; f32 real; u8 bytes[4]; };\n"
         "union eval_bool { u8 byte; bool flag; };\n"
+        "typedef u32 u32x4 [[ext_vector_type(4)]];\n"
         "[[eval_only]] static uptr bad() { ${body} }\n"
         "global uptr result = bad();\n")
     execute_process(COMMAND "${CC}" -S "${input}"
@@ -450,6 +603,18 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
     endif()
 endforeach()
+
+set(aggregate_escape "${directory}/aggregate_escape.x")
+file(WRITE "${aggregate_escape}"
+    "struct value { u32 word; };\n"
+    "[[eval_only]] static struct value make() { struct value result; result.word = 7u32; return result; }\n"
+    "global struct value escaped = make();\n")
+execute_process(COMMAND "${CC}" -S "${aggregate_escape}"
+    -o "${OUTPUT}-aggregate-escape.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "aggregate runtime materialization is not implemented")
+    message(FATAL_ERROR "aggregate result entered the scalar replacement path\n${out}\n${err}")
+endif()
 
 set(void_escape "${directory}/void_escape.x")
 file(WRITE "${void_escape}"
@@ -541,6 +706,12 @@ foreach(target mips-unknown-elf mipsel-unknown-elf
        NOT assembly MATCHES "union_bytes:\n[^\n]*[.]byte ${union_bytes}" OR
        NOT assembly MATCHES "union_member_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "nested_union_member_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "record_value_copy_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "packed_record_value_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "union_record_value_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "bit_field_record_value_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "nested_record_value_checked:\n[^\n]*${success_directive}" OR
+       NOT assembly MATCHES "meta_modifying_operators_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "bit_fields:\n[^\n]*[.]byte ${bit_field_bytes}" OR
        NOT assembly MATCHES "bit_field_checked:\n[^\n]*${success_directive}" OR
        NOT assembly MATCHES "record_array_member_checked:\n[^\n]*${success_directive}" OR
