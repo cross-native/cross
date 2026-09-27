@@ -2642,6 +2642,9 @@ public:
 
     bool charge_input_match(const SyntaxMatchValue& match, SourceLocation location) {
         if (!charge_meta_bytes(128, location) || !charge_input_tokens(match.input, location)) return false;
+        if (match.variant && !charge_meta_bytes(32 + match.variant->size(), location)) return false;
+        for (const auto& label : match.variant_labels)
+            if (!charge_meta_bytes(32 + label.size(), location)) return false;
         for (const auto& field : match.fields) {
             if (!charge_meta_bytes(64 + field.name.size(), location) ||
                 !charge_input_tokens(field.tokens, location)) return false;
@@ -3348,7 +3351,8 @@ private:
             const auto& name = node.left->text;
             if (name.starts_with("$::syntax::")) {
                 const auto count = name == "$::syntax::input" ? 1U
-                    : name == "$::syntax::capture" || name == "$::syntax::count" ? 2U
+                    : name == "$::syntax::capture" || name == "$::syntax::count" ||
+                      name == "$::syntax::is_variant" ? 2U
                     : name == "$::syntax::at" ? 3U : 0U;
                 if (!procedural_ || count == 0 || node.arguments.size() != count) {
                     fail(node.location, "unsupported syntax operation or invalid argument count: " + name);
@@ -3952,6 +3956,8 @@ private:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
             if (procedural_ && expression.left->text == "$::syntax::at") return syntax_match_type();
             if (procedural_ && expression.left->text == "$::syntax::count") return builtin_type(BuiltinType::Uptr);
+            if (procedural_ && expression.left->text == "$::syntax::is_variant")
+                return builtin_type(BuiltinType::Bool);
             if (procedural_ && (expression.left->text == "$::syntax::input" ||
                 expression.left->text == "$::syntax::capture")) return tokens_type();
             if (expression.left->text == "$::embed") return bytes_type();
@@ -6166,7 +6172,8 @@ private:
         if (expression.left->text.starts_with("$::syntax::")) {
             const auto& name = expression.left->text;
             const auto count = name == "$::syntax::input" ? 1U
-                : name == "$::syntax::capture" || name == "$::syntax::count" ? 2U
+                : name == "$::syntax::capture" || name == "$::syntax::count" ||
+                  name == "$::syntax::is_variant" ? 2U
                 : name == "$::syntax::at" ? 3U : 0U;
             if (!procedural_ || count == 0 || expression.arguments.size() != count) {
                 fail(expression.location, "unsupported syntax operation or invalid argument count: " + name);
@@ -6193,6 +6200,17 @@ private:
             }
             const auto written = std::string_view(*field->string).substr(field->offset,
                 field->string->size() - field->offset - 1);
+            if (name == "$::syntax::is_variant") {
+                if (!match->syntax_match->variant ||
+                    std::find(match->syntax_match->variant_labels.begin(),
+                              match->syntax_match->variant_labels.end(), written) ==
+                        match->syntax_match->variant_labels.end()) {
+                    fail(expression.location, "syntax choice has no variant named '" + std::string(written) + "'");
+                    return std::nullopt;
+                }
+                return EvalValue{UInt128{*match->syntax_match->variant == written ? 1U : 0U},
+                                 builtin_type(BuiltinType::Bool)};
+            }
             const auto found = std::find_if(match->syntax_match->fields.begin(), match->syntax_match->fields.end(),
                 [&](const SyntaxMatchValue::Field& candidate) { return candidate.name == written; });
             if (found == match->syntax_match->fields.end()) {
@@ -6200,7 +6218,7 @@ private:
                 return std::nullopt;
             }
             if (name == "$::syntax::capture") {
-                if (!found->records.empty()) {
+                if (found->nested) {
                     fail(expression.location, "syntax capture requires a primitive token field");
                     return std::nullopt;
                 }
@@ -6208,7 +6226,7 @@ private:
                 if (!append_tokens(output, found->tokens, expression.location)) return std::nullopt;
                 return token_value(std::move(output));
             }
-            if (found->records.empty()) {
+            if (!found->nested) {
                 fail(expression.location, "syntax count/at requires a nested record field");
                 return std::nullopt;
             }

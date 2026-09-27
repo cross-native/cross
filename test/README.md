@@ -5,7 +5,7 @@
 - `language/` covers target-independent source-language behavior.
 - `frontend/` covers preprocessing, diagnostics, procedural expansion, and
   lexically activated raw-capture syntax, including opaque function bodies
-  behind validated direct core headers.
+  behind validated direct core headers and nonrecursive pattern combinators.
 - `middle/` covers semantic expansion, evaluation, patch values, MIR,
   optimization flags, inlining, local DSE, conservative IPA purity, and
   surviving-call specialization.

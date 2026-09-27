@@ -19,9 +19,12 @@ struct SyntaxMatchValue {
         std::string name;
         TokenSequence tokens;
         std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
+        bool nested{};
     };
     TokenSequence input;
     std::vector<Field> fields;
+    std::optional<std::string> variant;
+    std::vector<std::string> variant_labels;
 };
 
 using SyntaxEntityId = SyntaxContext::EntityId;
@@ -35,10 +38,17 @@ struct SyntaxActivation {
 };
 struct SyntaxPatternElement {
     enum class Kind { Terminal, Ident, Name, Literal, Paren, Bracket, Block, Group,
-                      TokensUntil, FunctionRaw, Rule } kind;
+                      TokensUntil, FunctionRaw, Rule, Optional, Repeat0, Repeat1,
+                      Separated0, Separated1, Choice } kind;
+    struct Alternative {
+        std::string label;
+        std::vector<SyntaxPatternElement> pattern;
+    };
     std::string field;
     MetaToken terminal;
     std::string rule_name;
+    std::vector<SyntaxPatternElement> pattern;
+    std::vector<Alternative> alternatives;
     SourceLocation location;
     std::optional<SyntaxEntityId> resolved_rule{};
 };

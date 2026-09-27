@@ -66,6 +66,36 @@ reject(function_raw_header "expected ';' or function body"
     "[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; } syntax Fn : item { prefix \"fn\"; match body:function; expand drop; } syntax Fn; fn static u32 bad(in u32 value) alien { foreign words; }\n")
 reject(function_raw_direct "requires a direct core function header"
     "[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; } syntax Fn : item { prefix \"fn\"; match body:function_raw; expand drop; } syntax Fn; fn struct Record { u32 value; }\n")
+reject(nullable_repeat "repetition body may be nullable"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match parts:repeat0(item:optional(value:literal)); expand expand; }\n")
+reject(nullable_optional "optional/repetition body may be nullable"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match part:optional(inner:optional(\"x\")); expand expand; }\n")
+reject(nullable_rule_repeat "repetition body may be nullable"
+    "${expander}syntax Empty : rule { match item:optional(value:literal); } syntax Bad : expression { prefix \"bad\"; match parts:repeat0(rule(Empty)); expand expand; } syntax Bad;\n")
+reject(repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(\"x\") \"x\" \")\"; expand expand; }\n")
+reject(separated_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:separated0(number:literal, \",\") \",\" \")\"; expand expand; }\n")
+reject(rule_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax X : rule { match \"x\"; } syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(rule(X)) \"x\" \")\"; expand expand; } syntax Bad;\n")
+reject(nullable_choice "choice alternative must consume input"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match branch:choice(empty:(value:optional(\"x\")) | value:(\"y\")); expand expand; }\n")
+reject(choice_duplicate "duplicate choice alternative label"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match branch:choice(one:(\"x\") | one:(\"y\")); expand expand; }\n")
+reject(choice_ambiguous "ambiguous syntax invocation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" branch:choice(one:(\"x\") | two:(\"x\")) \")\"; expand expand; } syntax Bad; global u32 entry() { return bad (x); }\n")
+reject(optional_ambiguous "ambiguous syntax invocation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match maybe:optional(\"x\"); expand expand; } syntax Bad; global u32 entry() { return bad x; }\n")
+reject(separated_trailing "malformed syntax item after committed separator"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" values:separated0(number:literal, \",\") \")\"; expand expand; } syntax Bad; global u32 entry() { return bad (1u32,); }\n")
+reject(malformed_repeat "malformed syntax repetition after committed start"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(\"x\" \"y\") \")\"; expand expand; } syntax Bad; global u32 entry() { return bad (x z); }\n")
+reject(repeat_one_empty "syntax-match error for active prefix"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat1(\"x\") \")\"; expand expand; } syntax Bad; global u32 entry() { return bad (); }\n")
+reject(separated_one_empty "syntax-match error for active prefix"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:separated1(value:literal, \",\") \")\"; expand expand; } syntax Bad; global u32 entry() { return bad (); }\n")
+reject(choice_bad_label "syntax choice has no variant named"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax_match branch = $::syntax::at(input, \"branch\", 0uptr); if ($::syntax::is_variant(branch, \"missing\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match \"(\" branch:choice(one:(\"x\") | two:(\"y\")) \")\"; expand expand; } syntax Bad; global u32 entry() { return bad (x); }\n")
 reject(missing_expander "syntax expander is not visible"
     "${definition}syntax Value;\n")
 reject(forward_expander "syntax expander is not visible"

@@ -226,6 +226,7 @@ void print_builtins(const CompilerOptions& options) {
                  "$::syntax::capture translation intrinsic\n"
                  "$::syntax::count translation intrinsic\n"
                  "$::syntax::at translation intrinsic\n"
+                 "$::syntax::is_variant translation intrinsic\n"
                  "$::atomic_load atomic intrinsic\n"
                  "$::atomic_store atomic intrinsic\n"
                  "$::atomic_exchange atomic intrinsic\n"

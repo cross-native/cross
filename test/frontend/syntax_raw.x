@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture)
+#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant)
 #error implemented syntax operations must be discoverable
 #endif
 #if $::has_feature($::feature::syntax_extensions)
@@ -76,6 +76,50 @@ namespace flow {
         return $::quote { 3u32 > 2u32 ? 9u32 : 0u32 };
     }
     syntax Greater : expression { prefix "greater"; match body:paren; expand greater; }
+    [[syntax_expander]] static $::meta::tokens maybe_value(in $::meta::syntax_match input) {
+        if ($::syntax::count(input, "value") == 0uptr) return $::quote { 10u32 };
+        $::meta::syntax_match child = $::syntax::at(input, "value", 0uptr);
+        return $::syntax::capture(child, "number");
+    }
+    syntax Maybe : expression {
+        prefix "maybe"; match "(" value:optional(number:literal) ")"; expand maybe_value;
+    }
+    [[syntax_expander]] static $::meta::tokens list_sum(in $::meta::syntax_match input) {
+        if ($::syntax::count(input, "values") == 0uptr) return $::quote { 0u32 };
+        $::meta::syntax_match first = $::syntax::at(input, "values", 0uptr);
+        if ($::syntax::count(input, "values") == 1uptr) return $::syntax::capture(first, "number");
+        $::meta::syntax_match second = $::syntax::at(input, "values", 1uptr);
+        return $::quote {
+            $::unquote($::syntax::capture(first, "number")) +
+            $::unquote($::syntax::capture(second, "number"))
+        };
+    }
+    syntax List : expression {
+        prefix "list"; match "(" values:separated0(number:literal, ",") ")"; expand list_sum;
+    }
+    syntax ListOne : expression {
+        prefix "list_one"; match "(" values:separated1(number:literal, ",") ")"; expand list_sum;
+    }
+    [[syntax_expander]] static $::meta::tokens repeated(in $::meta::syntax_match input) {
+        if ($::syntax::count(input, "parts") == 2uptr) return $::quote { 2u32 };
+        return $::quote { 0u32 };
+    }
+    syntax Repeat : expression {
+        prefix "repeat"; match "(" parts:repeat1("a") ")"; expand repeated;
+    }
+    syntax RepeatZero : expression {
+        prefix "repeat_zero"; match "(" parts:repeat0("a") ")"; expand repeated;
+    }
+    [[syntax_expander]] static $::meta::tokens selected(in $::meta::syntax_match input) {
+        $::meta::syntax_match branch = $::syntax::at(input, "branch", 0uptr);
+        if ($::syntax::is_variant(branch, "left")) return $::syntax::capture(branch, "number");
+        return $::quote { $::unquote($::syntax::capture(branch, "number")) + 1u32 };
+    }
+    syntax Select : expression {
+        prefix "select";
+        match "(" branch:choice(left:("left" number:literal) | right:("right" number:literal)) ")";
+        expand selected;
+    }
 }
 namespace caller {
     global u32 number = 13u32;
@@ -175,6 +219,13 @@ namespace frozen {
     syntax flow::Greater;
     return actual<greater ()>();
 }
+[[noinline]] static u32 combinators() {
+    syntax flow::Maybe, flow::List, flow::ListOne, flow::Repeat, flow::RepeatZero, flow::Select;
+    return maybe () + maybe (3u32) + list () + list (4u32) +
+           list (2u32, 5u32) + list_one (8u32) + repeat (a a) +
+           repeat_zero () + repeat_zero (a a) +
+           select (left 6u32) + select (right 7u32);
+}
 syntax flow::Width;
 global uptr syntax_width = width ();
 #ifdef CUSTOM_SYNTAX_ABI
@@ -191,6 +242,7 @@ global u32 syntax_raw_entry() {
     if (primitives() != 26u32) return 0u32;
     if (macro_statements() != 10u32) return 0u32;
     if (angle_boundary() != 9u32) return 0u32;
+    if (combinators() != 50u32) return 0u32;
     if (syntax_width != sizeof(uptr)) return 0u32;
 #endif
     return 61u32;
