@@ -2630,7 +2630,8 @@ public:
               const LayoutQuery* align_of = nullptr,
               const GenericPointerResolver* pointer_resolver = nullptr,
               std::shared_ptr<const SyntaxContext> macro_context = {},
-              SyntaxParseCallback syntax_parse = {})
+              SyntaxParseCallback syntax_parse = {},
+              std::shared_ptr<const SyntaxContext> call_context = {})
         : program_(program), diagnostics_(diagnostics),
           current_function_(caller),
           current_namespace_(std::move(current_namespace)),
@@ -2641,7 +2642,7 @@ public:
           pointer_resolver_(pointer_resolver ? pointer_resolver :
               (program.evaluation_pointer_resolver ? &program.evaluation_pointer_resolver : nullptr)),
           procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)),
-          syntax_parse_(std::move(syntax_parse)) {}
+          syntax_parse_(std::move(syntax_parse)), call_context_(std::move(call_context)) {}
 
     bool charge_input_tokens(const TokenSequence& tokens, SourceLocation location) {
         constexpr std::size_t metadata_cost = meta_token_storage_bytes;
@@ -3517,6 +3518,20 @@ private:
                 }
                 return true;
             }
+            if (procedural_ && name == "$::meta::call_site") {
+                if (node.arguments.size() != 1U) {
+                    fail(node.location, "$::meta::call_site requires one token value");
+                    return false;
+                }
+                const auto& argument = *node.arguments.front();
+                if (!validate_required_tree(argument)) return false;
+                const auto type = expression_type(argument);
+                if (!type || type->kind != Type::Kind::Tokens) {
+                    fail(argument.location, "$::meta::call_site requires one identifier token value");
+                    return false;
+                }
+                return true;
+            }
             if (name == "$::meta::len" || name == "$::meta::at" ||
                 name == "$::meta::slice" || name == "$::meta::concat") {
                 const auto count = name == "$::meta::len" ? 1U
@@ -4129,6 +4144,7 @@ private:
             if (procedural_ && (expression.left->text == "$::syntax::input" ||
                 expression.left->text == "$::syntax::capture")) return tokens_type();
             if (procedural_ && expression.left->text == "$::meta::tokens") return tokens_type();
+            if (procedural_ && expression.left->text == "$::meta::call_site") return tokens_type();
             if (procedural_ && (expression.left->text == "$::meta::child" ||
                 expression.left->text == "$::meta::replace_child")) return syntax_type();
             if (procedural_ && expression.left->text == "$::meta::child_count")
@@ -6622,6 +6638,30 @@ private:
             }
             return EvalValue{UInt128{node.kind == found->second}, builtin_type(BuiltinType::Bool)};
         }
+        if (procedural_ && expression.left->text == "$::meta::call_site") {
+            if (expression.arguments.size() != 1U) {
+                fail(expression.location, "$::meta::call_site requires one token value");
+                return std::nullopt;
+            }
+            const auto& argument = *expression.arguments.front();
+            auto value = this->expression(argument);
+            if (!value || !value->tokens || value->tokens->size() != 1U ||
+                value->tokens->front().kind != TokenKind::Identifier) {
+                fail(argument.location, "$::meta::call_site requires exactly one identifier token");
+                return std::nullopt;
+            }
+            if (!call_context_) {
+                fail(expression.location, "$::meta::call_site has no invocation context");
+                return std::nullopt;
+            }
+            if (!charge_input_context(call_context_, expression.location)) return std::nullopt;
+            auto token = value->tokens->front();
+            token.origin.context = call_context_;
+            token.origin.value_binding = {};
+            TokenSequence result;
+            if (!append_tokens(result, {token}, expression.location)) return std::nullopt;
+            return token_value(std::move(result));
+        }
         if (procedural_ && expression.left->text == "$::meta::parse") {
             if (expression.arguments.size() == 3U) {
                 auto category = this->expression(*expression.arguments[0]);
@@ -7269,6 +7309,7 @@ private:
     bool procedural_{};
     std::shared_ptr<const SyntaxContext> macro_context_;
     SyntaxParseCallback syntax_parse_;
+    std::shared_ptr<const SyntaxContext> call_context_;
     std::unordered_set<const SyntaxContext*> charged_contexts_;
     std::unordered_set<const SyntaxParseEnvironment*> charged_environments_;
     std::size_t token_bytes_{};
@@ -9079,14 +9120,16 @@ std::optional<TokenSequence> evaluate_procedural_body(
     const FunctionDecl& macro, const TokenSequence& input, unsigned address_bits,
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
-    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse) {
+    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse,
+    std::shared_ptr<const SyntaxContext> call_context) {
     Program context;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
     context.evaluation_layout = layout;
     const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &macro, macro.source_namespace,
-                        &size_of, &align_of, nullptr, std::move(macro_context), parse);
+                        &size_of, &align_of, nullptr, std::move(macro_context), parse,
+                        std::move(call_context));
     if (!evaluator.charge_input_tokens(input, invocation)) {
         evaluator.diagnose(invocation);
         return std::nullopt;
@@ -9110,14 +9153,16 @@ std::optional<TokenSequence> evaluate_syntax_body(
     const FunctionDecl& function, std::shared_ptr<const SyntaxMatchValue> input,
     unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
-    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse) {
+    EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse,
+    std::shared_ptr<const SyntaxContext> call_context) {
     Program context;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
     context.evaluation_layout = layout;
     const auto invocation = macro_context->invocation;
     Evaluator evaluator(context, diagnostics, &function, function.source_namespace,
-                        &size_of, &align_of, nullptr, std::move(macro_context), parse);
+                        &size_of, &align_of, nullptr, std::move(macro_context), parse,
+                        std::move(call_context));
     if (!input || !evaluator.charge_input_match(*input, invocation) ||
         !evaluator.validate_procedural_body(function)) {
         evaluator.diagnose(invocation);

@@ -431,9 +431,9 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     };
     auto output = function.syntax_expander
         ? evaluate_syntax_body(function.declaration, std::move(match), address_bits_, size_of_, align_of_,
-                               definition, diagnostics_, limits_, layout_, parse)
+                               definition, diagnostics_, limits_, layout_, parse, call)
         : evaluate_procedural_body(function.declaration, input, address_bits_, size_of_, align_of_,
-                                   definition, diagnostics_, limits_, layout_, parse);
+                                   definition, diagnostics_, limits_, layout_, parse, call);
     if (!output) {
         diagnostics_.note(function.declaration.location, "expansion function is defined here");
         diagnostics_.note(invocation, "while expanding '" + function.declaration.name + "'");

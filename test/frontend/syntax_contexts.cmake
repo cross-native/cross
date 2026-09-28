@@ -71,6 +71,17 @@ reject(context_uninitialized "read of uninitialized value"
 reject(context_emit "unquote requires a token value"
     "return $::quote { $::unquote($::syntax::context(input)) };")
 
+reject(call_site_count "call_site requires one token value"
+    "$::meta::tokens selected = $::meta::call_site($::quote { name }, $::quote { value });")
+reject(call_site_type "call_site requires one identifier token value"
+    "$::meta::tokens selected = $::meta::call_site(7u32);")
+reject(call_site_empty "call_site requires exactly one identifier token"
+    "$::meta::tokens selected = $::meta::call_site($::quote { });")
+reject(call_site_multiple "call_site requires exactly one identifier token"
+    "$::meta::tokens selected = $::meta::call_site($::quote { name value });")
+reject(call_site_nonidentifier "call_site requires exactly one identifier token"
+    "$::meta::tokens selected = $::meta::call_site($::quote { 7u32 });")
+
 set(body [=[
     const $::meta::context original = $::syntax::context(input);
     $::meta::syntax root = $::syntax::node(input, "body");

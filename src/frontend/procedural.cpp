@@ -439,7 +439,7 @@ std::optional<Replacement> find_expansion(SourceManager& sources,
                 definition_context->imports = macro->function.imports;
                 auto output = evaluate_procedural_body(macro->function,
                     input, address_bits, size_of, align_of, definition_context,
-                    diagnostics, limits, layout);
+                    diagnostics, limits, layout, {}, call_context);
                 if (!output) {
                     diagnostics.error(tokens[index].location,
                                       "procedural macro '" + macro->name +

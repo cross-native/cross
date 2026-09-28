@@ -46,6 +46,9 @@ namespace definitions {
     [[macro]] static $::meta::tokens separated(in $::meta::tokens input) {
         return $::meta::concat($::meta::parse("+"), $::meta::parse("+"));
     }
+    [[macro]] static $::meta::tokens retarget(in $::meta::tokens input) {
+        return $::meta::call_site(input);
+    }
 }
 namespace caller {
     [[macro]] static $::meta::tokens duplicate(in $::meta::tokens input) {
@@ -57,6 +60,7 @@ namespace caller {
     definitions::parsed! {}
     definitions::generated_forward! {}
     definitions::separated! {}
+    definitions::retarget! { caller_identifier }
 }
 )";
     std::vector<TokenIdentity> first_unit;
@@ -70,6 +74,7 @@ namespace caller {
         std::vector<TokenOrigin> quoted;
         std::vector<TokenOrigin> parsed;
         std::vector<TokenOrigin> forwarded;
+        std::vector<TokenOrigin> retargeted;
         unsigned plus_count{};
         for (const auto& token : tokens) {
             require(!token.is("wrong"), "quoted macro name rebound at invocation site");
@@ -80,6 +85,7 @@ namespace caller {
             if (token.is("quoted")) quoted.push_back(token_origin(token.location));
             if (token.is("parsed_identifier")) parsed.push_back(token_origin(token.location));
             if (token.is("freshly_forwarded")) forwarded.push_back(token_origin(token.location));
+            if (token.is("caller_identifier")) retargeted.push_back(token_origin(token.location));
             if (token.kind != TokenKind::End) {
                 const auto* origin = expanded->token_origin_at(token.location.offset);
                 require(origin != nullptr, "serialized token lost its origin");
@@ -87,7 +93,7 @@ namespace caller {
             }
         }
         require(copied.size() == 2 && patches.size() == 8 && quoted.size() == 1 && parsed.size() == 1 &&
-                forwarded.size() == 2 && plus_count == 2,
+                forwarded.size() == 2 && retargeted.size() == 1 && plus_count == 2,
                 "unexpected expansion token counts");
         require(copied[0].identity == copied[1].identity, "copied token lost lexical identity");
         require(copied[0].context == copied[1].context, "copied token lost lookup context");
@@ -96,6 +102,12 @@ namespace caller {
         require(copied[0].identity.expansion.value == 0, "input token was treated as newly constructed");
         require(copied[0].span.file->text.substr(copied[0].span.offset, 6) == "copied",
                 "copied token did not preserve its supplied span");
+        require(retargeted[0].identity.expansion.value == 0 &&
+                retargeted[0].span.file->text.substr(retargeted[0].span.offset, 17) == "caller_identifier" &&
+                retargeted[0].context &&
+                retargeted[0].context->kind == SyntaxContext::Kind::CallSite &&
+                retargeted[0].context->name_space == "caller",
+                "call_site changed copied identifier identity/span or lost invocation context");
         require(patches[0].identity == patches[1].identity, "copied patch token lost lexical identity");
         require(patches[2].identity != patches[3].identity, "constructed output positions are not distinct");
         require(patches[2].identity.expansion == patches[3].identity.expansion,
