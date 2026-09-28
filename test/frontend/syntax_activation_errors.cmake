@@ -7,6 +7,26 @@ foreach(required CC OUTPUT)
     endif()
 endforeach()
 
+set(declaration_input "${OUTPUT}.declaration.x")
+file(WRITE "${declaration_input}" [=[
+syntax Broken : expression { prefix "broken"; match item:ident item:ident; expand expand; }
+]=])
+execute_process(COMMAND "${CC}" -S "${declaration_input}" -o "${OUTPUT}"
+    RESULT_VARIABLE declaration_status OUTPUT_VARIABLE declaration_out ERROR_VARIABLE declaration_err)
+if(declaration_status EQUAL 0 OR NOT declaration_err MATCHES "duplicate syntax capture field" OR
+   NOT declaration_err MATCHES "while declaring syntax 'Broken'")
+    message(FATAL_ERROR "definition diagnostic lost its owner\n${declaration_out}\n${declaration_err}")
+endif()
+
+set(missing_match_end "${OUTPUT}.missing-match-end.x")
+file(WRITE "${missing_match_end}" "syntax Broken : rule { match value:literal\n")
+execute_process(COMMAND "${CC}" -S "${missing_match_end}" -o "${OUTPUT}"
+    RESULT_VARIABLE missing_status OUTPUT_VARIABLE missing_out ERROR_VARIABLE missing_err)
+if(missing_status EQUAL 0 OR NOT missing_err MATCHES "expected ';' after syntax match" OR
+   NOT missing_err MATCHES "while declaring syntax 'Broken'")
+    message(FATAL_ERROR "unterminated match was not diagnosed\n${missing_out}\n${missing_err}")
+endif()
+
 set(cycle_input "${OUTPUT}.cycle.x")
 file(WRITE "${cycle_input}" [=[
 [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {

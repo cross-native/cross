@@ -1052,11 +1052,17 @@ void Parser::adopt_replacement(Parser& child) {
 std::unique_ptr<Statement> Parser::parse_statement_replacement() {
     const auto location = current().location;
     const bool macro = macro_start();
+    const auto* owner = macro ? nullptr : active_syntax(false);
     auto result = std::make_unique<Statement>();
     result->kind = Statement::Kind::Empty;
     result->location = location;
     auto execution = syntax_->execution();
-    if (!execution->begin_replacement(location)) { ++index_; synchronize_external(); return result; }
+    if (!execution->begin_replacement(location)) {
+        if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
+        ++index_;
+        synchronize_external();
+        return result;
+    }
     struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
     auto output = expand_at_position(false);
     if (!output) return result;
@@ -1109,13 +1115,18 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
     result->kind = Expr::Kind::Integer;
     result->text = "0";
     result->location = location;
-    if (const auto* definition = active_syntax(false); definition && definition->kind != SyntaxKind::Expression) {
+    const auto* owner = macro_start() ? nullptr : active_syntax(false);
+    if (owner && owner->kind != SyntaxKind::Expression) {
         error_here("statement syntax is not valid at expression position");
         ++index_;
         return result;
     }
     auto execution = syntax_->execution();
-    if (!execution->begin_replacement(location)) { ++index_; return result; }
+    if (!execution->begin_replacement(location)) {
+        if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
+        ++index_;
+        return result;
+    }
     struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
     auto output = expand_at_position(false);
     if (!output) return result;
@@ -2553,10 +2564,18 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
     if (parse_syntax_registration(&program)) return;
-    if (syntax_ && (macro_start() || active_syntax(true))) {
+    const bool external_macro = syntax_ && macro_start();
+    const auto* external_owner = syntax_ && !external_macro ? active_syntax(true) : nullptr;
+    if (syntax_ && (external_macro || external_owner)) {
         const auto location = current().location;
         auto execution = syntax_->execution();
-        if (!execution->begin_replacement(location)) { ++index_; synchronize_external(); return; }
+        if (!execution->begin_replacement(location)) {
+            if (external_owner) diagnostics_.note(external_owner->location,
+                "syntax '" + external_owner->name + "' defined here");
+            ++index_;
+            synchronize_external();
+            return;
+        }
         struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
         auto output = expand_at_position(true);
         if (!output) return;

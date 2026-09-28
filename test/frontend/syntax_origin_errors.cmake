@@ -95,3 +95,25 @@ if(evaluator_status EQUAL 0 OR NOT evaluator_err MATCHES "no field named 'missin
    NOT evaluator_err MATCHES "in expansion of syntax 'Outer'")
     message(FATAL_ERROR "pre-output evaluator ancestry lost\n${evaluator_out}\n${evaluator_err}")
 endif()
+
+# The replacement-depth gate runs before the next owner has generated output.
+set(depth_input "${OUTPUT}.depth.x")
+file(WRITE "${depth_input}" [=[
+[[syntax_expander]] static $::meta::tokens make_a(in $::meta::syntax_match input) {
+    return $::meta::concat($::meta::call_site($::meta::parse("b")), $::quote { () });
+}
+[[syntax_expander]] static $::meta::tokens make_b(in $::meta::syntax_match input) {
+    return $::meta::concat($::meta::call_site($::meta::parse("a")), $::quote { () });
+}
+syntax A : expression { prefix "a"; match body:paren; expand make_a; }
+syntax B : expression { prefix "b"; match body:paren; expand make_b; }
+syntax A, B;
+global u32 entry() { return a (); }
+]=])
+execute_process(COMMAND "${CC}" -S -feval-depth-limit=2 "${depth_input}" -o "${OUTPUT}"
+    RESULT_VARIABLE depth_status OUTPUT_VARIABLE depth_out ERROR_VARIABLE depth_err)
+if(depth_status EQUAL 0 OR NOT depth_err MATCHES "expansion depth or invocation budget exceeded" OR
+   NOT depth_err MATCHES "syntax 'A' defined here" OR
+   NOT depth_err MATCHES "in expansion of syntax 'B'")
+    message(FATAL_ERROR "replacement-depth owner lost\n${depth_out}\n${depth_err}")
+endif()

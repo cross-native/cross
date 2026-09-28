@@ -631,6 +631,19 @@ std::optional<SyntaxEntityId> SyntaxState::lookup(std::string_view name, std::st
 bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
     std::string_view name_space, Diagnostics& diagnostics) {
     const auto start = tokens[index++].location;
+    std::string name;
+    struct DeclarationNote {
+        Diagnostics& diagnostics;
+        SourceLocation start;
+        const std::string& name;
+        unsigned previous_errors;
+        bool complete{};
+        ~DeclarationNote() {
+            if (complete || diagnostics.errors() == previous_errors) return;
+            diagnostics.note(start, name.empty() ? "while declaring a syntax entity"
+                : "while declaring syntax '" + name + "'");
+        }
+    } note{diagnostics, start, name, diagnostics.errors()};
     const auto error = [&](std::string message) {
         diagnostics.error(index < tokens.size() ? tokens[index].location : start, std::move(message));
         return false;
@@ -640,7 +653,7 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
         return false;
     };
     if (index >= tokens.size() || !user_identifier(tokens[index])) return error("expected nonreserved syntax entity name");
-    const auto name = join(name_space, tokens[index++].text);
+    name = join(name_space, tokens[index++].text);
     if (!take(":")) return error("expected ':' after syntax entity name");
     const auto kind = index < tokens.size() ? tokens[index++].text : std::string_view{};
     const auto selected = kind == "item" ? std::optional<SyntaxKind>(SyntaxKind::Item)
@@ -799,7 +812,8 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
             return pattern;
         };
         auto pattern = parse_pattern(parse_pattern, ";", 0);
-        if (!pattern || !take(";")) return false;
+        if (!pattern) return false;
+        if (!take(";")) return error("expected ';' after syntax match");
         definition.pattern = std::move(*pattern);
         if (!validate_pattern_progress(definition.pattern,
             [](SyntaxEntityId) -> const Pattern* { return nullptr; }, diagnostics)) return false;
@@ -813,6 +827,7 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
     if (std::any_of(definitions_->begin(), definitions_->end(), [&](const auto& prior) { return prior.name == name; }))
         return error("syntax entity is defined more than once: '" + name + "'");
     definitions_->push_back(std::move(definition));
+    note.complete = true;
     return true;
 }
 
