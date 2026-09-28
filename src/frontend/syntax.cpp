@@ -504,7 +504,7 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
 }
 
 std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
-    const SyntaxNode& node, SourceLocation location) {
+    const SyntaxNode& node, SourceLocation location, bool allow_deferred_statement) {
     std::vector<const SyntaxNode*> pending{&node};
     std::unordered_set<const SyntaxNode*> seen;
     while (!pending.empty()) {
@@ -512,7 +512,8 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
         pending.pop_back();
         if (!seen.insert(next).second) continue;
         if (!work(location)) return {};
-        if (next->kind == SyntaxNode::Kind::Deferred) {
+        if (next->kind == SyntaxNode::Kind::Deferred &&
+            !(allow_deferred_statement && next->deferred_category == SyntaxParseCategory::Statement)) {
             diagnostics_.error(location,
                 "deferred syntax-node splice requires explicit $::meta::tokens projection");
             return {};

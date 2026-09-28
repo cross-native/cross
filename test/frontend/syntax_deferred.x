@@ -19,7 +19,12 @@ syntax Drop : statement { prefix "drop"; match body:stmt; expand discard; }
         $::meta::is_production(deferred, "compound_statement") ||
         $::meta::child_count(deferred) != 0uptr)
         return $::quote { public_schema_failure(); };
-    return $::meta::tokens(root);
+    $::meta::syntax parsed = $::meta::parse("stmt",
+        $::quote { $::unquote(root) }, $::syntax::context(input));
+    if (!$::meta::is_production(parsed, "statement") ||
+        !$::meta::is_kind($::meta::child($::meta::child(parsed, 0uptr), 0uptr), "deferred"))
+        return $::quote { public_schema_failure(); };
+    return $::quote { $::unquote(root) };
 }
 syntax Deferred : statement { prefix "deferred"; match body:stmt; expand deferred_statement; }
 [[syntax_expander]] static $::meta::tokens introduce_alias(in $::meta::syntax_match input) {

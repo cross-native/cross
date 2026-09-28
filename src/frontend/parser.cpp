@@ -3573,7 +3573,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
                 "structured statement splice requires a destination block");
             return invalid;
         }
-        auto output = syntax_->execution()->materialize_node(*item.splice, item.location);
+        auto output = syntax_->execution()->materialize_node(*item.splice, item.location, true);
         if (!output) return invalid;
         auto child = replacement_parser(std::move(*output));
         child->restore_environment(*item.splice->context->parse_environment,
