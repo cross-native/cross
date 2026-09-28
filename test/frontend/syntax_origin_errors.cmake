@@ -43,3 +43,55 @@ if(eof_status EQUAL 0 OR NOT eof_err MATCHES "expected expression" OR
    NOT eof_err MATCHES "in expansion of syntax 'Outer'")
     message(FATAL_ERROR "end-token syntax ancestry lost\n${eof_out}\n${eof_err}")
 endif()
+
+# A match failure in generated input must identify both the nested rule and
+# the syntax declaration that owns the invocation, then the outer expansion.
+file(READ "${SOURCE}" original_source)
+string(REPLACE "syntax Inner : expression {"
+    "syntax NeedParen : rule { match body:paren; }\nsyntax Inner : expression {"
+    rule_source "${original_source}")
+string(REPLACE "match body:paren; expand inner_expander;"
+    "match body:rule(NeedParen); expand inner_expander;" rule_source "${rule_source}")
+string(REPLACE "return $::quote { inner () };"
+    "return $::quote { inner 1u32 };" rule_source "${rule_source}")
+set(rule_input "${OUTPUT}.rule.x")
+file(WRITE "${rule_input}" "${rule_source}")
+execute_process(COMMAND "${CC}" -S "${rule_input}" -o "${OUTPUT}"
+    RESULT_VARIABLE rule_status OUTPUT_VARIABLE rule_out ERROR_VARIABLE rule_err)
+if(rule_status EQUAL 0 OR NOT rule_err MATCHES "syntax-match error" OR
+   NOT rule_err MATCHES "syntax 'Inner' defined here" OR
+   NOT rule_err MATCHES "syntax rule 'NeedParen' defined here" OR
+   NOT rule_err MATCHES "in expansion of syntax 'Outer'")
+    message(FATAL_ERROR "nested match ancestry lost\n${rule_out}\n${rule_err}")
+endif()
+
+# Both complete derivations of an ambiguous rule must retain rule provenance.
+string(REPLACE "syntax NeedParen : rule { match body:paren; }"
+    "syntax NeedX : rule { match branch:choice(left:(\"x\") | right:(\"x\")); }"
+    ambiguous_source "${rule_source}")
+string(REPLACE "rule(NeedParen)" "rule(NeedX)" ambiguous_source "${ambiguous_source}")
+string(REPLACE "inner 1u32" "inner x" ambiguous_source "${ambiguous_source}")
+set(ambiguous_input "${OUTPUT}.ambiguous.x")
+file(WRITE "${ambiguous_input}" "${ambiguous_source}")
+execute_process(COMMAND "${CC}" -S "${ambiguous_input}" -o "${OUTPUT}"
+    RESULT_VARIABLE ambiguous_status OUTPUT_VARIABLE ambiguous_out ERROR_VARIABLE ambiguous_err)
+if(ambiguous_status EQUAL 0 OR NOT ambiguous_err MATCHES "ambiguous syntax invocation" OR
+   NOT ambiguous_err MATCHES "syntax 'Inner' defined here" OR
+   NOT ambiguous_err MATCHES "syntax rule 'NeedX' defined here" OR
+   NOT ambiguous_err MATCHES "in expansion of syntax 'Outer'")
+    message(FATAL_ERROR "ambiguous match ancestry lost\n${ambiguous_out}\n${ambiguous_err}")
+endif()
+
+# An evaluator failure happens before output exists, so the owner must be
+# attached explicitly rather than relying on replacement-source metadata.
+string(REPLACE "return $::quote { 1u32 + ; 2u32 };"
+    "return $::syntax::capture(input, \"missing\");" evaluator_source "${original_source}")
+set(evaluator_input "${OUTPUT}.evaluator.x")
+file(WRITE "${evaluator_input}" "${evaluator_source}")
+execute_process(COMMAND "${CC}" -S "${evaluator_input}" -o "${OUTPUT}"
+    RESULT_VARIABLE evaluator_status OUTPUT_VARIABLE evaluator_out ERROR_VARIABLE evaluator_err)
+if(evaluator_status EQUAL 0 OR NOT evaluator_err MATCHES "no field named 'missing'" OR
+   NOT evaluator_err MATCHES "syntax 'Inner' defined here" OR
+   NOT evaluator_err MATCHES "in expansion of syntax 'Outer'")
+    message(FATAL_ERROR "pre-output evaluator ancestry lost\n${evaluator_out}\n${evaluator_err}")
+endif()

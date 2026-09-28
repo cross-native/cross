@@ -383,6 +383,7 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
         if (repeats >= 2) {
             diagnostics_.error(invocation,
                 "syntax/procedural expansion depth or invocation budget exceeded (recursive cycle)");
+            if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
             return {};
         }
         active_expansions_.back() = std::move(signature);
@@ -436,6 +437,7 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
                                    definition, diagnostics_, limits_, layout_, parse, call);
     if (!output) {
         diagnostics_.note(function.declaration.location, "expansion function is defined here");
+        if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
         diagnostics_.note(invocation, "while expanding '" + function.declaration.name + "'");
         return {};
     }
@@ -1102,36 +1104,66 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         return SyntaxSpan{token_origin(tokens[first].location).span,
             token_origin(tokens[last == first ? first : last - 1].location).span};
     };
+    struct RuleFrame {
+        SyntaxEntityId id;
+        SourceLocation reference;
+    };
     struct Candidate {
         std::size_t end;
         std::shared_ptr<const SyntaxMatchValue> value;
+        std::vector<RuleFrame> rules;
     };
     struct Piece {
         std::size_t end;
         std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
         FieldKind kind{FieldKind::Primitive};
         std::shared_ptr<const SyntaxNode> node;
+        std::vector<RuleFrame> rules;
     };
     using K = SyntaxPatternElement::Kind;
+    std::vector<RuleFrame> active_rules;
+    std::vector<RuleFrame> failure_rules;
+    std::optional<std::vector<RuleFrame>> hard_failure_rules;
+    std::size_t farthest_failure{};
+    const auto consider_failure = [&](std::size_t at) {
+        if (at > farthest_failure || (at == farthest_failure && active_rules.size() > failure_rules.size())) {
+            farthest_failure = at;
+            failure_rules = active_rules;
+        }
+    };
+    std::vector<bool> noted_rules(definitions_->size());
+    const auto note_rules = [&](const std::vector<RuleFrame>& rules) {
+        for (const auto& frame : rules) {
+            const auto id = frame.id;
+            if (id.value >= definitions_->size() || noted_rules[id.value]) continue;
+            noted_rules[id.value] = true;
+            const auto& rule = (*definitions_)[id.value];
+            diagnostics.note(frame.reference, "while matching syntax rule '" + rule.name + "'");
+            diagnostics.note(rule.location, "syntax rule '" + rule.name + "' defined here");
+        }
+    };
     std::function<std::vector<Candidate>(const Pattern&, std::size_t, unsigned)> run;
     std::function<std::vector<Piece>(const SyntaxPatternElement&, std::size_t, unsigned)> pieces;
     run = [&](const Pattern& pattern, std::size_t first, unsigned depth) -> std::vector<Candidate> {
         if (failed) return {};
+        consider_failure(first);
         if (depth >= execution_->limits().depth) {
             diagnostics.error(tokens[begin].location, "syntax pattern matching depth exceeded");
             failed = true;
             return {};
         }
         if (!charge(syntax_match_storage_bytes)) { failed = true; return {}; }
-        std::vector<Candidate> active{{first, std::make_shared<SyntaxMatchValue>()}};
+        std::vector<Candidate> active{{first, std::make_shared<SyntaxMatchValue>(), {}}};
         for (const auto& element : pattern) {
             std::vector<Candidate> next;
             for (const auto& candidate : active) {
                 if (candidate.end >= tokens.size() || failed) continue;
+                consider_failure(candidate.end);
                 if (!execution_->work(tokens[candidate.end].location)) { failed = true; break; }
                 for (auto part : pieces(element, candidate.end, depth + 1)) {
                     if (failed || !charge(syntax_match_storage_bytes +
-                        syntax_field_storage_bytes * candidate.value->fields.size())) { failed = true; break; }
+                        syntax_field_storage_bytes * candidate.value->fields.size() +
+                        32 * (candidate.rules.size() + part.rules.size()))) { failed = true; break; }
                     auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
                     if (!element.field.empty()) {
                         SyntaxMatchValue::Field field{element.field, {}, std::move(part.node),
@@ -1143,7 +1175,9 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                         }
                         value->fields.push_back(std::move(field));
                     }
-                    next.push_back({part.end, std::move(value)});
+                    auto rules = candidate.rules;
+                    rules.insert(rules.end(), part.rules.begin(), part.rules.end());
+                    next.push_back({part.end, std::move(value), std::move(rules)});
                 }
             }
             if (failed) return {};
@@ -1161,6 +1195,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     };
     pieces = [&](const SyntaxPatternElement& element, std::size_t start, unsigned depth) -> std::vector<Piece> {
         if (failed || start >= tokens.size()) return {};
+        consider_failure(start);
         if (tokens[start].kind == TokenKind::End && element.kind != K::Optional &&
             element.kind != K::Repeat0 && element.kind != K::Separated0) return {};
         const auto nested = [&](const Pattern& pattern, std::size_t from) {
@@ -1169,8 +1204,15 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         if (element.kind == K::Rule) {
             if (!element.resolved_rule) return {};
             std::vector<Piece> output;
-            for (auto& candidate : nested((*definitions_)[element.resolved_rule->value].pattern, start))
-                output.push_back({candidate.end, {candidate.value}, FieldKind::Nested, {}});
+            active_rules.push_back({*element.resolved_rule, element.location});
+            auto candidates = nested((*definitions_)[element.resolved_rule->value].pattern, start);
+            if (failed && !hard_failure_rules) hard_failure_rules = active_rules;
+            active_rules.pop_back();
+            for (auto& candidate : candidates) {
+                auto rules = std::move(candidate.rules);
+                rules.insert(rules.begin(), {*element.resolved_rule, element.location});
+                output.push_back({candidate.end, {candidate.value}, FieldKind::Nested, {}, std::move(rules)});
+            }
             return output;
         }
         if (element.kind == K::Choice) {
@@ -1184,14 +1226,16 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                         if (!charge(32 + possible.label.size())) { failed = true; return {}; }
                         value->variant_labels.push_back(possible.label);
                     }
-                    output.push_back({candidate.end, {std::move(value)}, FieldKind::Nested, {}});
+                    output.push_back({candidate.end, {std::move(value)}, FieldKind::Nested, {},
+                                      std::move(candidate.rules)});
                 }
             return output;
         }
         if (element.kind == K::Optional) {
-            std::vector<Piece> output{{start, {}, FieldKind::Nested, {}}};
+            std::vector<Piece> output{{start, {}, FieldKind::Nested, {}, {}}};
             for (auto& candidate : nested(element.pattern, start))
-                if (candidate.end > start) output.push_back({candidate.end, {candidate.value}, FieldKind::Nested, {}});
+                if (candidate.end > start) output.push_back({candidate.end, {candidate.value}, FieldKind::Nested,
+                                                               {}, std::move(candidate.rules)});
             return output;
         }
         if (element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
@@ -1200,7 +1244,8 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             const bool separated = element.kind == K::Separated0 || element.kind == K::Separated1;
             const bool require_one = element.kind == K::Repeat1 || element.kind == K::Separated1;
             const auto extend = [&](const auto& self, std::size_t at,
-                                    std::vector<std::shared_ptr<const SyntaxMatchValue>>& records) -> void {
+                                    std::vector<std::shared_ptr<const SyntaxMatchValue>>& records,
+                                    std::vector<RuleFrame>& rules) -> void {
                 if (failed) return;
                 if (records.size() >= execution_->limits().depth) {
                     diagnostics.error(tokens[begin].location, "syntax repetition depth exceeded");
@@ -1208,8 +1253,8 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                     return;
                 }
                 if (!require_one || !records.empty()) {
-                    if (!charge(128 + 16 * records.size())) { failed = true; return; }
-                    output.push_back({at, records, FieldKind::Nested, {}});
+                    if (!charge(128 + 16 * records.size() + 32 * rules.size())) { failed = true; return; }
+                    output.push_back({at, records, FieldKind::Nested, {}, rules});
                 }
                 std::size_t body = at;
                 if (separated && !records.empty()) {
@@ -1241,12 +1286,16 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                         return;
                     }
                     records.push_back(candidate.value);
-                    self(self, candidate.end, records);
+                    const auto previous = rules.size();
+                    rules.insert(rules.end(), candidate.rules.begin(), candidate.rules.end());
+                    self(self, candidate.end, records, rules);
+                    rules.resize(previous);
                     records.pop_back();
                 }
             };
             std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
-            extend(extend, start, records);
+            std::vector<RuleFrame> rules;
+            extend(extend, start, records, rules);
             return output;
         }
         std::size_t position = start;
@@ -1303,7 +1352,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 failed = true;
                 return {};
             }
-            return {{parsed->end, {}, FieldKind::Parsed, std::move(parsed->node)}};
+            return {{parsed->end, {}, FieldKind::Parsed, std::move(parsed->node), {}}};
         } else {
             const auto opening = tokens[position].text;
             if ((element.kind == K::Paren && opening != "(") ||
@@ -1314,25 +1363,32 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             position = *close + 1;
             auto node = raw_group(start, position);
             if (!node) return {};
-            return {{position, {}, FieldKind::RawGroup, std::move(node)}};
+            return {{position, {}, FieldKind::RawGroup, std::move(node), {}}};
         }
         if (!execution_->work(tokens[start].location, position - start)) { failed = true; return {}; }
-        return {{position, {}, FieldKind::Primitive, {}}};
+        return {{position, {}, FieldKind::Primitive, {}, {}}};
     };
     auto matches = run(definition.pattern, begin + 1, 0);
     if (matches.empty() || failed) {
         if (diagnostics.errors() == previous_errors) diagnostics.error(tokens[begin].location,
             "syntax-match error for active prefix '" + std::string(tokens[begin].text) + "'");
-        diagnostics.note(definition.location, "syntax is defined here");
+        diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        if (hard_failure_rules) note_rules(*hard_failure_rules);
+        else if (!failed) note_rules(failure_rules);
         return {};
     }
     if (matches.size() != 1) {
         diagnostics.error(tokens[begin].location, "ambiguous syntax invocation has multiple complete derivations");
-        diagnostics.note(definition.location, "syntax is defined here");
+        diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        for (const auto& match : matches) note_rules(match.rules);
         return {};
     }
     auto root = std::make_shared<SyntaxMatchValue>(*matches.front().value);
-    if (!charge(meta_token_storage_bytes + tokens[begin].text.size())) return {};
+    if (!charge(meta_token_storage_bytes + tokens[begin].text.size())) {
+        diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        note_rules(matches.front().rules);
+        return {};
+    }
     root->input.insert(root->input.begin(), MetaToken(tokens[begin]));
     root->span = span(begin, matches.front().end);
     if (!definition.bound_expander) return {};
