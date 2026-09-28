@@ -212,6 +212,12 @@ reject(parsed_unknown_kind "unknown public syntax node kind"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_kind($::syntax::node(input, \"body\"), \"unknown\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(parsed_unknown_production "unknown public syntax production"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_production($::syntax::node(input, \"body\"), \"unknown\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(extension_unknown_definition "syntax entity is not visible"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_extension($::syntax::node(input, \"body\"), \"Missing\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(extension_invalid_definition "expected a qualified syntax-name string"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_extension($::syntax::node(input, \"body\"), \"Bad:::Name\")) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
+reject(extension_definition_type "requires a string name"
+    "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { if ($::meta::is_extension($::syntax::node(input, \"body\"), 1u32)) return $::quote { 1u32 }; return $::quote { 0u32 }; } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(extension_match_core "extension_match requires an extension node"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { $::meta::syntax_match nested = $::meta::extension_match($::syntax::node(input, \"body\")); return $::syntax::input(nested); } syntax Bad : expression { prefix \"bad\"; match body:expr; expand expand; } syntax Bad; global u32 entry() { return bad 1u32; }\n")
 reject(fence "followed immediately by terminal ';'"

@@ -184,4 +184,19 @@ syntax Pack : bundle { use First; use Item; }
         std::make_shared<const SplitTokenSource>(SplitTokenSource{TokenKind::Punctuator, ">>"});
     require(syntax_node_tokens(generic).size() == 2,
             "distinct generic-close source tokens were accidentally joined");
+
+    // A copied parse environment must not acquire later syntax declarations.
+    SyntaxState frozen(state, nullptr);
+    const auto* later_source = sources.add("later-syntax.x",
+        "syntax Later : rule { match value:literal; }");
+    const auto later_tokens = Lexer(*later_source, diagnostics).lex();
+    std::size_t later_at = 0;
+    require(state.declare(later_tokens, later_at, "N", diagnostics),
+            "later syntax declaration failed");
+    const auto prior_errors = diagnostics.errors();
+    require(state.resolve("N::Later", "", later_tokens.front().location, diagnostics).has_value(),
+            "current syntax registry missed a later declaration");
+    require(!frozen.resolve("N::Later", "", later_tokens.front().location, diagnostics) &&
+            diagnostics.errors() == prior_errors + 1,
+            "saved syntax context saw a later declaration");
 }

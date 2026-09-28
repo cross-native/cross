@@ -125,6 +125,60 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "empty match record lost its context\n${err}")
 endif()
 
+# The unqualified name is resolved where the captured node was parsed, not
+# where the inspecting expander was defined.
+set(source [=[
+namespace left {
+    [[syntax_expander]] static $::meta::tokens five(in $::meta::syntax_match input) {
+        return $::quote { 5u32 };
+    }
+    syntax Base : expression { prefix "base"; match body:paren; expand five; }
+    [[syntax_expander]] static $::meta::tokens inspect(in $::meta::syntax_match input) {
+        $::meta::syntax leaf = $::syntax::node(input, "body");
+        while ($::meta::is_kind(leaf, "core") && $::meta::child_count(leaf) == 1uptr)
+            leaf = $::meta::child(leaf, 0uptr);
+        if (!$::meta::is_extension(leaf, "Base") ||
+            $::meta::is_extension(leaf, "left::Base"))
+            $::syntax::error($::syntax::span(input), "wrong node lookup context");
+        if ($::meta::is_kind($::syntax::node(input, "body"), "core") &&
+            $::meta::is_extension($::syntax::node(input, "body"), "right::Base"))
+            $::syntax::error($::syntax::span(input), "core node compared as extension");
+        return $::quote { 1u32 };
+    }
+    syntax Inspect : expression { prefix "inspect"; match body:expr; expand inspect; }
+}
+namespace right {
+    [[syntax_expander]] static $::meta::tokens seven(in $::meta::syntax_match input) {
+        return $::quote { 7u32 };
+    }
+    syntax Base : expression { prefix "base"; match body:paren; expand seven; }
+    syntax Base, left::Inspect;
+    global u32 entry() { return inspect base (); }
+}
+]=])
+compile(extension_node_context "${source}")
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "extension identity used the expander rather than node context\n${err}")
+endif()
+
+set(source [=[
+namespace first { syntax Base : rule { match value:literal; } }
+namespace second { syntax Base : rule { match value:literal; } }
+using first;
+using second;
+[[syntax_expander]] static $::meta::tokens inspect(in $::meta::syntax_match input) {
+    $::meta::is_extension($::syntax::node(input, "body"), "Base");
+    return $::quote { 1u32 };
+}
+syntax Inspect : expression { prefix "inspect"; match body:expr; expand inspect; }
+syntax Inspect;
+global u32 entry() { return inspect 1u32; }
+]=])
+compile(extension_ambiguous_context "${source}")
+if(NOT result EQUAL 1 OR NOT err MATCHES "ambiguous syntax entity 'Base'")
+    message(FATAL_ERROR "ambiguous extension name was not diagnosed in node context\n${err}")
+endif()
+
 compile(runtime "$::meta::context forbidden;\nglobal u32 entry() { return 0u32; }\n")
 if(NOT result EQUAL 1 OR NOT err MATCHES "context is only available in expansion functions")
     message(FATAL_ERROR "context type entered runtime declaration\n${err}")

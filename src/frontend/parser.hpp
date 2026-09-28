@@ -247,6 +247,8 @@ struct SyntaxParseEnvironment {
 private:
     friend class Parser;
     friend std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment&);
+    friend std::optional<SyntaxEntityId> syntax_resolve_entity(
+        const SyntaxNode&, std::string_view, Diagnostics&, SourceLocation);
     unsigned address_bits{};
     std::optional<SyntaxState> syntax;
     std::weak_ptr<SyntaxExecution> execution;

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant) || !$::has_builtin($::syntax::node) || !$::has_intrinsic($::meta::child) || !$::has_builtin($::syntax::span) || !$::has_intrinsic($::syntax::capture_span) || !$::has_builtin($::meta::node_span) || !$::has_intrinsic($::syntax::warning) || !$::has_builtin($::syntax::error) || !$::has_builtin($::syntax::note)
+#if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant) || !$::has_builtin($::syntax::node) || !$::has_intrinsic($::meta::child) || !$::has_builtin($::meta::is_extension) || !$::has_intrinsic($::meta::is_extension) || !$::has_builtin($::syntax::span) || !$::has_intrinsic($::syntax::capture_span) || !$::has_builtin($::meta::node_span) || !$::has_intrinsic($::syntax::warning) || !$::has_builtin($::syntax::error) || !$::has_builtin($::syntax::note)
 #error implemented syntax operations must be discoverable
 #endif
 #if $::has_feature($::feature::syntax_extensions)
@@ -449,6 +449,9 @@ syntax Rebuild;
     $::meta::syntax leaf = root;
     while ($::meta::is_kind(leaf, "core") && $::meta::child_count(leaf) == 1uptr)
         leaf = $::meta::child(leaf, 0uptr);
+    if (!$::meta::is_extension(leaf, "flow::Base") ||
+        $::meta::is_extension(leaf, "caller::Base"))
+        return $::quote { public_schema_failure(); };
     $::meta::syntax_match nested = $::meta::extension_match(leaf);
     if ($::meta::len($::syntax::input(nested)) != 2uptr ||
         $::meta::len($::syntax::capture(nested, "body")) != 1uptr)

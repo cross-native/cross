@@ -585,6 +585,7 @@ SyntaxState::SyntaxState(std::shared_ptr<SyntaxExecution> execution)
 
 SyntaxState::SyntaxState(const SyntaxState& snapshot, std::shared_ptr<SyntaxExecution> execution)
     : execution_(std::move(execution)), definitions_(snapshot.definitions_),
+      visible_definitions_(snapshot.visible_definitions_),
       imports_(snapshot.imports_), scopes_(snapshot.scopes_) {}
 
 void SyntaxState::push_scope() { scopes_.emplace_back(); imports_.emplace_back(); }
@@ -597,12 +598,38 @@ std::vector<SyntaxBinding> SyntaxState::bindings() const {
     return result;
 }
 
+std::optional<SyntaxEntityId> SyntaxState::resolve(
+    std::string_view name, std::string_view name_space, SourceLocation location,
+    Diagnostics& diagnostics) const {
+    const auto start = [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_';
+    };
+    const auto continuation = [&](char ch) {
+        return start(ch) || (ch >= '0' && ch <= '9');
+    };
+    bool valid = !name.empty();
+    for (std::size_t at = 0; valid && at < name.size();) {
+        const auto begin = at;
+        if (!start(name[at++])) { valid = false; break; }
+        while (at < name.size() && continuation(name[at])) ++at;
+        valid = !is_reserved_identifier(name.substr(begin, at - begin));
+        if (at == name.size()) break;
+        valid = valid && at + 2 < name.size() && name.substr(at, 2) == "::";
+        at += 2;
+    }
+    if (!valid) {
+        diagnostics.error(location, "expected a qualified syntax-name string");
+        return {};
+    }
+    return lookup(name, name_space, imports_, location, diagnostics);
+}
+
 std::optional<SyntaxEntityId> SyntaxState::lookup(std::string_view name, std::string_view name_space,
     const std::vector<std::vector<std::string>>& imports, SourceLocation location,
     Diagnostics& diagnostics) const {
     const auto exact = [&](std::string_view candidate) -> std::optional<SyntaxEntityId> {
-        for (const auto& definition : *definitions_)
-            if (definition.name == candidate) return definition.id;
+        for (std::size_t at = 0; at < visible_definitions_; ++at)
+            if ((*definitions_)[at].name == candidate) return (*definitions_)[at].id;
         return {};
     };
     if (name.find("::") != std::string_view::npos) {
@@ -828,6 +855,7 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
     if (std::any_of(definitions_->begin(), definitions_->end(), [&](const auto& prior) { return prior.name == name; }))
         return error("syntax entity is defined more than once: '" + name + "'");
     definitions_->push_back(std::move(definition));
+    visible_definitions_ = definitions_->size();
     note.complete = true;
     return true;
 }

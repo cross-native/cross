@@ -91,6 +91,9 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node);
 bool syntax_expression_node(const SyntaxNode& node);
 bool syntax_statement_node(const SyntaxNode& node);
 bool syntax_type_node(const SyntaxNode& node);
+std::optional<SyntaxEntityId> syntax_resolve_entity(
+    const SyntaxNode& node, std::string_view name, Diagnostics& diagnostics,
+    SourceLocation location);
 std::size_t syntax_node_count(const SyntaxNode& node);
 std::uint64_t syntax_node_storage(const SyntaxNode& node,
     std::uint64_t stop_after = std::numeric_limits<std::uint64_t>::max());
@@ -255,6 +258,9 @@ public:
     void import(std::string name);
     std::vector<SyntaxBinding> bindings() const;
     const std::vector<std::vector<std::string>>& imports() const { return imports_; }
+    std::optional<SyntaxEntityId> resolve(std::string_view name,
+        std::string_view name_space, SourceLocation location,
+        Diagnostics& diagnostics) const;
     bool declare(const std::vector<Token>& tokens, std::size_t& index,
                  std::string_view name_space, Diagnostics& diagnostics);
     bool activate(std::span<const SyntaxActivation> entries, std::string_view name_space,
@@ -277,6 +283,7 @@ private:
         Diagnostics& diagnostics) const;
     std::shared_ptr<SyntaxExecution> execution_;
     std::shared_ptr<std::vector<SyntaxDefinition>> definitions_;
+    std::size_t visible_definitions_{};
     std::vector<std::vector<std::string>> imports_{{}};
     std::vector<std::vector<SyntaxBinding>> scopes_{{}};
 };

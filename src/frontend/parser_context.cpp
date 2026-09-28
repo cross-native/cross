@@ -11,6 +11,18 @@ std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment& environme
     return environment.storage;
 }
 
+std::optional<SyntaxEntityId> syntax_resolve_entity(
+    const SyntaxNode& node, std::string_view name, Diagnostics& diagnostics,
+    SourceLocation location) {
+    if (!node.context || !node.context->parse_environment ||
+        !node.context->parse_environment->syntax) {
+        diagnostics.error(location, "$::meta::is_extension requires a node with retained syntax context");
+        return {};
+    }
+    return node.context->parse_environment->syntax->resolve(
+        name, node.context->name_space, location, diagnostics);
+}
+
 std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() const {
     const auto execution = syntax_ ? syntax_->execution() : nullptr;
     const auto limits = execution ? execution->limits() : EvaluationLimits{};

@@ -3471,7 +3471,8 @@ private:
             }
             if (name == "$::meta::tokens" || name == "$::meta::node_span" || name == "$::meta::child_count" ||
                 name == "$::meta::child" || name == "$::meta::is_kind" ||
-                name == "$::meta::is_production" || name == "$::meta::replace_child" ||
+                name == "$::meta::is_production" || name == "$::meta::is_extension" ||
+                name == "$::meta::replace_child" ||
                 name == "$::meta::extension_match") {
                 const auto count = name == "$::meta::tokens" || name == "$::meta::node_span" ||
                     name == "$::meta::child_count" || name == "$::meta::extension_match" ? 1U :
@@ -4168,7 +4169,8 @@ private:
             if (procedural_ && expression.left->text == "$::meta::child_count")
                 return builtin_type(BuiltinType::Uptr);
             if (procedural_ && (expression.left->text == "$::meta::is_kind" ||
-                expression.left->text == "$::meta::is_production"))
+                expression.left->text == "$::meta::is_production" ||
+                expression.left->text == "$::meta::is_extension"))
                 return builtin_type(BuiltinType::Bool);
             if (expression.left->text == "$::embed") return bytes_type();
             if (expression.left->text == "$::meta::len")
@@ -6535,6 +6537,7 @@ private:
             expression.left->text == "$::meta::child" ||
             expression.left->text == "$::meta::is_kind" ||
             expression.left->text == "$::meta::is_production" ||
+            expression.left->text == "$::meta::is_extension" ||
             expression.left->text == "$::meta::replace_child" ||
             expression.left->text == "$::meta::extension_match")) {
             const auto& name = expression.left->text;
@@ -6629,6 +6632,14 @@ private:
             }
             const auto written = std::string_view(*argument->string).substr(argument->offset,
                 argument->string->size() - argument->offset - 1);
+            if (name == "$::meta::is_extension") {
+                const auto resolved = syntax_resolve_entity(node, written, diagnostics_,
+                    expression.arguments[1]->location);
+                if (!resolved) return std::nullopt;
+                return EvalValue{UInt128{node.kind == SyntaxNode::Kind::Extension &&
+                    node.definition && *node.definition == *resolved},
+                    builtin_type(BuiltinType::Bool)};
+            }
             if (name == "$::meta::is_production") {
                 bool known = false;
                 for (std::size_t at = 1; at < static_cast<std::size_t>(SyntaxProduction::Count); ++at)
