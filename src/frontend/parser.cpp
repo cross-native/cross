@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frontend/parser.hpp"
 #include "frontend/name.hpp"
+#include "frontend/procedural.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2673,11 +2674,11 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_
         ? SyntaxProduction::Declaration : SyntaxProduction::None);
+    const auto expansion_head = expansion_function_head(tokens_, index_);
     if (parsing_public_fragment_ && (current().is("syntax") ||
         current().is("namespace") || current().is("using") ||
         current().is("$::static_assert") || macro_start() || active_syntax(true) ||
-        (current().is("[[") && (current(1).is("macro") ||
-         current(1).is("syntax_expander"))))) {
+        expansion_head)) {
         error_here("parsed declaration requires a direct core declaration");
         ++index_;
         return;
@@ -2688,8 +2689,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         ~NamespaceRestore() { value = std::move(previous); }
     } restore{active_namespace_, active_namespace_};
     active_namespace_ = name_space;
-    if (syntax_ && current().is("[[") &&
-        (current(1).is("macro") || current(1).is("syntax_expander")) && current(2).is("]]")) {
+    if (syntax_ && expansion_head) {
         if (replacement_) error_here("expansion output cannot introduce syntax registration");
         else {
             const auto context = syntax_context(current().location);

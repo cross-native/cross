@@ -54,6 +54,93 @@ std::optional<std::size_t> matching_group(const std::vector<Token>& tokens,
     return std::nullopt;
 }
 
+} // namespace
+
+std::optional<ExpansionFunctionHead> expansion_function_head(
+    const std::vector<Token>& tokens, std::size_t index) {
+    if (index >= tokens.size()) return std::nullopt;
+    const auto location = tokens[index].location;
+    auto cursor = index;
+    bool static_storage = false;
+    bool global_storage = false;
+    bool malformed = false;
+    std::optional<ExpansionFunctionHead> head;
+    std::optional<std::pair<std::string, SourceLocation>> other_attribute;
+    const auto set_error = [&](std::string message, SourceLocation at) {
+        if (head && head->error.empty()) {
+            head->error = std::move(message);
+            head->error_location = at;
+        }
+    };
+    while (cursor < tokens.size()) {
+        if (tokens[cursor].is("static") || tokens[cursor].is("global") ||
+            tokens[cursor].is("inline")) {
+            static_storage |= tokens[cursor].is("static");
+            global_storage |= tokens[cursor].is("global");
+            ++cursor;
+            continue;
+        }
+        if (!tokens[cursor].is("[[")) break;
+        ++cursor;
+        bool closed = false;
+        while (cursor < tokens.size() && tokens[cursor].kind != TokenKind::End) {
+            if (tokens[cursor].kind != TokenKind::Identifier) {
+                malformed = true;
+                break;
+            }
+            const auto attribute_location = tokens[cursor].location;
+            std::string name(tokens[cursor++].text);
+            while (cursor + 1 < tokens.size() && tokens[cursor].is("::") &&
+                   tokens[cursor + 1].kind == TokenKind::Identifier) {
+                name += "::";
+                name += tokens[cursor + 1].text;
+                cursor += 2;
+            }
+            bool arguments = false;
+            if (cursor < tokens.size() && tokens[cursor].is("(")) {
+                arguments = true;
+                const auto close = matching_group(tokens, cursor);
+                if (!close) { malformed = true; break; }
+                cursor = *close + 1;
+            }
+            if (name == "macro" || name == "syntax_expander") {
+                if (head) set_error("expansion function has more than one role attribute",
+                                    attribute_location);
+                else head = ExpansionFunctionHead{cursor, location,
+                    name == "syntax_expander", false, false, {}, {}};
+                if (arguments) set_error("'" + name + "' takes no arguments",
+                                         attribute_location);
+            } else if (name != "eval_only" || arguments) {
+                if (!other_attribute)
+                    other_attribute = std::pair{name, attribute_location};
+            }
+            if (cursor < tokens.size() && tokens[cursor].is(",")) {
+                ++cursor;
+                continue;
+            }
+            if (cursor < tokens.size() && tokens[cursor].is("]]")) {
+                ++cursor;
+                closed = true;
+            } else malformed = true;
+            break;
+        }
+        if (!closed) { malformed = true; break; }
+    }
+    if (!head) return std::nullopt;
+    head->after_specifiers = cursor;
+    head->static_storage = static_storage;
+    head->global_storage = global_storage;
+    if (malformed) set_error("malformed expansion function attribute list", location);
+    if (other_attribute) {
+        set_error("attribute '" + other_attribute->first +
+                  "' on an expansion function is not implemented",
+                  other_attribute->second);
+    }
+    return head;
+}
+
+namespace {
+
 std::string qualified_name(const std::vector<Token>& tokens, std::size_t& index,
                            std::size_t end) {
     if (index >= end || tokens[index].kind != TokenKind::Identifier) return {};
@@ -187,34 +274,24 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                        bool syntax_expanders = false) {
     std::vector<TokenMacro> macros;
     const auto regions = namespace_regions(tokens);
-    for (std::size_t index = 0; index + 3 < tokens.size(); ++index) {
-        if (tokens[index].text != "[[" ||
-            (tokens[index + 1].text != "macro" &&
-             !(syntax_expanders && tokens[index + 1].text == "syntax_expander")) ||
-            tokens[index + 2].text != "]]") {
-            continue;
-        }
-        const bool syntax_expander = tokens[index + 1].text == "syntax_expander";
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const auto head = expansion_function_head(tokens, index);
+        if (!head || (head->syntax_expander && !syntax_expanders)) continue;
+        const bool syntax_expander = head->syntax_expander;
         const auto role = syntax_expander ? "syntax_expander" : "macro";
         const auto input_type = syntax_expander ? "$::meta::syntax_match" : "$::meta::tokens";
         const auto declaration_begin = tokens[index].location.offset;
-        auto cursor = index + 3;
-        bool static_storage = false;
-        bool global_storage = false;
-        while (cursor < tokens.size() &&
-               (tokens[cursor].text == "static" ||
-                tokens[cursor].text == "global" ||
-                tokens[cursor].text == "inline")) {
-            static_storage = static_storage ||
-                             tokens[cursor].text == "static";
-            global_storage = global_storage ||
-                             tokens[cursor].text == "global";
-            ++cursor;
+        auto cursor = head->after_specifiers;
+        if (!head->error.empty()) {
+            diagnostics.error(head->error_location, head->error);
+            index = cursor - 1;
+            continue;
         }
-        if (!static_storage || global_storage) {
+        if (!head->static_storage || head->global_storage) {
             diagnostics.error(
                 tokens[index].location,
                 "'" + std::string(role) + "' functions must be static and cannot be global");
+            index = cursor - 1;
             continue;
         }
         if (cursor >= tokens.size() ||

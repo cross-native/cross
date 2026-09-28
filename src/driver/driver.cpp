@@ -822,10 +822,11 @@ int cc_main(int argc, char** argv) {
     for (const auto* preprocessed_source : compilation_units) {
         auto tokens = Lexer(*preprocessed_source, diagnostics).lex();
         bool uses_syntax = false;
-        for (std::size_t at = 0; at < tokens.size(); ++at)
-            if (tokens[at].is("syntax") ||
-                (tokens[at].is("[[") && at + 1 < tokens.size() && tokens[at + 1].is("syntax_expander")))
-                uses_syntax = true;
+        for (std::size_t at = 0; at < tokens.size(); ++at) {
+            if (tokens[at].is("syntax")) { uses_syntax = true; break; }
+            const auto head = expansion_function_head(tokens, at);
+            if (head && head->syntax_expander) { uses_syntax = true; break; }
+        }
         std::shared_ptr<SyntaxExecution> execution;
         if (uses_syntax) {
             // Owner expansion must precede macros nested in raw captures.

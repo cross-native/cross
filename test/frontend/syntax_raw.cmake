@@ -44,6 +44,35 @@ function(reject case expected source)
     endif()
 endfunction()
 
+function(accept case source)
+    set(input "${directory}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S "${input}" -o "${directory}/${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "${case} failed\n${out}\n${err}")
+    endif()
+endfunction()
+
+accept(expander_combined_attributes
+    "[[eval_only, syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { 7u32 }; } ${definition}syntax Value; global u32 entry() { return value (); }\n")
+accept(expander_separated_attributes
+    "static [[eval_only]] [[syntax_expander]] $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { 7u32 }; } ${definition}syntax Value; global u32 entry() { return value (); }\n")
+accept(expander_standalone_attributes
+    "[[eval_only, syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { 7u32 }; }\n")
+file(READ "${directory}/expander_standalone_attributes.s" standalone_assembly)
+if(standalone_assembly MATCHES "expand:")
+    message(FATAL_ERROR "standalone syntax expander escaped to runtime assembly")
+endif()
+accept(macro_combined_attributes
+    "[[macro, eval_only]] static $::meta::tokens answer(in $::meta::tokens input) { return $::quote { 7u32 }; } global u32 entry() { return answer!{}; }\n")
+accept(macro_separated_attributes
+    "[[eval_only]] static [[macro]] $::meta::tokens answer(in $::meta::tokens input) { return $::quote { 7u32 }; } global u32 entry() { return answer!{}; }\n")
+reject(expander_conflicting_attribute "attribute 'runtime_only' on an expansion function is not implemented"
+    "[[runtime_only, syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote {}; }\n")
+reject(macro_duplicate_role "more than one role attribute"
+    "[[macro]] [[macro]] static $::meta::tokens answer(in $::meta::tokens input) { return $::quote {}; }\n")
+
 reject(reserved "ordinary nonreserved identifier"
     "${expander}syntax Bad : expression { prefix \"if\"; match body:paren; expand expand; }\n")
 reject(terminal "exactly one existing token"

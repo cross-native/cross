@@ -13,6 +13,19 @@ struct ExpansionFunctionSource {
     FunctionDecl function;
     bool syntax_expander{};
 };
+struct ExpansionFunctionHead {
+    std::size_t after_specifiers{};
+    SourceLocation location;
+    bool syntax_expander{};
+    bool static_storage{};
+    bool global_storage{};
+    std::string error;
+    SourceLocation error_location;
+};
+// Recognize a translation-time function's role among its leading declaration
+// attributes and storage specifiers. Ordinary declarations return no head.
+std::optional<ExpansionFunctionHead> expansion_function_head(
+    const std::vector<Token>& tokens, std::size_t index);
 // Parse one original declaration selected by the item parser, never scan raw
 // captured inputs for declarations. Advances index past the bounded source.
 std::optional<ExpansionFunctionSource> parse_expansion_function(
