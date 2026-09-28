@@ -215,6 +215,9 @@ private:
         bool complete{};
     };
     std::unordered_map<std::string, RecordTag> record_types_;
+    bool transfer_spliced_tags(Parser& child,
+        const std::unordered_map<std::string, RecordTag>& prior_records,
+        SourceLocation location);
     std::unordered_map<std::string, TypePtr> type_aliases_;
     std::vector<StaticAssertDecl> static_assertions_;
     FunctionDecl* active_function_{};

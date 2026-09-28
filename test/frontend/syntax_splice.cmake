@@ -47,6 +47,66 @@ if(NOT reverse_status EQUAL 1 OR
     message(FATAL_ERROR "reverse splice category was not diagnosed\n${reverse_out}\n${reverse_err}")
 endif()
 
+set(type_source [=[
+[[syntax_expander]] static $::meta::tokens wrong_type(in $::meta::syntax_match input) {
+    return $::quote { typedef $::unquote($::syntax::node(input, "body")) Alias; };
+}
+syntax WrongType : statement { prefix "wrong_type"; match body:stmt; expand wrong_type; }
+global u32 entry() { syntax WrongType; wrong_type return 1u32; return 0u32; }
+]=])
+set(type_input "${OUTPUT}/wrong-type-category.x")
+file(WRITE "${type_input}" "${type_source}")
+execute_process(COMMAND "${CC}" -S "${type_input}" -o "${OUTPUT}/wrong-type-category.s"
+    RESULT_VARIABLE type_status OUTPUT_VARIABLE type_out ERROR_VARIABLE type_err)
+if(NOT type_status EQUAL 1 OR
+   NOT type_err MATCHES "structured syntax splice requires a type node at type position" OR
+   NOT type_err MATCHES "wrong-type-category.x:[0-9]+:[0-9]+:")
+    message(FATAL_ERROR "wrong type splice category was not diagnosed\n${type_out}\n${type_err}")
+endif()
+
+set(type_expression_source [=[
+[[syntax_expander]] static $::meta::tokens wrong_expression(in $::meta::syntax_match input) {
+    return $::quote { return $::unquote($::syntax::node(input, "value")); };
+}
+syntax WrongExpression : statement {
+    prefix "wrong_expression"; match value:type ";"; expand wrong_expression;
+}
+global u32 entry() { syntax WrongExpression; wrong_expression u32; return 0u32; }
+]=])
+set(type_expression_input "${OUTPUT}/type-at-expression.x")
+file(WRITE "${type_expression_input}" "${type_expression_source}")
+execute_process(COMMAND "${CC}" -S "${type_expression_input}" -o "${OUTPUT}/type-at-expression.s"
+    RESULT_VARIABLE type_expression_status OUTPUT_VARIABLE type_expression_out ERROR_VARIABLE type_expression_err)
+if(NOT type_expression_status EQUAL 1 OR
+   NOT type_expression_err MATCHES "structured syntax splice requires an expression node at expression position" OR
+   NOT type_expression_err MATCHES "type-at-expression.x:[0-9]+:[0-9]+:")
+    message(FATAL_ERROR "type at expression position was not diagnosed\n${type_expression_out}\n${type_expression_err}")
+endif()
+
+set(type_tag_source [=[
+[[syntax_expander]] static $::meta::tokens duplicate_type_tag(in $::meta::syntax_match input) {
+    return $::quote { { struct TypeTag { u32 first; } earlier;
+                       $::unquote($::syntax::node(input, "value")) later; } };
+}
+syntax DuplicateTypeTag : statement {
+    prefix "duplicate_type_tag"; match value:type ";"; expand duplicate_type_tag;
+}
+global u32 entry() {
+    syntax DuplicateTypeTag;
+    duplicate_type_tag struct TypeTag { u32 second; };
+    return 0u32;
+}
+]=])
+set(type_tag_input "${OUTPUT}/destination-type-tag-collision.x")
+file(WRITE "${type_tag_input}" "${type_tag_source}")
+execute_process(COMMAND "${CC}" -S "${type_tag_input}" -o "${OUTPUT}/destination-type-tag-collision.s"
+    RESULT_VARIABLE type_tag_status OUTPUT_VARIABLE type_tag_out ERROR_VARIABLE type_tag_err)
+if(NOT type_tag_status EQUAL 1 OR
+   NOT type_tag_err MATCHES "spliced record tag 'TypeTag' duplicates a destination definition" OR
+   NOT type_tag_err MATCHES "destination-type-tag-collision.x:[0-9]+:[0-9]+:")
+    message(FATAL_ERROR "type splice destination tag collision was not diagnosed\n${type_tag_out}\n${type_tag_err}")
+endif()
+
 set(collision_source [=[
 [[syntax_expander]] static $::meta::tokens duplicate(in $::meta::syntax_match input) {
     $::meta::tokens name = $::meta::call_site($::meta::parse("copied"));

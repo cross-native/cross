@@ -85,6 +85,21 @@ bool syntax_statement_node(const SyntaxNode& node) {
           node.slot_production == SyntaxProduction::UnattributedStatement));
 }
 
+bool syntax_type_node(const SyntaxNode& node) {
+    const auto core_type = node.production == SyntaxProduction::TypeName ||
+        node.production == SyntaxProduction::TypeSpecifier ||
+        node.production == SyntaxProduction::ScalarType ||
+        node.production == SyntaxProduction::StructOrUnionSpecifier ||
+        node.production == SyntaxProduction::EnumSpecifier ||
+        node.production == SyntaxProduction::TypedefName ||
+        node.production == SyntaxProduction::TargetScalarBuiltinName;
+    return (node.kind == SyntaxNode::Kind::Core && core_type) ||
+        ((node.kind == SyntaxNode::Kind::Deferred ||
+          node.kind == SyntaxNode::Kind::Extension ||
+          node.kind == SyntaxNode::Kind::Macro) &&
+         node.slot_production == SyntaxProduction::TypeName);
+}
+
 TokenSequence syntax_node_tokens(const SyntaxNode& node) {
     TokenSequence result;
     const auto append = [&](const MetaToken& token) {
@@ -146,11 +161,12 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node) {
     while (!pending.empty()) {
         const auto* next = pending.back();
         pending.pop_back();
-        if (next->kind == SyntaxNode::Kind::Core &&
-            next->production == SyntaxProduction::PrimaryExpression &&
-            next->structured_splice &&
+        if (next->kind == SyntaxNode::Kind::Core && next->structured_splice &&
             next->children.size() == 1 && next->children.front() &&
-            syntax_expression_node(*next->children.front())) {
+            ((next->production == SyntaxProduction::PrimaryExpression &&
+              syntax_expression_node(*next->children.front())) ||
+             (next->production == SyntaxProduction::TypeSpecifier &&
+              syntax_type_node(*next->children.front())))) {
             const auto& child = next->children.front();
             MetaToken marker;
             marker.kind = TokenKind::StructuredSplice;
@@ -572,7 +588,7 @@ struct TreeValidator {
             }
             if (node->kind == SyntaxNode::Kind::Token || opaque_kind(node->kind)) {
                 if (node->structured_splice) {
-                    error = "structured splice must be a core primary expression";
+                    error = "structured splice must be a core expression or type specifier";
                     return false;
                 }
                 if (node->kind == SyntaxNode::Kind::Deferred) {
@@ -643,16 +659,22 @@ struct TreeValidator {
                 error = "invalid public syntax tree node representation";
                 return false;
             }
-            const bool splice_shape = node->structured_splice &&
+            const bool expression_splice_shape = node->structured_splice &&
                 node->kind == SyntaxNode::Kind::Core &&
                 node->production == SyntaxProduction::PrimaryExpression &&
                 node->children.size() == 1 && node->children.front() &&
                 syntax_expression_node(*node->children.front());
-            if (node->structured_splice && !splice_shape) {
-                error = "structured expression splice requires one expression child";
+            const bool type_splice_shape = node->structured_splice &&
+                node->kind == SyntaxNode::Kind::Core &&
+                node->production == SyntaxProduction::TypeSpecifier &&
+                node->children.size() == 1 && node->children.front() &&
+                syntax_type_node(*node->children.front());
+            if (node->structured_splice && !expression_splice_shape && !type_splice_shape) {
+                error = "structured splice requires one category-compatible child";
                 return false;
             }
-            const auto positions = splice_shape ? Positions{node->children.size()}
+            const auto positions = expression_splice_shape || type_splice_shape
+                ? Positions{node->children.size()}
                 : match(*rule, node->children, 0);
             if (exhausted) break;
             if (std::find(positions.begin(), positions.end(), node->children.size()) == positions.end()) {

@@ -89,6 +89,42 @@ syntax TransplantInner : statement {
 syntax ShadowTransplant : statement {
     prefix "shadow_transplant"; match result:ident body:stmt; expand shadow_transplant;
 }
+[[syntax_expander]] static $::meta::tokens transplant_type(in $::meta::syntax_match input) {
+    $::meta::syntax type = $::syntax::node(input, "value");
+    $::meta::syntax parsed = $::meta::parse("type",
+        $::quote { $::unquote(type) }, $::syntax::context(input));
+    $::meta::syntax specifier = $::meta::child(
+        $::meta::child($::meta::child(parsed, 0uptr), 0uptr), 0uptr);
+    if (!$::meta::is_production(parsed, "type_name") ||
+        !$::meta::is_production(specifier, "type_specifier") ||
+        !$::meta::is_production($::meta::child(specifier, 0uptr), "type_name"))
+        return $::quote { public_schema_failure(); };
+    return $::quote { $::unquote(parsed) $::unquote($::syntax::capture(input, "name")); };
+}
+syntax TransplantType : statement {
+    prefix "transplant_type"; match name:ident value:type ";"; expand transplant_type;
+}
+[[syntax_expander]] static $::meta::tokens shadow_type(in $::meta::syntax_match input) {
+    $::meta::tokens alias = $::meta::call_site($::meta::parse("CapturedAlias"));
+    $::meta::tokens name = $::syntax::capture(input, "name");
+    return $::quote { {
+        typedef u32 $::unquote(alias);
+        $::unquote($::syntax::node(input, "value")) $::unquote(name);
+        if (sizeof($::unquote(name)) != 2uptr) return 0u32;
+    } };
+}
+syntax ShadowType : statement {
+    prefix "shadow_type"; match name:ident value:type ";"; expand shadow_type;
+}
+[[syntax_expander]] static $::meta::tokens transplant_specifier(in $::meta::syntax_match input) {
+    $::meta::syntax type = $::syntax::node(input, "value");
+    $::meta::syntax specifier = $::meta::child(
+        $::meta::child($::meta::child(type, 0uptr), 0uptr), 0uptr);
+    return $::quote { $::unquote(specifier) $::unquote($::syntax::capture(input, "name")); };
+}
+syntax TransplantSpecifier : statement {
+    prefix "transplant_specifier"; match name:ident value:type ";"; expand transplant_specifier;
+}
 [[macro]] static $::meta::tokens declare_spliced(in $::meta::tokens name) {
     return $::quote { u32 $::unquote(name) = 11u32; };
 }
@@ -104,6 +140,9 @@ global u32 syntax_raw_entry() {
     syntax Transplant;
     syntax InnerStatement, TransplantInner;
     syntax ShadowTransplant;
+    syntax TransplantType;
+    syntax ShadowType;
+    syntax TransplantSpecifier;
     u32 amount = 4u32;
     transplant u32 moved = amount + 1u32;
     transplant typedef u32 MovedType;
@@ -112,6 +151,20 @@ global u32 syntax_raw_entry() {
     transplant declare_spliced!(macro_moved);
     transplant_inner inner_statement inner_moved;
     shadow_transplant relocated u32 relocated = amount;
+    transplant_type typed_value u32;
+    typed_value = 7u32;
+    transplant_type pointer_value u32 *;
+    pointer_value = &amount;
+    transplant_type array_value u32 [2];
+    array_value[0] = 3u32;
+    array_value[1] = 4u32;
+    transplant_type record_value struct SplicedTypeTag { u32 field; };
+    record_value.field = 12u32;
+    struct SplicedTypeTag *record_pointer = &record_value;
+    typedef u16 CapturedAlias;
+    shadow_type alias_value CapturedAlias;
+    transplant_specifier base_value u16;
+    base_value = 8u16;
     MovedType checked = moved;
     struct SplicedRecord later = { 9u32 };
     enum SplicedMode later_mode = spliced_mode_value;
@@ -124,7 +177,10 @@ global u32 syntax_raw_entry() {
         __cross_syntax_splice != 2u32 || checked != 5u32 ||
         record.value != 7u32 || later.value != 9u32 ||
         mode != spliced_mode_value || later_mode != spliced_mode_value ||
-        macro_moved != 11u32 || inner_moved != 13u32)
+        macro_moved != 11u32 || inner_moved != 13u32 ||
+        typed_value != 7u32 || *pointer_value != amount ||
+        array_value[0] + array_value[1] != 7u32 ||
+        record_pointer->field != 12u32 || base_value != 8u16)
         return 0u32;
     return 61u32;
 }

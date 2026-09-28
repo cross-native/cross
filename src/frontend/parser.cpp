@@ -1064,6 +1064,52 @@ void Parser::adopt_replacement(Parser& child) {
         static_assertions_.push_back(std::move(assertion));
 }
 
+bool Parser::transfer_spliced_tags(
+    Parser& child, const std::unordered_map<std::string, RecordTag>& prior_records,
+    SourceLocation location) {
+    const auto previous_errors = diagnostics_.errors();
+    for (const auto& [name, tag] : child.record_types_) {
+        const auto before = prior_records.find(name);
+        if (before != prior_records.end() &&
+            before->second.is_union == tag.is_union &&
+            before->second.complete == tag.complete) continue;
+        const auto destination = record_types_.find(name);
+        if (destination == record_types_.end()) continue;
+        if (destination->second.is_union != tag.is_union)
+            diagnostics_.error(location,
+                "spliced record tag '" + name + "' conflicts with the destination record kind");
+        else if (tag.complete && destination->second.complete)
+            diagnostics_.error(location,
+                "spliced record tag '" + name + "' duplicates a destination definition");
+    }
+    for (const auto& enumeration : child.pending_enumerations_) {
+        if (const auto destination = enum_types_.find(enumeration.name);
+            destination != enum_types_.end() &&
+            destination->second != enumeration.underlying)
+            diagnostics_.error(location,
+                "spliced enumeration '" + enumeration.name +
+                "' conflicts with the destination underlying type");
+    }
+    if (diagnostics_.errors() != previous_errors) return false;
+    for (const auto& [name, tag] : child.record_types_) {
+        const auto before = prior_records.find(name);
+        if (before != prior_records.end() &&
+            before->second.is_union == tag.is_union &&
+            before->second.complete == tag.complete) continue;
+        auto [destination, inserted] = record_types_.emplace(name, tag);
+        if (!inserted && tag.complete) destination->second.complete = true;
+    }
+    for (auto& record : child.pending_records_)
+        pending_records_.push_back(std::move(record));
+    for (auto& enumeration : child.pending_enumerations_) {
+        enum_types_[enumeration.name] = enumeration.underlying;
+        for (const auto& enumerator : enumeration.enumerators)
+            known_ordinary_values_.insert(enumerator.name);
+        pending_enumerations_.push_back(std::move(enumeration));
+    }
+    return true;
+}
+
 std::unique_ptr<Statement> Parser::parse_statement_replacement() {
     const auto location = current().location;
     const bool macro = macro_start();
@@ -1467,6 +1513,8 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
 
 bool Parser::type_start() const {
     const auto& token = current();
+    if (token.kind == TokenKind::StructuredSplice)
+        return token.splice && syntax_type_node(*token.splice);
     if (token.kind == TokenKind::Identifier) {
         const auto binding = token.value_binding.kind != ValueBinding::Kind::Unknown
             ? token.value_binding : token_origin(token.location).value_binding;
@@ -1561,7 +1609,53 @@ TypePtr Parser::parse_type(bool record_specifiers,
         ProductionScope builtin(*this, current().kind == TokenKind::BuiltinName
                                            ? SyntaxProduction::BuiltinName
                                            : SyntaxProduction::None);
-        if (current().is("$::meta::context")) {
+        if (current().kind == TokenKind::StructuredSplice) {
+            const auto item = current();
+            ++index_;
+            type = builtin_type(BuiltinType::I32, is_const, is_volatile);
+            if (!item.splice || !syntax_type_node(*item.splice)) {
+                diagnostics_.error(item.location,
+                    "structured syntax splice requires a type node at type position");
+            } else if (!syntax_ || !item.splice->context ||
+                       !item.splice->context->parse_environment) {
+                diagnostics_.error(item.location,
+                    "structured syntax splice has no retained parse environment");
+            } else {
+                if (recording_public_tree_ && type_specifier.event < production_events_.size()) {
+                    auto wrapper = std::make_shared<SyntaxNode>();
+                    wrapper->kind = SyntaxNode::Kind::Core;
+                    wrapper->production = SyntaxProduction::TypeSpecifier;
+                    wrapper->structured_splice = true;
+                    wrapper->children.push_back(item.splice);
+                    wrapper->span = item.splice->span;
+                    wrapper->context = item.splice->context;
+                    production_events_[type_specifier.event].opaque = std::move(wrapper);
+                }
+                if (!parsing_public_fragment_) {
+                    auto output = syntax_->execution()->materialize_node(*item.splice, item.location);
+                    if (output) {
+                        auto child = replacement_parser(std::move(*output));
+                        child->restore_environment(*item.splice->context->parse_environment,
+                                                   *item.splice->context);
+                        const auto prior_records = child->record_types_;
+                        const auto previous_errors = diagnostics_.errors();
+                        auto parsed = child->parse_type();
+                        std::optional<std::string> declarator_name;
+                        if (parsed) parsed = child->parse_declarator(std::move(parsed), declarator_name);
+                        if (declarator_name)
+                            child->error_here("structured type splice cannot declare a name");
+                        if (child->current().kind != TokenKind::End)
+                            child->error_here("structured type splice must contain one complete type");
+                        if (diagnostics_.errors() == previous_errors && parsed &&
+                            transfer_spliced_tags(*child, prior_records, item.location)) {
+                            for (auto& assertion : child->static_assertions_)
+                                static_assertions_.push_back(std::move(assertion));
+                            type = std::move(parsed);
+                        }
+                    }
+                }
+            }
+        } else if (current().is("$::meta::context")) {
             if (!parsing_procedural_body_)
                 error_here("$::meta::context is only available in expansion functions");
             type = context_type();
@@ -3530,7 +3624,8 @@ std::unique_ptr<Statement> Parser::parse_compound() {
 
 std::unique_ptr<Statement> Parser::parse_statement() {
     ProductionScope production(*this, SyntaxProduction::Statement);
-    if (current().kind == TokenKind::StructuredSplice) {
+    if (current().kind == TokenKind::StructuredSplice &&
+        (!current().splice || !syntax_type_node(*current().splice))) {
         const auto item = current();
         ++index_;
         auto invalid = std::make_unique<Statement>();
@@ -3594,29 +3689,6 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         if (child->current().kind != TokenKind::End)
             child->error_here("structured statement splice must contain one complete statement");
         if (diagnostics_.errors() != previous_errors || !statement) return invalid;
-        for (const auto& [name, tag] : child->record_types_) {
-            const auto before = prior_records.find(name);
-            if (before != prior_records.end() &&
-                before->second.is_union == tag.is_union &&
-                before->second.complete == tag.complete) continue;
-            const auto destination = record_types_.find(name);
-            if (destination == record_types_.end()) continue;
-            if (destination->second.is_union != tag.is_union)
-                diagnostics_.error(item.location,
-                    "spliced record tag '" + name + "' conflicts with the destination record kind");
-            else if (tag.complete && destination->second.complete)
-                diagnostics_.error(item.location,
-                    "spliced record tag '" + name + "' duplicates a destination definition");
-        }
-        for (const auto& enumeration : child->pending_enumerations_) {
-            if (const auto destination = enum_types_.find(enumeration.name);
-                destination != enum_types_.end() &&
-                destination->second != enumeration.underlying)
-                diagnostics_.error(item.location,
-                    "spliced enumeration '" + enumeration.name +
-                    "' conflicts with the destination underlying type");
-        }
-        if (diagnostics_.errors() != previous_errors) return invalid;
         for (const auto& [key, binding] : child->local_scopes_.back()) {
             if (prior_values.contains(key)) continue;
             if (local_type_scopes_.back().contains(key))
@@ -3640,22 +3712,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
             } else local_type_scopes_.back().emplace(key, copy_type(type));
         }
         if (diagnostics_.errors() != previous_errors) return invalid;
-        for (const auto& [name, tag] : child->record_types_) {
-            const auto before = prior_records.find(name);
-            if (before != prior_records.end() &&
-                before->second.is_union == tag.is_union &&
-                before->second.complete == tag.complete) continue;
-            auto [destination, inserted] = record_types_.emplace(name, tag);
-            if (!inserted && tag.complete) destination->second.complete = true;
-        }
-        for (auto& record : child->pending_records_)
-            pending_records_.push_back(std::move(record));
-        for (auto& enumeration : child->pending_enumerations_) {
-            enum_types_[enumeration.name] = enumeration.underlying;
-            for (const auto& enumerator : enumeration.enumerators)
-                known_ordinary_values_.insert(enumerator.name);
-            pending_enumerations_.push_back(std::move(enumeration));
-        }
+        if (!transfer_spliced_tags(*child, prior_records, item.location)) return invalid;
         switch_default_seen_ = std::move(child->switch_default_seen_);
         for (auto& assertion : child->static_assertions_)
             static_assertions_.push_back(std::move(assertion));
