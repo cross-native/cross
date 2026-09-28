@@ -276,6 +276,7 @@ struct Statement {
     std::unique_ptr<Statement> first;
     std::unique_ptr<Statement> second;
     std::string label_name;
+    std::shared_ptr<const FreshIdentifier> label_fresh;
     std::vector<Attribute> attributes;
     bool global_label{};
 };
@@ -317,6 +318,7 @@ struct FunctionDecl {
 
     SourceLocation location;
     std::string name;
+    std::shared_ptr<const FreshIdentifier> fresh;
     std::string source_namespace;
     std::string source_unit;
     std::vector<std::string> imports;
@@ -338,6 +340,7 @@ struct FunctionDecl {
 struct ObjectDecl {
     SourceLocation location;
     std::string name;
+    std::shared_ptr<const FreshIdentifier> fresh;
     std::string source_unit;
     TypePtr type;
     std::vector<Attribute> attributes;
@@ -380,6 +383,8 @@ struct RecordDecl {
 struct GlobalLabelDecl {
     SourceLocation location;
     std::string qualified_name;
+    std::shared_ptr<const FreshIdentifier> owner_fresh;
+    std::shared_ptr<const FreshIdentifier> label_fresh;
     std::vector<Attribute> attributes;
 };
 

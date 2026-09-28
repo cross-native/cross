@@ -1,6 +1,10 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#if !$::has_builtin($::meta::call_site) || !$::has_intrinsic($::meta::call_site) || !$::has_builtin($::meta::gensym) || !$::has_intrinsic($::meta::gensym)
+#error identifier context and fresh identity operations must be discoverable
+#endif
+
 [[syntax_expander]] static $::meta::tokens relocate(in $::meta::syntax_match input) {
     return $::quote {
         {
@@ -39,6 +43,18 @@ syntax ChooseCallSite : expression {
 }
 syntax ChooseDefinition : expression {
     prefix "defsite"; match body:paren; expand choose_definition;
+}
+[[syntax_expander]] static $::meta::tokens make_fresh_pair(in $::meta::syntax_match input) {
+    $::meta::tokens first = $::meta::gensym("fresh");
+    $::meta::tokens second = $::meta::gensym("fresh");
+    return $::quote {{
+        u32 $::unquote(first) = 7u32;
+        u32 $::unquote(second) = 11u32;
+        return $::unquote(first) * 10u32 + $::unquote(second);
+    }};
+}
+syntax FreshPair : statement {
+    prefix "fresh_pair"; match body:paren; expand make_fresh_pair;
 }
 [[macro]] static $::meta::tokens choose_macro_site(in $::meta::tokens input) {
     return $::meta::call_site($::meta::parse("outside"));
@@ -96,6 +112,11 @@ static u32 ordinary_shadow() {
     { u32 value = 17u32; result = value; }
     return result + value;
 }
+[[noinline]] static u32 fresh_pair_result() {
+    syntax FreshPair;
+    u32 fresh = 99u32;
+    fresh_pair ();
+}
 #ifdef CUSTOM_SYNTAX_ABI
 [[abi(HOST_ABI)]]
 #endif
@@ -109,7 +130,7 @@ global u32 syntax_raw_entry() {
         value != 8u32 || interior() != 16u32 ||
         generic<u32, 3u32>(9u32) != 12u32 || ordinary_shadow() != 22u32 ||
         callsite () != 41u32 || defsite () != 23u32 ||
-        choose_macro_site! {} != 41u32)
+        choose_macro_site! {} != 41u32 || fresh_pair_result() != 81u32)
         return 0u32;
     return 61u32;
 }

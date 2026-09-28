@@ -70,11 +70,13 @@ struct NameKey {
     std::string spelling;
     ExpansionId context;
     ValueBinding binding;
+    std::shared_ptr<const FreshIdentifier> fresh;
 
     NameKey() = default;
     explicit NameKey(std::string_view name, SourceLocation location = {})
         : spelling(name) {
         const auto origin = token_origin(location);
+        fresh = origin.fresh;
         if (origin.context && origin.context->kind == SyntaxContext::Kind::DefinitionSite)
             context = origin.context->expansion;
     }
@@ -98,6 +100,7 @@ struct NameKeyHash {
         mix(std::hash<std::size_t>{}(name.binding.declaration.offset));
         mix(std::hash<std::uint64_t>{}(name.binding.declaration.expansion.value));
         mix(std::hash<std::size_t>{}(name.binding.declaration.output_position));
+        mix(std::hash<const FreshIdentifier*>{}(name.fresh.get()));
         return result;
     }
 };

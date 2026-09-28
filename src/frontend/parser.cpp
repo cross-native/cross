@@ -1184,7 +1184,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
                         TypePtr value_type;
                         if (current().kind == TokenKind::Identifier &&
                             (current(1).is(",") || current(1).is(")"))) {
-                            parameter_name = std::string(current().text);
+                            parameter_name = identifier_binding_name(current());
                             ++index_;
                             active_generic_types_.push_back(*parameter_name);
                         } else {
@@ -1387,7 +1387,7 @@ std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction product
     ProductionScope production(*this, production_name);
     const auto* first = consume_kind(TokenKind::Identifier);
     if (!first) return std::nullopt;
-    std::string name(first->text);
+    std::string name = identifier_binding_name(*first);
     while (current().is("::") && current(1).kind == TokenKind::Identifier) {
         consume("::");
         const auto* component = consume_kind(TokenKind::Identifier);
@@ -1396,20 +1396,20 @@ std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction product
             break;
         }
         name += "::";
-        name += component->text;
+        name += identifier_binding_name(*component);
     }
     return name;
 }
 
 std::string Parser::peek_qualified_name() const {
     if (current().kind != TokenKind::Identifier) return {};
-    std::string result(current().text);
+    std::string result = identifier_binding_name(current());
     auto position = index_ + 1;
     while (position + 1 < tokens_.size() &&
            tokens_[position].is("::") &&
            tokens_[position + 1].kind == TokenKind::Identifier) {
         result += "::";
-        result += tokens_[position + 1].text;
+        result += identifier_binding_name(tokens_[position + 1]);
         position += 2;
     }
     return result;
@@ -1745,7 +1745,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             } else {
                 ProductionScope leaf(*this, kind ? SyntaxProduction::ScalarType
                                                  : SyntaxProduction::TypedefName);
-                const auto spelling = std::string(current().text);
+                const auto spelling = identifier_binding_name(current());
                 if (kind)
                     ++index_;
                 else
@@ -1925,7 +1925,7 @@ Parser::parse_angle_generic_parameters() {
         TypePtr value_type;
         if (current().kind == TokenKind::Identifier &&
             (current(1).is(",") || current(1).is(">"))) {
-            name = std::string(current().text);
+            name = identifier_binding_name(current());
             ++index_;
         } else {
             {
@@ -1936,7 +1936,7 @@ Parser::parse_angle_generic_parameters() {
                                                   nullptr, nullptr, nullptr, true);
             }
             if (const auto* token = consume_kind(TokenKind::Identifier))
-                name = std::string(token->text);
+                name = identifier_binding_name(*token);
             if (value_type && !is_integer(value_type) &&
                 value_type->kind != Type::Kind::Pointer &&
                 !(value_type->kind == Type::Kind::Builtin &&
@@ -2717,8 +2717,9 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     for (;;) {
         ProductionScope item(*this, SyntaxProduction::InitDeclarator);
         std::optional<std::string> name;
+        SourceLocation name_location;
         std::vector<FunctionDecl::GenericParameter> angle_parameters;
-        auto type = parse_declarator(copy_type(base_type), name, false, nullptr, nullptr,
+        auto type = parse_declarator(copy_type(base_type), name, false, nullptr, &name_location,
                                      &angle_parameters);
         if (!type || !name) {
             if (!name) error_here("expected declaration name");
@@ -2734,6 +2735,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                 location, std::move(*name), name_space, std::move(result_type),
                 linkage, inline_hint, attributes, std::move(signature),
                 std::move(angle_parameters));
+            if (function) function->fresh = token_origin(name_location).fresh;
             if (function) {
                 if (!function->generic_parameters.empty())
                     known_generic_functions_.insert(function->name);
@@ -2777,6 +2779,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                 diagnostics_.error(location, "'inline' is valid only on a function");
             auto object = parse_object(location, std::move(*name), std::move(type),
                                        linkage, std::move(item_attributes), false);
+            if (object) object->fresh = token_origin(name_location).fresh;
             if (object) program.objects.push_back(std::move(object));
         }
         item.finish();
@@ -2797,6 +2800,7 @@ void Parser::parse_global_label_declaration(
     std::vector<Attribute> attributes) {
     const auto location = current().location;
     consume("label");
+    const auto first_name = index_;
     auto name = parse_qualified_name();
     if (!name || name->find("::") == std::string::npos) {
         diagnostics_.error(location,
@@ -2804,13 +2808,17 @@ void Parser::parse_global_label_declaration(
         synchronize_external();
         return;
     }
+    auto owner_fresh = index_ >= first_name + 3
+        ? token_origin(tokens_[index_ - 3].location).fresh : nullptr;
+    auto label_fresh = token_origin(tokens_[index_ - 1].location).fresh;
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
                       std::make_move_iterator(trailing.end()));
     expect(";", "after global label declaration");
     program.global_labels.push_back(
-        {location, join_namespace(name_space, *name), std::move(attributes)});
+        {location, join_namespace(name_space, *name), std::move(owner_fresh),
+         std::move(label_fresh), std::move(attributes)});
 }
 
 void Parser::parse_enum_declaration(Program& program,
@@ -2905,7 +2913,7 @@ void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_sp
         } else {
             EnumDecl::Enumerator enumerator;
             enumerator.location = token->location;
-            enumerator.name = join_namespace(name_space, token->text);
+            enumerator.name = join_namespace(name_space, identifier_binding_name(*token));
             known_ordinary_values_.insert(enumerator.name);
             if (consume("=")) enumerator.initializer = parse_constant_expression();
             declaration.enumerators.push_back(std::move(enumerator));
@@ -3604,8 +3612,9 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Label;
         statement->location = current().location;
-        if (consume("label")) statement->label_name = std::string(current().text);
-        else statement->label_name = std::string(current().text);
+        consume("label");
+        statement->label_name = identifier_binding_name(current());
+        statement->label_fresh = token_origin(current().location).fresh;
         ++index_;
         expect(":");
         if (parsing_public_fragment_ ||
@@ -3770,7 +3779,8 @@ std::unique_ptr<Statement> Parser::parse_global_label_statement(
     if (!name) {
         error_here("expected label name after 'global label'");
     } else {
-        statement->label_name = std::string(name->text);
+        statement->label_name = identifier_binding_name(*name);
+        statement->label_fresh = token_origin(name->location).fresh;
     }
     expect(":", "after global label name");
     if (parsing_public_fragment_ ||
@@ -3823,7 +3833,7 @@ std::unique_ptr<Expr> Parser::parse_initializer() {
                     designator.kind = Expr::InitializerDesignator::Kind::Member;
                     const auto* member = consume_kind(TokenKind::Identifier);
                     if (!member) error_here("expected member name after '.' in initializer");
-                    else designator.member = std::string(member->text);
+                    else designator.member = identifier_binding_name(*member);
                 } else {
                     consume("[");
                     designator.kind = Expr::InitializerDesignator::Kind::Index;
@@ -4085,7 +4095,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
             member->right = std::make_unique<Expr>();
             member->right->kind = Expr::Kind::Name;
             member->right->location = member_name->location;
-            member->right->text = std::string(member_name->text);
+            member->right->text = identifier_binding_name(*member_name);
             expression = std::move(member);
             continue;
         }

@@ -8,6 +8,38 @@
 
 namespace cross {
 
+namespace {
+std::string hex_unit(std::string_view unit) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(unit.size() * 2);
+    for (const char character : unit) {
+        const auto byte = static_cast<unsigned char>(character);
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 15]);
+    }
+    return result;
+}
+} // namespace
+
+std::string fresh_identifier_name(const FreshIdentifier& identifier) {
+    // The '$' marker is not legal in a written Cross identifier. This
+    // internal spelling is derived from the opaque identity, never the token's
+    // visible prefix, and cannot be selected by ordinary source text.
+    return "$fresh$" + hex_unit(identifier.source_unit) + '_' +
+           std::to_string(identifier.expansion.value) + '_' +
+           std::to_string(identifier.ordinal);
+}
+
+std::string fresh_identifier_link_stem(const FreshIdentifier& identifier) {
+    // Object-file names are a separate serialization boundary. Keep the
+    // complete source-unit bytes so separate compilation groups do not share
+    // a stem merely because their local expansion counters restart.
+    return "__cross_gensym_" + hex_unit(identifier.source_unit) + '_' +
+           std::to_string(identifier.expansion.value) + '_' +
+           std::to_string(identifier.ordinal);
+}
+
 SourceFile::SourceFile(std::filesystem::path source_path, std::string source_text,
                        std::vector<SourceExpansion> source_expansions,
                        std::vector<SourceTokenOrigin> source_token_origins,

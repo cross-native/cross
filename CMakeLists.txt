@@ -2474,6 +2474,36 @@ if(BUILD_TESTING)
                         -DENTRY=syntax_raw_entry -DEXPECTED=61
                         "-DCC_FLAGS=${syntax_flags}"
                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            add_test(NAME cross_gensym_global_${level}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_global.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-global-${level}-${mode}
+                        -DENTRY=syntax_raw_entry -DEXPECTED=61
+                        "-DCC_FLAGS=${syntax_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            add_test(NAME cross_gensym_categories_${level}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_categories.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-categories-${level}-${mode}
+                        -DENTRY=syntax_raw_entry -DEXPECTED=61
+                        "-DCC_FLAGS=${syntax_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            add_test(NAME cross_gensym_global_labels_${level}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_global_labels.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-global-labels-${level}-${mode}
+                        -DENTRY=syntax_raw_entry -DEXPECTED=61
+                        "-DCC_FLAGS=${syntax_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
             add_test(NAME cross_syntax_splice_${level}_${mode}
                 COMMAND "${CMAKE_COMMAND}"
                         -DCC=$<TARGET_FILE:cross_cc>
@@ -2522,6 +2552,27 @@ if(BUILD_TESTING)
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-hygiene-mips-${syntax_level}
             -DEXPECTED=P "-DCC_FLAGS=-${syntax_level};-fno-eval-calls"
             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        add_test(NAME cross_gensym_global_mips_${syntax_level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_global.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-global-mips-${syntax_level}
+            -DEXPECTED=P "-DCC_FLAGS=-${syntax_level};-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        add_test(NAME cross_gensym_categories_mips_${syntax_level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_categories.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-categories-mips-${syntax_level}
+            -DEXPECTED=P "-DCC_FLAGS=-${syntax_level};-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        add_test(NAME cross_gensym_global_labels_mips_${syntax_level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_global_labels.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-global-labels-mips-${syntax_level}
+            -DEXPECTED=P "-DCC_FLAGS=-${syntax_level};-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
         add_test(NAME cross_syntax_deferred_mips_${syntax_level} COMMAND "${CMAKE_COMMAND}"
             -DCC=$<TARGET_FILE:cross_cc>
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_deferred.x
@@ -2551,6 +2602,30 @@ if(BUILD_TESTING)
                 -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
                 -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-hygiene-n64-${syntax_level}-${syntax_endian}
+                -DN64_ENDIAN=${syntax_endian} "-DEXTRA_FLAGS=-${syntax_level} -fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            add_test(NAME cross_gensym_global_n64_${syntax_level}_${syntax_endian} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_global.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-global-n64-${syntax_level}-${syntax_endian}
+                -DN64_ENDIAN=${syntax_endian} "-DEXTRA_FLAGS=-${syntax_level} -fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            add_test(NAME cross_gensym_categories_n64_${syntax_level}_${syntax_endian} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_categories.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-categories-n64-${syntax_level}-${syntax_endian}
+                -DN64_ENDIAN=${syntax_endian} "-DEXTRA_FLAGS=-${syntax_level} -fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            add_test(NAME cross_gensym_global_labels_n64_${syntax_level}_${syntax_endian} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/gensym_global_labels.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gensym-global-labels-n64-${syntax_level}-${syntax_endian}
                 -DN64_ENDIAN=${syntax_endian} "-DEXTRA_FLAGS=-${syntax_level} -fno-eval-calls"
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
             add_test(NAME cross_syntax_deferred_n64_${syntax_level}_${syntax_endian} COMMAND "${CMAKE_COMMAND}"

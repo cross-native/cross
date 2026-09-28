@@ -270,6 +270,7 @@ std::unique_ptr<Statement> clone_statement(
     result->kind = source.kind;
     result->location = source.location;
     result->label_name = source.label_name;
+    result->label_fresh = source.label_fresh;
     result->attributes = source.attributes;
     result->global_label = source.global_label;
     for (const auto& child : source.statements) {
@@ -3532,6 +3533,22 @@ private:
                 }
                 return true;
             }
+            if (procedural_ && name == "$::meta::gensym") {
+                if (node.arguments.size() != 1U) {
+                    fail(node.location, "$::meta::gensym requires one string prefix");
+                    return false;
+                }
+                const auto& argument = *node.arguments.front();
+                if (!validate_required_tree(argument)) return false;
+                const auto type = expression_type(argument);
+                if (!type || type->kind != Type::Kind::Pointer ||
+                    !type->pointee || type->pointee->kind != Type::Kind::Builtin ||
+                    type->pointee->builtin != BuiltinType::U8) {
+                    fail(argument.location, "$::meta::gensym requires a translation-time string prefix");
+                    return false;
+                }
+                return true;
+            }
             if (name == "$::meta::len" || name == "$::meta::at" ||
                 name == "$::meta::slice" || name == "$::meta::concat") {
                 const auto count = name == "$::meta::len" ? 1U
@@ -4145,6 +4162,7 @@ private:
                 expression.left->text == "$::syntax::capture")) return tokens_type();
             if (procedural_ && expression.left->text == "$::meta::tokens") return tokens_type();
             if (procedural_ && expression.left->text == "$::meta::call_site") return tokens_type();
+            if (procedural_ && expression.left->text == "$::meta::gensym") return tokens_type();
             if (procedural_ && (expression.left->text == "$::meta::child" ||
                 expression.left->text == "$::meta::replace_child")) return syntax_type();
             if (procedural_ && expression.left->text == "$::meta::child_count")
@@ -6662,6 +6680,48 @@ private:
             if (!append_tokens(result, {token}, expression.location)) return std::nullopt;
             return token_value(std::move(result));
         }
+        if (procedural_ && expression.left->text == "$::meta::gensym") {
+            if (expression.arguments.size() != 1U) {
+                fail(expression.location, "$::meta::gensym requires one string prefix");
+                return std::nullopt;
+            }
+            const auto& argument = *expression.arguments.front();
+            auto value = this->expression(argument);
+            if (!value || !value->string || value->offset >= value->string->size()) {
+                fail(argument.location, "$::meta::gensym requires a translation-time string prefix");
+                return std::nullopt;
+            }
+            const auto prefix = std::string_view(*value->string).substr(value->offset,
+                value->string->size() - value->offset - 1);
+            const auto initial = [](char ch) {
+                return (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= 'a' && ch <= 'z') || ch == '_';
+            };
+            const auto continuation = [&](char ch) {
+                return initial(ch) || (ch >= '0' && ch <= '9');
+            };
+            if (prefix.empty() || !initial(prefix.front()) ||
+                !std::all_of(prefix.begin() + 1, prefix.end(), continuation) ||
+                is_reserved_identifier(prefix)) {
+                fail(argument.location, "$::meta::gensym prefix must be a nonreserved identifier");
+                return std::nullopt;
+            }
+            const auto source = macro_context_->invocation;
+            auto fresh = std::make_shared<FreshIdentifier>();
+            fresh->expansion = macro_context_->expansion;
+            fresh->ordinal = ++fresh_ordinal_;
+            fresh->prefix = std::string(prefix);
+            fresh->source_unit = source.file ? source.file->source_unit_at(source.line) : std::string{};
+            if (!charge_meta_bytes(64 + fresh->prefix.size() + fresh->source_unit.size(),
+                                   expression.location)) return std::nullopt;
+            MetaToken token;
+            token.kind = TokenKind::Identifier;
+            token.text = std::string(prefix);
+            token.origin = {token_origin(source).span, {}, macro_context_, {}, 0, {}, fresh};
+            TokenSequence result;
+            if (!append_tokens(result, {token}, expression.location)) return std::nullopt;
+            return token_value(std::move(result));
+        }
         if (procedural_ && expression.left->text == "$::meta::parse") {
             if (expression.arguments.size() == 3U) {
                 auto category = this->expression(*expression.arguments[0]);
@@ -7314,6 +7374,7 @@ private:
     std::unordered_set<const SyntaxParseEnvironment*> charged_environments_;
     std::size_t token_bytes_{};
     std::size_t meta_bytes_{};
+    std::uint64_t fresh_ordinal_{};
     std::unordered_set<const std::string*> counted_asset_backings_;
     std::vector<NameMap<Cell>> scopes_;
     std::size_t frame_base_{};

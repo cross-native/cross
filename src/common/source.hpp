@@ -31,6 +31,18 @@ struct ExpansionId {
     bool operator==(const ExpansionId&) const = default;
 };
 
+// Opaque private name identity. Its visible token spelling is only a hint;
+// copied tokens share this object for declaration/reference binding.
+struct FreshIdentifier {
+    ExpansionId expansion;
+    std::uint64_t ordinal{};
+    std::string prefix;
+    std::string source_unit;
+};
+
+std::string fresh_identifier_name(const FreshIdentifier& identifier);
+std::string fresh_identifier_link_stem(const FreshIdentifier& identifier);
+
 // Lexical identity is independent of where a token is subsequently printed.
 // Original tokens use their primary source and offset; constructed tokens use
 // the expansion and output position. A null source marks an unplaced token.
@@ -100,6 +112,17 @@ struct TokenOrigin {
     std::shared_ptr<const EmbedIdentity> embed;
     unsigned embed_piece{};
     ValueBinding value_binding;
+    std::shared_ptr<const FreshIdentifier> fresh;
+
+    TokenOrigin() = default;
+    TokenOrigin(SourceLocation span, TokenIdentity identity,
+                std::shared_ptr<const SyntaxContext> context,
+                std::shared_ptr<const EmbedIdentity> embed, unsigned embed_piece,
+                ValueBinding value_binding,
+                std::shared_ptr<const FreshIdentifier> fresh = {})
+        : span(span), identity(identity), context(std::move(context)),
+          embed(std::move(embed)), embed_piece(embed_piece),
+          value_binding(value_binding), fresh(std::move(fresh)) {}
 };
 
 struct SourceTokenOrigin {

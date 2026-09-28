@@ -81,6 +81,16 @@ reject(call_site_multiple "call_site requires exactly one identifier token"
     "$::meta::tokens selected = $::meta::call_site($::quote { name value });")
 reject(call_site_nonidentifier "call_site requires exactly one identifier token"
     "$::meta::tokens selected = $::meta::call_site($::quote { 7u32 });")
+reject(gensym_count "gensym requires one string prefix"
+    "$::meta::tokens selected = $::meta::gensym(\"name\", \"other\");")
+reject(gensym_type "gensym requires a translation-time string prefix"
+    "$::meta::tokens selected = $::meta::gensym(7u32);")
+reject(gensym_empty "gensym prefix must be a nonreserved identifier"
+    "$::meta::tokens selected = $::meta::gensym(\"\");")
+reject(gensym_reserved "gensym prefix must be a nonreserved identifier"
+    "$::meta::tokens selected = $::meta::gensym(\"return\");")
+reject(gensym_punctuation "gensym prefix must be a nonreserved identifier"
+    "$::meta::tokens selected = $::meta::gensym(\"two words\");")
 
 set(body [=[
     const $::meta::context original = $::syntax::context(input);

@@ -222,6 +222,8 @@ void print_builtins(const CompilerOptions& options) {
                  "$::unquote procedural interpolation\n"
                  "$::meta::parse translation intrinsic\n"
                  "$::meta::concat translation intrinsic\n"
+                 "$::meta::call_site identifier-context intrinsic\n"
+                 "$::meta::gensym fresh-identifier intrinsic\n"
                  "$::meta::tokens syntax-tree token projection\n"
                  "$::meta::child_count translation intrinsic\n"
                  "$::meta::child translation intrinsic\n"

@@ -58,6 +58,8 @@ std::string resolved_link_name(const FunctionDecl& function,
                                const CompilerOptions& options) {
     if (const auto exact = decode_attribute_string(function.attribute("link_name"));
         !exact.empty()) return exact;
+    const auto model_name = function.fresh
+        ? fresh_identifier_link_stem(*function.fresh) : function.name;
     if (function.linkage == Linkage::Global ||
         (function.linkage != Linkage::Static && !function.definition())) {
         std::vector<ManglingParameter> parameters;
@@ -69,7 +71,7 @@ std::string resolved_link_name(const FunctionDecl& function,
                  .mode = std::string(parameter_mode_name(parameter.mode))});
         }
         return encode_model_link_name(
-            {.qualified_name = function.name,
+            {.qualified_name = model_name,
              .kind = "function",
              .result = canonical_type_name(function.return_type),
              .parameters = parameters,
@@ -78,9 +80,9 @@ std::string resolved_link_name(const FunctionDecl& function,
     }
     if (function.linkage == Linkage::Static) {
         return "__cross_static_" + std::to_string(stable_hash(function.source_unit)) + '_' +
-               sanitize(function.name);
+               sanitize(model_name);
     }
-    return "__cross_group_" + sanitize(function.name);
+    return "__cross_group_" + sanitize(model_name);
 }
 
 const Attribute* object_attribute(const ObjectDecl& object, std::string_view name) {
@@ -94,10 +96,12 @@ std::string resolved_link_name(const ObjectDecl& object,
                                const CompilerOptions& options) {
     if (const auto exact = decode_attribute_string(object_attribute(object, "link_name"));
         !exact.empty()) return exact;
+    const auto model_name = object.fresh
+        ? fresh_identifier_link_stem(*object.fresh) : object.name;
     if (object.linkage == Linkage::Global ||
         (object.linkage != Linkage::Static && !object.initializer)) {
         return encode_model_link_name(
-            {.qualified_name = object.name,
+            {.qualified_name = model_name,
              .kind = "object",
              .result = canonical_type_name(object.type),
              .parameters = {},
@@ -106,9 +110,9 @@ std::string resolved_link_name(const ObjectDecl& object,
     }
     if (object.linkage == Linkage::Static) {
         return "__cross_static_" + std::to_string(stable_hash(object.source_unit)) + '_' +
-               sanitize(object.name);
+               sanitize(model_name);
     }
-    return "__cross_group_" + sanitize(object.name);
+    return "__cross_group_" + sanitize(model_name);
 }
 
 std::vector<std::string> decoded_clobbers(const FunctionDecl& function) {
@@ -1766,8 +1770,11 @@ private:
                     function.source_name + "::" + statement.label_name;
                 std::string symbol;
                 if (statement.global_label) {
+                    const auto* owner = function.definition
+                        ? function.definition : function.declarations.back();
                     symbol = resolved_label_link_name(
-                        qualified, statement.attributes, statement.location);
+                        qualified, statement.attributes, statement.location,
+                        owner->fresh.get(), statement.label_fresh.get());
                     if (function.linkage != Linkage::Global ||
                         function.abi_contract != AbiContract::Registered) {
                         diagnostics_.error(
@@ -1799,7 +1806,9 @@ private:
     std::string resolved_label_link_name(
         std::string_view qualified_name,
         const std::vector<Attribute>& attributes,
-        SourceLocation location) {
+        SourceLocation location,
+        const FreshIdentifier* owner_fresh = nullptr,
+        const FreshIdentifier* label_fresh = nullptr) {
         const Attribute* link_name{};
         for (const auto& attribute : attributes) {
             if (attribute.name != "link_name") {
@@ -1825,7 +1834,20 @@ private:
                     "global-label link_name requires one nonempty string literal");
             }
         } else {
-            result = encode_model_link_name(qualified_name, true,
+            std::string model_name(qualified_name);
+            if (owner_fresh || label_fresh) {
+                const auto split = qualified_name.rfind("::");
+                if (split != std::string_view::npos) {
+                    model_name = owner_fresh
+                        ? fresh_identifier_link_stem(*owner_fresh)
+                        : std::string(qualified_name.substr(0, split));
+                    model_name += "::";
+                    model_name += label_fresh
+                        ? fresh_identifier_link_stem(*label_fresh)
+                        : std::string(qualified_name.substr(split + 2));
+                }
+            }
+            result = encode_model_link_name(model_name, true,
                                             options_.mangling);
         }
         if (result.empty()) {
@@ -1881,7 +1903,8 @@ private:
             }
             const auto symbol = resolved_label_link_name(
                 declaration.qualified_name, declaration.attributes,
-                declaration.location);
+                declaration.location, declaration.owner_fresh.get(),
+                declaration.label_fresh.get());
             auto found = std::find_if(
                 module_.labels.begin(), module_.labels.end(),
                 [&](const Label& label) {

@@ -41,6 +41,12 @@ struct Token {
     [[nodiscard]] bool is(std::string_view spelling) const { return text == spelling; }
 };
 
+inline std::string identifier_binding_name(const Token& token) {
+    const auto origin = token_origin(token.location);
+    return origin.fresh ? fresh_identifier_name(*origin.fresh)
+                        : std::string(token.text);
+}
+
 // Translation-time token values own spelling but retain structured provenance.
 // Copying a token value never reparses it or changes its lexical identity.
 struct MetaToken {
@@ -64,6 +70,6 @@ using TokenSequence = std::vector<MetaToken>;
 
 // Logical resource accounting includes the optional owned-splice handle and
 // is independent of the host C++ object layout.
-inline constexpr std::uint64_t meta_token_storage_bytes = 208;
+inline constexpr std::uint64_t meta_token_storage_bytes = 224;
 
 } // namespace cross
