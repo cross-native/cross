@@ -584,6 +584,21 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         if (kind == K::Expr) {
             (void)child->parse_assignment();
         } else if (kind == K::Type) {
+            // A macro may introduce the type specifiers themselves. Its
+            // output belongs after owner expansion, so retain the bounded
+            // type fragment without executing or prematurely classifying it.
+            const auto type_first = child->index_;
+            while (child->current().is("const") || child->current().is("volatile") ||
+                   child->current().is("restrict") || child->current().is("[[")) {
+                if (child->current().is("[[")) {
+                    const auto group_end = child->bounded_group_end(child->index_);
+                    if (!group_end) return {};
+                    child->index_ = *group_end;
+                } else ++child->index_;
+            }
+            const bool opaque_type = child->macro_start();
+            child->index_ = type_first;
+            if (opaque_type) throw DeferredNameRecognition{};
             ProductionScope scope(*child, SyntaxProduction::TypeName);
             if (!child->type_start()) return {};
             auto type = child->parse_type();

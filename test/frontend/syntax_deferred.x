@@ -4,6 +4,9 @@
 [[macro]] static $::meta::tokens introduce_type(in $::meta::tokens input) {
     return $::quote { typedef uptr $::unquote(input); };
 }
+[[macro]] static $::meta::tokens opaque_type(in $::meta::tokens input) {
+    return $::quote { NotAType };
+}
 [[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
     return $::quote { ; };
 }
@@ -32,6 +35,15 @@ syntax Introduce : statement { prefix "introduce"; match name:ident ";"; expand 
     };
 }
 syntax UseType : statement { prefix "use_type"; match value:type ";"; expand use_type; }
+[[syntax_expander]] static $::meta::tokens inspect_deferred_type(in $::meta::syntax_match input) {
+    $::meta::syntax type = $::syntax::node(input, "value");
+    if (!$::meta::is_kind(type, "deferred") || $::meta::child_count(type) != 0uptr)
+        return $::quote { public_schema_failure(); };
+    return $::quote { ; };
+}
+syntax UseDeferredType : statement {
+    prefix "use_deferred_type"; match value:type ";"; expand inspect_deferred_type;
+}
 [[syntax_expander]] static $::meta::tokens use_expression(in $::meta::syntax_match input) {
     $::meta::syntax value = $::syntax::node(input, "value");
     if (!$::meta::is_production(value, "assignment_expression"))
@@ -59,8 +71,10 @@ definition [[noinline]] static u32 deferred_definition(in u32 value) {
     return result;
 }
 [[noinline]] static u32 deferred_statements(in u32 value) {
-    syntax Deferred, Drop, Introduce, UseType, UseExpr, UseStmt;
+    syntax Deferred, Drop, Introduce, UseType, UseDeferredType, UseExpr, UseStmt;
     u32 total = 0u32;
+    use_deferred_type opaque_type!();
+    use_deferred_type const opaque_type!();
     drop { never_executed!{}; NeverDefined discarded; }
     deferred {
         introduce_type!(LocalWord);
