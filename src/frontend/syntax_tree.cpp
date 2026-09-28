@@ -74,6 +74,17 @@ bool syntax_expression_node(const SyntaxNode& node) {
         production == SyntaxProduction::QuoteExpression;
 }
 
+bool syntax_statement_node(const SyntaxNode& node) {
+    return (node.kind == SyntaxNode::Kind::Core &&
+            (node.production == SyntaxProduction::Statement ||
+             node.production == SyntaxProduction::UnattributedStatement)) ||
+        ((node.kind == SyntaxNode::Kind::Deferred ||
+          node.kind == SyntaxNode::Kind::Extension ||
+          node.kind == SyntaxNode::Kind::Macro) &&
+         (node.slot_production == SyntaxProduction::Statement ||
+          node.slot_production == SyntaxProduction::UnattributedStatement));
+}
+
 TokenSequence syntax_node_tokens(const SyntaxNode& node) {
     TokenSequence result;
     const auto append = [&](const MetaToken& token) {

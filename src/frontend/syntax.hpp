@@ -89,6 +89,7 @@ TokenSequence syntax_node_tokens(const SyntaxNode& node);
 // boundaries when a parsed public tree is inserted into another quote.
 TokenSequence syntax_node_fragments(const SyntaxNode& node);
 bool syntax_expression_node(const SyntaxNode& node);
+bool syntax_statement_node(const SyntaxNode& node);
 std::size_t syntax_node_count(const SyntaxNode& node);
 std::uint64_t syntax_node_storage(const SyntaxNode& node,
     std::uint64_t stop_after = std::numeric_limits<std::uint64_t>::max());
