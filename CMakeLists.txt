@@ -2401,6 +2401,10 @@ if(BUILD_TESTING)
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_origin_errors.x
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-origin-errors.s
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_origin_errors.cmake")
+    add_test(NAME cross_syntax_activation_errors
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-activation-errors.s
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_activation_errors.cmake")
     add_test(NAME cross_syntax_context_checks
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-context-checks

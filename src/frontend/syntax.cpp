@@ -827,6 +827,26 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
     std::vector<PendingRules> pending_rules;
     std::vector<std::pair<SyntaxEntityId, SyntaxFunctionId>> pending_expanders;
     std::vector<SyntaxEntityId> resolving_rules;
+    struct BindingNote {
+        Diagnostics& diagnostics;
+        const SyntaxDefinition& definition;
+        bool complete{};
+        ~BindingNote() {
+            if (!complete) diagnostics.note(definition.location,
+                "while binding syntax '" + definition.name + "'");
+        }
+    };
+    struct ActivationNote {
+        Diagnostics& diagnostics;
+        const SyntaxActivation& entry;
+        const SyntaxDefinition& definition;
+        bool complete{};
+        ~ActivationNote() {
+            if (complete) return;
+            diagnostics.note(entry.location, "while activating syntax '" + entry.name + "'");
+            diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        }
+    };
     const auto validate_rules = [&](const auto& self, const SyntaxDefinition& definition) -> bool {
         if (definition.rules_bound || std::any_of(pending_rules.begin(), pending_rules.end(),
             [&](const auto& pending) { return pending.definition == definition.id; })) return true;
@@ -834,6 +854,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
         // only paths that can recurse without consuming input.
         if (std::find(resolving_rules.begin(), resolving_rules.end(), definition.id) != resolving_rules.end())
             return true;
+        BindingNote note{diagnostics, definition};
         if (resolving_rules.size() >= execution_->limits().depth) {
             diagnostics.error(definition.location, "syntax rule binding depth exceeded");
             return false;
@@ -864,13 +885,16 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
         if (!bind(bind, pending.pattern)) return false;
         resolving_rules.pop_back();
         pending_rules.push_back(std::move(pending));
+        note.complete = true;
         return true;
     };
     const auto flatten = [&](const auto& self, const SyntaxActivation& entry, std::string_view context,
                              const std::vector<std::vector<std::string>>& imports) -> bool {
         const auto id = lookup(entry.name, context, imports, entry.location, diagnostics);
-        if (!id || !execution_->work(entry.location)) return false;
+        if (!id) return false;
         const auto& definition = (*definitions_)[id->value];
+        ActivationNote note{diagnostics, entry, definition};
+        if (!execution_->work(entry.location)) return false;
         if (definition.kind == SyntaxKind::Rule) {
             diagnostics.error(entry.location, "a syntax rule cannot be activated");
             return false;
@@ -888,6 +912,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
             for (const auto& use : definition.uses)
                 if (!self(self, use, definition.name_space, definition.imports)) return false;
             path.pop_back();
+            note.complete = true;
             return true;
         }
         const auto expander = definition.bound_expander ? definition.bound_expander
@@ -913,6 +938,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
             }
         }
         if (std::find(proposed.begin(), proposed.end(), binding) == proposed.end()) proposed.push_back(std::move(binding));
+        note.complete = true;
         return true;
     };
     for (const auto& entry : entries) if (!flatten(flatten, entry, name_space, imports_)) return false;
@@ -997,24 +1023,36 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
         if (analysis_failed) return false;
     }
     std::vector<std::uint8_t> visited(definitions_->size());
+    std::vector<SyntaxEntityId> leading_path;
     const auto check_leading = [&](const auto& self, SyntaxEntityId id) -> bool {
         if (visited[id.value] == 2) return true;
         visited[id.value] = 1;
+        leading_path.push_back(id);
         for (const auto& edge : leading[id.value]) {
             if (!execution_->work(edge.location)) return false;
             if (visited[edge.target.value] == 1) {
                 diagnostics.error(edge.location, "left-recursive or nullable syntax rule cycle");
+                const auto first = std::find(leading_path.begin(), leading_path.end(), edge.target);
+                for (auto at = first; at != leading_path.end(); ++at) {
+                    const auto& rule = (*definitions_)[at->value];
+                    diagnostics.note(rule.location, "syntax rule '" + rule.name + "' participates in this cycle");
+                }
                 return false;
             }
             if (visited[edge.target.value] == 0 && !self(self, edge.target)) return false;
         }
+        leading_path.pop_back();
         visited[id.value] = 2;
         return true;
     };
     for (const auto& pending : pending_rules)
         if (visited[pending.definition.value] == 0 && !check_leading(check_leading, pending.definition)) return false;
     for (const auto& pending : pending_rules)
-        if (!validate_pattern_progress(pending.pattern, bound_pattern, diagnostics)) return false;
+        if (!validate_pattern_progress(pending.pattern, bound_pattern, diagnostics)) {
+            const auto& definition = (*definitions_)[pending.definition.value];
+            diagnostics.note(definition.location, "while validating syntax '" + definition.name + "'");
+            return false;
+        }
     // Commit lookup identities together with the entire activation. Later
     // declarations must not retarget a grammar already bound at activation.
     for (const auto& pending : pending_rules) {
