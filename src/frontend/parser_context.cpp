@@ -53,7 +53,9 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     for (const auto& entry : known_ordinary_values_) name(entry);
     for (const auto& scope : local_scopes_) {
         add(32);
-        for (const auto& entry : scope) name(entry.spelling);
+        for (const auto& [entry, binding] : scope) {
+            (void)binding; name(entry.spelling); add(64);
+        }
     }
     for (const auto& scope : local_type_scopes_) {
         add(32);

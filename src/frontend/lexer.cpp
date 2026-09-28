@@ -40,7 +40,9 @@ char Lexer::take() {
 }
 
 Token Lexer::token(TokenKind kind, std::size_t start, SourceLocation location) const {
-    return {kind, std::string_view(source_.text).substr(start, offset_ - start), location};
+    Token result(kind, std::string_view(source_.text).substr(start, offset_ - start), location);
+    result.value_binding = token_origin(location).value_binding;
+    return result;
 }
 
 void Lexer::skip_trivia() {

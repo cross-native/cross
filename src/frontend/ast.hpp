@@ -149,6 +149,13 @@ struct Attribute {
     // Parameter declarations are parsed with the ordinary type/declarator
     // grammar; their spelling is never reparsed by semantic expansion.
     std::vector<GenericParameter> generic_parameters{};
+    // The target model still classifies variadic states. These names only
+    // preserve source declaration identity for body lookup and lowering.
+    struct VariadicName {
+        SourceLocation location;
+        std::string name;
+    };
+    std::vector<VariadicName> variadic_names{};
 };
 
 struct Expr {
@@ -215,7 +222,10 @@ struct Expr {
 };
 
 inline NameKey name_key(const Expr& expression) {
-    return NameKey(expression.text, expression.location);
+    NameKey result(expression.text, expression.location);
+    result.bind(expression.name_context ? expression.name_context->value_binding
+                                       : token_origin(expression.location).value_binding);
+    return result;
 }
 
 inline NameUse::NameUse(const Expr& expression)

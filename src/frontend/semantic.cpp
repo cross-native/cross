@@ -1162,9 +1162,9 @@ public:
     }
 
 private:
-    const std::string* replacement(std::string_view name, SourceLocation location) const {
+    const std::string* replacement(const Expr& expression) const {
         for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
-            const auto found = scope->find(NameKey(name, location));
+            const auto found = scope->find(name_key(expression));
             if (found == scope->end()) continue;
             return found->second.empty() ? nullptr : &found->second;
         }
@@ -1174,7 +1174,7 @@ private:
     void rewrite(std::unique_ptr<Expr>& expression) {
         if (!expression) return;
         if (expression->kind == Expr::Kind::Name) {
-            if (const auto* name = replacement(expression->text, expression->location)) {
+            if (const auto* name = replacement(*expression)) {
                 bind_exact_name(*expression, *name);
             }
         }
@@ -1488,6 +1488,10 @@ private:
             argument->kind = Expr::Kind::Name;
             argument->location = location;
             argument->text = parameter.name;
+            auto context = std::make_shared<NameLookupContext>();
+            context->kind = NameLookupContext::Kind::Local;
+            context->value_binding = name_key(parameter).binding;
+            argument->name_context = std::move(context);
             call->arguments.push_back(std::move(argument));
         }
 
@@ -2640,7 +2644,7 @@ public:
           syntax_parse_(std::move(syntax_parse)) {}
 
     bool charge_input_tokens(const TokenSequence& tokens, SourceLocation location) {
-        constexpr std::size_t metadata_cost = 128;
+        constexpr std::size_t metadata_cost = meta_token_storage_bytes;
         std::size_t size = 0;
         const auto byte_limit = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         for (const auto& token : tokens) {
@@ -2869,7 +2873,7 @@ public:
                 auto literal = expression.quote_fragments[index];
                 for (auto& token : literal) {
                     token.origin = {token_origin(macro_context_->invocation).span,
-                                    {}, macro_context_, {}, 0};
+                                    {}, macro_context_, {}, 0, {}};
                 }
                 if (!append_tokens(result, literal, expression.location))
                     return std::nullopt;
@@ -3128,7 +3132,7 @@ private:
         const auto budget = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         // Logical metadata charge, not sizeof(MetaToken): resource decisions
         // must not depend on the host C++ library's string/pointer layout.
-        constexpr std::size_t metadata_cost = 128;
+        constexpr std::size_t metadata_cost = meta_token_storage_bytes;
         for (const auto& token : part) {
             if (token.text.size() > budget - token_bytes_ ||
                 metadata_cost > budget - token_bytes_ - token.text.size()) {
@@ -3199,7 +3203,7 @@ private:
             if (token.kind == TokenKind::End) break;
             MetaToken value(token);
             value.origin = {token_origin(macro_context_->invocation).span,
-                            {}, macro_context_, {}, 0};
+                            {}, macro_context_, {}, 0, {}};
             result.push_back(std::move(value));
         }
         return result;
@@ -3214,7 +3218,7 @@ private:
             while (node->kind == Expr::Kind::Parenthesized && node->left)
                 node = node->left.get();
         }
-        if (node->kind != Expr::Kind::Name || lookup_mutable(node->text, node->location) ||
+        if (node->kind != Expr::Kind::Name || lookup_mutable(*node) ||
             resolve_object(program_, current_function_, *node)) return nullptr;
         return resolve_function(program_, current_function_, *node,
                                 [](const FunctionDecl&) { return true; });
@@ -3258,7 +3262,7 @@ private:
     // Its designated cell is never read, nor can an automatic cell escape.
     std::unique_ptr<Expr> address_designator(const Expr& node) {
         if (node.kind == Expr::Kind::Name) {
-            if (lookup_mutable(node.text, node.location)) {
+            if (lookup_mutable(node)) {
                 fail(node.location, "translation-time automatic object address cannot escape");
                 return {};
             }
@@ -3710,7 +3714,7 @@ private:
                 return false;
             }
             bool read_only = expression_type(*node.left)->is_const;
-            if (const auto* cell = lookup_mutable(node.left->text, node.left->location)) {
+            if (const auto* cell = lookup_mutable(*node.left)) {
                 read_only = read_only || cell->read_only;
             } else if (current_function_) {
                 for (const auto& parameter : current_function_->parameters)
@@ -3907,7 +3911,7 @@ private:
             source.left->kind == Expr::Kind::Name &&
             source.left->text == "$::meta::data") return true;
         if (source.kind == Expr::Kind::Name) {
-            const auto* cell = lookup_mutable(source.text, source.location);
+            const auto* cell = lookup_mutable(source);
             return cell && (cell->value.meta_pointer.has_value() ||
                             cell->value.object != nullptr || cell->storage != nullptr);
         }
@@ -3936,7 +3940,7 @@ private:
         }
         case Expr::Kind::Character: return builtin_type(BuiltinType::U32);
         case Expr::Kind::Name:
-            if (const auto* cell = lookup_mutable(expression.text, expression.location)) {
+            if (const auto* cell = lookup_mutable(expression)) {
                 if (decay && cell->value.type->kind == Type::Kind::Array)
                     return pointer_type(cell->value.type->element);
                 return cell->value.type;
@@ -4731,10 +4735,10 @@ private:
         return false;
     }
 
-    Cell* lookup_mutable(std::string_view name, SourceLocation location) {
+    Cell* lookup_mutable(const Expr& expression) {
         for (auto index = scopes_.size(); index > frame_base_;) {
             auto& scope = scopes_[--index];
-            const auto found = scope.find(NameKey(name, location));
+            const auto found = scope.find(name_key(expression));
             if (found != scope.end()) return &found->second;
         }
         return nullptr;
@@ -4743,7 +4747,7 @@ private:
     std::optional<EvalValue> lookup(const Expr& expression) {
         const auto& name = expression.text;
         const auto location = expression.location;
-        if (auto* cell = lookup_mutable(name, location)) {
+        if (auto* cell = lookup_mutable(expression)) {
             if (cell->storage) {
                 EvalValue storage{UInt128{}, cell->value.type};
                 storage.object = cell->storage;
@@ -5404,7 +5408,7 @@ private:
                designator->left)
             designator = designator->left.get();
         if (designator->kind == Expr::Kind::Name) {
-            auto* cell = lookup_mutable(designator->text, designator->location);
+            auto* cell = lookup_mutable(*designator);
             if (cell && !cell->value.object && meta_object_type(cell->value.type)) {
                 if (!cell->storage) {
                     auto storage = new_object(cell->value.type, designator->location);
@@ -5797,7 +5801,7 @@ private:
             while (designator->kind == Expr::Kind::Parenthesized && designator->left)
                 designator = designator->left.get();
             const bool local = (designator->kind == Expr::Kind::Name &&
-                lookup_mutable(designator->text, designator->location)) ||
+                lookup_mutable(*designator)) ||
                 (designator->kind == Expr::Kind::Binary && designator->left &&
                  meta_pointer_source(*designator->left)) ||
                 (designator->kind == Expr::Kind::Unary && designator->text == "*" &&
@@ -6253,9 +6257,9 @@ private:
             designator = designator->left.get();
         if (designator &&
             ((designator->kind == Expr::Kind::Name &&
-              lookup_mutable(designator->text, designator->location) &&
-              (lookup_mutable(designator->text, designator->location)->storage ||
-               lookup_mutable(designator->text, designator->location)->value.object)) ||
+              lookup_mutable(*designator) &&
+              (lookup_mutable(*designator)->storage ||
+               lookup_mutable(*designator)->value.object)) ||
              (designator->kind == Expr::Kind::Binary &&
               (designator->text == "index" ||
                designator->text == "member" ||
@@ -6309,7 +6313,7 @@ private:
         }
         if (!designator || designator->kind != Expr::Kind::Name)
             return std::nullopt;
-        auto* destination = lookup_mutable(designator->text, designator->location);
+        auto* destination = lookup_mutable(*designator);
         if (!destination) return std::nullopt;
         if (destination->read_only) {
             fail(expression.location, "cannot write a const cell");
@@ -6321,7 +6325,7 @@ private:
             if (!source) return std::nullopt;
             source = convert(*source, destination_type, expression.location);
             if (!source) return std::nullopt;
-            *lookup_mutable(designator->text, designator->location) = {*source, true, false};
+            *lookup_mutable(*designator) = {*source, true, false};
             return source;
         }
         if (previous_value) {
@@ -6339,7 +6343,7 @@ private:
         if (!result) return std::nullopt;
         result = convert(*result, destination_type, expression.location);
         if (!result) return std::nullopt;
-        *lookup_mutable(designator->text, designator->location) = {*result, true, false};
+        *lookup_mutable(*designator) = {*result, true, false};
         return result;
     }
 
@@ -6347,7 +6351,7 @@ private:
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
             return std::nullopt;
         }
-        if (lookup_mutable(expression.left->text, expression.left->location)) {
+        if (lookup_mutable(*expression.left)) {
             fail(expression.location, "indirect calls are not permitted during translation-time evaluation");
             return std::nullopt;
         }
@@ -7330,7 +7334,8 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics) {
 
 class EnumeratorMaterializer {
 public:
-    explicit EnumeratorMaterializer(Program& program) : program_(program) {}
+    EnumeratorMaterializer(Program& program, Diagnostics& diagnostics)
+        : program_(program), diagnostics_(diagnostics) {}
 
     void run() {
         for (auto& record : program_.records) {
@@ -7361,6 +7366,10 @@ public:
             for (const auto& parameter : function->generic_parameters) {
                 scopes_.back().insert(name_key(parameter));
             }
+            for (const auto& attribute : function->attributes)
+                if (attribute.name == "variadic")
+                    for (const auto& name : attribute.variadic_names)
+                        scopes_.back().insert(name_key(name));
             if (function->body) rewrite(*function->body);
         }
         caller_ = nullptr;
@@ -7368,9 +7377,9 @@ public:
     }
 
 private:
-    bool local(std::string_view name, SourceLocation location) const {
+    bool local(const Expr& expression) const {
         for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
-            if (scope->contains(NameKey(name, location))) return true;
+            if (scope->contains(name_key(expression))) return true;
         }
         return false;
     }
@@ -7378,13 +7387,23 @@ private:
     void rewrite(std::unique_ptr<Expr>& expression) {
         if (!expression) return;
         if (expression->kind == Expr::Kind::Name &&
-            local(expression->text, expression->location)) {
-            auto context = std::make_shared<NameLookupContext>();
+            name_key(*expression).binding.kind == ValueBinding::Kind::Local &&
+            !local(*expression)) {
+            diagnostics_.error(expression->location,
+                "captured local value '" + expression->text +
+                "' is not visible at its replacement site");
+            return;
+        }
+        if (expression->kind == Expr::Kind::Name &&
+            local(*expression)) {
+            auto context = expression->name_context
+                ? std::make_shared<NameLookupContext>(*expression->name_context)
+                : std::make_shared<NameLookupContext>();
             context->kind = NameLookupContext::Kind::Local;
             expression->name_context = std::move(context);
         }
         if (expression->kind == Expr::Kind::Name &&
-            !local(expression->text, expression->location) &&
+            !local(*expression) &&
             !resolve_object(program_, caller_, *expression) &&
             !resolve_function(program_, caller_, *expression,
                               [](const FunctionDecl&) { return true; })) {
@@ -7419,28 +7438,32 @@ private:
         const bool scoped = statement.kind == Statement::Kind::Compound ||
                             statement.kind == Statement::Kind::For;
         if (scoped) scopes_.emplace_back();
+        if (statement.kind == Statement::Kind::For && statement.first)
+            rewrite(*statement.first);
         if (statement.declaration) {
+            scopes_.back().insert(name_key(*statement.declaration));
             rewrite(statement.declaration->dynamic_array_bound);
             rewrite(statement.declaration->initializer);
-            scopes_.back().insert(name_key(*statement.declaration));
         }
         rewrite(statement.expression);
         rewrite(statement.condition);
         rewrite(statement.increment);
-        if (statement.first) rewrite(*statement.first);
+        if (statement.first && statement.kind != Statement::Kind::For)
+            rewrite(*statement.first);
         for (auto& child : statement.statements) rewrite(*child);
         if (statement.second) rewrite(*statement.second);
         if (scoped) scopes_.pop_back();
     }
 
     Program& program_;
+    Diagnostics& diagnostics_;
     FunctionDecl* caller_{};
     std::string current_namespace_;
     std::vector<NameSet> scopes_;
 };
 
-void materialize_enumerators(Program& program) {
-    EnumeratorMaterializer(program).run();
+void materialize_enumerators(Program& program, Diagnostics& diagnostics) {
+    EnumeratorMaterializer(program, diagnostics).run();
 }
 
 bool contains_layout_query(const Expr& expression) {
@@ -8909,7 +8932,7 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       const EvaluationLayoutInstaller& install_layout) {
     if (!validate_attribute_names(program, diagnostics)) return false;
     if (!evaluate_enumerations(program, diagnostics)) return false;
-    materialize_enumerators(program);
+    materialize_enumerators(program, diagnostics);
     if (!expand_generics(program, diagnostics, mangling, pointer_resolver,
                          canonical_abi)) {
         if (diagnostics.errors() == 0) {

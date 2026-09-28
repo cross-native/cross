@@ -20,6 +20,10 @@ struct NameLookupContext {
     enum class Kind { Relative, Exact, Local } kind{Kind::Relative};
     std::string name_space;
     std::vector<std::string> imports;
+    ValueBinding value_binding;
+    // True only when the incoming token already carried a resolved use;
+    // a later header prebinding pass must not retarget copied source input.
+    bool value_binding_inherited{};
 };
 
 struct NameUse {
@@ -59,12 +63,13 @@ inline std::vector<std::string> namespace_candidates(
     return result;
 }
 
-// A local binding is identified by spelling and its introducing syntax mark,
-// never by an encoded/mangled spelling. Copied source input uses the ordinary
-// lexical scope; copied generated input retains the introducing expansion.
+// Unresolved classifier keys use spelling and a syntax mark. Resolved value
+// keys additionally name the declaring source token. Copied uses retain this
+// identity rather than searching a replacement's same-spelled lexical locals.
 struct NameKey {
     std::string spelling;
     ExpansionId context;
+    ValueBinding binding;
 
     NameKey() = default;
     explicit NameKey(std::string_view name, SourceLocation location = {})
@@ -73,6 +78,10 @@ struct NameKey {
         if (origin.context && origin.context->kind == SyntaxContext::Kind::DefinitionSite)
             context = origin.context->expansion;
     }
+    void bind(ValueBinding value) {
+        binding = value;
+        if (value.kind != ValueBinding::Kind::Unknown) context = value.mark;
+    }
     bool operator==(const NameKey&) const = default;
 };
 
@@ -80,7 +89,16 @@ struct NameKeyHash {
     std::size_t operator()(const NameKey& name) const {
         const auto spelling = std::hash<std::string>{}(name.spelling);
         const auto context = std::hash<std::uint64_t>{}(name.context.value);
-        return spelling ^ (context + (spelling << 6) + (spelling >> 2));
+        auto result = spelling ^ (context + (spelling << 6) + (spelling >> 2));
+        const auto mix = [&](std::size_t value) {
+            result ^= value + (result << 6) + (result >> 2);
+        };
+        mix(static_cast<std::size_t>(name.binding.kind));
+        mix(std::hash<const SourceFile*>{}(name.binding.declaration.source_unit));
+        mix(std::hash<std::size_t>{}(name.binding.declaration.offset));
+        mix(std::hash<std::uint64_t>{}(name.binding.declaration.expansion.value));
+        mix(std::hash<std::size_t>{}(name.binding.declaration.output_position));
+        return result;
     }
 };
 
@@ -90,7 +108,10 @@ using NameSet = std::unordered_set<NameKey, NameKeyHash>;
 
 template <typename Declaration>
 NameKey name_key(const Declaration& declaration) {
-    return NameKey(declaration.name, declaration.location);
+    NameKey result(declaration.name, declaration.location);
+    result.bind({ValueBinding::Kind::Local, token_origin(declaration.location).identity,
+                 result.context});
+    return result;
 }
 
 } // namespace cross

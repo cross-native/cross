@@ -122,7 +122,7 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
     const auto tokens = [&](const TokenSequence& sequence) {
         for (const auto& token : sequence) {
             if (size > stop_after) break;
-            add(128); add(token.text.size());
+            add(meta_token_storage_bytes); add(token.text.size());
             context(token.origin.context);
             if (token.split_source) { add(32); add(token.split_source->spelling.size()); }
         }

@@ -280,11 +280,22 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                               "unterminated '" + std::string(role) + "' body");
             continue;
         }
+        FunctionDecl function;
+        function.name = name;
+        function.location = tokens[index].location;
+        function.return_type = tokens_type();
+        function.source_namespace = current_namespace;
+        function.imports = active_imports(tokens, index);
+        function.linkage = Linkage::Static;
+        auto parameter_type = syntax_expander ? syntax_match_type() : tokens_type();
+        parameter_type->is_const = local_const;
+        function.parameters.push_back({tokens[*parameter_end - 1].location,
+            std::move(parameter), std::move(parameter_type), ParameterMode::In, true, {}});
         std::vector<Token> body_tokens(tokens.begin() + static_cast<std::ptrdiff_t>(cursor),
             tokens.begin() + static_cast<std::ptrdiff_t>(*body_end + 1));
         body_tokens.push_back({TokenKind::End, {}, tokens[*body_end].location});
         Parser parser(std::move(body_tokens), diagnostics, {}, address_bits);
-        auto body = parser.parse_procedural_body();
+        auto body = parser.parse_procedural_body(function);
         if (!body) continue;
         const auto declaration_end =
             tokens[*body_end].location.offset + tokens[*body_end].text.size();
@@ -299,17 +310,6 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                   "' is defined more than once");
             continue;
         }
-        FunctionDecl function;
-        function.name = name;
-        function.location = tokens[index].location;
-        function.return_type = tokens_type();
-        function.source_namespace = current_namespace;
-        function.imports = active_imports(tokens, index);
-        function.linkage = Linkage::Static;
-        auto parameter_type = syntax_expander ? syntax_match_type() : tokens_type();
-        parameter_type->is_const = local_const;
-        function.parameters.push_back({tokens[*parameter_end - 1].location,
-            std::move(parameter), std::move(parameter_type), ParameterMode::In, true, {}});
         function.body = std::move(body);
         macros.push_back({std::move(name), std::move(function), tokens[index].location,
                           syntax_expander});

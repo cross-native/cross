@@ -1238,6 +1238,25 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
                     }
                     expect(")", "after generic parameters");
                     active_generic_types_ = saved_generic_types;
+                } else if (attribute.name == "variadic") {
+                    while (!current().is(")") && current().kind != TokenKind::End) {
+                        const auto start = index_;
+                        auto type = parse_type();
+                        std::optional<std::string> binding_name;
+                        auto name_location = current().location;
+                        if (type) (void)parse_declarator(std::move(type), binding_name, false,
+                                                          nullptr, &name_location);
+                        if (!binding_name) error_here("expected variadic state binding name");
+                        if (current().kind == TokenKind::String) ++index_;
+                        else error_here("expected variadic state-name string");
+                        std::string spelling;
+                        for (auto at = start; at < index_; ++at) spelling += tokens_[at].text;
+                        attribute.arguments.push_back(std::move(spelling));
+                        if (binding_name)
+                            attribute.variadic_names.push_back({name_location, *binding_name});
+                        if (index_ == start || !consume(",")) break;
+                    }
+                    expect(")", "after variadic state bindings");
                 } else if (attribute.name == "aligned") {
                     while (!current().is(")") &&
                            current().kind != TokenKind::End) {
@@ -1422,7 +1441,12 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
 
 bool Parser::type_start() const {
     const auto& token = current();
-    if (token.kind == TokenKind::Identifier) require_public_name_context(token.text);
+    if (token.kind == TokenKind::Identifier) {
+        const auto binding = token.value_binding.kind != ValueBinding::Kind::Unknown
+            ? token.value_binding : token_origin(token.location).value_binding;
+        if (binding.kind != ValueBinding::Kind::Unknown) return false;
+        require_public_name_context(token.text);
+    }
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
@@ -1945,11 +1969,14 @@ Parser::parse_angle_generic_parameters() {
 }
 
 bool Parser::known_generic_name(const Expr& name) const {
-    if (current().is("<")) require_public_name_context(name.text, name.location);
-    if (name.text.find("::") == std::string::npos)
+    const auto binding = name_key(name).binding.kind;
+    if (binding == ValueBinding::Kind::Local) return false;
+    if (binding == ValueBinding::Kind::Unknown && current().is("<"))
+        require_public_name_context(name.text, name.location);
+    if (binding == ValueBinding::Kind::Unknown && name.text.find("::") == std::string::npos)
         for (auto scope = local_scopes_.rbegin();
              scope != local_scopes_.rend(); ++scope)
-            if (scope->contains(name_key(name))) return false;
+            if (scope->contains(NameKey(name.text, name.location))) return false;
     const auto lookup = [&](std::string_view candidate)
         -> std::optional<bool> {
         if (known_ordinary_values_.contains(std::string(candidate)))
@@ -3137,6 +3164,41 @@ Parser::parse_function(SourceLocation location, std::string name,
         else
             function->generic_parameters = std::move(angle_parameters);
     }
+    // Attributes preceding a function header are parsed before its generic
+    // parameter list becomes part of the active function. Bind their scalar
+    // expressions now, without rebinding a copied token that already has an
+    // immutable source context of its own.
+    const auto bind_attribute_name = [&](const auto& self, Expr& expression) -> void {
+        if (expression.kind == Expr::Kind::Name &&
+            (!expression.name_context || !expression.name_context->value_binding_inherited)) {
+            for (const auto& parameter : function->generic_parameters) {
+                if (!parameter.value_type ||
+                    NameKey(expression.text, expression.location) !=
+                        NameKey(parameter.name, parameter.location)) continue;
+                auto context = expression.name_context
+                    ? std::make_shared<NameLookupContext>(*expression.name_context)
+                    : std::make_shared<NameLookupContext>();
+                context->kind = NameLookupContext::Kind::Local;
+                context->value_binding = name_key(parameter).binding;
+                expression.name_context = std::move(context);
+                for (auto& token : tokens_)
+                    if (token.location.file == expression.location.file &&
+                        token.location.offset == expression.location.offset &&
+                        token.text == expression.text)
+                        token.value_binding = expression.name_context->value_binding;
+                break;
+            }
+        }
+        if (expression.left) self(self, *expression.left);
+        if (expression.right) self(self, *expression.right);
+        if (expression.third) self(self, *expression.third);
+        for (auto& argument : expression.arguments) self(self, *argument);
+        for (auto& argument : expression.generic_arguments)
+            if (argument.value) self(self, *argument.value);
+    };
+    for (auto& attribute : function->attributes)
+        if (attribute.expression_argument)
+            bind_attribute_name(bind_attribute_name, *attribute.expression_argument);
     // The containing declaration owns its separators or the function body.
     return function;
 }
@@ -3248,11 +3310,15 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         else {
             declaration.name = *name;
             if (!local_scopes_.empty()) {
-                const auto key = name_key(declaration);
+                const NameKey key(declaration.name, declaration.location);
                 if (local_type_scopes_.back().contains(key))
                     diagnostics_.error(declaration.location,
                         "local value '" + declaration.name + "' conflicts with a typedef");
-                local_scopes_.back().insert(key);
+                if (local_scopes_.back().contains(key))
+                    diagnostics_.error(declaration.location,
+                        "local value '" + declaration.name +
+                        "' was declared more than once");
+                local_scopes_.back()[key] = name_key(declaration).binding;
             }
         }
         if (current().kind == TokenKind::String) {
@@ -3332,8 +3398,22 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     local_type_scopes_.emplace_back();
     if (syntax_) syntax_->push_scope();
     if (local_scopes_.size() == 1 && active_function_)
-        for (const auto& parameter : active_function_->parameters)
-            local_scopes_.back().insert(name_key(parameter));
+        for (const auto& parameter : active_function_->parameters) {
+            if (!local_scopes_.back().emplace(NameKey(parameter.name, parameter.location),
+                    name_key(parameter).binding).second)
+                diagnostics_.error(parameter.location,
+                    "duplicate parameter name '" + parameter.name + "'");
+        }
+    if (local_scopes_.size() == 1 && active_function_)
+        for (const auto& attribute : active_function_->attributes)
+            if (attribute.name == "variadic")
+                for (const auto& name : attribute.variadic_names) {
+                    if (!local_scopes_.back().emplace(NameKey(name.name, name.location),
+                            name_key(name).binding).second)
+                        diagnostics_.error(name.location,
+                            "variadic state binding '" + name.name +
+                            "' conflicts with another local name");
+                }
     auto statement = std::make_unique<Statement>();
     statement->kind = Statement::Kind::Compound;
     statement->location = current().location;
@@ -4025,12 +4105,21 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
     return expression;
 }
 
-std::unique_ptr<Statement> Parser::parse_procedural_body() {
+std::unique_ptr<Statement> Parser::parse_procedural_body(FunctionDecl& function) {
+    const auto previous_function = active_function_;
+    const auto previous_namespace = active_namespace_;
+    const auto previous_imports = active_imports_;
+    active_function_ = &function;
+    active_namespace_ = function.source_namespace;
+    active_imports_ = function.imports;
     parsing_procedural_body_ = true;
     auto body = parse_compound();
     if (current().kind != TokenKind::End)
         error_here("unexpected tokens after procedural macro body");
     parsing_procedural_body_ = false;
+    active_function_ = previous_function;
+    active_namespace_ = previous_namespace;
+    active_imports_ = previous_imports;
     return body;
 }
 
@@ -4108,6 +4197,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         return parse_expression_replacement();
     }
     const auto item = current();
+    const auto item_index = index_;
     if (current().is("$::quote")) return parse_quote();
     if (current().is("$::embed")) {
         ProductionScope embed(*this, SyntaxProduction::EmbedExpression);
@@ -4206,6 +4296,37 @@ std::unique_ptr<Expr> Parser::parse_primary() {
             auto context = std::make_shared<NameLookupContext>();
             context->name_space = origin.context ? origin.context->name_space : active_namespace_;
             context->imports = origin.context ? origin.context->imports : active_imports_;
+            context->value_binding_inherited =
+                item.value_binding.kind != ValueBinding::Kind::Unknown ||
+                origin.value_binding.kind != ValueBinding::Kind::Unknown;
+            context->value_binding = item.value_binding.kind != ValueBinding::Kind::Unknown
+                ? item.value_binding : origin.value_binding;
+            if (context->value_binding.kind == ValueBinding::Kind::Unknown) {
+                // Do not freeze a lookup that preceding opaque code may change.
+                // The enclosing bounded unit must stay deferred instead.
+                require_public_name_context(result->text, item.location);
+                context->value_binding.kind = ValueBinding::Kind::Nonlocal;
+                if (result->text.find("::") == std::string::npos) {
+                    const NameKey key(result->text, item.location);
+                    for (auto scope = local_scopes_.rbegin(); scope != local_scopes_.rend(); ++scope) {
+                        if (const auto found = scope->find(key); found != scope->end()) {
+                            context->value_binding = found->second;
+                            break;
+                        }
+                    }
+                    if (context->value_binding.kind == ValueBinding::Kind::Nonlocal && active_function_)
+                        for (const auto& parameter : active_function_->generic_parameters)
+                            if (parameter.value_type && NameKey(parameter.name, parameter.location) == key) {
+                                context->value_binding = name_key(parameter).binding;
+                                break;
+                            }
+                }
+            }
+            if (context->value_binding.kind == ValueBinding::Kind::Local)
+                context->kind = NameLookupContext::Kind::Local;
+            // This belongs to the private token provenance. Public trees still
+            // expose syntax only, while projection preserves an exact use.
+            tokens_[item_index].value_binding = context->value_binding;
             result->name_context = std::move(context);
             return result;
         }

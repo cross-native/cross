@@ -454,6 +454,7 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
         auto origin = token.origin;
         // Explicit-context parsing changes lookup, not identity or source span.
         origin.context = context;
+        origin.value_binding = {};
         origins.push_back({begin, text.size(), std::move(origin)});
         text += ' ';
     }
@@ -967,7 +968,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     };
     const auto copy_tokens = [&](TokenSequence& destination, std::size_t first, std::size_t last) {
         for (auto at = first; at < last; ++at) {
-            if (!charge(128 + tokens[at].text.size()) ||
+            if (!charge(meta_token_storage_bytes + tokens[at].text.size()) ||
                 (tokens[at].split_source &&
                  !charge(32 + tokens[at].split_source->spelling.size()))) return false;
             destination.emplace_back(tokens[at]);
@@ -1242,7 +1243,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         return {};
     }
     auto root = std::make_shared<SyntaxMatchValue>(*matches.front().value);
-    if (!charge(128 + tokens[begin].text.size())) return {};
+    if (!charge(meta_token_storage_bytes + tokens[begin].text.size())) return {};
     root->input.insert(root->input.begin(), MetaToken(tokens[begin]));
     root->span = span(begin, matches.front().end);
     if (!definition.bound_expander) return {};

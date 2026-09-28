@@ -82,6 +82,36 @@ int main() {
     using P = SyntaxProduction;
     using K = SyntaxPatternElement::Kind;
 
+    const auto bound_tokens = syntax_node_tokens(*parse(
+        "{ u32 value = 7u32; value += 1u32; }", K::Statement));
+    require(bound_tokens.size() == 11 &&
+            bound_tokens[6].origin.value_binding.kind == ValueBinding::Kind::Local &&
+            bound_tokens[6].origin.value_binding.declaration ==
+                bound_tokens[2].origin.identity,
+            "parsed source value did not retain its exact declaring token");
+    const auto free_tokens = syntax_node_tokens(*parse("outside + 1u32", K::Expr));
+    require(!free_tokens.empty() &&
+            free_tokens.front().origin.value_binding.kind == ValueBinding::Kind::Nonlocal,
+            "parsed free value can be captured by a relocated local");
+    for (const bool inherited : {false, true}) {
+        const auto* header_source = sources.add("generic-attribute.x",
+            "[[generic(u32 N), aligned(N)]] static u32 f() { return 0u32; }");
+        auto header = Lexer(*header_source, diagnostics).lex();
+        unsigned names{};
+        for (auto& item : header)
+            if (item.text == "N" && ++names == 2 && inherited)
+                item.value_binding.kind = ValueBinding::Kind::Nonlocal;
+        Parser header_parser(std::move(header), diagnostics);
+        auto parsed = header_parser.parse();
+        require(parsed.functions.size() == 1 && parsed.functions.front()->attributes.size() == 2,
+                "generic attribute binding fixture failed to parse");
+        const auto& value = parsed.functions.front()->attributes[1].expression_argument;
+        require(value && value->name_context &&
+                value->name_context->value_binding.kind ==
+                    (inherited ? ValueBinding::Kind::Nonlocal : ValueBinding::Kind::Local),
+                "function header retargeted an inherited generic-value use");
+    }
+
     auto type = production(parse("const u32 * [[address_space(0)]] volatile restrict", K::Type),
                            P::TypeName, 2);
     auto specifiers = child(type, 0, P::DeclarationSpecifiers, 2);

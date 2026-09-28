@@ -40,6 +40,18 @@ struct TokenIdentity {
     bool operator==(const TokenIdentity&) const = default;
 };
 
+// Private name-resolution provenance, not a public meta-tree property. Unknown
+// means the token has not been interpreted as a value name. Nonlocal records
+// the absence of a visible local, so relocating a parsed use cannot capture a
+// subsequently introduced local. Local names retain the declaring token's
+// identity and syntax mark independently of the use token's own identity.
+struct ValueBinding {
+    enum class Kind { Unknown, Local, Nonlocal } kind{Kind::Unknown};
+    TokenIdentity declaration;
+    ExpansionId mark;
+    bool operator==(const ValueBinding&) const = default;
+};
+
 struct SyntaxContext {
     enum class Kind { CallSite, DefinitionSite } kind{Kind::CallSite};
     ExpansionId expansion;
@@ -85,6 +97,7 @@ struct TokenOrigin {
     std::shared_ptr<const SyntaxContext> context;
     std::shared_ptr<const EmbedIdentity> embed;
     unsigned embed_piece{};
+    ValueBinding value_binding;
 };
 
 struct SourceTokenOrigin {

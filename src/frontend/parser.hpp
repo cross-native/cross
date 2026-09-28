@@ -25,7 +25,7 @@ public:
     Program parse();
     // Parse a macro's braced body with the ordinary statement/expression
     // grammar, enabling translation-only token types and quotation.
-    std::unique_ptr<Statement> parse_procedural_body();
+    std::unique_ptr<Statement> parse_procedural_body(FunctionDecl& function);
     // Read-only, bounded recognition using the same core grammar. The returned
     // tree preserves source tokens; speculative state never escapes this call.
     std::optional<SyntaxParsedFragment> parse_syntax_fragment(
@@ -203,7 +203,8 @@ private:
     std::vector<std::string> active_generic_types_;
     std::unordered_set<std::string> known_generic_functions_;
     std::unordered_set<std::string> known_ordinary_values_;
-    std::vector<NameSet> local_scopes_;
+    // Classifier spelling/mark -> exact local value declaration identity.
+    std::vector<NameMap<ValueBinding>> local_scopes_;
     std::vector<NameMap<TypePtr>> local_type_scopes_;
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
@@ -250,7 +251,7 @@ private:
     std::vector<std::string> generic_types;
     std::unordered_set<std::string> generic_functions;
     std::unordered_set<std::string> ordinary_values;
-    std::vector<NameSet> values;
+    std::vector<NameMap<ValueBinding>> values;
     std::vector<NameMap<TypePtr>> local_aliases;
     std::unordered_map<std::string, TypePtr> aliases;
     std::unordered_map<std::string, BuiltinType> enumerations;

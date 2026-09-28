@@ -2404,6 +2404,10 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-deferred-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_deferred.cmake")
+    add_test(NAME cross_syntax_hygiene_checks
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-hygiene-checks
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_hygiene.cmake")
     add_executable(cross_syntax_state_test test/frontend/syntax_state_test.cpp)
     target_link_libraries(cross_syntax_state_test PRIVATE cross_frontend)
     cross_component(cross_syntax_state_test)
@@ -2451,6 +2455,16 @@ if(BUILD_TESTING)
                         -DENTRY=syntax_raw_entry -DEXPECTED=61
                         "-DCC_FLAGS=${syntax_flags}"
                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            add_test(NAME cross_syntax_hygiene_${level}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_hygiene.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-hygiene-${level}-${mode}
+                        -DENTRY=syntax_raw_entry -DEXPECTED=61
+                        "-DCC_FLAGS=${syntax_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
             add_test(NAME cross_meta_objects_${level}_${mode}
                 COMMAND "${CMAKE_COMMAND}"
                         -DCC=$<TARGET_FILE:cross_cc>
@@ -2475,6 +2489,13 @@ if(BUILD_TESTING)
         endforeach()
     endforeach()
     foreach(syntax_level O0 O2)
+        add_test(NAME cross_syntax_hygiene_mips_${syntax_level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_hygiene.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-hygiene-mips-${syntax_level}
+            -DEXPECTED=P "-DCC_FLAGS=-${syntax_level};-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
         add_test(NAME cross_syntax_deferred_mips_${syntax_level} COMMAND "${CMAKE_COMMAND}"
             -DCC=$<TARGET_FILE:cross_cc>
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_deferred.x
@@ -2490,6 +2511,14 @@ if(BUILD_TESTING)
             -DEXPECTED=P "-DCC_FLAGS=-${syntax_level};-fno-eval-calls"
             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
         foreach(syntax_endian big little)
+            add_test(NAME cross_syntax_hygiene_n64_${syntax_level}_${syntax_endian} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_hygiene.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/syntax_raw_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-hygiene-n64-${syntax_level}-${syntax_endian}
+                -DN64_ENDIAN=${syntax_endian} "-DEXTRA_FLAGS=-${syntax_level} -fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
             add_test(NAME cross_syntax_deferred_n64_${syntax_level}_${syntax_endian} COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_deferred.x

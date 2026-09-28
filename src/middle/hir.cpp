@@ -1554,7 +1554,9 @@ private:
                     const auto* attribute = variadic_attribute;
                     std::unordered_set<std::string> names;
                     std::unordered_set<std::string> states;
-                    for (const auto& argument : attribute->arguments) {
+                    for (std::size_t argument_index = 0;
+                         argument_index < attribute->arguments.size(); ++argument_index) {
+                        const auto& argument = attribute->arguments[argument_index];
                         const auto quote = argument.find('"');
                         const auto decoded = quote == std::string::npos
                             ? std::optional<std::string>{}
@@ -1601,8 +1603,12 @@ private:
                                 "duplicate variadic state binding");
                             continue;
                         }
+                        const auto name_location = argument_index < attribute->variadic_names.size() &&
+                                attribute->variadic_names[argument_index].name == name
+                            ? attribute->variadic_names[argument_index].location
+                            : attribute->location;
                         function.variadic_bindings.push_back(
-                            {attribute->location, std::string(name),
+                            {name_location, std::string(name),
                              intern_type(type), state->id});
                     }
                 }
