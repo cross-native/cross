@@ -119,11 +119,23 @@ struct SourceTokenOrigin {
 TokenOrigin token_origin(SourceLocation location);
 
 struct SourceExpansion {
+    enum class Kind { ProceduralMacro, SyntaxExtension };
     std::size_t begin{};
     std::size_t end{};
     std::string macro_name;
     SourceLocation invocation;
     SourceLocation definition;
+    Kind kind{Kind::ProceduralMacro};
+    SourceLocation expander;
+
+    SourceExpansion() = default;
+    SourceExpansion(std::size_t begin, std::size_t end, std::string name,
+                    SourceLocation invocation, SourceLocation definition,
+                    Kind kind = Kind::ProceduralMacro,
+                    SourceLocation expander = {})
+        : begin(begin), end(end), macro_name(std::move(name)),
+          invocation(invocation), definition(definition), kind(kind),
+          expander(expander) {}
 };
 
 struct SourceFile {

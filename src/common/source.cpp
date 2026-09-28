@@ -55,7 +55,11 @@ TokenOrigin token_origin(SourceLocation location) {
 const SourceExpansion* SourceFile::expansion_at(std::size_t offset) const {
     const SourceExpansion* best{};
     for (const auto& expansion : expansions) {
-        if (offset < expansion.begin || offset >= expansion.end) continue;
+        // A parser error at the synthetic end token still belongs to the
+        // expansion that supplied the final nonempty source fragment.
+        const bool at_final_end = offset == text.size() &&
+            expansion.end == text.size() && expansion.begin < expansion.end;
+        if (offset < expansion.begin || (offset >= expansion.end && !at_final_end)) continue;
         if (!best ||
             expansion.end - expansion.begin < best->end - best->begin) {
             best = &expansion;

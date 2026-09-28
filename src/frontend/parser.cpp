@@ -347,7 +347,7 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
     if (!matched) { ++index_; synchronize_external(); return {}; }
     index_ = matched->end;
     return execution->expand(matched->expander, {}, matched->value, location, name_space, imports, bindings,
-                             context->parse_environment);
+                             context->parse_environment, definition);
 }
 
 bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body_open,

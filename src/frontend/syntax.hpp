@@ -188,7 +188,8 @@ public:
         std::shared_ptr<const SyntaxMatchValue> match, SourceLocation invocation,
         std::string_view name_space, const std::vector<std::string>& imports,
         const std::vector<SyntaxBinding>& bindings,
-        std::shared_ptr<const SyntaxParseEnvironment> environment = {});
+        std::shared_ptr<const SyntaxParseEnvironment> environment = {},
+        const SyntaxDefinition* owner = nullptr);
     bool begin_replacement(SourceLocation location);
     void end_replacement();
     bool begin_fragment(SourceLocation location, std::size_t copied_tokens);

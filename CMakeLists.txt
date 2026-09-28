@@ -2396,6 +2396,11 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-span-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_spans.cmake")
+    add_test(NAME cross_syntax_origin_errors
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_origin_errors.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-origin-errors.s
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_origin_errors.cmake")
     add_test(NAME cross_syntax_context_checks
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-context-checks

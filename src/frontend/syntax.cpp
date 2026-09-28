@@ -364,7 +364,8 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     TokenSequence input, std::shared_ptr<const SyntaxMatchValue> match, SourceLocation invocation,
     std::string_view name_space, const std::vector<std::string>& imports,
     const std::vector<SyntaxBinding>& bindings,
-    std::shared_ptr<const SyntaxParseEnvironment> environment) {
+    std::shared_ptr<const SyntaxParseEnvironment> environment,
+    const SyntaxDefinition* owner) {
     if (id.value >= functions_.size()) return {};
     if (!active_expansions_.empty()) {
         ExpansionSignature signature;
@@ -454,8 +455,12 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     const auto unit = invocation.file ? invocation.file->source_unit_at(invocation.line) : std::string{};
     std::vector<std::string> units(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) + 1, unit);
     const auto* source = sources_.add(invocation.file ? invocation.file->path : std::filesystem::path("<syntax>"),
-        std::move(text), {{0, end,
-            function.declaration.name, invocation, function.declaration.location}}, std::move(origins), {}, std::move(units));
+        std::move(text), {SourceExpansion{0, end,
+            owner ? owner->name : function.declaration.name,
+            invocation, owner ? owner->location : function.declaration.location,
+            owner ? SourceExpansion::Kind::SyntaxExtension : SourceExpansion::Kind::ProceduralMacro,
+            owner ? function.declaration.location : SourceLocation{}}},
+        std::move(origins), {}, std::move(units));
     if (!validate_embeds(*source, diagnostics_)) return {};
     auto tokens = Lexer(*source, diagnostics_).lex();
     // Empty item replacements still need an ancestry-bearing source location.

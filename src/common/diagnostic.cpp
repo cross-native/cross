@@ -58,12 +58,21 @@ void Diagnostics::report(DiagnosticLevel level, SourceLocation location,
     for (unsigned depth = 0; origin.valid() && depth < 64; ++depth) {
         const auto* expansion = origin.file->expansion_at(origin.offset);
         if (!expansion) break;
-        emit(expansion->invocation, "note",
-             "in expansion of procedural macro '" +
-                 expansion->macro_name + "'");
-        emit(expansion->definition, "note",
-             "procedural macro '" + expansion->macro_name +
-                 "' defined here");
+        if (expansion->kind == SourceExpansion::Kind::SyntaxExtension) {
+            emit(expansion->invocation, "note",
+                 "in expansion of syntax '" + expansion->macro_name + "'");
+            emit(expansion->definition, "note",
+                 "syntax '" + expansion->macro_name + "' defined here");
+            if (expansion->expander.valid())
+                emit(expansion->expander, "note", "syntax expander defined here");
+        } else {
+            emit(expansion->invocation, "note",
+                 "in expansion of procedural macro '" +
+                     expansion->macro_name + "'");
+            emit(expansion->definition, "note",
+                 "procedural macro '" + expansion->macro_name +
+                     "' defined here");
+        }
         origin = expansion->invocation;
     }
 }
