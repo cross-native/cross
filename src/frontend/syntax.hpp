@@ -206,7 +206,7 @@ public:
         const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
         SourceLocation location);
     std::optional<Output> materialize_node(const SyntaxNode& node, SourceLocation location,
-        bool allow_deferred_statement = false);
+        SyntaxParseCategory deferred_category = SyntaxParseCategory::None);
     const EvaluationLimits& limits() const { return limits_; }
     std::optional<MetaToken> terminal(std::string_view quoted, SourceLocation location);
 private:

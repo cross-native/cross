@@ -22,6 +22,17 @@ function(reject case expected source)
     endif()
 endfunction()
 
+function(reject_expansion case expected source)
+    set(input "${OUTPUT}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}" OR
+       NOT err MATCHES "${case}.x:[0-9]+:[0-9]+: note:")
+        message(FATAL_ERROR "${case} expansion was not diagnosed correctly\n${out}\n${err}")
+    endif()
+endfunction()
+
 reject(known_error "syntax-match error for active prefix"
     "${discard}${owner} global u32 entry() { syntax Owner; owner { u32 = ; future!{}; NewType value; } return 0u32; }")
 reject(unbounded_group "syntax-match error|unterminated|bounded group"
@@ -32,6 +43,11 @@ reject(incomplete_statement "syntax-match error for active prefix"
     "${discard}${owner} syntax Inner : statement { prefix \"inner\"; match body:stmt; expand discard; } global u32 entry() { syntax Owner, Inner; owner { future!{}; inner if (1u32) NewType value else other; } return 0u32; }")
 reject(copied_assertion "static_assert failed: copied assertion must execute"
     "${copy} syntax Copy : statement { prefix \"copied\"; match body:stmt; expand copy; } static T checked<T>(in T value) { syntax Copy; copied { $::static_assert(0u32, \"copied assertion must execute\"); } return value; } global u32 entry() { return checked(1u32); }")
+set(type_macro_owner "[[syntax_expander]] static $::meta::tokens copy_type(in $::meta::syntax_match input) { return $::quote { typedef $::unquote($::syntax::node(input, \"value\")) Alias; }; } syntax CopyType : statement { prefix \"copy_type\"; match value:type \";\"; expand copy_type; }")
+reject_expansion(type_macro_name "procedural type macro cannot declare a name"
+    "[[macro]] static $::meta::tokens bad_type(in $::meta::tokens input) { return $::quote { u16 named }; } ${type_macro_owner} global u32 entry() { syntax CopyType; copy_type bad_type!(); return 0u32; }")
+reject_expansion(type_macro_extra "procedural type macro must produce one complete type"
+    "[[macro]] static $::meta::tokens bad_type(in $::meta::tokens input) { return $::quote { u16 ; u32 }; } ${type_macro_owner} global u32 entry() { syntax CopyType; copy_type bad_type!(); return 0u32; }")
 foreach(depth 1 2 3)
     reject(deferred_depth_${depth} "depth|syntax-match error for active prefix"
         "${discard}${owner} global u32 entry() { syntax Owner; owner { future!{}; NewType value; } return 0u32; }"

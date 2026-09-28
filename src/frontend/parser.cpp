@@ -1609,7 +1609,34 @@ TypePtr Parser::parse_type(bool record_specifiers,
         ProductionScope builtin(*this, current().kind == TokenKind::BuiltinName
                                            ? SyntaxProduction::BuiltinName
                                            : SyntaxProduction::None);
-        if (current().kind == TokenKind::StructuredSplice) {
+        if (syntax_ && macro_start()) {
+            const auto location = current().location;
+            type = builtin_type(BuiltinType::I32, is_const, is_volatile);
+            if (parsing_public_fragment_) throw DeferredNameRecognition{};
+            auto execution = syntax_->execution();
+            if (execution->begin_replacement(location)) {
+                struct End {
+                    SyntaxExecution& execution;
+                    ~End() { execution.end_replacement(); }
+                } end{*execution};
+                auto output = expand_at_position(false);
+                if (output) {
+                    auto child = replacement_parser(std::move(*output));
+                    const auto previous_errors = diagnostics_.errors();
+                    auto parsed = child->parse_type();
+                    std::optional<std::string> declarator_name;
+                    if (parsed) parsed = child->parse_declarator(std::move(parsed), declarator_name);
+                    if (declarator_name)
+                        child->error_here("procedural type macro cannot declare a name");
+                    if (child->current().kind != TokenKind::End)
+                        child->error_here("procedural type macro must produce one complete type");
+                    if (diagnostics_.errors() == previous_errors && parsed) {
+                        adopt_replacement(*child);
+                        type = std::move(parsed);
+                    }
+                }
+            } else ++index_;
+        } else if (current().kind == TokenKind::StructuredSplice) {
             const auto item = current();
             ++index_;
             type = builtin_type(BuiltinType::I32, is_const, is_volatile);
@@ -1632,7 +1659,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     production_events_[type_specifier.event].opaque = std::move(wrapper);
                 }
                 if (!parsing_public_fragment_) {
-                    auto output = syntax_->execution()->materialize_node(*item.splice, item.location);
+                    auto output = syntax_->execution()->materialize_node(
+                        *item.splice, item.location, SyntaxParseCategory::Type);
                     if (output) {
                         auto child = replacement_parser(std::move(*output));
                         child->restore_environment(*item.splice->context->parse_environment,
@@ -3668,7 +3696,8 @@ std::unique_ptr<Statement> Parser::parse_statement() {
                 "structured statement splice requires a destination block");
             return invalid;
         }
-        auto output = syntax_->execution()->materialize_node(*item.splice, item.location, true);
+        auto output = syntax_->execution()->materialize_node(
+            *item.splice, item.location, SyntaxParseCategory::Statement);
         if (!output) return invalid;
         auto child = replacement_parser(std::move(*output));
         child->restore_environment(*item.splice->context->parse_environment,
