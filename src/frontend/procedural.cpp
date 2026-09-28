@@ -72,15 +72,8 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
             head->error_location = at;
         }
     };
-    while (cursor < tokens.size()) {
-        if (tokens[cursor].is("static") || tokens[cursor].is("global") ||
-            tokens[cursor].is("inline")) {
-            static_storage |= tokens[cursor].is("static");
-            global_storage |= tokens[cursor].is("global");
-            ++cursor;
-            continue;
-        }
-        if (!tokens[cursor].is("[[")) break;
+    const auto consume_attribute_list = [&]() {
+        if (cursor >= tokens.size() || !tokens[cursor].is("[[")) return false;
         ++cursor;
         bool closed = false;
         while (cursor < tokens.size() && tokens[cursor].kind != TokenKind::End) {
@@ -106,8 +99,11 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
             if (name == "macro" || name == "syntax_expander") {
                 if (head) set_error("expansion function has more than one role attribute",
                                     attribute_location);
-                else head = ExpansionFunctionHead{cursor, location,
-                    name == "syntax_expander", false, false, {}, {}};
+                else {
+                    head.emplace();
+                    head->location = location;
+                    head->syntax_expander = name == "syntax_expander";
+                }
                 if (arguments) set_error("'" + name + "' takes no arguments",
                                          attribute_location);
             } else if (name != "eval_only" || arguments) {
@@ -124,12 +120,57 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
             } else malformed = true;
             break;
         }
-        if (!closed) { malformed = true; break; }
+        if (!closed) malformed = true;
+        return true;
+    };
+    const auto consume_specifier_prefix = [&]() {
+        while (cursor < tokens.size()) {
+            if (tokens[cursor].is("static") || tokens[cursor].is("global") ||
+                tokens[cursor].is("inline")) {
+                static_storage |= tokens[cursor].is("static");
+                global_storage |= tokens[cursor].is("global");
+                ++cursor;
+            } else if (!consume_attribute_list() || malformed) break;
+        }
+    };
+    consume_specifier_prefix();
+    const auto return_type_index = cursor;
+    std::size_t name_index = 0;
+    std::size_t body_index = 0;
+    bool result_location = false;
+    if (!malformed && cursor < tokens.size() &&
+        tokens[cursor].is("$::meta::tokens")) {
+        ++cursor;
+        consume_specifier_prefix();
+        name_index = cursor;
+        if (!malformed && cursor < tokens.size() &&
+            tokens[cursor].kind == TokenKind::Identifier) {
+            ++cursor;
+            while (cursor + 1 < tokens.size() && tokens[cursor].is("::") &&
+                   tokens[cursor + 1].kind == TokenKind::Identifier)
+                cursor += 2;
+            if (cursor < tokens.size() && tokens[cursor].is("(")) {
+                const auto close = matching_group(tokens, cursor);
+                if (close) {
+                    cursor = *close + 1;
+                    if (cursor + 1 < tokens.size() && tokens[cursor].is("->") &&
+                        tokens[cursor + 1].kind == TokenKind::String) {
+                        result_location = true;
+                        cursor += 2;
+                    }
+                    while (consume_attribute_list() && !malformed) {}
+                    body_index = cursor;
+                }
+            }
+        }
     }
     if (!head) return std::nullopt;
-    head->after_specifiers = cursor;
+    head->after_specifiers = return_type_index;
+    head->name_index = name_index;
+    head->body_index = body_index;
     head->static_storage = static_storage;
     head->global_storage = global_storage;
+    head->result_location = result_location;
     if (malformed) set_error("malformed expansion function attribute list", location);
     if (other_attribute) {
         set_error("attribute '" + other_attribute->first +
@@ -284,14 +325,14 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         auto cursor = head->after_specifiers;
         if (!head->error.empty()) {
             diagnostics.error(head->error_location, head->error);
-            index = cursor - 1;
+            if (cursor > index) index = cursor - 1;
             continue;
         }
         if (!head->static_storage || head->global_storage) {
             diagnostics.error(
                 tokens[index].location,
                 "'" + std::string(role) + "' functions must be static and cannot be global");
-            index = cursor - 1;
+            if (cursor > index) index = cursor - 1;
             continue;
         }
         if (cursor >= tokens.size() ||
@@ -301,6 +342,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
             continue;
         }
         ++cursor;
+        if (head->name_index) cursor = head->name_index;
         auto name = qualified_name(tokens, cursor, tokens.size());
         if (name.empty() || cursor >= tokens.size() ||
             tokens[cursor].text != "(") {
@@ -345,6 +387,12 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         }
         std::string parameter(tokens[name_index].text);
         cursor = *parameter_end + 1;
+        if (head->result_location) {
+            diagnostics.error(tokens[index].location,
+                              "expansion functions cannot specify a result location");
+            continue;
+        }
+        if (head->body_index) cursor = head->body_index;
         if (parameter.empty() || cursor >= tokens.size() ||
             tokens[cursor].text != "{") {
             diagnostics.error(tokens[index].location,

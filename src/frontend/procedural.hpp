@@ -15,15 +15,18 @@ struct ExpansionFunctionSource {
 };
 struct ExpansionFunctionHead {
     std::size_t after_specifiers{};
+    std::size_t name_index{};
+    std::size_t body_index{};
     SourceLocation location;
     bool syntax_expander{};
     bool static_storage{};
     bool global_storage{};
+    bool result_location{};
     std::string error;
     SourceLocation error_location;
 };
-// Recognize a translation-time function's role among its leading declaration
-// attributes and storage specifiers. Ordinary declarations return no head.
+// Recognize a translation-time function's role in its declaration attributes,
+// including those after its return type or parameter declarator.
 std::optional<ExpansionFunctionHead> expansion_function_head(
     const std::vector<Token>& tokens, std::size_t index);
 // Parse one original declaration selected by the item parser, never scan raw
