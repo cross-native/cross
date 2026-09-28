@@ -8,12 +8,14 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace cross {
 
 struct SourceFile;
 struct SyntaxParseEnvironment;
+struct SyntaxNode;
 
 struct SourceLocation {
     const SourceFile* file{};
@@ -104,6 +106,14 @@ struct SourceTokenOrigin {
     std::size_t begin{};
     std::size_t end{};
     TokenOrigin origin;
+    // A structured syntax fragment travels beside its serialized marker.
+    // Its subtree is never reconstructed from the marker's spelling.
+    std::shared_ptr<const SyntaxNode> splice;
+
+    SourceTokenOrigin() = default;
+    SourceTokenOrigin(std::size_t begin, std::size_t end, TokenOrigin origin,
+                      std::shared_ptr<const SyntaxNode> splice = {})
+        : begin(begin), end(end), origin(std::move(origin)), splice(std::move(splice)) {}
 };
 
 TokenOrigin token_origin(SourceLocation location);
@@ -138,6 +148,7 @@ struct SourceFile {
     [[nodiscard]] const SourceExpansion* expansion_at(
         std::size_t offset) const;
     [[nodiscard]] const TokenOrigin* token_origin_at(std::size_t offset) const;
+    [[nodiscard]] const SourceTokenOrigin* source_token_origin_at(std::size_t offset) const;
 };
 
 class SourceManager {

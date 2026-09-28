@@ -59,7 +59,63 @@ std::string_view syntax_production_name(SyntaxProduction production) {
     return index < std::size(names) ? names[index] : std::string_view{};
 }
 
+bool syntax_expression_node(const SyntaxNode& node) {
+    auto production = node.kind == SyntaxNode::Kind::Core
+        ? node.production : node.slot_production;
+    if (node.kind != SyntaxNode::Kind::Core &&
+        node.kind != SyntaxNode::Kind::Extension &&
+        node.kind != SyntaxNode::Kind::Macro &&
+        node.kind != SyntaxNode::Kind::Deferred) return false;
+    return (production >= SyntaxProduction::Expression &&
+            production <= SyntaxProduction::PrimaryExpression) ||
+        production == SyntaxProduction::BuiltinName ||
+        production == SyntaxProduction::Literal ||
+        production == SyntaxProduction::EmbedExpression ||
+        production == SyntaxProduction::QuoteExpression;
+}
+
 TokenSequence syntax_node_tokens(const SyntaxNode& node) {
+    TokenSequence result;
+    const auto append = [&](const MetaToken& token) {
+        if (!result.empty() && token.split_source &&
+            result.back().split_source == token.split_source &&
+            result.back().origin.context == token.origin.context &&
+            result.back().split_offset + result.back().text.size() == token.split_offset) {
+            auto& prior = result.back();
+            prior.text += token.text;
+            if (prior.split_offset == 0 && prior.text.size() == prior.split_source->spelling.size()) {
+                prior.kind = prior.split_source->kind;
+                prior.text = prior.split_source->spelling;
+                prior.split_source.reset();
+            }
+        } else result.push_back(token);
+    };
+    struct ProjectionPart {
+        const SyntaxNode* node{};
+        const MetaToken* token{};
+    };
+    std::vector<ProjectionPart> pending{{&node, nullptr}};
+    while (!pending.empty()) {
+        const auto next = pending.back();
+        pending.pop_back();
+        if (next.token) {
+            if (next.token->splice) pending.push_back({next.token->splice.get(), nullptr});
+            else append(*next.token);
+        } else if (next.node->kind == SyntaxNode::Kind::Token ||
+                   next.node->kind == SyntaxNode::Kind::Extension ||
+                   next.node->kind == SyntaxNode::Kind::Macro ||
+                   next.node->kind == SyntaxNode::Kind::Deferred) {
+            for (auto at = next.node->tokens.rbegin(); at != next.node->tokens.rend(); ++at)
+                pending.push_back({nullptr, &*at});
+        } else {
+            for (auto at = next.node->children.rbegin(); at != next.node->children.rend(); ++at)
+                pending.push_back({at->get(), nullptr});
+        }
+    }
+    return result;
+}
+
+TokenSequence syntax_node_fragments(const SyntaxNode& node) {
     TokenSequence result;
     const auto append = [&](const MetaToken& token) {
         if (!result.empty() && token.split_source &&
@@ -79,10 +135,23 @@ TokenSequence syntax_node_tokens(const SyntaxNode& node) {
     while (!pending.empty()) {
         const auto* next = pending.back();
         pending.pop_back();
-        if (next->kind == SyntaxNode::Kind::Token ||
-            next->kind == SyntaxNode::Kind::Extension ||
-            next->kind == SyntaxNode::Kind::Macro ||
-            next->kind == SyntaxNode::Kind::Deferred) {
+        if (next->kind == SyntaxNode::Kind::Core &&
+            next->production == SyntaxProduction::PrimaryExpression &&
+            next->structured_splice &&
+            next->children.size() == 1 && next->children.front() &&
+            syntax_expression_node(*next->children.front())) {
+            const auto& child = next->children.front();
+            MetaToken marker;
+            marker.kind = TokenKind::StructuredSplice;
+            marker.text = "__cross_syntax_splice";
+            marker.origin = token_origin(child->span.first);
+            marker.origin.context = child->context;
+            marker.splice = child;
+            result.push_back(std::move(marker));
+        } else if (next->kind == SyntaxNode::Kind::Token ||
+                   next->kind == SyntaxNode::Kind::Extension ||
+                   next->kind == SyntaxNode::Kind::Macro ||
+                   next->kind == SyntaxNode::Kind::Deferred) {
             for (const auto& token : next->tokens) append(token);
         } else {
             for (auto at = next->children.rbegin(); at != next->children.rend(); ++at)
@@ -491,6 +560,10 @@ struct TreeValidator {
                 return false;
             }
             if (node->kind == SyntaxNode::Kind::Token || opaque_kind(node->kind)) {
+                if (node->structured_splice) {
+                    error = "structured splice must be a core primary expression";
+                    return false;
+                }
                 if (node->kind == SyntaxNode::Kind::Deferred) {
                     if (!deferred_slot(node->deferred_category, node->slot_production) ||
                         node->production != SyntaxProduction::None || !node->context ||
@@ -559,7 +632,17 @@ struct TreeValidator {
                 error = "invalid public syntax tree node representation";
                 return false;
             }
-            const auto positions = match(*rule, node->children, 0);
+            const bool splice_shape = node->structured_splice &&
+                node->kind == SyntaxNode::Kind::Core &&
+                node->production == SyntaxProduction::PrimaryExpression &&
+                node->children.size() == 1 && node->children.front() &&
+                syntax_expression_node(*node->children.front());
+            if (node->structured_splice && !splice_shape) {
+                error = "structured expression splice requires one expression child";
+                return false;
+            }
+            const auto positions = splice_shape ? Positions{node->children.size()}
+                : match(*rule, node->children, 0);
             if (exhausted) break;
             if (std::find(positions.begin(), positions.end(), node->children.size()) == positions.end()) {
                 error = "syntax replacement changes the grammar production shape of '" +

@@ -4198,6 +4198,57 @@ std::unique_ptr<Expr> Parser::parse_primary() {
     }
     const auto item = current();
     const auto item_index = index_;
+    if (item.kind == TokenKind::StructuredSplice) {
+        ++index_;
+        auto invalid = [&] {
+            auto result = std::make_unique<Expr>();
+            result->kind = Expr::Kind::Integer;
+            result->location = item.location;
+            result->text = "0";
+            return result;
+        };
+        if (!item.splice || !syntax_expression_node(*item.splice)) {
+            diagnostics_.error(item.location,
+                "structured syntax splice requires an expression node at expression position");
+            return invalid();
+        }
+        if (!syntax_ || !item.splice->context ||
+            !item.splice->context->parse_environment) {
+            diagnostics_.error(item.location,
+                "structured syntax splice has no retained parse environment");
+            return invalid();
+        }
+        if (recording_public_tree_ && production.event < production_events_.size()) {
+            auto wrapper = std::make_shared<SyntaxNode>();
+            wrapper->kind = SyntaxNode::Kind::Core;
+            wrapper->production = SyntaxProduction::PrimaryExpression;
+            wrapper->structured_splice = true;
+            wrapper->children.push_back(item.splice);
+            wrapper->span = item.splice->span;
+            wrapper->context = item.splice->context;
+            production_events_[production.event].opaque = std::move(wrapper);
+        }
+        // Public recognition must not reparse or execute the fragment's
+        // nested invocations. Its validated public root already proves this
+        // operand's category; the owner will materialize surviving output.
+        if (parsing_public_fragment_) return invalid();
+        auto output = syntax_->execution()->materialize_node(*item.splice, item.location);
+        if (!output) return invalid();
+        auto child = replacement_parser(std::move(*output));
+        child->restore_environment(*item.splice->context->parse_environment,
+                                   *item.splice->context);
+        child->parsing_public_fragment_ = parsing_public_fragment_;
+        child->recording_public_tree_ = parsing_public_fragment_;
+        auto parsed = child->parse_assignment();
+        if (child->current().kind != TokenKind::End)
+            child->error_here("structured expression splice must contain one complete expression");
+        if (!parsed) return invalid();
+        auto grouped = std::make_unique<Expr>();
+        grouped->kind = Expr::Kind::Parenthesized;
+        grouped->location = item.location;
+        grouped->left = std::move(parsed);
+        return grouped;
+    }
     if (current().is("$::quote")) return parse_quote();
     if (current().is("$::embed")) {
         ProductionScope embed(*this, SyntaxProduction::EmbedExpression);

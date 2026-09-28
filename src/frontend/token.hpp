@@ -10,9 +10,11 @@
 
 namespace cross {
 
+struct SyntaxNode;
+
 enum class TokenKind {
     End, Identifier, BuiltinName, Integer, Floating, String, Character,
-    Punctuator, Invalid,
+    Punctuator, StructuredSplice, Invalid,
 };
 
 // A grammar may consume the two characters of a lexical >> separately.
@@ -28,6 +30,7 @@ struct Token {
     std::string_view text;
     SourceLocation location;
     ValueBinding value_binding;
+    std::shared_ptr<const SyntaxNode> splice;
     std::shared_ptr<const SplitTokenSource> split_source;
     std::size_t split_offset{};
 
@@ -44,13 +47,14 @@ struct MetaToken {
     TokenKind kind{TokenKind::Invalid};
     std::string text;
     TokenOrigin origin;
+    std::shared_ptr<const SyntaxNode> splice;
     std::shared_ptr<const SplitTokenSource> split_source;
     std::size_t split_offset{};
 
     MetaToken() = default;
     explicit MetaToken(const Token& token)
         : kind(token.kind), text(token.text), origin(token_origin(token.location)),
-          split_source(token.split_source), split_offset(token.split_offset) {
+          splice(token.splice), split_source(token.split_source), split_offset(token.split_offset) {
         if (token.value_binding.kind != ValueBinding::Kind::Unknown)
             origin.value_binding = token.value_binding;
     }
@@ -58,7 +62,8 @@ struct MetaToken {
 
 using TokenSequence = std::vector<MetaToken>;
 
-// Logical resource accounting, independent of the host C++ object layout.
-inline constexpr std::uint64_t meta_token_storage_bytes = 192;
+// Logical resource accounting includes the optional owned-splice handle and
+// is independent of the host C++ object layout.
+inline constexpr std::uint64_t meta_token_storage_bytes = 208;
 
 } // namespace cross

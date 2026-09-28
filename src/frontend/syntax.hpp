@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace cross {
@@ -68,6 +69,9 @@ std::uint64_t syntax_context_storage(const SyntaxContext& context);
 struct SyntaxNode {
     enum class Kind { Token, Group, Core, Extension, Macro, Deferred } kind{Kind::Token};
     SyntaxProduction production{SyntaxProduction::None};
+    // Internal category-aware splice alternative of primary_expression.
+    // This distinguishes it from a normal literal/builtin primary child.
+    bool structured_splice{};
     // Expected grammar slot for an opaque extension/macro/deferred node.
     // It is not exposed as a core production by the public query API.
     SyntaxProduction slot_production{SyntaxProduction::None};
@@ -81,6 +85,10 @@ struct SyntaxNode {
 };
 
 TokenSequence syntax_node_tokens(const SyntaxNode& node);
+// Unlike the explicit textual projection above, this retains nested splice
+// boundaries when a parsed public tree is inserted into another quote.
+TokenSequence syntax_node_fragments(const SyntaxNode& node);
+bool syntax_expression_node(const SyntaxNode& node);
 std::size_t syntax_node_count(const SyntaxNode& node);
 std::uint64_t syntax_node_storage(const SyntaxNode& node,
     std::uint64_t stop_after = std::numeric_limits<std::uint64_t>::max());
@@ -194,9 +202,24 @@ public:
     std::shared_ptr<const SyntaxNode> parse_tokens(SyntaxParseCategory category,
         const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
         SourceLocation location);
+    std::optional<Output> materialize_node(const SyntaxNode& node, SourceLocation location);
     const EvaluationLimits& limits() const { return limits_; }
     std::optional<MetaToken> terminal(std::string_view quoted, SourceLocation location);
 private:
+    struct ExpansionInputToken {
+        TokenKind kind{TokenKind::Invalid};
+        std::string text;
+        const SyntaxNode* splice{};
+        bool operator==(const ExpansionInputToken&) const = default;
+    };
+    struct ExpansionSignature {
+        std::uint32_t function{};
+        std::string name_space;
+        std::vector<std::string> imports;
+        std::vector<SyntaxBinding> bindings;
+        std::vector<ExpansionInputToken> input;
+        bool operator==(const ExpansionSignature&) const = default;
+    };
     struct Function {
         FunctionDecl declaration;
         bool syntax_expander{};
@@ -214,6 +237,7 @@ private:
     unsigned depth_{};
     unsigned fragment_depth_{};
     unsigned expansions_{};
+    std::vector<std::optional<ExpansionSignature>> active_expansions_;
 };
 
 // Copyable lexical state; the stable declaration registry is shared by

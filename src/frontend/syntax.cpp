@@ -322,10 +322,14 @@ bool SyntaxExecution::begin_replacement(SourceLocation location) {
     }
     ++depth_;
     ++expansions_;
+    active_expansions_.emplace_back();
     return true;
 }
 
-void SyntaxExecution::end_replacement() { --depth_; }
+void SyntaxExecution::end_replacement() {
+    active_expansions_.pop_back();
+    --depth_;
+}
 
 bool SyntaxExecution::begin_fragment(SourceLocation location, std::size_t copied_tokens) {
     if (fragment_depth_ >= limits_.depth) {
@@ -362,6 +366,26 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     const std::vector<SyntaxBinding>& bindings,
     std::shared_ptr<const SyntaxParseEnvironment> environment) {
     if (id.value >= functions_.size()) return {};
+    if (!active_expansions_.empty()) {
+        ExpansionSignature signature;
+        signature.function = id.value;
+        signature.name_space = name_space;
+        signature.imports = imports;
+        signature.bindings = bindings;
+        const auto& matched = match ? match->input : input;
+        signature.input.reserve(matched.size());
+        for (const auto& token : matched)
+            signature.input.push_back({token.kind, token.text, token.splice.get()});
+        unsigned repeats{};
+        for (std::size_t at = 0; at + 1 < active_expansions_.size(); ++at)
+            if (active_expansions_[at] && *active_expansions_[at] == signature) ++repeats;
+        if (repeats >= 2) {
+            diagnostics_.error(invocation,
+                "syntax/procedural expansion depth or invocation budget exceeded (recursive cycle)");
+            return {};
+        }
+        active_expansions_.back() = std::move(signature);
+    }
     const auto& function = functions_[id.value];
     const auto call = call_context(invocation, name_space, imports, bindings, std::move(environment));
     const auto attach = [&](TokenSequence& tokens) {
@@ -423,7 +447,7 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
             token.origin.identity = {original.source_unit, 0, expansion, index};
         const auto begin = text.size();
         text += token.text;
-        origins.push_back({begin, text.size(), token.origin});
+        origins.push_back({begin, text.size(), token.origin, token.splice});
         text += ' ';
     }
     const auto end = text.size();
@@ -455,7 +479,7 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
         // Explicit-context parsing changes lookup, not identity or source span.
         origin.context = context;
         origin.value_binding = {};
-        origins.push_back({begin, text.size(), std::move(origin)});
+        origins.push_back({begin, text.size(), std::move(origin), token.splice});
         text += ' ';
     }
     const auto size = text.size();
@@ -465,10 +489,70 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
     if (tokens.size() != input.size() + 1) return {};
     for (std::size_t at = 0; at < input.size(); ++at) {
         if (tokens[at].kind != input[at].kind || tokens[at].text != input[at].text) return {};
+        if (tokens[at].splice != input[at].splice) return {};
         tokens[at].split_source = input[at].split_source;
         tokens[at].split_offset = input[at].split_offset;
     }
     return Parser::parse_syntax_tokens(category, std::move(tokens), std::move(context), diagnostics_);
+}
+
+std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
+    const SyntaxNode& node, SourceLocation location) {
+    std::vector<const SyntaxNode*> pending{&node};
+    std::unordered_set<const SyntaxNode*> seen;
+    while (!pending.empty()) {
+        const auto* next = pending.back();
+        pending.pop_back();
+        if (!seen.insert(next).second) continue;
+        if (!work(location)) return {};
+        if (next->kind == SyntaxNode::Kind::Deferred) {
+            diagnostics_.error(location,
+                "deferred syntax-node splice requires explicit $::meta::tokens projection");
+            return {};
+        }
+        for (const auto& child : next->children) if (child) pending.push_back(child.get());
+        for (const auto& token : next->tokens)
+            if (token.splice) pending.push_back(token.splice.get());
+    }
+    const auto fragments = syntax_node_fragments(node);
+    std::string text;
+    std::vector<SourceTokenOrigin> origins;
+    const auto expansion = sources_.next_expansion();
+    const auto original = token_origin(location).identity;
+    for (std::size_t index = 0; index < fragments.size(); ++index) {
+        if (!work(location)) return {};
+        auto token = fragments[index];
+        if (token.kind == TokenKind::End || token.kind == TokenKind::Invalid ||
+            token.text.empty() || token.text.find('\0') != std::string::npos ||
+            token.text.size() + 1 > limits_.bytes - std::min<std::uint64_t>(text.size(), limits_.bytes)) {
+            diagnostics_.error(location, "syntax node cannot be materialized without explicit token projection");
+            return {};
+        }
+        if (!token.origin.identity.source_unit)
+            token.origin.identity = {original.source_unit, 0, expansion, index};
+        const auto begin = text.size();
+        text += token.text;
+        origins.push_back({begin, text.size(), std::move(token.origin), token.splice});
+        text += ' ';
+    }
+    const auto end = text.size();
+    const auto* source = sources_.add("<syntax-splice>", std::move(text),
+        {{0, end, "$::unquote", location, node.span.first}}, std::move(origins));
+    auto tokens = Lexer(*source, diagnostics_).lex();
+    if (tokens.size() != fragments.size() + 1) {
+        diagnostics_.error(location, "syntax node cannot be materialized without explicit token projection");
+        return {};
+    }
+    for (std::size_t at = 0; at < fragments.size(); ++at) {
+        if (tokens[at].kind != fragments[at].kind || tokens[at].text != fragments[at].text ||
+            tokens[at].splice != fragments[at].splice) {
+            diagnostics_.error(location, "syntax node cannot be materialized without explicit token projection");
+            return {};
+        }
+        tokens[at].split_source = fragments[at].split_source;
+        tokens[at].split_offset = fragments[at].split_offset;
+    }
+    return Output{std::move(tokens), {source, 0, 1, 1}};
 }
 
 std::optional<MetaToken> SyntaxExecution::terminal(std::string_view quoted, SourceLocation location) {

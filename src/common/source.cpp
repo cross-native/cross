@@ -31,13 +31,18 @@ std::string SourceFile::source_unit_at(unsigned number) const {
     return path.generic_string();
 }
 
-const TokenOrigin* SourceFile::token_origin_at(std::size_t offset) const {
+const SourceTokenOrigin* SourceFile::source_token_origin_at(std::size_t offset) const {
     const auto found = std::lower_bound(token_origins.begin(), token_origins.end(), offset,
         [](const SourceTokenOrigin& origin, std::size_t position) {
             return origin.end <= position;
         });
     return found != token_origins.end() && found->begin <= offset
-        ? &found->origin : nullptr;
+        ? &*found : nullptr;
+}
+
+const TokenOrigin* SourceFile::token_origin_at(std::size_t offset) const {
+    if (const auto* found = source_token_origin_at(offset)) return &found->origin;
+    return nullptr;
 }
 
 TokenOrigin token_origin(SourceLocation location) {

@@ -456,7 +456,7 @@ std::optional<Replacement> find_expansion(SourceManager& sources,
                     }
                     const auto begin = replacement.text.size();
                     replacement.text += token.text;
-                    replacement.token_origins.push_back({begin, replacement.text.size(), token.origin});
+                    replacement.token_origins.push_back({begin, replacement.text.size(), token.origin, token.splice});
                     // Serialization is the only text boundary. Never paste two
                     // adjacent token spellings into a different lexical token.
                     replacement.text += ' ';

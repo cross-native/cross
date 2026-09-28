@@ -2879,8 +2879,21 @@ public:
                     return std::nullopt;
                 if (index == expression.arguments.size()) break;
                 auto value = this->expression(*expression.arguments[index]);
-                if (!value || !value->tokens) {
-                    fail(expression.arguments[index]->location, "$::unquote requires a token value");
+                if (!value) return std::nullopt;
+                if (value->syntax_node) {
+                    MetaToken splice;
+                    splice.kind = TokenKind::StructuredSplice;
+                    splice.text = "__cross_syntax_splice";
+                    splice.origin = token_origin(value->syntax_node->span.first);
+                    splice.origin.context = value->syntax_node->context;
+                    splice.splice = value->syntax_node;
+                    if (!append_tokens(result, {splice}, expression.arguments[index]->location))
+                        return std::nullopt;
+                    continue;
+                }
+                if (!value->tokens) {
+                    fail(expression.arguments[index]->location,
+                         "$::unquote requires a token value or syntax node");
                     return std::nullopt;
                 }
                 if (!append_tokens(result, *value->tokens, expression.arguments[index]->location))
@@ -3372,8 +3385,10 @@ private:
             for (const auto& argument : node.arguments) {
                 if (!validate_required_tree(*argument)) return false;
                 const auto type = expression_type(*argument);
-                if (!type || type->kind != Type::Kind::Tokens) {
-                    fail(argument->location, "$::unquote requires a token value");
+                if (!type || (type->kind != Type::Kind::Tokens &&
+                              type->kind != Type::Kind::Syntax)) {
+                    fail(argument->location,
+                         "$::unquote requires a token value or syntax node");
                     return false;
                 }
             }

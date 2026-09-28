@@ -93,6 +93,51 @@ int main() {
     require(!free_tokens.empty() &&
             free_tokens.front().origin.value_binding.kind == ValueBinding::Kind::Nonlocal,
             "parsed free value can be captured by a relocated local");
+    const auto expression_child = parse("outside + 1u32", K::Expr);
+    auto splice_wrapper = std::make_shared<SyntaxNode>();
+    splice_wrapper->kind = SyntaxNode::Kind::Core;
+    splice_wrapper->production = P::PrimaryExpression;
+    splice_wrapper->structured_splice = true;
+    splice_wrapper->children.push_back(expression_child);
+    splice_wrapper->span = expression_child->span;
+    splice_wrapper->context = expression_child->context;
+    std::string splice_error;
+    require(syntax_validate_node(*splice_wrapper, splice_error),
+            "expression splice public shape failed validation");
+    const auto structured = syntax_node_fragments(*splice_wrapper);
+    require(structured.size() == 1 && structured.front().kind == TokenKind::StructuredSplice &&
+            structured.front().splice == expression_child,
+            "expression splice lost its owned public subtree");
+    require(syntax_node_tokens(*splice_wrapper).size() == 3,
+            "explicit textual projection did not flatten expression splice");
+    const auto ordinary_literal = syntax_node_fragments(*parse("3u32", K::Expr));
+    require(ordinary_literal.size() == 1 && ordinary_literal.front().splice == nullptr &&
+            ordinary_literal.front().kind == TokenKind::Integer,
+            "ordinary literal primary was misclassified as a structured splice");
+    auto raw_splice = std::make_shared<SyntaxNode>();
+    raw_splice->kind = SyntaxNode::Kind::Token;
+    raw_splice->tokens.push_back(structured.front());
+    require(syntax_node_tokens(*raw_splice).size() == 3 &&
+            syntax_node_fragments(*raw_splice).front().splice == expression_child,
+            "raw-node projection or structured copying lost its splice boundary");
+    splice_wrapper->children.front() = parse("return 1u32;", K::Statement);
+    require(!syntax_validate_node(*splice_wrapper, splice_error),
+            "statement subtree was accepted in an expression splice slot");
+    {
+        auto deferred = std::make_shared<SyntaxNode>();
+        deferred->kind = SyntaxNode::Kind::Deferred;
+        deferred->slot_production = P::AssignmentExpression;
+        deferred->deferred_category = SyntaxParseCategory::Expression;
+        deferred->span = expression_child->span;
+        deferred->context = expression_child->context;
+        deferred->tokens = free_tokens;
+        std::ostringstream output;
+        Diagnostics local(output);
+        SyntaxExecution execution(sources, local, 64, {}, {}, {}, {});
+        require(!execution.materialize_node(*deferred, deferred->span.first) &&
+                output.str().find("requires explicit $::meta::tokens projection") != std::string::npos,
+                "unsettled deferred input was silently structured-spliced");
+    }
     for (const bool inherited : {false, true}) {
         const auto* header_source = sources.add("generic-attribute.x",
             "[[generic(u32 N), aligned(N)]] static u32 f() { return 0u32; }");
