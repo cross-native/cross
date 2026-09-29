@@ -334,7 +334,32 @@ const AbiEntry* abi_model(AbiId id) {
     return abi && abi->architecture == "mips" ? abi : nullptr;
 }
 
-const AbiEntry* managed_abi_model(const hir::Function& function,
+std::optional<SignatureLayout> classify_managed_interface(
+    const hir::Module& module, const hir::Function& entity,
+    const Subtarget& subtarget, const AbiEntry& abi) {
+    std::vector<AbiValue> arguments;
+    arguments.reserve(entity.parameters.size());
+    for (const auto& parameter : entity.parameters) {
+        arguments.push_back(abi_value_for(
+            module, parameter.type, subtarget.target().data_layout, abi,
+            parameter.mode == ParameterMode::In
+                ? ValueTransport::Direct : ValueTransport::ByReference));
+    }
+    std::vector<AbiValue> results;
+    if (!is_void(module, entity.result_type)) {
+        results.push_back(abi_value_for(
+            module, entity.result_type, subtarget.target().data_layout, abi));
+    }
+    auto classified = entity.variadic
+        ? classify_variadic_signature(abi, arguments, results, entity.parameters.size(),
+                                      subtarget.enabled_features())
+        : classify_signature(abi, arguments, results, subtarget.enabled_features());
+    if (!classified) return std::nullopt;
+    return std::move(classified.layout);
+}
+
+const AbiEntry* managed_abi_model(const hir::Module& module,
+                                  const hir::Function& function,
                                   const Subtarget& subtarget,
                                   const CompilerOptions& options) {
     if (options.private_abi &&
@@ -350,7 +375,13 @@ const AbiEntry* managed_abi_model(const hir::Function& function,
                 : std::string_view{"cross32"};
             if (const auto* abi = model_registry().find_abi(
                     "mips", name, options.target)) {
-                return abi;
+                // Private transport is an optimization, not permission to
+                // reject a signature supported by its resolved source ABI.
+                // Classify the complete interface (including hidden result
+                // channels) before committing, using the same model and
+                // resolved ISA facts at caller and callee.
+                if (classify_managed_interface(module, function, subtarget, *abi))
+                    return abi;
             }
         }
     }
@@ -586,7 +617,7 @@ private:
         if (!wide || !narrow) return false;
 
         const auto& entity = hir_.function(source_->source);
-        const auto* abi = managed_abi_model(entity, subtarget_, options_);
+        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
         const auto signature = abi
             ? classify_function_interface(entity, *abi)
             : std::optional<SignatureLayout>{};
@@ -1326,7 +1357,7 @@ private:
             const auto* entity =
                 value.callee ? &hir_.function(*value.callee) : nullptr;
             if (const auto* abi =
-                    entity ? managed_abi_model(*entity, subtarget_, options_)
+                    entity ? managed_abi_model(hir_, *entity, subtarget_, options_)
                            : abi_model(callee.abi)) {
                 const auto exact =
                     entity && options_.ipa_ra && options_.private_abi &&
@@ -1615,35 +1646,13 @@ private:
 
     std::optional<SignatureLayout> classify_function_interface(
         const hir::Function& entity, const AbiEntry& abi) const {
-        std::vector<AbiValue> arguments;
-        arguments.reserve(entity.parameters.size());
-        for (const auto& parameter : entity.parameters) {
-            arguments.push_back(abi_value_for(
-                hir_, parameter.type, subtarget_.target().data_layout, abi,
-                parameter.mode == ParameterMode::In
-                    ? ValueTransport::Direct
-                    : ValueTransport::ByReference));
-        }
-        std::vector<AbiValue> results;
-        if (!is_void(hir_, entity.result_type)) {
-            results.push_back(abi_value_for(
-                hir_, entity.result_type, subtarget_.target().data_layout,
-                abi));
-        }
-        const auto classified = entity.variadic
-            ? classify_variadic_signature(
-                  abi, arguments, results, entity.parameters.size(),
-                  subtarget_.enabled_features())
-            : classify_signature(abi, arguments, results,
-                                 subtarget_.enabled_features());
-        if (!classified) return std::nullopt;
-        return classified.layout;
+        return classify_managed_interface(hir_, entity, subtarget_, abi);
     }
 
     bool allocate_registers(machine::Function& function) {
         const auto& entity = hir_.function(function.source);
         if (!options_.register_allocation) {
-            const auto* abi = managed_abi_model(entity, subtarget_, options_);
+            const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
             bool changed = false;
             std::unordered_set<std::uint32_t> saved;
             const auto add_save = [&](machine::PhysicalRegisterId physical) {
@@ -1832,7 +1841,7 @@ private:
         std::vector<std::vector<machine::PhysicalRegisterId>>
             preferred_physical_colors(count);
         const auto* function_abi = managed_abi_model(
-            entity, subtarget_, options_);
+            hir_, entity, subtarget_, options_);
         const auto function_layout = function_abi
             ? classify_function_interface(entity, *function_abi)
             : std::optional<SignatureLayout>{};
@@ -2009,7 +2018,7 @@ private:
                     const auto& callee =
                         hir_.function(*instruction.direct_callee);
                     if (const auto* callee_abi = managed_abi_model(
-                            callee, subtarget_, options_)) {
+                            hir_, callee, subtarget_, options_)) {
                         const auto layout = classify_function_interface(
                             callee, *callee_abi);
                         if (layout && layout->results.size() == 1 &&
@@ -2509,7 +2518,7 @@ private:
             }
         }
 
-        const auto* abi = managed_abi_model(entity, subtarget_, options_);
+        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
         const auto function_clobbers = [&](std::string_view name) {
             const auto contains = [&](const std::vector<std::string>& names) {
                 return std::find(names.begin(), names.end(), name) !=
@@ -4237,7 +4246,7 @@ private:
         for (const auto& name : entity.clobbers) append_name(name);
 
         if (const auto* abi = managed_abi_model(
-                entity, subtarget_, options_)) {
+                hir_, entity, subtarget_, options_)) {
             if (const auto signature =
                     classify_function_interface(entity, *abi)) {
                 for (const auto& result : signature->results) {
@@ -4270,9 +4279,8 @@ private:
         current_.source_entry = source.entry;
         current_.location = source.location;
         current_.symbol = entity.link_symbol;
-        current_.abi = managed_abi_model(entity, subtarget_, options_)
-            ? managed_abi_model(entity, subtarget_, options_)->id
-            : entity.abi;
+        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
+        current_.abi = abi ? abi->id : entity.abi;
         current_.entry = {source.entry.value};
         current_.frame.stack_alignment =
             std::max(1U, subtarget_.abi_info().stack_alignment);
@@ -5123,7 +5131,7 @@ private:
     std::optional<ActiveSignature> classify_entity(
         const hir::Function& entity, SourceLocation location,
         std::span<const hir::TypeId> actual_types = {}) {
-        const auto* abi = managed_abi_model(entity, subtarget_, options_);
+        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
         return classify_interface(
             *hir::call_signature(hir_, entity.id, std::nullopt), abi, location,
             actual_types);

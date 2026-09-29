@@ -8,6 +8,12 @@ namespace LocalTagGeneric {
     $::static_assert(sizeof(AnonymousRecord) == 2uptr && sizeof(AnonymousEnum) == 2uptr &&
         (u16)AnonymousB == 6u16 && (u32)AnonymousGlobal == 11u32, "file-scope anonymous tags");
     [[noinline]] static T pass<T>(in T value) { return value; }
+#ifdef CUSTOM_SYNTAX_ABI
+    // The deliberately narrow register-only test ABI cannot carry this
+    // larger record. Exercise its explicit stack-result companion instead.
+    [[abi("stack_result_abi")]]
+#endif
+    [[noinline]] static T large_pass<T>(in T value) { return value; }
     [[noinline]] static bool same<T>(in T left, in T right) { return left == right; }
     [[noinline]] static T member<T>(in T input) {
         struct Local { T value; } object = {input};
@@ -75,6 +81,9 @@ namespace LocalTagGeneric {
         object.pointer = pass(&object.grid[N - 1u32]);
         if (object.bytes[sizeof(T) - 1uptr] != 7u8) return (T)0u32;
         struct Local copied = object;
+        struct Local transported_large = large_pass(object);
+        if (transported_large.grid[N - 1u32][N] != input ||
+            (*transported_large.pointer)[N] != input) return (T)0u32;
         struct Small { T data[2]; } small = {{input, (T)0u32}};
         struct Small transported = pass(small);
         if (transported.data[0] != input) return (T)0u32;
@@ -105,6 +114,7 @@ namespace LocalTagGeneric {
     [[noinline]] static T anonymous<T, u32 N>(in T input) {
         struct { T value; } first = {input}, second = pass(first);
         if (second.value != input) return (T)0u32;
+        if (pass(first).value != input || pass(second).value != input) return (T)0u32;
         typedef struct { T value; u8 bytes[N]; } Local;
         Local object = {second.value}, copied = object;
         typedef union [[aligned(8)]] { T value; u8 byte; } Variant;

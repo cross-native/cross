@@ -1,0 +1,17 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+set(base "${OUTPUT}")
+set(SOURCE "${CMAKE_CURRENT_LIST_DIR}/private_record_result.x")
+set(MODEL "${CMAKE_CURRENT_LIST_DIR}/../../model/mips_record_result.y")
+set(STARTUP "${base}-start.s")
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../../frontend/syntax_raw_start.s" startup)
+string(REPLACE "syntax_raw_entry" "private_record_entry" startup "${startup}")
+file(WRITE "${STARTUP}" "${startup}")
+set(EXPECTED "P")
+foreach(level O0 O2)
+    foreach(private private-abi no-private-abi)
+        set(OUTPUT "${base}-${level}-${private}")
+        set(CC_FLAGS -${level} -f${private} -fno-eval-calls "--model=${MODEL}" -mabi=custom_record_result)
+        include("${CMAKE_CURRENT_LIST_DIR}/../../language/semantics/mips.cmake")
+    endforeach()
+endforeach()

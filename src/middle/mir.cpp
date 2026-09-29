@@ -968,6 +968,8 @@ private:
         std::optional<BitFieldAccess> bit_field{};
     };
 
+    enum class ObjectAccess { Designator, Value };
+
     struct ActiveDynamicArray {
         const Statement* declaration{};
         std::size_t scope_depth{};
@@ -1639,10 +1641,10 @@ private:
     }
 
     std::optional<DesignatorAddress> lower_designator_address(
-        const Expr& expression) {
+        const Expr& expression, ObjectAccess access = ObjectAccess::Designator) {
         if (expression.kind == Expr::Kind::Parenthesized &&
             expression.left) {
-            return lower_designator_address(*expression.left);
+            return lower_designator_address(*expression.left, access);
         }
         if (expression.kind == Expr::Kind::Name) {
             if (const auto* local = find_local(name_key(expression))) {
@@ -1689,9 +1691,13 @@ private:
             std::optional<ValueId> base;
             hir::TypeId element{};
             unsigned base_alignment{1};
-            if (auto aggregate =
-                    lower_designator_address(*expression.left);
-                aggregate && array_type(hir_, aggregate->type)) {
+            // Classify without evaluating first. A pointer-valued member is
+            // not an array designator, and probing its address would execute
+            // a side-effecting base twice before the fallback value load.
+            const auto aggregate_type = designator_type(*expression.left, nullptr, access);
+            if (aggregate_type && array_type(hir_, *aggregate_type)) {
+                const auto aggregate = lower_designator_address(*expression.left, access);
+                if (!aggregate) return std::nullopt;
                 element = qualified_array_element(aggregate->type);
                 base = decay_array_address(aggregate->address,
                                            aggregate->type,
@@ -1729,7 +1735,7 @@ private:
             expression.right->kind == Expr::Kind::Name) {
             std::optional<DesignatorAddress> base;
             if (expression.text == "member") {
-                base = lower_designator_address(*expression.left);
+                base = lower_designator_address(*expression.left, access);
             } else {
                 auto address = lower_expression(*expression.left);
                 if (address) {
@@ -1744,7 +1750,15 @@ private:
                     }
                 }
             }
-            if (!base) return std::nullopt;
+            if (!base) {
+                if (access == ObjectAccess::Designator && expression.text == "member" &&
+                    designator_type(*expression.left, nullptr, ObjectAccess::Value)) {
+                    diagnostics_.error(expression.location,
+                        "a member of a record value is not an object designator");
+                    failed_ = true;
+                }
+                return std::nullopt;
+            }
             const auto* member = resolve_member(
                 base->type, expression.right->text,
                 expression.right->location);
@@ -1777,15 +1791,36 @@ private:
                           *member->bit_width, member->bit_offset})
                     : std::nullopt};
         }
+        if (access == ObjectAccess::Value) {
+            const auto type = infer_type(expression);
+            if (type && record_value_type(hir_, *type)) {
+                const auto value = lower_expression(expression);
+                if (!value) return std::nullopt;
+                // A record SSA result has no source designator. Give this
+                // occurrence a typed storage home for common member/bit-field
+                // projection; target ABI lowering still owns its transport.
+                const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
+                current_.slots.push_back({slot, expression.location, *type,
+                    "$record.value." + std::to_string(slot.value), std::nullopt,
+                    false, true, false, storage_alignment(hir_, *type, target_), std::nullopt});
+                scopes_.back().slots.push_back(slot);
+                (void)lifetime(ValueKind::LifetimeStart, slot, expression.location);
+                const LocalBinding temporary{slot, *type, std::nullopt, std::nullopt};
+                (void)store_slot(temporary, *value, expression.location);
+                return DesignatorAddress{slot_address(temporary, expression.location),
+                    *type, storage_alignment(hir_, *type, target_)};
+            }
+        }
         return std::nullopt;
     }
 
     std::optional<hir::TypeId> designator_type(
-        const Expr& expression, bool* is_bit_field = nullptr) {
+        const Expr& expression, bool* is_bit_field = nullptr,
+        ObjectAccess access = ObjectAccess::Designator) {
         if (is_bit_field) *is_bit_field = false;
         if (expression.kind == Expr::Kind::Parenthesized &&
             expression.left) {
-            return designator_type(*expression.left, is_bit_field);
+            return designator_type(*expression.left, is_bit_field, access);
         }
         if (expression.kind == Expr::Kind::Name) {
             if (const auto* local = find_local(name_key(expression))) {
@@ -1824,7 +1859,7 @@ private:
             expression.right->kind == Expr::Kind::Name) {
             auto owner = expression.text == "pointer_member"
                              ? infer_type(*expression.left)
-                             : designator_type(*expression.left);
+                             : designator_type(*expression.left, nullptr, access);
             if (!owner) return std::nullopt;
             if (expression.text == "pointer_member") {
                 const auto& pointer = hir_.type(*owner);
@@ -1843,6 +1878,10 @@ private:
             return member ? std::optional<hir::TypeId>(
                                 qualified_member_type(*owner, *member))
                           : std::nullopt;
+        }
+        if (access == ObjectAccess::Value) {
+            const auto type = infer_type(expression);
+            if (type && record_value_type(hir_, *type)) return type;
         }
         return std::nullopt;
     }
@@ -2862,7 +2901,7 @@ private:
         case Expr::Kind::Binary: {
             if (expression.text == "member" ||
                 expression.text == "pointer_member") {
-                const auto type = designator_type(expression);
+                const auto type = designator_type(expression, nullptr, ObjectAccess::Value);
                 if (!type) return std::nullopt;
                 const auto& member = hir_.type(*type);
                 if (member.kind == hir::Type::Kind::Array &&
@@ -3484,7 +3523,7 @@ private:
             if (expression.type) {
                 queried = hir_.intern_type(expression.type);
             } else if (expression.left) {
-                queried = designator_type(*expression.left, &bit_field);
+                queried = designator_type(*expression.left, &bit_field, ObjectAccess::Value);
                 if (!queried) queried = infer_type(*expression.left);
             }
             if (!queried) break;
@@ -3518,7 +3557,7 @@ private:
             if (expression.type) {
                 queried = hir_.intern_type(expression.type);
             } else if (expression.left) {
-                queried = designator_type(*expression.left, &bit_field);
+                queried = designator_type(*expression.left, &bit_field, ObjectAccess::Value);
                 if (!queried) queried = infer_type(*expression.left);
             }
             if (!queried) break;
@@ -3831,7 +3870,7 @@ private:
         case Expr::Kind::Binary:
             if (expression.text == "member" ||
                 expression.text == "pointer_member") {
-                auto designator = lower_designator_address(expression);
+                auto designator = lower_designator_address(expression, ObjectAccess::Value);
                 if (designator) {
                     const auto& type = hir_.type(designator->type);
                     if (type.kind == hir::Type::Kind::Array &&
@@ -3858,9 +3897,10 @@ private:
                 if (!aggregate_type ||
                     !vector_type(hir_, *aggregate_type)) {
                     if (auto designator =
-                            lower_designator_address(expression);
+                            lower_designator_address(expression, ObjectAccess::Value);
                         designator &&
-                        managed_value_type(hir_, designator->type)) {
+                        (managed_value_type(hir_, designator->type) ||
+                         array_type(hir_, designator->type))) {
                         result = load_pointer(
                             designator->address, expression.location,
                             designator->alignment);

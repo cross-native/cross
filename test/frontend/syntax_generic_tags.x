@@ -40,6 +40,8 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
     enum LocalLayout [[underlying(uptr)]] { LocalBytes = sizeof(struct Local) };
     if ((uptr)LocalBytes < sizeof(T) + (uptr)N || $::alignof(struct Local) != 8uptr) return (T)0u32;
     struct Local first = {amount};
+    struct Projection { T value; } projected = {amount};
+    if (tag_expression(LocalTagGeneric::pass(projected).value) != amount) return (T)0u32;
     tag_type second, struct TypeTag { T value; T grid[N]; };
     second.value = first.value;
     tag_copy union Union [[packed, aligned(8)]] { T value; u8 byte; };
@@ -101,6 +103,8 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
     enum Scalar [[underlying(u32)]] { A = 9u32 } item = stack_pass(A);
     if (copied.first != (u64)amount || (u32)item != 9u32 ||
         copied.bytes[sizeof(T) - 1uptr] != 7u8) return (T)0u32;
+    if (stack_pass(object).first != (u64)amount ||
+        memory_pass(object).bytes[sizeof(T) - 1uptr] != 7u8) return (T)0u32;
     return stack_pass(copied.second);
 }
 [[abi(HOST_ABI)]]

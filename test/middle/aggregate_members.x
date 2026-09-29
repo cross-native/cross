@@ -5,6 +5,15 @@ struct member_pair { u32 left; u32 right; };
 struct member_nested { struct member_pair pair; u32 values[3]; u32 *pointer; };
 struct member_packed [[packed]] { u8 tag; u64 value; };
 union member_union { u64 integer; f64 floating; };
+struct member_bits { i32 signed_value : 5; u32 unsigned_value : 7; };
+struct member_grid { u32 values[2][3]; };
+
+[[noinline]] static T member_pass<T>(in T value) { return value; }
+[[noinline]] static T member_counted<T>(in T value, inout u32 count) {
+    count += 1u32;
+    return value;
+}
+[[noinline]] static u32 member_row(in const u32 *values) { return values[2]; }
 
 [[noinline]] global u32 member_host_read(in struct member_pair pair) {
     return pair.left + 3u32 * pair.right;
@@ -53,5 +62,30 @@ global i32 aggregate_members_entry() {
     if (member_packed_read(packed) != 0x1122334455667791u64) return 6;
     union member_union bits; bits.integer = 0x123456789abcdef0u64;
     if (member_union_read(bits) != 0x123456789abcdef0u64) return 7;
+    if (member_pass(pair).left != 7u32 ||
+        (1 == 1 ? member_pass(pair) : pair).right != 11u32 ||
+        ((struct member_pair)member_pass(pair)).left != 7u32) return 8;
+    if (member_pass(cell).pair.right != 11u32 ||
+        member_pass(cell).values[2] != 9u32 ||
+        member_pass(member_pass(cell).pair).left != 7u32) return 9;
+    if (member_pass(packed).value != 0x1122334455667788u64 ||
+        member_pass(bits).integer != 0x123456789abcdef0u64) return 10;
+    struct member_bits fields = {-7, 91u32};
+    if (member_pass(fields).signed_value != -7 ||
+        member_pass(fields).unsigned_value != 91u32) return 11;
+    u32 count = 0u32;
+    if (member_counted(cell, count).pointer[0] != 21u32 || count != 1u32) return 12;
+    count = 0u32;
+    if (member_counted(&cell, count)->pointer[0] != 21u32 || count != 1u32) return 13;
+    count = 0u32;
+    struct member_grid grid = {{{1u32, 2u32, 3u32}, {5u32, 7u32, 11u32}}};
+    if (member_row(member_counted(grid, count).values[1]) != 11u32 || count != 1u32) return 14;
+    count = 0u32;
+    if (sizeof(member_counted(grid, count).values) != 6uptr * sizeof(u32) ||
+        $::alignof(member_counted(grid, count).values) != $::alignof(u32) || count != 0u32) return 15;
+    u32 sum = 0u32;
+    for (u32 index = 0u32; index < 5u32; ++index)
+        sum += member_counted(pair, count).right;
+    if (sum != 55u32 || count != 5u32) return 16;
     return 1;
 }
