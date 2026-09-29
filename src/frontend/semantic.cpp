@@ -2680,10 +2680,10 @@ public:
           syntax_parse_(std::move(syntax_parse)), call_context_(std::move(call_context)) {}
 
     bool charge_input_tokens(const TokenSequence& tokens, SourceLocation location) {
-        constexpr std::size_t metadata_cost = meta_token_storage_bytes;
         std::size_t size = 0;
         const auto byte_limit = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         for (const auto& token : tokens) {
+            const auto metadata_cost = meta_token_storage_bytes + tag_binding_storage(token.origin.tag_binding);
             if (!charge_input_context(token.origin.context, location)) return false;
             if (size > byte_limit || token.text.size() > byte_limit - size ||
                 metadata_cost > byte_limit - size - token.text.size()) {
@@ -3181,8 +3181,8 @@ private:
         const auto budget = static_cast<std::size_t>(program_.evaluation_limits.bytes);
         // Logical metadata charge, not sizeof(MetaToken): resource decisions
         // must not depend on the host C++ library's string/pointer layout.
-        constexpr std::size_t metadata_cost = meta_token_storage_bytes;
         for (const auto& token : part) {
+            const auto metadata_cost = meta_token_storage_bytes + tag_binding_storage(token.origin.tag_binding);
             if (token.text.size() > budget - token_bytes_ ||
                 metadata_cost > budget - token_bytes_ - token.text.size()) {
                 fail(location, "translation-time token construction budget exceeded " +
@@ -6719,6 +6719,7 @@ private:
             auto token = value->tokens->front();
             token.origin.context = call_context_;
             token.origin.value_binding = {};
+            token.origin.tag_binding.reset();
             TokenSequence result;
             if (!append_tokens(result, {token}, expression.location)) return std::nullopt;
             return token_value(std::move(result));

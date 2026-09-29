@@ -47,6 +47,18 @@ reject_splice(local_tag_outer_kind_shadow "previously declared as a record"
     "enum Tag { Value }; global u32 entry() { struct Tag { u16 value; }; enum Tag wrong; return 0u32; }")
 reject_splice(local_tag_duplicate_definition "duplicate definition of record 'Tag'"
     "global u32 entry() { struct Tag { u16 value; }; struct Tag { u32 value; }; return 0u32; }")
+reject_splice(projected_tag_wrong_kind "previously declared with the other record kind" [=[
+    [[syntax_expander]] static $::meta::tokens wrong(in $::meta::syntax_match input) {
+        $::meta::tokens name = $::meta::at($::meta::tokens($::syntax::node(input, "value")), 1uptr);
+        return $::quote { { struct $::unquote(name) *pointer; } };
+    }
+    syntax Wrong : statement { prefix "wrong"; match value:type ";"; expand wrong; }
+    global u32 entry() { union Tag { u16 value; }; syntax Wrong; wrong union Tag; return 0u32; }
+]=])
+accept_splice(enum_tag_visible_in_initializer [=[
+    enum Tag [[underlying(u16)]] { Value = (enum Tag)7u16 };
+    $::static_assert((u16)Value == 7u16, "enum tag visible in its definition");
+]=])
 foreach(kind struct enum)
     if(kind STREQUAL struct)
         set(tag_attributes "")

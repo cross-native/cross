@@ -465,6 +465,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->tag_destination_ = tag_destination_;
     child->tag_destination_depth_ = tag_destination_depth_;
     child->enum_rebindings_ = enum_rebindings_;
+    child->tag_rebindings_ = tag_rebindings_;
     child->scope_origins_ = scope_origins_;
     child->scope_events_ = scope_events_;
     child->active_namespace_ = active_namespace_;
@@ -600,6 +601,7 @@ void Parser::retain_prepared_fragment(std::size_t first, SyntaxExecution::Output
     };
     for (const auto& token : output.tokens) {
         add(meta_token_storage_bytes); add(token.text.size());
+        add(token_binding_storage(token));
         if (token.prepared) add(token.prepared->storage);
         if (token.splice) add(syntax_node_storage(*token.splice, maximum));
     }
@@ -1374,6 +1376,7 @@ void Parser::adopt_replacement(Parser& child) {
     local_type_scopes_ = std::move(child.local_type_scopes_);
     local_tag_scopes_ = std::move(child.local_tag_scopes_);
     enum_rebindings_ = std::move(child.enum_rebindings_);
+    tag_rebindings_ = std::move(child.tag_rebindings_);
     scope_origins_ = std::move(child.scope_origins_);
     enum_types_ = std::move(child.enum_types_);
     pending_enumerations_.insert(pending_enumerations_.end(),
@@ -1501,6 +1504,10 @@ bool Parser::transfer_spliced_tags(
         if (std::any_of(transferred_enumerators.begin(), transferred_enumerators.end(),
                 [&](const auto& entry) { return entry.second == binding; }))
             enum_rebindings_[key] = binding;
+    for (const auto& [key, binding] : child.tag_rebindings_)
+        if (std::any_of(transferred.begin(), transferred.end(), [&](const auto& entry) {
+                return entry.second.type->nominal_key() == binding->type;
+            })) tag_rebindings_[key] = binding;
     for (const auto& [name, tag] : child.record_types_) {
         const auto prior = prior_records.find(name);
         if (prior != prior_records.end() &&
@@ -1999,14 +2006,74 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
     return {};
 }
 
-TypePtr Parser::resolve_tag_type(std::string_view name, SourceLocation location) const {
+TypePtr Parser::rebind_tag_types(TypePtr type) const {
+    if (!type || tag_rebindings_.empty()) return type;
+    type = copy_type(type);
+    std::unordered_set<Type*> seen;
+    std::vector<TypePtr> pending{type};
+    while (!pending.empty()) {
+        auto next = std::move(pending.back());
+        pending.pop_back();
+        if (!next || !seen.insert(next.get()).second) continue;
+        // Labels also have nominal keys, but occupy a different name domain.
+        if ((next->kind == Type::Kind::Record || is_integer(next)) &&
+            !next->nominal_key().empty()) {
+            for (std::size_t remaining = tag_rebindings_.size(); remaining; --remaining) {
+                const auto replacement = tag_rebindings_.find(next->nominal_key());
+                if (replacement == tag_rebindings_.end()) break;
+                const auto& binding = *replacement->second;
+                next->kind = binding.kind == TagBinding::Kind::Enumeration
+                    ? Type::Kind::Builtin : Type::Kind::Record;
+                next->is_union = binding.kind == TagBinding::Kind::Union;
+                next->builtin = binding.underlying;
+                next->nominal_name = binding.type.name;
+                next->nominal_identity = binding.type.identity;
+            }
+        }
+        pending.push_back(next->pointee);
+        pending.push_back(next->element);
+        if (next->function) {
+            pending.push_back(next->function->result);
+            for (const auto& parameter : next->function->parameters) pending.push_back(parameter.type);
+        }
+    }
+    return type;
+}
+
+void Parser::remember_tag_binding(std::size_t token_index, std::string_view spelling,
+                                  const TypePtr& type, bool declaration) {
+    if (!type || type->nominal_key().empty() || preparing_header_) return;
+    auto& token = tokens_[token_index];
+    auto binding = std::make_shared<const TagBinding>(TagBinding{
+        type->kind != Type::Kind::Record ? TagBinding::Kind::Enumeration :
+            type->is_union ? TagBinding::Kind::Union : TagBinding::Kind::Structure,
+        declaration ? TagBinding::Role::Declaration : TagBinding::Role::Use,
+        std::string(spelling), type->nominal_key(), type->builtin});
+    const auto incoming = token.tag_binding ? token.tag_binding : token_origin(token.location).tag_binding;
+    if (declaration && incoming && incoming->role == TagBinding::Role::Declaration &&
+        incoming->spelling == spelling && incoming->type != binding->type)
+        tag_rebindings_[incoming->type] = binding;
+    token.tag_binding = std::move(binding);
+}
+
+TypePtr Parser::resolve_tag_type(std::string_view name, const Token& token) const {
+    const auto location = token.location;
+    const auto origin = token_origin(location);
+    const auto binding = token.tag_binding ? token.tag_binding : origin.tag_binding;
+    if (binding && binding->spelling == name) {
+        auto type = binding->kind == TagBinding::Kind::Enumeration
+            ? enum_type(binding->type.name, binding->underlying)
+            : record_type(binding->type.name, binding->kind == TagBinding::Kind::Union);
+        type->nominal_identity = binding->type.identity;
+        return rebind_tag_types(std::move(type));
+    }
+    require_public_name_context(name, location, PublicNameDomain::Tag);
     if (name.find("::") == std::string_view::npos) {
         const NameKey key(name, location);
         for (auto scope = local_tag_scopes_.rbegin(); scope != local_tag_scopes_.rend(); ++scope)
             if (const auto found = scope->find(key); found != scope->end())
-                return copy_type(found->second.type);
+                return rebind_tag_types(copy_type(found->second.type));
     }
-    const auto origin = token_origin(location);
     // All three tag kinds share one lookup space. Select the nearest name
     // before checking its requested kind, and use the name token's context:
     // a quoted keyword and a copied tag identifier can have different origins.
@@ -2014,9 +2081,9 @@ TypePtr Parser::resolve_tag_type(std::string_view name, SourceLocation location)
             origin.context ? origin.context->name_space : active_namespace_,
             origin.context ? origin.context->imports : active_imports_)) {
         if (const auto found = record_types_.find(candidate); found != record_types_.end())
-            return record_type(candidate, found->second.is_union);
+            return rebind_tag_types(record_type(candidate, found->second.is_union));
         if (const auto found = enum_types_.find(candidate); found != enum_types_.end())
-            return enum_type(candidate, found->second);
+            return rebind_tag_types(enum_type(candidate, found->second));
     }
     return {};
 }
@@ -2315,6 +2382,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             const bool is_union = consume("union");
             if (!is_union)
                 consume("struct");
+            const auto name_index = index_;
             const auto name_location = current().location;
             const auto name = parse_qualified_name();
             if (!name) {
@@ -2355,6 +2423,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     }
                     tag->second.complete = true;
                 }
+                remember_tag_binding(name_index, *name, record_type(declaration), true);
                 if (defer_public_header_group(allow_public_header_deferral_
                         ? bounded_group_end(index_) : std::nullopt, [&] {
                         consume("{");
@@ -2363,15 +2432,17 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 type = record_type(declaration);
                 pending_records_.push_back(std::move(declaration));
             } else {
-                require_public_name_context(*name, name_location, PublicNameDomain::Tag);
                 for (const auto& attribute : record_attributes)
                     diagnostics_.error(attribute.location,
                         "record attributes on a type use are not yet supported");
-                type = local_tag && tag_declaration && current().is(";")
+                bool declares_tag = local_tag && tag_declaration && current().is(";");
+                type = declares_tag
                     ? declare_local_tag(record_type(*name, is_union), name_location, false)
-                    : resolve_tag_type(*name, name_location);
-                if (!type && local_tag)
+                    : resolve_tag_type(*name, tokens_[name_index]);
+                if (!type && local_tag) {
                     type = declare_local_tag(record_type(*name, is_union), name_location, false);
+                    declares_tag = true;
+                }
                 if (!type) {
                     const auto origin = token_origin(name_location);
                     const auto& name_space = origin.context
@@ -2380,6 +2451,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                         ? join_namespace(name_space, *name) : *name;
                     record_types_.emplace(canonical, RecordTag{is_union, false});
                     type = record_type(canonical, is_union);
+                    declares_tag = true;
                 } else if (type->kind != Type::Kind::Record) {
                     diagnostics_.error(name_location, "tag '" + *name +
                         "' was previously declared as an enumeration");
@@ -2388,11 +2460,13 @@ TypePtr Parser::parse_type(bool record_specifiers,
                                        "record tag '" + *name +
                                            "' was previously declared with the other record kind");
                 }
+                remember_tag_binding(name_index, *name, type, declares_tag);
             }
         } else if (current().is("enum")) {
             ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
             const auto location = current().location;
             consume("enum");
+            const auto name_index = index_;
             const auto name_location = current().location;
             const auto name = parse_qualified_name();
             if (!name) {
@@ -2420,10 +2494,6 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     type = declare_local_tag(enum_type(*name, declaration.underlying), name_location, true);
                     declaration.nominal_identity = type->nominal_identity;
                 }
-                if (defer_public_header_group(allow_public_header_deferral_
-                        ? bounded_group_end(index_) : std::nullopt, [&] {
-                        parse_enumerators(declaration, active_namespace_);
-                    })) declaration.enumerators.clear();
                 if (!local_tag) {
                     const auto found = enum_types_.find(declaration.name);
                     if (found != enum_types_.end() && found->second != declaration.underlying) {
@@ -2434,16 +2504,21 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     }
                 }
                 type = enum_type(declaration);
+                remember_tag_binding(name_index, *name, type, true);
+                if (defer_public_header_group(allow_public_header_deferral_
+                        ? bounded_group_end(index_) : std::nullopt, [&] {
+                        parse_enumerators(declaration, active_namespace_);
+                    })) declaration.enumerators.clear();
                 pending_enumerations_.push_back(std::move(declaration));
             } else if (local_tag && tag_declaration && current().is(";")) {
                 type = declare_local_tag(enum_type(*name, enum_underlying(enum_attributes)),
                                          name_location, false);
+                remember_tag_binding(name_index, *name, type, true);
             } else {
-                require_public_name_context(*name, name_location, PublicNameDomain::Tag);
                 for (const auto& attribute : enum_attributes)
                     diagnostics_.error(attribute.location,
                         "enumeration attributes on a type use are not yet supported");
-                type = resolve_tag_type(*name, name_location);
+                type = resolve_tag_type(*name, tokens_[name_index]);
                 if (!type) {
                     diagnostics_.error(name_location,
                                        "unknown enumeration type '" + *name + "'");
@@ -2452,6 +2527,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     diagnostics_.error(name_location, "tag '" + *name +
                         "' was previously declared as a record");
                 }
+                remember_tag_binding(name_index, *name, type, false);
             }
         }
         const auto kind = type ? std::optional<BuiltinType>{} : builtin_kind(current().text);
@@ -2496,6 +2572,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             }
         }
     }
+    type = rebind_tag_types(std::move(type));
     for (const auto& attribute : deferred_type_attributes)
         apply_type_attribute(type, attribute, &pending_address_space);
     while (current().is("const") || current().is("volatile") ||
@@ -4081,12 +4158,14 @@ void Parser::parse_enum_declaration(Program& program,
     ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
     const auto location = current().location;
     consume("enum");
+    const auto name_index = index_;
     auto name = parse_qualified_name();
     if (!name) {
         error_here("expected enumeration name");
         synchronize_external();
         return;
     }
+    const auto written_name = *name;
     *name = join_namespace(name_space, *name);
     if (record_types_.contains(*name))
         diagnostics_.error(location, "tag '" + *name +
@@ -4102,13 +4181,6 @@ void Parser::parse_enum_declaration(Program& program,
     declaration.name = *name;
     declaration.underlying = underlying;
     declaration.attributes = std::move(attributes);
-    parse_enumerators(declaration, name_space);
-    enumeration.finish();
-    type_specifier.finish();
-    specifier.finish();
-    specifiers.finish();
-    expect(";", "after enumeration declaration");
-
     const auto found = enum_types_.find(*name);
     if (found != enum_types_.end() && found->second != underlying) {
         diagnostics_.error(location,
@@ -4117,6 +4189,13 @@ void Parser::parse_enum_declaration(Program& program,
     } else {
         enum_types_[*name] = underlying;
     }
+    remember_tag_binding(name_index, written_name, enum_type(declaration), true);
+    parse_enumerators(declaration, name_space);
+    enumeration.finish();
+    type_specifier.finish();
+    specifier.finish();
+    specifiers.finish();
+    expect(";", "after enumeration declaration");
     program.enumerations.push_back(std::move(declaration));
 }
 
@@ -4210,12 +4289,14 @@ void Parser::parse_record_declaration(
     const auto location = current().location;
     const bool is_union = consume("union");
     if (!is_union) consume("struct");
+    const auto name_index = index_;
     auto name = parse_qualified_name();
     if (!name) {
         error_here("expected record name");
         synchronize_external();
         return;
     }
+    const auto written_name = *name;
     *name = join_namespace(name_space, *name);
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
@@ -4238,6 +4319,7 @@ void Parser::parse_record_declaration(
     declaration.name = *name;
     declaration.is_union = is_union;
     declaration.attributes = std::move(attributes);
+    remember_tag_binding(name_index, written_name, record_type(declaration), true);
     if (consume("{")) {
         declaration.complete = true;
         if (!inserted && tag->second.complete) {
@@ -4724,6 +4806,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     const auto saved_values_depth = local_scopes_.size();
     const auto saved_types_depth = local_type_scopes_.size();
     const auto saved_enum_rebindings = enum_rebindings_;
+    const auto saved_tag_rebindings = tag_rebindings_;
     const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
     const auto saved_recording = recording_public_tree_;
     const auto saved_generic_argument = parsing_generic_argument_;
@@ -4859,6 +4942,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     local_type_scopes_.resize(saved_types_depth);
     local_tag_scopes_.resize(saved_types_depth);
     enum_rebindings_ = saved_enum_rebindings;
+    tag_rebindings_ = saved_tag_rebindings;
     scope_origins_.resize(saved_values_depth);
     public_uncertain_binding_depths_.resize(saved_uncertain_count);
     if (syntax_) syntax_->pop_scope();
@@ -5184,6 +5268,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
     if (consume("for")) {
         statement->kind = Statement::Kind::For;
         const auto saved_enum_rebindings = enum_rebindings_;
+        const auto saved_tag_rebindings = tag_rebindings_;
         const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
         local_scopes_.emplace_back();
         local_type_scopes_.emplace_back();
@@ -5232,6 +5317,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         local_type_scopes_.pop_back();
         local_tag_scopes_.pop_back();
         enum_rebindings_ = saved_enum_rebindings;
+        tag_rebindings_ = saved_tag_rebindings;
         scope_origins_.pop_back();
         public_uncertain_binding_depths_.resize(saved_uncertain_count);
         return statement;

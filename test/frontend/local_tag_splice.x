@@ -38,6 +38,9 @@ namespace LocalTagSplice {
     [[noinline]] static u32 enum_pair<T>(in T left, in T right) {
         return (u32)left + (u32)right;
     }
+    [[noinline]] static bool same_pointer<T>(in T left, in T right) {
+        return left == right;
+    }
 
     [[noinline]] static u32 run(in u32 amount) {
         syntax Copy, Type, Twice, TextTwice, Shadow;
@@ -61,10 +64,16 @@ namespace LocalTagSplice {
         struct CapturedTag { u16 value; } original = {9u16};
         tag_shadow copied struct CapturedTag copied = original;
         tag_twice {
+            struct Node { u32 value; struct Node *next; } node = {amount, (struct Node *)0uptr};
+            node.next = &node;
+            typedef struct Node NodeAlias;
+            NodeAlias *alias = &node;
+            if (!same_pointer(node.next, alias) || node.next->value != amount) return 0u32;
             struct RepeatedTag { u16 value; } repeated = {(u16)amount};
             if (repeated.value != (u16)amount) return 0u32;
             enum RepeatedEnum [[underlying(u16)]] { RepeatedA = 7u16 } repeated_enum = RepeatedA;
             if (enum_pair(repeated_enum, RepeatedA) != 14u32) return 0u32;
+            if (enum_pair(repeated_enum, (enum RepeatedEnum)RepeatedA) != 14u32) return 0u32;
             tag_twice {
                 enum NestedEnum [[underlying(u16)]] { NestedA = (u16)RepeatedA } nested_enum = NestedA;
                 if (enum_pair(nested_enum, NestedA) != 14u32 ||

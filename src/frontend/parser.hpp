@@ -136,7 +136,10 @@ private:
     std::string peek_qualified_name();
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
-    TypePtr resolve_tag_type(std::string_view name, SourceLocation location) const;
+    TypePtr resolve_tag_type(std::string_view name, const Token& token) const;
+    TypePtr rebind_tag_types(TypePtr type) const;
+    void remember_tag_binding(std::size_t token_index, std::string_view spelling,
+                              const TypePtr& type, bool declaration);
     TypePtr declare_local_tag(TypePtr type, SourceLocation location, bool complete);
     TypePtr parse_type(bool record_specifiers = true,
                        std::function<bool()> storage_specifier = {},
@@ -294,6 +297,8 @@ private:
     // Only declarations reintroduced by the currently placed subtree remap
     // captured enumerator uses. Unrelated destination names never do so.
     NameMap<ValueBinding> enum_rebindings_;
+    std::unordered_map<NominalTypeKey, std::shared_ptr<const TagBinding>, NominalTypeKeyHash>
+        tag_rebindings_;
     // Original opening-token identities distinguish a captured lexical block
     // from a different destination block with the same local names.
     std::vector<TokenIdentity> scope_origins_;

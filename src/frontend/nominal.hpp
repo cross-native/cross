@@ -49,4 +49,23 @@ struct NominalTypeKeyHash {
     }
 };
 
+enum class BuiltinType;
+
+// A parsed tag token names an exact nominal type. Declaration tokens also
+// identify binders that a copied subtree may reintroduce in a new placement;
+// copying a use token into a new declaration must not rebind the original type.
+struct TagBinding {
+    enum class Kind { Structure, Union, Enumeration } kind;
+    enum class Role { Use, Declaration } role;
+    std::string spelling;
+    NominalTypeKey type;
+    BuiltinType underlying{};
+};
+
+inline std::uint64_t tag_binding_storage(const std::shared_ptr<const TagBinding>& binding) {
+    if (!binding) return 0;
+    return 96 + binding->spelling.size() + binding->type.name.size() +
+        (binding->type.identity ? 80 + binding->type.identity->source_unit.size() : 0);
+}
+
 } // namespace cross
