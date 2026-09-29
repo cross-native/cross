@@ -467,3 +467,84 @@ foreach(tag "struct Result { u32 first u32 second; unknown!(); }"
 discard static ${tag} ignored() { noncore body; unknown!(); }" 1
         "error: syntax-match error for active prefix")
 endforeach()
+
+check(grouped_pointer_fragment [=[
+[[macro]] static $::meta::tokens part(in $::meta::tokens input) { return input; }
+[[noinline]] static u32 target(in u32 value) { return value + 3u32; }
+global u32 entry() {
+    u32 (part!(*callback))(in u32 value) = &target;
+    return callback(5u32);
+}
+]=] 0)
+
+check(grouped_names [=[
+typedef u32 Word;
+[[noinline]] static u32 (identity)(in u32 (value)) { return value; }
+[[noinline]] static u32 ((nested))(in u32 value) { return value + 1u32; }
+global u32 entry() {
+    u32 (Word) = 7u32;
+    return identity(Word) + nested(Word);
+}
+$::static_assert(identity(5u32) == 5u32 && nested(5u32) == 6u32, "grouped names changed binding");
+]=] 0)
+
+check(grouped_header_fragments "${prefix}
+[[macro]] static $::meta::tokens named(in $::meta::tokens input) { return input; }
+static T (named!(identity))(in T value)
+    [[aligned(notice(unknown!{discarded})), generic(params!(T))]] { return value; }
+$::static_assert(identity(53u32) == 53u32, \"grouped generated header lost generics\");"
+    0 "note: earlier-header-owner")
+
+foreach(name "identity<T>" "identity<part!(T)>" "part!(identity<T>)"
+             "(identity<part!(T)>)" "part!((identity<part!(T)>))")
+    string(MD5 case "${name}")
+    check(grouped_angle_header_${case} "
+[[macro]] static $::meta::tokens part(in $::meta::tokens input) { return input; }
+typedef u8 T;
+static T (${name})(in T value) { return value; }
+$::static_assert(identity(300u32) == 300u32, \"grouped angle generics did not cover the result type\");" 0)
+endforeach()
+
+foreach(name "(identity<params!(T)>)" "((params!(identity<T>)))")
+    string(MD5 case "${name}")
+    check(grouped_header_order_${case} "${prefix}
+typedef u8 T;
+[[aligned(notice(unknown!{discarded}))]] static T ${name}(in T (value)) {
+    return value;
+}
+$::static_assert(identity(300u32) == 300u32, \"grouped header lost generic scope\");"
+        0 "note: earlier-header-owner")
+endforeach()
+
+check(grouped_late_failure_order "${prefix}
+[[aligned(notice(unknown!{discarded}))]] static T ((test<bad!(T)>))(in T value) {
+    return value;
+}" 1 "note: earlier-header-owner" "error: division by zero")
+
+check(grouped_macro_input_opaque "${prefix}
+[[macro]] static $::meta::tokens choose(in $::meta::tokens ignored) {
+    return $::quote { (function) };
+}
+[[aligned(notice(unknown!{discarded}))]] static u32
+(choose!(unknown!{discarded}))(in u32 value) { return value; }
+$::static_assert(function(300u32) == 300u32, \"grouped name fragment failed\");"
+    0 "note: earlier-header-owner")
+
+check(captured_grouped_generics "${compose}
+typedef u8 T;
+compose [[noinline]] static T ((identity<params!(T)>))(in T (value)) { return value; }
+$::static_assert(identity(300u32) == 300u32, \"captured grouped header lost generic scope\");" 0)
+
+foreach(header "static T ((ignored<unknown!(T)>))(in T value)"
+               "static u32 (ignored)(unknown!())")
+    string(MD5 case "${header}")
+    check(discard_grouped_header_${case} "${discard_header}
+discard ${header} { not core syntax; unknown!(); }" 0)
+endforeach()
+
+foreach(header "static u32 (unknown!(name))()"
+               "static u32 (*object)(unknown!())")
+    string(MD5 case "${header}")
+    check(reject_unproved_grouped_header_${case} "${discard_header}
+discard ${header} { unknown!(); }" 1 "error: syntax-match error for active prefix")
+endforeach()

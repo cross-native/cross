@@ -135,6 +135,35 @@ int main() {
     require(late_generic.objects[0]->type->kind == Type::Kind::Builtin);
     require(late_generic.objects[0]->type->builtin == BuiltinType::U8);
 
+    const auto* grouped_source = sources.add("grouped-declarators.x", R"(
+        typedef u8 T;
+        static T ((identity<T>))(in T (value)) [[noinline]] { return value; }
+        static u32 (callback)(in u32 value) -> "custom.result";
+        u32 accepts(u32 (T), u32 (u16), u32 (named));
+        T after_grouped;
+    )");
+    Parser grouped_parser(Lexer(*grouped_source, diagnostics).lex(), diagnostics);
+    auto grouped = grouped_parser.parse();
+    require(diagnostics.errors() == 0 && grouped.functions.size() == 3);
+    require(grouped.functions[0]->return_type->kind == Type::Kind::Generic);
+    require(grouped.functions[0]->return_type->generic_name == "T");
+    require(grouped.functions[0]->parameters[0].name == "value");
+    require(grouped.functions[0]->parameters[0].type->kind == Type::Kind::Generic);
+    require(grouped.functions[1]->result_location == "custom.result");
+    const auto& grouped_parameters = grouped.functions[2]->parameters;
+    require(grouped_parameters.size() == 3);
+    for (std::size_t index = 0; index < 2; ++index) {
+        require(grouped_parameters[index].type->kind == Type::Kind::Pointer);
+        const auto& callable = grouped_parameters[index].type->pointee;
+        require(callable->kind == Type::Kind::Function);
+        require(callable->function->parameters.size() == 1);
+        require(callable->function->parameters[0].type->builtin ==
+            (index == 0 ? BuiltinType::U8 : BuiltinType::U16));
+    }
+    require(grouped_parameters[2].name == "named");
+    require(grouped_parameters[2].type->builtin == BuiltinType::U32);
+    require(grouped.objects[0]->type->builtin == BuiltinType::U8);
+
     const auto* lists_source = sources.add("declaration-lists.x", R"(
         typedef u8 Word;
         namespace nested {

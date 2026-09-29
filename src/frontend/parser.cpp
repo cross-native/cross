@@ -525,7 +525,7 @@ bool Parser::probe_header_type() {
     try {
         auto type = child->parse_type();
         std::optional<std::string> name;
-        if (type) type = child->parse_declarator(std::move(type), name);
+        if (type) type = child->parse_declarator(std::move(type), name, DeclaratorContext::TypeName);
         return type && !name && child->current().is(")") && provisional.errors() == 0;
     } catch (const DeferredNameRecognition&) {
         return false;
@@ -851,7 +851,7 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
             if (!child->type_start()) return {};
             auto type = child->parse_type();
             std::optional<std::string> name;
-            (void)child->parse_declarator(std::move(type), name);
+            (void)child->parse_declarator(std::move(type), name, DeclaratorContext::TypeName);
             if (name) return {};
         } else if (kind == K::Statement) {
             (void)child->parse_statement();
@@ -1563,7 +1563,7 @@ std::vector<Attribute> Parser::parse_attributes_impl(bool one_specifier, Attribu
                             value_type = parse_type();
                             if (value_type) {
                                 value_type = parse_declarator(
-                                    std::move(value_type), parameter_name, false,
+                                    std::move(value_type), parameter_name, DeclaratorContext::Named,
                                     nullptr, &parameter_location);
                             }
                             if (value_type && !is_integer(value_type) &&
@@ -1616,7 +1616,7 @@ std::vector<Attribute> Parser::parse_attributes_impl(bool one_specifier, Attribu
                         auto type = parse_type();
                         std::optional<std::string> binding_name;
                         auto name_location = current().location;
-                        if (type) (void)parse_declarator(std::move(type), binding_name, false,
+                        if (type) (void)parse_declarator(std::move(type), binding_name, DeclaratorContext::Named,
                                                           nullptr, &name_location);
                         if (!binding_name) error_here("expected variadic state binding name");
                         if (current().kind == TokenKind::String) ++index_;
@@ -1994,7 +1994,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 const auto previous_errors = diagnostics_.errors();
                 auto parsed = child->parse_type();
                 std::optional<std::string> name;
-                if (parsed) parsed = child->parse_declarator(std::move(parsed), name);
+                if (parsed) parsed = child->parse_declarator(std::move(parsed), name, DeclaratorContext::TypeName);
                 if (name || child->current().kind != TokenKind::End)
                     child->error_here("prepared type must contain one complete nameless type");
                 if (diagnostics_.errors() == previous_errors && parsed &&
@@ -2044,7 +2044,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
                         const auto previous_errors = diagnostics_.errors();
                         auto parsed = child->parse_type();
                         std::optional<std::string> declarator_name;
-                        if (parsed) parsed = child->parse_declarator(std::move(parsed), declarator_name);
+                        if (parsed) parsed = child->parse_declarator(std::move(parsed), declarator_name,
+                                                                   DeclaratorContext::TypeName);
                         if (declarator_name)
                             child->error_here("structured type splice cannot declare a name");
                         if (child->current().kind != TokenKind::End)
@@ -2371,14 +2372,20 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
         normalize_qualified_name();
         index_ = saved;
     };
+    std::size_t declarator_depth = 0;
     const auto group_end = [&](std::size_t first, bool parameters = false) -> std::optional<std::size_t> {
+        if (execution && declarator_depth >= execution->limits().depth) {
+            execution->tree_limit_error(tokens_[first].location);
+            if (recording_public_tree_) public_tree_failed_ = true;
+            return {};
+        }
         std::vector<std::string_view> closes{closer(tokens_[first].text)};
         for (auto at = first + 1; at < tokens_.size(); ++at) {
             if (parameters && closes.size() == 1) expose(at);
             if (!work(at)) return {};
             if (tokens_[at].kind == TokenKind::End) return {};
             if (const auto close = closer(tokens_[at].text); !close.empty()) {
-                if (execution && closes.size() >= execution->limits().depth) {
+                if (execution && closes.size() + declarator_depth >= execution->limits().depth) {
                     execution->tree_limit_error(tokens_[at].location);
                     if (recording_public_tree_) public_tree_failed_ = true;
                     return {};
@@ -2414,6 +2421,22 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
             begin = at + 1;
         }
     };
+    bool have_type = false;
+    bool have_name = false;
+    const auto name_end = [&](std::size_t at) {
+        while (at + 2 < tokens_.size() && tokens_[at + 1].is("::") &&
+               tokens_[at + 2].kind == TokenKind::Identifier) at += 2;
+        return at;
+    };
+    const auto macro_end = [&](std::size_t last_name) -> std::optional<std::size_t> {
+        if (last_name + 2 < tokens_.size() && tokens_[last_name + 1].is("!") &&
+            (tokens_[last_name + 2].is("(") || tokens_[last_name + 2].is("[") ||
+             tokens_[last_name + 2].is("{")))
+            // A malformed invocation is still opaque. Stop discovery at the
+            // fence instead of descending into its unbalanced raw input.
+            return group_end(last_name + 2).value_or(tokens_.size() - 1);
+        return {};
+    };
     for (auto cursor = index_; cursor < tokens_.size(); ++cursor) {
         // Header fragments can introduce generics that scope over the earlier
         // result type. Expose attribute names and generic-parameter sequences,
@@ -2431,14 +2454,12 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
             // Skip only the independently proved written groups here; their
             // surviving expansions run through normal grammar preparation.
             auto at = cursor + 1;
+            expose(at);
             if (at < tokens_.size() && tokens_[at].kind == TokenKind::Identifier) {
-                if (!work(at)) return result;
-                ++at;
-                while (at + 1 < tokens_.size() && tokens_[at].is("::") &&
-                       tokens_[at + 1].kind == TokenKind::Identifier) {
-                    if (!work(at) || !work(at + 1)) return result;
-                    at += 2;
-                }
+                const auto last_name = name_end(at);
+                for (; at <= last_name; ++at)
+                    if (!work(at)) return result;
+                if (const auto end = macro_end(last_name)) at = *end + 1;
                 while (at < tokens_.size() && tokens_[at].is("[[")) {
                     const auto end = group_end(at);
                     if (!end) return result;
@@ -2447,9 +2468,11 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
                 if (at < tokens_.size() && tokens_[at].is("{")) {
                     const auto end = group_end(at);
                     if (!end) return result;
-                    cursor = *end;
-                    continue;
+                    at = *end + 1;
                 }
+                have_type = true;
+                cursor = at - 1;
+                continue;
             }
         }
         if (tokens_[cursor].is("[[")) {
@@ -2481,7 +2504,7 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
             const auto close = group_end(cursor);
             if (!close) break;
             cursor = *close;
-        } else if (tokens_[cursor].is("<") && cursor != 0 &&
+        } else if (tokens_[cursor].is("<") && have_name && cursor != 0 &&
                    tokens_[cursor - 1].kind == TokenKind::Identifier) {
             unsigned depth = 1;
             auto close = cursor + 1;
@@ -2503,13 +2526,41 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
             }
             if (close + 1 < tokens_.size()) expose(close + 1);
             if (depth != 0 || close + 1 >= tokens_.size() ||
-                !tokens_[close + 1].is("(")) break;
+                (!tokens_[close + 1].is("(") &&
+                 !(declarator_depth && tokens_[close + 1].is(")")))) break;
             append_types(cursor + 1, close);
             cursor = close;
+        } else if (tokens_[cursor].is("(") && have_type && !have_name) {
+            // A required named declarator may group its name (and its angle
+            // parameters). Descend only until that name is found; parameter
+            // lists and expression groups remain opaque. Macro inputs are
+            // skipped below as units, never mistaken for declarator grouping.
+            if (execution && declarator_depth >= execution->limits().depth) {
+                execution->tree_limit_error(tokens_[cursor].location);
+                if (recording_public_tree_) public_tree_failed_ = true;
+                break;
+            }
+            ++declarator_depth;
+        } else if (tokens_[cursor].is(")")) {
+            if (!declarator_depth) break;
+            --declarator_depth;
         } else if (!closer(tokens_[cursor].text).empty()) {
             const auto close = group_end(cursor);
             if (!close) break;
             cursor = *close;
+        } else if (tokens_[cursor].kind == TokenKind::Identifier &&
+                   !is_reserved_identifier(tokens_[cursor].text)) {
+            const auto last_name = name_end(cursor);
+            for (auto at = cursor + 1; at <= last_name; ++at)
+                if (!work(at)) return result;
+            if (have_type) have_name = true;
+            else have_type = true;
+            cursor = macro_end(last_name).value_or(last_name);
+        } else if (builtin_kind(tokens_[cursor].text) ||
+                   tokens_[cursor].kind == TokenKind::BuiltinName ||
+                   tokens_[cursor].kind == TokenKind::StructuredSplice ||
+                   tokens_[cursor].kind == TokenKind::PreparedFragment) {
+            have_type = true;
         }
     }
     return result;
@@ -2581,8 +2632,7 @@ Parser::parse_angle_generic_parameters_impl() {
                 ProductionScope type_name(*this, SyntaxProduction::TypeName);
                 value_type = parse_type();
                 if (value_type)
-                    value_type = parse_declarator(std::move(value_type), name, false,
-                                                  nullptr, nullptr, nullptr, true);
+                    value_type = parse_declarator(std::move(value_type), name, DeclaratorContext::TypePrefix);
             }
             if (const auto token = consume_kind(TokenKind::Identifier))
                 name = identifier_binding_name(*token);
@@ -2665,11 +2715,12 @@ bool Parser::consume_generic_close() {
     return true;
 }
 
-TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name, bool parameter,
+TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name, DeclaratorContext context,
                                  std::unique_ptr<Expr>* dynamic_outer_bound,
                                  SourceLocation* name_location,
-                                 std::vector<FunctionDecl::GenericParameter>* angle_parameters,
-                                 bool abstract_only) {
+                                 std::vector<FunctionDecl::GenericParameter>* angle_parameters) {
+    const bool parameter = context == DeclaratorContext::Parameter;
+    const bool abstract_only = context == DeclaratorContext::TypePrefix;
     expand_inline_macro_fragments();
     const bool written = current().is("*") || current().is("(") || current().is("[") ||
                          (!abstract_only && current().kind == TokenKind::Identifier);
@@ -2712,7 +2763,26 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         }
     }
     expand_inline_macro_fragments();
-    const bool grouped = current().is("(") && (current(1).is("*") || current(1).is("("));
+    const bool grouped = [&] {
+        if (!current().is("(")) return false;
+        struct Restore {
+            std::size_t& index;
+            std::size_t previous;
+            ~Restore() { index = previous; }
+        } restore{index_, index_};
+        ++index_;
+        // This is a reached declarator boundary, not a speculative scan of
+        // an expression owner's input. Public recognition still throws before
+        // expansion so a bounded enclosing capture may defer instead.
+        expand_inline_macro_fragments();
+        if (current().is("*") || current().is("(") || current().is("[")) return true;
+        if (current().kind != TokenKind::Identifier || is_reserved_identifier(current().text))
+            return false;
+        // A required declared name can shadow a type. In optional/abstract
+        // contexts an established type instead starts an unnamed parameter
+        // list, preserving the existing callable-type interpretation.
+        return context == DeclaratorContext::Named || !type_start();
+    }();
     if (pending_address_space) {
         if (grouped)
             base->pending_address_space = pending_address_space;
@@ -2734,8 +2804,8 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     if (grouped) {
         consume("(");
         hole = std::make_shared<Type>();
-        nested = parse_declarator(hole, name, parameter, nullptr, name_location,
-                                   angle_parameters, abstract_only);
+        nested = parse_declarator(hole, name, context, nullptr, name_location,
+                                   angle_parameters);
         expect(")", "after parenthesized declarator");
     } else if (!abstract_only) {
         const auto location = current().location;
@@ -2779,7 +2849,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         }
         // In a grouped declarator the attributes follow this function
         // suffix, even if another callable component surrounds it.
-        if (nested || !name) {
+        if ((nested && nested != hole) || !name) {
             auto suffix_attributes = parse_attributes();
             apply_callable_attributes(base, suffix_attributes);
             for (const auto& attribute : suffix_attributes) {
@@ -3024,7 +3094,7 @@ void Parser::parse_typedef(const std::string& name_space,
         ProductionScope item(*this, SyntaxProduction::InitDeclarator);
         std::optional<std::string> name;
         auto name_location = location;
-        auto type = parse_declarator(copy_type(base_type), name, false,
+        auto type = parse_declarator(copy_type(base_type), name, DeclaratorContext::Named,
                                      nullptr, &name_location);
         if (!type || !name) {
             if (!name) error_here("expected typedef name");
@@ -3682,7 +3752,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         std::optional<std::string> name;
         SourceLocation name_location;
         std::vector<FunctionDecl::GenericParameter> angle_parameters;
-        auto type = parse_declarator(copy_type(base_type), name, false, nullptr, &name_location,
+        auto type = parse_declarator(copy_type(base_type), name, DeclaratorContext::Named, nullptr, &name_location,
                                      &angle_parameters);
         if (!type || !name) {
             if (!name) error_here("expected declaration name");
@@ -4081,7 +4151,7 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     expand_inline_macro_fragments();
     parameter.type = parse_type(true, {}, &attributes);
     std::optional<std::string> name;
-    parameter.type = parse_declarator(std::move(parameter.type), name, true,
+    parameter.type = parse_declarator(std::move(parameter.type), name, DeclaratorContext::Parameter,
                                       nullptr, &parameter.location);
     if (parameter.mode != ParameterMode::In && parameter.type &&
         parameter.type->is_const) {
@@ -4312,7 +4382,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         declaration.storage_stack = storage_stack;
         declaration.storage_static = storage_static;
         std::optional<std::string> name;
-        declaration.type = parse_declarator(copy_type(base_type), name, false,
+        declaration.type = parse_declarator(copy_type(base_type), name, DeclaratorContext::Named,
             &declaration.dynamic_array_bound, &declaration.location);
         if (!name) error_here("expected local variable name");
         else {
@@ -5123,7 +5193,7 @@ std::unique_ptr<Expr> Parser::parse_cast() {
             {
                 ProductionScope type_name(*this, SyntaxProduction::TypeName);
                 type = parse_type();
-                type = parse_declarator(std::move(type), name);
+                type = parse_declarator(std::move(type), name, DeclaratorContext::TypeName);
             }
             if (name) {
                 diagnostics_.error(location,
@@ -5162,7 +5232,7 @@ std::unique_ptr<Expr> Parser::parse_unary() {
                 {
                     ProductionScope type_name(*this, SyntaxProduction::TypeName);
                     result->type = parse_type();
-                    result->type = parse_declarator(std::move(result->type), name);
+                    result->type = parse_declarator(std::move(result->type), name, DeclaratorContext::TypeName);
                 }
                 if (name) {
                     diagnostics_.error(
@@ -5215,7 +5285,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                             ProductionScope type_name(*this, SyntaxProduction::TypeName);
                             argument.type = parse_type();
                             std::optional<std::string> declared;
-                            argument.type = parse_declarator(std::move(argument.type), declared);
+                            argument.type = parse_declarator(std::move(argument.type), declared, DeclaratorContext::TypeName);
                             if (declared) error_here("a generic type argument cannot declare an object");
                         } else {
                             const bool previous = parsing_generic_argument_;
@@ -5535,7 +5605,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
             ProductionScope type_name(*this, SyntaxProduction::TypeName);
             result->type = parse_type();
             std::optional<std::string> name;
-            result->type = parse_declarator(std::move(result->type), name);
+            result->type = parse_declarator(std::move(result->type), name, DeclaratorContext::TypeName);
             if (name) {
                 diagnostics_.error(
                     item.location,

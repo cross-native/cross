@@ -235,6 +235,12 @@ namespace HeaderFragments { typedef u32 Value; }
 [[noinline]] static T angle_fragment_identity<parameter_list_fragment!(T)>(in T value) {
     return value;
 }
+namespace GroupedHeaders {
+    typedef u8 T;
+    [[noinline]] static T ((identity<parameter_list_fragment!(T)>))(in T (value)) {
+        return value;
+    }
+}
 global volatile u32 header_runtime_seed = 5u32;
 [[noinline]] static u32 suffix_function declarator_function!(value) {
     return value + 3u32;
@@ -309,10 +315,10 @@ memory_header_function(in T value) [[generic(parameter_list_fragment!(T))]] {
     return result;
 }
 assign_header_abi "stack_result_abi"
-static u32 captured_stack_header_value(in u32 value)
+static u32 (captured_stack_header_value)(in u32 value)
     [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] { return value + N; }
 assign_header_abi "memory_result_abi"
-static struct HeaderMemoryResult captured_memory_header_value(in u32 value)
+static struct HeaderMemoryResult ((captured_memory_header_value))(in u32 value)
     [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
     struct HeaderMemoryResult result = { (u64)value + (u64)N, (u64)value + (u64)N + 1u64 };
     return result;
@@ -427,6 +433,9 @@ global u32 syntax_raw_entry() {
     u32 amount = 4u32;
     transplant_type fragmented_type HeaderFragments parameter_list_fragment!(::Value);
     fragmented_type = header_runtime_seed;
+    u32 (parameter_list_fragment!(*grouped_callback))(in u32 value) = &parameter_function;
+    if (grouped_callback(fragmented_type) != 7u32 ||
+        GroupedHeaders::identity(fragmented_type + 300u32) != 305u32) return 0u32;
     struct InlineHeaderResult inline_header_result = captured_inline_header(fragmented_type);
     if (header_fragment_identity(fragmented_type) != 5u32 ||
         angle_fragment_identity(fragmented_type) != 5u32 ||

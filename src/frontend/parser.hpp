@@ -133,13 +133,15 @@ private:
     TypePtr parse_type(bool record_specifiers = true,
                        std::function<bool()> storage_specifier = {},
                        std::vector<Attribute>* declaration_attributes = nullptr);
+    // TypePrefix ends before the separately written angle-generic value name.
+    enum class DeclaratorContext { Named, Parameter, TypeName, TypePrefix };
     TypePtr
     parse_declarator(TypePtr base, std::optional<std::string>& name,
-                     bool parameter = false,
+                     DeclaratorContext context = DeclaratorContext::Named,
                      std::unique_ptr<Expr>* dynamic_outer_bound = nullptr,
                      SourceLocation* name_location = nullptr,
                      std::vector<FunctionDecl::GenericParameter>*
-                         angle_parameters = nullptr, bool abstract_only = false);
+                         angle_parameters = nullptr);
     std::vector<FunctionDecl::GenericParameter>
     parse_angle_generic_parameters();
     std::vector<FunctionDecl::GenericParameter>

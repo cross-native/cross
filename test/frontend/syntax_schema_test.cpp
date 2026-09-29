@@ -503,6 +503,21 @@ int main() {
                  0, P::InitDeclarator, 2);
     child(item, 1, P::AttributeSpecifier, 3);
 
+    header = production(parse("static T (identity<T>)(in T (value)) [[noinline]]",
+                              K::FunctionHeader), P::FunctionHeader, 3);
+    direct = child(child(header, 1, P::Declarator, 1), 0, P::DirectDeclarator, 4);
+    token(direct->children[0], "(");
+    token(direct->children[2], ")");
+    auto grouped_direct = child(child(direct, 1, P::Declarator, 1), 0, P::DirectDeclarator, 2);
+    child(grouped_direct, 1, P::GenericParameterList, 3);
+    child(direct, 3, P::FunctionSuffix, 3);
+    for (const auto text : {"static u32 ((fn))(in u16 (value)) [[noinline]]",
+                           "static u32 (*callback(in u16 value))(in u32 other)",
+                           "static u32 accepts(u32 (u16), u32 (named))"})
+        (void)parse(text, K::FunctionHeader);
+    for (const auto text : {"u32 (in u16)", "u32 ((*)[3u32])", "u32 ([3u32])"})
+        (void)parse(text, K::Type);
+
     const LayoutQuery no_layout = [](const TypePtr&) -> std::optional<std::uint64_t> { return {}; };
     auto execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 32,
         no_layout, no_layout, EvaluationLimits{}, EvaluationLayout{});
