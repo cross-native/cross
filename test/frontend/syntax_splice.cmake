@@ -77,6 +77,50 @@ accept_splice(member_required_bounds [=[
     $::static_assert(sizeof(struct Cell) == sizeof(uptr) + 2uptr, "required pointer-sized bound");
     $::static_assert(sizeof(struct Matrix) == 2uptr, "required record-sized bound");
 ]=])
+accept_splice(early_record_layout [=[
+    static u32 width<u32 N>() {
+        struct Local { u32 value; } object = {N};
+        enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
+        return object.value + (u32)Bytes;
+    }
+    enum First [[underlying(u32)]] { Count = width<0u32>() };
+    struct Cell [[aligned(width<4u32>())]] {
+        u8 values[(u32)Count];
+        u32 bits : width<0u32>();
+    };
+    struct Matrix { [[aligned($::alignof(struct Cell))]] u8 data[sizeof(struct Cell)]; };
+    enum Second [[underlying(uptr)]] { Bytes = sizeof(struct Matrix), Next };
+    $::static_assert((uptr)Bytes == 8uptr && (uptr)Next == 9uptr, "early layout chain");
+    $::static_assert($::alignof(struct Matrix) == 8uptr, "member layout dependency");
+]=])
+reject_splice(early_layout_cycle "required constant expression|cyclic|cycle" [=[
+    struct Local { u8 data[sizeof(struct Local)]; };
+    enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
+]=])
+reject_splice(early_alignment_cycle "required constant expression|cyclic|cycle" [=[
+    struct Local;
+    struct Local [[aligned(sizeof(struct Local))]] { u8 value; };
+    enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
+]=])
+reject_splice(early_layout_invalid_alignment "sizeof requires a complete object type with fixed size" [=[
+    static uptr bad<u32 N>() {
+        struct Local [[aligned(N)]] { u8 value; };
+        enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
+        return (uptr)Bytes;
+    }
+    global uptr entry() { return bad<3u32>(); }
+]=])
+reject_splice(early_layout_later_enum "required constant expression|sizeof requires a complete object type with fixed size" [=[
+    static u32 next();
+    struct Local { u8 data[next()]; };
+    enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
+    enum Later [[underlying(u32)]] { Count = 4u32 };
+    static u32 next() { return (u32)Count; }
+]=])
+reject_splice(early_layout_bad_address_space "address space 999 is not registered" [=[
+    struct Local { u8 data[sizeof([[address_space(999)]] u8 *)]; };
+    enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
+]=])
 reject_splice(local_enum_not_visible "unknown|unresolved"
     "static u32 first() { enum E { Value }; return (u32)Value; } $::static_assert((u32)Value == 0u32, \"scope\");")
 reject_splice(local_enum_duplicate_value "local enumerator 'Value' conflicts"

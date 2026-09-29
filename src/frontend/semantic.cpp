@@ -514,6 +514,7 @@ std::vector<GenericArgumentKey> generic_argument_keys(
 }
 
 struct GenericExpansionState {
+    enum class RecordPreparation { Preparing, Prepared, Failed };
     struct Instance {
         const FunctionDecl* generic{};
         std::vector<GenericArgumentKey> arguments;
@@ -526,6 +527,7 @@ struct GenericExpansionState {
     GenericAbiCanonicalizer canonical_abi;
     std::vector<NameKey> locals;
     std::vector<std::pair<NameKey, TypePtr>> local_types;
+    std::unordered_map<NominalTypeKey, RecordPreparation, NominalTypeKeyHash> required_records;
 };
 
 bool normalize_generic_callable_abis(TypePtr& type,
@@ -879,16 +881,67 @@ void rewrite_generic_type_bounds(const TypePtr& type, FunctionDecl* caller, Prog
     auto expression = clone_expr(*type->array_bound);
     rewrite_generic_expr(expression, caller, program, diagnostics, state, mangling);
     type->array_bound = std::move(expression);
-    // Resolve target-independent extents before a generic body can deduce an
-    // array-pointer argument from a member. Layout-dependent queries remain
-    // required expressions for the target's cycle-checked record layout pass.
+    // Resolve extents before a generic body can deduce an array-pointer
+    // argument from a member. Queries use target-owned layout when available;
+    // unresolved expressions remain for the final required layout pass.
     std::ostringstream output;
     Diagnostics quiet(output);
-    if (const auto bound = evaluate_fixed_array_bound(program, *type->array_bound, quiet,
+    const auto bound_expression = type->array_bound;
+    if (const auto bound = evaluate_fixed_array_bound(program, *bound_expression, quiet,
             program.evaluation_size_of, program.evaluation_align_of,
             caller ? caller->source_namespace : std::string_view{})) {
         type->lanes = *bound;
     }
+}
+
+bool prepare_generic_record(const NominalTypeKey& key, Program& program,
+    Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling) {
+    if (key.identity && key.identity->generic_owner) return true;
+    if (const auto found = state.required_records.find(key); found != state.required_records.end())
+        return found->second != GenericExpansionState::RecordPreparation::Failed;
+    std::size_t index = 0;
+    while (index < program.records.size() &&
+           (!program.records[index].complete || program.records[index].nominal_key() != key)) ++index;
+    if (index == program.records.size()) return true;
+    state.required_records.emplace(key, GenericExpansionState::RecordPreparation::Preparing);
+    const auto errors = diagnostics.errors();
+    FunctionDecl context;
+    context.source_namespace = namespace_prefix(program.records[index].name);
+    const auto location = program.records[index].location;
+    if (location.file) context.source_unit = location.file->source_unit_at(location.line);
+    // A reached record's expressions carry their lexical bindings. Do not let
+    // the function that happened to request its layout shadow those bindings.
+    auto saved_locals = std::move(state.locals);
+    auto saved_local_types = std::move(state.local_types);
+    state.locals.clear();
+    state.local_types.clear();
+    const auto rewrite_attribute = [&](std::optional<std::size_t> member, std::size_t attribute) {
+        const auto& attributes = member ? program.records[index].members[*member].attributes
+                                       : program.records[index].attributes;
+        if (!attributes[attribute].expression_argument) return;
+        auto value = clone_expr(*attributes[attribute].expression_argument);
+        rewrite_generic_expr(value, &context, program, diagnostics, state, mangling);
+        auto& updated = member ? program.records[index].members[*member].attributes
+                               : program.records[index].attributes;
+        updated[attribute].expression_argument = std::shared_ptr<Expr>(std::move(value));
+    };
+    for (std::size_t attribute = 0; attribute < program.records[index].attributes.size(); ++attribute)
+        rewrite_attribute({}, attribute);
+    for (std::size_t member = 0; member < program.records[index].members.size(); ++member) {
+        const auto type = program.records[index].members[member].type;
+        rewrite_generic_type_bounds(type, &context, program, diagnostics, state, mangling);
+        auto width = std::move(program.records[index].members[member].bit_width);
+        rewrite_generic_expr(width, &context, program, diagnostics, state, mangling);
+        program.records[index].members[member].bit_width = std::move(width);
+        for (std::size_t attribute = 0; attribute < program.records[index].members[member].attributes.size(); ++attribute)
+            rewrite_attribute(member, attribute);
+    }
+    state.locals = std::move(saved_locals);
+    state.local_types = std::move(saved_local_types);
+    const bool valid = diagnostics.errors() == errors;
+    state.required_records[key] = valid ? GenericExpansionState::RecordPreparation::Prepared
+                                        : GenericExpansionState::RecordPreparation::Failed;
+    return valid;
 }
 
 void rewrite_generic_statement(
@@ -1245,30 +1298,9 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                 [&](std::unique_ptr<Expr>& initializer) {
                     rewrite_generic_expr(initializer, concrete, program, diagnostics, state, mangling);
                 })) return;
-        const auto rewrite_attribute = [&](std::size_t record, std::optional<std::size_t> member,
-                                           std::size_t attribute) {
-            const auto& attributes = member ? program.records[record].members[*member].attributes
-                                            : program.records[record].attributes;
-            if (!attributes[attribute].expression_argument) return;
-            auto value = clone_expr(*attributes[attribute].expression_argument);
-            rewrite_generic_expr(value, concrete, program, diagnostics, state, mangling);
-            auto& updated = member ? program.records[record].members[*member].attributes
-                                  : program.records[record].attributes;
-            updated[attribute].expression_argument = std::shared_ptr<Expr>(std::move(value));
-        };
         for (auto index = first_record; index < program.records.size(); ++index) {
-            for (std::size_t attribute = 0; attribute < program.records[index].attributes.size(); ++attribute)
-                rewrite_attribute(index, {}, attribute);
-            for (std::size_t member = 0; member < program.records[index].members.size(); ++member) {
-                // Copy the handle before calls that may append record definitions.
-                const auto type = program.records[index].members[member].type;
-                rewrite_generic_type_bounds(type, concrete, program, diagnostics, state, mangling);
-                auto width = std::move(program.records[index].members[member].bit_width);
-                rewrite_generic_expr(width, concrete, program, diagnostics, state, mangling);
-                program.records[index].members[member].bit_width = std::move(width);
-                for (std::size_t attribute = 0; attribute < program.records[index].members[member].attributes.size(); ++attribute)
-                    rewrite_attribute(index, member, attribute);
-            }
+            const auto key = program.records[index].nominal_key();
+            if (!prepare_generic_record(key, program, diagnostics, state, mangling)) return;
         }
         // Publish before walking the body so recursive identical instances
         // resolve to the in-progress function. Nested constant generic calls
@@ -1290,17 +1322,28 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
     state.canonical_abi = canonical_abi;
     if (!validate_generic_redeclarations(program, state, diagnostics))
         return false;
+    auto previous_prepare = std::move(program.evaluation_prepare_type);
+    struct RestorePreparation {
+        Program& program;
+        std::function<bool(const TypePtr&)> previous;
+        ~RestorePreparation() { program.evaluation_prepare_type = std::move(previous); }
+    } restore_preparation{program, std::move(previous_prepare)};
+    program.evaluation_prepare_type = [&](const TypePtr& type) {
+        if (!type) return true;
+        const auto errors = diagnostics.errors();
+        rewrite_generic_type_bounds(type, nullptr, program, diagnostics, state, mangling);
+        const bool prepared = type->kind != Type::Kind::Record ||
+            prepare_generic_record(type->nominal_key(), program, diagnostics, state, mangling);
+        return prepared && diagnostics.errors() == errors;
+    };
+    if (!evaluate_enumerations(program, diagnostics, 0,
+            [&](std::unique_ptr<Expr>& initializer) {
+                rewrite_generic_expr(initializer, nullptr, program, diagnostics, state, mangling);
+            })) return false;
+    materialize_enumerators(program, diagnostics);
     for (std::size_t index = 0; index < program.records.size(); ++index) {
-        if (program.records[index].nominal_identity &&
-            program.records[index].nominal_identity->generic_owner) continue;
-        FunctionDecl context;
-        context.source_namespace = namespace_prefix(program.records[index].name);
-        const auto location = program.records[index].location;
-        if (location.file) context.source_unit = location.file->source_unit_at(location.line);
-        for (std::size_t member = 0; member < program.records[index].members.size(); ++member) {
-            const auto type = program.records[index].members[member].type;
-            rewrite_generic_type_bounds(type, &context, program, diagnostics, state, mangling);
-        }
+        const auto key = program.records[index].nominal_key();
+        if (!prepare_generic_record(key, program, diagnostics, state, mangling)) return false;
     }
     for (std::size_t index = 0; index < program.functions.size(); ++index) {
         auto* function = program.functions[index].get();
@@ -7618,7 +7661,8 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size
     std::unordered_set<std::string> names;
     // Nested instantiation prepares its own enums. Visit only this publication
     // batch, in declaration order, so a later generic actual may use an earlier
-    // enumerator. No vector-element references survive a preparation callback.
+    // enumerator. Neither preparation nor evaluation may retain vector-element
+    // references: a layout query can instantiate further records and enums.
     const auto last = program.enumerations.size();
     for (auto index = first; index < last; ++index) {
         const auto owner = program.enumerations[index].nominal_identity;
@@ -7632,8 +7676,10 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size
                 program.enumerations[index].enumerators[item].initializer = std::move(initializer);
                 if (diagnostics.errors() != 0) return false;
             }
-            auto& enumeration = program.enumerations[index];
-            auto& enumerator = enumeration.enumerators[item];
+            const auto& enumeration = program.enumerations[index];
+            const auto& enumerator = enumeration.enumerators[item];
+            const auto location = enumerator.location;
+            const auto underlying = enumeration.underlying;
             if (enumerator.binding.kind != ValueBinding::Kind::Enumerator &&
                 !names.insert(enumerator.name).second) {
                 diagnostics.error(enumerator.location,
@@ -7649,17 +7695,17 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size
                                     namespace_prefix(enumeration.name));
                 value = evaluator.required_integer(*enumerator.initializer,
                                                    type);
-                if (!value) evaluator.diagnose(enumerator.location);
+                if (!value) evaluator.diagnose(location);
             } else if (!previous) {
                 value = EvalValue{UInt128{}, clone_type(type)};
             } else {
                 auto bits = type_bits(type);
-                if (enumeration.underlying == BuiltinType::Iptr ||
-                    enumeration.underlying == BuiltinType::Uptr) {
+                if (underlying == BuiltinType::Iptr ||
+                    underlying == BuiltinType::Uptr) {
                     bits = program.address_bits;
                 }
                 const bool is_signed =
-                    signed_builtin(enumeration.underlying);
+                    signed_builtin(underlying);
                 const auto limit = is_signed
                                        ? subtract(shift_left(UInt128{1},
                                                              bits - 1),
@@ -7671,7 +7717,7 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size
                 if (previous->integer == limit ||
                     incremented.error != IntegerError::None) {
                     diagnostics.error(
-                        enumerator.location,
+                        location,
                         "implicit enumerator value is not representable in '" +
                             type_name(type) + "'");
                 } else {
@@ -7679,8 +7725,8 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size
                 }
             }
             if (!value) continue;
-            enumerator.value = Expr::IntegerConstant{
-                value->integer, enumeration.underlying};
+            program.enumerations[index].enumerators[item].value = Expr::IntegerConstant{
+                value->integer, underlying};
             previous = *value;
         }
     }
@@ -9285,8 +9331,6 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       const GenericAbiCanonicalizer& canonical_abi,
                       const EvaluationLayoutInstaller& install_layout) {
     if (!validate_attribute_names(program, diagnostics)) return false;
-    if (!evaluate_enumerations(program, diagnostics)) return false;
-    materialize_enumerators(program, diagnostics);
     if (!expand_generics(program, diagnostics, mangling, pointer_resolver,
                          canonical_abi)) {
         if (diagnostics.errors() == 0) {

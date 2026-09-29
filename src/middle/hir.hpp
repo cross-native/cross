@@ -119,6 +119,7 @@ struct RecordMember {
 
 struct Record {
     RecordId id;
+    NominalTypeKey source_key;
     SourceLocation location;
     std::string source_name;
     bool is_union{};
@@ -271,6 +272,11 @@ Module build_constant_context(Program& program, const CompilerOptions& options,
 // still be materialized by translation-time evaluation.
 Module build_record_layout_context(Program& program, const CompilerOptions& options,
                                    const TargetInfo& target, Diagnostics& diagnostics);
+// Demand-driven view for an early required query. Only the requested type and
+// its layout dependencies are completed; unrelated declarations stay lazy.
+Module build_required_layout_context(Program& program, const CompilerOptions& options,
+                                     const TargetInfo& target, Diagnostics& diagnostics,
+                                     const TypePtr& type);
 bool validate_source_address_spaces(Program& program,
                                     const CompilerOptions& options,
                                     const TargetInfo& target,

@@ -884,19 +884,24 @@ int cc_main(int argc, char** argv) {
         return data::normalize_generic_pointer(program, expression, destination,
             caller, locals, options, *subtarget, quiet);
     };
-    const EvaluationLayoutInstaller install_layout = [&](Program& current) {
-        auto layout = std::make_shared<hir::Module>(
-            hir::build_record_layout_context(current, options, *target, diagnostics));
-        if (diagnostics.errors() != 0) return;
-        current.evaluation_size_of = [layout, target](const TypePtr& type) {
+    const auto install_layout_queries = [target](Program& current, auto layout_for) {
+        current.evaluation_size_of = [layout_for, target](const TypePtr& type)
+            -> std::optional<std::uint64_t> {
+            const auto layout = layout_for(type);
+            if (!layout) return {};
             return hir::layout_size(*layout, layout->intern_type(type), *target);
         };
-        current.evaluation_align_of = [layout, target](const TypePtr& type) {
+        current.evaluation_align_of = [layout_for, target](const TypePtr& type)
+            -> std::optional<std::uint64_t> {
+            const auto layout = layout_for(type);
+            if (!layout) return {};
             return hir::layout_alignment(*layout, layout->intern_type(type), *target);
         };
-        current.evaluation_member_layout = [layout](
+        current.evaluation_member_layout = [layout_for](
             const TypePtr& owner, std::string_view name)
             -> std::optional<EvaluationMemberLayout> {
+            const auto layout = layout_for(owner);
+            if (!layout) return {};
             const auto id = layout->intern_type(owner);
             const auto& type = layout->type(id);
             if (!type.record) return std::nullopt;
@@ -906,8 +911,12 @@ int cc_main(int argc, char** argv) {
                 member->offset, member->alignment,
                 member->bit_width, member->bit_offset};
         };
-        current.evaluation_initializer_plan = [layout, target, &current](
+        current.evaluation_initializer_plan = [layout_for, target, &current](
             const Expr& expression, const TypePtr& destination) {
+            const auto layout = layout_for(destination);
+            if (!layout) return EvaluationInitializerPlan{.items = {}, .valid = false,
+                .error_location = expression.location,
+                .error_message = "target layout is unavailable for this initializer"};
             // The shared planner owns selection, duplicate checking, and
             // physical placement; the evaluator consumes source types only.
             const auto type_hash = [](hir::TypeId id) { return std::hash<std::uint32_t>{}(id.value); };
@@ -941,6 +950,30 @@ int cc_main(int argc, char** argv) {
             }
             return result;
         };
+    };
+    // Generic publication changes the source tables. Build an isolated lazy
+    // view per early query; do not cache pointers into growing declaration
+    // vectors or force unrelated templates/required expressions.
+    std::vector<TypePtr> active_layout_queries;
+    install_layout_queries(program, [&](const TypePtr& type) -> std::shared_ptr<hir::Module> {
+        if (active_layout_queries.size() >= program.evaluation_limits.depth ||
+            std::any_of(active_layout_queries.begin(), active_layout_queries.end(),
+                [&](const auto& active) { return same_type(active, type); })) return {};
+        active_layout_queries.push_back(type);
+        struct Pop { std::vector<TypePtr>& values; ~Pop() { values.pop_back(); } }
+            pop{active_layout_queries};
+        if (program.evaluation_prepare_type && !program.evaluation_prepare_type(type)) return {};
+        std::ostringstream output;
+        Diagnostics quiet(output);
+        auto layout = std::make_shared<hir::Module>(
+            hir::build_required_layout_context(program, options, *target, quiet, type));
+        return quiet.errors() == 0 ? std::move(layout) : nullptr;
+    });
+    const EvaluationLayoutInstaller install_layout = [&](Program& current) {
+        auto layout = std::make_shared<hir::Module>(
+            hir::build_record_layout_context(current, options, *target, diagnostics));
+        if (diagnostics.errors() != 0) return;
+        install_layout_queries(current, [layout](const TypePtr&) { return layout; });
     };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
                           options.mangling, options.abi, pointer_resolver,

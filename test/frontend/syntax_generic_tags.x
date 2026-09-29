@@ -37,6 +37,8 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
     syntax LocalTagSplice::Copy, LocalTagSplice::Type, LocalTagSplice::Twice,
            LocalTagSplice::TextTwice, Expression;
     tag_copy struct Local { T value; u8 padding[N]; };
+    enum LocalLayout [[underlying(uptr)]] { LocalBytes = sizeof(struct Local) };
+    if ((uptr)LocalBytes < sizeof(T) + (uptr)N) return (T)0u32;
     struct Local first = {amount};
     tag_type second, struct TypeTag { T value; T grid[N]; };
     second.value = first.value;
@@ -50,12 +52,16 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
         if (!LocalTagGeneric::same(&repeated, repeated.next) || repeated.next->value != amount) return (T)0u32;
         enum RepeatedEnum [[underlying(u32)]] { A = N, B = A + (u32)sizeof(T) } item = B;
         if (LocalTagSplice::enum_pair(item, B) != 2u32 * (N + (u32)sizeof(T))) return (T)0u32;
+        enum RepeatedLayout [[underlying(uptr)]] { Bytes = sizeof(struct Repeated) };
+        if ((uptr)Bytes < sizeof(T) + sizeof(uptr) + (uptr)N) return (T)0u32;
     }
     tag_text_twice {
         struct Text { T value; u8 padding[N]; } text = {amount};
         if (text.value != amount) return (T)0u32;
         enum TextEnum [[underlying(u32)]] { TextA = N } item = TextA;
         if (LocalTagSplice::enum_pair(item, TextA) != 2u32 * N) return (T)0u32;
+        enum TextLayout [[underlying(uptr)]] { TextBytes = sizeof(struct Text) };
+        if ((uptr)TextBytes < sizeof(T) + (uptr)N) return (T)0u32;
     }
     return second.value;
 }

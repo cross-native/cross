@@ -229,6 +229,13 @@ public:
         return std::move(module_);
     }
 
+    Module required_layout_context(const TypePtr& type) {
+        collect_record_shells();
+        if (resolve_member_bounds(type, {}))
+            (void)storage_layout(intern_type(type), {});
+        return std::move(module_);
+    }
+
     void validate_address_spaces() {
         std::unordered_set<const cross::Type*> visited;
         std::unordered_set<std::string> reported;
@@ -674,6 +681,7 @@ private:
 
     void collect_record_shells() {
         for (const auto& declaration : program_.records) {
+            if (declaration.nominal_identity && declaration.nominal_identity->generic_owner) continue;
             auto found = module_.record_ids.find(declaration.nominal_key());
             RecordId id;
             if (found == module_.record_ids.end()) {
@@ -681,6 +689,7 @@ private:
                 module_.record_ids.emplace(declaration.nominal_key(), id);
                 Record record;
                 record.id = id;
+                record.source_key = declaration.nominal_key();
                 record.location = declaration.location;
                 record.source_name = declaration.name;
                 record.is_union = declaration.is_union;
@@ -933,11 +942,21 @@ private:
                 "record contains itself by value through a member cycle");
             return false;
         }
+        const auto key = module_.record(id).source_key;
+        auto type = record_type(key.name, module_.record(id).is_union);
+        type->nominal_identity = key.identity;
+        if (program_.evaluation_prepare_type && !program_.evaluation_prepare_type(type)) return false;
+        // Preparation can publish generic definitions and relocate the source
+        // vector. Refresh this pointer from its typed nominal key, not spelling.
+        const RecordDecl* definition = nullptr;
+        for (const auto& source : program_.records)
+            if (source.complete && source.nominal_key() == key) { definition = &source; break; }
+        module_.record(id).definition = definition;
         // A required layout expression may intern an implicit pointer tag and
         // grow the record table. Work on a detached record, then publish by ID;
         // neither the record nor its member references may dangle across queries.
         auto record = module_.record(id);
-        if (!record.complete) {
+        if (!record.definition) {
             diagnostics_.error(
                 use_location,
                 "incomplete record type '" + record.source_name +
@@ -945,9 +964,11 @@ private:
             return false;
         }
         layout_state_[id.value] = 1;
+        const auto errors = diagnostics_.errors();
+        prepare_record(record);
         std::uint64_t extent{};
         unsigned record_alignment = 1;
-        bool valid = true;
+        bool valid = diagnostics_.errors() == errors;
         struct ActiveBitFieldUnit {
             TypeId type;
             std::uint64_t offset{};
@@ -1193,89 +1214,86 @@ private:
         return valid;
     }
 
-    void finish_records() {
-        // Intern every referenced type before retaining references into the
-        // record table. An implicit incomplete tag may append a shell.
-        for (const auto& declaration : program_.records) {
-            for (const auto& member : declaration.members) {
-                (void)intern_type(member.type);
-            }
+    void prepare_record(Record& record) {
+        const auto* definition = record.definition;
+        const auto attributes = definition->attributes;
+        // Member buffers and expression allocations survive RecordDecl vector
+        // growth. Copy the descriptor handles before any nested required query.
+        std::vector<const RecordMemberDecl*> members;
+        for (const auto& member : definition->members) members.push_back(&member);
+        record.location = definition->location;
+        record.complete = true;
+        record.packed = parse_packed(attributes,
+                                     "a record definition");
+        record.explicit_alignment =
+            parse_alignment(attributes,
+                            "a record definition",
+                            source_namespace(record.source_name));
+        if (members.empty()) {
+            diagnostics_.error(record.location,
+                               "a complete record requires at least one member");
         }
-        for (std::size_t index = 0; index < module_.records.size(); ++index) {
-            const auto* definition = module_.records[index].definition;
-            if (!definition) continue;
-            auto& record = module_.records[index];
-            record.location = definition->location;
-            record.complete = true;
-            record.packed = parse_packed(definition->attributes,
-                                         "a record definition");
-            record.explicit_alignment =
-                parse_alignment(definition->attributes,
-                                "a record definition",
-                                source_namespace(record.source_name));
-            if (definition->members.empty()) {
-                diagnostics_.error(definition->location,
-                                   "a complete record requires at least one member");
+        std::unordered_set<std::string> names;
+        for (const auto* descriptor : members) {
+            const auto& source = *descriptor;
+            if (!source.name.empty() &&
+                !names.insert(source.name).second) {
+                diagnostics_.error(
+                    source.location,
+                    "duplicate record member '" + source.name + "'");
+                continue;
             }
-            std::unordered_set<std::string> names;
-            for (const auto& source : definition->members) {
-                if (!source.name.empty() &&
-                    !names.insert(source.name).second) {
+            RecordMember member;
+            member.location = source.location;
+            member.name = source.name;
+            member.type = intern_type(source.type);
+            member.pending_source_type = source.type;
+            if (source.bit_width) {
+                const auto& type = module_.type(member.type);
+                bool valid_base = true;
+                if (type.kind != Type::Kind::Builtin ||
+                    type.builtin < BuiltinType::Bool ||
+                    type.builtin > BuiltinType::Uptr) {
                     diagnostics_.error(
                         source.location,
-                        "duplicate record member '" + source.name + "'");
-                    continue;
+                        "bit-field base type must be bool, an integer, or an enumeration");
+                    valid_base = false;
+                } else if (type.is_atomic) {
+                    diagnostics_.error(
+                        source.location,
+                        "a bit-field cannot have atomic type");
+                    valid_base = false;
                 }
-                RecordMember member;
-                member.location = source.location;
-                member.name = source.name;
-                member.type = intern_type(source.type);
-                member.pending_source_type = source.type;
-                if (source.bit_width) {
-                    const auto& type = module_.type(member.type);
-                    bool valid_base = true;
-                    if (type.kind != Type::Kind::Builtin ||
-                        type.builtin < BuiltinType::Bool ||
-                        type.builtin > BuiltinType::Uptr) {
-                        diagnostics_.error(
-                            source.location,
-                            "bit-field base type must be bool, an integer, or an enumeration");
-                        valid_base = false;
-                    } else if (type.is_atomic) {
-                        diagnostics_.error(
-                            source.location,
-                            "a bit-field cannot have atomic type");
-                        valid_base = false;
-                    }
-                    const auto* width = source.bit_width.get();
-                    while (width &&
-                           width->kind == Expr::Kind::Parenthesized &&
-                           width->left) {
-                        width = width->left.get();
-                    }
-                    if (!width) {
-                        diagnostics_.error(
-                            source.location,
-                            "bit-field width must be a nonnegative integer constant expression");
-                    } else if (valid_base && width->evaluated_integer) {
-                        (void)set_bit_field_width(
-                            member, *width->evaluated_integer,
-                            source.location);
-                    } else if (valid_base) {
-                        member.pending_bit_width = width;
-                    }
+                const auto* width = source.bit_width.get();
+                while (width &&
+                       width->kind == Expr::Kind::Parenthesized &&
+                       width->left) {
+                    width = width->left.get();
                 }
-                member.packed = parse_packed(source.attributes,
-                                             "a record member");
-                member.alignment = parse_alignment(source.attributes,
-                                                   "a record member",
-                                                   source_namespace(record.source_name));
-                record.members.push_back(std::move(member));
+                if (!width) {
+                    diagnostics_.error(
+                        source.location,
+                        "bit-field width must be a nonnegative integer constant expression");
+                } else if (valid_base && width->evaluated_integer) {
+                    (void)set_bit_field_width(
+                        member, *width->evaluated_integer,
+                        source.location);
+                } else if (valid_base) {
+                    member.pending_bit_width = width;
+                }
             }
+            member.packed = parse_packed(source.attributes,
+                                         "a record member");
+            member.alignment = parse_alignment(source.attributes,
+                                               "a record member",
+                                               source_namespace(record.source_name));
+            record.members.push_back(std::move(member));
         }
-        layout_state_.assign(module_.records.size(), 0);
+    }
+
+    void finish_records() {
         for (std::size_t index = 0; index < module_.records.size(); ++index) {
-            if (module_.records[index].complete) {
+            if (module_.records[index].definition) {
                 (void)layout_record(
                     RecordId{static_cast<std::uint32_t>(index)},
                     module_.records[index].location);
@@ -2400,6 +2418,7 @@ TypeId Module::intern_type(const TypePtr& source) {
                 record_ids.emplace(source->nominal_key(), id);
                 Record record;
                 record.id = id;
+                record.source_key = source->nominal_key();
                 record.source_name = source->nominal_name;
                 record.is_union = source->is_union;
                 records.push_back(std::move(record));
@@ -2669,6 +2688,12 @@ Module build_constant_context(Program& program, const CompilerOptions& options,
 Module build_record_layout_context(Program& program, const CompilerOptions& options,
                                    const TargetInfo& target, Diagnostics& diagnostics) {
     return Builder(program, options, target, diagnostics).record_layout_context();
+}
+
+Module build_required_layout_context(Program& program, const CompilerOptions& options,
+                                     const TargetInfo& target, Diagnostics& diagnostics,
+                                     const TypePtr& type) {
+    return Builder(program, options, target, diagnostics).required_layout_context(type);
 }
 
 bool validate_source_address_spaces(Program& program,

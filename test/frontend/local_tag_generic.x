@@ -27,6 +27,16 @@ namespace LocalTagGeneric {
         return copied.value;
     }
     static u32 increment<u32 N>() { return N + 1u32; }
+    static u32 layout_helper<u32 N>() {
+        struct Bits { u32 value : 4; u32 next : 4; } object = {N, 1u32};
+        enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Bits) };
+        if ((uptr)Bytes != 4uptr) return 0u32;
+        return object.value + object.next;
+    }
+    // A global enum can instantiate a helper that publishes its own local enum
+    // and record while the outer enum is still being evaluated.
+    enum Helper [[underlying(u32)]] { HelperValue = layout_helper<7u32>(), HelperNext };
+    $::static_assert((u32)HelperValue == 8u32 && (u32)HelperNext == 9u32, "early generic enum call");
     [[noinline]] static u32 enumeration<T, u32 N>(in T input) {
         enum Local [[underlying(u32)]] { A = N, B = A + (u32)sizeof(T), C = increment<(u32)A>() };
         enum Local item = pass(B);
@@ -65,6 +75,28 @@ namespace LocalTagGeneric {
         if (transported.data[0] != input) return (T)0u32;
         return (*copied.pointer)[N];
     }
+    [[noinline]] static T early_layout<T, u32 N>(in T input) {
+        enum Count [[underlying(u32)]] { CountValue = N };
+        struct Cell { T value; };
+        struct Local [[aligned(layout_helper<7u32>())]] {
+            T values[layout_helper<(u32)CountValue>()];
+            u8 bytes[sizeof(struct Cell *)];
+            T grid[2][sizeof(struct Cell)];
+        };
+        enum Layout [[underlying(uptr)]] {
+            Alignment = $::alignof(struct Local),
+            Bytes = sizeof(struct Local),
+            CellBytes = sizeof(struct Cell),
+            PointerBytes = sizeof(struct Cell *)
+        };
+        if ((uptr)Alignment != 8uptr || (uptr)Bytes % 8uptr != 0uptr ||
+            (uptr)CellBytes != sizeof(T) || (uptr)PointerBytes != sizeof(uptr)) return (T)0u32;
+        struct Local object = {{(T)0u32}};
+        object.values[N] = input;
+        object.grid[1][sizeof(T) - 1uptr] = input;
+        if ((*pass(&object.grid[1]))[sizeof(T) - 1uptr] != input) return (T)0u32;
+        return object.values[N];
+    }
     // Unused templates must not leak unsubstituted members into final layout.
     static T unused<T>(in T input) { struct Unused { T value; } object = {input}; return object.value; }
 
@@ -76,7 +108,8 @@ namespace LocalTagGeneric {
             enumeration<u16, 5u32>(7u16) != 20u32 ||
             bits<u32, 4u32>(amount) != amount + 3u32 || bits<u16, 2u32>(7u16) != 8u32 ||
             alignment<u32, 8u32>(amount) != amount || alignment<u16, 4u32>(7u16) != 7u16 ||
-            arrays<u32, 3u32>(amount) != amount || arrays<u16, 2u32>(7u16) != 7u16)
+            arrays<u32, 3u32>(amount) != amount || arrays<u16, 2u32>(7u16) != 7u16 ||
+            early_layout<u32, 3u32>(amount) != amount || early_layout<u16, 2u32>(7u16) != 7u16)
             return 0u32;
         return amount;
     }

@@ -445,6 +445,9 @@ struct Program {
     unsigned address_bits{64};
     EvaluationLimits evaluation_limits;
     EvaluationLayout evaluation_layout;
+    // Installed only while semantic instantiation is active. A reached target
+    // layout dependency may need its required expressions prepared first.
+    std::function<bool(const TypePtr&)> evaluation_prepare_type;
     // Installed after semantic declarations are available; the target owns
     // nominal layout even when evaluation precedes final HIR lowering.
     std::function<std::optional<std::uint64_t>(const TypePtr&)>
