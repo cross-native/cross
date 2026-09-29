@@ -33,16 +33,6 @@ function(reject_expansion case expected source)
     endif()
 endfunction()
 
-function(reject_driver case expected source)
-    set(input "${OUTPUT}/${case}.x")
-    file(WRITE "${input}" "${source}")
-    execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
-        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-    if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}")
-        message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
-    endif()
-endfunction()
-
 function(accept case source)
     set(input "${OUTPUT}/${case}.x")
     file(WRITE "${input}" "${source}")
@@ -177,12 +167,16 @@ global u32 entry() {
     return 0u32;
 }
 ]=])
-reject_driver(nested_declarator_macro_recursion
-    "procedural macro expansion exceeded 128 explicit invocations" [=[
+reject_expansion(nested_declarator_macro_recursion
+    "syntax/procedural expansion depth or invocation budget exceeded" [=[
 [[macro]] static $::meta::tokens again(in $::meta::tokens ignored) {
     return $::quote { again!() };
 }
-global u32 entry() { u32 value again!(); return 0u32; }
+[[syntax_expander]] static $::meta::tokens dummy(in $::meta::syntax_match input) {
+    return $::quote { ; };
+}
+syntax Dummy : statement { prefix "dummy"; match ";"; expand dummy; }
+global u32 entry() { syntax Dummy; u32 value again!(); return 0u32; }
 ]=])
 function(as_deferred_statement_alias result source)
     string(REPLACE "match value:expr \";\"" "match value:stmt" statement_source "${source}")
