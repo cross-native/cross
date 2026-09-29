@@ -512,7 +512,9 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
         pending.pop_back();
         if (!seen.insert(next).second) continue;
         if (!work(location)) return {};
-        if (next->kind == SyntaxNode::Kind::Deferred &&
+        // Only the root is opened in this grammar slot. Deferred descendants
+        // stay structured markers and are opened by their own category parser.
+        if (next == &node && next->kind == SyntaxNode::Kind::Deferred &&
             next->deferred_category != deferred_category) {
             diagnostics_.error(location,
                 "deferred syntax-node splice requires explicit $::meta::tokens projection");
@@ -544,8 +546,13 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
         text += ' ';
     }
     const auto end = text.size();
+    const auto unit = location.file
+        ? location.file->source_unit_at(location.line) : std::string{};
+    std::vector<std::string> units(
+        static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) + 1, unit);
     const auto* source = sources_.add("<syntax-splice>", std::move(text),
-        {{0, end, "$::unquote", location, node.span.first}}, std::move(origins));
+        {{0, end, "$::unquote", location, node.span.first}}, std::move(origins),
+        {}, std::move(units));
     auto tokens = Lexer(*source, diagnostics_).lex();
     if (tokens.size() != fragments.size() + 1) {
         diagnostics_.error(location, "syntax node cannot be materialized without explicit token projection");

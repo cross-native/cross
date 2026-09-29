@@ -131,6 +131,15 @@ int main() {
         deferred->span = expression_child->span;
         deferred->context = expression_child->context;
         deferred->tokens = free_tokens;
+        auto parent = std::make_shared<SyntaxNode>();
+        parent->kind = SyntaxNode::Kind::Core;
+        parent->production = P::Expression;
+        parent->children.push_back(deferred);
+        const auto nested_fragments = syntax_node_fragments(*parent);
+        require(nested_fragments.size() == 1 &&
+                nested_fragments.front().kind == TokenKind::StructuredSplice &&
+                nested_fragments.front().splice == deferred,
+                "nested deferred syntax lost its category/context boundary");
         std::ostringstream output;
         Diagnostics local(output);
         SyntaxExecution execution(sources, local, 64, {}, {}, {}, {});

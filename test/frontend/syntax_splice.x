@@ -167,8 +167,73 @@ namespace Source {
 [[macro]] static $::meta::tokens declarator_function(in $::meta::tokens name) {
     return $::quote { (in u32 $::unquote(name)) };
 }
+[[macro]] static $::meta::tokens parameter_fragment(in $::meta::tokens name) {
+    return $::quote { in u32 $::unquote(name) };
+}
 [[noinline]] static u32 suffix_function declarator_function!(value) {
     return value + 3u32;
+}
+[[noinline]] static u32 parameter_function(parameter_fragment!(value)) {
+    return value + 2u32;
+}
+[[syntax_expander]] static $::meta::tokens copy_parameter_header(
+    in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    if (!$::meta::is_kind(header, "deferred"))
+        $::syntax::error($::syntax::span(input), "function header was parsed too early");
+    return $::quote {
+        $::unquote($::meta::tokens(header))
+        $::unquote($::syntax::capture(input, "body"))
+    };
+}
+syntax CopyParameterHeader : item {
+    prefix "copy_parameter_header";
+    match header:function_header body:block;
+    expand copy_parameter_header;
+}
+syntax CopyParameterHeader;
+copy_parameter_header [[noinline]] static u32 header_function(parameter_fragment!(value)) {
+    return value + 4u32;
+}
+[[syntax_expander]] static $::meta::tokens copy_parameter_prototype(
+    in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    if (!$::meta::is_kind(body, "deferred"))
+        $::syntax::error($::syntax::span(input), "prototype was parsed too early");
+    return $::quote { $::unquote(body) };
+}
+syntax CopyParameterPrototype : item {
+    prefix "copy_parameter_prototype";
+    match body:function_decl;
+    expand copy_parameter_prototype;
+}
+syntax CopyParameterPrototype;
+copy_parameter_prototype static u32 prototype_function(parameter_fragment!(value));
+[[noinline]] static u32 prototype_function(in u32 value) { return value + 5u32; }
+[[syntax_expander]] static $::meta::tokens copy_function_definition(
+    in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+syntax CopyFunctionDefinition : item {
+    prefix "copy_function_definition";
+    match body:function_def;
+    expand copy_function_definition;
+}
+syntax CopyFunctionDefinition;
+copy_function_definition [[noinline]] static u32 copied_function(in u32 value) {
+    return value + 6u32;
+}
+copy_function_definition [[noinline]] static u32 deferred_copied_function(
+    parameter_fragment!(value)) {
+    return value + 7u32;
+}
+[[macro]] static $::meta::tokens deferred_body_type(in $::meta::tokens name) {
+    return $::quote { typedef u32 $::unquote(name); };
+}
+copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 value) {
+    deferred_body_type!(Local);
+    Local result = value + 8u32;
+    return result;
 }
 
 #ifdef CUSTOM_SYNTAX_ABI
@@ -236,7 +301,11 @@ global u32 syntax_raw_entry() {
         external_spliced_alias != 7u16 || named_by_macro != 5u32 ||
         *pointer_by_macro != amount || array_by_macro[1] != 3u32 ||
         copied_array[1] != 8u32 ||
-        suffix_function(5u32) != 8u32 ||
+        suffix_function(5u32) != 8u32 || parameter_function(5u32) != 7u32 ||
+        header_function(5u32) != 9u32 || prototype_function(5u32) != 10u32 ||
+        copied_function(5u32) != 11u32 ||
+        deferred_copied_function(5u32) != 12u32 ||
+        deferred_body_function(5u32) != 13u32 ||
         sizeof(Source::Destination::moved) != 2uptr)
         return 0u32;
     return 61u32;

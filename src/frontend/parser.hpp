@@ -58,7 +58,7 @@ private:
     const SyntaxDefinition* active_syntax(bool item) const;
     bool macro_start() const;
     std::optional<SyntaxExecution::Output> expand_at_position(bool item);
-    void expand_declarator_macros();
+    void expand_inline_macro_fragments();
     bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
                                          std::string_view name_space,
                                          const std::vector<std::string>& imports) const;
@@ -115,8 +115,8 @@ private:
         std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
     bool type_start() const;
     void parse_external(Program& program, const std::string& name_space);
-    void parse_external_declaration_splice(Program& program,
-                                           const std::string& name_space);
+    void parse_external_node_splice(Program& program,
+                                    const std::string& name_space);
     void parse_typedef(const std::string& name_space,
                        std::vector<Attribute> attributes, TypePtr base_type,
                        SourceLocation location, bool consume_semicolon = true);
@@ -252,6 +252,11 @@ private:
     bool parsing_procedural_body_{};
     bool parsing_public_fragment_{};
     bool parsing_public_function_header_{};
+    // A known parameter group can be opaque while declarator binding is still
+    // recognized by the ordinary parser. These flags are speculative only;
+    // no placeholder signature may leave a deferred public-tree capture.
+    bool allow_public_parameter_deferral_{};
+    bool public_deferred_parameters_{};
     bool recording_public_tree_{};
     bool public_tree_failed_{};
     std::vector<std::size_t> public_uncertain_binding_depths_;

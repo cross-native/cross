@@ -351,7 +351,7 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
                              context->parse_environment, definition);
 }
 
-void Parser::expand_declarator_macros() {
+void Parser::expand_inline_macro_fragments() {
     while (syntax_ && macro_start()) {
         // Captures only recognize syntax; they cannot execute a nested macro
         // to discover a declarator's shape or its bound names.
@@ -615,14 +615,64 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         child->active_namespace_ = origin.context->name_space;
         child->active_imports_ = origin.context->imports;
     }
+    const auto initial_context = child->public_fragment_context(first);
+    child->allow_public_parameter_deferral_ = kind == K::FunctionHeader ||
+        kind == K::FunctionDeclaration || kind == K::FunctionDefinition;
+    const auto deferred_category = [&]() {
+        switch (kind) {
+        case K::Expr: return SyntaxParseCategory::Expression;
+        case K::Type: return SyntaxParseCategory::Type;
+        case K::Statement: return SyntaxParseCategory::Statement;
+        case K::Declaration: return SyntaxParseCategory::Declaration;
+        case K::FunctionHeader: return SyntaxParseCategory::FunctionHeader;
+        case K::FunctionDeclaration: return SyntaxParseCategory::FunctionDeclaration;
+        case K::FunctionDefinition: return SyntaxParseCategory::FunctionDefinition;
+        default: return SyntaxParseCategory::None;
+        }
+    }();
+    const auto deferred_slot = [&]() {
+        switch (kind) {
+        case K::Expr: return SyntaxProduction::AssignmentExpression;
+        case K::Type: return SyntaxProduction::TypeName;
+        case K::Statement: return SyntaxProduction::Statement;
+        case K::Declaration:
+        case K::FunctionDeclaration: return SyntaxProduction::Declaration;
+        case K::FunctionHeader: return SyntaxProduction::FunctionHeader;
+        case K::FunctionDefinition: return SyntaxProduction::FunctionDefinition;
+        default: return SyntaxProduction::None;
+        }
+    }();
     std::shared_ptr<const SyntaxNode> deferred_root;
     try {
-        if (kind == K::Declaration &&
+        if ((kind == K::Declaration || kind == K::FunctionDeclaration ||
+             kind == K::FunctionDefinition) &&
             child->current().kind == TokenKind::StructuredSplice) {
-            ProductionScope declaration(*child, SyntaxProduction::Declaration);
+            ProductionScope declaration(*child, kind == K::FunctionDefinition
+                ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration);
             const auto item = child->current();
             ++child->index_;
-            if (!item.splice || !syntax_declaration_node(*item.splice)) return {};
+            if (!item.splice ||
+                (kind == K::FunctionDefinition
+                    ? !syntax_function_definition_node(*item.splice)
+                    : !syntax_declaration_node(*item.splice))) return {};
+            if (kind == K::FunctionDeclaration &&
+                (item.splice->kind != SyntaxNode::Kind::Deferred ||
+                 item.splice->deferred_category != SyntaxParseCategory::FunctionDeclaration)) {
+                // The public declaration production also describes objects
+                // and typedefs. Classify its direct-function shape without
+                // executing nested macros or changing the retained node.
+                if (!execution || !item.splice->context ||
+                    !item.splice->context->parse_environment) return {};
+                auto materialized = execution->materialize_node(*item.splice, item.location,
+                    item.splice->kind == SyntaxNode::Kind::Deferred
+                        ? item.splice->deferred_category : SyntaxParseCategory::None);
+                if (!materialized) return {};
+                auto validator = child->replacement_parser(std::move(*materialized), &local);
+                validator->restore_environment(*item.splice->context->parse_environment,
+                                                *item.splice->context);
+                const auto classified = validator->parse_syntax_fragment(kind, 0);
+                if (!classified || classified->end + 1 != validator->tokens_.size()) return {};
+            }
             if (declaration.event < child->production_events_.size())
                 child->production_events_[declaration.event].opaque = item.splice;
         } else if (kind == K::Expr) {
@@ -683,26 +733,30 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         } else {
             return {};
         }
+        if (child->public_deferred_parameters_)
+            deferred_root = child->deferred_node(first, child->index_, deferred_slot,
+                                                 deferred_category, initial_context);
     } catch (const DeferredNameRecognition&) {
         // A nested capture can inherit uncertainty from an earlier opaque
         // invocation in its enclosing block. Prove its boundary lexically,
         // independently of the unresolved type/generic lookup.
-        const auto fragment_end = kind == K::Expr || kind == K::Type
-            ? child->fenced_fragment_end(first, kind == K::Expr)
-            : kind == K::Statement || kind == K::Declaration
-                ? child->bounded_statement_end(first)
-                                  : std::optional<std::size_t>{};
+        std::optional<std::size_t> fragment_end;
+        switch (kind) {
+        case K::Expr:
+            fragment_end = child->fenced_fragment_end(first, true);
+            break;
+        case K::Type:
+            fragment_end = child->fenced_fragment_end(first, false);
+            break;
+        case K::Statement:
+        case K::Declaration:
+            fragment_end = child->bounded_statement_end(first);
+            break;
+        default: return {};
+        }
         if (!fragment_end) return {};
-        const auto slot = kind == K::Expr ? SyntaxProduction::AssignmentExpression
-            : kind == K::Type ? SyntaxProduction::TypeName
-            : kind == K::Declaration ? SyntaxProduction::Declaration
-                                     : SyntaxProduction::Statement;
-        const auto category = kind == K::Expr ? SyntaxParseCategory::Expression
-            : kind == K::Type ? SyntaxParseCategory::Type
-            : kind == K::Declaration ? SyntaxParseCategory::Declaration
-                                     : SyntaxParseCategory::Statement;
-        deferred_root = child->deferred_node(first, *fragment_end, slot, category,
-                                             child->public_fragment_context(first));
+        deferred_root = child->deferred_node(first, *fragment_end, deferred_slot,
+                                             deferred_category, initial_context);
         child->index_ = *fragment_end;
     }
     if (child->public_tree_failed_) {
@@ -2233,7 +2287,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                                  SourceLocation* name_location,
                                  std::vector<FunctionDecl::GenericParameter>* angle_parameters,
                                  bool abstract_only) {
-    expand_declarator_macros();
+    expand_inline_macro_fragments();
     const bool written = current().is("*") || current().is("(") || current().is("[") ||
                          (!abstract_only && current().kind == TokenKind::Identifier);
     ProductionScope declarator(*this,
@@ -2256,7 +2310,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
             pending_address_space.reset();
         }
         for (;;) {
-            expand_declarator_macros();
+            expand_inline_macro_fragments();
             if (!current().is("const") && !current().is("volatile") &&
                 !current().is("restrict") && !current().is("[[")) break;
             if (current().is("[[")) {
@@ -2274,7 +2328,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
             }
         }
     }
-    expand_declarator_macros();
+    expand_inline_macro_fragments();
     const bool grouped = current().is("(") && (current(1).is("*") || current(1).is("("));
     if (pending_address_space) {
         if (grouped)
@@ -2308,17 +2362,28 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         if (name && angle_parameters && current().is("<"))
             *angle_parameters = parse_angle_generic_parameters();
     }
-    expand_declarator_macros();
+    expand_inline_macro_fragments();
     if (current().is("[")) {
         base = parse_array_suffix(std::move(base), parameter, dynamic_outer_bound);
     }
-    expand_declarator_macros();
+    expand_inline_macro_fragments();
     if (current().is("(")) {
         ProductionScope suffix(*this, SyntaxProduction::FunctionSuffix);
+        const auto parameter_first = index_;
+        const auto production_depth = production_stack_.size();
+        const auto parameter_context = allow_public_parameter_deferral_
+            ? public_fragment_context(parameter_first) : nullptr;
+        const auto saved_generic_argument = parsing_generic_argument_;
+        const auto saved_records = pending_records_.size();
+        const auto saved_enumerations = pending_enumerations_.size();
+        std::optional<std::size_t> end_input;
+        if (allow_public_parameter_deferral_)
+            if (const auto end = bounded_group_end(parameter_first))
+                end_input = public_input_indices_[*end];
         consume("(");
         std::vector<ParameterDecl> parameters;
         bool variadic = false;
-        {
+        try {
             ProductionScope list(*this, SyntaxProduction::ParameterList);
             if (!current().is(")")) {
                 if (current().is("void") && current(1).is(")")) {
@@ -2337,10 +2402,33 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                     }
                 }
             }
+        } catch (const DeferredNameRecognition&) {
+            if (!allow_public_parameter_deferral_ || !end_input ||
+                !parameter_context || !parameter_context->parse_environment ||
+                public_tree_failed_) throw;
+            // The grammar parser identified this exact parameter group.
+            // Preserve its opacity, then finish parsing the declarator to
+            // distinguish a direct function from a function-pointer object.
+            // The signature below is only a speculative shape placeholder;
+            // the entire public capture becomes deferred, never typed HIR.
+            const auto end = std::find(public_input_indices_.begin() +
+                static_cast<std::ptrdiff_t>(parameter_first),
+                public_input_indices_.end(), *end_input);
+            if (end == public_input_indices_.end()) throw;
+            restore_environment(*parameter_context->parse_environment,
+                                *parameter_context);
+            pending_records_.resize(saved_records);
+            pending_enumerations_.resize(saved_enumerations);
+            parsing_generic_argument_ = saved_generic_argument;
+            production_stack_.resize(production_depth);
+            index_ = static_cast<std::size_t>(end - public_input_indices_.begin()) - 1;
+            parameters.clear();
+            variadic = false;
+            public_deferred_parameters_ = true;
         }
         expect(")", "after function parameters");
         base = function_type(std::move(base), std::move(parameters), variadic);
-        expand_declarator_macros();
+        expand_inline_macro_fragments();
         if (current().is("->")) {
             ProductionScope result_location(*this, SyntaxProduction::ResultLocation);
             consume("->");
@@ -2744,13 +2832,16 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
     aliases[std::move(name)] = std::move(type);
 }
 
-void Parser::parse_external_declaration_splice(
+void Parser::parse_external_node_splice(
     Program& program, const std::string& name_space) {
     const auto item = current();
     ++index_;
-    if (!item.splice || !syntax_declaration_node(*item.splice)) {
+    const bool function_definition = item.splice &&
+        syntax_function_definition_node(*item.splice);
+    if (!item.splice || (!syntax_declaration_node(*item.splice) &&
+                         !function_definition)) {
         diagnostics_.error(item.location,
-            "structured syntax splice requires a declaration node at external position");
+            "structured syntax splice requires a declaration or function-definition node at external position");
         return;
     }
     if (!syntax_ || !item.splice->context ||
@@ -2759,8 +2850,12 @@ void Parser::parse_external_declaration_splice(
             "structured syntax splice has no retained parse environment");
         return;
     }
+    const auto category = item.splice->kind == SyntaxNode::Kind::Deferred
+        ? item.splice->deferred_category
+        : function_definition ? SyntaxParseCategory::FunctionDefinition
+                              : SyntaxParseCategory::Declaration;
     auto output = syntax_->execution()->materialize_node(
-        *item.splice, item.location, SyntaxParseCategory::Declaration);
+        *item.splice, item.location, category);
     if (!output) return;
     auto child = replacement_parser(std::move(*output));
     if (item.splice->kind == SyntaxNode::Kind::Deferred)
@@ -2775,8 +2870,16 @@ void Parser::parse_external_declaration_splice(
     Program parsed;
     child->parse_external(parsed, name_space);
     if (child->current().kind != TokenKind::End)
-        child->error_here("structured declaration splice must contain one complete declaration");
-    for (const auto& function : parsed.functions)
+        child->error_here(function_definition
+            ? "structured function-definition splice must contain one complete function definition"
+            : "structured declaration splice must contain one complete declaration");
+    if (function_definition) {
+        if (parsed.functions.size() != 1 || !parsed.functions.front()->body ||
+            !parsed.objects.empty() || !parsed.records.empty() ||
+            !parsed.enumerations.empty())
+            diagnostics_.error(item.location,
+                "structured function-definition splice must contain one complete function definition");
+    } else for (const auto& function : parsed.functions)
         if (function->body)
             diagnostics_.error(item.location,
                 "structured declaration splice cannot contain a function definition");
@@ -2843,12 +2946,13 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         if (parsing_public_fragment_) {
             const auto item = current();
             ++index_;
-            if (!item.splice || !syntax_declaration_node(*item.splice))
+            if (!item.splice || (!syntax_declaration_node(*item.splice) &&
+                                 !syntax_function_definition_node(*item.splice)))
                 diagnostics_.error(item.location,
-                    "structured syntax splice requires a declaration node at external position");
+                    "structured syntax splice requires a declaration or function-definition node at external position");
             else if (recording_public_tree_ && production.event < production_events_.size())
                 production_events_[production.event].opaque = item.splice;
-        } else parse_external_declaration_splice(program, name_space);
+        } else parse_external_node_splice(program, name_space);
         return;
     }
     struct NamespaceRestore {
@@ -3066,7 +3170,10 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                 else
                     known_ordinary_values_.insert(function->name);
             }
-            if (function && (parsing_public_function_header_ || current().is("{"))) {
+            const bool compound_start = current().is("{") ||
+                (current().kind == TokenKind::StructuredSplice && current().splice &&
+                 syntax_compound_node(*current().splice));
+            if (function && (parsing_public_function_header_ || compound_start)) {
                 if (ordinal != 0)
                     error_here("a function definition requires a single declarator");
                 const auto item_event = item.event;
@@ -3080,10 +3187,22 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                         parsing_public_function_header_ ? SyntaxProduction::FunctionHeader
                                                         : SyntaxProduction::FunctionDefinition;
                 if (!parsing_public_function_header_) {
-                    auto* previous_function = active_function_;
-                    active_function_ = function.get();
-                    function->body = parse_compound();
-                    active_function_ = previous_function;
+                    if (public_deferred_parameters_) {
+                        const auto end = bounded_group_end(index_);
+                        if (!end) {
+                            error_here("deferred function requires a balanced body");
+                            return;
+                        }
+                        function->body = std::make_unique<Statement>();
+                        function->body->kind = Statement::Kind::Compound;
+                        function->body->location = current().location;
+                        index_ = *end;
+                    } else {
+                        auto* previous_function = active_function_;
+                        active_function_ = function.get();
+                        function->body = parse_compound();
+                        active_function_ = previous_function;
+                    }
                 }
                 program.functions.push_back(std::move(function));
                 return;
@@ -3381,10 +3500,12 @@ bool Parser::parse_static_assertion() {
 }
 
 ParameterDecl Parser::parse_parameter(unsigned ordinal) {
+    expand_inline_macro_fragments();
     ProductionScope production(*this, SyntaxProduction::ParameterDeclaration);
     ParameterDecl parameter;
     parameter.location = current().location;
     auto attributes = parse_attributes();
+    expand_inline_macro_fragments();
     if (current().is("in") || current().is("out") || current().is("inout")) {
         ProductionScope mode(*this, SyntaxProduction::ParameterMode);
         if (consume("in")) parameter.mode = ParameterMode::In;
@@ -3392,6 +3513,7 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
         else { consume("inout"); parameter.mode = ParameterMode::InOut; }
         parameter.explicit_mode = true;
     }
+    expand_inline_macro_fragments();
     parameter.type = parse_type(true, {}, &attributes);
     std::optional<std::string> name;
     parameter.type = parse_declarator(std::move(parameter.type), name, true,
@@ -3697,6 +3819,28 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
 
 std::unique_ptr<Statement> Parser::parse_compound() {
     ProductionScope production(*this, SyntaxProduction::CompoundStatement);
+    if (current().kind == TokenKind::StructuredSplice) {
+        const auto item = current();
+        if (!item.splice || !syntax_compound_node(*item.splice)) {
+            error_here("structured function body requires a compound-statement node");
+            ++index_;
+            return {};
+        }
+        if (parsing_public_fragment_) {
+            if (production.event < production_events_.size())
+                production_events_[production.event].opaque = item.splice;
+            ++index_;
+            auto body = std::make_unique<Statement>();
+            body->kind = Statement::Kind::Compound;
+            body->location = item.location;
+            return body;
+        }
+        auto body = parse_statement();
+        if (body && body->kind != Statement::Kind::Compound)
+            diagnostics_.error(item.location,
+                "structured function body must contain one complete compound statement");
+        return body;
+    }
     const auto first = index_;
     const auto production_depth = production_stack_.size();
     std::optional<std::size_t> end_input;
@@ -3876,7 +4020,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
                 production_events_[production.event].opaque = item.splice;
             else {
                 std::shared_ptr<const SyntaxNode> child = item.splice;
-                if (declaration_node) {
+                if (declaration_node || syntax_compound_node(*item.splice)) {
                     auto unattributed = std::make_shared<SyntaxNode>();
                     unattributed->kind = SyntaxNode::Kind::Core;
                     unattributed->production = SyntaxProduction::UnattributedStatement;
@@ -3899,7 +4043,8 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         // environment, then only declarations made by this statement enter
         // the destination block.
         if (parsing_public_fragment_) return invalid;
-        if (local_scopes_.empty() || local_type_scopes_.empty()) {
+        if ((local_scopes_.empty() || local_type_scopes_.empty()) &&
+            !syntax_compound_node(*item.splice)) {
             diagnostics_.error(item.location,
                 "structured statement splice requires a destination block");
             return invalid;
@@ -3920,46 +4065,61 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         // (notably switch labels) belongs to the destination statement.
         child->switch_depth_ = switch_depth_;
         child->switch_default_seen_ = switch_default_seen_;
-        if (child->local_scopes_.empty()) {
+        if (child->local_scopes_.empty() && !syntax_compound_node(*item.splice)) {
             child->local_scopes_.emplace_back();
             child->local_type_scopes_.emplace_back();
             child->scope_origins_.emplace_back();
         }
-        const auto prior_values = child->local_scopes_.back();
-        const auto prior_aliases = child->local_type_scopes_.back();
+        const auto prior_values = child->local_scopes_.empty()
+            ? NameMap<ValueBinding>{} : child->local_scopes_.back();
+        const auto prior_aliases = child->local_type_scopes_.empty()
+            ? NameMap<TypePtr>{} : child->local_type_scopes_.back();
         const auto prior_records = child->record_types_;
         const auto previous_errors = diagnostics_.errors();
         auto statement = child->parse_statement();
         if (child->current().kind != TokenKind::End)
             child->error_here("structured statement splice must contain one complete statement");
         if (diagnostics_.errors() != previous_errors || !statement) return invalid;
-        for (const auto& [key, binding] : child->local_scopes_.back()) {
-            if (prior_values.contains(key)) continue;
-            if (local_type_scopes_.back().contains(key))
-                diagnostics_.error(item.location,
-                    "spliced local value '" + key.spelling + "' conflicts with a destination typedef");
-            else if (local_scopes_.back().contains(key))
-                diagnostics_.error(item.location,
-                    "spliced local value '" + key.spelling + "' was declared more than once");
-            else local_scopes_.back().emplace(key, binding);
-        }
-        for (const auto& [key, type] : child->local_type_scopes_.back()) {
-            if (prior_aliases.contains(key)) continue;
-            if (local_scopes_.back().contains(key))
-                diagnostics_.error(item.location,
-                    "spliced typedef '" + key.spelling + "' conflicts with a destination value");
-            else if (const auto found = local_type_scopes_.back().find(key);
-                     found != local_type_scopes_.back().end()) {
-                if (!same_type(found->second, type))
+        // A compound owns an inner scope. Only a direct declaration statement
+        // can add bindings to the surrounding destination block.
+        if (!syntax_compound_node(*item.splice)) {
+            for (const auto& [key, binding] : child->local_scopes_.back()) {
+                if (prior_values.contains(key)) continue;
+                if (local_type_scopes_.back().contains(key))
                     diagnostics_.error(item.location,
-                        "spliced typedef '" + key.spelling + "' has a different destination type");
-            } else local_type_scopes_.back().emplace(key, copy_type(type));
+                        "spliced local value '" + key.spelling + "' conflicts with a destination typedef");
+                else if (local_scopes_.back().contains(key))
+                    diagnostics_.error(item.location,
+                        "spliced local value '" + key.spelling + "' was declared more than once");
+                else local_scopes_.back().emplace(key, binding);
+            }
+            for (const auto& [key, type] : child->local_type_scopes_.back()) {
+                if (prior_aliases.contains(key)) continue;
+                if (local_scopes_.back().contains(key))
+                    diagnostics_.error(item.location,
+                        "spliced typedef '" + key.spelling + "' conflicts with a destination value");
+                else if (const auto found = local_type_scopes_.back().find(key);
+                         found != local_type_scopes_.back().end()) {
+                    if (!same_type(found->second, type))
+                        diagnostics_.error(item.location,
+                            "spliced typedef '" + key.spelling + "' has a different destination type");
+                } else local_type_scopes_.back().emplace(key, copy_type(type));
+            }
         }
         if (diagnostics_.errors() != previous_errors) return invalid;
         if (!transfer_spliced_tags(*child, prior_records, item.location)) return invalid;
         switch_default_seen_ = std::move(child->switch_default_seen_);
         for (auto& assertion : child->static_assertions_)
             static_assertions_.push_back(std::move(assertion));
+        // Restored function metadata is detached from the destination AST.
+        // Keep surviving generic assertions instead of losing them when the
+        // bounded parser and its temporary function context are destroyed.
+        if (child->restored_function_context_) {
+            auto& assertions = active_function_ && !active_function_->generic_parameters.empty()
+                ? active_function_->deferred_static_assertions : static_assertions_;
+            for (auto& assertion : child->restored_function_context_->deferred_static_assertions)
+                assertions.push_back(std::move(assertion));
+        }
         return statement;
     }
     auto attributes = parse_attributes();

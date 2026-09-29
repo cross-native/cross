@@ -18,12 +18,17 @@ function(accept_splice case source)
     endif()
 endfunction()
 function(reject_splice case expected source)
+    set(anchor_kind "error")
+    if(ARGC GREATER 3)
+        set(anchor_kind "${ARGV3}")
+    endif()
     set(input "${OUTPUT}/${case}.x")
     file(WRITE "${input}" "${source}")
     execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}" OR
-       NOT err MATCHES "${case}.x:[0-9]+:[0-9]+: error:")
+       NOT err MATCHES ":[0-9]+:[0-9]+: error:" OR
+       NOT err MATCHES "${case}.x:[0-9]+:[0-9]+: ${anchor_kind}:")
         message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
     endif()
 endfunction()
@@ -91,8 +96,63 @@ syntax Reparse : item { prefix \"reparse\"; match body:declaration; expand repar
 syntax Reparse;
 reparse global u32 copied = 5u32;
 global u32 entry() { return copied; }")
+accept_splice(function_declaration_reparse [=[
+[[syntax_expander]] static $::meta::tokens reparse(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    $::meta::syntax parsed = $::meta::parse("function_decl",
+        $::quote { $::unquote(body) }, $::syntax::context(input));
+    return $::quote { $::unquote(parsed) };
+}
+syntax Reparse : item { prefix "reparse"; match body:function_decl; expand reparse; }
+syntax Reparse;
+reparse global u32 declared(in u32 value);
+global u32 declared(in u32 value) { return value; }
+]=])
+accept_splice(function_definition_deferred_body [=[
+[[macro]] static $::meta::tokens introduce(in $::meta::tokens name) {
+    return $::quote { typedef u32 $::unquote(name); };
+}
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+syntax Copy : item { prefix "copy"; match body:function_def; expand copy; }
+syntax Copy;
+copy static u32 function(in u32 value) {
+    introduce!(Local);
+    Local result = value + 1u32;
+    return result;
+}
+global u32 entry() { return function(4u32); }
+]=])
+reject_splice(function_declaration_reparse_object "could not recognize complete bounded input" [=[
+[[syntax_expander]] static $::meta::tokens reparse(in $::meta::syntax_match input) {
+    $::meta::syntax parsed = $::meta::parse("function_decl",
+        $::quote { $::unquote($::syntax::node(input, "body")) }, $::syntax::context(input));
+    return $::quote { $::unquote(parsed) };
+}
+syntax Reparse : item { prefix "reparse"; match body:declaration; expand reparse; }
+syntax Reparse;
+reparse global u32 object;
+]=])
+reject_splice(function_definition_deferred_assertion "copied generic assertion" [=[
+[[macro]] static $::meta::tokens introduce(in $::meta::tokens name) {
+    return $::quote { typedef u32 $::unquote(name); };
+}
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+syntax Copy : item { prefix "copy"; match body:function_def; expand copy; }
+syntax Copy;
+copy static u32 function<u32 N>(in u32 value) {
+    introduce!(Local);
+    Local result = value;
+    $::static_assert(N == 1u32, "copied generic assertion");
+    return result;
+}
+global u32 entry() { return function<2u32>(4u32); }
+]=] note)
 reject_splice(declaration_external_wrong_category
-    "structured syntax splice requires a declaration node at external position" [=[
+    "structured syntax splice requires a declaration or function-definition node at external position" [=[
 [[syntax_expander]] static $::meta::tokens wrong(in $::meta::syntax_match input) {
     return $::quote { $::unquote($::syntax::node(input, "value")) };
 }

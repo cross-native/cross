@@ -146,6 +146,85 @@ global u32 entry() {
     return values[1];
 }
 ]=])
+accept(discard_nested_function_parameter_macro [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+syntax DropDecl : item { prefix "drop_decl"; match body:function_decl; expand discard; }
+syntax DropDef : item { prefix "drop_def"; match body:function_def; expand discard; }
+syntax DropHeader : item {
+    prefix "drop_header"; match head:function_header body:block; expand discard;
+}
+syntax DropDecl, DropDef, DropHeader;
+drop_decl static u32 one(missing_parameter!());
+drop_decl static u32 (*callback(missing_parameter!()))(in u32 value);
+drop_def static u32 two(missing_parameter!()) { return 2u32; }
+drop_header static u32 three(missing_parameter!()) { return 3u32; }
+drop_def static struct Inline { u32 value; } four(missing_parameter!()) {
+    return { 4u32 };
+}
+global u32 entry() { return 1u32; }
+]=])
+accept(survive_nested_function_parameter_macro [=[
+[[macro]] static $::meta::tokens parameter(in $::meta::tokens name) {
+    return $::quote { in u32 $::unquote(name) };
+}
+[[syntax_expander]] static $::meta::tokens copy_def(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    if (!$::meta::is_kind(body, "deferred"))
+        $::syntax::error($::syntax::span(input), "function was parsed too early");
+    return $::meta::tokens(body);
+}
+syntax CopyDef : item { prefix "copy_def"; match body:function_def; expand copy_def; }
+syntax CopyDef;
+copy_def static u32 helper(parameter!(value)) { return value + 1u32; }
+global u32 entry() { return helper(4u32); }
+]=])
+reject(function_decl_cannot_capture_definition
+    "syntax-match error for active prefix" [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+syntax Decl : item { prefix "decl"; match body:function_decl; expand discard; }
+syntax Decl;
+decl static u32 wrong(missing_parameter!()) { return 1u32; }
+]=])
+reject(function_def_cannot_capture_prototype
+    "syntax-match error for active prefix" [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+syntax Def : item { prefix "def"; match body:function_def; expand discard; }
+syntax Def;
+def static u32 wrong(missing_parameter!());
+]=])
+reject(function_decl_cannot_capture_pointer_object
+    "syntax-match error for active prefix" [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+syntax Decl : item { prefix "decl"; match body:function_decl; expand discard; }
+syntax Decl;
+decl static u32 (*object)(missing_parameter!());
+]=])
+reject(function_decl_cannot_guess_macro_shape
+    "syntax-match error for active prefix" [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+syntax Decl : item { prefix "decl"; match body:function_decl; expand discard; }
+syntax Decl;
+decl static u32 unknown_declarator!();
+]=])
+reject(function_decl_cannot_capture_declarator_list
+    "syntax-match error for active prefix" [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+syntax Decl : item { prefix "decl"; match body:function_decl; expand discard; }
+syntax Decl;
+decl static u32 one(missing_parameter!()), two();
+]=])
 accept(result_location_declarator_macro [=[
 [[macro]] static $::meta::tokens result_location(in $::meta::tokens ignored) {
     return $::quote { -> "rax" };

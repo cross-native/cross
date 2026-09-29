@@ -75,7 +75,7 @@ bool syntax_expression_node(const SyntaxNode& node) {
 }
 
 bool syntax_statement_node(const SyntaxNode& node) {
-    return (node.kind == SyntaxNode::Kind::Core &&
+    return syntax_compound_node(node) || (node.kind == SyntaxNode::Kind::Core &&
             (node.production == SyntaxProduction::Statement ||
              node.production == SyntaxProduction::UnattributedStatement)) ||
         ((node.kind == SyntaxNode::Kind::Deferred ||
@@ -85,12 +85,29 @@ bool syntax_statement_node(const SyntaxNode& node) {
           node.slot_production == SyntaxProduction::UnattributedStatement));
 }
 
+bool syntax_compound_node(const SyntaxNode& node) {
+    return (node.kind == SyntaxNode::Kind::Core &&
+            node.production == SyntaxProduction::CompoundStatement) ||
+        (node.kind == SyntaxNode::Kind::Deferred &&
+         node.slot_production == SyntaxProduction::CompoundStatement &&
+         node.deferred_category == SyntaxParseCategory::Statement);
+}
+
 bool syntax_declaration_node(const SyntaxNode& node) {
     return (node.kind == SyntaxNode::Kind::Core &&
             node.production == SyntaxProduction::Declaration) ||
         (node.kind == SyntaxNode::Kind::Deferred &&
          node.slot_production == SyntaxProduction::Declaration &&
-         node.deferred_category == SyntaxParseCategory::Declaration);
+         (node.deferred_category == SyntaxParseCategory::Declaration ||
+          node.deferred_category == SyntaxParseCategory::FunctionDeclaration));
+}
+
+bool syntax_function_definition_node(const SyntaxNode& node) {
+    return (node.kind == SyntaxNode::Kind::Core &&
+            node.production == SyntaxProduction::FunctionDefinition) ||
+        (node.kind == SyntaxNode::Kind::Deferred &&
+         node.slot_production == SyntaxProduction::FunctionDefinition &&
+         node.deferred_category == SyntaxParseCategory::FunctionDefinition);
 }
 
 bool syntax_type_node(const SyntaxNode& node) {
@@ -165,23 +182,32 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node) {
             }
         } else result.push_back(token);
     };
-    std::vector<const SyntaxNode*> pending{&node};
+    struct Part {
+        const SyntaxNode* node;
+        std::shared_ptr<const SyntaxNode> owner;
+    };
+    std::vector<Part> pending{{&node, {}}};
     while (!pending.empty()) {
-        const auto* next = pending.back();
+        auto [next, owner] = std::move(pending.back());
         pending.pop_back();
+        std::shared_ptr<const SyntaxNode> fragment;
+        if (next != &node && next->kind == SyntaxNode::Kind::Deferred)
+            fragment = std::move(owner);
         if (next->kind == SyntaxNode::Kind::Core && next->structured_splice &&
             next->children.size() == 1 && next->children.front() &&
             ((next->production == SyntaxProduction::PrimaryExpression &&
               syntax_expression_node(*next->children.front())) ||
              (next->production == SyntaxProduction::TypeSpecifier &&
               syntax_type_node(*next->children.front())))) {
-            const auto& child = next->children.front();
+            fragment = next->children.front();
+        }
+        if (fragment) {
             MetaToken marker;
             marker.kind = TokenKind::StructuredSplice;
             marker.text = "__cross_syntax_splice";
-            marker.origin = token_origin(child->span.first);
-            marker.origin.context = child->context;
-            marker.splice = child;
+            marker.origin = token_origin(fragment->span.first);
+            marker.origin.context = fragment->context;
+            marker.splice = std::move(fragment);
             result.push_back(std::move(marker));
         } else if (next->kind == SyntaxNode::Kind::Token ||
                    next->kind == SyntaxNode::Kind::Extension ||
@@ -190,7 +216,7 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node) {
             for (const auto& token : next->tokens) append(token);
         } else {
             for (auto at = next->children.rbegin(); at != next->children.rend(); ++at)
-                pending.push_back(at->get());
+                pending.push_back({at->get(), *at});
         }
     }
     return result;
