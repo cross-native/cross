@@ -90,9 +90,6 @@ private:
         SyntaxParseCategory category, std::shared_ptr<const SyntaxContext> context = {},
         bool deferred = false, SourceLocation original_position = {});
     std::unique_ptr<Parser> prepared_fragment_parser(const Token& token);
-    bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
-                                         std::string_view name_space,
-                                         const std::vector<std::string>& imports) const;
     std::shared_ptr<const SyntaxNode> parse_opaque_invocation(SyntaxKind category);
     bool opaque_statement_has_expression_continuation() const;
     struct DeferredNameRecognition {};

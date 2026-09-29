@@ -368,3 +368,102 @@ syntax Compose;
 compose static T kept(in T value) [[generic(params!(T))]] { T copy = value; return copy; }
 $::static_assert(kept(23u32) == 23u32, "body fragment lost header generic bindings");
 ]=] 0)
+
+foreach(tag struct union)
+    foreach(generic "T" "params!(T)")
+        string(MD5 case "${tag}-${generic}")
+        check(inline_tag_generic_${case} "
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+static ${tag} Result { u32 value; } make(in T value) [[generic(${generic})]] {
+    ${tag} Result result = { (u32)value }; return result;
+}
+$::static_assert(make(29u32).value == 29u32, \"inline result tag hid header generics\");" 0)
+    endforeach()
+endforeach()
+
+check(inline_enum_generic [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+static enum Result { value = 31 } make(in T input) [[generic(params!(T))]] { return value; }
+$::static_assert((u32)make(1u32) == 31u32, "inline enum hid header generics");
+]=] 0)
+
+foreach(category function function_raw)
+    check(raw_inline_tag_${category} "
+[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; }
+syntax Drop : item { prefix \"drop\"; match value:${category}; expand drop; }
+syntax Drop;
+drop static struct Record { u32 field; } make(in u32 value) { not core syntax; unknown!{}; }
+drop static union Union { u32 field; u64 other; } make_union() { not core syntax; unknown!{}; }
+drop static enum Code { code = 1 } make_enum() { not core syntax; unknown!{}; }" 0)
+endforeach()
+
+check(captured_inline_tag "${compose}
+compose static struct Result { u32 value; } make(in T value) [[generic(params!(T))]] {
+    struct Result result = { (u32)value }; return result;
+}
+$::static_assert(make(37u32).value == 37u32, \"captured inline result tag lost its binding\");" 0)
+
+check(inline_tag_owner_order "${prefix}
+static struct Result { u32 values[notice(unknown!{discarded})]; } make(in T value)
+    [[generic(bad!(T))]] { struct Result result = {}; return result; }"
+    1 "note: earlier-header-owner" "error: division by zero")
+
+foreach(tag "struct Result { unknown!(members) }" "union Result { unknown!(members) }"
+            "enum Result { unknown!(enumerators) }")
+    string(MD5 case "${tag}")
+    check(opaque_inline_tag_${case} "${discard_header}
+discard static ${tag} ignored() { noncore body; unknown!(); }" 0)
+endforeach()
+
+check(raw_choice_failed_header [=[
+[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) {
+    $::static_assert($::syntax::is_variant($::syntax::at(input, "branch", 0uptr), "raw"),
+                    "a nonfunction was matched as a raw function");
+    return $::quote {};
+}
+syntax Drop : item {
+    prefix "drop";
+    match branch:choice(function:(value:function_raw) | raw:("static" "u32" "object" body:block));
+    expand drop;
+}
+syntax Drop;
+drop static u32 object { not a function body; unknown!(); }
+]=] 0)
+
+check(nested_inline_tag_generic [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[noinline]] static struct Outer { struct Inner { u16 value; } nested; }
+make(in T value) [[generic(params!(T))]] {
+    struct Outer result = { { (u16)value } }; return result;
+}
+$::static_assert(make(41u32).nested.value == 41u16, "nested inline tags lost header context");
+]=] 0)
+
+check(captured_inline_tag_members "${compose}
+compose [[noinline]] static struct Result { params!(u32 value;) } make(in u32 value) {
+    struct Result result = { value }; return result;
+}
+$::static_assert(make(43u32).value == 43u32, \"deferred tag members were not reparsed\");" 0)
+
+check(captured_inline_enum_members "${compose}
+compose [[noinline]] static enum Result [[underlying(u16)]] { params!(value = 47u16) }
+make() { return value; }
+$::static_assert((u16)make() == 47u16, \"deferred enumerators were not reparsed\");" 0)
+
+check(inline_tag_attribute_owner_order "${prefix}
+static struct Result [[aligned(notice(unknown!{discarded}))]] { u32 value; }
+make(in T value) [[generic(bad!(T))]] { struct Result result = { 0u32 }; return result; }"
+    1 "note: earlier-header-owner" "error: division by zero")
+
+check(inline_enum_owner_order "${prefix}
+static enum Result { first = notice(unknown!{discarded}) }
+make(in T value) [[generic(bad!(T))]] { return first; }"
+    1 "note: earlier-header-owner" "error: division by zero")
+
+foreach(tag "struct Result { u32 first u32 second; unknown!(); }"
+            "enum Result { first = , unknown!() }")
+    string(MD5 case "${tag}")
+    check(invalid_before_opaque_tag_${case} "${discard_header}
+discard static ${tag} ignored() { noncore body; unknown!(); }" 1
+        "error: syntax-match error for active prefix")
+endforeach()

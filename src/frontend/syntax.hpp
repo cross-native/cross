@@ -277,7 +277,6 @@ public:
     };
     std::optional<Match> match(const SyntaxDefinition& definition,
         const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
-        const std::function<bool(std::size_t, std::size_t)>& function_header = {},
         const std::function<std::optional<SyntaxParsedFragment>(
             SyntaxPatternElement::Kind, std::size_t)>& parse_fragment = {}) const;
     std::shared_ptr<SyntaxExecution> execution() const { return execution_; }

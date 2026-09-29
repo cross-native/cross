@@ -340,6 +340,21 @@ int main() {
     suffix = child(direct, 1, P::FunctionSuffix, 4);
     child(suffix, 3, P::ResultLocation, 2);
     child(header, 2, P::AttributeSpecifier, 3);
+    for (const auto kind : {K::FunctionHeader, K::FunctionDefinition}) {
+        auto inline_header = production(parse(
+            "static struct InlineResult { u32 value; } fn(in T value) "
+            "[[generic(T)]] { struct InlineResult result = { (u32)value }; return result; }", kind),
+            kind == K::FunctionHeader ? P::FunctionHeader : P::FunctionDefinition,
+            kind == K::FunctionHeader ? 3 : 4);
+        auto record = production(descendant(inline_header, P::StructOrUnionSpecifier),
+                                 P::StructOrUnionSpecifier, 5);
+        token(record->children.front(), "struct");
+        child(record, 3, P::MemberDeclaration, 3);
+        token(record->children.back(), "}");
+        child(inline_header, 2, P::AttributeSpecifier, 3);
+        if (kind == K::FunctionDefinition)
+            production(inline_header->children.back(), P::CompoundStatement, 4);
+    }
     auto definition = production(parse(function_source, K::FunctionDefinition), P::FunctionDefinition, 4);
     auto composed = std::make_shared<SyntaxNode>(*definition);
     composed->children = {header, definition->children.back()};

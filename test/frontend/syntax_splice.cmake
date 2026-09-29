@@ -222,10 +222,10 @@ accept_splice(raw_header_copy_parameters "${parameter_list_macros}${raw_header_p
 copy_raw static u32 copied(parameters!(in u32 value)) { return value + 1u32; }
 copy_raw static u32 empty(parameters!()) { return copied(4u32); }
 $::static_assert(empty() == 5u32, \"raw header was not expanded after its owner\");")
-reject_splice(raw_header_pointer_object "requires a direct core function header"
+reject_splice(raw_header_pointer_object "syntax-match error for active prefix"
     "${raw_header_prefix}
 discard_raw static u32 (*object)(unknown!()) { not a function; }")
-reject_splice(raw_header_opaque_declarator "requires a direct core function header"
+reject_splice(raw_header_opaque_declarator "syntax-match error for active prefix"
     "${raw_header_prefix}
 discard_raw static u32 unknown!(declarator) { cannot prove a function; }")
 

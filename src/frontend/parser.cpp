@@ -192,6 +192,15 @@ void Parser::synchronize_external() {
     while (std::as_const(*this).current().kind != TokenKind::End) {
         if (std::as_const(*this).current().is(";")) { ++index_; return; }
         if (std::as_const(*this).current().is("}")) return;
+        const auto& token = std::as_const(*this).current();
+        if (token.is("(") || token.is("[") || token.is("[[") || token.is("{")) {
+            // A semicolon inside an inline tag or rejected raw body is not
+            // an external recovery boundary. Keep the complete written group
+            // opaque so its nested invocations cannot become new source.
+            const auto end = bounded_group_end(index_);
+            index_ = end.value_or(tokens_.size() - 1);
+            continue;
+        }
         ++index_;
     }
 }
@@ -354,9 +363,7 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
     const auto* definition = active_syntax(item);
     if (!definition) return {};
     const auto matched = syntax_->match(*definition, tokens_, index_, expansion_diagnostics,
-        [&](std::size_t first, std::size_t body_open) {
-            return validate_syntax_function_header(first, body_open, name_space, imports);
-        }, [&](SyntaxPatternElement::Kind kind, std::size_t first) {
+        [&](SyntaxPatternElement::Kind kind, std::size_t first) {
             return parse_syntax_fragment(kind, first);
         });
     if (!matched) { ++index_; synchronize_external(); return {}; }
@@ -430,24 +437,6 @@ void Parser::expand_inline_macro_fragments() {
             std::make_move_iterator(output->tokens.end()));
         index_ = first;
     }
-}
-
-bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body_open,
-    std::string_view name_space, const std::vector<std::string>& imports) const {
-    // Reuse direct-function recognition, including opaque parameter groups.
-    // The body is absent from this bounded input: it belongs exclusively to
-    // the raw owner and must not be core-parsed or expanded for validation.
-    std::vector<Token> header(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
-                              tokens_.begin() + static_cast<std::ptrdiff_t>(body_open));
-    header.push_back({TokenKind::End, {}, tokens_[body_open].location});
-    auto child = replacement_parser({std::move(header), tokens_[first].location});
-    child->active_namespace_ = name_space;
-    child->active_imports_ = imports;
-    const auto parsed = child->parse_syntax_fragment(SyntaxPatternElement::Kind::FunctionHeader, 0);
-    const bool direct = parsed && parsed->end + 1 == child->tokens_.size();
-    if (!direct) diagnostics_.error(tokens_[first].location,
-        "syntax function capture requires a direct core function header");
-    return direct;
 }
 
 std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output,
@@ -1292,9 +1281,7 @@ std::shared_ptr<const SyntaxNode> Parser::parse_opaque_invocation(SyntaxKind cat
             return {};
         }
         const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_,
-            [&](std::size_t begin, std::size_t body_open) {
-                return validate_syntax_function_header(begin, body_open, active_namespace_, active_imports_);
-            }, [&](SyntaxPatternElement::Kind kind, std::size_t begin) {
+            [&](SyntaxPatternElement::Kind kind, std::size_t begin) {
                 return parse_syntax_fragment(kind, begin);
             });
         if (!matched) return {};
@@ -2132,14 +2119,16 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 return {};
             }
             auto record_attributes = parse_attributes();
-            if (consume("{")) {
+            if (current().is("{")) {
                 RecordDecl declaration;
                 declaration.location = location;
                 declaration.name = join_namespace(active_namespace_, *name);
                 declaration.is_union = is_union;
                 declaration.complete = true;
                 if (declaration_attributes)
-                    declaration.attributes = *declaration_attributes;
+                    for (const auto& attribute : *declaration_attributes)
+                        if (attribute.name == "packed" || attribute.name == "aligned")
+                            declaration.attributes.push_back(attribute);
                 declaration.attributes.insert(declaration.attributes.end(),
                     std::make_move_iterator(record_attributes.begin()),
                     std::make_move_iterator(record_attributes.end()));
@@ -2153,7 +2142,11 @@ TypePtr Parser::parse_type(bool record_specifiers,
                         "duplicate definition of record '" + declaration.name + "'");
                 }
                 tag->second.complete = true;
-                parse_record_members(declaration);
+                if (defer_public_header_group(allow_public_header_deferral_
+                        ? bounded_group_end(index_) : std::nullopt, [&] {
+                        consume("{");
+                        parse_record_members(declaration);
+                    })) declaration.members.clear();
                 type = record_type(declaration.name, is_union, is_const, is_volatile);
                 pending_records_.push_back(std::move(declaration));
             } else {
@@ -2216,12 +2209,17 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 declaration.location = location;
                 declaration.name = join_namespace(active_namespace_, *name);
                 if (declaration_attributes)
-                    declaration.attributes = *declaration_attributes;
+                    for (const auto& attribute : *declaration_attributes)
+                        if (attribute.name == "underlying")
+                            declaration.attributes.push_back(attribute);
                 declaration.attributes.insert(declaration.attributes.end(),
                     std::make_move_iterator(enum_attributes.begin()),
                     std::make_move_iterator(enum_attributes.end()));
                 declaration.underlying = enum_underlying(declaration.attributes);
-                parse_enumerators(declaration, active_namespace_);
+                if (defer_public_header_group(allow_public_header_deferral_
+                        ? bounded_group_end(index_) : std::nullopt, [&] {
+                        parse_enumerators(declaration, active_namespace_);
+                    })) declaration.enumerators.clear();
                 const auto found = enum_types_.find(declaration.name);
                 if (found != enum_types_.end() && found->second != declaration.underlying) {
                     diagnostics_.error(location, "enumeration '" + declaration.name +
@@ -2425,6 +2423,35 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
         if (tokens_[cursor].kind == TokenKind::End || tokens_[cursor].is(";") ||
             tokens_[cursor].is("{") || tokens_[cursor].is("=") ||
             tokens_[cursor].is(",")) break;
+        if (tokens_[cursor].is("struct") || tokens_[cursor].is("union") ||
+            tokens_[cursor].is("enum")) {
+            // A written tag definition is part of the result specifier, not
+            // the function body. Its members/enumerators and tag attributes
+            // cannot supply outer header bindings merely by containing names.
+            // Skip only the independently proved written groups here; their
+            // surviving expansions run through normal grammar preparation.
+            auto at = cursor + 1;
+            if (at < tokens_.size() && tokens_[at].kind == TokenKind::Identifier) {
+                if (!work(at)) return result;
+                ++at;
+                while (at + 1 < tokens_.size() && tokens_[at].is("::") &&
+                       tokens_[at + 1].kind == TokenKind::Identifier) {
+                    if (!work(at) || !work(at + 1)) return result;
+                    at += 2;
+                }
+                while (at < tokens_.size() && tokens_[at].is("[[")) {
+                    const auto end = group_end(at);
+                    if (!end) return result;
+                    at = *end + 1;
+                }
+                if (at < tokens_.size() && tokens_[at].is("{")) {
+                    const auto end = group_end(at);
+                    if (!end) return result;
+                    cursor = *end;
+                    continue;
+                }
+            }
+        }
         if (tokens_[cursor].is("[[")) {
             auto at = cursor + 1;
             while (at < tokens_.size()) {
@@ -3854,6 +3881,7 @@ void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_sp
     if (!consume("{")) return;
     while (!current().is("}") && current().kind != TokenKind::End) {
         ProductionScope entry(*this, SyntaxProduction::Enumerator);
+        expand_inline_macro_fragments();
         const auto token = consume_kind(TokenKind::Identifier);
         if (!token) {
             error_here("expected enumerator name");

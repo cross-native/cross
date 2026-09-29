@@ -213,6 +213,22 @@ captured_header [[noinline]] static u32 captured_header_value(in u32 value)
     [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
     return value + N;
 }
+captured_header [[noinline]] static struct InlineHeaderResult { uptr value; }
+captured_inline_header(in T value) [[generic(parameter_list_fragment!(T))]] {
+    struct InlineHeaderResult result = { (uptr)value + 1uptr };
+    return result;
+}
+[[syntax_expander]] static $::meta::tokens raw_inline_header(in $::meta::syntax_match input) {
+    return $::syntax::capture(input, "body");
+}
+syntax RawInlineHeader : item {
+    prefix "raw_inline_header"; match body:function_raw; expand raw_inline_header;
+}
+syntax RawInlineHeader;
+raw_inline_header [[noinline]] static enum InlineRawResult [[underlying(u32)]] { raw_result_base = 8u32 }
+copied_inline_enum(in T value) [[generic(parameter_list_fragment!(T))]] {
+    return (enum InlineRawResult)((u32)value + raw_result_base);
+}
 namespace HeaderFragments { typedef u32 Value; }
 [[noinline]] static T header_fragment_identity(in T value)
     [[parameter_list_fragment!(generic(T))]] { return value; }
@@ -286,9 +302,9 @@ syntax AssignHeaderAbi : item {
 syntax AssignHeaderAbi;
 assign_header_abi "stack_result_abi"
 static u32 stack_header_function(parameter_fragment!(value)) { return value + 9u32; }
-struct HeaderMemoryResult { u64 low; u64 high; };
 assign_header_abi "memory_result_abi"
-static struct HeaderMemoryResult memory_header_function(parameter_fragment!(value)) {
+static struct HeaderMemoryResult { u64 low; u64 high; }
+memory_header_function(in T value) [[generic(parameter_list_fragment!(T))]] {
     struct HeaderMemoryResult result = { (u64)value + 10u64, (u64)value + 11u64 };
     return result;
 }
@@ -411,10 +427,13 @@ global u32 syntax_raw_entry() {
     u32 amount = 4u32;
     transplant_type fragmented_type HeaderFragments parameter_list_fragment!(::Value);
     fragmented_type = header_runtime_seed;
+    struct InlineHeaderResult inline_header_result = captured_inline_header(fragmented_type);
     if (header_fragment_identity(fragmented_type) != 5u32 ||
         angle_fragment_identity(fragmented_type) != 5u32 ||
         captured_header_identity(fragmented_type) != 5u32 ||
-        captured_header_value<16u32>(fragmented_type) != 21u32) return 0u32;
+        captured_header_value<16u32>(fragmented_type) != 21u32 ||
+        inline_header_result.value != 6uptr ||
+        (u32)copied_inline_enum(fragmented_type) != 13u32) return 0u32;
     if (multiplied(amount parameter_list_fragment!(+) 2u32) != 18u32)
         return 0u32;
     u32 declarator_name!(named_by_macro) = 5u32;

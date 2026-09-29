@@ -1147,7 +1147,6 @@ const SyntaxDefinition* SyntaxState::selected(const Token& token, bool item) con
 
 std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& definition,
     const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
-    const std::function<bool(std::size_t, std::size_t)>& function_header,
     const std::function<std::optional<SyntaxParsedFragment>(
         SyntaxPatternElement::Kind, std::size_t)>& parse_fragment) const {
     const auto previous_errors = diagnostics.errors();
@@ -1427,15 +1426,15 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             }
             if (position == start || position >= tokens.size() || !tokens[position].is(";")) return {};
         } else if (element.kind == K::FunctionRaw) {
-            while (position < tokens.size() && tokens[position].kind != TokenKind::End &&
-                   !tokens[position].is("{") && !tokens[position].is(";")) {
-                if (!execution_->work(tokens[position].location)) { failed = true; return {}; }
-                if (const auto close = group_end(tokens, position, *execution_)) position = *close + 1;
-                else if (!closer(tokens[position].text).empty() || closing(tokens[position].text)) return {};
-                else ++position;
-            }
-            if (position >= tokens.size() || !tokens[position].is("{") ||
-                !function_header || !function_header(start, position)) return {};
+            // Let the core declarator grammar locate the header boundary.
+            // The first written brace may instead belong to an inline tag,
+            // and parentheses may belong to a function-pointer object. The
+            // shared recognizer never parses or expands the following body.
+            if (!parse_fragment) return {};
+            const auto header = parse_fragment(K::FunctionHeader, start);
+            if (!header || !header->node || header->end <= start ||
+                header->end >= tokens.size() || !tokens[header->end].is("{")) return {};
+            position = header->end;
             const auto close = group_end(tokens, position, *execution_);
             if (!close) return {};
             position = *close + 1;
