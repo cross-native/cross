@@ -375,9 +375,29 @@ void Parser::expand_inline_macro_fragments() {
         // to discover a declarator's shape or its bound names.
         if (parsing_public_fragment_) throw DeferredNameRecognition{};
         const auto first = index_;
+        const auto discard_failed_invocation = [&] {
+            // Header/name lookahead restores its cursor after exposing tokens.
+            // Consume a failed invocation persistently, including its raw
+            // input, so it cannot execute again or leak nested input into
+            // recovery when normal parsing revisits this position.
+            auto after = first + 1;
+            while (after + 1 < tokens_.size() && tokens_[after].is("::")) after += 2;
+            ++after; // '!' (macro_start already recognized the opening group)
+            unsigned depth = 0;
+            for (; after + 1 < tokens_.size(); ++after) {
+                const auto& token = tokens_[after];
+                if (token.is("(") || token.is("[") || token.is("[[") || token.is("{")) ++depth;
+                else if (token.is(")") || token.is("]") || token.is("]]") || token.is("}")) {
+                    if (depth && --depth == 0) { ++after; break; }
+                }
+            }
+            tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+                          tokens_.begin() + static_cast<std::ptrdiff_t>(after));
+            index_ = first;
+        };
         auto execution = syntax_->execution();
         if (!execution->begin_replacement(current().location)) {
-            ++index_;
+            discard_failed_invocation();
             return;
         }
         struct End {
@@ -385,10 +405,14 @@ void Parser::expand_inline_macro_fragments() {
             ~End() { execution.end_replacement(); }
         } end{*execution};
         auto output = expand_at_position(false);
-        if (!output) return;
+        if (!output) {
+            discard_failed_invocation();
+            return;
+        }
         if (output->tokens.empty() || output->tokens.back().kind != TokenKind::End) {
             diagnostics_.error(output->location,
                 "procedural macro produced no token boundary");
+            discard_failed_invocation();
             return;
         }
         const auto after = index_;

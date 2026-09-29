@@ -154,6 +154,45 @@ global u32 entry() { return recur!(); }")
 parameters!([[macro]] static $::meta::tokens introduced(in $::meta::tokens input) { return input; })")
 endforeach()
 
+set(failing_header_macro [=[
+[[macro]] static $::meta::tokens bad(in $::meta::tokens input) {
+    u32 value = 1u32 / 0u32;
+    return input;
+}
+]=])
+foreach(mode macro_only syntax_enabled)
+    foreach(position result attribute angle qualified)
+        set(source "${failing_header_macro}")
+        if(mode STREQUAL syntax_enabled)
+            string(APPEND source "syntax Unused : rule { match \"unused\"; }\n")
+        endif()
+        if(position STREQUAL result)
+            string(APPEND source "static bad!(unknown!{ discarded }) broken() { return 0u32; }\n")
+        elseif(position STREQUAL attribute)
+            string(APPEND source "static u32 broken() [[generic(bad!(unknown!{ discarded }))]] { return 0u32; }\n")
+        elseif(position STREQUAL angle)
+            string(APPEND source "static u32 broken<bad!(unknown!{ discarded })>() { return 0u32; }\n")
+        else()
+            string(APPEND source "namespace names { typedef u32 Value; }\nnames bad!(unknown!{ discarded }) broken;\n")
+        endif()
+        string(APPEND source
+            "[[macro]] static $::meta::tokens later(in $::meta::tokens input) { return input; }\n"
+            "later!{ static u32 valid() { return 1u32; } }\n")
+        set(input "${OUTPUT}/failed-header-${mode}-${position}.x")
+        file(WRITE "${input}" "${source}")
+        execute_process(COMMAND "${CC}" -S "${input}"
+            -o "${OUTPUT}/failed-header-${mode}-${position}.s"
+            RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 10)
+        string(REGEX MATCHALL "error: division by zero during translation-time evaluation" failures "${err}")
+        list(LENGTH failures failure_count)
+        if(NOT status EQUAL 1 OR NOT failure_count EQUAL 1 OR
+           err MATCHES "procedural macro is not visible" OR
+           NOT err MATCHES "failed-header-${mode}-${position}.x:[0-9]+:[0-9]+: error:")
+            message(FATAL_ERROR "${mode}/${position}: failed header macro retried or lost recovery\n${out}\n${err}")
+        endif()
+    endforeach()
+endforeach()
+
 accept_splice(header_attribute_owner_first "${parameter_list_macros}
 [[syntax_expander]] static $::meta::tokens alignment(in $::meta::syntax_match input) {
     return $::quote { 16u32 };
