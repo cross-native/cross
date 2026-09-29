@@ -36,15 +36,15 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
 [[noinline]] static T generic_copy<T, u32 N>(in T amount) {
     syntax LocalTagSplice::Copy, LocalTagSplice::Type, LocalTagSplice::Twice,
            LocalTagSplice::TextTwice, Expression;
-    tag_copy struct Local { T value; };
+    tag_copy struct Local { T value; u8 padding[N]; };
     struct Local first = {amount};
-    tag_type second, struct TypeTag { T value; };
+    tag_type second, struct TypeTag { T value; T grid[N]; };
     second.value = first.value;
     uptr expression_size = tag_expression(sizeof(struct ExpressionTag { T value; }));
     struct ExpressionTag expression_object = {amount};
     if (expression_size != sizeof(T) || expression_object.value != amount) return (T)0u32;
     tag_twice {
-        struct Repeated { T value; struct Repeated *next; } repeated;
+        struct Repeated { T value; struct Repeated *next; u8 padding[N]; } repeated;
         repeated.value = second.value;
         repeated.next = &repeated;
         if (!LocalTagGeneric::same(&repeated, repeated.next) || repeated.next->value != amount) return (T)0u32;
@@ -52,7 +52,7 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
         if (LocalTagSplice::enum_pair(item, B) != 2u32 * (N + (u32)sizeof(T))) return (T)0u32;
     }
     tag_text_twice {
-        struct Text { T value; } text = {amount};
+        struct Text { T value; u8 padding[N]; } text = {amount};
         if (text.value != amount) return (T)0u32;
         enum TextEnum [[underlying(u32)]] { TextA = N } item = TextA;
         if (LocalTagSplice::enum_pair(item, TextA) != 2u32 * N) return (T)0u32;
@@ -63,10 +63,12 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
 [[noinline, abi("stack_result_abi")]] static T stack_pass<T>(in T value) { return value; }
 [[noinline, abi("memory_result_abi")]] static T memory_pass<T>(in T value) { return value; }
 [[noinline]] static T custom_transport<T>(in T amount) {
-    struct Local { u64 first; T second; } object = {(u64)amount, amount};
+    struct Local { u64 first; T second; u8 bytes[sizeof(T)]; } object = {(u64)amount, amount};
+    object.bytes[sizeof(T) - 1uptr] = 7u8;
     struct Local copied = memory_pass(object);
     enum Scalar [[underlying(u32)]] { A = 9u32 } item = stack_pass(A);
-    if (copied.first != (u64)amount || (u32)item != 9u32) return (T)0u32;
+    if (copied.first != (u64)amount || (u32)item != 9u32 ||
+        copied.bytes[sizeof(T) - 1uptr] != 7u8) return (T)0u32;
     return stack_pass(copied.second);
 }
 [[abi(HOST_ABI)]]

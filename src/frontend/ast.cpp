@@ -8,6 +8,7 @@
 #include <charconv>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace cross {
 
@@ -68,6 +69,24 @@ TypePtr copy_type(const TypePtr& type) {
         }
     }
     return result;
+}
+
+bool has_pending_array_bound(const TypePtr& type) {
+    std::unordered_set<const Type*> seen;
+    std::vector<TypePtr> pending{type};
+    while (!pending.empty()) {
+        auto next = std::move(pending.back());
+        pending.pop_back();
+        if (!next || !seen.insert(next.get()).second) continue;
+        if (next->array_bound && next->lanes == 0) return true;
+        pending.push_back(next->element);
+        pending.push_back(next->pointee);
+        if (next->function) {
+            pending.push_back(next->function->result);
+            for (const auto& parameter : next->function->parameters) pending.push_back(parameter.type);
+        }
+    }
+    return false;
 }
 
 std::span<const std::string_view> core_keyword_names() {
@@ -404,6 +423,7 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
     }
     if (left->kind == Type::Kind::Array) {
         return left->lanes == right->lanes &&
+               (left->lanes != 0 || left->array_bound == right->array_bound) &&
                same_type(left->element, right->element);
     }
     if (left->kind == Type::Kind::Record) {

@@ -113,6 +113,7 @@ struct RecordMember {
     std::optional<unsigned> bit_width;
     unsigned bit_offset{};
     const Expr* pending_bit_width{};
+    TypePtr pending_source_type{};
     bool packed{};
 };
 

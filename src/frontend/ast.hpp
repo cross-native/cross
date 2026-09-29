@@ -26,6 +26,7 @@ enum class BuiltinType {
 };
 
 struct Type;
+struct Expr;
 struct FunctionType;
 using TypePtr = std::shared_ptr<Type>;
 
@@ -52,6 +53,9 @@ struct Type {
     TypePtr element;
     std::shared_ptr<FunctionType> function;
     std::uint32_t lanes{};
+    // Retained required source bound, never a VLA. Positive lanes caches its
+    // resolved extent; the expression remains available for source validation.
+    std::shared_ptr<const Expr> array_bound{};
     bool scalable{};
     std::string generic_name;
     std::string nominal_name;
@@ -81,6 +85,7 @@ TypePtr context_type();
 // Copy a mutable type graph without sharing nested callable/element state.
 // Preserve graph sharing inside the copy, including any recursive edges.
 TypePtr copy_type(const TypePtr& type);
+bool has_pending_array_bound(const TypePtr& type);
 std::span<const std::string_view> core_keyword_names();
 bool is_reserved_identifier(std::string_view name);
 TypePtr bytes_type();

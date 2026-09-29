@@ -232,9 +232,11 @@ public:
     void validate_address_spaces() {
         std::unordered_set<const cross::Type*> visited;
         std::unordered_set<std::string> reported;
+        std::vector<const Expr*> retained_bounds;
         const auto type = [&](const auto& self, const TypePtr& source,
                               SourceLocation fallback) -> void {
             if (!source || !visited.insert(source.get()).second) return;
+            if (source->array_bound) retained_bounds.push_back(source->array_bound.get());
             if (source->pending_address_space) {
                 diagnostics_.error(source->pending_address_space->second,
                                    "address_space requires a pointer declarator");
@@ -348,6 +350,11 @@ public:
             type(type, object->type, object->location);
             attributes(object->attributes);
             expression(expression, object->initializer.get());
+        }
+        while (!retained_bounds.empty()) {
+            const auto* bound = retained_bounds.back();
+            retained_bounds.pop_back();
+            expression(expression, bound);
         }
     }
 
@@ -849,21 +856,18 @@ private:
         return true;
     }
 
-    bool resolve_bit_field_width(RecordMember& member,
-                                 std::string_view source_namespace) {
-        if (!member.pending_bit_width) return member.bit_width.has_value();
-        const auto* expression = member.pending_bit_width;
-        member.pending_bit_width = nullptr;
+    template<class Evaluate>
+    auto with_record_layout(SourceLocation location, Evaluate&& evaluate) {
         const auto layout = [&](const TypePtr& source)
             -> std::optional<std::pair<std::uint64_t, unsigned>> {
             const auto id = intern_type(source);
             const auto& type = module_.type(id);
             if (type.kind == Type::Kind::Record &&
                 (!type.record ||
-                 !layout_record(*type.record, expression->location))) {
+                 !layout_record(*type.record, location))) {
                 return std::nullopt;
             }
-            const auto result = storage_layout(id, expression->location);
+            const auto result = storage_layout(id, location);
             return result.first == 0 ? std::nullopt
                                      : std::optional(result);
         };
@@ -878,11 +882,43 @@ private:
             return result ? std::optional<std::uint64_t>(result->second)
                           : std::nullopt;
         };
-        const auto evaluated = evaluate_target_integer_constant(
-            program_, *expression, diagnostics_, size_of, align_of,
-            source_namespace);
+        return evaluate(size_of, align_of);
+    }
+
+    bool resolve_bit_field_width(RecordMember& member,
+                                 std::string_view source_namespace) {
+        if (!member.pending_bit_width) return member.bit_width.has_value();
+        const auto* expression = member.pending_bit_width;
+        member.pending_bit_width = nullptr;
+        const auto evaluated = with_record_layout(expression->location,
+            [&](const LayoutQuery& size_of, const LayoutQuery& align_of) {
+                return evaluate_target_integer_constant(program_, *expression, diagnostics_,
+                    size_of, align_of, source_namespace);
+            });
         return evaluated &&
                set_bit_field_width(member, *evaluated, member.location);
+    }
+
+    bool resolve_member_bounds(const TypePtr& type, std::string_view name_space) {
+        if (!type) return true;
+        bool valid = resolve_member_bounds(type->element, name_space);
+        valid = resolve_member_bounds(type->pointee, name_space) && valid;
+        if (type->function) {
+            valid = resolve_member_bounds(type->function->result, name_space) && valid;
+            for (const auto& parameter : type->function->parameters)
+                valid = resolve_member_bounds(parameter.type, name_space) && valid;
+        }
+        if (type->array_bound && type->lanes == 0) {
+            const auto expression = type->array_bound;
+            const auto bound = with_record_layout(expression->location,
+                [&](const LayoutQuery& size_of, const LayoutQuery& align_of) {
+                    return evaluate_fixed_array_bound(program_, *expression, diagnostics_,
+                        size_of, align_of, name_space);
+                });
+            if (!bound) return false;
+            type->lanes = *bound;
+        }
+        return valid;
     }
 
     bool layout_record(RecordId id, SourceLocation use_location) {
@@ -897,7 +933,10 @@ private:
                 "record contains itself by value through a member cycle");
             return false;
         }
-        auto& record = module_.record(id);
+        // A required layout expression may intern an implicit pointer tag and
+        // grow the record table. Work on a detached record, then publish by ID;
+        // neither the record nor its member references may dangle across queries.
+        auto record = module_.record(id);
         if (!record.complete) {
             diagnostics_.error(
                 use_location,
@@ -925,6 +964,16 @@ private:
         std::uint64_t next_bit{};
         const auto current_namespace = source_namespace(record.source_name);
         for (auto& member : record.members) {
+            if (member.pending_source_type) {
+                if (!resolve_member_bounds(member.pending_source_type, current_namespace)) {
+                    valid = false;
+                    member.pending_source_type.reset();
+                    continue;
+                }
+                member.type = intern_type(member.pending_source_type);
+                member.pending_source_type.reset();
+                validate_atomic_type(member.type, member.location);
+            }
             if (member.pending_bit_width &&
                 !resolve_bit_field_width(member, current_namespace)) {
                 valid = false;
@@ -1139,6 +1188,7 @@ private:
         }
         record.alignment = record_alignment;
         record.size = rounded.value_or(0);
+        module_.record(id) = std::move(record);
         layout_state_[id.value] = valid ? 2 : 3;
         return valid;
     }
@@ -1180,7 +1230,7 @@ private:
                 member.location = source.location;
                 member.name = source.name;
                 member.type = intern_type(source.type);
-                validate_atomic_type(member.type, source.location);
+                member.pending_source_type = source.type;
                 if (source.bit_width) {
                     const auto& type = module_.type(member.type);
                     bool valid_base = true;

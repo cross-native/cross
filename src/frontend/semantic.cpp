@@ -134,8 +134,13 @@ bool validate_attribute_names(const Program& program,
     return diagnostics.errors() == 0;
 }
 
+std::unique_ptr<Expr> clone_expr(const Expr& source,
+                                 const TypeSubstitutions& types = {},
+                                 const ValueSubstitutions& values = {});
+
 TypePtr clone_type(const TypePtr& source,
-                   const TypeSubstitutions& substitutions = {}) {
+                   const TypeSubstitutions& substitutions = {},
+                   const ValueSubstitutions& values = {}) {
     if (!source) return {};
     TypePtr result;
     if (source->kind == Type::Kind::Builtin) {
@@ -143,13 +148,13 @@ TypePtr clone_type(const TypePtr& source,
                      ? builtin_type(source->builtin)
                      : enum_type(source->nominal_name, source->builtin);
     } else if (source->kind == Type::Kind::Pointer) {
-        result = pointer_type(clone_type(source->pointee, substitutions));
+        result = pointer_type(clone_type(source->pointee, substitutions, values));
     } else if (source->kind == Type::Kind::Function && source->function) {
         auto parameters = source->function->parameters;
         for (auto& parameter : parameters)
-            parameter.type = clone_type(parameter.type, substitutions);
+            parameter.type = clone_type(parameter.type, substitutions, values);
         result =
-            function_type(clone_type(source->function->result, substitutions),
+            function_type(clone_type(source->function->result, substitutions, values),
                           std::move(parameters), source->function->variadic,
                           source->function->abi);
         result->function->result_location =
@@ -158,11 +163,13 @@ TypePtr clone_type(const TypePtr& source,
         result->function->stack_cleanup =
             source->function->stack_cleanup;
     } else if (source->kind == Type::Kind::Vector) {
-        result = vector_type(clone_type(source->element, substitutions),
+        result = vector_type(clone_type(source->element, substitutions, values),
                              source->lanes, source->scalable);
     } else if (source->kind == Type::Kind::Array) {
-        result = array_type(clone_type(source->element, substitutions),
+        result = array_type(clone_type(source->element, substitutions, values),
                             source->lanes);
+        if (source->array_bound)
+            result->array_bound = clone_expr(*source->array_bound, substitutions, values);
     } else if (source->kind == Type::Kind::Record) {
         result = record_type(source->nominal_name, source->is_union);
     } else if (source->kind == Type::Kind::Tokens) {
@@ -202,10 +209,6 @@ TypePtr clone_type(const TypePtr& source,
 }
 
 std::unique_ptr<Expr> clone_expr(const Expr& source,
-                                 const TypeSubstitutions& types = {},
-                                 const ValueSubstitutions& values = {});
-
-std::unique_ptr<Expr> clone_expr(const Expr& source,
                                  const TypeSubstitutions& types,
                                  const ValueSubstitutions& values) {
     if (source.kind == Expr::Kind::Name) {
@@ -231,7 +234,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     result->evaluated_address = source.evaluated_address;
     result->object_relocations = source.object_relocations;
     result->generic_visible_at_call = source.generic_visible_at_call;
-    if (source.type) result->type = clone_type(source.type, types);
+    if (source.type) result->type = clone_type(source.type, types, values);
     if (source.left) result->left = clone_expr(*source.left, types, values);
     if (source.right) result->right = clone_expr(*source.right, types, values);
     if (source.third) result->third = clone_expr(*source.third, types, values);
@@ -240,7 +243,7 @@ std::unique_ptr<Expr> clone_expr(const Expr& source,
     }
     for (const auto& argument : source.generic_arguments) {
         Expr::GenericArgument copy;
-        if (argument.type) copy.type = clone_type(argument.type, types);
+        if (argument.type) copy.type = clone_type(argument.type, types, values);
         if (argument.value) copy.value = clone_expr(*argument.value, types, values);
         result->generic_arguments.push_back(std::move(copy));
     }
@@ -283,7 +286,7 @@ std::unique_ptr<VariableDecl> clone_variable(
     auto result = std::make_unique<VariableDecl>();
     result->location = source.location;
     result->name = source.name;
-    result->type = clone_type(source.type, types);
+    result->type = clone_type(source.type, types, values);
     if (source.dynamic_array_bound) {
         result->dynamic_array_bound =
             clone_expr(*source.dynamic_array_bound, types, values);
@@ -795,6 +798,11 @@ bool deduce_generic_arguments(const FunctionDecl& generic,
                               "cannot determine generic call argument type");
             return false;
         }
+        if (has_pending_array_bound(actual)) {
+            diagnostics.error(argument.location,
+                "generic deduction requires a resolved fixed array bound");
+            return false;
+        }
         actual = clone_type(actual);
         auto formal = clone_type(
             callable_parameter_type(parameter.type, parameter.mode));
@@ -856,6 +864,32 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
                           Diagnostics& diagnostics,
                           GenericExpansionState& state,
                           std::string_view mangling);
+
+void rewrite_generic_type_bounds(const TypePtr& type, FunctionDecl* caller, Program& program,
+    Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling) {
+    if (!type) return;
+    rewrite_generic_type_bounds(type->pointee, caller, program, diagnostics, state, mangling);
+    rewrite_generic_type_bounds(type->element, caller, program, diagnostics, state, mangling);
+    if (type->function) {
+        rewrite_generic_type_bounds(type->function->result, caller, program, diagnostics, state, mangling);
+        for (const auto& parameter : type->function->parameters)
+            rewrite_generic_type_bounds(parameter.type, caller, program, diagnostics, state, mangling);
+    }
+    if (!type->array_bound || type->lanes != 0) return;
+    auto expression = clone_expr(*type->array_bound);
+    rewrite_generic_expr(expression, caller, program, diagnostics, state, mangling);
+    type->array_bound = std::move(expression);
+    // Resolve target-independent extents before a generic body can deduce an
+    // array-pointer argument from a member. Layout-dependent queries remain
+    // required expressions for the target's cycle-checked record layout pass.
+    std::ostringstream output;
+    Diagnostics quiet(output);
+    if (const auto bound = evaluate_fixed_array_bound(program, *type->array_bound, quiet,
+            program.evaluation_size_of, program.evaluation_align_of,
+            caller ? caller->source_namespace : std::string_view{})) {
+        type->lanes = *bound;
+    }
+}
 
 void rewrite_generic_statement(
     Statement& statement, FunctionDecl* caller, Program& program,
@@ -993,10 +1027,10 @@ std::unique_ptr<FunctionDecl> instantiate(
     result->source_namespace = source.source_namespace;
     result->source_unit = source.source_unit;
     result->imports = source.imports;
-    result->return_type = clone_type(source.return_type, types);
+    result->return_type = clone_type(source.return_type, types, values);
     for (const auto& parameter : source.parameters) {
         result->parameters.push_back(
-            {parameter.location, parameter.name, clone_type(parameter.type, types),
+            {parameter.location, parameter.name, clone_type(parameter.type, types, values),
              parameter.mode, parameter.explicit_mode, parameter.location_name});
     }
     for (const auto& attribute : source.attributes) {
@@ -1038,7 +1072,7 @@ std::unique_ptr<FunctionDecl> instantiate(
             copy.nominal_identity = types.nominal->substitute(record.nominal_identity);
             copy.attributes = clone_attributes(record.attributes, types, values);
             for (const auto& member : record.members)
-                copy.members.push_back({member.location, member.name, clone_type(member.type, types),
+                copy.members.push_back({member.location, member.name, clone_type(member.type, types, values),
                     member.bit_width ? clone_expr(*member.bit_width, types, values) : nullptr,
                     clone_attributes(member.attributes, types, values)});
             records.push_back(std::move(copy));
@@ -1226,6 +1260,9 @@ void rewrite_generic_expr(std::unique_ptr<Expr>& expression,
             for (std::size_t attribute = 0; attribute < program.records[index].attributes.size(); ++attribute)
                 rewrite_attribute(index, {}, attribute);
             for (std::size_t member = 0; member < program.records[index].members.size(); ++member) {
+                // Copy the handle before calls that may append record definitions.
+                const auto type = program.records[index].members[member].type;
+                rewrite_generic_type_bounds(type, concrete, program, diagnostics, state, mangling);
                 auto width = std::move(program.records[index].members[member].bit_width);
                 rewrite_generic_expr(width, concrete, program, diagnostics, state, mangling);
                 program.records[index].members[member].bit_width = std::move(width);
@@ -1253,6 +1290,18 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
     state.canonical_abi = canonical_abi;
     if (!validate_generic_redeclarations(program, state, diagnostics))
         return false;
+    for (std::size_t index = 0; index < program.records.size(); ++index) {
+        if (program.records[index].nominal_identity &&
+            program.records[index].nominal_identity->generic_owner) continue;
+        FunctionDecl context;
+        context.source_namespace = namespace_prefix(program.records[index].name);
+        const auto location = program.records[index].location;
+        if (location.file) context.source_unit = location.file->source_unit_at(location.line);
+        for (std::size_t member = 0; member < program.records[index].members.size(); ++member) {
+            const auto type = program.records[index].members[member].type;
+            rewrite_generic_type_bounds(type, &context, program, diagnostics, state, mangling);
+        }
+    }
     for (std::size_t index = 0; index < program.functions.size(); ++index) {
         auto* function = program.functions[index].get();
         if (!function->generic_parameters.empty()) continue;
@@ -9433,13 +9482,35 @@ std::optional<Expr::IntegerConstant> evaluate_target_integer_constant(
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::string_view source_namespace) {
     Evaluator evaluator(program, diagnostics, nullptr,
-                        std::string(source_namespace), &size_of, &align_of);
+                        std::string(source_namespace), size_of ? &size_of : nullptr,
+                        align_of ? &align_of : nullptr);
     const auto value = evaluator.required_integer(expression);
     if (!value) {
         evaluator.diagnose(expression.location);
         return std::nullopt;
     }
     return Expr::IntegerConstant{value->integer, value->type->builtin};
+}
+
+std::optional<std::uint32_t> evaluate_fixed_array_bound(
+    Program& program, const Expr& expression, Diagnostics& diagnostics,
+    const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::string_view source_namespace) {
+    const auto value = evaluate_target_integer_constant(program, expression, diagnostics,
+        size_of, align_of, source_namespace);
+    if (!value) return {};
+    const auto type = builtin_type(value->type);
+    const auto bits = value->type == BuiltinType::Iptr || value->type == BuiltinType::Uptr
+        ? program.address_bits : type_bits(type);
+    const bool negative = signed_builtin(value->type) && bits &&
+        (shift_right(value->value, bits - 1).low & 1U);
+    if (negative || value->value.high || value->value.low == 0 ||
+        value->value.low > std::numeric_limits<std::uint32_t>::max()) {
+        diagnostics.error(expression.location,
+            "fixed array bound must be a positive integer representable in 32 bits");
+        return {};
+    }
+    return static_cast<std::uint32_t>(value->value.low);
 }
 
 std::unique_ptr<Expr> evaluate_target_pointer_constant(

@@ -48,6 +48,35 @@ reject_splice(local_tag_generic_enum_overflow "not representable" [=[
     static u32 broken<u32 N>() { enum Local [[underlying(u16)]] { A = N }; return (u32)A; }
     global u32 entry() { return broken<65536u32>(); }
 ]=])
+reject_splice(member_bound_zero "fixed array bound must be a positive integer" [=[
+    static uptr bad<u32 N>() { struct Local { u8 data[N]; }; return sizeof(struct Local); }
+    global uptr entry() { return bad<0u32>(); }
+]=])
+reject_splice(member_bound_negative "fixed array bound must be a positive integer" [=[
+    static uptr bad<i32 N>() { struct Local { u8 data[N]; }; return sizeof(struct Local); }
+    global uptr entry() { return bad<(-1)>(); }
+]=])
+reject_splice(member_bound_overflow "fixed array bound must be a positive integer" [=[
+    static uptr bad<u64 N>() { struct Local { u8 data[N]; }; return sizeof(struct Local); }
+    global uptr entry() { return bad<4294967296u64>(); }
+]=])
+reject_splice(member_bound_cycle "record contains itself by value through a member cycle" [=[
+    struct Local { u8 data[sizeof(struct Local)]; };
+]=])
+reject_splice(member_bound_runtime "required constant expression" [=[
+    global uptr bad(in u32 count) { struct Local { u8 data[count]; }; return sizeof(struct Local); }
+]=])
+reject_splice(member_bound_bad_address_space "address space 999 is not registered" [=[
+    struct Local { u8 data[sizeof([[address_space(999)]] u8 *)]; };
+]=])
+accept_splice(member_required_bounds [=[
+    struct Other { u16 value; };
+    static uptr width() { return sizeof(struct Unknown *) + sizeof(struct Other); }
+    struct Cell { u8 data[width()]; };
+    struct Matrix { u8 data[sizeof(struct Other)]; };
+    $::static_assert(sizeof(struct Cell) == sizeof(uptr) + 2uptr, "required pointer-sized bound");
+    $::static_assert(sizeof(struct Matrix) == 2uptr, "required record-sized bound");
+]=])
 reject_splice(local_enum_not_visible "unknown|unresolved"
     "static u32 first() { enum E { Value }; return (u32)Value; } $::static_assert((u32)Value == 0u32, \"scope\");")
 reject_splice(local_enum_duplicate_value "local enumerator 'Value' conflicts"

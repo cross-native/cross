@@ -9,10 +9,50 @@ namespace cross {
 namespace {
 
 template<class Add, class Name>
-void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_budget) {
+void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_budget,
+                  std::uint64_t maximum) {
     std::unordered_set<const Type*> seen;
+    std::unordered_set<const Expr*> seen_expressions;
     std::vector<TypePtr> pending{root};
-    while (!pending.empty() && !over_budget) {
+    std::vector<const Expr*> expressions;
+    while ((!pending.empty() || !expressions.empty()) && !over_budget) {
+        if (!expressions.empty()) {
+            const auto* expression = expressions.back();
+            expressions.pop_back();
+            if (!expression || !seen_expressions.insert(expression).second) continue;
+            add(256); name(expression->text); name(expression->string_value);
+            pending.push_back(expression->type);
+            expressions.push_back(expression->left.get());
+            expressions.push_back(expression->right.get());
+            expressions.push_back(expression->third.get());
+            if (expression->name_context) {
+                add(96); name(expression->name_context->name_space);
+                for (const auto& imported : expression->name_context->imports) name(imported);
+                if (const auto& id = expression->name_context->value_binding.enumeration) {
+                    add(112); name(id->source_unit); name(id->instance_key);
+                }
+            }
+            for (const auto& argument : expression->arguments) expressions.push_back(argument.get());
+            for (const auto& argument : expression->generic_arguments) {
+                add(32); pending.push_back(argument.type); expressions.push_back(argument.value.get());
+            }
+            for (const auto& entry : expression->initializer_entries) {
+                add(48); expressions.push_back(entry.value.get());
+                for (const auto& designator : entry.designators) {
+                    add(48); name(designator.member); expressions.push_back(designator.index.get());
+                }
+            }
+            for (const auto& relocation : expression->object_relocations) {
+                add(80); pending.push_back(relocation.type);
+            }
+            for (const auto& fragment : expression->quote_fragments)
+                for (const auto& token : fragment) {
+                    add(meta_token_storage_bytes); name(token.text);
+                    add(tag_binding_storage(token.origin.tag_binding));
+                    if (token.splice) add(syntax_node_storage(*token.splice, maximum));
+                }
+            continue;
+        }
         auto next = std::move(pending.back());
         pending.pop_back();
         if (!next || !seen.insert(next.get()).second) continue;
@@ -23,6 +63,7 @@ void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_
         }
         pending.push_back(next->pointee);
         pending.push_back(next->element);
+        expressions.push_back(next->array_bound.get());
         if (next->function) {
             add(96); name(next->function->abi);
             if (next->function->result_location) name(*next->function->result_location);
@@ -53,7 +94,7 @@ void SyntaxHeaderBindings::finish(std::vector<GenericParameter> values,
     const auto name = [&](std::string_view text) { add(32); add(text.size()); };
     for (const auto& parameter : values) {
         add(32); name(parameter.name);
-        type_storage(parameter.value_type, add, name, over_budget);
+        type_storage(parameter.value_type, add, name, over_budget, maximum);
     }
     complete = true;
     if (over_budget || !execution.work(location, work)) {
@@ -93,7 +134,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
         else storage += size;
     };
     const auto name = [&](std::string_view text) { add(32); add(text.size()); };
-    const auto type = [&](const TypePtr& root) { type_storage(root, add, name, over_budget); };
+    const auto type = [&](const TypePtr& root) { type_storage(root, add, name, over_budget, maximum); };
     for (const auto& entry : active_generic_types_) name(entry);
     for (const auto& [entry, parameters] : known_generic_functions_) {
         name(entry); add(32 + parameters.size() * 8);
@@ -162,6 +203,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     result->local_tags = local_tag_scopes_;
     result->nominal_occurrence = nominal_occurrence_;
     result->generic_tag_owner = generic_tag_owner_;
+    result->retaining_member_bounds = retaining_member_bounds_;
     for (auto& scope : result->local_tags)
         for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     result->scope_origins = scope_origins_;
@@ -223,6 +265,7 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
     local_tag_scopes_ = environment.local_tags;
     if (environment.nominal_occurrence) nominal_occurrence_ = environment.nominal_occurrence;
     generic_tag_owner_ = environment.generic_tag_owner;
+    retaining_member_bounds_ = environment.retaining_member_bounds;
     for (auto& scope : local_tag_scopes_)
         for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     scope_origins_ = environment.scope_origins;

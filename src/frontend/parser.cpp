@@ -463,6 +463,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->local_tag_scopes_ = local_tag_scopes_;
     child->nominal_occurrence_ = nominal_occurrence_;
     child->generic_tag_owner_ = generic_tag_owner_;
+    child->retaining_member_bounds_ = retaining_member_bounds_;
     child->tag_destination_ = tag_destination_;
     child->tag_destination_depth_ = tag_destination_depth_;
     child->enum_rebindings_ = enum_rebindings_;
@@ -3285,7 +3286,8 @@ void Parser::apply_callable_attributes(
 TypePtr Parser::parse_array_suffix(
     TypePtr element, bool parameter,
     std::unique_ptr<Expr>* dynamic_outer_bound) {
-    std::vector<std::uint32_t> bounds;
+    struct Bound { std::uint32_t count; std::shared_ptr<const Expr> expression{}; };
+    std::vector<Bound> bounds;
     while (current().is("[")) {
         ProductionScope array_suffix(*this, SyntaxProduction::ArraySuffix);
         consume("[");
@@ -3294,9 +3296,9 @@ TypePtr Parser::parse_array_suffix(
                 diagnostics_.error(
                     current().location,
                     "an array parameter requires a positive fixed bound in the bootstrap compiler");
-                bounds.push_back(1);
+                bounds.push_back({1});
             } else {
-                bounds.push_back(0);
+                bounds.push_back({0});
             }
             continue;
         }
@@ -3308,7 +3310,9 @@ TypePtr Parser::parse_array_suffix(
         if (!value && dynamic_outer_bound && bounds.empty() &&
             !*dynamic_outer_bound) {
             *dynamic_outer_bound = std::move(expression);
-            bounds.push_back(0);
+            bounds.push_back({0});
+        } else if (!value && expression && retaining_member_bounds_ && !parameter) {
+            bounds.push_back({0, std::shared_ptr<const Expr>(std::move(expression))});
         } else if (!value || *value <= 0 ||
             static_cast<std::uint64_t>(*value) >
                 std::numeric_limits<std::uint32_t>::max()) {
@@ -3317,13 +3321,14 @@ TypePtr Parser::parse_array_suffix(
                 dynamic_outer_bound
                     ? "only the outermost array bound may be a runtime value"
                     : "fixed array bound must be a positive integer translation-time value");
-            bounds.push_back(1);
+            bounds.push_back({1});
         } else {
-            bounds.push_back(static_cast<std::uint32_t>(*value));
+            bounds.push_back({static_cast<std::uint32_t>(*value)});
         }
     }
     for (auto bound = bounds.rbegin(); bound != bounds.rend(); ++bound) {
-        element = array_type(std::move(element), *bound);
+        element = array_type(std::move(element), bound->count);
+        element->array_bound = std::move(bound->expression);
     }
     if (parameter && element && element->kind == Type::Kind::Array) {
         element = pointer_type(element->element);
@@ -4347,6 +4352,10 @@ void Parser::parse_record_declaration(
 }
 
 void Parser::parse_record_members(RecordDecl& declaration) {
+    const auto previous_bounds = retaining_member_bounds_;
+    retaining_member_bounds_ = true;
+    struct RestoreBounds { bool& value; bool previous; ~RestoreBounds() { value = previous; } }
+        restore_bounds{retaining_member_bounds_, previous_bounds};
     while (!current().is("}") && current().kind != TokenKind::End) {
         ProductionScope member(*this, SyntaxProduction::MemberDeclaration);
         auto member_attributes = parse_attributes();

@@ -293,6 +293,7 @@ private:
     std::vector<NameMap<LocalTag>> local_tag_scopes_;
     std::shared_ptr<std::uint64_t> nominal_occurrence_ = std::make_shared<std::uint64_t>();
     std::shared_ptr<const GenericTagOwner> generic_tag_owner_;
+    bool retaining_member_bounds_{};
     std::optional<NameMap<LocalTag>> tag_destination_;
     std::size_t tag_destination_depth_{};
     // Only declarations reintroduced by the currently placed subtree remap
@@ -395,6 +396,7 @@ private:
     std::vector<ParameterDecl> parameters;
     std::vector<GenericParameter> generic_parameters;
     std::shared_ptr<const GenericTagOwner> generic_tag_owner;
+    bool retaining_member_bounds{};
     std::vector<std::size_t> uncertain_depths;
     bool function_context{};
     bool procedural_body{};

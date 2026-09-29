@@ -47,6 +47,24 @@ namespace LocalTagGeneric {
         if ($::alignof(struct Local) != (uptr)N || sizeof(object) != (uptr)N) return (T)0u32;
         return object.value;
     }
+    [[noinline]] static T arrays<T, u32 N>(in T input) {
+        enum Count [[underlying(u32)]] { CountValue = N };
+        struct Cell { T value; };
+        struct Local {
+            T grid[(u32)CountValue][increment<N>()];
+            u8 bytes[sizeof(struct Cell)];
+            T (*pointer)[N + 1u32];
+        } object = { { { (T)0u32 } } };
+        object.grid[N - 1u32][N] = input;
+        object.bytes[sizeof(T) - 1uptr] = 7u8;
+        object.pointer = pass(&object.grid[N - 1u32]);
+        if (object.bytes[sizeof(T) - 1uptr] != 7u8) return (T)0u32;
+        struct Local copied = object;
+        struct Small { T data[2]; } small = {{input, (T)0u32}};
+        struct Small transported = pass(small);
+        if (transported.data[0] != input) return (T)0u32;
+        return (*copied.pointer)[N];
+    }
     // Unused templates must not leak unsubstituted members into final layout.
     static T unused<T>(in T input) { struct Unused { T value; } object = {input}; return object.value; }
 
@@ -57,7 +75,8 @@ namespace LocalTagGeneric {
             enumeration<u32, 3u32>(amount) != amount + 11u32 ||
             enumeration<u16, 5u32>(7u16) != 20u32 ||
             bits<u32, 4u32>(amount) != amount + 3u32 || bits<u16, 2u32>(7u16) != 8u32 ||
-            alignment<u32, 8u32>(amount) != amount || alignment<u16, 4u32>(7u16) != 7u16)
+            alignment<u32, 8u32>(amount) != amount || alignment<u16, 4u32>(7u16) != 7u16 ||
+            arrays<u32, 3u32>(amount) != amount || arrays<u16, 2u32>(7u16) != 7u16)
             return 0u32;
         return amount;
     }
