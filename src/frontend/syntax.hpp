@@ -90,6 +90,7 @@ TokenSequence syntax_node_tokens(const SyntaxNode& node);
 TokenSequence syntax_node_fragments(const SyntaxNode& node);
 bool syntax_expression_node(const SyntaxNode& node);
 bool syntax_statement_node(const SyntaxNode& node);
+bool syntax_declaration_node(const SyntaxNode& node);
 bool syntax_type_node(const SyntaxNode& node);
 std::optional<SyntaxEntityId> syntax_resolve_entity(
     const SyntaxNode& node, std::string_view name, Diagnostics& diagnostics,

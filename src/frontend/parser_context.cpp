@@ -197,7 +197,7 @@ void Parser::restore_deferred_environment(const SyntaxParseEnvironment& environm
                                           SourceLocation original_position) {
     // Reparse against the saved environment plus declarations made after the
     // capture by earlier statements of its original lexical block. A moved
-    // expression never inherits declarations from its destination block.
+    // fragment never inherits declarations from its destination block.
     restore_environment(environment, context);
     if (!original_position.valid()) return;
     for (std::size_t at = environment.scope_event_base; at < scope_events_->size(); ++at) {

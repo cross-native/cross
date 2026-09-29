@@ -8,6 +8,119 @@ foreach(required CC OUTPUT)
 endforeach()
 file(MAKE_DIRECTORY "${OUTPUT}")
 
+function(accept_splice case source)
+    set(input "${OUTPUT}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "${case} failed\n${out}\n${err}")
+    endif()
+endfunction()
+function(reject_splice case expected source)
+    set(input "${OUTPUT}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}" OR
+       NOT err MATCHES "${case}.x:[0-9]+:[0-9]+: error:")
+        message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
+    endif()
+endfunction()
+
+set(declaration_expander [=[
+[[syntax_expander]] static $::meta::tokens copy_decl(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+]=])
+accept_splice(declaration_block "${declaration_expander}
+syntax Copy : statement { prefix \"copy\"; match body:declaration; expand copy_decl; }
+global u32 entry() { syntax Copy; copy u32 copied = 5u32; return copied; }")
+accept_splice(declaration_block_storage "${declaration_expander}
+syntax Copy : statement { prefix \"copy\"; match body:declaration; expand copy_decl; }
+global u32 entry() { syntax Copy; copy register u32 copied = 5u32; return copied; }")
+accept_splice(declaration_block_typedef "${declaration_expander}
+syntax Copy : statement { prefix \"copy\"; match body:declaration; expand copy_decl; }
+global u32 entry() { syntax Copy; copy typedef u16 Copied; Copied value = 5u16; return value; }")
+accept_splice(declaration_external "${declaration_expander}
+syntax Copy : item { prefix \"copy\"; match body:declaration; expand copy_decl; }
+syntax Copy;
+copy global u32 copied = 5u32;
+global u32 entry() { return copied; }")
+accept_splice(declaration_external_typedef "${declaration_expander}
+syntax Copy : item { prefix \"copy\"; match body:declaration; expand copy_decl; }
+syntax Copy;
+copy typedef u16 Copied;
+global Copied copied = 5u16;
+global u32 entry() { return copied; }")
+accept_splice(declaration_external_namespace "${declaration_expander}
+syntax Copy : item { prefix \"copy\"; match body:declaration; expand copy_decl; }
+syntax Copy;
+namespace Destination { copy global u32 copied = 5u32; }
+global u32 entry() { return Destination::copied; }")
+set(reparse_declaration_expander [=[
+[[syntax_expander]] static $::meta::tokens reparse_decl(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    $::meta::syntax parsed = $::meta::parse("declaration",
+        $::quote { $::unquote(body) }, $::syntax::context(input));
+    if (!$::meta::is_production(parsed, "declaration"))
+        return $::quote { invalid_declaration(); };
+    return $::quote { $::unquote(parsed) };
+}
+]=])
+accept_splice(declaration_reparse_block "${reparse_declaration_expander}
+syntax Reparse : statement { prefix \"reparse\"; match body:declaration; expand reparse_decl; }
+global u32 entry() { syntax Reparse; reparse register u32 copied = 5u32; return copied; }")
+accept_splice(declaration_public_statement_wrapper [=[
+[[syntax_expander]] static $::meta::tokens inspect_decl(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    $::meta::syntax statement = $::meta::parse("stmt",
+        $::quote { $::unquote(body) }, $::syntax::context(input));
+    if (!$::meta::is_production(statement, "statement") ||
+        !$::meta::is_production($::meta::child(statement, 0uptr), "unattributed_statement") ||
+        !$::meta::is_production(
+            $::meta::child($::meta::child(statement, 0uptr), 0uptr), "declaration"))
+        return $::quote { invalid_declaration(); };
+    return $::quote { $::unquote(statement) };
+}
+syntax Inspect : statement { prefix "inspect"; match body:declaration; expand inspect_decl; }
+global u32 entry() { syntax Inspect; inspect u32 copied = 5u32; return copied; }
+]=])
+accept_splice(declaration_reparse_external "${reparse_declaration_expander}
+syntax Reparse : item { prefix \"reparse\"; match body:declaration; expand reparse_decl; }
+syntax Reparse;
+reparse global u32 copied = 5u32;
+global u32 entry() { return copied; }")
+reject_splice(declaration_external_wrong_category
+    "structured syntax splice requires a declaration node at external position" [=[
+[[syntax_expander]] static $::meta::tokens wrong(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "value")) };
+}
+syntax Wrong : item { prefix "wrong"; match value:expr ";"; expand wrong; }
+syntax Wrong;
+wrong 5u32;
+]=])
+reject_splice(declaration_external_typedef_collision
+    "spliced typedef 'Clash' has a different destination type" [=[
+[[syntax_expander]] static $::meta::tokens collide(in $::meta::syntax_match input) {
+    return $::quote { typedef u16 Clash;
+        $::unquote($::syntax::node(input, "body")) };
+}
+syntax Collide : item { prefix "collide"; match body:declaration; expand collide; }
+syntax Collide;
+collide typedef u32 Clash;
+]=])
+reject_splice(declaration_block_collision
+    "spliced local value 'copied' was declared more than once" [=[
+[[syntax_expander]] static $::meta::tokens collide(in $::meta::syntax_match input) {
+    $::meta::tokens name = $::meta::call_site($::meta::parse("copied"));
+    return $::quote { { u32 $::unquote(name) = 0u32;
+        $::unquote($::syntax::node(input, "body")) } };
+}
+syntax Collide : statement { prefix "collide"; match body:declaration; expand collide; }
+global u32 entry() { syntax Collide; collide u32 copied = 1u32; return 0u32; }
+]=])
+
 set(source [=[
 [[syntax_expander]] static $::meta::tokens wrong(in $::meta::syntax_match input) {
     return $::quote { return $::unquote($::syntax::node(input, "body")); };

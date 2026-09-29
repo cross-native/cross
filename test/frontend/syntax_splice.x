@@ -125,6 +125,33 @@ syntax ShadowType : statement {
 syntax TransplantSpecifier : statement {
     prefix "transplant_specifier"; match name:ident value:type ";"; expand transplant_specifier;
 }
+[[syntax_expander]] static $::meta::tokens copy_declaration(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+syntax CopyDeclaration : statement {
+    prefix "copy_declaration"; match body:declaration; expand copy_declaration;
+}
+syntax CopyExternal : item {
+    prefix "copy_external"; match body:declaration; expand copy_declaration;
+}
+syntax CopyExternal;
+copy_external global u32 external_spliced_value = 17u32;
+copy_external typedef u16 ExternalSplicedType;
+[[syntax_expander]] static $::meta::tokens move_external_declaration(
+    in $::meta::syntax_match input) {
+    return $::quote { namespace Destination {
+        $::unquote($::syntax::node(input, "body"))
+    } };
+}
+syntax MoveExternal : item {
+    prefix "move_external"; match body:declaration; expand move_external_declaration;
+}
+namespace Source {
+    typedef u16 OriginType;
+    namespace Destination { typedef u32 OriginType; }
+    syntax MoveExternal;
+    move_external global OriginType moved;
+}
 [[macro]] static $::meta::tokens declare_spliced(in $::meta::tokens name) {
     return $::quote { u32 $::unquote(name) = 11u32; };
 }
@@ -143,7 +170,12 @@ global u32 syntax_raw_entry() {
     syntax TransplantType;
     syntax ShadowType;
     syntax TransplantSpecifier;
+    syntax CopyDeclaration;
     u32 amount = 4u32;
+    copy_declaration register u32 local_spliced_value = external_spliced_value;
+    copy_declaration typedef u16 LocalSplicedType;
+    LocalSplicedType local_spliced_alias = 6u16;
+    ExternalSplicedType external_spliced_alias = 7u16;
     transplant u32 moved = amount + 1u32;
     transplant typedef u32 MovedType;
     transplant struct SplicedRecord { u32 value; } record = { 7u32 };
@@ -180,7 +212,10 @@ global u32 syntax_raw_entry() {
         macro_moved != 11u32 || inner_moved != 13u32 ||
         typed_value != 7u32 || *pointer_value != amount ||
         array_value[0] + array_value[1] != 7u32 ||
-        record_pointer->field != 12u32 || base_value != 8u16)
+        record_pointer->field != 12u32 || base_value != 8u16 ||
+        local_spliced_value != 17u32 || local_spliced_alias != 6u16 ||
+        external_spliced_alias != 7u16 ||
+        sizeof(Source::Destination::moved) != 2uptr)
         return 0u32;
     return 61u32;
 }

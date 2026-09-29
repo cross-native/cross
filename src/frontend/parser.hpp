@@ -114,6 +114,8 @@ private:
         std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
     bool type_start() const;
     void parse_external(Program& program, const std::string& name_space);
+    void parse_external_declaration_splice(Program& program,
+                                           const std::string& name_space);
     void parse_typedef(const std::string& name_space,
                        std::vector<Attribute> attributes, TypePtr base_type,
                        SourceLocation location, bool consume_semicolon = true);
@@ -234,6 +236,12 @@ private:
         const std::unordered_map<std::string, RecordTag>& prior_records,
         SourceLocation location);
     std::unordered_map<std::string, TypePtr> type_aliases_;
+    struct DeclaredAlias {
+        std::string name;
+        TypePtr type;
+        std::size_t scope_depth{};
+    };
+    std::vector<DeclaredAlias> declared_aliases_;
     std::vector<StaticAssertDecl> static_assertions_;
     FunctionDecl* active_function_{};
     // Own a restored context's function metadata; never retain the original

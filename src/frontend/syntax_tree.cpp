@@ -85,6 +85,14 @@ bool syntax_statement_node(const SyntaxNode& node) {
           node.slot_production == SyntaxProduction::UnattributedStatement));
 }
 
+bool syntax_declaration_node(const SyntaxNode& node) {
+    return (node.kind == SyntaxNode::Kind::Core &&
+            node.production == SyntaxProduction::Declaration) ||
+        (node.kind == SyntaxNode::Kind::Deferred &&
+         node.slot_production == SyntaxProduction::Declaration &&
+         node.deferred_category == SyntaxParseCategory::Declaration);
+}
+
 bool syntax_type_node(const SyntaxNode& node) {
     const auto core_type = node.production == SyntaxProduction::TypeName ||
         node.production == SyntaxProduction::TypeSpecifier ||

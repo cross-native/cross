@@ -584,7 +584,15 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     }
     std::shared_ptr<const SyntaxNode> deferred_root;
     try {
-        if (kind == K::Expr) {
+        if (kind == K::Declaration &&
+            child->current().kind == TokenKind::StructuredSplice) {
+            ProductionScope declaration(*child, SyntaxProduction::Declaration);
+            const auto item = child->current();
+            ++child->index_;
+            if (!item.splice || !syntax_declaration_node(*item.splice)) return {};
+            if (declaration.event < child->production_events_.size())
+                child->production_events_[declaration.event].opaque = item.splice;
+        } else if (kind == K::Expr) {
             (void)child->parse_assignment();
         } else if (kind == K::Type) {
             // A macro may introduce the type specifiers themselves. Its
@@ -610,6 +618,12 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
             if (name) return {};
         } else if (kind == K::Statement) {
             (void)child->parse_statement();
+        } else if (kind == K::Declaration && !child->local_scopes_.empty()) {
+            // The public declaration category has the same root at either
+            // scope, but a block admits register/stack and local typedefs.
+            if (!child->local_declaration_start()) return {};
+            (void)child->parse_local_declaration({}, true,
+                                                 SyntaxProduction::Declaration);
         } else if (kind == K::Declaration || kind == K::FunctionHeader ||
                    kind == K::FunctionDeclaration || kind == K::FunctionDefinition) {
             // These categories exclude namespaces, registration, and invocations
@@ -642,13 +656,18 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         // independently of the unresolved type/generic lookup.
         const auto fragment_end = kind == K::Expr || kind == K::Type
             ? child->fenced_fragment_end(first, kind == K::Expr)
-            : kind == K::Statement ? child->bounded_statement_end(first)
+            : kind == K::Statement || kind == K::Declaration
+                ? child->bounded_statement_end(first)
                                   : std::optional<std::size_t>{};
         if (!fragment_end) return {};
         const auto slot = kind == K::Expr ? SyntaxProduction::AssignmentExpression
-            : kind == K::Type ? SyntaxProduction::TypeName : SyntaxProduction::Statement;
+            : kind == K::Type ? SyntaxProduction::TypeName
+            : kind == K::Declaration ? SyntaxProduction::Declaration
+                                     : SyntaxProduction::Statement;
         const auto category = kind == K::Expr ? SyntaxParseCategory::Expression
-            : kind == K::Type ? SyntaxParseCategory::Type : SyntaxParseCategory::Statement;
+            : kind == K::Type ? SyntaxParseCategory::Type
+            : kind == K::Declaration ? SyntaxParseCategory::Declaration
+                                     : SyntaxParseCategory::Statement;
         deferred_root = child->deferred_node(first, *fragment_end, slot, category,
                                              child->public_fragment_context(first));
         child->index_ = *fragment_end;
@@ -1063,6 +1082,9 @@ void Parser::adopt_replacement(Parser& child) {
         std::make_move_iterator(child.pending_records_.end()));
     record_types_ = std::move(child.record_types_);
     type_aliases_ = std::move(child.type_aliases_);
+    declared_aliases_.insert(declared_aliases_.end(),
+        std::make_move_iterator(child.declared_aliases_.begin()),
+        std::make_move_iterator(child.declared_aliases_.end()));
     switch_default_seen_ = std::move(child.switch_default_seen_);
     for (auto& assertion : child.static_assertions_)
         static_assertions_.push_back(std::move(assertion));
@@ -2653,6 +2675,9 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
         }
     }
 
+    if (replacement_)
+        declared_aliases_.push_back({name, copy_type(type),
+                                     local_type_scopes_.size()});
     auto& aliases = type_aliases_;
     if (!local_type_scopes_.empty()) {
         const NameKey key(name, location);
@@ -2679,6 +2704,88 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
     aliases[std::move(name)] = std::move(type);
 }
 
+void Parser::parse_external_declaration_splice(
+    Program& program, const std::string& name_space) {
+    const auto item = current();
+    ++index_;
+    if (!item.splice || !syntax_declaration_node(*item.splice)) {
+        diagnostics_.error(item.location,
+            "structured syntax splice requires a declaration node at external position");
+        return;
+    }
+    if (!syntax_ || !item.splice->context ||
+        !item.splice->context->parse_environment) {
+        diagnostics_.error(item.location,
+            "structured syntax splice has no retained parse environment");
+        return;
+    }
+    auto output = syntax_->execution()->materialize_node(
+        *item.splice, item.location, SyntaxParseCategory::Declaration);
+    if (!output) return;
+    auto child = replacement_parser(std::move(*output));
+    if (item.splice->kind == SyntaxNode::Kind::Deferred)
+        child->restore_deferred_environment(
+            *item.splice->context->parse_environment,
+            *item.splice->context, item.splice->span.first);
+    else
+        child->restore_environment(*item.splice->context->parse_environment,
+                                   *item.splice->context);
+    const auto prior_records = child->record_types_;
+    const auto previous_errors = diagnostics_.errors();
+    Program parsed;
+    child->parse_external(parsed, name_space);
+    if (child->current().kind != TokenKind::End)
+        child->error_here("structured declaration splice must contain one complete declaration");
+    for (const auto& function : parsed.functions)
+        if (function->body)
+            diagnostics_.error(item.location,
+                "structured declaration splice cannot contain a function definition");
+    if (!parsed.global_labels.empty() || !parsed.static_assertions.empty())
+        diagnostics_.error(item.location,
+            "structured declaration splice must contain a core declaration");
+    for (const auto& alias : child->declared_aliases_) {
+        if (alias.scope_depth != 0) continue;
+        if (const auto found = type_aliases_.find(alias.name);
+            found != type_aliases_.end() && !same_type(found->second, alias.type))
+            diagnostics_.error(item.location,
+                "spliced typedef '" + alias.name + "' has a different destination type");
+    }
+    for (const auto& enumeration : parsed.enumerations)
+        if (const auto found = enum_types_.find(enumeration.name);
+            found != enum_types_.end() && found->second != enumeration.underlying)
+            diagnostics_.error(item.location,
+                "spliced enumeration '" + enumeration.name +
+                "' conflicts with the destination underlying type");
+    if (diagnostics_.errors() != previous_errors ||
+        !transfer_spliced_tags(*child, prior_records, item.location)) return;
+    for (const auto& alias : child->declared_aliases_)
+        if (alias.scope_depth == 0)
+            type_aliases_.try_emplace(alias.name, copy_type(alias.type));
+    for (const auto& function : parsed.functions) {
+        if (function->generic_parameters.empty())
+            known_ordinary_values_.insert(function->name);
+        else known_generic_functions_.insert(function->name);
+    }
+    for (const auto& object : parsed.objects)
+        known_ordinary_values_.insert(object->name);
+    for (const auto& enumeration : parsed.enumerations) {
+        enum_types_[enumeration.name] = enumeration.underlying;
+        for (const auto& enumerator : enumeration.enumerators)
+            known_ordinary_values_.insert(enumerator.name);
+    }
+    const auto append = [](auto& destination, auto& source) {
+        destination.insert(destination.end(),
+            std::make_move_iterator(source.begin()),
+            std::make_move_iterator(source.end()));
+    };
+    append(program.functions, parsed.functions);
+    append(program.objects, parsed.objects);
+    append(program.records, parsed.records);
+    append(program.enumerations, parsed.enumerations);
+    for (auto& assertion : child->static_assertions_)
+        static_assertions_.push_back(std::move(assertion));
+}
+
 void Parser::parse_external(Program& program, const std::string& name_space) {
     drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_
@@ -2690,6 +2797,18 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         expansion_head)) {
         error_here("parsed declaration requires a direct core declaration");
         ++index_;
+        return;
+    }
+    if (current().kind == TokenKind::StructuredSplice) {
+        if (parsing_public_fragment_) {
+            const auto item = current();
+            ++index_;
+            if (!item.splice || !syntax_declaration_node(*item.splice))
+                diagnostics_.error(item.location,
+                    "structured syntax splice requires a declaration node at external position");
+            else if (recording_public_tree_ && production.event < production_events_.size())
+                production_events_[production.event].opaque = item.splice;
+        } else parse_external_declaration_splice(program, name_space);
         return;
     }
     struct NamespaceRestore {
@@ -3697,7 +3816,8 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         auto invalid = std::make_unique<Statement>();
         invalid->kind = Statement::Kind::Empty;
         invalid->location = item.location;
-        if (!item.splice || !syntax_statement_node(*item.splice)) {
+        const bool declaration_node = item.splice && syntax_declaration_node(*item.splice);
+        if (!item.splice || (!syntax_statement_node(*item.splice) && !declaration_node)) {
             diagnostics_.error(item.location,
                 "structured syntax splice requires a statement node at statement position");
             return invalid;
@@ -3715,12 +3835,22 @@ std::unique_ptr<Statement> Parser::parse_statement() {
             if (whole_statement)
                 production_events_[production.event].opaque = item.splice;
             else {
+                std::shared_ptr<const SyntaxNode> child = item.splice;
+                if (declaration_node) {
+                    auto unattributed = std::make_shared<SyntaxNode>();
+                    unattributed->kind = SyntaxNode::Kind::Core;
+                    unattributed->production = SyntaxProduction::UnattributedStatement;
+                    unattributed->span = item.splice->span;
+                    unattributed->context = item.splice->context;
+                    unattributed->children.push_back(child);
+                    child = std::move(unattributed);
+                }
                 auto wrapper = std::make_shared<SyntaxNode>();
                 wrapper->kind = SyntaxNode::Kind::Core;
                 wrapper->production = SyntaxProduction::Statement;
                 wrapper->span = item.splice->span;
                 wrapper->context = item.splice->context;
-                wrapper->children.push_back(item.splice);
+                wrapper->children.push_back(std::move(child));
                 production_events_[production.event].opaque = std::move(wrapper);
             }
         }
@@ -3735,7 +3865,8 @@ std::unique_ptr<Statement> Parser::parse_statement() {
             return invalid;
         }
         auto output = syntax_->execution()->materialize_node(
-            *item.splice, item.location, SyntaxParseCategory::Statement);
+            *item.splice, item.location, declaration_node
+                ? SyntaxParseCategory::Declaration : SyntaxParseCategory::Statement);
         if (!output) return invalid;
         auto child = replacement_parser(std::move(*output));
         if (item.splice->kind == SyntaxNode::Kind::Deferred)

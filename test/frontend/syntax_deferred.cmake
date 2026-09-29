@@ -113,6 +113,14 @@ string(REPLACE "if ($::unquote(value) != 5uptr) return 0u32;"
     "$::unquote(value)\n        if ($::unquote($::meta::call_site($::quote { object })) != 5uptr) return 0u32;"
     deferred_statement_source "${deferred_statement_source}")
 accept(deferred_statement_original_block "${deferred_statement_source}")
+string(REPLACE "match value:expr \";\"" "match value:declaration"
+    deferred_declaration_source "${deferred_expression_source}")
+string(REPLACE "inner (Later)5uptr;" "inner Later object = 5uptr;"
+    deferred_declaration_source "${deferred_declaration_source}")
+string(REPLACE "if ($::unquote(value) != 5uptr) return 0u32;"
+    "$::unquote(value)\n        if ($::unquote($::meta::call_site($::quote { object })) != 5uptr) return 0u32;"
+    deferred_declaration_source "${deferred_declaration_source}")
+accept(deferred_declaration_original_block "${deferred_declaration_source}")
 function(as_deferred_statement_alias result source)
     string(REPLACE "match value:expr \";\"" "match value:stmt" statement_source "${source}")
     string(REPLACE "inner (Later)5uptr;" "inner typedef Later Composed;"
