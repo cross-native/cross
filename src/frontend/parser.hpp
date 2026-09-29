@@ -48,8 +48,9 @@ private:
                                       const SyntaxContext& context,
                                       SourceLocation original_position);
     const Token& current(std::size_t lookahead = 0) const;
+    const Token& current(std::size_t lookahead = 0);
     bool consume(std::string_view spelling);
-    const Token* consume_kind(TokenKind kind);
+    std::optional<Token> consume_kind(TokenKind kind);
     bool expect(std::string_view spelling, std::string_view context = {});
     void error_here(std::string message);
     void synchronize_external();
@@ -208,8 +209,8 @@ private:
     unsigned address_bits_{};
     std::size_t index_{};
     std::optional<SyntaxState> syntax_;
+    unsigned raw_token_depth_{};
     bool replacement_{};
-    bool deferred_statement_semicolon_{};
     std::vector<std::string> active_imports_;
     std::size_t current_scope_imports_{};
     std::vector<std::string> active_generic_types_;

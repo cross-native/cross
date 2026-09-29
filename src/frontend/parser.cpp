@@ -153,15 +153,26 @@ const Token& Parser::current(std::size_t lookahead) const {
     return tokens_[position < tokens_.size() ? position : tokens_.size() - 1];
 }
 
+const Token& Parser::current(std::size_t lookahead) {
+    // Procedural macros replace tokens, not grammar subtrees. Only expose
+    // expanded tokens when the core parser reaches them; raw captures and
+    // speculative public-tree recognition must keep their input opaque.
+    if (!raw_token_depth_ && !parsing_public_fragment_ && !public_tree_failed_)
+        expand_inline_macro_fragments();
+    return std::as_const(*this).current(lookahead);
+}
+
 bool Parser::consume(std::string_view spelling) {
     if (!current().is(spelling)) return false;
     ++index_;
     return true;
 }
 
-const Token* Parser::consume_kind(TokenKind kind) {
-    if (current().kind != kind) return nullptr;
-    return &tokens_[index_++];
+std::optional<Token> Parser::consume_kind(TokenKind kind) {
+    if (current().kind != kind) return {};
+    // Later token expansion may reallocate the cursor's vector. Consumers
+    // retain a value, never a pointer into that mutable sequence.
+    return tokens_[index_++];
 }
 
 bool Parser::expect(std::string_view spelling, std::string_view context) {
@@ -352,6 +363,12 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
 }
 
 void Parser::expand_inline_macro_fragments() {
+    if (raw_token_depth_) return;
+    struct RawTokens {
+        unsigned& depth;
+        explicit RawTokens(unsigned& value) : depth(value) { ++depth; }
+        ~RawTokens() { --depth; }
+    } raw{raw_token_depth_};
     while (syntax_ && macro_start()) {
         // Captures only recognize syntax; they cannot execute a nested macro
         // to discover a declarator's shape or its bound names.
@@ -370,11 +387,15 @@ void Parser::expand_inline_macro_fragments() {
         if (!output) return;
         if (output->tokens.empty() || output->tokens.back().kind != TokenKind::End) {
             diagnostics_.error(output->location,
-                "procedural declarator macro produced no token boundary");
+                "procedural macro produced no token boundary");
             return;
         }
-        output->tokens.pop_back();
         const auto after = index_;
+        // Keep end-of-fragment errors on the innermost generating macro,
+        // while preserving the caller's actual End boundary.
+        if (after < tokens_.size() && tokens_[after].kind == TokenKind::End)
+            tokens_[after].location = output->tokens.back().location;
+        output->tokens.pop_back();
         tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
                       tokens_.begin() + static_cast<std::ptrdiff_t>(after));
         tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
@@ -1234,8 +1255,7 @@ bool Parser::transfer_spliced_tags(
 
 std::unique_ptr<Statement> Parser::parse_statement_replacement() {
     const auto location = current().location;
-    const bool macro = macro_start();
-    const auto* owner = macro ? nullptr : active_syntax(false);
+    const auto* owner = active_syntax(false);
     auto result = std::make_unique<Statement>();
     result->kind = Statement::Kind::Empty;
     result->location = location;
@@ -1250,45 +1270,14 @@ std::unique_ptr<Statement> Parser::parse_statement_replacement() {
     auto output = expand_at_position(false);
     if (!output) return result;
     auto child = replacement_parser(std::move(*output));
-    // A macro at statement start may produce an expression whose semicolon
-    // belongs to the caller. Custom statement syntax always owns a complete
-    // statement; neither path can borrow an outside else or adjacent tokens.
-    bool expression_macro = macro && child->current().kind != TokenKind::End &&
-        !child->current().is("{") && !child->local_declaration_start();
-    for (const auto keyword : {"return", "goto", "if", "switch", "while", "do", "for",
-                               "break", "continue", "case", "default", "label", ";", "[["})
-        if (child->current().is(keyword)) expression_macro = false;
-    if (child->macro_start()) expression_macro = false;
-    if (const auto* selected = child->active_syntax(false); selected && selected->kind == SyntaxKind::Statement)
-        expression_macro = false;
-    unsigned group_depth = 0;
-    for (const auto& token : child->tokens_) {
-        if (token.is("(") || token.is("[") || token.is("[[") || token.is("{")) ++group_depth;
-        else if ((token.is(")") || token.is("]") || token.is("]]") || token.is("}")) && group_depth) --group_depth;
-        else if (token.is(";") && group_depth == 0) expression_macro = false;
-    }
-    if (expression_macro) {
-        result->kind = Statement::Kind::Expression;
-        auto grouped = std::make_unique<Expr>();
-        grouped->kind = Expr::Kind::Parenthesized;
-        grouped->location = location;
-        grouped->left = child->parse_assignment();
-        result->expression = std::move(grouped);
-    } else if (child->current().kind == TokenKind::End) {
+    // Only custom statement owners use this bounded parser. Procedural
+    // token macros are exposed directly in the caller's token stream.
+    if (child->current().kind == TokenKind::End) {
         diagnostics_.error(location, "statement expansion must produce exactly one complete statement");
     } else result = child->parse_statement();
     if (child->current().kind != TokenKind::End)
         child->error_here("statement expansion must produce exactly one complete statement");
-    const bool needs_semicolon = expression_macro || child->deferred_statement_semicolon_;
     adopt_replacement(*child);
-    if (needs_semicolon) {
-        if (!macro) diagnostics_.error(location, "statement expansion must produce exactly one complete statement");
-        else {
-            result->expression = parse_expression(std::move(result->expression));
-            if (current().kind == TokenKind::End && replacement_) deferred_statement_semicolon_ = true;
-            else expect(";", "after procedural expression statement");
-        }
-    }
     return result;
 }
 
@@ -1298,7 +1287,7 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
     result->kind = Expr::Kind::Integer;
     result->text = "0";
     result->location = location;
-    const auto* owner = macro_start() ? nullptr : active_syntax(false);
+    const auto* owner = active_syntax(false);
     if (owner && owner->kind != SyntaxKind::Expression) {
         error_here("statement syntax is not valid at expression position");
         ++index_;
@@ -1345,7 +1334,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier, AttributePar
                 break;
             }
             const auto name_event = begin_production(SyntaxProduction::AttributeName);
-            const auto* first = consume_kind(TokenKind::Identifier);
+            const auto first = consume_kind(TokenKind::Identifier);
             if (!first) {
                 end_production(name_event);
                 error_here("expected attribute name");
@@ -1354,7 +1343,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier, AttributePar
             }
             std::string name(first->text);
             while (consume("::")) {
-                const auto* component = consume_kind(TokenKind::Identifier);
+                const auto component = consume_kind(TokenKind::Identifier);
                 if (!component) {
                     error_here("expected attribute-name component after '::'");
                     break;
@@ -1579,12 +1568,12 @@ void Parser::apply_type_attribute(
 std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction production_name) {
     if (current().kind != TokenKind::Identifier) return std::nullopt;
     ProductionScope production(*this, production_name);
-    const auto* first = consume_kind(TokenKind::Identifier);
+    const auto first = consume_kind(TokenKind::Identifier);
     if (!first) return std::nullopt;
     std::string name = identifier_binding_name(*first);
     while (current().is("::") && current(1).kind == TokenKind::Identifier) {
         consume("::");
-        const auto* component = consume_kind(TokenKind::Identifier);
+        const auto component = consume_kind(TokenKind::Identifier);
         if (!component) {
             error_here("expected identifier after '::'");
             break;
@@ -1731,34 +1720,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
         ProductionScope builtin(*this, current().kind == TokenKind::BuiltinName
                                            ? SyntaxProduction::BuiltinName
                                            : SyntaxProduction::None);
-        if (syntax_ && macro_start()) {
-            const auto location = current().location;
-            type = builtin_type(BuiltinType::I32, is_const, is_volatile);
-            if (parsing_public_fragment_) throw DeferredNameRecognition{};
-            auto execution = syntax_->execution();
-            if (execution->begin_replacement(location)) {
-                struct End {
-                    SyntaxExecution& execution;
-                    ~End() { execution.end_replacement(); }
-                } end{*execution};
-                auto output = expand_at_position(false);
-                if (output) {
-                    auto child = replacement_parser(std::move(*output));
-                    const auto previous_errors = diagnostics_.errors();
-                    auto parsed = child->parse_type();
-                    std::optional<std::string> declarator_name;
-                    if (parsed) parsed = child->parse_declarator(std::move(parsed), declarator_name);
-                    if (declarator_name)
-                        child->error_here("procedural type macro cannot declare a name");
-                    if (child->current().kind != TokenKind::End)
-                        child->error_here("procedural type macro must produce one complete type");
-                    if (diagnostics_.errors() == previous_errors && parsed) {
-                        adopt_replacement(*child);
-                        type = std::move(parsed);
-                    }
-                }
-            } else ++index_;
-        } else if (current().kind == TokenKind::StructuredSplice) {
+        if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
+        if (current().kind == TokenKind::StructuredSplice) {
             const auto item = current();
             ++index_;
             type = builtin_type(BuiltinType::I32, is_const, is_volatile);
@@ -2126,6 +2089,16 @@ std::vector<std::string> Parser::preview_generic_types() {
         }
     };
     for (auto cursor = index_; cursor < tokens_.size(); ++cursor) {
+        if (!parsing_public_fragment_ && syntax_) {
+            // A trailing token macro can introduce a generic attribute that
+            // scopes over the earlier result type. Expose only this header
+            // cursor: groups (including raw owner inputs) and bodies remain
+            // untouched by lookahead.
+            const auto saved = index_;
+            index_ = cursor;
+            expand_inline_macro_fragments();
+            index_ = saved;
+        }
         if (!work(cursor)) break;
         if (tokens_[cursor].kind == TokenKind::End || tokens_[cursor].is(";") ||
             tokens_[cursor].is("{") || tokens_[cursor].is("=") ||
@@ -2211,7 +2184,7 @@ Parser::parse_angle_generic_parameters() {
                     value_type = parse_declarator(std::move(value_type), name, false,
                                                   nullptr, nullptr, nullptr, true);
             }
-            if (const auto* token = consume_kind(TokenKind::Identifier))
+            if (const auto token = consume_kind(TokenKind::Identifier))
                 name = identifier_binding_name(*token);
             if (value_type && !is_integer(value_type) &&
                 value_type->kind != Type::Kind::Pointer &&
@@ -2424,7 +2397,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         if (current().is("->")) {
             ProductionScope result_location(*this, SyntaxProduction::ResultLocation);
             consume("->");
-            const auto* location_token = consume_kind(TokenKind::String);
+            const auto location_token = consume_kind(TokenKind::String);
             if (!location_token) {
                 error_here("expected result location string after '->'");
             } else {
@@ -3074,6 +3047,13 @@ void Parser::parse_function_header_splice(
 }
 
 void Parser::parse_external(Program& program, const std::string& name_space) {
+    struct NamespaceRestore {
+        std::string& value;
+        std::string previous;
+        ~NamespaceRestore() { value = std::move(previous); }
+    } restore{active_namespace_, active_namespace_};
+    active_namespace_ = name_space;
+    (void)current();
     drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_
         ? SyntaxProduction::Declaration : SyntaxProduction::None);
@@ -3103,27 +3083,21 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         } else parse_external_node_splice(program, name_space);
         return;
     }
-    struct NamespaceRestore {
-        std::string& value;
-        std::string previous;
-        ~NamespaceRestore() { value = std::move(previous); }
-    } restore{active_namespace_, active_namespace_};
-    active_namespace_ = name_space;
     if (syntax_ && expansion_head) {
-        if (replacement_) error_here("expansion output cannot introduce syntax registration");
+        const bool generated = replacement_ || token_origin(current().location).context;
+        if (generated) error_here("expansion output cannot introduce syntax registration");
         else {
             const auto context = syntax_context(current().location);
             if (context) (void)syntax_->execution()->define_function(tokens_, index_, active_namespace_,
                 active_imports_, syntax_->bindings(), context->parse_environment);
             else { ++index_; synchronize_external(); }
         }
-        if (replacement_) { ++index_; synchronize_external(); }
+        if (generated) { ++index_; synchronize_external(); }
         return;
     }
     if (parse_syntax_registration(&program)) return;
-    const bool external_macro = syntax_ && macro_start();
-    const auto* external_owner = syntax_ && !external_macro ? active_syntax(true) : nullptr;
-    if (syntax_ && (external_macro || external_owner)) {
+    const auto* external_owner = active_syntax(true);
+    if (external_owner) {
         const auto location = current().location;
         auto execution = syntax_->execution();
         if (!execution->begin_replacement(location)) {
@@ -3165,6 +3139,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         const auto saved_scope_imports = current_scope_imports_;
         current_scope_imports_ = 0;
         if (syntax_) syntax_->push_scope();
+        active_namespace_ = full;
         while (!current().is("}") && current().kind != TokenKind::End) {
             const auto before = index_;
             parse_external(program, full);
@@ -3494,7 +3469,7 @@ void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_sp
     if (!consume("{")) return;
     while (!current().is("}") && current().kind != TokenKind::End) {
         ProductionScope entry(*this, SyntaxProduction::Enumerator);
-        const auto* token = consume_kind(TokenKind::Identifier);
+        const auto token = consume_kind(TokenKind::Identifier);
         if (!token) {
             error_here("expected enumerator name");
             while (!current().is(",") && !current().is("}") &&
@@ -3627,7 +3602,7 @@ bool Parser::parse_static_assertion() {
     expect("(");
     auto condition = parse_constant_expression();
     expect(",");
-    const auto* message_token = consume_kind(TokenKind::String);
+    const auto message_token = consume_kind(TokenKind::String);
     if (!message_token) error_here("expected diagnostic string in $::static_assert");
     expect(")");
     expect(";");
@@ -3704,7 +3679,7 @@ ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     apply_callable_attributes(parameter.type, attributes);
     if (current().kind == TokenKind::String) {
         ProductionScope location_production(*this, SyntaxProduction::Location);
-        const auto* location = consume_kind(TokenKind::String);
+        const auto location = consume_kind(TokenKind::String);
         parameter.location_name = decode_string_literal(location->text);
         if (!parameter.location_name) diagnostics_.error(location->location, "invalid location string");
     }
@@ -3757,7 +3732,7 @@ Parser::parse_function(SourceLocation location, std::string name,
         expect(")");
     }
     if (consume("->")) {
-        const auto* location_token = consume_kind(TokenKind::String);
+        const auto location_token = consume_kind(TokenKind::String);
         if (!location_token)
             error_here("expected result location string after '->'");
         else {
@@ -3940,7 +3915,7 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         }
         if (current().kind == TokenKind::String) {
             ProductionScope location_production(*this, SyntaxProduction::ObjectLocation);
-            const auto* location_token = consume_kind(TokenKind::String);
+            const auto location_token = consume_kind(TokenKind::String);
             declaration.location_name = decode_string_literal(location_token->text);
             if (!declaration.location_name)
                 diagnostics_.error(location_token->location, "invalid location string");
@@ -4363,7 +4338,6 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         } else mark_public_binding_uncertainty();
         return placeholder;
     }
-    if (syntax_ && macro_start()) return parse_statement_replacement();
     if (const auto* definition = active_syntax(false)) {
         if (definition->kind == SyntaxKind::Statement) {
             if (!parsing_public_fragment_) return parse_statement_replacement();
@@ -4566,7 +4540,7 @@ std::unique_ptr<Statement> Parser::parse_global_label_statement(
     statement->attributes = std::move(attributes);
     consume("global");
     consume("label");
-    const auto* name = consume_kind(TokenKind::Identifier);
+    const auto name = consume_kind(TokenKind::Identifier);
     if (!name) {
         error_here("expected label name after 'global label'");
     } else {
@@ -4622,7 +4596,7 @@ std::unique_ptr<Expr> Parser::parse_initializer() {
                 designator.location = current().location;
                 if (consume(".")) {
                     designator.kind = Expr::InitializerDesignator::Kind::Member;
-                    const auto* member = consume_kind(TokenKind::Identifier);
+                    const auto member = consume_kind(TokenKind::Identifier);
                     if (!member) error_here("expected member name after '.' in initializer");
                     else designator.member = identifier_binding_name(*member);
                 } else {
@@ -4695,6 +4669,9 @@ std::unique_ptr<Expr> Parser::parse_binary(int minimum_precedence, std::unique_p
         ? (seed ? parse_postfix(std::move(seed)) : parse_cast())
         : parse_binary(minimum_precedence + 1, std::move(seed));
     for (;;) {
+        // A token macro between operands may supply any operator or suffix.
+        // Recognition cannot choose its precedence before the owner runs.
+        if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
         if (parsing_generic_argument_ &&
             (current().is(">") || current().is(">>"))) break;
         const int current_precedence = precedence(current().text);
@@ -4718,6 +4695,8 @@ std::unique_ptr<Expr> Parser::parse_cast() {
     if (current().is("(")) {
         const auto saved = index_;
         ++index_;
+        (void)current();
+        if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
         const bool begins_type = type_start();
         index_ = saved;
         if (begins_type) {
@@ -4757,6 +4736,8 @@ std::unique_ptr<Expr> Parser::parse_unary() {
         if (current().is("(")) {
             const auto saved = index_;
             ++index_;
+            (void)current();
+            if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
             const bool begins_type = type_start();
             index_ = saved;
             if (begins_type) {
@@ -4812,6 +4793,8 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                     {
                         ProductionScope generic_argument(*this, SyntaxProduction::GenericArgument);
                         Expr::GenericArgument argument;
+                        (void)current();
+                        if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
                         if (type_start()) {
                             ProductionScope type_name(*this, SyntaxProduction::TypeName);
                             argument.type = parse_type();
@@ -4872,7 +4855,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
         if (current().is(".") || current().is("->")) {
             const bool through_pointer = consume("->");
             if (!through_pointer) consume(".");
-            const auto* member_name = consume_kind(TokenKind::Identifier);
+            const auto member_name = consume_kind(TokenKind::Identifier);
             if (!member_name) {
                 error_here("expected member name after '" +
                            std::string(through_pointer ? "->" : ".") + "'");
@@ -4925,6 +4908,11 @@ std::unique_ptr<Statement> Parser::parse_procedural_body(FunctionDecl& function)
 }
 
 std::unique_ptr<Expr> Parser::parse_quote() {
+    struct RawTokens {
+        unsigned& depth;
+        explicit RawTokens(unsigned& value) : depth(value) { ++depth; }
+        ~RawTokens() { --depth; }
+    } raw{raw_token_depth_};
     ProductionScope quote(*this, SyntaxProduction::QuoteExpression);
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::Quote;
@@ -5070,7 +5058,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         result->left->kind = Expr::Kind::Name;
         result->left->location = item.location;
         result->left->text = std::string(item.text);
-        const auto* path = consume_kind(TokenKind::String);
+        const auto path = consume_kind(TokenKind::String);
         if (!path) {
             error_here("$::embed requires one string-literal path");
         } else {

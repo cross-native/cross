@@ -319,7 +319,7 @@ reject(expression_output "without a semicolon"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { 1u32; }; } ${definition}syntax Value; global u32 entry() { return value (); }\n")
 reject(statement_output "exactly one complete statement"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { ; ; }; } syntax Stmt : statement { prefix \"stmt\"; match body:block; expand expand; } syntax Stmt; global u32 entry() { stmt {} return 1u32; }\n")
-reject(nested_semicolon "exactly one complete statement"
+reject(nested_semicolon "expected ';'"
     "[[macro]] static $::meta::tokens expr(in $::meta::tokens input) { return $::quote { 1u32 }; } [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { expr!() }; } syntax Stmt : statement { prefix \"stmt\"; match body:block; expand expand; } syntax Stmt; global u32 entry() { stmt {}; return 1u32; }\n")
 reject(adjacent "expected ';'"
     "[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) { return $::quote { return 1u32 }; } syntax Stmt : statement { prefix \"stmt\"; match body:block; expand expand; } syntax Stmt; global u32 entry() { stmt {}; }\n")

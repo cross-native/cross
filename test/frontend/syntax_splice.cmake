@@ -74,6 +74,50 @@ global u32 function(in u32 value, parameters!());")
     reject_splice(parameter_unnamed_variadic_${mode} "requires at least one named parameter"
         "${parameter_prefix}
 global u32 function(parameters!(...));")
+    accept_splice(token_macro_statements_${mode} "${parameter_prefix}
+global u32 entry() {
+    u32 value = 1u32;
+    parameters!(value += 2u32; value += 3u32;)
+    parameters!()
+    return value;
+}")
+    accept_splice(token_macro_precedence_${mode} "${parameter_prefix}
+static u32 precedence() { return parameters!(1u32 + 2u32) * 3u32; }
+$::static_assert(precedence() == 7u32, \"token macro was implicitly grouped\");
+static u32 operators() { return 1u32 parameters!(+) 2u32 parameters!(*) 3u32; }
+$::static_assert(operators() == 7u32, \"operator fragments were not spliced\");")
+    accept_splice(token_macro_type_parts_${mode} "${parameter_prefix}
+static u32 value = 3u32;
+parameters!(global u32 *) pointer = &value, scalar = 4u32;
+$::static_assert(sizeof(scalar) == sizeof(u32), \"token type macro was treated as an alias\");
+static parameters!(const) u32 qualifier = 5u32;
+global u32 entry() { return *pointer + scalar + qualifier; }")
+    accept_splice(token_macro_type_lookahead_${mode} "${parameter_prefix}
+static T identity<T>(in T value) { return value; }
+global u32 entry() {
+    return (parameters!(u32))4u16 + sizeof(parameters!(u16)) + identity<parameters!(u32)>(5u32);
+}")
+    accept_splice(token_macro_lists_${mode} "${parameter_prefix}
+static u32 sum(in u32 a, in u32 b) { return a + b; }
+static u32 lists() {
+    u32 array[] = { parameters!(2u32, 3u32) };
+    return sum(parameters!(array[0], array[1]));
+}
+$::static_assert(lists() == 5u32, \"token list fragments did not compose\");")
+    accept_splice(token_macro_header_attribute_${mode} "${parameter_prefix}
+static T identity(in T value) parameters!([[generic(T)]]) { return value; }
+global u32 entry() { return identity(5u32); }")
+    accept_splice(token_macro_owner_first_${mode} "${parameter_prefix}
+[[macro]] static $::meta::tokens discard(in $::meta::tokens input) { return $::quote {}; }
+discard! { [[macro]] invalid declaration; unknown!{ not Cross } }
+global u32 entry() { return 1u32; }")
+    reject_splice(token_macro_cycle_${mode} "expansion depth or invocation budget exceeded"
+        "${parameter_prefix}
+[[macro]] static $::meta::tokens recur(in $::meta::tokens input) { return $::quote { recur!() }; }
+global u32 entry() { return recur!(); }")
+    reject_splice(token_macro_registration_${mode} "cannot introduce syntax registration"
+        "${parameter_prefix}
+parameters!([[macro]] static $::meta::tokens introduced(in $::meta::tokens input) { return input; })")
 endforeach()
 
 set(declaration_expander [=[

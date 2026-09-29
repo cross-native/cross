@@ -666,9 +666,10 @@ std::optional<ExpansionFunctionSource> parse_expansion_function(
     bounded.push_back({TokenKind::End, {}, tokens[end < tokens.size() ? end : tokens.size() - 1].location});
     index = end;
     std::vector<Replacement> removals;
+    const auto errors_before = diagnostics.errors();
     auto functions = collect_macros(bounded, removals, diagnostics,
                                     address_bits, true);
-    if (functions.size() != 1 || diagnostics.errors() != 0) return {};
+    if (functions.size() != 1 || diagnostics.errors() != errors_before) return {};
     return ExpansionFunctionSource{std::move(functions.front().function), functions.front().syntax_expander};
 }
 

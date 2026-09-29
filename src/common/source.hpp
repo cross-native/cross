@@ -142,7 +142,7 @@ struct SourceTokenOrigin {
 TokenOrigin token_origin(SourceLocation location);
 
 struct SourceExpansion {
-    enum class Kind { ProceduralMacro, SyntaxExtension };
+    enum class Kind { ProceduralMacro, SyntaxExtension, FragmentParse, StructuredSplice };
     std::size_t begin{};
     std::size_t end{};
     std::string macro_name;

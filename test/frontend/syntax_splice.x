@@ -320,6 +320,13 @@ copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 v
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
+    u32 textual_precedence = parameter_list_fragment!(1u32 + 2u32) * 3u32;
+    u32 textual_value = 1u32;
+    parameter_list_fragment!(textual_value += 2u32; textual_value += 3u32;)
+    parameter_list_fragment!()
+    u32 textual_operator = 1u32 parameter_list_fragment!(+) 2u32;
+    if (textual_precedence != 7u32 || textual_value != 6u32 || textual_operator != 3u32)
+        return 0u32;
 #if $::has_feature($::feature::variadics)
     if (dispatch_variadic(&variadic_parameter_function, 8u32) != 13u32) return 0u32;
 #endif
@@ -341,6 +348,8 @@ global u32 syntax_raw_entry() {
     syntax TransplantSpecifier;
     syntax CopyDeclaration;
     u32 amount = 4u32;
+    if (multiplied(amount parameter_list_fragment!(+) 2u32) != 18u32)
+        return 0u32;
     u32 declarator_name!(named_by_macro) = 5u32;
     u32 declarator_pointer!(pointer_by_macro) = &amount;
     u32 array_by_macro declarator_array!() = { 2u32, 3u32 };

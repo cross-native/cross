@@ -92,6 +92,27 @@ global u32 entry() {
 }
 ]=])
 accept(deferred_expression_splice "${deferred_expression_source}")
+string(REPLACE "typedef uptr $::unquote(input);"
+    "typedef uptr $::unquote(input); u32 additional = 0u32;"
+    deferred_multiple_items_source "${deferred_expression_source}")
+reject_expansion(structured_macro_multiple_items "structured statement splice must contain one complete statement"
+    "${deferred_multiple_items_source}")
+string(REPLACE "$::unquote($::meta::child(block, 1uptr))"
+    "$::unquote($::meta::tokens($::meta::child(block, 1uptr)))"
+    deferred_multiple_items_source "${deferred_multiple_items_source}")
+accept(deferred_expression_after_textual_items "${deferred_multiple_items_source}")
+accept(discard_expression_operator_macro [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    if (!$::meta::is_kind($::syntax::node(input, "value"), "deferred"))
+        $::syntax::error($::syntax::span(input), "operator fragment was not deferred");
+    return $::quote { 7u32 };
+}
+syntax Discard : expression {
+    prefix "discard"; match "(" value:expr ")"; expand discard;
+}
+syntax Discard;
+global u32 entry() { return discard(1u32 unknown!(+) 2u32); }
+]=])
 function(as_deferred_type result source)
     string(REPLACE "match value:expr" "match value:type" type_source "${source}")
     string(REPLACE "inner (Later)5uptr;" "inner Later;" type_source "${type_source}")
@@ -327,9 +348,9 @@ reject(incomplete_statement "syntax-match error for active prefix"
 reject(copied_assertion "static_assert failed: copied assertion must execute"
     "${copy} syntax Copy : statement { prefix \"copied\"; match body:stmt; expand copy; } static T checked<T>(in T value) { syntax Copy; copied { $::static_assert(0u32, \"copied assertion must execute\"); } return value; } global u32 entry() { return checked(1u32); }")
 set(type_macro_owner "[[syntax_expander]] static $::meta::tokens copy_type(in $::meta::syntax_match input) { return $::quote { typedef $::unquote($::syntax::node(input, \"value\")) Alias; }; } syntax CopyType : statement { prefix \"copy_type\"; match value:type \";\"; expand copy_type; }")
-reject_expansion(type_macro_name "procedural type macro cannot declare a name"
+reject_expansion(type_macro_name "structured type splice cannot declare a name"
     "[[macro]] static $::meta::tokens bad_type(in $::meta::tokens input) { return $::quote { u16 named }; } ${type_macro_owner} global u32 entry() { syntax CopyType; copy_type bad_type!(); return 0u32; }")
-reject_expansion(type_macro_extra "procedural type macro must produce one complete type"
+reject_expansion(type_macro_extra "structured type splice must contain one complete type"
     "[[macro]] static $::meta::tokens bad_type(in $::meta::tokens input) { return $::quote { u16 ; u32 }; } ${type_macro_owner} global u32 entry() { syntax CopyType; copy_type bad_type!(); return 0u32; }")
 foreach(depth 1 2 3)
     reject(deferred_depth_${depth} "depth|syntax-match error for active prefix"

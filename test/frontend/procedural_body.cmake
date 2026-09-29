@@ -30,6 +30,6 @@ execute_process(
     ERROR_VARIABLE error_stderr
 )
 if(error_status EQUAL 0 OR
-   NOT error_stderr MATCHES "did not return a token value")
+   NOT error_stderr MATCHES "did not produce a value")
     message(FATAL_ERROR "missing macro return was not diagnosed\n${error_stdout}\n${error_stderr}")
 endif()

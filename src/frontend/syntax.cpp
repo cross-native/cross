@@ -316,7 +316,21 @@ bool SyntaxExecution::work(SourceLocation location, std::uint64_t amount) {
 }
 
 bool SyntaxExecution::begin_replacement(SourceLocation location) {
-    if (depth_ >= limits_.depth || expansions_ >= 128) {
+    // Textual macro output is parsed by the caller's token cursor, so its
+    // generating expansion may no longer occupy the C++ call stack. Retain
+    // the same nesting limit through typed source ancestry, excluding public
+    // fragment parsing/materialization wrappers.
+    unsigned ancestry{};
+    for (auto at = location; at.file;) {
+        const auto* expansion = at.file->expansion_at(at.offset);
+        if (!expansion) break;
+        if (!work(location)) return false;
+        if (expansion->kind == SourceExpansion::Kind::ProceduralMacro ||
+            expansion->kind == SourceExpansion::Kind::SyntaxExtension) ++ancestry;
+        if (ancestry >= limits_.depth) break;
+        at = expansion->invocation;
+    }
+    if (std::max(depth_, ancestry) >= limits_.depth || expansions_ >= 128) {
         diagnostics_.error(location, "syntax/procedural expansion depth or invocation budget exceeded");
         return false;
     }
@@ -491,7 +505,8 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
     }
     const auto size = text.size();
     const auto* source = sources_.add("<meta::parse>", std::move(text),
-        {{0, size, "$::meta::parse", location, context->definition}}, std::move(origins));
+        {{0, size, "$::meta::parse", location, context->definition,
+          SourceExpansion::Kind::FragmentParse}}, std::move(origins));
     auto tokens = Lexer(*source, diagnostics_).lex();
     if (tokens.size() != input.size() + 1) return {};
     for (std::size_t at = 0; at < input.size(); ++at) {
@@ -551,7 +566,8 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
     std::vector<std::string> units(
         static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) + 1, unit);
     const auto* source = sources_.add("<syntax-splice>", std::move(text),
-        {{0, end, "$::unquote", location, node.span.first}}, std::move(origins),
+        {{0, end, "$::unquote", location, node.span.first,
+          SourceExpansion::Kind::StructuredSplice}}, std::move(origins),
         {}, std::move(units));
     auto tokens = Lexer(*source, diagnostics_).lex();
     if (tokens.size() != fragments.size() + 1) {

@@ -821,27 +821,23 @@ int cc_main(int argc, char** argv) {
     }
     for (const auto* preprocessed_source : compilation_units) {
         auto tokens = Lexer(*preprocessed_source, diagnostics).lex();
-        bool uses_syntax = false;
-        for (std::size_t at = 0; at < tokens.size(); ++at) {
-            if (tokens[at].is("syntax")) { uses_syntax = true; break; }
-            const auto head = expansion_function_head(tokens, at);
-            if (head && head->syntax_expander) { uses_syntax = true; break; }
-        }
+        // One expansion path for every source unit. An unused syntax
+        // declaration cannot change procedural token-splice semantics.
+        // Parser-driven exposure keeps nested raw input behind its owner.
+        if (!validate_embeds(*preprocessed_source, diagnostics)) return 1;
         std::shared_ptr<SyntaxExecution> execution;
-        if (uses_syntax) {
-            // Owner expansion must precede macros nested in raw captures.
-            // Registration and replacement therefore run at parser positions.
-            if (!validate_embeds(*preprocessed_source, diagnostics)) return 1;
+        for (std::size_t at = 0; at < tokens.size(); ++at) {
+            const bool invocation = at + 2 < tokens.size() &&
+                tokens[at].kind == TokenKind::Identifier && tokens[at + 1].is("!") &&
+                (tokens[at + 2].is("(") || tokens[at + 2].is("[") || tokens[at + 2].is("{"));
+            if (!tokens[at].is("syntax") && !invocation &&
+                !expansion_function_head(tokens, at)) continue;
+            // Ordinary units need no expansion environment or meta budget.
+            // This scan only enables the engine; it registers nothing.
             execution = std::make_shared<SyntaxExecution>(sources, diagnostics,
                 program.address_bits, macro_size, macro_align,
                 program.evaluation_limits, program.evaluation_layout);
-        } else {
-            const auto* source = expand_procedural_macros(
-                sources, *preprocessed_source, diagnostics,
-                program.address_bits, macro_size, macro_align,
-                program.evaluation_limits, program.evaluation_layout);
-            if (diagnostics.errors() != 0 || !validate_embeds(*source, diagnostics)) return 1;
-            tokens = Lexer(*source, diagnostics).lex();
+            break;
         }
         if (diagnostics.errors() != 0) return 1;
         Parser parser(std::move(tokens), diagnostics, std::move(execution),
