@@ -60,6 +60,7 @@ private:
     bool macro_start() const;
     std::optional<SyntaxExecution::Output> expand_at_position(bool item);
     void expand_inline_macro_fragments();
+    void normalize_qualified_name();
     bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
                                          std::string_view name_space,
                                          const std::vector<std::string>& imports) const;
@@ -94,6 +95,7 @@ private:
             pending_address_space = nullptr);
     std::optional<std::string> parse_qualified_name(
         SyntaxProduction production = SyntaxProduction::QualifiedName);
+    std::string peek_qualified_name();
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
     TypePtr parse_type(bool record_specifiers = true,
@@ -116,7 +118,7 @@ private:
     TypePtr parse_array_suffix(
         TypePtr element, bool parameter = false,
         std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
-    bool type_start() const;
+    bool type_start();
     void parse_external(Program& program, const std::string& name_space);
     void parse_external_node_splice(Program& program,
                                     const std::string& name_space);
@@ -163,7 +165,7 @@ private:
     parse_local_declaration(std::vector<Attribute> attributes = {},
                             bool consume_semicolon = true,
                             SyntaxProduction production = SyntaxProduction::Declaration);
-    bool local_declaration_start() const;
+    bool local_declaration_start();
 
     std::unique_ptr<Expr> parse_expression(std::unique_ptr<Expr> seed = {});
     std::unique_ptr<Expr> parse_constant_expression();

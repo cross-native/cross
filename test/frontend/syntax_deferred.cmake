@@ -113,6 +113,35 @@ syntax Discard : expression {
 syntax Discard;
 global u32 entry() { return discard(1u32 unknown!(+) 2u32); }
 ]=])
+accept(discard_qualified_type_fragment [=[
+namespace names { typedef u32 Value; }
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    if (!$::meta::is_kind($::syntax::node(input, "value"), "deferred"))
+        $::syntax::error($::syntax::span(input), "qualified type fragment was not deferred");
+    return $::quote { ; };
+}
+syntax Discard : statement { prefix "discard"; match value:type ";"; expand discard; }
+global u32 entry() {
+    syntax Discard;
+    discard names unknown!(::Value);
+    return 1u32;
+}
+]=])
+accept(type_probe_keeps_expression_owner_input [=[
+[[syntax_expander]] static $::meta::tokens inspect(in $::meta::syntax_match input) {
+    $::meta::syntax node = $::syntax::node(input, "value");
+    while ($::meta::is_kind(node, "core") && $::meta::child_count(node) == 1uptr)
+        node = $::meta::child(node, 0uptr);
+    if (!$::meta::is_kind(node, "macro"))
+        $::syntax::error($::syntax::span(input), "type probe expanded owner input");
+    return $::quote { 7u32 };
+}
+syntax Inspect : expression { prefix "inspect"; match value:expr; expand inspect; }
+global u32 entry() {
+    syntax Inspect;
+    return (inspect unknown!{foreign tokens}) + sizeof(inspect unknown!{foreign tokens});
+}
+]=])
 function(as_deferred_type result source)
     string(REPLACE "match value:expr" "match value:type" type_source "${source}")
     string(REPLACE "inner (Later)5uptr;" "inner Later;" type_source "${type_source}")

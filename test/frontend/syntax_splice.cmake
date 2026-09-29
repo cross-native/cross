@@ -107,6 +107,41 @@ $::static_assert(lists() == 5u32, \"token list fragments did not compose\");")
     accept_splice(token_macro_header_attribute_${mode} "${parameter_prefix}
 static T identity(in T value) parameters!([[generic(T)]]) { return value; }
 global u32 entry() { return identity(5u32); }")
+    accept_splice(token_macro_nested_header_attribute_${mode} "${parameter_prefix}
+static T first(in T value) [[parameters!(generic(T))]] { return value; }
+static T second(in T value) [[generic(parameters!(T))]] { return value; }
+static T third<parameters!(T)>(in T value) { return value; }
+static U fourth<parameters!(T, U)>(in T a, in U b) { return b; }
+global u32 entry() { return first(second(third(fourth(1u16, 5u32)))); }")
+    accept_splice(token_macro_qualified_type_${mode} "${parameter_prefix}
+namespace names { typedef u32 Value; global u32 amount = 5u32; }
+global u32 entry() {
+    names parameters!(::Value) value = 3u32;
+    names parameters!() parameters!(::Value) second = 4u32;
+    return value + second + (names parameters!(::Value))2u16 + sizeof(names parameters!(::Value));
+}")
+    accept_splice(token_macro_composed_qualified_invocation_${mode} "${parameter_prefix}
+namespace fragments {
+    [[macro]] static $::meta::tokens type(in $::meta::tokens input) { return $::quote { u32 }; }
+    [[macro]] static $::meta::tokens value(in $::meta::tokens input) { return $::quote { 7u32 }; }
+}
+static fragments parameters!(::type)!() header_type() { return 3u32; }
+static u32 composed() {
+    fragments parameters!(::type)!() result = fragments parameters!(::value)!();
+    return result;
+}
+$::static_assert(composed() == 7u32 && header_type() == 3u32, \"assembled invocation was classified too early\");")
+    accept_splice(token_macro_private_generic_${mode} "${parameter_prefix}
+[[macro]] static $::meta::tokens make(in $::meta::tokens input) {
+    $::meta::tokens type = $::meta::gensym(\"Type\");
+    return $::quote {
+        static $::unquote(type) $::unquote(input)(in $::unquote(type) value)
+            [[generic($::unquote(type))]] { return value; }
+    };
+}
+make!(identity)
+static u32 entry() { return identity(7u32); }
+$::static_assert(entry() == 7u32, \"private generic identity was lost in lookahead\");")
     accept_splice(token_macro_owner_first_${mode} "${parameter_prefix}
 [[macro]] static $::meta::tokens discard(in $::meta::tokens input) { return $::quote {}; }
 discard! { [[macro]] invalid declaration; unknown!{ not Cross } }
@@ -119,6 +154,16 @@ global u32 entry() { return recur!(); }")
         "${parameter_prefix}
 parameters!([[macro]] static $::meta::tokens introduced(in $::meta::tokens input) { return input; })")
 endforeach()
+
+accept_splice(header_attribute_owner_first "${parameter_list_macros}
+[[syntax_expander]] static $::meta::tokens alignment(in $::meta::syntax_match input) {
+    return $::quote { 16u32 };
+}
+syntax Alignment : expression { prefix \"alignment\"; match body:paren; expand alignment; }
+syntax Alignment;
+static T identity(in T value)
+    [[aligned(alignment(unknown!{ discarded input })), parameters!(generic(T))]] { return value; }
+global u32 entry() { return identity(7u32); }")
 
 set(raw_header_prefix [=[
 [[syntax_expander]] static $::meta::tokens discard_raw(in $::meta::syntax_match input) {

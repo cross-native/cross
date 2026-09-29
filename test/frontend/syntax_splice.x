@@ -97,7 +97,8 @@ syntax ShadowTransplant : statement {
         $::meta::child($::meta::child(parsed, 0uptr), 0uptr), 0uptr);
     if (!$::meta::is_production(parsed, "type_name") ||
         !$::meta::is_production(specifier, "type_specifier") ||
-        !$::meta::is_production($::meta::child(specifier, 0uptr), "type_name"))
+        (!$::meta::is_production($::meta::child(specifier, 0uptr), "type_name") &&
+         !$::meta::is_kind($::meta::child(specifier, 0uptr), "deferred")))
         return $::quote { public_schema_failure(); };
     return $::quote { $::unquote(parsed) $::unquote($::syntax::capture(input, "name")); };
 }
@@ -175,6 +176,12 @@ namespace Source {
 }
 [[macro]] static $::meta::tokens nested_parameter_list(in $::meta::tokens input) {
     return $::quote { parameter_list_fragment!($::unquote(input)) };
+}
+namespace HeaderFragments { typedef u32 Value; }
+[[noinline]] static T header_fragment_identity(in T value)
+    [[parameter_list_fragment!(generic(T))]] { return value; }
+[[noinline]] static T angle_fragment_identity<parameter_list_fragment!(T)>(in T value) {
+    return value;
 }
 global volatile u32 header_runtime_seed = 5u32;
 [[noinline]] static u32 suffix_function declarator_function!(value) {
@@ -348,6 +355,10 @@ global u32 syntax_raw_entry() {
     syntax TransplantSpecifier;
     syntax CopyDeclaration;
     u32 amount = 4u32;
+    transplant_type fragmented_type HeaderFragments parameter_list_fragment!(::Value);
+    fragmented_type = header_runtime_seed;
+    if (header_fragment_identity(fragmented_type) != 5u32 ||
+        angle_fragment_identity(fragmented_type) != 5u32) return 0u32;
     if (multiplied(amount parameter_list_fragment!(+) 2u32) != 18u32)
         return 0u32;
     u32 declarator_name!(named_by_macro) = 5u32;

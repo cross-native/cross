@@ -1559,6 +1559,7 @@ void Parser::apply_type_attribute(
 }
 
 std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction production_name) {
+    normalize_qualified_name();
     if (current().kind != TokenKind::Identifier) return std::nullopt;
     ProductionScope production(*this, production_name);
     const auto first = consume_kind(TokenKind::Identifier);
@@ -1575,6 +1576,50 @@ std::optional<std::string> Parser::parse_qualified_name(SyntaxProduction product
         name += identifier_binding_name(*component);
     }
     return name;
+}
+
+void Parser::normalize_qualified_name() {
+    if (!syntax_ || raw_token_depth_) return;
+    struct Restore {
+        std::size_t& cursor;
+        std::size_t first;
+        ~Restore() { cursor = first; }
+    } restore{index_, index_};
+    const auto errors = diagnostics_.errors();
+    const auto assembled_invocation = [&] {
+        const auto saved = index_;
+        index_ = restore.first;
+        const bool invocation = macro_start();
+        index_ = saved;
+        return invocation;
+    };
+    for (;;) {
+        expand_inline_macro_fragments();
+        if (diagnostics_.errors() != errors ||
+            std::as_const(*this).current().kind != TokenKind::Identifier) return;
+        ++index_;
+        for (;;) {
+            // A following fragment may contribute the separator, component,
+            // or nothing. Never enter an argument group while probing a name.
+            expand_inline_macro_fragments();
+            if (diagnostics_.errors() != errors || assembled_invocation() ||
+                !std::as_const(*this).current().is("::")) break;
+            ++index_;
+            expand_inline_macro_fragments();
+            if (diagnostics_.errors() != errors || assembled_invocation() ||
+                std::as_const(*this).current().kind != TokenKind::Identifier) break;
+            ++index_;
+        }
+        index_ = restore.first;
+        if (diagnostics_.errors() != errors || !macro_start()) return;
+        // Fragments may have assembled a complete qualified invocation.
+        // Expand it before callers classify a value, type, or declaration.
+    }
+}
+
+std::string Parser::peek_qualified_name() {
+    normalize_qualified_name();
+    return std::as_const(*this).peek_qualified_name();
 }
 
 std::string Parser::peek_qualified_name() const {
@@ -1615,8 +1660,12 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
     return {};
 }
 
-bool Parser::type_start() const {
-    const auto& token = current();
+bool Parser::type_start() {
+    // Cast/sizeof probes can be looking at an expression owner rather than
+    // a type. Its input must stay opaque until the expression parser selects
+    // it, even if the next token happens to begin a procedural invocation.
+    if (!active_syntax(false)) normalize_qualified_name();
+    const auto token = current();
     if (token.kind == TokenKind::StructuredSplice)
         return token.splice && syntax_type_node(*token.splice);
     if (token.kind == TokenKind::Identifier) {
@@ -1625,6 +1674,7 @@ bool Parser::type_start() const {
         if (binding.kind != ValueBinding::Kind::Unknown) return false;
         require_public_name_context(token.text);
     }
+    const auto name = std::as_const(*this).peek_qualified_name();
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
@@ -1636,8 +1686,8 @@ bool Parser::type_start() const {
            token.is("struct") || token.is("union") ||
            builtin_kind(token.text).has_value() ||
            std::find(active_generic_types_.begin(), active_generic_types_.end(),
-                     peek_qualified_name()) != active_generic_types_.end() ||
-           resolve_type_alias(peek_qualified_name()) != nullptr;
+                     name) != active_generic_types_.end() ||
+           resolve_type_alias(name) != nullptr;
 }
 
 TypePtr Parser::parse_type(bool record_specifiers,
@@ -1703,6 +1753,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             is_restrict = true;
         }
     }
+    normalize_qualified_name();
     TypePtr type;
     {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
@@ -2041,9 +2092,17 @@ std::vector<std::string> Parser::preview_generic_types() {
         if (text == "[[") return "]]";
         return {};
     };
-    const auto group_end = [&](std::size_t first) -> std::optional<std::size_t> {
+    const auto expose = [&](std::size_t at) {
+        if (parsing_public_fragment_ || !syntax_) return;
+        const auto saved = index_;
+        index_ = at;
+        normalize_qualified_name();
+        index_ = saved;
+    };
+    const auto group_end = [&](std::size_t first, bool parameters = false) -> std::optional<std::size_t> {
         std::vector<std::string_view> closes{closer(tokens_[first].text)};
         for (auto at = first + 1; at < tokens_.size(); ++at) {
+            if (parameters && closes.size() == 1) expose(at);
             if (!work(at)) return {};
             if (tokens_[at].kind == TokenKind::End) return {};
             if (const auto close = closer(tokens_[at].text); !close.empty()) {
@@ -2075,55 +2134,58 @@ std::vector<std::string> Parser::preview_generic_types() {
                 }
                 if (!tokens_[at].is(",")) continue;
             }
-            if (at == begin + 1 && tokens_[begin].kind == TokenKind::Identifier &&
-                std::find(result.begin(), result.end(), tokens_[begin].text) == result.end())
-                result.emplace_back(tokens_[begin].text);
+            if (at == begin + 1 && tokens_[begin].kind == TokenKind::Identifier) {
+                const auto name = identifier_binding_name(tokens_[begin]);
+                if (std::find(result.begin(), result.end(), name) == result.end())
+                    result.push_back(name);
+            }
             begin = at + 1;
         }
     };
     for (auto cursor = index_; cursor < tokens_.size(); ++cursor) {
-        if (!parsing_public_fragment_ && syntax_) {
-            // A trailing token macro can introduce a generic attribute that
-            // scopes over the earlier result type. Expose only this header
-            // cursor: groups (including raw owner inputs) and bodies remain
-            // untouched by lookahead.
-            const auto saved = index_;
-            index_ = cursor;
-            expand_inline_macro_fragments();
-            index_ = saved;
-        }
+        // Header fragments can introduce generics that scope over the earlier
+        // result type. Expose attribute names and generic-parameter sequences,
+        // but never inspect expression arguments or a function's body.
+        expose(cursor);
         if (!work(cursor)) break;
         if (tokens_[cursor].kind == TokenKind::End || tokens_[cursor].is(";") ||
             tokens_[cursor].is("{") || tokens_[cursor].is("=") ||
             tokens_[cursor].is(",")) break;
         if (tokens_[cursor].is("[[")) {
-            const auto close = group_end(cursor);
-            if (!close) break;
             auto at = cursor + 1;
-            while (at < *close && tokens_[at].kind == TokenKind::Identifier) {
+            while (at < tokens_.size()) {
+                expose(at);
+                if (tokens_[at].kind != TokenKind::Identifier) break;
                 const auto name = at++;
                 bool qualified = false;
-                while (at + 1 < *close && tokens_[at].is("::") &&
-                       tokens_[at + 1].kind == TokenKind::Identifier) {
+                expose(at);
+                while (at + 1 < tokens_.size() && tokens_[at].is("::")) {
                     qualified = true;
-                    at += 2;
+                    expose(++at);
+                    if (tokens_[at].kind != TokenKind::Identifier) break;
+                    expose(++at);
                 }
-                if (at < *close && tokens_[at].is("(")) {
-                    const auto arguments_end = group_end(at);
-                    if (!arguments_end || *arguments_end >= *close) break;
-                    if (!qualified && tokens_[name].is("generic"))
+                if (at < tokens_.size() && tokens_[at].is("(")) {
+                    const bool generic = !qualified && tokens_[name].is("generic");
+                    const auto arguments_end = group_end(at, generic);
+                    if (!arguments_end) break;
+                    if (generic)
                         append_types(at + 1, *arguments_end);
                     at = *arguments_end + 1;
                 }
-                if (at == *close || !tokens_[at].is(",")) break;
+                expose(at);
+                if (at >= tokens_.size() || !tokens_[at].is(",")) break;
                 ++at;
             }
+            const auto close = group_end(cursor);
+            if (!close) break;
             cursor = *close;
         } else if (tokens_[cursor].is("<") && cursor != 0 &&
                    tokens_[cursor - 1].kind == TokenKind::Identifier) {
             unsigned depth = 1;
             auto close = cursor + 1;
             for (; close < tokens_.size(); ++close) {
+                if (depth == 1) expose(close);
                 if (!work(close)) return result;
                 if (!closer(tokens_[close].text).empty()) {
                     const auto end = group_end(close);
@@ -2138,6 +2200,7 @@ std::vector<std::string> Parser::preview_generic_types() {
                            tokens_[close].is(";") || tokens_[close].is("=")) break;
                 if (depth == 0) break;
             }
+            if (close + 1 < tokens_.size()) expose(close + 1);
             if (depth != 0 || close + 1 >= tokens_.size() ||
                 !tokens_[close + 1].is("(")) break;
             append_types(cursor + 1, close);
@@ -3818,7 +3881,7 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
     return object;
 }
 
-bool Parser::local_declaration_start() const {
+bool Parser::local_declaration_start() {
     return current().is("register") || current().is("stack") ||
            current().is("static") || current().is("typedef") || type_start();
 }
@@ -4954,6 +5017,9 @@ std::unique_ptr<Expr> Parser::parse_quote() {
 
 std::unique_ptr<Expr> Parser::parse_primary() {
     ProductionScope production(*this, SyntaxProduction::PrimaryExpression);
+    // A selected custom owner gets its still-opaque input first. Ordinary
+    // names may instead be assembled textually before primary classification.
+    if (!macro_start() && !active_syntax(false)) normalize_qualified_name();
     if (current().is("syntax") &&
         (replacement_ || token_origin(current().location).context)) {
         error_here("expansion output cannot introduce syntax registration");
