@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 namespace LocalTagGeneric {
+    typedef struct { u16 value; } AnonymousRecord;
+    typedef enum [[underlying(u16)]] { AnonymousA = 5u16, AnonymousB } AnonymousEnum;
+    enum [[underlying(u32)]] { AnonymousGlobal = 11u32 };
+    $::static_assert(sizeof(AnonymousRecord) == 2uptr && sizeof(AnonymousEnum) == 2uptr &&
+        (u16)AnonymousB == 6u16 && (u32)AnonymousGlobal == 11u32, "file-scope anonymous tags");
     [[noinline]] static T pass<T>(in T value) { return value; }
     [[noinline]] static bool same<T>(in T left, in T right) { return left == right; }
     [[noinline]] static T member<T>(in T input) {
@@ -97,6 +102,29 @@ namespace LocalTagGeneric {
         if ((*pass(&object.grid[1]))[sizeof(T) - 1uptr] != input) return (T)0u32;
         return object.values[N];
     }
+    [[noinline]] static T anonymous<T, u32 N>(in T input) {
+        struct { T value; } first = {input}, second = pass(first);
+        if (second.value != input) return (T)0u32;
+        typedef struct { T value; u8 bytes[N]; } Local;
+        Local object = {second.value}, copied = object;
+        typedef union [[aligned(8)]] { T value; u8 byte; } Variant;
+        Variant variant;
+        variant.value = copied.value;
+        if (sizeof(Variant) != 8uptr) return (T)0u32;
+        enum [[underlying(u32)]] { Count = N, Next = Count + 1u32 };
+        typedef enum [[underlying(u16)]] { A = (u16)N, B } Flag;
+        Flag item = pass(B);
+        {
+            enum [[underlying(u32)]] { Count = 9u32 };
+            if ((u32)pass(Count) != 9u32) return (T)0u32;
+        }
+        if ((u32)pass(Count) != N || (u32)Next != N + 1u32 || (u16)item != (u16)(N + 1u32)) return (T)0u32;
+        AnonymousRecord outer = {7u16};
+        AnonymousRecord outer_copy = pass(outer);
+        AnonymousEnum outer_enum = pass(AnonymousB);
+        if (outer_copy.value != 7u16 || (u16)outer_enum != 6u16) return (T)0u32;
+        return variant.value;
+    }
     // Unused templates must not leak unsubstituted members into final layout.
     static T unused<T>(in T input) { struct Unused { T value; } object = {input}; return object.value; }
 
@@ -109,7 +137,8 @@ namespace LocalTagGeneric {
             bits<u32, 4u32>(amount) != amount + 3u32 || bits<u16, 2u32>(7u16) != 8u32 ||
             alignment<u32, 8u32>(amount) != amount || alignment<u16, 4u32>(7u16) != 7u16 ||
             arrays<u32, 3u32>(amount) != amount || arrays<u16, 2u32>(7u16) != 7u16 ||
-            early_layout<u32, 3u32>(amount) != amount || early_layout<u16, 2u32>(7u16) != 7u16)
+            early_layout<u32, 3u32>(amount) != amount || early_layout<u16, 2u32>(7u16) != 7u16 ||
+            anonymous<u32, 3u32>(amount) != amount || anonymous<u16, 2u32>(7u16) != 7u16)
             return 0u32;
         return amount;
     }

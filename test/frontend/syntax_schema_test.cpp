@@ -321,6 +321,40 @@ int main() {
         }
     }
 
+    for (const auto tag : {"struct", "union", "enum"}) {
+        const bool enumeration = std::string_view(tag) == "enum";
+        const auto anonymous = std::string(tag) + (enumeration
+            ? " [[underlying(u16)]] { A = 3u16, B }"
+            : " [[aligned(8)]] { u32 value; }");
+        for (const auto kind : {K::Type, K::Declaration, K::Statement, K::FunctionHeader,
+                                K::FunctionDefinition}) {
+            const auto source = kind == K::Type ? anonymous :
+                kind == K::Declaration || kind == K::Statement ? anonymous + " object;" :
+                "static " + anonymous + " function() { return 0u32; }";
+            const auto tree = parse(source, kind);
+            const auto definition = production(descendant(tree, enumeration ? P::EnumSpecifier : P::StructOrUnionSpecifier),
+                enumeration ? P::EnumSpecifier : P::StructOrUnionSpecifier, enumeration ? 7 : 5);
+            token(definition->children[0], tag);
+            child(definition, 1, P::AttributeSpecifier, 3);
+            token(definition->children[2], "{");
+            token(definition->children.back(), "}");
+            if (kind == K::Type || kind == K::Declaration || kind == K::Statement) {
+                const auto tokens = syntax_node_tokens(*definition);
+                require(tokens.front().origin.tag_binding && tokens.front().origin.tag_binding->type.identity &&
+                        tokens.front().origin.tag_binding->type.name.empty() &&
+                        tokens.front().origin.tag_binding->role == TagBinding::Role::Declaration,
+                        "anonymous definition keyword lost its private nominal binding");
+            }
+        }
+    }
+    for (const auto kind : {K::FunctionHeader, K::FunctionDefinition}) {
+        const auto tree = parse("static struct { T value; } *function<T>(in T input) { return 0u32; }", kind);
+        const auto definition = production(descendant(tree, P::StructOrUnionSpecifier),
+                                           P::StructOrUnionSpecifier, 4);
+        child(definition, 2, P::MemberDeclaration, 3);
+        descendant(tree, P::GenericParameterList);
+    }
+
     type = production(parse("u32 (* const)(in u16 p \"abi.input\", out u32 *, ...) "
                             "-> \"memory.result\" [[abi(\"custom\")]]", K::Type), P::TypeName, 2);
     abstract = child(type, 1, P::AbstractDeclarator, 4);

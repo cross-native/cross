@@ -216,16 +216,42 @@ int main() {
         const auto module = hir::build(program, options, *target, diagnostics);
         require(diagnostics.errors() == 0 && module.records.size() == 2);
 
+        const auto* anonymous_source = sources.add("anonymous_nominal_identity.x", R"(
+            global struct { u32 value; } first, second;
+            global struct { u32 value; } third;
+            global union { u32 value; u8 byte; } variant;
+            typedef enum [[underlying(u16)]] { A = 1u16 } First;
+            typedef enum [[underlying(u16)]] { B = 2u16 } Second;
+            global First first_enum;
+            global Second second_enum;
+        )");
+        Parser anonymous_parser(Lexer(*anonymous_source, diagnostics).lex(), diagnostics, {}, model->address_bits);
+        auto anonymous_program = anonymous_parser.parse();
+        require(diagnostics.errors() == 0 && anonymous_program.records.size() == 3 &&
+                anonymous_program.enumerations.size() == 2 && anonymous_program.objects.size() == 6);
+        require(same_type(anonymous_program.objects[0]->type, anonymous_program.objects[1]->type));
+        require(!same_type(anonymous_program.objects[0]->type, anonymous_program.objects[2]->type));
+        require(!same_type(anonymous_program.objects[4]->type, anonymous_program.objects[5]->type));
+        for (const auto& record : anonymous_program.records)
+            require(record.name.empty() && record.nominal_identity);
+        for (const auto& anonymous_enum : anonymous_program.enumerations)
+            require(anonymous_enum.name.empty() && anonymous_enum.nominal_identity && !anonymous_enum.local);
+        anonymous_program.address_bits = model->address_bits;
+        require(expand_semantics(anonymous_program, diagnostics, false, "default", abi));
+        const auto anonymous_module = hir::build(anonymous_program, options, *target, diagnostics);
+        require(diagnostics.errors() == 0 && anonymous_module.records.size() == 3);
+
         const auto* generic_source = sources.add("generic_nominal_identity.x", R"(
             [[noinline]] static T pass<T>(in T value) { return value; }
             [[noinline]] static T local<T>(in T input) {
                 struct Fixed { u16 value; } fixed = {3u16};
                 struct Fixed copy = pass(fixed);
+                struct { u16 value; } anonymous = {5u16}, anonymous_copy = pass(anonymous);
                 struct Node { T value; struct Node *next; } node;
                 node.value = input;
                 node.next = &node;
                 enum E [[underlying(u32)]] { A = (u32)sizeof(T) } item = pass(A);
-                return node.next->value + (T)copy.value + (T)item;
+                return node.next->value + (T)copy.value + (T)item + (T)anonymous_copy.value;
             }
             static T unused<T>(in T input) { struct Unused { T value; }; return input; }
             global u32 entry() {
@@ -234,10 +260,10 @@ int main() {
         )");
         Parser generic_parser(Lexer(*generic_source, diagnostics).lex(), diagnostics, {}, model->address_bits);
         auto generic_program = generic_parser.parse();
-        require(diagnostics.errors() == 0 && generic_program.records.size() == 3);
+        require(diagnostics.errors() == 0 && generic_program.records.size() == 4);
         generic_program.address_bits = model->address_bits;
         require(expand_semantics(generic_program, diagnostics, false, "default", abi));
-        require(generic_program.records.size() == 4 && generic_program.enumerations.size() == 2);
+        require(generic_program.records.size() == 6 && generic_program.enumerations.size() == 2);
         std::unordered_set<NominalTypeKey, NominalTypeKeyHash> keys;
         std::unordered_set<std::string> serializations;
         unsigned fixed_instances = 0;
@@ -247,7 +273,7 @@ int main() {
             require(keys.insert(key).second && serializations.insert(key.canonical_name()).second);
             if (record.name == "Node") {
                 require(record.members[1].type->pointee->nominal_identity == record.nominal_identity);
-            } else {
+            } else if (!record.name.empty()) {
                 require(record.name == "Fixed");
                 ++fixed_instances;
             }
@@ -259,11 +285,16 @@ int main() {
             require(declaration.enumerators.front().value.has_value());
         }
         unsigned fixed_passes = 0;
+        unsigned anonymous_passes = 0;
         for (const auto& function : generic_program.functions)
-            if (function->name.starts_with("pass$") && function->return_type->nominal_name == "Fixed")
-                ++fixed_passes;
+            if (function->name.starts_with("pass$")) {
+                if (function->return_type->nominal_name == "Fixed") ++fixed_passes;
+                if (function->return_type->kind == Type::Kind::Record &&
+                    function->return_type->nominal_name.empty()) ++anonymous_passes;
+            }
         require(fixed_passes == 2); // Same spelling/layout, different enclosing instances.
+        require(anonymous_passes == 2);
         const auto generic_module = hir::build(generic_program, options, *target, diagnostics);
-        require(diagnostics.errors() == 0 && generic_module.records.size() == 4);
+        require(diagnostics.errors() == 0 && generic_module.records.size() == 6);
     }
 }

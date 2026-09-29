@@ -1401,6 +1401,7 @@ void Parser::adopt_replacement(Parser& child) {
 Parser::TagState Parser::tag_state() const {
     return {record_types_, local_tag_scopes_.empty() ? NameMap<LocalTag>{}
                                                     : local_tag_scopes_.back(),
+            local_scopes_.empty() ? NameMap<ValueBinding>{} : local_scopes_.back(),
             local_tag_scopes_.size()};
 }
 
@@ -1458,12 +1459,18 @@ bool Parser::transfer_spliced_tags(
             transferred.emplace(key, tag);
         }
     for (const auto& enumeration : child.pending_enumerations_) {
-        if (!enumeration.nominal_identity || local_scopes_.empty() ||
-            std::none_of(transferred.begin(), transferred.end(), [&](const auto& entry) {
-                return entry.second.type->nominal_identity == enumeration.nominal_identity;
-            })) continue;
+        if (!enumeration.local || !before.depth ||
+            child.local_scopes_.size() != before.depth) continue;
         for (const auto& enumerator : enumeration.enumerators) {
             const NameKey key(enumerator.name, enumerator.location);
+            const auto source = child.local_scopes_.back().find(key);
+            if (source == child.local_scopes_.back().end() || source->second != enumerator.binding) continue;
+            const auto prior = before.values.find(key);
+            if (prior != before.values.end() && prior->second == enumerator.binding) continue;
+            if (local_scopes_.empty()) {
+                diagnostics_.error(location, "moving a local enumerator declaration to file scope is not yet supported");
+                continue;
+            }
             const auto existing = local_scopes_.back().find(key);
             if (local_type_scopes_.back().contains(key) ||
                 (existing != local_scopes_.back().end() && existing->second != enumerator.binding))
@@ -1490,7 +1497,7 @@ bool Parser::transfer_spliced_tags(
                 "spliced record tag '" + name + "' duplicates a destination definition");
     }
     for (const auto& enumeration : child.pending_enumerations_) {
-        if (enumeration.nominal_identity) continue;
+        if (enumeration.local || enumeration.name.empty()) continue;
         if (record_types_.contains(enumeration.name))
             diagnostics_.error(location,
                 "spliced enumeration '" + enumeration.name + "' conflicts with a destination record");
@@ -1511,7 +1518,11 @@ bool Parser::transfer_spliced_tags(
     for (const auto& [key, binding] : child.tag_rebindings_)
         if (std::any_of(transferred.begin(), transferred.end(), [&](const auto& entry) {
                 return entry.second.type->nominal_key() == binding->type;
-            })) tag_rebindings_[key] = binding;
+            }) || std::any_of(child.pending_records_.begin(), child.pending_records_.end(),
+                [&](const auto& record) { return record.name.empty() && record.nominal_key() == binding->type; }) ||
+            std::any_of(child.pending_enumerations_.begin(), child.pending_enumerations_.end(),
+                [&](const auto& enumeration) { return enumeration.name.empty() && enumeration.nominal_key() == binding->type; }))
+            tag_rebindings_[key] = binding;
     for (const auto& [name, tag] : child.record_types_) {
         const auto prior = prior_records.find(name);
         if (prior != prior_records.end() &&
@@ -1523,8 +1534,8 @@ bool Parser::transfer_spliced_tags(
     for (auto& record : child.pending_records_)
         pending_records_.push_back(std::move(record));
     for (auto& enumeration : child.pending_enumerations_) {
-        if (!enumeration.nominal_identity) {
-            enum_types_[enumeration.name] = enumeration.underlying;
+        if (!enumeration.local) {
+            if (!enumeration.name.empty()) enum_types_[enumeration.name] = enumeration.underlying;
             for (const auto& enumerator : enumeration.enumerators)
                 known_ordinary_values_.insert(enumerator.name);
         }
@@ -2092,6 +2103,13 @@ TypePtr Parser::resolve_tag_type(std::string_view name, const Token& token) cons
     return {};
 }
 
+std::shared_ptr<const NominalTypeIdentity> Parser::new_nominal_identity(SourceLocation location) {
+    const auto origin = token_origin(location);
+    return std::make_shared<const NominalTypeIdentity>(NominalTypeIdentity{
+        origin.identity, location.file ? location.file->source_unit_at(location.line) : std::string{},
+        ++*nominal_occurrence_, generic_tag_owner_});
+}
+
 TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool complete) {
     const NameKey key(type->nominal_name, location);
     auto& scope = local_tag_scopes_.back();
@@ -2119,10 +2137,7 @@ TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool co
         found->second.complete = found->second.complete || complete;
         return copy_type(prior);
     }
-    const auto origin = token_origin(location);
-    type->nominal_identity = std::make_shared<const NominalTypeIdentity>(NominalTypeIdentity{
-        origin.identity, location.file ? location.file->source_unit_at(location.line) : std::string{},
-        ++*nominal_occurrence_, generic_tag_owner_});
+    type->nominal_identity = new_nominal_identity(location);
     scope.emplace(key, LocalTag{copy_type(type), complete});
     return type;
 }
@@ -2382,6 +2397,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
             type->is_volatile = is_volatile;
         } else if (current().is("struct") || current().is("union")) {
             ProductionScope record(*this, SyntaxProduction::StructOrUnionSpecifier);
+            const auto keyword_index = index_;
             const auto location = current().location;
             const bool is_union = consume("union");
             if (!is_union)
@@ -2389,20 +2405,19 @@ TypePtr Parser::parse_type(bool record_specifiers,
             const auto name_index = index_;
             const auto name_location = current().location;
             const auto name = parse_qualified_name();
-            if (!name) {
-                error_here("expected record name after '" +
-                           std::string(is_union ? "union" : "struct") + "'");
+            auto record_attributes = parse_attributes();
+            if (!name && !current().is("{")) {
+                error_here("an anonymous record requires a definition");
                 return {};
             }
-            auto record_attributes = parse_attributes();
-            const bool local_tag = !local_tag_scopes_.empty() && name->find("::") == std::string::npos;
+            const bool local_tag = name && !local_tag_scopes_.empty() && name->find("::") == std::string::npos;
             if (current().is("{")) {
                 RecordDecl declaration;
                 declaration.location = location;
-                declaration.name = local_tag ? *name : join_namespace(active_namespace_, *name);
+                declaration.name = !name ? std::string{} : local_tag ? *name : join_namespace(active_namespace_, *name);
                 declaration.is_union = is_union;
                 declaration.complete = true;
-                if (!local_tag && enum_types_.contains(declaration.name))
+                if (name && !local_tag && enum_types_.contains(declaration.name))
                     diagnostics_.error(name_location, "tag '" + declaration.name +
                         "' was previously declared as an enumeration");
                 if (declaration_attributes)
@@ -2412,7 +2427,9 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 declaration.attributes.insert(declaration.attributes.end(),
                     std::make_move_iterator(record_attributes.begin()),
                     std::make_move_iterator(record_attributes.end()));
-                if (local_tag) {
+                if (!name) {
+                    declaration.nominal_identity = new_nominal_identity(location);
+                } else if (local_tag) {
                     type = declare_local_tag(record_type(*name, is_union), name_location, true);
                     declaration.nominal_identity = type->nominal_identity;
                 } else {
@@ -2427,7 +2444,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     }
                     tag->second.complete = true;
                 }
-                remember_tag_binding(name_index, *name, record_type(declaration), true);
+                remember_tag_binding(name ? name_index : keyword_index,
+                    name ? *name : is_union ? "union" : "struct", record_type(declaration), true);
                 if (defer_public_header_group(allow_public_header_deferral_
                         ? bounded_group_end(index_) : std::nullopt, [&] {
                         consume("{");
@@ -2468,22 +2486,24 @@ TypePtr Parser::parse_type(bool record_specifiers,
             }
         } else if (current().is("enum")) {
             ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
+            const auto keyword_index = index_;
             const auto location = current().location;
             consume("enum");
             const auto name_index = index_;
             const auto name_location = current().location;
             const auto name = parse_qualified_name();
-            if (!name) {
-                error_here("expected enumeration name after 'enum'");
+            auto enum_attributes = parse_attributes();
+            if (!name && !current().is("{")) {
+                error_here("an anonymous enumeration requires a definition");
                 return {};
             }
-            auto enum_attributes = parse_attributes();
-            const bool local_tag = !local_tag_scopes_.empty() && name->find("::") == std::string::npos;
+            const bool local_tag = name && !local_tag_scopes_.empty() && name->find("::") == std::string::npos;
             if (current().is("{")) {
                 EnumDecl declaration;
                 declaration.location = location;
-                declaration.name = local_tag ? *name : join_namespace(active_namespace_, *name);
-                if (!local_tag && record_types_.contains(declaration.name))
+                declaration.name = !name ? std::string{} : local_tag ? *name : join_namespace(active_namespace_, *name);
+                declaration.local = local_tag || (!name && !local_scopes_.empty());
+                if (name && !local_tag && record_types_.contains(declaration.name))
                     diagnostics_.error(name_location, "tag '" + declaration.name +
                         "' was previously declared as a record");
                 if (declaration_attributes)
@@ -2494,11 +2514,13 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     std::make_move_iterator(enum_attributes.begin()),
                     std::make_move_iterator(enum_attributes.end()));
                 declaration.underlying = enum_underlying(declaration.attributes);
-                if (local_tag) {
+                if (!name) {
+                    declaration.nominal_identity = new_nominal_identity(location);
+                } else if (local_tag) {
                     type = declare_local_tag(enum_type(*name, declaration.underlying), name_location, true);
                     declaration.nominal_identity = type->nominal_identity;
                 }
-                if (!local_tag) {
+                if (name && !local_tag) {
                     const auto found = enum_types_.find(declaration.name);
                     if (found != enum_types_.end() && found->second != declaration.underlying) {
                         diagnostics_.error(location, "enumeration '" + declaration.name +
@@ -2508,7 +2530,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     }
                 }
                 type = enum_type(declaration);
-                remember_tag_binding(name_index, *name, type, true);
+                remember_tag_binding(name ? name_index : keyword_index, name ? *name : "enum", type, true);
                 if (defer_public_header_group(allow_public_header_deferral_
                         ? bounded_group_end(index_) : std::nullopt, [&] {
                         parse_enumerators(declaration, active_namespace_);
@@ -2735,20 +2757,20 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
                 for (; at <= last_name; ++at)
                     if (!work(at)) return result;
                 if (const auto end = macro_end(last_name)) at = *end + 1;
-                while (at < tokens_.size() && tokens_[at].is("[[")) {
-                    const auto end = group_end(at);
-                    if (!end) return result;
-                    at = *end + 1;
-                }
-                if (at < tokens_.size() && tokens_[at].is("{")) {
-                    const auto end = group_end(at);
-                    if (!end) return result;
-                    at = *end + 1;
-                }
-                have_type = true;
-                cursor = at - 1;
-                continue;
             }
+            while (at < tokens_.size() && tokens_[at].is("[[")) {
+                const auto end = group_end(at);
+                if (!end) return result;
+                at = *end + 1;
+            }
+            if (at < tokens_.size() && tokens_[at].is("{")) {
+                const auto end = group_end(at);
+                if (!end) return result;
+                at = *end + 1;
+            }
+            have_type = true;
+            cursor = at - 1;
+            continue;
         }
         if (tokens_[cursor].is("[[")) {
             auto at = cursor + 1;
@@ -4038,6 +4060,11 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         parse_typedef(name_space, std::move(attributes), std::move(base_type), location);
         return;
     }
+    if (current().is(";") && base_type && !base_type->nominal_key().empty() &&
+        !linkage_seen && !inline_hint) {
+        consume(";");
+        return;
+    }
     ProductionScope list(*this, SyntaxProduction::InitDeclaratorList);
     unsigned ordinal = 0;
     bool last_function = false;
@@ -4263,7 +4290,7 @@ void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_sp
             EnumDecl::Enumerator enumerator;
             enumerator.location = token->location;
             enumerator.name = identifier_binding_name(*token);
-            if (declaration.nominal_identity) {
+            if (declaration.local) {
                 const NameKey key(enumerator.name, token->location);
                 enumerator.binding = {ValueBinding::Kind::Enumerator,
                     token_origin(token->location).identity, key.context,

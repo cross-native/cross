@@ -52,6 +52,13 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
     uptr expression_size = tag_expression(sizeof(struct ExpressionTag { T value; }));
     struct ExpressionTag expression_object = {amount};
     if (expression_size != sizeof(T) || expression_object.value != amount) return (T)0u32;
+    uptr anonymous_size = tag_expression(sizeof(enum [[underlying(u16)]] { ExpressionValue = 7u16 }));
+    if (anonymous_size != 2uptr || (u16)LocalTagGeneric::pass(ExpressionValue) != 7u16) return (T)0u32;
+    tag_copy enum [[underlying(u32)]] { AnonymousCount = N };
+    if ((u32)LocalTagGeneric::pass(AnonymousCount) != N) return (T)0u32;
+    tag_type anonymous_type, struct { T value; u8 data[N]; };
+    anonymous_type.value = amount;
+    if (anonymous_type.value != amount) return (T)0u32;
     tag_twice {
         struct Repeated [[aligned(8)]] { T value; struct Repeated *next; u8 padding[N]; } repeated;
         repeated.value = second.value;
@@ -62,6 +69,10 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
         enum RepeatedLayout [[underlying(uptr)]] { Bytes = sizeof(struct Repeated) };
         if ((uptr)Bytes < sizeof(T) + sizeof(uptr) + (uptr)N ||
             $::alignof(struct Repeated) != 8uptr) return (T)0u32;
+        struct { T value; } anonymous = {amount}, transported = LocalTagGeneric::pass(anonymous);
+        if (transported.value != amount) return (T)0u32;
+        enum [[underlying(u32)]] { Count = N };
+        if ((u32)LocalTagGeneric::pass(Count) != N) return (T)0u32;
     }
     tag_text_twice {
         struct Text [[aligned(8)]] { T value; u8 padding[N]; } text = {amount};
@@ -70,6 +81,13 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
         if (LocalTagSplice::enum_pair(item, TextA) != 2u32 * N) return (T)0u32;
         enum TextLayout [[underlying(uptr)]] { TextBytes = sizeof(struct Text) };
         if ((uptr)TextBytes < sizeof(T) + (uptr)N || $::alignof(struct Text) != 8uptr) return (T)0u32;
+        typedef union { T value; u8 byte; } Anonymous;
+        Anonymous anonymous;
+        anonymous.value = amount;
+        Anonymous transported = LocalTagGeneric::pass(anonymous);
+        if (transported.value != amount) return (T)0u32;
+        enum [[underlying(u32)]] { Count = N };
+        if ((u32)LocalTagGeneric::pass(Count) != N) return (T)0u32;
     }
     return second.value;
 }

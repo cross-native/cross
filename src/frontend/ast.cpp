@@ -278,14 +278,14 @@ std::string type_name(const TypePtr& type) {
     }
     if (type->kind == Type::Kind::Record) {
         return prefix + (type->is_union ? "union " : "struct ") +
-               type->nominal_name;
+               (type->nominal_name.empty() ? "<anonymous>" : type->nominal_name);
     }
     static constexpr const char* names[] = {
         "void", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
         "i128", "u128", "iptr", "uptr", "f32", "f64", "f80", "f128", "fptr", "label"
     };
     if (!type->nominal_key().empty()) {
-        return prefix + "enum " + type->nominal_name;
+        return prefix + "enum " + (type->nominal_name.empty() ? "<anonymous>" : type->nominal_name);
     }
     return prefix + names[static_cast<unsigned>(type->builtin)];
 }

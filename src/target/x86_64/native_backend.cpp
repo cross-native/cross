@@ -1458,6 +1458,24 @@ private:
             instruction.defs.push_back(reg(value.id));
             instruction.may_load = true;
             instruction.has_side_effects = value.is_volatile_access;
+            // Pointer-access expansion stages its address and some results
+            // through fixed physical scratch. A live call result may occupy
+            // any model-selected register, including those scratch locations.
+            if (instruction.opcode == Opcode::AggregatePointerLoad) {
+                append_fixed_clobber(instruction, "r10", machine::i64);
+                const auto bytes = storage_size(hir_, value.type);
+                if (bytes % 16U != 0) append_fixed_clobber(instruction, "rax", machine::i64);
+                if (bytes >= 16U) append_fixed_clobber(instruction, "xmm0", machine::i128);
+            } else {
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                if (instruction.opcode == Opcode::PointerLoad && reg(value.id).mode.bits > 64) {
+                    append_fixed_clobber(instruction, "rdx", machine::i64);
+                    append_fixed_clobber(instruction, "rcx", machine::i64);
+                } else if (instruction.opcode == Opcode::VpointerLoad ||
+                           (instruction.opcode == Opcode::FpointerLoad && reg(value.id).mode.bits != 80)) {
+                    append_fixed_clobber(instruction, "xmm0", machine::i128);
+                }
+            }
             return instruction;
         }
         if (value.kind == ValueKind::PointerStore) {

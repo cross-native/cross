@@ -372,6 +372,9 @@ struct EnumDecl {
     std::vector<Attribute> attributes;
     std::vector<Enumerator> enumerators;
     std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
+    // Lexical enumerator scope is independent of whether the tag has a private
+    // identity: an anonymous file-scope enumeration also has such an identity.
+    bool local{};
     [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity}; }
 };
 

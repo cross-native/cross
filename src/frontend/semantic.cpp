@@ -1136,6 +1136,7 @@ std::unique_ptr<FunctionDecl> instantiate(
             EnumDecl copy;
             copy.location = enumeration.location;
             copy.name = enumeration.name;
+            copy.local = enumeration.local;
             copy.underlying = enumeration.underlying;
             copy.nominal_identity = types.nominal->substitute(enumeration.nominal_identity);
             copy.attributes = clone_attributes(enumeration.attributes, types, values);

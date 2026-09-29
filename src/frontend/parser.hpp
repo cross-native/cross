@@ -141,6 +141,7 @@ private:
     void remember_tag_binding(std::size_t token_index, std::string_view spelling,
                               const TypePtr& type, bool declaration);
     TypePtr declare_local_tag(TypePtr type, SourceLocation location, bool complete);
+    std::shared_ptr<const NominalTypeIdentity> new_nominal_identity(SourceLocation location);
     TypePtr parse_type(bool record_specifiers = true,
                        std::function<bool()> storage_specifier = {},
                        std::vector<Attribute>* declaration_attributes = nullptr,
@@ -326,6 +327,7 @@ private:
     struct TagState {
         std::unordered_map<std::string, RecordTag> records;
         NameMap<LocalTag> local;
+        NameMap<ValueBinding> values;
         std::size_t depth{};
     };
     TagState tag_state() const;

@@ -40,6 +40,39 @@ accept_splice(local_tag_scope_syntax "syntax Enabled : rule { match \"unused\"; 
 file(READ "${CMAKE_CURRENT_LIST_DIR}/local_tag_generic.x" local_tag_generic_source)
 accept_splice(local_tag_generic_core "${local_tag_generic_source}")
 accept_splice(local_tag_generic_syntax "syntax Enabled : rule { match \"unused\"; }\n${local_tag_generic_source}")
+reject_splice(anonymous_missing_record_body "anonymous record requires a definition" "typedef struct *Alias;")
+reject_splice(anonymous_missing_enum_body "anonymous enumeration requires a definition" "typedef enum [[underlying(u16)]] Alias;")
+reject_splice(anonymous_record_distinct "conflicting|incompatible|different|deduc" [=[
+    static u32 pair<T>(in T left, in T right) { return 7u32; }
+    global u32 entry() {
+        struct { u32 value; } first = {1u32};
+        struct { u32 value; } second = {2u32};
+        return pair(&first, &second);
+    }
+]=])
+reject_splice(anonymous_enum_distinct "conflicting|incompatible|different|deduc" [=[
+    static u32 pair<T>(in T left, in T right) { return 7u32; }
+    global u32 entry() {
+        enum [[underlying(u16)]] { A = 1u16 };
+        enum [[underlying(u16)]] { B = 2u16 };
+        return pair(A, B);
+    }
+]=])
+reject_splice(anonymous_enum_local_scope "unknown|unresolved" [=[
+    static u32 first() { enum { Value = 7 }; return (u32)Value; }
+    $::static_assert((u32)Value == 7u32, "outside local scope");
+]=])
+reject_splice(anonymous_enum_duplicate "local enumerator 'Value' conflicts" [=[
+    global u32 entry() { enum { Value = 1 }; enum { Value = 2 }; return (u32)Value; }
+]=])
+reject_splice(anonymous_enum_splice_collision "spliced local value 'Value' was declared more than once" [=[
+    [[syntax_expander]] static $::meta::tokens collide(in $::meta::syntax_match input) {
+        $::meta::tokens name = $::meta::call_site($::meta::parse("Value"));
+        return $::quote { { u32 $::unquote(name) = 0u32; $::unquote($::syntax::node(input, "body")) } };
+    }
+    syntax Collide : statement { prefix "collide"; match body:stmt; expand collide; }
+    global u32 entry() { syntax Collide; collide enum { Value = 1 }; return 0u32; }
+]=] "note")
 reject_splice(local_tag_generic_invalid_member "record member has an incomplete or non-object type" [=[
     static u32 broken<T>() { struct Local { T value; }; return 1u32; }
     global u32 entry() { return broken<void>(); }

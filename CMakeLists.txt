@@ -2546,6 +2546,18 @@ if(BUILD_TESTING)
                         -DENTRY=syntax_raw_entry -DEXPECTED=61
                         "-DCC_FLAGS=${syntax_flags}"
                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            if(mode STREQUAL "custom")
+                add_test(NAME cross_syntax_generic_tags_${level}_custom_noeval
+                    COMMAND "${CMAKE_COMMAND}"
+                            -DCC=$<TARGET_FILE:cross_cc>
+                            -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_generic_tags.x
+                            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-generic-tags-${level}-custom-noeval
+                            -DENTRY=syntax_raw_entry -DEXPECTED=61
+                            "-DCC_FLAGS=${syntax_flags};-fno-eval-calls"
+                            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            endif()
             add_test(NAME cross_meta_objects_${level}_${mode}
                 COMMAND "${CMAKE_COMMAND}"
                         -DCC=$<TARGET_FILE:cross_cc>
