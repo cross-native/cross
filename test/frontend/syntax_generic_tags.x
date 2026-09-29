@@ -5,6 +5,7 @@
 #include "local_tag_splice.x"
 #include "type_alias_binding.x"
 #include "meta_helpers.x"
+#include "meta_helper_semantics.x"
 
 [[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
     return $::quote { $::unquote($::syntax::node(input, "body")) };
@@ -112,7 +113,7 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
-    if (MetaHelperCaller::run() != 61u32 ||
+    if (MetaHelperCaller::run() != 61u32 || MetaPreparation::run() != 67u32 ||
         AliasBindingTests::run(65549u32) != 65549u32 ||
         LocalTagGeneric::run(65549u32) != 65549u32 ||
         copied_generic_local(65549u32) != 65549u32 || copied_generic_local(7u16) != 7u16 ||

@@ -76,6 +76,49 @@ reject(conflicting_declaration "meta helper 'helper'.*incompatible interfaces"
 reject(duplicate_definition "duplicate definition of meta helper 'helper'"
     "static $::meta::tokens helper() { return $::quote { 9u32 }; }\nstatic $::meta::tokens helper() { return $::quote { 7u32 }; }")
 
+# These instances are reached only by expansion, never by the runtime program.
+# Their constraints still apply, including assertions that instantiate helpers.
+reject(generic_assertion "static_assert failed: expansion constraint" [=[
+static T helper<T>(in T input) {
+    $::static_assert(sizeof(T) == 0uptr, "expansion constraint");
+    return input;
+}
+[[macro]] static $::meta::tokens apply(in $::meta::tokens input) {
+    u32 value = helper(9u32); return input;
+}
+global u32 entry() { return apply!(9u32); }
+]=])
+reject(nested_generic_assertion "static_assert failed: nested expansion constraint" [=[
+static bool constraint<T>() {
+    $::static_assert(sizeof(T) == 0uptr, "nested expansion constraint");
+    return (bool)1u8;
+}
+static T helper<T>(in T input) {
+    $::static_assert(constraint<T>(), "outer expansion constraint");
+    return input;
+}
+[[macro]] static $::meta::tokens apply(in $::meta::tokens input) {
+    u32 value = helper(9u32); return input;
+}
+global u32 entry() { return apply!(9u32); }
+]=])
+reject(enum_forward "has no value in this syntax context" [=[
+enum Invalid { First = Second, Second = 2 };
+[[macro]] static $::meta::tokens apply(in $::meta::tokens input) {
+    u32 value = (u32)First; return input;
+}
+global u32 entry() { return apply!(9u32); }
+]=])
+reject(enum_cycle "has no value in this syntax context" [=[
+static u32 cycle();
+enum Invalid { First = cycle() };
+static u32 cycle() { return (u32)First; }
+[[macro]] static $::meta::tokens apply(in $::meta::tokens input) {
+    u32 value = (u32)First; return input;
+}
+global u32 entry() { return apply!(9u32); }
+]=])
+
 compile(call_trace [=[
 static void failure(in $::meta::tokens input) { u32 invalid = 1u32 / 0u32; }
 static void forward(in $::meta::tokens input) { return failure(input); }

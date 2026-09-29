@@ -73,7 +73,8 @@ using ValueSubstitutions = NameMap<const Expr*>;
 
 using EnumInitializerPreparation = std::function<void(std::unique_ptr<Expr>&)>;
 bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size_t first = 0,
-                           const EnumInitializerPreparation& prepare = {});
+                           const EnumInitializerPreparation& prepare = {},
+                           std::optional<Program::EnumerationPosition> through = {});
 void materialize_enumerators(Program& program, Diagnostics& diagnostics);
 
 template <typename Visitor>
@@ -528,6 +529,7 @@ struct GenericExpansionState {
     std::vector<NameKey> locals;
     std::vector<std::pair<NameKey, TypePtr>> local_types;
     std::unordered_map<NominalTypeKey, RecordPreparation, NominalTypeKeyHash> required_records;
+    bool expansion_evaluation{};
 };
 
 bool normalize_generic_callable_abis(TypePtr& type,
@@ -654,6 +656,71 @@ bool validate_generic_redeclarations(const Program& program,
         }
     }
     return diagnostics.errors() == 0;
+}
+
+template <typename TypeOf>
+TypePtr translation_intrinsic_type(const Expr& expression, bool procedural, TypeOf&& type_of) {
+    if (expression.kind != Expr::Kind::Call || !expression.left ||
+        expression.left->kind != Expr::Kind::Name) return {};
+    if (procedural && (expression.left->text == "$::syntax::at" ||
+        expression.left->text == "$::meta::extension_match")) return syntax_match_type();
+    if (procedural && expression.left->text == "$::syntax::node") return syntax_type();
+    if (procedural && expression.left->text == "$::syntax::context") return context_type();
+    if (procedural && (expression.left->text == "$::syntax::span" ||
+        expression.left->text == "$::syntax::capture_span" ||
+        expression.left->text == "$::meta::node_span")) return span_type();
+    if (procedural && (expression.left->text == "$::syntax::error" ||
+        expression.left->text == "$::syntax::warning" ||
+        expression.left->text == "$::syntax::note")) return builtin_type(BuiltinType::Void);
+    if (procedural && expression.left->text == "$::syntax::count") return builtin_type(BuiltinType::Uptr);
+    if (procedural && expression.left->text == "$::syntax::is_variant")
+        return builtin_type(BuiltinType::Bool);
+    if (procedural && (expression.left->text == "$::syntax::input" ||
+        expression.left->text == "$::syntax::capture")) return tokens_type();
+    if (procedural && expression.left->text == "$::meta::tokens") return tokens_type();
+    if (procedural && expression.left->text == "$::meta::call_site") return tokens_type();
+    if (procedural && expression.left->text == "$::meta::gensym") return tokens_type();
+    if (procedural && (expression.left->text == "$::meta::child" ||
+        expression.left->text == "$::meta::replace_child")) return syntax_type();
+    if (procedural && expression.left->text == "$::meta::child_count")
+        return builtin_type(BuiltinType::Uptr);
+    if (procedural && (expression.left->text == "$::meta::is_kind" ||
+        expression.left->text == "$::meta::is_production" ||
+        expression.left->text == "$::meta::is_extension"))
+        return builtin_type(BuiltinType::Bool);
+    if (expression.left->text == "$::embed") return bytes_type();
+    if (expression.left->text == "$::meta::len")
+        return builtin_type(BuiltinType::Uptr);
+    if (expression.left->text == "$::meta::alloc")
+        return buffer_type();
+    if (expression.left->text == "$::meta::cap")
+        return builtin_type(BuiltinType::Uptr);
+    if (expression.left->text == "$::meta::freeze")
+        return bytes_type();
+    if (expression.left->text == "$::meta::data") {
+        if (expression.arguments.size() != 1U) return {};
+        const auto sequence = type_of(*expression.arguments.front());
+        if (!sequence || (sequence->kind != Type::Kind::Bytes &&
+                          sequence->kind != Type::Kind::Buffer)) return {};
+        return pointer_type(builtin_type(BuiltinType::U8,
+            sequence->kind == Type::Kind::Bytes));
+    }
+    if (expression.left->text == "$::meta::at" ||
+        expression.left->text == "$::meta::slice" ||
+        expression.left->text == "$::meta::concat") {
+        if (expression.arguments.empty()) return {};
+        const auto sequence = type_of(*expression.arguments.front());
+        if (!sequence || (sequence->kind != Type::Kind::Bytes &&
+                          sequence->kind != Type::Kind::Tokens)) return {};
+        return expression.left->text == "$::meta::at" &&
+               sequence->kind == Type::Kind::Bytes
+            ? builtin_type(BuiltinType::U8) : sequence;
+    }
+    if (procedural && expression.left->text == "$::meta::parse")
+        return expression.arguments.size() == 3U ? syntax_type() : tokens_type();
+    if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
+        expression.arguments.size() == 1) return type_of(*expression.arguments.front());
+    return {};
 }
 
 TypePtr infer_generic_actual(const Expr& expression,
@@ -1006,7 +1073,7 @@ void rewrite_generic_function(FunctionDecl& function, Program& program,
                               std::string_view mangling) {
     if (!function.body || !function.generic_parameters.empty() ||
         !state.rewritten_functions.insert(&function).second) return;
-    lift_static_locals(program, function);
+    if (!state.expansion_evaluation) lift_static_locals(program, function);
     auto saved_locals = std::move(state.locals);
     auto saved_local_types = std::move(state.local_types);
     state.locals.clear();
@@ -2668,6 +2735,10 @@ TypePtr infer_generic_actual(const Expr& expression,
         return builtin_type(BuiltinType::U32);
     case Expr::Kind::String:
         return pointer_type(builtin_type(BuiltinType::U8, true));
+    case Expr::Kind::Quote:
+        return tokens_type();
+    case Expr::Kind::ByteSequence:
+        return expression.type ? expression.type : bytes_type();
     case Expr::Kind::Address:
         return expression.type;
     case Expr::Kind::Name: {
@@ -2853,6 +2924,10 @@ TypePtr infer_generic_actual(const Expr& expression,
     }
     case Expr::Kind::Call: {
         if (!expression.left) return {};
+        if (auto type = translation_intrinsic_type(expression, true,
+                [&](const Expr& argument) {
+                    return infer_generic_actual(argument, caller, program, state);
+                })) return adjusted(type);
         auto callee = infer_generic_actual(*expression.left, caller,
                                            program, state);
         if (callee && callee->kind == Type::Kind::Pointer)
@@ -4003,7 +4078,8 @@ private:
             return false;
         }
         const bool pointer_unary = pointer_resolver_ && node.kind == Expr::Kind::Unary &&
-            node.left && (node.text == "&" || (node.text == "*" &&
+            node.left && !is_meta_type(expression_type(*node.left)) &&
+            (node.text == "&" || (node.text == "*" &&
                 expression_type(*node.left)->kind == Type::Kind::Pointer));
         const bool vector_unary = node.kind == Expr::Kind::Unary && node.left &&
             is_vector(expression_type(*node.left)) &&
@@ -4295,7 +4371,7 @@ private:
             if (const auto found = resolve_enumerator(
                     program_, current_function_, current_namespace_,
                     expression);
-                found && found->enumerator->value) {
+                found && (found->enumerator->value || program_.evaluation_prepare_enumerator)) {
                 return enum_type(*found->enumeration);
             }
             return {};
@@ -4428,64 +4504,8 @@ private:
         }
         case Expr::Kind::Call:
             if (!expression.left || expression.left->kind != Expr::Kind::Name) return {};
-            if (procedural_ && (expression.left->text == "$::syntax::at" ||
-                expression.left->text == "$::meta::extension_match")) return syntax_match_type();
-            if (procedural_ && expression.left->text == "$::syntax::node") return syntax_type();
-            if (procedural_ && expression.left->text == "$::syntax::context") return context_type();
-            if (procedural_ && (expression.left->text == "$::syntax::span" ||
-                expression.left->text == "$::syntax::capture_span" ||
-                expression.left->text == "$::meta::node_span")) return span_type();
-            if (procedural_ && (expression.left->text == "$::syntax::error" ||
-                expression.left->text == "$::syntax::warning" ||
-                expression.left->text == "$::syntax::note")) return builtin_type(BuiltinType::Void);
-            if (procedural_ && expression.left->text == "$::syntax::count") return builtin_type(BuiltinType::Uptr);
-            if (procedural_ && expression.left->text == "$::syntax::is_variant")
-                return builtin_type(BuiltinType::Bool);
-            if (procedural_ && (expression.left->text == "$::syntax::input" ||
-                expression.left->text == "$::syntax::capture")) return tokens_type();
-            if (procedural_ && expression.left->text == "$::meta::tokens") return tokens_type();
-            if (procedural_ && expression.left->text == "$::meta::call_site") return tokens_type();
-            if (procedural_ && expression.left->text == "$::meta::gensym") return tokens_type();
-            if (procedural_ && (expression.left->text == "$::meta::child" ||
-                expression.left->text == "$::meta::replace_child")) return syntax_type();
-            if (procedural_ && expression.left->text == "$::meta::child_count")
-                return builtin_type(BuiltinType::Uptr);
-            if (procedural_ && (expression.left->text == "$::meta::is_kind" ||
-                expression.left->text == "$::meta::is_production" ||
-                expression.left->text == "$::meta::is_extension"))
-                return builtin_type(BuiltinType::Bool);
-            if (expression.left->text == "$::embed") return bytes_type();
-            if (expression.left->text == "$::meta::len")
-                return builtin_type(BuiltinType::Uptr);
-            if (expression.left->text == "$::meta::alloc")
-                return buffer_type();
-            if (expression.left->text == "$::meta::cap")
-                return builtin_type(BuiltinType::Uptr);
-            if (expression.left->text == "$::meta::freeze")
-                return bytes_type();
-            if (expression.left->text == "$::meta::data") {
-                if (expression.arguments.size() != 1U) return {};
-                const auto sequence = expression_type(*expression.arguments.front());
-                if (!sequence || (sequence->kind != Type::Kind::Bytes &&
-                                  sequence->kind != Type::Kind::Buffer)) return {};
-                return pointer_type(builtin_type(BuiltinType::U8,
-                    sequence->kind == Type::Kind::Bytes));
-            }
-            if (expression.left->text == "$::meta::at" ||
-                expression.left->text == "$::meta::slice" ||
-                expression.left->text == "$::meta::concat") {
-                if (expression.arguments.empty()) return {};
-                const auto sequence = expression_type(*expression.arguments.front());
-                if (!sequence || (sequence->kind != Type::Kind::Bytes &&
-                                  sequence->kind != Type::Kind::Tokens)) return {};
-                return expression.left->text == "$::meta::at" &&
-                       sequence->kind == Type::Kind::Bytes
-                    ? builtin_type(BuiltinType::U8) : sequence;
-            }
-            if (procedural_ && expression.left->text == "$::meta::parse")
-                return expression.arguments.size() == 3U ? syntax_type() : tokens_type();
-            if ((expression.left->text == "$::eval" || expression.left->text == "$::runtime") &&
-                expression.arguments.size() == 1) return expression_type(*expression.arguments.front());
+            if (auto type = translation_intrinsic_type(expression, procedural_,
+                    [&](const Expr& argument) { return expression_type(argument); })) return type;
             if (const auto* callee = resolve_function(program_, current_function_, *expression.left,
                     [](const FunctionDecl&) { return true; })) return callee->return_type;
             return {};
@@ -5101,9 +5121,16 @@ private:
             if (cell->value.object) return read_meta_pointer(object_pointer(cell->value), location);
             return cell->value;
         }
-        if (const auto found = resolve_enumerator(
-                program_, current_function_, current_namespace_, expression);
-            found && found->enumerator->value) {
+        auto found = resolve_enumerator(program_, current_function_, current_namespace_, expression);
+        if (found && !found->enumerator->value && program_.evaluation_prepare_enumerator) {
+            const Program::EnumerationPosition position{
+                static_cast<std::size_t>(found->enumeration - program_.enumerations.data()),
+                static_cast<std::size_t>(found->enumerator - found->enumeration->enumerators.data())};
+            const bool prepared = program_.evaluation_prepare_enumerator(position);
+            found = prepared ? resolve_enumerator(program_, current_function_, current_namespace_, expression)
+                             : std::nullopt;
+        }
+        if (found && found->enumerator->value) {
             return EvalValue{
                 found->enumerator->value->value,
                 enum_type(*found->enumeration)};
@@ -5448,6 +5475,26 @@ private:
             if (member.name.empty()) continue;
             const auto layout = program_.evaluation_member_layout
                 ? program_.evaluation_member_layout(type, member.name) : std::nullopt;
+            if (layout && layout->bit_width) {
+                const auto unit = meta_object_size(member.type);
+                if (!unit || layout->offset > *size || *unit > *size - layout->offset ||
+                    *layout->bit_width == 0 || *layout->bit_width > *unit * 8 ||
+                    layout->bit_offset > *unit * 8 - *layout->bit_width) {
+                    fail(location, "meta bit-field has invalid target layout");
+                    return false;
+                }
+                const auto mask = meta_bit_field_mask({*layout->bit_width, layout->bit_offset, {}, 0});
+                // A target allocation unit can overlap a preceding ordinary
+                // member. Stamp only bytes touched by the actual field bits.
+                for (std::size_t byte = 0; byte < *unit; ++byte) {
+                    const auto lane = program_.evaluation_layout.byte_order ==
+                        EvaluationByteOrder::Little ? byte : *unit - 1 - byte;
+                    if ((shift_right(mask, static_cast<unsigned>(lane * 8)).low & 0xffU) != 0)
+                        storage.effective_type[offset + layout->offset + byte] =
+                            static_cast<std::uint8_t>(member.type->builtin) + 1;
+                }
+                continue;
+            }
             if (!layout || layout->offset > *size ||
                 !stamp_meta_object_types(storage, member.type,
                     offset + static_cast<std::size_t>(layout->offset), location))
@@ -7690,19 +7737,28 @@ bool signed_builtin(BuiltinType type) {
 }
 
 bool evaluate_enumerations(Program& program, Diagnostics& diagnostics, std::size_t first,
-                           const EnumInitializerPreparation& prepare) {
+                           const EnumInitializerPreparation& prepare,
+                           std::optional<Program::EnumerationPosition> through) {
     std::unordered_set<std::string> names;
     // Nested instantiation prepares its own enums. Visit only this publication
     // batch, in declaration order, so a later generic actual may use an earlier
     // enumerator. Neither preparation nor evaluation may retain vector-element
     // references: a layout query can instantiate further records and enums.
-    const auto last = program.enumerations.size();
+    const auto last = through ? std::min(program.enumerations.size(), through->declaration + 1)
+                              : program.enumerations.size();
     for (auto index = first; index < last; ++index) {
         const auto owner = program.enumerations[index].nominal_identity;
         if (owner && owner->generic_owner) continue;
         const auto type = enum_type(program.enumerations[index]);
         std::optional<EvalValue> previous;
         for (std::size_t item = 0; item < program.enumerations[index].enumerators.size(); ++item) {
+            if (through && index == through->declaration && item > through->enumerator) break;
+            struct RestorePosition {
+                Program& program;
+                std::optional<Program::EnumerationPosition> previous;
+                ~RestorePosition() { program.evaluation_enumerator_position = previous; }
+            } restore_position{program, program.evaluation_enumerator_position};
+            program.evaluation_enumerator_position = Program::EnumerationPosition{index, item};
             if (prepare && !program.enumerations[index].enumerators[item].value) {
                 auto initializer = std::move(program.enumerations[index].enumerators[item].initializer);
                 prepare(initializer);
@@ -9453,6 +9509,123 @@ EnumDecl copy_evaluation_declaration(const EnumDecl& source) {
     return result;
 }
 
+namespace {
+void validate_static_assertion(Program& program, Diagnostics& diagnostics,
+    const StaticAssertDecl& assertion, const FunctionDecl* caller = nullptr,
+    const LayoutQuery* size_of = nullptr, const LayoutQuery* align_of = nullptr) {
+    Evaluator evaluator(program, diagnostics, caller, assertion.source_namespace, size_of, align_of);
+    const auto value = evaluator.required_scalar(*assertion.condition);
+    if (!value) {
+        diagnostics.error(assertion.location,
+            "$::static_assert condition is not a scalar constant expression");
+        evaluator.diagnose(assertion.location);
+    } else if (!value->truthy()) {
+        diagnostics.error(assertion.location, "$::static_assert failed: " + assertion.message);
+    }
+}
+} // namespace
+
+struct ExpansionSemantics::Impl {
+    Program& program;
+    Diagnostics& diagnostics;
+    std::string mangling;
+    GenericExpansionState state;
+    std::unordered_set<std::size_t> active_enumerations;
+    std::size_t next_assertion{};
+    std::function<bool(const TypePtr&)> previous_type;
+    std::function<bool(Program::EnumerationPosition)> previous_enumerator;
+
+    Impl(Program& declarations, Diagnostics& errors, std::string model,
+         GenericAbiCanonicalizer canonical_abi)
+        : program(declarations), diagnostics(errors), mangling(std::move(model)),
+          previous_type(std::move(program.evaluation_prepare_type)),
+          previous_enumerator(std::move(program.evaluation_prepare_enumerator)) {
+        state.expansion_evaluation = true;
+        state.canonical_abi = std::move(canonical_abi);
+        state.pointer_resolver = program.evaluation_pointer_resolver;
+        program.evaluation_prepare_type = [this](const TypePtr& type) {
+            if (!type) return true;
+            const auto errors = diagnostics.errors();
+            rewrite_generic_type_bounds(type, nullptr, program, diagnostics, state, mangling);
+            const bool ready = type->kind != Type::Kind::Record ||
+                prepare_generic_record(type->nominal_key(), program, diagnostics, state, mangling);
+            return ready && diagnostics.errors() == errors;
+        };
+        program.evaluation_prepare_enumerator = [this](Program::EnumerationPosition position) {
+            if (position.declaration >= program.enumerations.size() ||
+                position.enumerator >= program.enumerations[position.declaration].enumerators.size()) return false;
+            if (const auto& owner = program.enumerations[position.declaration].nominal_identity;
+                owner && owner->generic_owner) return false;
+            if (const auto active = program.evaluation_enumerator_position; active &&
+                (position.declaration > active->declaration ||
+                 (position.declaration == active->declaration && position.enumerator >= active->enumerator)))
+                return false;
+            if (!active_enumerations.insert(position.declaration).second) return false;
+            struct Pop {
+                std::unordered_set<std::size_t>& active;
+                std::size_t index;
+                ~Pop() { active.erase(index); }
+            } pop{active_enumerations, position.declaration};
+            // A nested enum dependency must not inherit an outer function's
+            // automatic-name classification while preparing generic arguments.
+            auto locals = std::move(state.locals);
+            auto local_types = std::move(state.local_types);
+            state.locals.clear();
+            state.local_types.clear();
+            const auto result = evaluate_enumerations(program, diagnostics, position.declaration,
+                [this](std::unique_ptr<Expr>& expression) {
+                    rewrite_generic_expr(expression, nullptr, program, diagnostics, state, mangling);
+                }, position);
+            state.locals = std::move(locals);
+            state.local_types = std::move(local_types);
+            return result;
+        };
+    }
+
+    ~Impl() {
+        program.evaluation_prepare_type = std::move(previous_type);
+        program.evaluation_prepare_enumerator = std::move(previous_enumerator);
+    }
+};
+
+ExpansionSemantics::ExpansionSemantics(Program& program, Diagnostics& diagnostics,
+    std::string mangling, GenericAbiCanonicalizer canonical_abi)
+    : impl_(std::make_unique<Impl>(program, diagnostics, std::move(mangling), std::move(canonical_abi))) {}
+
+ExpansionSemantics::~ExpansionSemantics() = default;
+
+std::unique_ptr<FunctionDecl> ExpansionSemantics::prepare(const FunctionDecl& function) {
+    auto result = copy_evaluation_declaration(function);
+    const auto errors = impl_->diagnostics.errors();
+    rewrite_generic_function(*result, impl_->program, impl_->diagnostics, impl_->state, impl_->mangling);
+    // Entry clones are invocation-local. Only declaration-view helper bodies
+    // and concrete instances have stable identities in the persistent cache.
+    impl_->state.rewritten_functions.erase(result.get());
+    if (impl_->diagnostics.errors() == errors) validate_assertions();
+    return impl_->diagnostics.errors() == errors ? std::move(result) : nullptr;
+}
+
+bool ExpansionSemantics::validate_assertions() {
+    const auto errors = impl_->diagnostics.errors();
+    auto& assertions = impl_->program.static_assertions;
+    // Both rewriting and evaluation can instantiate further helpers and append
+    // assertions. Keep the active declaration outside the growable vector.
+    while (impl_->next_assertion < assertions.size() && impl_->diagnostics.errors() == errors) {
+        const auto index = impl_->next_assertion++;
+        auto assertion = std::move(assertions[index]);
+        FunctionDecl context;
+        context.source_namespace = assertion.source_namespace;
+        if (assertion.location.file)
+            context.source_unit = assertion.location.file->source_unit_at(assertion.location.line);
+        rewrite_generic_expr(assertion.condition, &context, impl_->program,
+            impl_->diagnostics, impl_->state, impl_->mangling);
+        if (impl_->diagnostics.errors() == errors)
+            validate_static_assertion(impl_->program, impl_->diagnostics, assertion, &context);
+        assertions[index] = std::move(assertion);
+    }
+    return impl_->diagnostics.errors() == errors;
+}
+
 bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls, std::string_view mangling,
                       std::string_view default_abi,
@@ -9535,21 +9708,7 @@ bool finalize_target_constants(Program& program, Diagnostics& diagnostics,
         replace_eval_value(object->initializer, *value);
     }
     for (const auto& assertion : program.static_assertions) {
-        Evaluator evaluator(program, diagnostics, nullptr,
-                            assertion.source_namespace, &size_of, &align_of);
-        const auto value = evaluator.required_scalar(*assertion.condition);
-        if (!value) {
-            diagnostics.error(
-                assertion.location,
-                "$::static_assert condition is not a scalar constant expression");
-            evaluator.diagnose(assertion.location);
-            continue;
-        }
-        if (!value->truthy()) {
-            diagnostics.error(assertion.location,
-                              "$::static_assert failed: " +
-                                  assertion.message);
-        }
+        validate_static_assertion(program, diagnostics, assertion, nullptr, &size_of, &align_of);
     }
     const auto align_locals = [&](auto&& self, Statement& statement,
                                   std::string_view source_namespace) -> void {

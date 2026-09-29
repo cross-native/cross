@@ -312,7 +312,8 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                        std::vector<Replacement>& removals,
                                        Diagnostics& diagnostics,
                                        unsigned address_bits,
-                                       bool syntax_expanders = false) {
+                                       bool syntax_expanders = false,
+                                       std::shared_ptr<const SyntaxContext> definition_context = {}) {
     std::vector<TokenMacro> macros;
     const auto regions = namespace_regions(tokens);
     for (std::size_t index = 0; index < tokens.size(); ++index) {
@@ -409,8 +410,10 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         function.name = name;
         function.location = tokens[index].location;
         function.return_type = tokens_type();
-        function.source_namespace = current_namespace;
-        function.imports = active_imports(tokens, index);
+        function.source_namespace = definition_context ? definition_context->name_space : current_namespace;
+        function.imports = definition_context ? definition_context->imports : active_imports(tokens, index);
+        if (function.location.file)
+            function.source_unit = function.location.file->source_unit_at(function.location.line);
         function.linkage = Linkage::Static;
         auto parameter_type = syntax_expander ? syntax_match_type() : tokens_type();
         parameter_type->is_const = local_const;
@@ -420,7 +423,7 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
             tokens.begin() + static_cast<std::ptrdiff_t>(*body_end + 1));
         body_tokens.push_back({TokenKind::End, {}, tokens[*body_end].location});
         Parser parser(std::move(body_tokens), diagnostics, {}, address_bits);
-        auto body = parser.parse_procedural_body(function);
+        auto body = parser.parse_procedural_body(function, definition_context);
         if (!body) continue;
         const auto declaration_end =
             tokens[*body_end].location.offset + tokens[*body_end].text.size();
@@ -649,7 +652,7 @@ std::vector<SourceExpansion> remap_expansions(
 
 std::optional<ExpansionFunctionSource> parse_expansion_function(
     const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
-    unsigned address_bits) {
+    unsigned address_bits, std::shared_ptr<const SyntaxContext> definition_context) {
     const auto begin = index;
     auto end = index;
     for (auto at = index + 3; at < tokens.size() && tokens[at].kind != TokenKind::End; ++at) {
@@ -668,7 +671,7 @@ std::optional<ExpansionFunctionSource> parse_expansion_function(
     std::vector<Replacement> removals;
     const auto errors_before = diagnostics.errors();
     auto functions = collect_macros(bounded, removals, diagnostics,
-                                    address_bits, true);
+                                    address_bits, true, std::move(definition_context));
     if (functions.size() != 1 || diagnostics.errors() != errors_before) return {};
     return ExpansionFunctionSource{std::move(functions.front().function), functions.front().syntax_expander};
 }

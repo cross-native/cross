@@ -47,7 +47,8 @@ public:
     Program parse();
     // Parse a macro's braced body with the ordinary statement/expression
     // grammar, enabling translation-only token types and quotation.
-    std::unique_ptr<Statement> parse_procedural_body(FunctionDecl& function);
+    std::unique_ptr<Statement> parse_procedural_body(FunctionDecl& function,
+        std::shared_ptr<const SyntaxContext> definition_context = {});
     // Read-only, bounded recognition using the same core grammar. The returned
     // tree preserves source tokens; speculative state never escapes this call.
     std::optional<SyntaxParsedFragment> parse_syntax_fragment(

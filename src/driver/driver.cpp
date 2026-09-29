@@ -45,6 +45,96 @@
 namespace cross {
 namespace {
 
+template <typename LayoutFor>
+void install_evaluation_layout_queries(Program& current, const TargetInfo* target, LayoutFor layout_for) {
+    current.evaluation_size_of = [layout_for, target](const TypePtr& type)
+        -> std::optional<std::uint64_t> {
+        const auto layout = layout_for(type);
+        if (!layout) return {};
+        return hir::layout_size(*layout, layout->intern_type(type), *target);
+    };
+    current.evaluation_align_of = [layout_for, target](const TypePtr& type)
+        -> std::optional<std::uint64_t> {
+        const auto layout = layout_for(type);
+        if (!layout) return {};
+        return hir::layout_alignment(*layout, layout->intern_type(type), *target);
+    };
+    current.evaluation_member_layout = [layout_for](
+        const TypePtr& owner, std::string_view name)
+        -> std::optional<EvaluationMemberLayout> {
+        const auto layout = layout_for(owner);
+        if (!layout) return {};
+        const auto id = layout->intern_type(owner);
+        const auto& type = layout->type(id);
+        if (!type.record) return std::nullopt;
+        const auto* member = layout->member(*type.record, name);
+        if (!member) return std::nullopt;
+        return EvaluationMemberLayout{
+            member->offset, member->alignment,
+            member->bit_width, member->bit_offset};
+    };
+    current.evaluation_initializer_plan = [layout_for, target, &current](
+        const Expr& expression, const TypePtr& destination) {
+        const auto layout = layout_for(destination);
+        if (!layout) return EvaluationInitializerPlan{.items = {}, .valid = false,
+            .error_location = expression.location,
+            .error_message = "target layout is unavailable for this initializer"};
+        // The shared planner owns selection, duplicate checking, and
+        // physical placement; the evaluator consumes source types only.
+        const auto type_hash = [](hir::TypeId id) { return std::hash<std::uint32_t>{}(id.value); };
+        std::unordered_map<hir::TypeId, TypePtr, decltype(type_hash)> source_types(0, type_hash);
+        const auto visit = [&](const auto& self, const TypePtr& type) -> void {
+            if (!type) return;
+            const auto id = layout->intern_type(type);
+            if (!source_types.emplace(id, type).second) return;
+            self(self, type->element);
+            if (type->kind != Type::Kind::Record) return;
+            for (const auto& record : current.records) {
+                if (record.nominal_key() != type->nominal_key() || !record.complete) continue;
+                for (const auto& member : record.members) self(self, member.type);
+                break;
+            }
+        };
+        visit(visit, destination);
+        std::ostringstream output;
+        Diagnostics quiet(output);
+        const auto plan = initializer::build(expression,
+            layout->intern_type(destination), *layout, *target, quiet);
+        EvaluationInitializerPlan result;
+        result.valid = plan.valid;
+        result.error_location = plan.error_location;
+        result.error_message = plan.error_message;
+        for (const auto& item : plan.items) {
+            const auto found = source_types.find(item.type);
+            if (found == source_types.end()) { result.valid = false; break; }
+            result.items.push_back({item.expression, found->second,
+                {item.offset, item.alignment, item.bit_width, item.bit_offset}});
+        }
+        return result;
+    };
+}
+
+void install_early_evaluation_layout(Program& program, const CompilerOptions& options, const TargetInfo* target) {
+    // Generic publication changes the source tables. Build an isolated lazy
+    // view per early query; do not cache pointers into growing declaration
+    // vectors or force unrelated templates/required expressions.
+    auto active_layout_queries = std::make_shared<std::vector<TypePtr>>();
+    install_evaluation_layout_queries(program, target, [&, target, active_layout_queries](const TypePtr& type) -> std::shared_ptr<hir::Module> {
+        if (active_layout_queries->size() >= program.evaluation_limits.depth ||
+            std::any_of(active_layout_queries->begin(), active_layout_queries->end(),
+                [&](const auto& active) { return same_type(active, type); })) return {};
+        active_layout_queries->push_back(type);
+        struct Pop { std::vector<TypePtr>& values; ~Pop() { values.pop_back(); } }
+            pop{*active_layout_queries};
+        if (program.evaluation_prepare_type && !program.evaluation_prepare_type(type)) return {};
+        std::ostringstream output;
+        Diagnostics quiet(output);
+        auto layout = std::make_shared<hir::Module>(
+            hir::build_required_layout_context(program, options, *target, quiet, type));
+        return quiet.errors() == 0 ? std::move(layout) : nullptr;
+    });
+}
+
 void print_targets() {
     for (const auto* target : all_targets()) {
         std::cout << target->architecture << "  triples:";
@@ -794,6 +884,23 @@ int cc_main(int argc, char** argv) {
     const auto* target = target_for_triple(options.target);
     auto subtarget = resolve_subtarget(*target, options, diagnostics);
     if (!subtarget) return 1;
+    const GenericAbiCanonicalizer canonical_abi =
+        [&](std::string_view name) -> std::optional<std::string> {
+            const auto* abi = find_abi(*target,
+                name.empty() ? std::string_view(options.abi) : name,
+                options.target);
+            return abi ? std::optional<std::string>(abi->canonical_name)
+                       : std::nullopt;
+        };
+    const EvaluationLayoutInstaller install_expansion_evaluation = [&](Program& current) {
+        install_early_evaluation_layout(current, options, target);
+        current.evaluation_pointer_resolver = [&current, &options, &subtarget, &diagnostics](
+            std::unique_ptr<Expr>& expression, const TypePtr& destination,
+            const FunctionDecl* caller, std::span<const NameKey> locals) {
+            return data::normalize_generic_pointer(current, expression, destination,
+                caller, locals, options, *subtarget, diagnostics);
+        };
+    };
     Program program;
     program.address_bits = subtarget->abi_info().address_bits;
     program.evaluation_limits = {
@@ -836,7 +943,8 @@ int cc_main(int argc, char** argv) {
             // This scan only enables the engine; it registers nothing.
             execution = std::make_shared<SyntaxExecution>(sources, diagnostics,
                 program.address_bits, macro_size, macro_align,
-                program.evaluation_limits, program.evaluation_layout);
+                program.evaluation_limits, program.evaluation_layout,
+                install_expansion_evaluation, options.mangling, canonical_abi);
             break;
         }
         if (diagnostics.errors() != 0) return 1;
@@ -868,14 +976,6 @@ int cc_main(int argc, char** argv) {
             return data::normalize_generic_pointer(program, expression, destination,
                 caller, locals, options, *subtarget, diagnostics);
         };
-    const GenericAbiCanonicalizer canonical_abi =
-        [&](std::string_view name) -> std::optional<std::string> {
-            const auto* abi = find_abi(*target,
-                name.empty() ? std::string_view(options.abi) : name,
-                options.target);
-            return abi ? std::optional<std::string>(abi->canonical_name)
-                       : std::nullopt;
-        };
     program.evaluation_pointer_resolver = [&](std::unique_ptr<Expr>& expression,
         const TypePtr& destination, const FunctionDecl* caller, std::span<const NameKey> locals) {
         // An automatic attempt may defer to runtime without speculative diagnostics.
@@ -884,96 +984,12 @@ int cc_main(int argc, char** argv) {
         return data::normalize_generic_pointer(program, expression, destination,
             caller, locals, options, *subtarget, quiet);
     };
-    const auto install_layout_queries = [target](Program& current, auto layout_for) {
-        current.evaluation_size_of = [layout_for, target](const TypePtr& type)
-            -> std::optional<std::uint64_t> {
-            const auto layout = layout_for(type);
-            if (!layout) return {};
-            return hir::layout_size(*layout, layout->intern_type(type), *target);
-        };
-        current.evaluation_align_of = [layout_for, target](const TypePtr& type)
-            -> std::optional<std::uint64_t> {
-            const auto layout = layout_for(type);
-            if (!layout) return {};
-            return hir::layout_alignment(*layout, layout->intern_type(type), *target);
-        };
-        current.evaluation_member_layout = [layout_for](
-            const TypePtr& owner, std::string_view name)
-            -> std::optional<EvaluationMemberLayout> {
-            const auto layout = layout_for(owner);
-            if (!layout) return {};
-            const auto id = layout->intern_type(owner);
-            const auto& type = layout->type(id);
-            if (!type.record) return std::nullopt;
-            const auto* member = layout->member(*type.record, name);
-            if (!member) return std::nullopt;
-            return EvaluationMemberLayout{
-                member->offset, member->alignment,
-                member->bit_width, member->bit_offset};
-        };
-        current.evaluation_initializer_plan = [layout_for, target, &current](
-            const Expr& expression, const TypePtr& destination) {
-            const auto layout = layout_for(destination);
-            if (!layout) return EvaluationInitializerPlan{.items = {}, .valid = false,
-                .error_location = expression.location,
-                .error_message = "target layout is unavailable for this initializer"};
-            // The shared planner owns selection, duplicate checking, and
-            // physical placement; the evaluator consumes source types only.
-            const auto type_hash = [](hir::TypeId id) { return std::hash<std::uint32_t>{}(id.value); };
-            std::unordered_map<hir::TypeId, TypePtr, decltype(type_hash)> source_types(0, type_hash);
-            const auto visit = [&](const auto& self, const TypePtr& type) -> void {
-                if (!type) return;
-                const auto id = layout->intern_type(type);
-                if (!source_types.emplace(id, type).second) return;
-                self(self, type->element);
-                if (type->kind != Type::Kind::Record) return;
-                for (const auto& record : current.records) {
-                    if (record.nominal_key() != type->nominal_key() || !record.complete) continue;
-                    for (const auto& member : record.members) self(self, member.type);
-                    break;
-                }
-            };
-            visit(visit, destination);
-            std::ostringstream output;
-            Diagnostics quiet(output);
-            const auto plan = initializer::build(expression,
-                layout->intern_type(destination), *layout, *target, quiet);
-            EvaluationInitializerPlan result;
-            result.valid = plan.valid;
-            result.error_location = plan.error_location;
-            result.error_message = plan.error_message;
-            for (const auto& item : plan.items) {
-                const auto found = source_types.find(item.type);
-                if (found == source_types.end()) { result.valid = false; break; }
-                result.items.push_back({item.expression, found->second,
-                    {item.offset, item.alignment, item.bit_width, item.bit_offset}});
-            }
-            return result;
-        };
-    };
-    // Generic publication changes the source tables. Build an isolated lazy
-    // view per early query; do not cache pointers into growing declaration
-    // vectors or force unrelated templates/required expressions.
-    std::vector<TypePtr> active_layout_queries;
-    install_layout_queries(program, [&](const TypePtr& type) -> std::shared_ptr<hir::Module> {
-        if (active_layout_queries.size() >= program.evaluation_limits.depth ||
-            std::any_of(active_layout_queries.begin(), active_layout_queries.end(),
-                [&](const auto& active) { return same_type(active, type); })) return {};
-        active_layout_queries.push_back(type);
-        struct Pop { std::vector<TypePtr>& values; ~Pop() { values.pop_back(); } }
-            pop{active_layout_queries};
-        if (program.evaluation_prepare_type && !program.evaluation_prepare_type(type)) return {};
-        std::ostringstream output;
-        Diagnostics quiet(output);
-        auto layout = std::make_shared<hir::Module>(
-            hir::build_required_layout_context(program, options, *target, quiet, type));
-        return quiet.errors() == 0 ? std::move(layout) : nullptr;
-    });
+    install_early_evaluation_layout(program, options, target);
     const EvaluationLayoutInstaller install_layout = [&](Program& current) {
         auto layout = std::make_shared<hir::Module>(
             hir::build_record_layout_context(current, options, *target, diagnostics));
         if (diagnostics.errors() != 0) return;
-        install_layout_queries(current, [layout](const TypePtr&) { return layout; });
+        install_evaluation_layout_queries(current, target, [layout](const TypePtr&) { return layout; });
     };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
                           options.mangling, options.abi, pointer_resolver,

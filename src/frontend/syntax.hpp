@@ -182,7 +182,9 @@ public:
     using FunctionId = SyntaxFunctionId;
     SyntaxExecution(SourceManager& sources, Diagnostics& diagnostics,
                     unsigned address_bits, LayoutQuery size_of, LayoutQuery align_of,
-                    EvaluationLimits limits, EvaluationLayout layout);
+                    EvaluationLimits limits, EvaluationLayout layout,
+                    EvaluationLayoutInstaller install_evaluation = {},
+                    std::string mangling = {}, GenericAbiCanonicalizer canonical_abi = {});
     std::vector<Token> prepare(const SourceFile& source);
     void publish_declarations(const Program& program,
         std::span<const RecordDecl> pending_records = {},
@@ -250,6 +252,7 @@ private:
     EvaluationLayout layout_;
     std::vector<Function> functions_;
     Program declarations_;
+    std::unique_ptr<ExpansionSemantics> semantics_;
     std::unordered_set<const FunctionDecl*> published_functions_;
     std::unordered_set<const ObjectDecl*> published_objects_;
     std::unordered_map<NominalTypeKey, bool, NominalTypeKeyHash> published_records_;

@@ -449,12 +449,20 @@ struct EvaluationInitializerPlan {
 };
 
 struct Program {
+    struct EnumerationPosition {
+        std::size_t declaration{};
+        std::size_t enumerator{};
+    };
     unsigned address_bits{64};
     EvaluationLimits evaluation_limits;
     EvaluationLayout evaluation_layout;
     // Installed only while semantic instantiation is active. A reached target
     // layout dependency may need its required expressions prepared first.
     std::function<bool(const TypePtr&)> evaluation_prepare_type;
+    // Optional demand-driven preparation for early expansion evaluation. The
+    // active position keeps later enumerators unavailable to an initializer.
+    std::function<bool(EnumerationPosition)> evaluation_prepare_enumerator;
+    std::optional<EnumerationPosition> evaluation_enumerator_position;
     // Installed after semantic declarations are available; the target owns
     // nominal layout even when evaluation precedes final HIR lowering.
     std::function<std::optional<std::uint64_t>(const TypePtr&)>

@@ -47,6 +47,21 @@ std::unique_ptr<ObjectDecl> copy_evaluation_declaration(const ObjectDecl& declar
 RecordDecl copy_evaluation_declaration(const RecordDecl& declaration);
 EnumDecl copy_evaluation_declaration(const EnumDecl& declaration);
 
+// Persistent, demand-driven preparation for a growing expansion declaration
+// view. It uses ordinary generic instantiation without removing templates or
+// assigning any runtime transport to an expansion function.
+class ExpansionSemantics {
+public:
+    ExpansionSemantics(Program& declarations, Diagnostics& diagnostics,
+        std::string mangling, GenericAbiCanonicalizer canonical_abi);
+    ~ExpansionSemantics();
+    std::unique_ptr<FunctionDecl> prepare(const FunctionDecl& function);
+    bool validate_assertions();
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 struct SyntaxNode;
 enum class SyntaxParseCategory;
 using SyntaxParseCallback = std::function<std::shared_ptr<const SyntaxNode>(

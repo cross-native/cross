@@ -33,7 +33,7 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
 // captured inputs for declarations. Advances index past the bounded source.
 std::optional<ExpansionFunctionSource> parse_expansion_function(
     const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
-    unsigned address_bits);
+    unsigned address_bits, std::shared_ptr<const SyntaxContext> definition_context = {});
 
 // Executes explicit token macro invocations after ordinary preprocessing and
 // before the resulting token region is parsed as Cross.

@@ -5840,7 +5840,10 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
     return expression;
 }
 
-std::unique_ptr<Statement> Parser::parse_procedural_body(FunctionDecl& function) {
+std::unique_ptr<Statement> Parser::parse_procedural_body(FunctionDecl& function,
+    std::shared_ptr<const SyntaxContext> definition_context) {
+    if (definition_context && definition_context->parse_environment)
+        restore_environment(*definition_context->parse_environment, *definition_context);
     const auto previous_function = active_function_;
     const auto previous_namespace = active_namespace_;
     const auto previous_imports = active_imports_;

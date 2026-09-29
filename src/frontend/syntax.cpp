@@ -363,9 +363,17 @@ bool validate_pattern_progress(const Pattern& root, PatternAnalysis& analysis,
 
 SyntaxExecution::SyntaxExecution(SourceManager& sources, Diagnostics& diagnostics,
     unsigned address_bits, LayoutQuery size_of, LayoutQuery align_of,
-    EvaluationLimits limits, EvaluationLayout layout)
+    EvaluationLimits limits, EvaluationLayout layout, EvaluationLayoutInstaller install_evaluation,
+    std::string mangling, GenericAbiCanonicalizer canonical_abi)
     : sources_(sources), diagnostics_(diagnostics), address_bits_(address_bits),
-      size_of_(std::move(size_of)), align_of_(std::move(align_of)), limits_(limits), layout_(layout) {}
+      size_of_(std::move(size_of)), align_of_(std::move(align_of)), limits_(limits), layout_(layout) {
+    declarations_.address_bits = address_bits_;
+    declarations_.evaluation_limits = limits_;
+    declarations_.evaluation_layout = layout_;
+    if (install_evaluation) install_evaluation(declarations_);
+    semantics_ = std::make_unique<ExpansionSemantics>(declarations_, diagnostics_,
+        std::move(mangling), std::move(canonical_abi));
+}
 
 std::vector<Token> SyntaxExecution::prepare(const SourceFile& source) {
     return Lexer(source, diagnostics_).lex();
@@ -398,8 +406,13 @@ void SyntaxExecution::publish_declarations(const Program& program,
 bool SyntaxExecution::define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
     const std::vector<std::string>& imports, const std::vector<SyntaxBinding>& bindings,
     std::shared_ptr<const SyntaxParseEnvironment> environment) {
-    auto function = parse_expansion_function(tokens, index, diagnostics_,
-                                             address_bits_);
+    auto context = std::make_shared<SyntaxContext>();
+    context->kind = SyntaxContext::Kind::DefinitionSite;
+    context->name_space = name_space;
+    context->imports = imports;
+    context->syntax_bindings = bindings;
+    context->parse_environment = environment;
+    auto function = parse_expansion_function(tokens, index, diagnostics_, address_bits_, std::move(context));
     if (!function) return false;
     auto& declaration = function->function;
     declaration.name = join(name_space, declaration.name);
@@ -569,11 +582,19 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
         std::shared_ptr<const SyntaxContext> context, SourceLocation location) {
         return parse_tokens(category, tokens, std::move(context), location);
     };
+    auto prepared = semantics_->prepare(function.declaration);
+    if (!prepared) {
+        diagnostics_.note(invocation, "while preparing expansion '" + function.declaration.name + "'");
+        return {};
+    }
+    const auto& size_of = declarations_.evaluation_size_of ? declarations_.evaluation_size_of : size_of_;
+    const auto& align_of = declarations_.evaluation_align_of ? declarations_.evaluation_align_of : align_of_;
     auto output = function.syntax_expander
-        ? evaluate_syntax_body(function.declaration, std::move(match), address_bits_, size_of_, align_of_,
+        ? evaluate_syntax_body(*prepared, std::move(match), address_bits_, size_of, align_of,
                                definition, diagnostics_, limits_, layout_, parse, call, &declarations_)
-        : evaluate_procedural_body(function.declaration, input, address_bits_, size_of_, align_of_,
+        : evaluate_procedural_body(*prepared, input, address_bits_, size_of, align_of,
                                    definition, diagnostics_, limits_, layout_, parse, call, &declarations_);
+    if (output && !semantics_->validate_assertions()) output.reset();
     if (!output) {
         diagnostics_.note(function.declaration.location, "expansion function is defined here");
         if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
