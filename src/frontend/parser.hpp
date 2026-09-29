@@ -151,6 +151,7 @@ private:
         SourceLocation location, std::string name, TypePtr type, Linkage linkage,
         std::vector<Attribute> attributes, bool consume_semicolon = true);
     ParameterDecl parse_parameter(unsigned ordinal);
+    void parse_parameter_list(std::vector<ParameterDecl>& parameters, bool& variadic);
 
     std::unique_ptr<Statement> parse_statement();
     std::unique_ptr<Statement> parse_unattributed_statement(std::vector<Attribute> attributes);

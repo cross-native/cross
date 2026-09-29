@@ -170,6 +170,13 @@ namespace Source {
 [[macro]] static $::meta::tokens parameter_fragment(in $::meta::tokens name) {
     return $::quote { in u32 $::unquote(name) };
 }
+[[macro]] static $::meta::tokens parameter_list_fragment(in $::meta::tokens input) {
+    return input;
+}
+[[macro]] static $::meta::tokens nested_parameter_list(in $::meta::tokens input) {
+    return $::quote { parameter_list_fragment!($::unquote(input)) };
+}
+global volatile u32 header_runtime_seed = 5u32;
 [[noinline]] static u32 suffix_function declarator_function!(value) {
     return value + 3u32;
 }
@@ -195,8 +202,32 @@ syntax CopyParameterHeader;
 copy_parameter_header [[noinline]] static u32 header_function(parameter_fragment!(value)) {
     return value + 4u32;
 }
+copy_parameter_header [[noinline]] static u32 empty_parameter_function(parameter_list_fragment!()) {
+    return header_runtime_seed + 1u32;
+}
+copy_parameter_header [[noinline]] static u32 void_parameter_function(void parameter_list_fragment!()) {
+    return header_runtime_seed + 2u32;
+}
+copy_parameter_header [[noinline]] static u32 list_parameter_function(
+    nested_parameter_list!(in u32 left, in u32 right)) { return left + right; }
+typedef u32 (*EmptyCallback)(nested_parameter_list!(void));
+[[noinline]] static u32 dispatch_empty(in EmptyCallback function) { return function(); }
+#if $::has_feature($::feature::variadics)
 #ifdef CUSTOM_SYNTAX_ABI
-global volatile u32 header_runtime_seed = 5u32;
+// The odd-register model intentionally has no variadic transport. Exercise an
+// explicit supported ABI boundary without inventing a fallback for that model.
+#define PARAMETER_VARIADIC_ABI [[abi(HOST_ABI)]]
+#else
+#define PARAMETER_VARIADIC_ABI
+#endif
+copy_parameter_header PARAMETER_VARIADIC_ABI [[noinline]] static u32 variadic_parameter_function(
+    in u32 value, parameter_list_fragment!(...)) { return value + header_runtime_seed; }
+typedef u32 (*VariadicCallback)(in u32 value, nested_parameter_list!(...)) PARAMETER_VARIADIC_ABI;
+[[noinline]] static u32 dispatch_variadic(in VariadicCallback function, in u32 value) {
+    return function(value, 9u32);
+}
+#endif
+#ifdef CUSTOM_SYNTAX_ABI
 [[syntax_expander]] static $::meta::tokens assign_header_abi(in $::meta::syntax_match input) {
     return $::quote {
         [[abi($::unquote($::syntax::capture(input, "abi")))]]
@@ -289,6 +320,9 @@ copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 v
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
+#if $::has_feature($::feature::variadics)
+    if (dispatch_variadic(&variadic_parameter_function, 8u32) != 13u32) return 0u32;
+#endif
 #ifdef CUSTOM_SYNTAX_ABI
     u32 seed = header_runtime_seed;
     struct HeaderMemoryResult memory = memory_header_function(seed);
@@ -358,6 +392,9 @@ global u32 syntax_raw_entry() {
         copied_array[1] != 8u32 ||
         suffix_function(5u32) != 8u32 || parameter_function(5u32) != 7u32 ||
         header_function(5u32) != 9u32 || prototype_function(5u32) != 10u32 ||
+        dispatch_empty(&empty_parameter_function) != 6u32 ||
+        dispatch_empty(&void_parameter_function) != 7u32 ||
+        list_parameter_function(3u32, 4u32) != 7u32 ||
         copied_function(5u32) != 11u32 ||
         deferred_copied_function(5u32) != 12u32 ||
         deferred_body_function(5u32) != 13u32 ||

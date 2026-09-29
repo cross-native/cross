@@ -2393,24 +2393,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         std::vector<ParameterDecl> parameters;
         bool variadic = false;
         try {
-            ProductionScope list(*this, SyntaxProduction::ParameterList);
-            if (!current().is(")")) {
-                if (current().is("void") && current(1).is(")")) {
-                    ++index_;
-                } else {
-                    unsigned ordinal = 0;
-                    for (;;) {
-                        if (consume("...")) {
-                            variadic = true;
-                            break;
-                        }
-                        const auto before = index_;
-                        parameters.push_back(parse_parameter(ordinal++));
-                        if (index_ == before || !consume(","))
-                            break;
-                    }
-                }
-            }
+            parse_parameter_list(parameters, variadic);
         } catch (const DeferredNameRecognition&) {
             if (!allow_public_parameter_deferral_ || !end_input ||
                 !parameter_context || !parameter_context->parse_environment ||
@@ -3664,6 +3647,35 @@ bool Parser::parse_static_assertion() {
     return true;
 }
 
+void Parser::parse_parameter_list(std::vector<ParameterDecl>& parameters, bool& variadic) {
+    ProductionScope list(*this, SyntaxProduction::ParameterList);
+    // A fragment may supply no parameters, the lone void spelling, a list,
+    // or its final ellipsis. Decide only after expansion; speculative capture
+    // still throws before running any nested invocation.
+    expand_inline_macro_fragments();
+    if (current().is(")")) return;
+    if (current().is("void")) {
+        const auto first = index_++;
+        expand_inline_macro_fragments();
+        index_ = first;
+        if (current(1).is(")")) { ++index_; return; }
+    }
+    unsigned ordinal = 0;
+    for (;;) {
+        expand_inline_macro_fragments();
+        if (consume("...")) {
+            variadic = true;
+            expand_inline_macro_fragments();
+            return;
+        }
+        const auto before = index_;
+        parameters.push_back(parse_parameter(ordinal++));
+        // Empty output after a comma is not an empty list: it leaves an
+        // invalid trailing comma and must diagnose as an absent parameter.
+        if (index_ == before || !consume(",")) return;
+    }
+}
+
 ParameterDecl Parser::parse_parameter(unsigned ordinal) {
     expand_inline_macro_fragments();
     ProductionScope production(*this, SyntaxProduction::ParameterDeclaration);
@@ -3741,22 +3753,8 @@ Parser::parse_function(SourceLocation location, std::string name,
         }
     } else {
         expect("(");
-        if (!consume(")")) {
-            if (current().is("void") && current(1).is(")")) {
-                ++index_;
-            } else {
-                unsigned ordinal = 0;
-                for (;;) {
-                    if (consume("...")) {
-                        function->variadic = true;
-                        break;
-                    }
-                    function->parameters.push_back(parse_parameter(ordinal++));
-                    if (!consume(",")) break;
-                }
-            }
-            expect(")");
-        }
+        parse_parameter_list(function->parameters, function->variadic);
+        expect(")");
     }
     if (consume("->")) {
         const auto* location_token = consume_kind(TokenKind::String);

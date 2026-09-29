@@ -33,6 +33,49 @@ function(reject_splice case expected source)
     endif()
 endfunction()
 
+set(parameter_list_macros [=[
+[[macro]] static $::meta::tokens parameters(in $::meta::tokens input) { return input; }
+[[macro]] static $::meta::tokens nested_parameters(in $::meta::tokens input) {
+    return $::quote { parameters!($::unquote(input)) };
+}
+]=])
+foreach(mode macro_only syntax_enabled)
+    set(parameter_prefix "${parameter_list_macros}")
+    if(mode STREQUAL "syntax_enabled")
+        string(APPEND parameter_prefix "syntax ParserEnabled : rule { match \"not_used\"; }\n")
+    endif()
+    accept_splice(parameter_empty_${mode} "${parameter_prefix}
+static u32 empty(parameters!()) { return 1u32; }
+static u32 nested(nested_parameters!()) { return empty(); }
+typedef u32 (*Callback)(parameters!());
+static u32 call(in Callback function) { return function(); }
+global u32 entry() { return call(&nested); }")
+    accept_splice(parameter_void_${mode} "${parameter_prefix}
+static u32 empty(parameters!(void)) { return 1u32; }
+static u32 trailing(void parameters!()) { return empty(); }
+typedef u32 (*Callback)(nested_parameters!(void));
+static u32 call(in Callback function) { return function(); }
+global u32 entry() { return call(&trailing); }")
+    accept_splice(parameter_variadic_${mode} "${parameter_prefix}
+global u32 first(parameters!(in u32 value, ...));
+global u32 second(in u32 value, parameters!(...) parameters!());
+typedef u32 (*Callback)(nested_parameters!(in u32 value, ...));
+global u32 call(in Callback function) { return function(2u32, 3u32); }")
+    accept_splice(parameter_void_pointer_${mode} "${parameter_prefix}
+static void *first(void parameters!(*value)) { return value; }
+static void *second(parameters!(void) parameters!(*value)) { return value; }
+global void *entry(in void *value) { return first(second(value)); }")
+    accept_splice(parameter_empty_prefix_${mode} "${parameter_prefix}
+static u32 first(parameters!() in u32 value) { return value; }
+static u32 second(in u32 a, parameters!() in u32 b) { return a + b; }
+global u32 entry() { return first(second(2u32, 3u32)); }")
+    reject_splice(parameter_trailing_comma_${mode} "expected Cross type" "${parameter_prefix}
+global u32 function(in u32 value, parameters!());")
+    reject_splice(parameter_unnamed_variadic_${mode} "requires at least one named parameter"
+        "${parameter_prefix}
+global u32 function(parameters!(...));")
+endforeach()
+
 set(declaration_expander [=[
 [[syntax_expander]] static $::meta::tokens copy_decl(in $::meta::syntax_match input) {
     return $::quote { $::unquote($::syntax::node(input, "body")) };
