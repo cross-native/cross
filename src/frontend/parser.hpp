@@ -80,7 +80,9 @@ private:
     std::unique_ptr<Statement> parse_statement_replacement();
     std::unique_ptr<Expr> parse_expression_replacement();
 
-    std::vector<Attribute> parse_attributes(bool one_specifier = false);
+    enum class AttributeParseMode { Semantic, SyntaxOnly };
+    std::vector<Attribute> parse_attributes(bool one_specifier = false,
+        AttributeParseMode mode = AttributeParseMode::Semantic);
     void apply_type_attributes(
         TypePtr& type,
         std::optional<std::pair<std::uint32_t, SourceLocation>>*
@@ -117,8 +119,9 @@ private:
     void parse_external(Program& program, const std::string& name_space);
     void parse_external_node_splice(Program& program,
                                     const std::string& name_space);
+    std::optional<std::size_t> function_header_splice_position();
     void parse_function_header_splice(Program& program, const std::string& name_space,
-                                      std::size_t production_event);
+                                      std::size_t production_event, std::size_t header_index);
     void parse_typedef(const std::string& name_space,
                        std::vector<Attribute> attributes, TypePtr base_type,
                        SourceLocation location, bool consume_semicolon = true);

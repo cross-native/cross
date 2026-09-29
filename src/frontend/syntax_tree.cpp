@@ -370,14 +370,15 @@ const auto& public_tree_rules() {
             return rule;
         };
         set(P::Declaration, choice({declaration(true),
-            sequence({reference(P::FunctionHeader), terminal(";")})}));
+            sequence({attrs, reference(P::FunctionHeader), attrs, terminal(";")})}));
         set(P::DeclarationWithoutFinalSemicolon, declaration(false));
-        set(P::FunctionHeader, sequence({attrs, reference(P::DeclarationSpecifiers),
-            reference(P::Declarator), attrs}));
+        set(P::FunctionHeader, choice({
+            sequence({attrs, reference(P::DeclarationSpecifiers), reference(P::Declarator), attrs}),
+            sequence({attrs, reference(P::FunctionHeader), attrs})}));
         set(P::FunctionDefinition, choice({
             sequence({attrs, reference(P::DeclarationSpecifiers),
                 reference(P::Declarator), attrs, reference(P::CompoundStatement)}),
-            sequence({reference(P::FunctionHeader), reference(P::CompoundStatement)})}));
+            sequence({attrs, reference(P::FunctionHeader), attrs, reference(P::CompoundStatement)})}));
         set(P::TypeName, sequence({reference(P::DeclarationSpecifiers),
             optional(reference(P::AbstractDeclarator))}));
         set(P::DeclarationSpecifiers, sequence({reference(P::DeclarationSpecifier),

@@ -644,9 +644,10 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     }();
     std::shared_ptr<const SyntaxNode> deferred_root;
     try {
-        const bool header_splice = child->current().kind == TokenKind::StructuredSplice &&
-            child->current().splice && syntax_function_header_node(*child->current().splice);
-        if (kind == K::FunctionHeader && header_splice) {
+        const auto header_position = child->function_header_splice_position();
+        const bool header_splice = header_position.has_value();
+        if (kind == K::FunctionHeader && header_position == child->index_ &&
+            !child->current(1).is("[[")) {
             ProductionScope header(*child, SyntaxProduction::FunctionHeader);
             const auto item = child->current();
             ++child->index_;
@@ -1328,7 +1329,7 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
     return grouped;
 }
 
-std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
+std::vector<Attribute> Parser::parse_attributes(bool one_specifier, AttributeParseMode mode) {
     std::vector<Attribute> result;
     while (current().is("[[")) {
         ProductionScope attribute_specifier(*this, SyntaxProduction::AttributeSpecifier);
@@ -1367,7 +1368,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
                 const auto argument_first = index_;
                 const auto recording = recording_public_tree_;
                 recording_public_tree_ = false;
-                if (attribute.name == "generic") {
+                if (mode == AttributeParseMode::Semantic && attribute.name == "generic") {
                     const auto saved_generic_types = active_generic_types_;
                     while (!current().is(")") &&
                            current().kind != TokenKind::End) {
@@ -1431,7 +1432,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
                     }
                     expect(")", "after generic parameters");
                     active_generic_types_ = saved_generic_types;
-                } else if (attribute.name == "variadic") {
+                } else if (mode == AttributeParseMode::Semantic && attribute.name == "variadic") {
                     while (!current().is(")") && current().kind != TokenKind::End) {
                         const auto start = index_;
                         auto type = parse_type();
@@ -1450,7 +1451,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier) {
                         if (index_ == start || !consume(",")) break;
                     }
                     expect(")", "after variadic state bindings");
-                } else if (attribute.name == "aligned") {
+                } else if (mode == AttributeParseMode::Semantic && attribute.name == "aligned") {
                     while (!current().is(")") &&
                            current().kind != TokenKind::End) {
                         const auto start = index_;
@@ -2937,26 +2938,49 @@ void Parser::parse_external_node_splice(
         static_assertions_.push_back(std::move(assertion));
 }
 
+std::optional<std::size_t> Parser::function_header_splice_position() {
+    auto at = index_;
+    while (at < tokens_.size() && tokens_[at].is("[[")) {
+        const auto end = bounded_group_end(at);
+        if (!end) return {};
+        at = *end;
+    }
+    if (at < tokens_.size() && tokens_[at].kind == TokenKind::StructuredSplice &&
+        tokens_[at].splice && syntax_function_header_node(*tokens_[at].splice)) return at;
+    return {};
+}
+
 void Parser::parse_function_header_splice(
-    Program& program, const std::string& name_space, std::size_t production_event) {
+    Program& program, const std::string& name_space, std::size_t production_event,
+    std::size_t header_index) {
     const auto first = index_;
-    const auto item = current();
+    const auto item = tokens_[header_index];
+    const auto previous_errors = diagnostics_.errors();
+    // Record the published attribute trees now, but interpret all attributes
+    // together with the retained header in the bounded parser below. This
+    // keeps generic/ABI/variadic handling on the ordinary declaration path.
+    (void)parse_attributes(false, AttributeParseMode::SyntaxOnly);
     {
         ProductionScope header(*this, SyntaxProduction::FunctionHeader);
         ++index_;
         if (header.event < production_events_.size())
             production_events_[header.event].opaque = item.splice;
     }
+    const auto trailing_first = index_;
+    (void)parse_attributes(false, AttributeParseMode::SyntaxOnly);
+    const auto header_end = index_;
+    const bool header_only = parsing_public_function_header_;
     const bool body = current().is("{") ||
         (current().kind == TokenKind::StructuredSplice && current().splice &&
          syntax_compound_node(*current().splice));
-    if (!body && !current().is(";")) {
+    if (!header_only && !body && !current().is(";")) {
         error_here("structured function header requires a body or ';'");
         return;
     }
     const auto discard_tail = [&] {
         // A failed header still owns this already delimited tail. Do not
         // misdiagnose its body as a sequence of unrelated external items.
+        if (header_only) return;
         if (body && current().is("{")) {
             if (const auto end = bounded_group_end(index_)) index_ = *end;
         } else ++index_;
@@ -2967,39 +2991,53 @@ void Parser::parse_function_header_splice(
         discard_tail();
         return;
     }
-    if (body && production_event < production_events_.size())
-        production_events_[production_event].production = SyntaxProduction::FunctionDefinition;
+    const auto slot = header_only ? SyntaxProduction::FunctionHeader
+        : body ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration;
+    if (production_event < production_events_.size())
+        production_events_[production_event].production = slot;
     if (parsing_public_fragment_ && item.splice->kind == SyntaxNode::Kind::Deferred) {
         // The header has a proven category, but unknown parameter/type names.
         // Keep the whole composed unit deferred, including the header marker;
         // no speculative signature is allowed to classify its body.
-        auto end = body && current().is("{") ? bounded_group_end(index_)
-                                              : std::optional{index_ + 1};
+        auto end = header_only ? std::optional{header_end}
+            : body && current().is("{") ? bounded_group_end(index_)
+                                        : std::optional{index_ + 1};
         if (!end) {
             error_here("structured function header requires a balanced body");
             return;
         }
-        const auto slot = body ? SyntaxProduction::FunctionDefinition
-                               : SyntaxProduction::Declaration;
-        const auto category = body ? SyntaxParseCategory::FunctionDefinition
-                                   : SyntaxParseCategory::FunctionDeclaration;
+        const auto category = header_only ? SyntaxParseCategory::FunctionHeader
+            : body ? SyntaxParseCategory::FunctionDefinition : SyntaxParseCategory::FunctionDeclaration;
         if (production_event < production_events_.size())
             production_events_[production_event].opaque = deferred_node(
                 first, *end, slot, category,
                 production_events_[production_event].context);
         index_ = *end;
         auto function = std::make_unique<FunctionDecl>();
-        if (body) {
+        if (body && !header_only) {
             function->body = std::make_unique<Statement>();
             function->body->kind = Statement::Kind::Compound;
         }
         program.functions.push_back(std::move(function));
         return;
     }
-    const auto previous_errors = diagnostics_.errors();
-    auto output = syntax_->execution()->materialize_node(
+    const auto execution = syntax_->execution();
+    auto output = execution->materialize_node(
         *item.splice, item.location, SyntaxParseCategory::FunctionHeader);
     if (!output) { discard_tail(); return; }
+    const auto token_count = output->tokens.size() + (header_index - first) +
+        (header_end - trailing_first);
+    if (!execution->begin_fragment(item.location, token_count)) { discard_tail(); return; }
+    struct FragmentEnd {
+        SyntaxExecution& execution;
+        ~FragmentEnd() { execution.end_fragment(); }
+    } fragment_end{*execution};
+    output->tokens.insert(output->tokens.begin(),
+        tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+        tokens_.begin() + static_cast<std::ptrdiff_t>(header_index));
+    output->tokens.insert(output->tokens.end() - 1,
+        tokens_.begin() + static_cast<std::ptrdiff_t>(trailing_first),
+        tokens_.begin() + static_cast<std::ptrdiff_t>(header_end));
     auto child = replacement_parser(std::move(*output));
     if (item.splice->kind == SyntaxNode::Kind::Deferred)
         child->restore_deferred_environment(*item.splice->context->parse_environment,
@@ -3028,7 +3066,7 @@ void Parser::parse_function_header_splice(
     auto function = std::move(parsed.functions.front());
     if (function->generic_parameters.empty()) known_ordinary_values_.insert(function->name);
     else known_generic_functions_.insert(function->name);
-    if (body) {
+    if (body && !header_only) {
         struct Restore {
             Parser& parser;
             FunctionDecl* function;
@@ -3046,7 +3084,7 @@ void Parser::parse_function_header_splice(
         for (const auto& parameter : function->generic_parameters)
             if (!parameter.value_type) active_generic_types_.push_back(parameter.name);
         function->body = parse_compound();
-    } else expect(";", "after structured function header");
+    } else if (!header_only) expect(";", "after structured function header");
     program.functions.push_back(std::move(function));
     for (auto& assertion : child->static_assertions_)
         static_assertions_.push_back(std::move(assertion));
@@ -3056,6 +3094,10 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
     drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_
         ? SyntaxProduction::Declaration : SyntaxProduction::None);
+    if (const auto header_position = function_header_splice_position()) {
+        parse_function_header_splice(program, name_space, production.event, *header_position);
+        return;
+    }
     const auto expansion_head = expansion_function_head(tokens_, index_);
     if (parsing_public_fragment_ && (current().is("syntax") ||
         current().is("namespace") || current().is("using") ||
@@ -3066,9 +3108,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
     if (current().kind == TokenKind::StructuredSplice) {
-        if (current().splice && syntax_function_header_node(*current().splice))
-            parse_function_header_splice(program, name_space, production.event);
-        else if (parsing_public_fragment_) {
+        if (parsing_public_fragment_) {
             const auto item = current();
             ++index_;
             if (!item.splice || (!syntax_declaration_node(*item.splice) &&

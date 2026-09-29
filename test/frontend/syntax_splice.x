@@ -197,10 +197,23 @@ copy_parameter_header [[noinline]] static u32 header_function(parameter_fragment
 }
 #ifdef CUSTOM_SYNTAX_ABI
 global volatile u32 header_runtime_seed = 5u32;
-copy_parameter_header [[abi("stack_result_abi"), noinline]]
+[[syntax_expander]] static $::meta::tokens assign_header_abi(in $::meta::syntax_match input) {
+    return $::quote {
+        [[abi($::unquote($::syntax::capture(input, "abi")))]]
+        $::unquote($::syntax::node(input, "header")) [[noinline]]
+        $::unquote($::syntax::capture(input, "body"))
+    };
+}
+syntax AssignHeaderAbi : item {
+    prefix "assign_header_abi";
+    match abi:literal header:function_header body:block;
+    expand assign_header_abi;
+}
+syntax AssignHeaderAbi;
+assign_header_abi "stack_result_abi"
 static u32 stack_header_function(parameter_fragment!(value)) { return value + 9u32; }
 struct HeaderMemoryResult { u64 low; u64 high; };
-copy_parameter_header [[abi("memory_result_abi"), noinline]]
+assign_header_abi "memory_result_abi"
 static struct HeaderMemoryResult memory_header_function(parameter_fragment!(value)) {
     struct HeaderMemoryResult result = { (u64)value + 10u64, (u64)value + 11u64 };
     return result;
@@ -208,8 +221,11 @@ static struct HeaderMemoryResult memory_header_function(parameter_fragment!(valu
 #endif
 [[syntax_expander]] static $::meta::tokens compose_plain_header(
     in $::meta::syntax_match input) {
+    $::meta::syntax header = $::meta::parse("function_header", $::quote {
+        [[noinline]] $::unquote($::syntax::node(input, "header")) [[aligned(16)]]
+    }, $::syntax::context(input));
     $::meta::syntax definition = $::meta::parse("function_def", $::quote {
-        $::unquote($::syntax::node(input, "header"))
+        $::unquote(header)
         $::unquote($::syntax::capture(input, "body"))
     }, $::syntax::context(input));
     return $::quote { $::unquote(definition) };
@@ -220,11 +236,11 @@ syntax ComposePlainHeader : item {
     expand compose_plain_header;
 }
 syntax ComposePlainHeader;
-compose_plain_header [[noinline]] static T generic_header<T>(in T value) {
+compose_plain_header static T generic_header<T>(in T value) {
     T copy = value;
     return copy;
 }
-compose_plain_header [[noinline]] static u32 recursive_header(in u32 value) {
+compose_plain_header static u32 recursive_header(in u32 value) {
     if (value <= 1u32) return 1u32;
     return value * recursive_header(value - 1u32);
 }

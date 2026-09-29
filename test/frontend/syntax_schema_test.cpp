@@ -299,6 +299,58 @@ int main() {
     const auto composed_fragments = syntax_node_fragments(*composed);
     require(!composed_fragments.empty() && composed_fragments.front().splice == header,
             "composed function flattened its retained header identity");
+    {
+        auto header_execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 64,
+            LayoutQuery{}, LayoutQuery{}, EvaluationLimits{}, EvaluationLayout{});
+        const auto parse_decorated = [&](Node input, std::string_view text, K kind) {
+            const auto* source = sources.add("decorated-header.x", std::string(text));
+            auto tokens = Lexer(*source, diagnostics).lex();
+            for (auto& item : tokens) {
+                if (!item.is("header_marker")) continue;
+                item.kind = TokenKind::StructuredSplice;
+                item.splice = input;
+            }
+            Parser parser(tokens, diagnostics, header_execution, 64);
+            const auto result = parser.parse_syntax_fragment(kind, 0);
+            require(result && result->end + 1 == tokens.size(),
+                    "decorated header did not consume its bounded input");
+            require(syntax_validate_node(*result->node, header_shape_error),
+                    "decorated header public tree failed validation");
+            return result->node;
+        };
+        Node nested = header;
+        for (unsigned at = 0; at < 4; ++at) {
+            const auto previous = nested;
+            nested = production(parse_decorated(previous,
+                "[[noinline]] header_marker [[aligned(16)]]", K::FunctionHeader),
+                P::FunctionHeader, 3);
+            child(nested, 0, P::AttributeSpecifier, 3);
+            child(nested, 2, P::AttributeSpecifier, 3);
+            require(nested->children[1] == previous,
+                    "decorated header cloned or flattened its retained child");
+            const auto fragments = syntax_node_fragments(*nested);
+            require(fragments.size() == 10 && fragments[3].splice == previous,
+                    "decorated header serialization lost attributes or child identity");
+            require(parse_decorated(nested, "header_marker", K::FunctionHeader) == nested,
+                    "bare header round trip introduced an unnecessary wrapper");
+        }
+        const auto prototype = production(parse_decorated(nested,
+            "[[noinline]] header_marker [[aligned(16)]];", K::FunctionDeclaration),
+            P::Declaration, 4);
+        require(prototype->children[1] == nested,
+                "decorated prototype lost header identity");
+        const auto decorated_definition = production(parse_decorated(nested,
+            "[[noinline]] header_marker [[aligned(16)]] { return 1u32; }", K::FunctionDefinition),
+            P::FunctionDefinition, 4);
+        require(decorated_definition->children[1] == nested,
+                "decorated definition lost header identity");
+        auto replacement = syntax_replace_child(*nested, 1, header, header_shape_error);
+        require(replacement && replacement->children[1] == header,
+                "compatible header-child replacement failed");
+        require(!syntax_replace_child(*nested, 1, decorated_definition, header_shape_error),
+                "function definition was accepted in a header-child slot");
+        require(diagnostics.errors() == 0, "decorated header diagnostics escaped");
+    }
     child(definition, 1, P::Declarator, 1);
     child(definition, 3, P::CompoundStatement, 3);
     declaration = production(parse("global u32 fn(in u16 value) -> \"stack.result\" "

@@ -41,7 +41,7 @@ set(declaration_expander [=[
 set(header_expander [=[
 [[syntax_expander]] static $::meta::tokens compose_header(in $::meta::syntax_match input) {
     return $::quote {
-        $::unquote($::syntax::node(input, "header"))
+        [[noinline]] $::unquote($::syntax::node(input, "header")) [[aligned(16)]]
         $::unquote($::syntax::capture(input, "body"))
     };
 }
@@ -56,19 +56,74 @@ global u32 entry() { return composed(4u32); }")
 accept_splice(function_header_generic_body "${header_expander}
 compose_header static T composed<T>(in T value) { T copy = value; return copy; }
 global u32 entry() { return composed(4u32); }")
+reject_splice(function_header_attribute_conflict "a function cannot be both always_inline and noinline"
+    "${header_expander}
+compose_header [[always_inline]] static u32 composed(in u32 value) { return value; }
+global u32 entry() { return composed(4u32); }" note)
 accept_splice(function_header_prototype [=[
 [[syntax_expander]] static $::meta::tokens declare(in $::meta::syntax_match input) {
-    return $::quote { $::unquote($::syntax::node(input, "header")); };
+    return $::quote { $::unquote($::syntax::node(input, "header")) [[noinline]]; };
 }
 syntax Declare : item { prefix "declare"; match header:function_header ";"; expand declare; }
 syntax Declare;
 declare global u32 composed(in u32 value);
 global u32 composed(in u32 value) { return value; }
 ]=])
+set(attribute_expander [=[
+[[syntax_expander]] static $::meta::tokens decorate(in $::meta::syntax_match input) {
+    return $::quote {
+        $::unquote($::syntax::capture(input, "attrs"))
+        $::unquote($::syntax::node(input, "header"))
+        $::unquote($::syntax::capture(input, "body"))
+    };
+}
+syntax Decorate : item {
+    prefix "decorate"; match attrs:tokens_until(";") ";" header:function_header body:block;
+    expand decorate;
+}
+syntax Decorate;
+]=])
+accept_splice(function_header_generic_attribute "${attribute_expander}
+decorate [[noinline, aligned(sizeof(T))]]; static T composed<T>(in T value) { return value; }
+global u32 entry() { return composed(4u32); }")
+accept_splice(function_header_value_generic_attribute "${attribute_expander}
+decorate [[generic(u32 N), aligned(N)]]; static u32 composed(in u32 value) { return value; }
+global u32 entry() { return composed<16u32>(4u32); }")
+reject_splice(function_header_unknown_attribute "unknown attribute" "${attribute_expander}
+decorate [[not_a_cross_attribute]]; static u32 composed() { return 1u32; }" note)
+reject_splice(function_header_registration_attribute "expansion output cannot introduce syntax registration"
+    "${attribute_expander}
+decorate [[macro]]; static u32 composed() { return 1u32; }")
+accept_splice(function_header_repeated_decoration [=[
+[[syntax_expander]] static $::meta::tokens wrap(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    for (uptr at = 0uptr; at < 4uptr; ++at) {
+        header = $::meta::parse("function_header", $::quote {
+            [[noinline]] $::unquote(header) [[aligned(16)]]
+        }, $::syntax::context(input));
+        if ($::meta::child_count(header) != 3uptr ||
+            !$::meta::is_production($::meta::child(header, 0uptr), "attribute_specifier") ||
+            !$::meta::is_production($::meta::child(header, 1uptr), "function_header") ||
+            !$::meta::is_production($::meta::child(header, 2uptr), "attribute_specifier"))
+            $::syntax::error($::syntax::span(input), "decorated header lost its public shape");
+    }
+    $::meta::syntax original = header;
+    for (uptr at = 0uptr; at < 4uptr; ++at) original = $::meta::child(original, 1uptr);
+    if (!$::meta::is_production($::meta::child(original, 0uptr), "declaration_specifiers"))
+        $::syntax::error($::syntax::span(input), "nested decoration flattened the input");
+    return $::quote { $::unquote(header) $::unquote($::syntax::capture(input, "body")) };
+}
+syntax Wrap : item { prefix "wrap"; match header:function_header body:block; expand wrap; }
+syntax Wrap;
+wrap static u32 composed(in u32 value) { return value; }
+global u32 entry() { return composed(4u32); }
+]=])
 set(header_reparse_expander [=[
 [[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
     $::meta::syntax header = $::syntax::node(input, "header");
-    header = $::meta::parse("function_header", $::quote { $::unquote(header) },
+    header = $::meta::parse("function_header", $::quote {
+        [[noinline]] $::unquote(header) [[aligned(16)]]
+    },
         $::syntax::context(input));
     $::meta::syntax definition = $::meta::parse("function_def", $::quote {
         $::unquote(header) $::unquote($::syntax::capture(input, "body"))
@@ -97,8 +152,11 @@ compose static u32 composed(parameter!(value)) { return value + 1u32; }
 global u32 entry() { return composed(4u32); }")
 accept_splice(function_header_discard_deferred [=[
 [[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::meta::parse("function_header", $::quote {
+        [[noinline]] $::unquote($::syntax::node(input, "header")) [[aligned(16)]]
+    }, $::syntax::context(input));
     $::meta::syntax definition = $::meta::parse("function_def", $::quote {
-        $::unquote($::syntax::node(input, "header"))
+        $::unquote(header)
         $::unquote($::syntax::capture(input, "body"))
     }, $::syntax::context(input));
     if (!$::meta::is_kind(definition, "deferred"))
@@ -113,10 +171,12 @@ global u32 entry() { return 1u32; }
 accept_splice(function_header_prototype_reparse [=[
 [[syntax_expander]] static $::meta::tokens declare(in $::meta::syntax_match input) {
     $::meta::syntax node = $::meta::parse("function_decl", $::quote {
-        $::unquote($::syntax::node(input, "header"));
+        [[noinline]] $::unquote($::syntax::node(input, "header"));
     }, $::syntax::context(input));
     if (!$::meta::is_production(node, "declaration") ||
-        !$::meta::is_production($::meta::child(node, 0uptr), "function_header"))
+        $::meta::child_count(node) != 3uptr ||
+        !$::meta::is_production($::meta::child(node, 0uptr), "attribute_specifier") ||
+        !$::meta::is_production($::meta::child(node, 1uptr), "function_header"))
         $::syntax::error($::syntax::span(input), "prototype lost its header root");
     return $::quote { $::unquote(node) };
 }
