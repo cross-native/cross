@@ -69,6 +69,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
             (void)binding; name(entry.spelling); add(64);
         }
     }
+    add(scope_origins_.size() * 40);
     for (const auto& scope : local_type_scopes_) {
         add(32);
         for (const auto& [entry, value] : scope) { name(entry.spelling); type(value); }
@@ -112,6 +113,8 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     result->ordinary_values = known_ordinary_values_;
     result->values = local_scopes_;
     result->local_aliases = local_type_scopes_;
+    result->scope_origins = scope_origins_;
+    result->scope_event_base = scope_events_->size();
     for (auto& scope : result->local_aliases)
         for (auto& [entry, value] : scope) { (void)entry; value = copy_type(value); }
     for (const auto& [entry, value] : type_aliases_)
@@ -165,6 +168,7 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
     known_ordinary_values_ = environment.ordinary_values;
     local_scopes_ = environment.values;
     local_type_scopes_ = environment.local_aliases;
+    scope_origins_ = environment.scope_origins;
     for (auto& scope : local_type_scopes_)
         for (auto& [entry, value] : scope) { (void)entry; value = copy_type(value); }
     type_aliases_.clear();
@@ -185,6 +189,28 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
         for (auto& parameter : restored_function_context_->generic_parameters)
             parameter.value_type = copy_type(parameter.value_type);
         active_function_ = restored_function_context_.get();
+    }
+}
+
+void Parser::restore_deferred_environment(const SyntaxParseEnvironment& environment,
+                                          const SyntaxContext& context,
+                                          SourceLocation original_position) {
+    // Reparse against the saved environment plus declarations made after the
+    // capture by earlier statements of its original lexical block. A moved
+    // expression never inherits declarations from its destination block.
+    restore_environment(environment, context);
+    if (!original_position.valid()) return;
+    for (std::size_t at = environment.scope_event_base; at < scope_events_->size(); ++at) {
+        const auto& event = (*scope_events_)[at];
+        if (event.statement.file != original_position.file ||
+            event.statement.offset >= original_position.offset) continue;
+        for (std::size_t captured = 0; captured < scope_origins_.size(); ++captured) {
+            if (scope_origins_[captured] != event.block) continue;
+            for (const auto& [key, binding] : event.values)
+                local_scopes_[captured].emplace(key, binding);
+            for (const auto& [key, type] : event.aliases)
+                local_type_scopes_[captured].try_emplace(key, copy_type(type));
+        }
     }
 }
 

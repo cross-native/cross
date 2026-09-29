@@ -199,4 +199,30 @@ syntax Pack : bundle { use First; use Item; }
     require(!frozen.resolve("N::Later", "", later_tokens.front().location, diagnostics) &&
             diagnostics.errors() == prior_errors + 1,
             "saved syntax context saw a later declaration");
+
+    const auto* expression_source = sources.add("deferred-expression.x", "1u32 + 2u32");
+    const auto expression_tokens = Lexer(*expression_source, diagnostics).lex();
+    SyntaxNode deferred_expression;
+    deferred_expression.kind = SyntaxNode::Kind::Deferred;
+    deferred_expression.slot_production = SyntaxProduction::AssignmentExpression;
+    deferred_expression.deferred_category = SyntaxParseCategory::Expression;
+    deferred_expression.context = execution->call_context(
+        expression_tokens.front().location, "", {}, state.bindings());
+    deferred_expression.span = {expression_tokens.front().location,
+                                expression_tokens[2].location};
+    for (std::size_t at = 0; at + 1 < expression_tokens.size(); ++at)
+        deferred_expression.tokens.emplace_back(expression_tokens[at]);
+    std::string deferred_error;
+    require(syntax_validate_node(deferred_expression, deferred_error),
+            "category-tagged deferred expression failed public-tree validation");
+    const auto materialized = execution->materialize_node(deferred_expression,
+        expression_tokens.front().location, SyntaxParseCategory::Expression);
+    require(materialized && materialized->tokens.size() == expression_tokens.size() &&
+            materialized->tokens[0].is("1u32") && materialized->tokens[1].is("+"),
+            "deferred expression could not be materialized in its expression slot");
+    const auto category_errors = diagnostics.errors();
+    require(!execution->materialize_node(deferred_expression,
+                expression_tokens.front().location, SyntaxParseCategory::Statement) &&
+            diagnostics.errors() == category_errors + 1,
+            "deferred expression was accepted in a statement slot");
 }

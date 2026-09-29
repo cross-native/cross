@@ -33,6 +33,96 @@ function(reject_expansion case expected source)
     endif()
 endfunction()
 
+function(accept case source)
+    set(input "${OUTPUT}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "${case} failed\n${out}\n${err}")
+    endif()
+endfunction()
+
+set(deferred_expression_source [=[
+[[macro]] static $::meta::tokens define_type(in $::meta::tokens input) {
+    return $::quote { typedef uptr $::unquote(input); };
+}
+[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) {
+    return $::quote { ; };
+}
+syntax Inner : statement { prefix "inner"; match value:expr ";"; expand drop; }
+[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    $::meta::syntax block = $::meta::child($::meta::child(body, 0uptr), 0uptr);
+    if ($::meta::is_kind(block, "deferred"))
+        $::syntax::error($::syntax::span(input), "block was deferred");
+    if (!$::meta::is_production(block, "compound_statement"))
+        $::syntax::error($::syntax::span(input), "block was not compound");
+    $::meta::syntax inner = body;
+    for (uptr at = 0uptr; at < $::meta::child_count(block); ++at) {
+        $::meta::syntax statement = $::meta::child(block, at);
+        if ($::meta::is_extension(statement, "Inner")) inner = statement;
+        for (uptr nested = 0uptr; nested < $::meta::child_count(statement); ++nested) {
+            $::meta::syntax child = $::meta::child(statement, nested);
+            if ($::meta::is_extension(child, "Inner")) inner = child;
+            for (uptr leaf = 0uptr; leaf < $::meta::child_count(child); ++leaf) {
+                $::meta::syntax candidate = $::meta::child(child, leaf);
+                if ($::meta::is_extension(candidate, "Inner")) inner = candidate;
+            }
+        }
+    }
+    if (!$::meta::is_extension(inner, "Inner"))
+        $::syntax::error($::syntax::span(input), "inner extension not found");
+    $::meta::syntax value = $::syntax::node($::meta::extension_match(inner), "value");
+    if (!$::meta::is_kind(value, "deferred"))
+        $::syntax::error($::syntax::span(input), "expression was not deferred");
+    // Keep the captured brace identity and its original leading macro.
+    return $::quote {
+        $::unquote($::meta::tokens($::meta::child(block, 0uptr)))
+        $::unquote($::meta::child(block, 1uptr))
+        if ($::unquote(value) != 5uptr) return 0u32;
+        $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))
+    };
+}
+syntax Owner : statement { prefix "owner"; match name:ident body:stmt; expand expand; }
+global u32 entry() {
+    syntax Owner, Inner;
+    owner Later { define_type!(Later); inner (Later)5uptr; }
+    return 1u32;
+}
+]=])
+accept(deferred_expression_splice "${deferred_expression_source}")
+string(REPLACE "$::unquote($::meta::child(block, 1uptr))" "typedef uptr Later;"
+    definition_site_alias "${deferred_expression_source}")
+reject_expansion(deferred_expression_hygiene
+    "structured expression splice must contain one complete expression"
+    "${definition_site_alias}")
+string(REPLACE "$::unquote($::meta::tokens($::meta::child(block, 0uptr)))" "{"
+    relocated_expression "${deferred_expression_source}")
+string(REPLACE "$::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))" "}"
+    relocated_expression "${relocated_expression}")
+reject_expansion(deferred_expression_relocated
+    "structured expression splice must contain one complete expression"
+    "${relocated_expression}")
+string(REPLACE
+    "return $::quote {\n        $::unquote($::meta::tokens($::meta::child(block, 0uptr)))"
+    "return $::quote {\n        {\n        $::unquote($::meta::tokens($::meta::child(block, 0uptr)))"
+    relocated_original "${deferred_expression_source}")
+string(REPLACE
+    "if ($::unquote(value) != 5uptr) return 0u32;\n        $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))"
+    "$::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))\n        { typedef u8 $::unquote($::syntax::capture(input, \"name\"));\n          $::static_assert(sizeof($::unquote(value)) == sizeof(uptr), \"original block alias selected\"); }\n        }"
+    relocated_original "${relocated_original}")
+accept(deferred_expression_original_block_after_exit "${relocated_original}")
+string(REPLACE "owner Later { define_type!(Later); inner (Later)5uptr; }"
+    "owner Later { define_type!(Other); inner (Later)5uptr; define_type!(Later); }"
+    later_original_alias "${relocated_original}")
+string(REPLACE "$::unquote($::meta::child(block, 1uptr))\n        $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))"
+    "$::unquote($::meta::child(block, 1uptr))\n        $::unquote($::meta::child(block, 3uptr))\n        $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))"
+    later_original_alias "${later_original_alias}")
+reject_expansion(deferred_expression_later_original_alias
+    "structured expression splice must contain one complete expression"
+    "${later_original_alias}")
+
 reject(known_error "syntax-match error for active prefix"
     "${discard}${owner} global u32 entry() { syntax Owner; owner { u32 = ; future!{}; NewType value; } return 0u32; }")
 reject(unbounded_group "syntax-match error|unterminated|bounded group"

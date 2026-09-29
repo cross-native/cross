@@ -75,6 +75,52 @@ syntax SurviveDeferredType : statement {
     return $::quote { if ($::unquote($::meta::tokens(value)) != 5uptr) return 0u32; };
 }
 syntax UseExpr : statement { prefix "use_expr"; match value:expr ";"; expand use_expression; }
+[[macro]] static $::meta::tokens deferred_expr_type(in $::meta::tokens input) {
+    return $::quote { typedef uptr $::unquote(input); };
+}
+[[syntax_expander]] static $::meta::tokens deferred_expr_drop(in $::meta::syntax_match input) {
+    return $::quote { ; };
+}
+syntax DeferredExprInner : statement {
+    prefix "deferred_expr_inner"; match value:expr ";"; expand deferred_expr_drop;
+}
+[[syntax_expander]] static $::meta::tokens deferred_expr_owner(in $::meta::syntax_match input) {
+    $::meta::syntax body = $::syntax::node(input, "body");
+    $::meta::syntax block = $::meta::child($::meta::child(body, 0uptr), 0uptr);
+    $::meta::syntax inner = body;
+    for (uptr at = 0uptr; at < $::meta::child_count(block); ++at) {
+        $::meta::syntax statement = $::meta::child(block, at);
+        for (uptr nested = 0uptr; nested < $::meta::child_count(statement); ++nested) {
+            $::meta::syntax child = $::meta::child(statement, nested);
+            for (uptr leaf = 0uptr; leaf < $::meta::child_count(child); ++leaf) {
+                $::meta::syntax candidate = $::meta::child(child, leaf);
+                if ($::meta::is_extension(candidate, "DeferredExprInner")) inner = candidate;
+            }
+        }
+    }
+    if (!$::meta::is_extension(inner, "DeferredExprInner"))
+        $::syntax::error($::syntax::span(input), "deferred expression owner lost nested extension");
+    $::meta::syntax value = $::syntax::node($::meta::extension_match(inner), "value");
+    if (!$::meta::is_kind(value, "deferred"))
+        $::syntax::error($::syntax::span(input), "expected deferred expression capture");
+    return $::quote {
+        $::unquote($::meta::tokens($::meta::child(block, 0uptr)))
+        $::unquote($::meta::child(block, 1uptr))
+        if ($::unquote(value) != 5uptr) return 0u32;
+        $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))
+    };
+}
+syntax DeferredExprOwner : statement {
+    prefix "deferred_expr_owner"; match name:ident body:stmt; expand deferred_expr_owner;
+}
+[[noinline]] static u32 deferred_expression_splice() {
+    syntax DeferredExprOwner, DeferredExprInner;
+    deferred_expr_owner ExprWord {
+        deferred_expr_type!(ExprWord);
+        deferred_expr_inner (ExprWord)5uptr;
+    }
+    return 1u32;
+}
 [[syntax_expander]] static $::meta::tokens use_statement(in $::meta::syntax_match input) {
     $::meta::syntax body = $::syntax::node(input, "body");
     if (!$::meta::is_production(body, "statement"))
@@ -133,7 +179,8 @@ definition [[noinline]] static u32 deferred_definition(in u32 value) {
 #endif
 // Share the explicit platform-ABI MIPS startup with syntax_raw.x.
 global u32 syntax_raw_entry() {
-    if (deferred_statements(5u32) != 14u32 || deferred_definition(7u32) != 9u32)
+    if (deferred_statements(5u32) != 14u32 || deferred_definition(7u32) != 9u32 ||
+        deferred_expression_splice() != 1u32)
         return 0u32;
     return 61u32;
 }

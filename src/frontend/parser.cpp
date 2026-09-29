@@ -390,6 +390,8 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->known_ordinary_values_ = known_ordinary_values_;
     child->local_scopes_ = local_scopes_;
     child->local_type_scopes_ = local_type_scopes_;
+    child->scope_origins_ = scope_origins_;
+    child->scope_events_ = scope_events_;
     child->active_namespace_ = active_namespace_;
     child->enum_types_ = enum_types_;
     child->record_types_ = record_types_;
@@ -1051,6 +1053,7 @@ void Parser::adopt_replacement(Parser& child) {
     known_ordinary_values_ = std::move(child.known_ordinary_values_);
     local_scopes_ = std::move(child.local_scopes_);
     local_type_scopes_ = std::move(child.local_type_scopes_);
+    scope_origins_ = std::move(child.scope_origins_);
     enum_types_ = std::move(child.enum_types_);
     pending_enumerations_.insert(pending_enumerations_.end(),
         std::make_move_iterator(child.pending_enumerations_.begin()),
@@ -3560,6 +3563,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     current_scope_imports_ = 0;
     local_scopes_.emplace_back();
     local_type_scopes_.emplace_back();
+    scope_origins_.push_back(token_origin(current().location).identity);
     if (syntax_) syntax_->push_scope();
     if (local_scopes_.size() == 1 && active_function_)
         for (const auto& parameter : active_function_->parameters) {
@@ -3585,6 +3589,21 @@ std::unique_ptr<Statement> Parser::parse_compound() {
         expect("{");
         while (!current().is("}") && current().kind != TokenKind::End) {
             const auto before = index_;
+            const auto statement_origin = token_origin(current().location).span;
+            const bool record_bindings = syntax_ && !parsing_public_fragment_ &&
+                statement_origin.valid() && scope_origins_.back().source_unit;
+            NameSet prior_values;
+            NameSet prior_aliases;
+            if (record_bindings) {
+                for (const auto& [key, binding] : local_scopes_.back()) {
+                    (void)binding;
+                    prior_values.insert(key);
+                }
+                for (const auto& [key, type] : local_type_scopes_.back()) {
+                    (void)type;
+                    prior_aliases.insert(key);
+                }
+            }
             if (current().is("syntax") && (syntax_ || token_origin(current().location).context)) {
                 auto declaration = std::make_unique<Statement>();
                 declaration->kind = Statement::Kind::Empty;
@@ -3607,6 +3626,18 @@ std::unique_ptr<Statement> Parser::parse_compound() {
                 expect(";", "after using declaration");
                 statement->statements.push_back(std::move(declaration));
             } else statement->statements.push_back(parse_statement());
+            if (record_bindings) {
+                ScopeEvent event;
+                event.block = scope_origins_.back();
+                event.statement = statement_origin;
+                for (const auto& [key, binding] : local_scopes_.back())
+                    if (!prior_values.contains(key)) event.values.emplace(key, binding);
+                for (const auto& [key, type] : local_type_scopes_.back())
+                    if (!prior_aliases.contains(key))
+                        event.aliases.emplace(key, copy_type(type));
+                if (!event.values.empty() || !event.aliases.empty())
+                    scope_events_->push_back(std::move(event));
+            }
             if (index_ == before && current().kind != TokenKind::End) ++index_;
         }
         expect("}");
@@ -3645,6 +3676,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     current_scope_imports_ = saved_scope_imports;
     local_scopes_.resize(saved_values_depth);
     local_type_scopes_.resize(saved_types_depth);
+    scope_origins_.resize(saved_values_depth);
     public_uncertain_binding_depths_.resize(saved_uncertain_count);
     if (syntax_) syntax_->pop_scope();
     return statement;
@@ -3709,6 +3741,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         if (child->local_scopes_.empty()) {
             child->local_scopes_.emplace_back();
             child->local_type_scopes_.emplace_back();
+            child->scope_origins_.emplace_back();
         }
         const auto prior_values = child->local_scopes_.back();
         const auto prior_aliases = child->local_type_scopes_.back();
@@ -3936,6 +3969,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
         local_scopes_.emplace_back();
         local_type_scopes_.emplace_back();
+        scope_origins_.push_back(token_origin(current().location).identity);
         expect("(");
         {
             ProductionScope initializer(*this, SyntaxProduction::ForInitializer);
@@ -3977,6 +4011,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         statement->second = parse_statement();
         local_scopes_.pop_back();
         local_type_scopes_.pop_back();
+        scope_origins_.pop_back();
         public_uncertain_binding_depths_.resize(saved_uncertain_count);
         return statement;
     }
@@ -4493,11 +4528,19 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         // nested invocations. Its validated public root already proves this
         // operand's category; the owner will materialize surviving output.
         if (parsing_public_fragment_) return invalid();
-        auto output = syntax_->execution()->materialize_node(*item.splice, item.location);
+        auto output = syntax_->execution()->materialize_node(
+            *item.splice, item.location, SyntaxParseCategory::Expression);
         if (!output) return invalid();
         auto child = replacement_parser(std::move(*output));
-        child->restore_environment(*item.splice->context->parse_environment,
-                                   *item.splice->context);
+        // A deferred expression needs declarations from preceding expansions
+        // in its original captured block, not same-spelled destination locals.
+        if (item.splice->kind == SyntaxNode::Kind::Deferred)
+            child->restore_deferred_environment(
+                *item.splice->context->parse_environment, *item.splice->context,
+                item.splice->span.first);
+        else
+            child->restore_environment(*item.splice->context->parse_environment,
+                                       *item.splice->context);
         child->parsing_public_fragment_ = parsing_public_fragment_;
         child->recording_public_tree_ = parsing_public_fragment_;
         auto parsed = child->parse_assignment();

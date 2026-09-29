@@ -44,6 +44,9 @@ private:
     std::shared_ptr<const SyntaxParseEnvironment> snapshot_environment() const;
     void restore_environment(const SyntaxParseEnvironment& environment,
                              const SyntaxContext& context);
+    void restore_deferred_environment(const SyntaxParseEnvironment& environment,
+                                      const SyntaxContext& context,
+                                      SourceLocation original_position);
     const Token& current(std::size_t lookahead = 0) const;
     bool consume(std::string_view spelling);
     const Token* consume_kind(TokenKind kind);
@@ -206,6 +209,18 @@ private:
     // Classifier spelling/mark -> exact local value declaration identity.
     std::vector<NameMap<ValueBinding>> local_scopes_;
     std::vector<NameMap<TypePtr>> local_type_scopes_;
+    // Original opening-token identities distinguish a captured lexical block
+    // from a different destination block with the same local names.
+    std::vector<TokenIdentity> scope_origins_;
+    struct ScopeEvent {
+        TokenIdentity block;
+        SourceLocation statement;
+        NameMap<ValueBinding> values;
+        NameMap<TypePtr> aliases;
+    };
+    // Shared by replacement parsers; speculative recognition does not publish.
+    std::shared_ptr<std::vector<ScopeEvent>> scope_events_ =
+        std::make_shared<std::vector<ScopeEvent>>();
     std::string active_namespace_;
     std::unordered_map<std::string, BuiltinType> enum_types_;
     std::vector<EnumDecl> pending_enumerations_;
@@ -258,6 +273,8 @@ private:
     std::unordered_set<std::string> ordinary_values;
     std::vector<NameMap<ValueBinding>> values;
     std::vector<NameMap<TypePtr>> local_aliases;
+    std::vector<TokenIdentity> scope_origins;
+    std::size_t scope_event_base{};
     std::unordered_map<std::string, TypePtr> aliases;
     std::unordered_map<std::string, BuiltinType> enumerations;
     std::unordered_map<std::string, Parser::RecordTag> records;
