@@ -392,10 +392,38 @@ copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 v
     return result;
 }
 
+namespace PatternComposition {
+    syntax Fence : rule { match ";"; }
+    [[syntax_expander]] static $::meta::tokens select_value(in $::meta::syntax_match input) {
+        $::meta::syntax_match branch = $::syntax::at(input, "branch", 0uptr);
+        if (!$::syntax::is_variant(branch, "value")) return $::quote { 3u32 };
+        $::meta::syntax value = $::syntax::node(branch, "value");
+        return $::quote { $::unquote(value) * 2u32 };
+    }
+    syntax Repeated : expression {
+        prefix "pick_repeat";
+        match "(" branch:choice(pairs:(parts:repeat1("x" "y")) |
+            value:("x" value:expr rule(Fence))) ")";
+        expand select_value;
+    }
+    syntax Separated : expression {
+        prefix "pick_separated";
+        match "(" branch:choice(pairs:(parts:separated1(number:literal, ",")) |
+            value:(head:literal "," value:expr rule(Fence))) ")";
+        expand select_value;
+    }
+    [[noinline]] static u32 run(in u32 amount) {
+        syntax Repeated, Separated;
+        return pick_repeat (x amount + 2u32;) +
+            pick_separated (1u32, amount + 3u32;) + pick_repeat (x y x y);
+    }
+}
+
 #ifdef CUSTOM_SYNTAX_ABI
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
+    if (PatternComposition::run(4u32) != 29u32) return 0u32;
     u32 textual_precedence = parameter_list_fragment!(1u32 + 2u32) * 3u32;
     u32 textual_value = 1u32;
     parameter_list_fragment!(textual_value += 2u32; textual_value += 3u32;)

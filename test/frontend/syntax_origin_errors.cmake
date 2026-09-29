@@ -65,6 +65,24 @@ if(rule_status EQUAL 0 OR NOT rule_err MATCHES "syntax-match error" OR
     message(FATAL_ERROR "nested match ancestry lost\n${rule_out}\n${rule_err}")
 endif()
 
+# A deferred branch-local failure still needs the complete rule/owner ancestry
+# when no alternative succeeds.
+string(REPLACE "syntax NeedParen : rule { match body:paren; }"
+    "syntax Pairs : rule { match pairs:repeat1(\"x\" \"y\"); }\nsyntax NeedParen : rule { match branch:choice(pairs:(rule(Pairs)) | other:(\"z\")); }"
+    committed_source "${rule_source}")
+string(REPLACE "inner 1u32" "inner x y x z" committed_source "${committed_source}")
+set(committed_input "${OUTPUT}.committed.x")
+file(WRITE "${committed_input}" "${committed_source}")
+execute_process(COMMAND "${CC}" -S "${committed_input}" -o "${OUTPUT}"
+    RESULT_VARIABLE committed_status OUTPUT_VARIABLE committed_out ERROR_VARIABLE committed_err)
+if(committed_status EQUAL 0 OR NOT committed_err MATCHES "malformed syntax repetition after committed start" OR
+   NOT committed_err MATCHES "syntax 'Inner' defined here" OR
+   NOT committed_err MATCHES "syntax rule 'NeedParen' defined here" OR
+   NOT committed_err MATCHES "syntax rule 'Pairs' defined here" OR
+   NOT committed_err MATCHES "in expansion of syntax 'Outer'")
+    message(FATAL_ERROR "deferred committed-failure ancestry lost\n${committed_out}\n${committed_err}")
+endif()
+
 # Both complete derivations of an ambiguous rule must retain rule provenance.
 string(REPLACE "syntax NeedParen : rule { match body:paren; }"
     "syntax NeedX : rule { match branch:choice(left:(\"x\") | right:(\"x\")); }"

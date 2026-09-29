@@ -287,6 +287,53 @@ string(APPEND diamond "syntax Diamond : expression { prefix \"diamond\"; match \
 accept(shared_rule_analysis "${diamond}" -feval-step-limit=100000)
 reject(shared_rule_analysis_budget "matching work budget exceeded"
     "${diamond}" -feval-step-limit=1000)
+reject(rule_expression_fence "parsed expression/type capture requires"
+    "${expander}syntax Value : rule { match value:expr; } syntax Bad : expression { prefix \"bad\"; match \"(\" rule(Value) \"+\" other:expr \")\"; expand expand; } syntax Bad;\n")
+reject(choice_type_fence "parsed expression/type capture requires"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" branch:choice(type:(value:type) | other:(\"other\")) \"+\" \")\"; expand expand; }\n")
+reject(optional_expression_fence "parsed expression/type capture requires"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" part:optional(value:expr) skip:optional(\",\") \"+\" \")\"; expand expand; }\n")
+reject(repeated_expression_fence "parsed expression/type capture requires"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat1(value:expr) \")\"; expand expand; }\n")
+reject(recursive_expression_fence "parsed expression/type capture requires"
+    "${expander}syntax Value : rule { match branch:choice(value:(value:expr) | next:(\"next\" rule(Value))); } syntax Bad : expression { prefix \"bad\"; match \"(\" rule(Value) \"+\" \")\"; expand expand; } syntax Bad;\n")
+accept(rule_expression_terminal_fence
+    "${expander}syntax Fence : rule { match \";\"; } syntax Value : expression { prefix \"value\"; match \"(\" body:expr rule(Fence) \")\"; expand expand; } syntax Value; $::static_assert(value (1u32 + 2u32;) == 1u32, \"rule fence\");\n")
+accept(composed_expression_fences
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" body:expr fence:choice(comma:(\",\") | semicolon:(\";\")) tail:optional(value:type) \")\"; expand expand; } syntax Value; $::static_assert(value (1u32, u32) + value (2u32;) == 2u32, \"composed fences\");\n")
+accept(nullable_expression_fence
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" body:expr comma:optional(\",\") \")\"; expand expand; } syntax Value; $::static_assert(value (1u32) + value (2u32,) == 2u32, \"nullable fence\");\n")
+accept(recursive_expression_fences
+    "${expander}syntax Values : rule { match value:expr tail:optional(\",\" rule(Values)); } syntax Value : expression { prefix \"value\"; match \"(\" rule(Values) \")\"; expand expand; } syntax Value; $::static_assert(value (1u32, 2u32, 3u32) == 1u32, \"recursive fence\");\n")
+accept(choice_committed_repeat_alternative
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(pairs:(parts:repeat1(\"x\" \"y\")) | other:(\"x\" \"z\")) \")\"; expand expand; } syntax Value; $::static_assert(value (x z) == 1u32, \"surviving alternative\");\n")
+accept(choice_committed_repeat_reverse
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(other:(\"x\" \"z\") | pairs:(parts:repeat1(\"x\" \"y\"))) \")\"; expand expand; } syntax Value; $::static_assert(value (x z) == 1u32, \"surviving first alternative\");\n")
+accept(choice_committed_opaque_expression
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(pairs:(parts:repeat1(\"x\" \"y\")) | other:(\"x\" value:expr \";\")) \")\"; expand expand; } syntax Value; $::static_assert(value (x missing_macro! { not source; };) == 1u32, \"discarded opaque input\");\n")
+accept(choice_committed_later_iteration
+    "${expander}syntax Pairs : rule { match parts:repeat1(\"x\" \"y\"); } syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(pairs:(rule(Pairs)) | other:(\"x\" \"y\" \"x\" \"z\")) \")\"; expand expand; } syntax Value; $::static_assert(value (x y x z) == 1u32, \"later malformed iteration\");\n")
+accept(choice_committed_separator
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(list:(parts:separated1(number:literal, \",\")) | other:(number:literal \",\" \"end\")) \")\"; expand expand; } syntax Value; $::static_assert(value (1u32, end) == 1u32, \"failed list separator\");\n")
+accept(optional_committed_repeat
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" maybe:optional(\"tag\" parts:repeat1(\"x\" \"y\")) \"tag\" \"x\" \"z\" \")\"; expand expand; } syntax Value; $::static_assert(value (tag x z) == 1u32, \"absent optional\");\n")
+accept(repetition_choice_committed_repeat
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" parts:repeat1(\"a\" branch:choice(pairs:(pairs:repeat1(\"x\" \"y\")) | other:(\"x\" \"z\"))) \")\"; expand expand; } syntax Value; $::static_assert(value (a x z a x y) == 1u32, \"outer repetition\");\n")
+reject(choice_committed_still_ambiguous "ambiguous syntax invocation"
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(pairs:(parts:repeat1(\"x\" \"y\")) | first:(\"x\" \"z\") | second:(\"x\" \"z\")) \")\"; expand expand; } syntax Value; global u32 entry() { return value (x z); }\n")
+reject(choice_committed_lengths_ambiguous "ambiguous syntax invocation"
+    "${expander}syntax Value : expression { prefix \"value\"; match branch:choice(pairs:(parts:repeat1(\"x\" \"y\")) | short:(\"x\") | long:(\"x\" \"z\")); expand expand; } syntax Value; global u32 entry() { return value x z; }\n")
+reject(repeat_lengths_ambiguous "ambiguous syntax invocation"
+    "${expander}syntax Value : expression { prefix \"value\"; match parts:repeat1(\"x\"); expand expand; } syntax Value; global u32 entry() { return value x x; }\n")
+reject(separated_lengths_ambiguous "ambiguous syntax invocation"
+    "${expander}syntax Value : expression { prefix \"value\"; match parts:separated1(number:literal, \",\"); expand expand; } syntax Value; global u32 entry() { return value 1u32, 2u32; }\n")
+reject(committed_repeat_no_shorter_match "malformed syntax repetition after committed start"
+    "${expander}syntax Value : expression { prefix \"value\"; match parts:repeat0(\"x\" \"y\"); expand expand; } syntax Value; global u32 entry() { return value x y x z; }\n")
+reject(committed_separator_no_shorter_match "malformed syntax item after committed separator"
+    "${expander}syntax Value : expression { prefix \"value\"; match parts:separated0(number:literal, \",\"); expand expand; } syntax Value; global u32 entry() { return value 1u32, 2u32, end; }\n")
+reject(choice_resource_failure "syntax repetition depth exceeded"
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(raw:(body:tokens_until(\";\") \";\") | repeated:(parts:repeat1(\"x\"))) \")\"; expand expand; } syntax Value; global u32 entry() { return value (x x x x x x x x x x x x x x x;); }\n"
+    -feval-depth-limit=12)
 reject(nullable_choice "choice alternative must consume input"
     "${expander}syntax Bad : expression { prefix \"bad\"; match branch:choice(empty:(value:optional(\"x\")) | value:(\"y\")); expand expand; }\n")
 reject(choice_duplicate "duplicate choice alternative label"

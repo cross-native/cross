@@ -302,10 +302,17 @@ bool validate_pattern_progress(const Pattern& root, PatternAnalysis& analysis,
         for (std::size_t at = pattern.size(); at-- > 0;) {
             const auto& element = pattern[at];
             if (!analysis.work(element.location)) return false;
-            if ((element.kind == K::Expr || element.kind == K::Type) && at + 1 < pattern.size()) {
-                const auto& fence = pattern[at + 1];
-                if (fence.kind != K::Terminal || (fence.terminal.text != ";" &&
-                    fence.terminal.text != "," && !closing(fence.terminal.text))) {
+            if (element.kind == K::Expr || element.kind == K::Type) {
+                if (!analysis.work(element.location, 1 + continuation.exact.size())) return false;
+                // A fence can be supplied by a caller, an optional/choice, or
+                // the separator of an enclosing list. Every possible next
+                // token must fence the capture; a record boundary alone does
+                // not bound an expression or inject new operator precedence.
+                if (continuation.raw || continuation.identifier || continuation.literal || continuation.builtin ||
+                    std::any_of(continuation.exact.begin(), continuation.exact.end(), [](const auto& fence) {
+                        return fence.kind != TokenKind::Punctuator ||
+                            (fence.text != ";" && fence.text != "," && !closing(fence.text));
+                    })) {
                     diagnostics.error(element.location,
                         "parsed expression/type capture requires a semicolon, comma, or closing-delimiter fence");
                     return false;
@@ -1327,6 +1334,19 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     std::vector<RuleFrame> active_rules;
     std::vector<RuleFrame> failure_rules;
     std::optional<std::vector<RuleFrame>> hard_failure_rules;
+    struct CommittedFailure {
+        std::size_t at;
+        bool separator;
+        std::vector<RuleFrame> rules;
+    };
+    std::optional<CommittedFailure> committed_failure;
+    const auto remember_commit = [&](std::size_t at, bool separator) {
+        if (!committed_failure || at > committed_failure->at ||
+            (at == committed_failure->at && active_rules.size() > committed_failure->rules.size())) {
+            if (!charge(64 + 32 * active_rules.size())) { failed = true; return; }
+            committed_failure = CommittedFailure{at, separator, active_rules};
+        }
+    };
     std::size_t farthest_failure{};
     const auto consider_failure = [&](std::size_t at) {
         if (at > farthest_failure || (at == farthest_failure && active_rules.size() > failure_rules.size())) {
@@ -1448,51 +1468,63 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             const bool require_one = element.kind == K::Repeat1 || element.kind == K::Separated1;
             const auto extend = [&](const auto& self, std::size_t at,
                                     std::vector<std::shared_ptr<const SyntaxMatchValue>>& records,
-                                    std::vector<RuleFrame>& rules) -> void {
-                if (failed) return;
+                                    std::vector<RuleFrame>& rules) -> bool {
+                if (failed) return false;
                 if (records.size() >= execution_->limits().depth) {
                     diagnostics.error(tokens[begin].location, "syntax repetition depth exceeded");
                     failed = true;
-                    return;
+                    return false;
                 }
-                if (!require_one || !records.empty()) {
-                    if (!charge(128 + 16 * records.size() + 32 * rules.size())) { failed = true; return; }
+                const auto finish = [&] {
+                    if (require_one && records.empty()) return false;
+                    if (!charge(128 + 16 * records.size() + 32 * rules.size())) { failed = true; return false; }
                     output.push_back({at, records, FieldKind::Nested, {}, rules});
-                }
+                    return true;
+                };
                 std::size_t body = at;
                 if (separated && !records.empty()) {
                     if (at >= tokens.size() || tokens[at].kind != element.terminal.kind ||
-                        tokens[at].text != element.terminal.text) return;
+                        tokens[at].text != element.terminal.text) return finish();
                     body = at + 1;
                 }
                 auto candidates = nested(element.pattern, body);
-                if (candidates.empty() && !failed && body < tokens.size()) {
+                if (failed) return false;
+                if (candidates.empty() && body < tokens.size()) {
                     const auto& first = analysis.sequence(element.pattern).first;
-                    if (!analysis.good()) { failed = true; return; }
+                    if (!analysis.good()) { failed = true; return false; }
                     if ((separated && !records.empty()) ||
                         (tokens[body].kind != TokenKind::End &&
                          first_accepts(first, tokens[body].kind, tokens[body].text))) {
-                        diagnostics.error(tokens[body].location,
-                            separated && !records.empty()
-                                ? "malformed syntax item after committed separator"
-                                : "malformed syntax repetition after committed start");
-                        failed = true;
-                        return;
+                        // This derivation cannot stop before malformed input,
+                        // but a sibling choice/optional derivation can still
+                        // match. Keep the diagnostic only if the entire owner
+                        // has no successful derivation. Resource failures use
+                        // the separate, global `failed` state.
+                        remember_commit(body, separated && !records.empty());
+                        return false;
                     }
                 }
+                if (candidates.empty()) return finish();
+                bool viable = false;
                 for (auto& candidate : candidates) {
                     if (candidate.end <= body) {
                         diagnostics.error(tokens[begin].location, "syntax repetition body must consume input");
                         failed = true;
-                        return;
+                        return false;
                     }
                     records.push_back(candidate.value);
                     const auto previous = rules.size();
                     rules.insert(rules.end(), candidate.rules.begin(), candidate.rules.end());
-                    self(self, candidate.end, records, rules);
+                    viable |= self(self, candidate.end, records, rules);
                     rules.resize(previous);
                     records.pop_back();
+                    if (failed) return false;
                 }
+                // Retain shorter complete lengths only along a viable chain.
+                // Otherwise a later malformed item would be silently treated
+                // as the end of this same repetition.
+                if (viable) (void)finish();
+                return viable;
             };
             std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
             std::vector<RuleFrame> rules;
@@ -1571,10 +1603,15 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     };
     auto matches = run(definition.pattern, begin + 1, 0);
     if (matches.empty() || failed) {
+        if (!failed && committed_failure && diagnostics.errors() == previous_errors)
+            diagnostics.error(tokens[committed_failure->at].location, committed_failure->separator
+                ? "malformed syntax item after committed separator"
+                : "malformed syntax repetition after committed start");
         if (diagnostics.errors() == previous_errors) diagnostics.error(tokens[begin].location,
             "syntax-match error for active prefix '" + std::string(tokens[begin].text) + "'");
         diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
         if (hard_failure_rules) note_rules(*hard_failure_rules);
+        else if (!failed && committed_failure) note_rules(committed_failure->rules);
         else if (!failed) note_rules(failure_rules);
         return {};
     }
