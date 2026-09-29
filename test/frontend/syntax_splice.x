@@ -47,6 +47,13 @@ syntax InspectWithoutExpanding : expression {
     prefix "inspect_splice"; match "(" value:expr ")"; expand inspect_without_expanding;
 }
 
+[[syntax_expander]] static $::meta::tokens active_type_expression(in $::meta::syntax_match input) {
+    return $::quote { 7u16 };
+}
+syntax ActiveTypeExpression : expression {
+    prefix "ProbeType"; match "*"; expand active_type_expression;
+}
+
 [[syntax_expander]] static $::meta::tokens transplant_statement(in $::meta::syntax_match input) {
     $::meta::syntax body = $::syntax::node(input, "body");
     $::meta::syntax parsed = $::meta::parse("stmt",
@@ -354,6 +361,12 @@ global u32 syntax_raw_entry() {
     syntax ShadowType;
     syntax TransplantSpecifier;
     syntax CopyDeclaration;
+    {
+        typedef u64 ProbeType;
+        syntax ActiveTypeExpression;
+        if (sizeof(ProbeType *) != sizeof(u16) || (ProbeType *) + 3u16 != 10u16 ||
+            multiplied(ProbeType *) != 21u32) return 0u32;
+    }
     u32 amount = 4u32;
     transplant_type fragmented_type HeaderFragments parameter_list_fragment!(::Value);
     fragmented_type = header_runtime_seed;

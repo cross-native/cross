@@ -118,7 +118,8 @@ private:
     TypePtr parse_array_suffix(
         TypePtr element, bool parameter = false,
         std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
-    bool type_start();
+    enum class TypeProbe { Required, ExpressionAlternative };
+    bool type_start(TypeProbe probe = TypeProbe::Required);
     void parse_external(Program& program, const std::string& name_space);
     void parse_external_node_splice(Program& program,
                                     const std::string& name_space);

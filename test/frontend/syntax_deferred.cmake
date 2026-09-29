@@ -142,6 +142,67 @@ global u32 entry() {
     return (inspect unknown!{foreign tokens}) + sizeof(inspect unknown!{foreign tokens});
 }
 ]=])
+accept(expression_prefix_precedes_type_probe [=[
+namespace Types { typedef u64 T; }
+using Types;
+[[syntax_expander]] static $::meta::tokens value(in $::meta::syntax_match input) {
+    return $::quote { 7u16 };
+}
+syntax Value : expression { prefix "T"; match "*"; expand value; }
+syntax Value;
+static T *forced_type(in T *value) { return value; }
+$::static_assert(sizeof(T *) == sizeof(u16), "active prefix lost to alias");
+$::static_assert($::alignof(T *) == $::alignof(u16), "active prefix lost to alignment probe");
+$::static_assert((T *) + 3u16 == 10u16, "active prefix lost to cast probe");
+$::static_assert(sizeof(Types::T *) == sizeof(void *), "qualified type was intercepted");
+static u32 value_argument<u32 N>() { return N; }
+$::static_assert(value_argument<T *>() == 7u32, "active prefix lost to generic argument probe");
+static u32 expression_statement() { T *; return 1u32; }
+$::static_assert(expression_statement() == 1u32, "active prefix lost to declaration probe");
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    $::meta::syntax node = $::syntax::node(input, "value");
+    $::meta::syntax leaf = node;
+    while ($::meta::is_kind(leaf, "core") && $::meta::child_count(leaf) == 1uptr)
+        leaf = $::meta::child(leaf, 0uptr);
+    if (!$::meta::is_kind(leaf, "extension"))
+        $::syntax::error($::syntax::span(input), "prefix was classified as a type in capture");
+    return $::quote { $::unquote(node) };
+}
+syntax Copy : expression { prefix "copied"; match "(" value:expr ")"; expand copy; }
+syntax Copy;
+$::static_assert(copied(T *) == 7u16, "captured active prefix lost its identity");
+[[syntax_expander]] static $::meta::tokens type_size(in $::meta::syntax_match input) {
+    $::meta::syntax node = $::syntax::node(input, "value");
+    if (!$::meta::is_production(node, "type_name"))
+        $::syntax::error($::syntax::span(input), "forced type capture dispatched expression syntax");
+    return $::quote { sizeof($::unquote(node)) };
+}
+syntax TypeSize : expression { prefix "type_size"; match "(" value:type ")"; expand type_size; }
+syntax TypeSize;
+$::static_assert(type_size(T *) == sizeof(void *), "type capture lost required-type classification");
+[[macro]] static $::meta::tokens generic_name(in $::meta::tokens input) { return input; }
+static T identity(in T value) [[aligned(sizeof(T *)), generic(generic_name!(T))]] { return value; }
+$::static_assert(identity(11u32) == 11u32, "generic header changed expression dispatch");
+]=])
+reject(active_prefix_does_not_fall_back_to_type "syntax-match error" [=[
+typedef u32 T;
+[[syntax_expander]] static $::meta::tokens value(in $::meta::syntax_match input) {
+    return $::quote { 7u16 };
+}
+syntax Value : expression { prefix "T"; match "*"; expand value; }
+global u32 entry() { syntax Value; return sizeof(T); }
+]=])
+accept(statement_prefix_does_not_override_type_probe [=[
+typedef u64 T;
+[[syntax_expander]] static $::meta::tokens statement(in $::meta::syntax_match input) {
+    return $::quote { ; };
+}
+syntax Statement : statement { prefix "T"; match "*"; expand statement; }
+global u32 entry() {
+    syntax Statement;
+    return sizeof(T *) == sizeof(void *);
+}
+]=])
 function(as_deferred_type result source)
     string(REPLACE "match value:expr" "match value:type" type_source "${source}")
     string(REPLACE "inner (Later)5uptr;" "inner Later;" type_source "${type_source}")

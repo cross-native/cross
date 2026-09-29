@@ -1684,11 +1684,16 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
     return {};
 }
 
-bool Parser::type_start() {
+bool Parser::type_start(TypeProbe probe) {
     // Cast/sizeof probes can be looking at an expression owner rather than
     // a type. Its input must stay opaque until the expression parser selects
     // it, even if the next token happens to begin a procedural invocation.
-    if (!active_syntax(false)) normalize_qualified_name();
+    const auto* owner = active_syntax(false);
+    if (probe == TypeProbe::ExpressionAlternative && owner) {
+        // Activation commits before name-sensitive type/expression probing.
+        // Required type slots remain unaffected by expression activation.
+        if (owner->kind == SyntaxKind::Expression) return false;
+    } else normalize_qualified_name();
     const auto token = current();
     if (token.kind == TokenKind::StructuredSplice)
         return token.splice && syntax_type_node(*token.splice);
@@ -3907,7 +3912,8 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
 
 bool Parser::local_declaration_start() {
     return current().is("register") || current().is("stack") ||
-           current().is("static") || current().is("typedef") || type_start();
+           current().is("static") || current().is("typedef") ||
+           type_start(TypeProbe::ExpressionAlternative);
 }
 
 std::unique_ptr<Statement>
@@ -4777,7 +4783,7 @@ std::unique_ptr<Expr> Parser::parse_cast() {
         ++index_;
         (void)current();
         if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
-        const bool begins_type = type_start();
+        const bool begins_type = type_start(TypeProbe::ExpressionAlternative);
         index_ = saved;
         if (begins_type) {
             const auto location = current().location;
@@ -4818,7 +4824,7 @@ std::unique_ptr<Expr> Parser::parse_unary() {
             ++index_;
             (void)current();
             if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
-            const bool begins_type = type_start();
+            const bool begins_type = type_start(TypeProbe::ExpressionAlternative);
             index_ = saved;
             if (begins_type) {
                 consume("(");
@@ -4875,7 +4881,7 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                         Expr::GenericArgument argument;
                         (void)current();
                         if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
-                        if (type_start()) {
+                        if (type_start(TypeProbe::ExpressionAlternative)) {
                             ProductionScope type_name(*this, SyntaxProduction::TypeName);
                             argument.type = parse_type();
                             std::optional<std::string> declared;
@@ -5165,7 +5171,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         auto result = std::make_unique<Expr>();
         result->kind = Expr::Kind::Alignof;
         result->location = item.location;
-        if (type_start()) {
+        if (type_start(TypeProbe::ExpressionAlternative)) {
             ProductionScope type_name(*this, SyntaxProduction::TypeName);
             result->type = parse_type();
             std::optional<std::string> name;
