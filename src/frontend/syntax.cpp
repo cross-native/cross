@@ -10,6 +10,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -83,179 +84,272 @@ using Pattern = std::vector<SyntaxPatternElement>;
 using RulePattern = std::function<const Pattern*(SyntaxEntityId)>;
 
 struct FirstSet {
-    std::vector<MetaToken> exact;
+    struct Terminal {
+        TokenKind kind;
+        std::string text;
+        bool operator==(const Terminal&) const = default;
+    };
+    std::vector<Terminal> exact;
     bool identifier{};
     bool literal{};
     bool builtin{};
-    bool any{};
+    bool raw{};
 };
 
-void merge_first(FirstSet& into, const FirstSet& from) {
-    into.exact.insert(into.exact.end(), from.exact.begin(), from.exact.end());
+bool merge_first(FirstSet& into, const FirstSet& from) {
+    bool changed = false;
+    for (const auto& token : from.exact)
+        if (std::find(into.exact.begin(), into.exact.end(), token) == into.exact.end()) {
+            into.exact.push_back(token);
+            changed = true;
+        }
+    changed |= (!into.identifier && from.identifier) || (!into.literal && from.literal) ||
+               (!into.builtin && from.builtin) || (!into.raw && from.raw);
     into.identifier |= from.identifier;
     into.literal |= from.literal;
     into.builtin |= from.builtin;
-    into.any |= from.any;
+    into.raw |= from.raw;
+    return changed;
 }
 
-bool first_accepts(const FirstSet& set, const MetaToken& token) {
-    if (set.any) return true;
-    if (set.identifier && token.kind == TokenKind::Identifier && !is_reserved_identifier(token.text)) return true;
-    if (set.literal && (token.kind == TokenKind::Integer || token.kind == TokenKind::Floating ||
-                        token.kind == TokenKind::String || token.kind == TokenKind::Character)) return true;
-    if (set.builtin && token.kind == TokenKind::BuiltinName) return true;
+bool first_accepts(const FirstSet& set, TokenKind kind, std::string_view text) {
+    if (set.raw && kind != TokenKind::End && text != ";" && !closing(text)) return true;
+    if (set.identifier && kind == TokenKind::Identifier && !is_reserved_identifier(text)) return true;
+    if (set.literal && (kind == TokenKind::Integer || kind == TokenKind::Floating ||
+                        kind == TokenKind::String || kind == TokenKind::Character)) return true;
+    if (set.builtin && kind == TokenKind::BuiltinName) return true;
     return std::any_of(set.exact.begin(), set.exact.end(), [&](const auto& candidate) {
-        return candidate.kind == token.kind && candidate.text == token.text;
+        return candidate.kind == kind && candidate.text == text;
     });
 }
 
 bool first_overlap(const FirstSet& left, const FirstSet& right) {
-    const auto nonempty = [](const FirstSet& set) {
-        return set.any || set.identifier || set.literal || set.builtin || !set.exact.empty();
+    const auto ordinary = [](const FirstSet& set) {
+        return set.raw || set.identifier || set.literal || set.builtin;
     };
-    if ((left.any && nonempty(right)) || (right.any && nonempty(left)) ||
+    if ((left.raw && ordinary(right)) || (right.raw && ordinary(left)) ||
         (left.identifier && right.identifier) || (left.literal && right.literal) ||
         (left.builtin && right.builtin)) return true;
-    for (const auto& token : left.exact) if (first_accepts(right, token)) return true;
-    for (const auto& token : right.exact) if (first_accepts(left, token)) return true;
+    for (const auto& token : left.exact) if (first_accepts(right, token.kind, token.text)) return true;
+    for (const auto& token : right.exact) if (first_accepts(left, token.kind, token.text)) return true;
     return false;
 }
 
-bool pattern_nullable(const Pattern& pattern, const RulePattern& rule);
+// Left-recursive cycles have been rejected before bound rules reach this
+// analysis. Summarize only nullable prefixes, memoizing shared rule bodies:
+// productive recursion stops at its first consuming element. Exact terminals
+// are sets, not derivation lists, so a diamond-shaped rule graph stays bounded.
+class PatternAnalysis {
+public:
+    struct Summary {
+        FirstSet first;
+        bool nullable{};
+    };
 
-bool element_nullable(const SyntaxPatternElement& element, const RulePattern& rule) {
-    using K = SyntaxPatternElement::Kind;
-    if (element.kind == K::Optional || element.kind == K::Repeat0 || element.kind == K::Separated0)
-        return true;
-    if (element.kind == K::Repeat1 || element.kind == K::Separated1)
-        return pattern_nullable(element.pattern, rule);
-    if (element.kind == K::Choice)
-        return std::any_of(element.alternatives.begin(), element.alternatives.end(),
-            [&](const auto& alternative) { return pattern_nullable(alternative.pattern, rule); });
-    if (element.kind == K::Rule && element.resolved_rule)
-        if (const auto* body = rule(*element.resolved_rule)) return pattern_nullable(*body, rule);
-    return false;
-}
+    PatternAnalysis(SyntaxExecution& execution, Diagnostics& diagnostics, RulePattern rule)
+        : execution_(execution), diagnostics_(diagnostics), rule_(std::move(rule)) {}
 
-bool pattern_nullable(const Pattern& pattern, const RulePattern& rule) {
-    return std::all_of(pattern.begin(), pattern.end(),
-        [&](const auto& element) { return element_nullable(element, rule); });
-}
+    bool good() const { return !failed_; }
+    const Pattern* rule(SyntaxEntityId id) const { return rule_(id); }
+    bool work(SourceLocation location, std::uint64_t amount = 1) {
+        if (!failed_ && !execution_.work(location, amount)) failed_ = true;
+        return !failed_;
+    }
+    bool merge(FirstSet& into, const FirstSet& from, SourceLocation location) {
+        // Account for the comparisons used by the small, deduplicated set.
+        if (!work(location, 1 + from.exact.size() *
+            (1 + into.exact.size() + from.exact.size()))) return false;
+        return merge_first(into, from);
+    }
 
-FirstSet pattern_first(const Pattern& pattern, std::size_t begin, const RulePattern& rule) {
-    using K = SyntaxPatternElement::Kind;
-    FirstSet result;
-    for (auto at = begin; at < pattern.size(); ++at) {
-        const auto& element = pattern[at];
-        FirstSet current;
-        switch (element.kind) {
-        case K::Terminal: current.exact.push_back(element.terminal); break;
-        case K::Ident: case K::Name: current.identifier = true; break;
-        case K::Literal: current.literal = true; break;
-        case K::Expr:
+    const Summary& sequence(const Pattern& pattern) {
+        if (failed_) return empty_;
+        if (const auto found = sequences_.find(&pattern); found != sequences_.end()) return found->second;
+        const auto location = pattern.empty() ? SourceLocation{} : pattern.front().location;
+        if (!work(location)) return empty_;
+        if (active_.size() >= execution_.limits().depth ||
+            std::find(active_.begin(), active_.end(), &pattern) != active_.end()) {
+            diagnostics_.error(location, "syntax pattern analysis depth exceeded");
+            failed_ = true;
+            return empty_;
+        }
+        active_.push_back(&pattern);
+        Summary result{{}, true};
+        for (const auto& part : pattern) {
+            const auto& current = element(part);
+            merge(result.first, current.first, part.location);
+            if (failed_ || !current.nullable) { result.nullable = false; break; }
+        }
+        active_.pop_back();
+        return sequences_.emplace(&pattern, std::move(result)).first->second;
+    }
+
+    const Summary& element(const SyntaxPatternElement& part) {
+        if (failed_) return empty_;
+        if (const auto found = elements_.find(&part); found != elements_.end()) return found->second;
+        if (!work(part.location)) return empty_;
+        using K = SyntaxPatternElement::Kind;
+        Summary result;
+        auto& current = result.first;
+        const auto expression_starts = [&] {
             current.identifier = current.literal = current.builtin = true;
-            for (const auto spelling : {"(", "++", "--", "&", "*", "+", "-", "~", "!", "sizeof"}) {
-                MetaToken token;
-                token.kind = spelling == std::string_view("sizeof")
-                    ? TokenKind::Identifier : TokenKind::Punctuator;
-                token.text = spelling;
-                current.exact.push_back(std::move(token));
-            }
-            break;
-        case K::Type: case K::Declaration: case K::FunctionHeader:
-        case K::FunctionDeclaration: case K::FunctionDefinition: case K::FunctionRaw:
+            for (const auto spelling : {"(", "++", "--", "&", "*", "+", "-", "~", "!", "sizeof"})
+                current.exact.push_back({spelling == std::string_view("sizeof")
+                    ? TokenKind::Identifier : TokenKind::Punctuator, spelling});
+        };
+        const auto type_starts = [&] {
             current.identifier = current.builtin = true;
             for (const auto spelling : {"void", "bool", "i8", "i16", "i32", "i64", "i128", "iptr",
                                        "u8", "u16", "u32", "u64", "u128", "uptr", "f32", "f64",
                                        "f80", "f128", "fptr", "label", "const", "volatile", "restrict",
-                                       "struct", "union", "enum"}) {
-                MetaToken token;
-                token.kind = TokenKind::Identifier;
-                token.text = spelling;
-                current.exact.push_back(std::move(token));
-            }
-            if (element.kind != K::Type)
-                for (const auto spelling : {"typedef", "static", "global", "inline", "[["}) {
-                    MetaToken token;
-                    token.kind = spelling == std::string_view("[[")
-                        ? TokenKind::Punctuator : TokenKind::Identifier;
-                    token.text = spelling;
-                    current.exact.push_back(std::move(token));
-                }
+                                       "struct", "union", "enum"})
+                current.exact.push_back({TokenKind::Identifier, spelling});
+            current.exact.push_back({TokenKind::Punctuator, "[["});
+        };
+        const auto declaration_starts = [&] {
+            type_starts();
+            for (const auto spelling : {"typedef", "static", "global", "register", "stack", "inline"})
+                current.exact.push_back({TokenKind::Identifier, spelling});
+        };
+        switch (part.kind) {
+        case K::Terminal: current.exact.push_back({part.terminal.kind, part.terminal.text}); break;
+        case K::Ident: case K::Name: current.identifier = true; break;
+        case K::Literal: current.literal = true; break;
+        case K::Expr: expression_starts(); break;
+        case K::Type: type_starts(); break;
+        case K::Declaration: case K::FunctionHeader:
+        case K::FunctionDeclaration: case K::FunctionDefinition: case K::FunctionRaw:
+            declaration_starts();
             break;
+        case K::Statement:
+            expression_starts();
+            declaration_starts();
+            for (const auto spelling : {"case", "default", "if", "switch", "while", "do", "for",
+                                       "goto", "break", "continue", "return", "syntax"})
+                current.exact.push_back({TokenKind::Identifier, spelling});
+            current.exact.push_back({TokenKind::Punctuator, "{"});
+            current.exact.push_back({TokenKind::Punctuator, ";"});
+            break;
+        case K::TokensUntil: current.raw = true; break;
         case K::Paren: case K::Bracket: case K::Block: case K::Group:
             for (const auto opener : {"(", "[", "[[", "{"})
-                if (element.kind == K::Group ||
-                    (element.kind == K::Paren && opener == std::string_view("(")) ||
-                    (element.kind == K::Bracket && opener == std::string_view("[")) ||
-                    (element.kind == K::Block && opener == std::string_view("{"))) {
-                    MetaToken token;
+                if (part.kind == K::Group ||
+                    (part.kind == K::Paren && opener == std::string_view("(")) ||
+                    (part.kind == K::Bracket && opener == std::string_view("[")) ||
+                    (part.kind == K::Block && opener == std::string_view("{"))) {
+                    FirstSet::Terminal token;
                     token.kind = TokenKind::Punctuator;
                     token.text = opener;
                     current.exact.push_back(std::move(token));
                 }
             break;
         case K::Rule:
-            if (element.resolved_rule)
-                if (const auto* body = rule(*element.resolved_rule)) current = pattern_first(*body, 0, rule);
+            if (part.resolved_rule)
+                if (const auto* body = rule_(*part.resolved_rule)) result = sequence(*body);
             break;
         case K::Optional: case K::Repeat0: case K::Repeat1: case K::Separated0: case K::Separated1:
-            current = pattern_first(element.pattern, 0, rule);
+            result = sequence(part.pattern);
+            if (part.kind == K::Optional || part.kind == K::Repeat0 || part.kind == K::Separated0)
+                result.nullable = true;
             break;
         case K::Choice:
-            for (const auto& alternative : element.alternatives)
-                merge_first(current, pattern_first(alternative.pattern, 0, rule));
+            for (const auto& alternative : part.alternatives) {
+                const auto& branch = sequence(alternative.pattern);
+                merge(current, branch.first, part.location);
+                result.nullable |= branch.nullable;
+            }
             break;
-        default: current.any = true; break;
         }
-        merge_first(result, current);
-        if (!element_nullable(element, rule)) break;
+        return elements_.emplace(&part, std::move(result)).first->second;
     }
-    return result;
-}
 
-bool validate_pattern_progress(const Pattern& pattern, const RulePattern& rule,
+private:
+    SyntaxExecution& execution_;
+    Diagnostics& diagnostics_;
+    RulePattern rule_;
+    bool failed_{};
+    Summary empty_;
+    std::vector<const Pattern*> active_;
+    std::unordered_map<const Pattern*, Summary> sequences_;
+    std::unordered_map<const SyntaxPatternElement*, Summary> elements_;
+};
+
+bool validate_pattern_progress(const Pattern& root, PatternAnalysis& analysis,
                                Diagnostics& diagnostics) {
     using K = SyntaxPatternElement::Kind;
-    for (std::size_t at = 0; at < pattern.size(); ++at) {
-        const auto& element = pattern[at];
-        if ((element.kind == K::Expr || element.kind == K::Type) && at + 1 < pattern.size()) {
-            const auto& fence = pattern[at + 1];
-            if (fence.kind != K::Terminal || (fence.terminal.text != ";" &&
-                fence.terminal.text != "," && !closing(fence.terminal.text))) {
-                diagnostics.error(element.location,
-                    "parsed expression/type capture requires a semicolon, comma, or closing-delimiter fence");
+    struct Pending {
+        FirstSet follow;
+        bool queued{};
+    };
+    std::unordered_map<const Pattern*, Pending> continuations;
+    std::vector<const Pattern*> queue;
+    const auto enqueue = [&](const Pattern& pattern, const FirstSet& follow) {
+        if (pattern.empty()) return;
+        auto [entry, inserted] = continuations.try_emplace(&pattern);
+        const bool changed = analysis.merge(entry->second.follow, follow, pattern.front().location);
+        if ((inserted || changed) && !entry->second.queued) {
+            entry->second.queued = true;
+            queue.push_back(&pattern);
+        }
+    };
+    enqueue(root, {});
+    // A rule can be reached through multiple callers or recursive tails.
+    // Propagate unions until stable; never inline the recursive rule graph.
+    for (std::size_t next = 0; next < queue.size() && analysis.good(); ++next) {
+        const auto& pattern = *queue[next];
+        auto continuation = continuations.at(&pattern).follow;
+        continuations.at(&pattern).queued = false;
+        for (std::size_t at = pattern.size(); at-- > 0;) {
+            const auto& element = pattern[at];
+            if (!analysis.work(element.location)) return false;
+            if ((element.kind == K::Expr || element.kind == K::Type) && at + 1 < pattern.size()) {
+                const auto& fence = pattern[at + 1];
+                if (fence.kind != K::Terminal || (fence.terminal.text != ";" &&
+                    fence.terminal.text != "," && !closing(fence.terminal.text))) {
+                    diagnostics.error(element.location,
+                        "parsed expression/type capture requires a semicolon, comma, or closing-delimiter fence");
+                    return false;
+                }
+            }
+            if ((element.kind == K::Optional || element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
+                 element.kind == K::Separated0 || element.kind == K::Separated1) &&
+                analysis.sequence(element.pattern).nullable) {
+                diagnostics.error(element.location, "syntax optional/repetition body may be nullable");
                 return false;
             }
-        }
-        if ((element.kind == K::Optional || element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
-             element.kind == K::Separated0 || element.kind == K::Separated1) &&
-            pattern_nullable(element.pattern, rule)) {
-            diagnostics.error(element.location, "syntax optional/repetition body may be nullable");
-            return false;
-        }
-        if (element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
-            element.kind == K::Separated0 || element.kind == K::Separated1) {
-            FirstSet repeated;
-            if (element.kind == K::Separated0 || element.kind == K::Separated1)
-                repeated.exact.push_back(element.terminal);
-            else repeated = pattern_first(element.pattern, 0, rule);
-            const auto continuation = pattern_first(pattern, at + 1, rule);
-            if (first_overlap(repeated, continuation)) {
-                diagnostics.error(element.location, "syntax repetition start conflicts with continuation");
-                return false;
+            const bool repeated = element.kind == K::Repeat0 || element.kind == K::Repeat1;
+            const bool separated = element.kind == K::Separated0 || element.kind == K::Separated1;
+            auto child_continuation = continuation;
+            if (repeated || separated) {
+                FirstSet loop;
+                if (separated) loop.exact.push_back({element.terminal.kind, element.terminal.text});
+                else loop = analysis.sequence(element.pattern).first;
+                if (!analysis.work(element.location,
+                    1 + loop.exact.size() + continuation.exact.size() +
+                    2 * loop.exact.size() * continuation.exact.size())) return false;
+                if (first_overlap(loop, continuation)) {
+                    diagnostics.error(element.location, "syntax repetition start conflicts with continuation");
+                    return false;
+                }
+                analysis.merge(child_continuation, loop, element.location);
             }
-        }
-        if (!validate_pattern_progress(element.pattern, rule, diagnostics)) return false;
-        for (const auto& alternative : element.alternatives) {
-            if (pattern_nullable(alternative.pattern, rule)) {
-                diagnostics.error(element.location, "syntax choice alternative must consume input");
-                return false;
+            enqueue(element.pattern, child_continuation);
+            if (element.kind == K::Rule && element.resolved_rule)
+                if (const auto* body = analysis.rule(*element.resolved_rule)) enqueue(*body, continuation);
+            for (const auto& alternative : element.alternatives) {
+                if (analysis.sequence(alternative.pattern).nullable) {
+                    diagnostics.error(element.location, "syntax choice alternative must consume input");
+                    return false;
+                }
+                enqueue(alternative.pattern, continuation);
             }
-            if (!validate_pattern_progress(alternative.pattern, rule, diagnostics)) return false;
+            const auto& start = analysis.element(element);
+            if (!start.nullable) continuation = start.first;
+            else analysis.merge(continuation, start.first, element.location);
+            if (!analysis.good()) return false;
         }
     }
-    return true;
+    return analysis.good();
 }
 
 } // namespace
@@ -866,8 +960,9 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
         if (!pattern) return false;
         if (!take(";")) return error("expected ';' after syntax match");
         definition.pattern = std::move(*pattern);
-        if (!validate_pattern_progress(definition.pattern,
-            [](SyntaxEntityId) -> const Pattern* { return nullptr; }, diagnostics)) return false;
+        PatternAnalysis analysis(*execution_, diagnostics,
+            [](SyntaxEntityId) -> const Pattern* { return nullptr; });
+        if (!validate_pattern_progress(definition.pattern, analysis, diagnostics)) return false;
         if (*selected != SyntaxKind::Rule) {
             if (!take("expand")) return error("syntax definition requires an expand clause after match");
             definition.expander = name_at(tokens, index);
@@ -1114,8 +1209,9 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
     };
     for (const auto& pending : pending_rules)
         if (visited[pending.definition.value] == 0 && !check_leading(check_leading, pending.definition)) return false;
+    PatternAnalysis progress(*execution_, diagnostics, bound_pattern);
     for (const auto& pending : pending_rules)
-        if (!validate_pattern_progress(pending.pattern, bound_pattern, diagnostics)) {
+        if (!validate_pattern_progress(pending.pattern, progress, diagnostics)) {
             const auto& definition = (*definitions_)[pending.definition.value];
             diagnostics.note(definition.location, "while validating syntax '" + definition.name + "'");
             return false;
@@ -1150,6 +1246,9 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     const std::function<std::optional<SyntaxParsedFragment>(
         SyntaxPatternElement::Kind, std::size_t)>& parse_fragment) const {
     const auto previous_errors = diagnostics.errors();
+    PatternAnalysis analysis(*execution_, diagnostics, [&](SyntaxEntityId id) -> const Pattern* {
+        return id.value < definitions_->size() ? &(*definitions_)[id.value].pattern : nullptr;
+    });
     std::uint64_t storage{};
     bool failed{};
     const auto charge = [&](std::uint64_t amount) {
@@ -1368,13 +1467,11 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 }
                 auto candidates = nested(element.pattern, body);
                 if (candidates.empty() && !failed && body < tokens.size()) {
-                    const RulePattern bound_pattern = [&](SyntaxEntityId id) -> const Pattern* {
-                        return id.value < definitions_->size() ? &(*definitions_)[id.value].pattern : nullptr;
-                    };
-                    const auto first = pattern_first(element.pattern, 0, bound_pattern);
+                    const auto& first = analysis.sequence(element.pattern).first;
+                    if (!analysis.good()) { failed = true; return; }
                     if ((separated && !records.empty()) ||
                         (tokens[body].kind != TokenKind::End &&
-                         first_accepts(first, MetaToken(tokens[body])))) {
+                         first_accepts(first, tokens[body].kind, tokens[body].text))) {
                         diagnostics.error(tokens[body].location,
                             separated && !records.empty()
                                 ? "malformed syntax item after committed separator"

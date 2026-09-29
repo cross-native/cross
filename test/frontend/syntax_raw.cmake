@@ -47,7 +47,7 @@ endfunction()
 function(accept case source)
     set(input "${directory}/${case}.x")
     file(WRITE "${input}" "${source}")
-    execute_process(COMMAND "${CC}" -S "${input}" -o "${directory}/${case}.s"
+    execute_process(COMMAND "${CC}" -S ${ARGN} "${input}" -o "${directory}/${case}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(NOT status EQUAL 0)
         message(FATAL_ERROR "${case} failed\n${out}\n${err}")
@@ -242,6 +242,51 @@ reject(separated_continuation "repetition start conflicts with continuation"
     "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:separated0(number:literal, \",\") \",\" \")\"; expand expand; }\n")
 reject(rule_repeat_continuation "repetition start conflicts with continuation"
     "${expander}syntax X : rule { match \"x\"; } syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(rule(X)) \"x\" \")\"; expand expand; } syntax Bad;\n")
+reject(choice_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" branch:choice(one:(\"a\" parts:repeat0(\"x\")) | two:(\"b\")) \"x\" \")\"; expand expand; }\n")
+reject(optional_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" part:optional(\"a\" parts:repeat1(\"x\")) skip:optional(\"y\") \"x\" \")\"; expand expand; }\n")
+reject(nested_repeat_loop_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat1(\"x\" tail:repeat0(\"x\")) \")\"; expand expand; }\n")
+reject(nested_separated_loop_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:separated1(\"x\" tail:repeat0(\",\"), \",\") \")\"; expand expand; }\n")
+reject(choice_separated_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" branch:choice(one:(parts:separated1(value:literal, \",\")) | two:(\"b\")) \",\" \")\"; expand expand; }\n")
+reject(referenced_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Tail : rule { match parts:repeat0(\"x\"); } syntax Bad : expression { prefix \"bad\"; match \"(\" rule(Tail) skip:optional(\"y\") \"x\" \")\"; expand expand; } syntax Bad;\n")
+reject(recursive_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Tail : rule { match \"a\" branch:choice(stop:(parts:repeat1(\"x\")) | next:(rule(Tail))); } syntax Bad : expression { prefix \"bad\"; match \"(\" rule(Tail) \"x\" \")\"; expand expand; } syntax Bad;\n")
+reject(mutual_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax A : rule { match \"a\" rule(B); } syntax B : rule { match branch:choice(stop:(parts:repeat1(\"x\")) | next:(rule(A))); } syntax Bad : expression { prefix \"bad\"; match \"(\" rule(A) \"x\" \")\"; expand expand; } syntax Bad;\n")
+reject(bound_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Tail : rule { match parts:repeat0(\"x\"); } syntax Good : expression { prefix \"good\"; match \"(\" rule(Tail) \")\"; expand expand; } syntax Bad : expression { prefix \"bad\"; match \"(\" rule(Tail) \"x\" \")\"; expand expand; } syntax Good; syntax Bad;\n")
+reject(type_attribute_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(value:type \";\") \"[[\" \"atomic\" \"]]\" \")\"; expand expand; }\n")
+reject(declaration_storage_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(value:declaration) \"register\" \")\"; expand expand; }\n")
+reject(raw_repeat_continuation "repetition start conflicts with continuation"
+    "${expander}syntax Bad : expression { prefix \"bad\"; match \"(\" parts:repeat0(value:tokens_until(\";\") \";\") \"alien\" \")\"; expand expand; }\n")
+accept(statement_repeat_closing_continuation
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" parts:repeat0(body:stmt) \")\"; expand expand; } syntax Value; $::static_assert(value (u32 unused; return 3u32; { ; }) == 1u32, \"statement repetitions\"); $::static_assert(value () == 1u32, \"empty statements\");\n")
+accept(raw_repeat_closing_continuation
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" parts:repeat0(body:tokens_until(\";\") \";\") \")\"; expand expand; } syntax Value; $::static_assert(value (foreign! { words; }; [[unknown]] [payload];) == 1u32, \"raw repetitions\"); $::static_assert(value () == 1u32, \"empty raw repetition\");\n")
+accept(nested_repeat_distinct_continuation
+    "${expander}syntax Tail : rule { match parts:repeat0(\"x\"); } syntax Value : expression { prefix \"value\"; match \"(\" branch:choice(one:(\"a\" rule(Tail)) | two:(\"b\")) skip:optional(\"y\") \")\"; expand expand; } syntax Value; $::static_assert(value (a x x y) == 1u32, \"nested repeat\"); $::static_assert(value (b) == 1u32, \"other branch\");\n")
+accept(recursive_repeat_distinct_continuation
+    "${expander}syntax Tail : rule { match \"a\" branch:choice(stop:(parts:repeat1(\"x\")) | next:(rule(Tail))); } syntax Value : expression { prefix \"value\"; match \"(\" rule(Tail) \")\"; expand expand; } syntax Value; $::static_assert(value (a a x x) == 1u32, \"recursive repeat\");\n")
+accept(reused_repeat_distinct_continuations
+    "${expander}syntax Tail : rule { match parts:repeat0(\"x\"); } syntax Round : expression { prefix \"round\"; match \"(\" rule(Tail) \")\"; expand expand; } syntax Square : expression { prefix \"square\"; match \"[\" rule(Tail) \"]\"; expand expand; } syntax Round, Square; $::static_assert(round (x x) + square [x] == 2u32, \"reused rule\");\n")
+# The number of derivations is exponential, but declaration/activation analysis
+# must memoize rule summaries rather than enumerate them. No invocation occurs.
+set(diamond "${expander}syntax D0 : rule { match \"x\"; }\n")
+foreach(level RANGE 1 32)
+    math(EXPR previous "${level} - 1")
+    string(APPEND diamond "syntax D${level} : rule { match branch:choice(left:(rule(D${previous})) | right:(rule(D${previous}))); }\n")
+endforeach()
+string(APPEND diamond "syntax Diamond : expression { prefix \"diamond\"; match \"(\" parts:repeat0(rule(D32)) \")\"; expand expand; } syntax Diamond;\n")
+accept(shared_rule_analysis "${diamond}" -feval-step-limit=100000)
+reject(shared_rule_analysis_budget "matching work budget exceeded"
+    "${diamond}" -feval-step-limit=1000)
 reject(nullable_choice "choice alternative must consume input"
     "${expander}syntax Bad : expression { prefix \"bad\"; match branch:choice(empty:(value:optional(\"x\")) | value:(\"y\")); expand expand; }\n")
 reject(choice_duplicate "duplicate choice alternative label"

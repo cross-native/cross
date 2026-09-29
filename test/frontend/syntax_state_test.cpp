@@ -21,7 +21,7 @@ int main() {
     const LayoutQuery no_layout = [](const TypePtr&) -> std::optional<std::uint64_t> { return {}; };
     auto execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 32,
         no_layout, no_layout, EvaluationLimits{}, EvaluationLayout{});
-    const auto* source = sources.add("syntax-state.x", R"(
+    const auto* source = sources.add("syntax-state.x", R"SOURCE(
 [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {
     return $::quote { 1u32 };
 }
@@ -33,8 +33,12 @@ syntax Combined : expression { prefix "combined"; match rule(Rule); expand expan
 syntax Optional : expression { prefix "optional"; match part:optional("x"); expand expand; }
 syntax BadRule : rule { match rule(BadRule) "x"; }
 syntax BadUse : expression { prefix "bad"; match rule(BadRule); expand expand; }
+syntax RepeatTail : rule { match parts:repeat0("x"); }
+syntax RepeatGood : expression { prefix "repeat_good"; match "(" rule(RepeatTail) ")"; expand expand; }
+syntax RepeatBad : expression { prefix "repeat_bad"; match "(" rule(RepeatTail) "x" ")"; expand expand; }
+syntax RepeatSquare : expression { prefix "repeat_square"; match "[" rule(RepeatTail) "]"; expand expand; }
 syntax Pack : bundle { use First; use Item; }
-)");
+)SOURCE");
     auto tokens = execution->prepare(*source);
     SyntaxState state(execution);
     for (std::size_t at = 0; tokens[at].kind != TokenKind::End;) {
@@ -75,6 +79,21 @@ syntax Pack : bundle { use First; use Item; }
     const auto before_cycle = state.bindings();
     require(!activate({{"BadUse", {}, {}}}), "left-recursive rule activation succeeded");
     require(state.bindings() == before_cycle, "failed recursive activation installed a binding");
+    require(activate({{"RepeatGood", {}, {}}}), "valid repeated-rule caller failed");
+    const auto before_continuation = state.bindings();
+    require(!activate({{"RepeatSquare", {}, {}}, {"RepeatBad", {}, {}}}),
+            "a previously bound rule ignored its new caller's continuation");
+    require(state.bindings() == before_continuation,
+            "failed continuation validation partially installed bindings");
+    require(activate({{"RepeatSquare", {}, {}}}),
+            "failed caller poisoned a later valid continuation of the shared rule");
+    const auto* repeated_source = sources.add("repeat-after-failure.x", "repeat_good (x x)");
+    const auto repeated_tokens = Lexer(*repeated_source, diagnostics).lex();
+    const auto repeated_errors = diagnostics.errors();
+    const auto repeated_match = state.match(*state.selected(repeated_tokens.front(), false),
+                                           repeated_tokens, 0, diagnostics);
+    require(repeated_match && repeated_match->end == 5 && diagnostics.errors() == repeated_errors,
+            "failed caller mutated a previously valid rule or match context");
 
     // Matching preserves the actual written prefix and its bounded input.
     const auto* invocation = sources.add("invocation.x", "same ()");
