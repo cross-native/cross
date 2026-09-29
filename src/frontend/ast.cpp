@@ -12,6 +12,16 @@
 
 namespace cross {
 
+bool is_meta_type(const TypePtr& type) {
+    if (!type) return false;
+    switch (type->kind) {
+    case Type::Kind::Tokens: case Type::Kind::SyntaxMatch: case Type::Kind::Syntax:
+    case Type::Kind::Span: case Type::Kind::Context: case Type::Kind::Bytes:
+    case Type::Kind::Buffer: return true;
+    default: return false;
+    }
+}
+
 AliasDefinition::AliasDefinition(const TypePtr& type, std::uint64_t storage)
     : type_(copy_type(type)), storage_(storage) {}
 
@@ -541,6 +551,12 @@ unsigned type_bits(const TypePtr& type) {
 const Attribute* FunctionDecl::attribute(std::string_view sought) const {
     for (const auto& item : attributes) if (item.name == sought) return &item;
     return nullptr;
+}
+
+bool FunctionDecl::has_meta_signature() const {
+    if (is_meta_type(return_type)) return true;
+    return std::any_of(parameters.begin(), parameters.end(),
+        [](const ParameterDecl& parameter) { return is_meta_type(parameter.type); });
 }
 
 std::string encode_link_name(std::string_view qualified_name, bool label,

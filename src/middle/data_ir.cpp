@@ -1506,6 +1506,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
             normalized.function = function.definition ? function.definition
                                                       : function.declarations.back();
             if (normalized.function->attribute("eval_only") ||
+                normalized.function->has_meta_signature() ||
                 normalized.function->attribute("always_inline"))
                 return reject(expression->location,
                               "generic pointer argument requires a function with a runtime address");

@@ -2389,36 +2389,26 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 }
             }
         } else if (current().is("$::meta::context")) {
-            if (!parsing_procedural_body_)
-                error_here("$::meta::context is only available in expansion functions");
             type = context_type();
             type->is_const = is_const;
             type->is_volatile = is_volatile;
             ++index_;
         } else if (current().is("$::meta::span")) {
-            if (!parsing_procedural_body_)
-                error_here("$::meta::span is only available in expansion functions");
             type = span_type();
             type->is_const = is_const;
             type->is_volatile = is_volatile;
             ++index_;
         } else if (current().is("$::meta::syntax")) {
-            if (!parsing_procedural_body_)
-                error_here("$::meta::syntax is only available in expansion functions");
             type = syntax_type();
             type->is_const = is_const;
             type->is_volatile = is_volatile;
             ++index_;
         } else if (current().is("$::meta::syntax_match")) {
-            if (!parsing_procedural_body_)
-                error_here("$::meta::syntax_match is only available in expansion functions");
             type = syntax_match_type();
             type->is_const = is_const;
             type->is_volatile = is_volatile;
             ++index_;
         } else if (current().is("$::meta::tokens")) {
-            if (!parsing_procedural_body_)
-                error_here("$::meta::tokens is only available in translation-time macro bodies");
             ++index_;
             type = tokens_type();
             type->is_const = is_const;
@@ -3888,6 +3878,28 @@ void Parser::parse_function_header_splice(
 }
 
 void Parser::parse_external(Program& program, const std::string& name_space) {
+    const auto errors = diagnostics_.errors();
+    const auto first_function = program.functions.size();
+    parse_external_impl(program, name_space);
+    if (!syntax_ || parsing_public_fragment_ || parsing_public_function_header_ ||
+        preparing_header_ || diagnostics_.errors() != errors) return;
+    for (std::size_t i = first_function; i < program.functions.size(); ++i) {
+        auto& function = *program.functions[i];
+        if (!function.translation_context) {
+            auto context = std::make_shared<SyntaxContext>();
+            context->kind = SyntaxContext::Kind::DefinitionSite;
+            context->definition = function.location;
+            context->name_space = function.source_namespace;
+            context->imports = function.imports;
+            context->syntax_bindings = syntax_->bindings();
+            context->parse_environment = snapshot_environment();
+            function.translation_context = std::move(context);
+        }
+    }
+    syntax_->execution()->publish_declarations(program, pending_records_, pending_enumerations_);
+}
+
+void Parser::parse_external_impl(Program& program, const std::string& name_space) {
     struct NamespaceRestore {
         std::string& value;
         std::string previous;
@@ -5856,8 +5868,6 @@ std::unique_ptr<Expr> Parser::parse_quote() {
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::Quote;
     result->location = current().location;
-    if (!parsing_procedural_body_ && !parsing_public_fragment_)
-        error_here("$::quote is only available in translation-time macro bodies");
     ++index_;
     if (!expect("{", "after $::quote")) return result;
     const auto content_first = index_;

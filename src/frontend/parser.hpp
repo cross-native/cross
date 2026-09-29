@@ -179,6 +179,7 @@ private:
     };
     bool type_start(TypeProbe probe = TypeProbe::Required);
     void parse_external(Program& program, const std::string& name_space);
+    void parse_external_impl(Program& program, const std::string& name_space);
     void parse_external_node_splice(Program& program,
                                     const std::string& name_space);
     std::optional<std::size_t> function_header_splice_position();

@@ -180,7 +180,7 @@ if(NOT result EQUAL 1 OR NOT err MATCHES "ambiguous syntax entity 'Base'")
 endif()
 
 compile(runtime "$::meta::context forbidden;\nglobal u32 entry() { return 0u32; }\n")
-if(NOT result EQUAL 1 OR NOT err MATCHES "context is only available in expansion functions")
+if(NOT result EQUAL 1 OR NOT err MATCHES "meta values cannot have runtime object storage")
     message(FATAL_ERROR "context type entered runtime declaration\n${err}")
 endif()
 

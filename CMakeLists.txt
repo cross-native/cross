@@ -2427,6 +2427,10 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-context-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_contexts.cmake")
+    add_test(NAME cross_meta_helper_checks
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/meta-helper-checks
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/meta_helpers.cmake")
     add_test(NAME cross_syntax_deferred_checks
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-deferred-checks

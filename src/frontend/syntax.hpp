@@ -11,6 +11,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -182,6 +184,9 @@ public:
                     unsigned address_bits, LayoutQuery size_of, LayoutQuery align_of,
                     EvaluationLimits limits, EvaluationLayout layout);
     std::vector<Token> prepare(const SourceFile& source);
+    void publish_declarations(const Program& program,
+        std::span<const RecordDecl> pending_records = {},
+        std::span<const EnumDecl> pending_enumerations = {});
     bool define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
                           const std::vector<std::string>& imports,
                           const std::vector<SyntaxBinding>& bindings,
@@ -244,6 +249,11 @@ private:
     EvaluationLimits limits_;
     EvaluationLayout layout_;
     std::vector<Function> functions_;
+    Program declarations_;
+    std::unordered_set<const FunctionDecl*> published_functions_;
+    std::unordered_set<const ObjectDecl*> published_objects_;
+    std::unordered_map<NominalTypeKey, bool, NominalTypeKeyHash> published_records_;
+    std::unordered_set<NominalTypeKey, NominalTypeKeyHash> published_enumerations_;
     std::uint64_t work_{};
     unsigned depth_{};
     unsigned fragment_depth_{};

@@ -121,7 +121,7 @@ foreach(case unassigned_prefix double_freeze over_capacity nonstatic_buffer meta
         set(expected "meta memory budget exceeded 67108864 bytes")
     else()
         set(body "")
-        set(expected "meta byte type in its signature must be static")
+        set(expected "meta type in its signature must be static")
     endif()
     set(input "${directory}/${case}.x")
     if(case STREQUAL nonstatic_buffer)

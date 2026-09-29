@@ -116,6 +116,7 @@ bool compatible_pointee(const TypePtr& source, const TypePtr& destination,
 bool is_integer(const TypePtr& type);
 bool is_floating(const TypePtr& type);
 bool is_scalar(const TypePtr& type);
+bool is_meta_type(const TypePtr& type);
 bool is_vector(const TypePtr& type);
 bool is_nominal(const TypePtr& type);
 unsigned type_bits(const TypePtr& type);
@@ -331,6 +332,8 @@ struct FunctionDecl {
     std::string source_unit;
     std::vector<std::string> imports;
     TypePtr return_type;
+    // Definition context for quotation performed by an ordinary evaluated helper.
+    std::shared_ptr<const SyntaxContext> translation_context;
     std::vector<ParameterDecl> parameters;
     std::vector<Attribute> attributes;
     std::vector<GenericParameter> generic_parameters;
@@ -344,6 +347,7 @@ struct FunctionDecl {
 
     [[nodiscard]] bool definition() const { return body != nullptr; }
     [[nodiscard]] const Attribute* attribute(std::string_view name) const;
+    [[nodiscard]] bool has_meta_signature() const;
 };
 
 struct ObjectDecl {

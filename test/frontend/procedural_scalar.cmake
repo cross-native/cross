@@ -115,8 +115,10 @@ foreach(target host mips mipsel mips64 mips64el)
                 set(expected "instruction budget exceeded")
             elseif(case STREQUAL TOKEN_BUDGET)
                 set(expected "token construction budget exceeded")
-            elseif(case STREQUAL TOKEN_ESCAPE OR case STREQUAL QUOTE_ESCAPE)
-                set(expected "only available in translation-time macro bodies")
+            elseif(case STREQUAL TOKEN_ESCAPE)
+                set(expected "meta values cannot have runtime object storage")
+            elseif(case STREQUAL QUOTE_ESCAPE)
+                set(expected "quote cannot enter runtime expressions")
             endif()
             execute_process(COMMAND "${CC}" ${flags} -${level} "-D${case}" -S
                 "${SOURCE_DIR}/procedural_scalar_errors.x" -o "${OUTPUT}-error.s"

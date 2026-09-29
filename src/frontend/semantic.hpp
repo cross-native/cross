@@ -40,6 +40,13 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
 using LayoutQuery =
     std::function<std::optional<std::uint64_t>(const TypePtr&)>;
 
+// Expansion evaluation owns snapshots of reached source declarations. These
+// copies preserve source identities without borrowing a replacement parser's AST.
+std::unique_ptr<FunctionDecl> copy_evaluation_declaration(const FunctionDecl& declaration);
+std::unique_ptr<ObjectDecl> copy_evaluation_declaration(const ObjectDecl& declaration);
+RecordDecl copy_evaluation_declaration(const RecordDecl& declaration);
+EnumDecl copy_evaluation_declaration(const EnumDecl& declaration);
+
 struct SyntaxNode;
 enum class SyntaxParseCategory;
 using SyntaxParseCallback = std::function<std::shared_ptr<const SyntaxNode>(
@@ -53,7 +60,7 @@ std::optional<TokenSequence> evaluate_procedural_body(
     std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
     EvaluationLimits limits = {}, EvaluationLayout layout = {},
     const SyntaxParseCallback& parse = {},
-    std::shared_ptr<const SyntaxContext> call_context = {});
+    std::shared_ptr<const SyntaxContext> call_context = {}, Program* declarations = nullptr);
 
 struct SyntaxMatchValue;
 std::optional<TokenSequence> evaluate_syntax_body(
@@ -61,7 +68,7 @@ std::optional<TokenSequence> evaluate_syntax_body(
     unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics,
     EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse = {},
-    std::shared_ptr<const SyntaxContext> call_context = {});
+    std::shared_ptr<const SyntaxContext> call_context = {}, Program* declarations = nullptr);
 
 // Static assertions are retained until target HIR has established nominal
 // layouts.  The callbacks keep target layout ownership out of the frontend.

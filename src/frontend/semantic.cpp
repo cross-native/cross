@@ -1080,6 +1080,7 @@ std::unique_ptr<FunctionDecl> instantiate(
     result->source_namespace = source.source_namespace;
     result->source_unit = source.source_unit;
     result->imports = source.imports;
+    result->translation_context = source.translation_context;
     result->return_type = clone_type(source.return_type, types, values);
     for (const auto& parameter : source.parameters) {
         result->parameters.push_back(
@@ -3102,6 +3103,15 @@ public:
         current_function_ = previous;
         pop_scope();
         frame_base_ = previous_base;
+        if (function.return_type && function.return_type->kind == Type::Kind::Builtin &&
+            function.return_type->builtin == BuiltinType::Void &&
+            (flow.kind == Flow::Normal || (flow.kind == Flow::Return &&
+             (!flow.value || (flow.value->type && flow.value->type->kind == Type::Kind::Builtin &&
+                              flow.value->type->builtin == BuiltinType::Void))))) {
+            call_stack_.pop_back();
+            --depth_;
+            return EvalValue{UInt128{}, builtin_type(BuiltinType::Void)};
+        }
         if (flow.kind != Flow::Return || !flow.value) {
             fail(location,
                  "translation-time call to '" + function.name +
@@ -3125,11 +3135,13 @@ public:
                 return std::nullopt;
             }
             TokenSequence result;
+            const auto context = literal_context(expression.location);
+            if (!context) return std::nullopt;
             for (std::size_t index = 0; index < expression.quote_fragments.size(); ++index) {
                 auto literal = expression.quote_fragments[index];
                 for (auto& token : literal) {
                     token.origin = {token_origin(macro_context_->invocation).span,
-                                    {}, macro_context_, {}, 0, {}};
+                                    {}, context, {}, 0, {}};
                 }
                 if (!append_tokens(result, literal, expression.location))
                     return std::nullopt;
@@ -3311,6 +3323,20 @@ public:
     }
 
 private:
+    std::shared_ptr<const SyntaxContext> literal_context(SourceLocation location) {
+        if (!current_function_ || !current_function_->translation_context) return macro_context_;
+        auto& cached = helper_contexts_[current_function_];
+        if (!cached) {
+            auto context = std::make_shared<SyntaxContext>(*current_function_->translation_context);
+            context->kind = SyntaxContext::Kind::DefinitionSite;
+            context->expansion = macro_context_->expansion;
+            context->invocation = macro_context_->invocation;
+            cached = std::move(context);
+        }
+        if (!charge_input_context(cached, location)) return {};
+        return cached;
+    }
+
     bool charge_input_context(const std::shared_ptr<const SyntaxContext>& context, SourceLocation location) {
         if (!context || !charged_contexts_.insert(context.get()).second) return true;
         auto size = syntax_context_storage(*context);
@@ -3471,8 +3497,10 @@ private:
         for (const auto& token : tokens) {
             if (token.kind == TokenKind::End) break;
             MetaToken value(token);
+            const auto context = literal_context(location);
+            if (!context) return std::nullopt;
             value.origin = {token_origin(macro_context_->invocation).span,
-                            {}, macro_context_, {}, 0, {}};
+                            {}, context, {}, 0, {}};
             result.push_back(std::move(value));
         }
         return result;
@@ -3939,6 +3967,7 @@ private:
                 const bool compatible = from && to &&
                     (((is_integer(from) || is_floating(from)) &&
                       (is_integer(to) || is_floating(to))) ||
+                     (is_meta_type(from) && from->kind == to->kind) ||
                      same_type(from, to) || pointer_compatible() ||
                      (is_vector(to) && !to->scalable &&
                       ((is_vector(from) && !from->scalable && from->lanes == to->lanes &&
@@ -7436,10 +7465,11 @@ private:
                 return {Flow::Failed};
             }
             return {};
-        case Statement::Kind::Return:
-            return {Flow::Return,
-                    statement.expression ? expression(*statement.expression)
-                                         : std::optional<EvalValue>{}};
+        case Statement::Kind::Return: {
+            if (!statement.expression) return {Flow::Return};
+            auto value = expression(*statement.expression);
+            return value ? Flow{Flow::Return, std::move(value)} : Flow{Flow::Failed};
+        }
         case Statement::Kind::If: {
             auto condition = expression(*statement.condition);
             if (!condition || !known_truth(*condition, statement.location)) return {Flow::Failed};
@@ -7633,6 +7663,7 @@ private:
     const GenericPointerResolver* pointer_resolver_{};
     bool procedural_{};
     std::shared_ptr<const SyntaxContext> macro_context_;
+    std::unordered_map<const FunctionDecl*, std::shared_ptr<const SyntaxContext>> helper_contexts_;
     SyntaxParseCallback syntax_parse_;
     std::shared_ptr<const SyntaxContext> call_context_;
     std::unordered_set<const SyntaxContext*> charged_contexts_;
@@ -7945,15 +7976,7 @@ std::string literal_suffix(const TypePtr& type) {
 }
 
 bool evaluation_only(const FunctionDecl& function) {
-    if (function.attribute("eval_only")) return true;
-    if (function.return_type && (function.return_type->kind == Type::Kind::Bytes ||
-                                  function.return_type->kind == Type::Kind::Buffer)) return true;
-    return std::any_of(function.parameters.begin(), function.parameters.end(),
-        [](const ParameterDecl& parameter) {
-            return parameter.type &&
-                (parameter.type->kind == Type::Kind::Bytes ||
-                 parameter.type->kind == Type::Kind::Buffer);
-        });
+    return function.attribute("eval_only") || function.has_meta_signature();
 }
 
 bool runtime_only(const FunctionDecl& function) {
@@ -8309,6 +8332,11 @@ void rewrite_eval_expr(std::unique_ptr<Expr>& expression,
                        bool required_context = false,
                        bool runtime_context = false) {
     if (!expression) return;
+
+    if (expression->kind == Expr::Kind::Quote) {
+        diagnostics.error(expression->location, "$::quote cannot enter runtime expressions");
+        return;
+    }
 
     if (expression->kind == Expr::Kind::Call && expression->left &&
         expression->left->kind == Expr::Kind::Name &&
@@ -8721,10 +8749,31 @@ void rewrite_eval_statement(Statement& statement, FunctionDecl* caller,
 
 bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                        bool opportunistic) {
+    const auto same_entity = [](const FunctionDecl& left, const FunctionDecl& right) {
+        return left.name == right.name && left.fresh == right.fresh &&
+            ((left.linkage != Linkage::Static && right.linkage != Linkage::Static) ||
+             left.source_unit == right.source_unit);
+    };
+    // These functions disappear before runtime HIR declaration merging. Check
+    // their source interfaces here, without assigning a physical call ABI.
+    for (std::size_t i = 0; i < program.functions.size(); ++i) {
+        const auto& left = *program.functions[i];
+        for (std::size_t j = i + 1; j < program.functions.size(); ++j) {
+            const auto& right = *program.functions[j];
+            if ((!left.has_meta_signature() && !right.has_meta_signature()) ||
+                !same_entity(left, right)) continue;
+            if (left.body && right.body)
+                diagnostics.error(right.location, "duplicate definition of meta helper '" + right.name + "'");
+            else if (left.linkage != right.linkage ||
+                !same_type(function_type(left.return_type, left.parameters, left.variadic),
+                           function_type(right.return_type, right.parameters, right.variadic)))
+                diagnostics.error(right.location, "declarations of meta helper '" + right.name +
+                    "' have incompatible interfaces");
+        }
+    }
     const auto contains_meta = [&](const auto& self, const TypePtr& type) -> bool {
         if (!type) return false;
-        if (type->kind == Type::Kind::Bytes || type->kind == Type::Kind::Buffer)
-            return true;
+        if (is_meta_type(type)) return true;
         if (self(self, type->pointee) || self(self, type->element)) return true;
         if (type->function) {
             if (self(self, type->function->result)) return true;
@@ -8751,8 +8800,18 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
         std::vector<NameMap<bool>> scopes(1);
         for (const auto& parameter : function->parameters)
             scopes.back()[name_key(parameter)] = parameter.type->is_const;
-        const auto check_expression = [&](const auto& self, const Expr* expression) -> void {
+        const auto check_expression = [&](const auto& self, const Expr* expression,
+                                          bool direct_callee = false) -> void {
             if (!expression) return;
+            if (expression->kind == Expr::Kind::Name && !direct_callee &&
+                std::none_of(scopes.rbegin(), scopes.rend(), [&](const auto& scope) {
+                    return scope.contains(name_key(*expression));
+                }) && !resolve_object(program, function.get(), *expression)) {
+                if (const auto* target = resolve_function(program, function.get(), *expression,
+                        [](const FunctionDecl& candidate) { return evaluation_only(candidate); }))
+                    diagnostics.error(expression->location,
+                        "eval-only function '" + target->name + "' has no runtime address");
+            }
             const bool write = expression->kind == Expr::Kind::Assign ||
                 (expression->kind == Expr::Kind::Unary &&
                  (expression->text == "++" || expression->text == "--" ||
@@ -8773,7 +8832,8 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                 if (read_only.value_or(false))
                     diagnostics.error(expression->location, "cannot write a const cell");
             }
-            self(self, expression->left.get());
+            self(self, expression->left.get(), expression->kind == Expr::Kind::Call ||
+                (direct_callee && expression->kind == Expr::Kind::Parenthesized));
             self(self, expression->right.get());
             self(self, expression->third.get());
             for (const auto& argument : expression->arguments) self(self, argument.get());
@@ -8785,12 +8845,17 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
             if (scoped) scopes.emplace_back();
             if (statement.declaration) {
                 if (contains_meta(contains_meta, statement.declaration->type) &&
-                    (!evaluation_only(*function) ||
-                     (statement.declaration->type->kind != Type::Kind::Bytes &&
-                      statement.declaration->type->kind != Type::Kind::Buffer))) {
+                    (!evaluation_only(*function) || !is_meta_type(statement.declaration->type))) {
                     diagnostics.error(statement.declaration->location,
                         "meta values cannot have runtime local storage");
                 }
+                const auto& declaration = *statement.declaration;
+                if (is_meta_type(declaration.type) &&
+                    (declaration.type->is_volatile || declaration.type->is_atomic ||
+                     declaration.storage_static || declaration.storage_register || declaration.storage_stack ||
+                     declaration.location_name || !declaration.attributes.empty()))
+                    diagnostics.error(declaration.location,
+                        "meta cells require automatic translation-only storage without runtime qualifiers");
                 scopes.back()[name_key(*statement.declaration)] = statement.declaration->type->is_const;
                 check_expression(check_expression, statement.declaration->initializer.get());
                 check_expression(check_expression, statement.declaration->dynamic_array_bound.get());
@@ -8808,13 +8873,11 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
     if (diagnostics.errors() != 0) return false;
     for (const auto& function : program.functions) {
         if (contains_meta(contains_meta, function->return_type) &&
-            function->return_type->kind != Type::Kind::Bytes &&
-            function->return_type->kind != Type::Kind::Buffer)
+            !is_meta_type(function->return_type))
             diagnostics.error(function->location, "meta types cannot be nested in runtime function types");
         for (const auto& parameter : function->parameters) {
             if (contains_meta(contains_meta, parameter.type) &&
-                parameter.type->kind != Type::Kind::Bytes &&
-                parameter.type->kind != Type::Kind::Buffer)
+                !is_meta_type(parameter.type))
                 diagnostics.error(parameter.location, "meta types cannot be nested in runtime function types");
         }
         if (evaluation_only(*function) && runtime_only(*function)) {
@@ -8823,20 +8886,15 @@ bool expand_evaluation(Program& program, Diagnostics& diagnostics,
                 "a function cannot be both eval_only and runtime_only");
         }
         if (!evaluation_only(*function)) continue;
-        if ((function->return_type &&
-             (function->return_type->kind == Type::Kind::Bytes ||
-              function->return_type->kind == Type::Kind::Buffer)) ||
-            std::any_of(function->parameters.begin(), function->parameters.end(),
-                [](const ParameterDecl& parameter) {
-                    return parameter.type &&
-                        (parameter.type->kind == Type::Kind::Bytes ||
-                         parameter.type->kind == Type::Kind::Buffer);
-                })) {
+        if (function->has_meta_signature()) {
             if (function->linkage != Linkage::Static)
                 diagnostics.error(function->location,
-                    "function with a meta byte type in its signature must be static");
+                    "function with a meta type in its signature must be static");
         }
-        if (!function->body) {
+        if (!function->body && !(function->has_meta_signature() &&
+            std::any_of(program.functions.begin(), program.functions.end(), [&](const auto& candidate) {
+                return candidate->body && same_entity(*function, *candidate);
+            }))) {
             diagnostics.error(
                 function->location,
                 "eval_only requires a visible function definition");
@@ -9326,6 +9384,75 @@ void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expr
 
 } // namespace
 
+std::unique_ptr<FunctionDecl> copy_evaluation_declaration(const FunctionDecl& source) {
+    auto result = std::make_unique<FunctionDecl>();
+    result->location = source.location;
+    result->name = source.name;
+    result->fresh = source.fresh;
+    result->source_namespace = source.source_namespace;
+    result->source_unit = source.source_unit;
+    result->imports = source.imports;
+    result->translation_context = source.translation_context;
+    result->return_type = clone_type(source.return_type);
+    result->parameters = source.parameters;
+    for (auto& parameter : result->parameters) parameter.type = clone_type(parameter.type);
+    result->attributes = clone_attributes(source.attributes, {}, {});
+    result->generic_parameters = source.generic_parameters;
+    for (auto& parameter : result->generic_parameters) parameter.value_type = clone_type(parameter.value_type);
+    result->generic_tag_owner = source.generic_tag_owner;
+    for (const auto& assertion : source.deferred_static_assertions)
+        result->deferred_static_assertions.push_back({assertion.location, assertion.source_namespace,
+            assertion.condition ? clone_expr(*assertion.condition) : nullptr, assertion.message});
+    result->result_location = source.result_location;
+    if (source.body) result->body = clone_statement(*source.body, {}, {});
+    result->linkage = source.linkage;
+    result->variadic = source.variadic;
+    result->inline_hint = source.inline_hint;
+    return result;
+}
+
+std::unique_ptr<ObjectDecl> copy_evaluation_declaration(const ObjectDecl& source) {
+    auto result = std::make_unique<ObjectDecl>();
+    result->location = source.location;
+    result->name = source.name;
+    result->fresh = source.fresh;
+    result->source_unit = source.source_unit;
+    result->type = clone_type(source.type);
+    result->attributes = clone_attributes(source.attributes, {}, {});
+    if (source.initializer) result->initializer = clone_expr(*source.initializer);
+    result->linkage = source.linkage;
+    return result;
+}
+
+RecordDecl copy_evaluation_declaration(const RecordDecl& source) {
+    RecordDecl result;
+    result.location = source.location;
+    result.name = source.name;
+    result.is_union = source.is_union;
+    result.complete = source.complete;
+    result.nominal_identity = source.nominal_identity;
+    result.attributes = clone_attributes(source.attributes, {}, {});
+    for (const auto& member : source.members)
+        result.members.push_back({member.location, member.name, clone_type(member.type),
+            member.bit_width ? clone_expr(*member.bit_width) : nullptr,
+            clone_attributes(member.attributes, {}, {})});
+    return result;
+}
+
+EnumDecl copy_evaluation_declaration(const EnumDecl& source) {
+    EnumDecl result;
+    result.location = source.location;
+    result.name = source.name;
+    result.local = source.local;
+    result.underlying = source.underlying;
+    result.nominal_identity = source.nominal_identity;
+    result.attributes = clone_attributes(source.attributes, {}, {});
+    for (const auto& item : source.enumerators)
+        result.enumerators.push_back({item.location, item.name,
+            item.initializer ? clone_expr(*item.initializer) : nullptr, item.value, item.binding});
+    return result;
+}
+
 bool expand_semantics(Program& program, Diagnostics& diagnostics,
                       bool evaluate_calls, std::string_view mangling,
                       std::string_view default_abi,
@@ -9466,8 +9593,9 @@ std::optional<TokenSequence> evaluate_procedural_body(
     const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
     EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse,
-    std::shared_ptr<const SyntaxContext> call_context) {
-    Program context;
+    std::shared_ptr<const SyntaxContext> call_context, Program* declarations) {
+    Program empty;
+    Program& context = declarations ? *declarations : empty;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
     context.evaluation_layout = layout;
@@ -9499,8 +9627,9 @@ std::optional<TokenSequence> evaluate_syntax_body(
     unsigned address_bits, const LayoutQuery& size_of, const LayoutQuery& align_of,
     std::shared_ptr<const SyntaxContext> macro_context, Diagnostics& diagnostics,
     EvaluationLimits limits, EvaluationLayout layout, const SyntaxParseCallback& parse,
-    std::shared_ptr<const SyntaxContext> call_context) {
-    Program context;
+    std::shared_ptr<const SyntaxContext> call_context, Program* declarations) {
+    Program empty;
+    Program& context = declarations ? *declarations : empty;
     context.address_bits = address_bits;
     context.evaluation_limits = limits;
     context.evaluation_layout = layout;

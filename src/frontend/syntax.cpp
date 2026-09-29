@@ -371,6 +371,30 @@ std::vector<Token> SyntaxExecution::prepare(const SourceFile& source) {
     return Lexer(source, diagnostics_).lex();
 }
 
+void SyntaxExecution::publish_declarations(const Program& program,
+    std::span<const RecordDecl> pending_records, std::span<const EnumDecl> pending_enumerations) {
+    for (const auto& function : program.functions)
+        if (published_functions_.insert(function.get()).second)
+            declarations_.functions.push_back(copy_evaluation_declaration(*function));
+    for (const auto& object : program.objects)
+        if (published_objects_.insert(object.get()).second)
+            declarations_.objects.push_back(copy_evaluation_declaration(*object));
+    const auto publish_record = [&](const RecordDecl& record) {
+        const auto prior = published_records_.find(record.nominal_key());
+        if (prior != published_records_.end() && (prior->second || !record.complete)) return;
+        published_records_[record.nominal_key()] = record.complete;
+        declarations_.records.push_back(copy_evaluation_declaration(record));
+    };
+    for (const auto& record : program.records) publish_record(record);
+    for (const auto& record : pending_records) publish_record(record);
+    const auto publish_enumeration = [&](const EnumDecl& enumeration) {
+        if (published_enumerations_.insert(enumeration.nominal_key()).second)
+            declarations_.enumerations.push_back(copy_evaluation_declaration(enumeration));
+    };
+    for (const auto& enumeration : program.enumerations) publish_enumeration(enumeration);
+    for (const auto& enumeration : pending_enumerations) publish_enumeration(enumeration);
+}
+
 bool SyntaxExecution::define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
     const std::vector<std::string>& imports, const std::vector<SyntaxBinding>& bindings,
     std::shared_ptr<const SyntaxParseEnvironment> environment) {
@@ -547,9 +571,9 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     };
     auto output = function.syntax_expander
         ? evaluate_syntax_body(function.declaration, std::move(match), address_bits_, size_of_, align_of_,
-                               definition, diagnostics_, limits_, layout_, parse, call)
+                               definition, diagnostics_, limits_, layout_, parse, call, &declarations_)
         : evaluate_procedural_body(function.declaration, input, address_bits_, size_of_, align_of_,
-                                   definition, diagnostics_, limits_, layout_, parse, call);
+                                   definition, diagnostics_, limits_, layout_, parse, call, &declarations_);
     if (!output) {
         diagnostics_.note(function.declaration.location, "expansion function is defined here");
         if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
