@@ -34,6 +34,43 @@ function(reject_splice case expected source)
 endfunction()
 
 file(READ "${CMAKE_CURRENT_LIST_DIR}/tag_lookup.x" tag_lookup_source)
+file(READ "${CMAKE_CURRENT_LIST_DIR}/local_tag_scope.x" local_tag_scope_source)
+accept_splice(local_tag_scope_core "${local_tag_scope_source}")
+accept_splice(local_tag_scope_syntax "syntax Enabled : rule { match \"unused\"; }\n${local_tag_scope_source}")
+reject_splice(local_enum_not_visible "unknown|unresolved"
+    "static u32 first() { enum E { Value }; return (u32)Value; } $::static_assert((u32)Value == 0u32, \"scope\");")
+reject_splice(local_enum_duplicate_value "local enumerator 'Value' conflicts"
+    "global u32 entry() { enum E { Value }; enum F { Value }; return 0u32; }")
+reject_splice(local_tag_kind_conflict "previously declared as a record"
+    "global u32 entry() { struct Tag { u16 value; }; enum Tag { Value }; return 0u32; }")
+reject_splice(local_tag_outer_kind_shadow "previously declared as a record"
+    "enum Tag { Value }; global u32 entry() { struct Tag { u16 value; }; enum Tag wrong; return 0u32; }")
+reject_splice(local_tag_duplicate_definition "duplicate definition of record 'Tag'"
+    "global u32 entry() { struct Tag { u16 value; }; struct Tag { u32 value; }; return 0u32; }")
+foreach(kind struct enum)
+    if(kind STREQUAL struct)
+        set(tag_attributes "")
+        set(tag_members "u16 value;")
+        set(tag_size 2)
+    else()
+        set(tag_attributes "[[underlying(u16)]]")
+        set(tag_members "Value = 7u16")
+        set(tag_size 2)
+    endif()
+    accept_splice(local_${kind}_forward_to_complete "
+        [[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
+            $::meta::tokens tag = $::meta::call_site($::meta::parse(\"Tag\"));
+            return $::quote { {
+                ${kind} $::unquote(tag) ${tag_attributes} { ${tag_members} };
+                $::unquote($::syntax::node(input, \"body\"))
+                ${kind} $::unquote(tag) object;
+                if (sizeof(object) != ${tag_size}uptr) return 0u32;
+            } };
+        }
+        syntax Move : statement { prefix \"move\"; match body:stmt; expand move; }
+        static u32 run() { syntax Move; move ${kind} Tag ${tag_attributes}; return 1u32; }
+        $::static_assert(run() == 1u32, \"forward splice into complete destination\");")
+endforeach()
 accept_splice(tag_lookup_macro_only "${tag_lookup_source}")
 accept_splice(tag_lookup_syntax_enabled
     "syntax Enabled : rule { match \"unused\"; }\n${tag_lookup_source}")
@@ -87,8 +124,8 @@ foreach(category stmt type declaration external)
             set(body "${record_body}")
             set(expected "spliced record tag '.*Tag' conflicts with a destination enumeration")
         endif()
-        # Local tag-only declarations are still outside the accepted local
-        # declaration grammar; give the generated local declaration an object.
+        # Exercise the declaration-with-object form here; tag-only declarations
+        # are covered independently by the local scope/splice fixtures.
         if(NOT category STREQUAL external)
             string(REGEX REPLACE ";$" " prior;" prior "${prior}")
         endif()
@@ -720,7 +757,8 @@ endif()
 
 set(type_tag_source [=[
 [[syntax_expander]] static $::meta::tokens duplicate_type_tag(in $::meta::syntax_match input) {
-    return $::quote { { struct TypeTag { u32 first; } earlier;
+    $::meta::tokens tag = $::meta::call_site($::meta::parse("TypeTag"));
+    return $::quote { { struct $::unquote(tag) { u32 first; } earlier;
                        $::unquote($::syntax::node(input, "value")) later; } };
 }
 syntax DuplicateTypeTag : statement {
@@ -763,7 +801,8 @@ endif()
 
 set(tag_source [=[
 [[syntax_expander]] static $::meta::tokens duplicate_tag(in $::meta::syntax_match input) {
-    return $::quote { { struct Tag { u32 first; } earlier; $::unquote($::syntax::node(input, "body")) } };
+    $::meta::tokens tag = $::meta::call_site($::meta::parse("Tag"));
+    return $::quote { { struct $::unquote(tag) { u32 first; } earlier; $::unquote($::syntax::node(input, "body")) } };
 }
 syntax DuplicateTag : statement { prefix "duplicate_tag"; match body:stmt; expand duplicate_tag; }
 global u32 entry() { syntax DuplicateTag; duplicate_tag struct Tag { u32 second; } later; return 0u32; }
@@ -780,7 +819,8 @@ endif()
 
 set(enum_source [=[
 [[syntax_expander]] static $::meta::tokens duplicate_enum(in $::meta::syntax_match input) {
-    return $::quote { { enum Tag [[underlying(u32)]] { earlier = 1u32 } earlier_value;
+    $::meta::tokens tag = $::meta::call_site($::meta::parse("Tag"));
+    return $::quote { { enum $::unquote(tag) [[underlying(u32)]] { earlier = 1u32 } earlier_value;
                        $::unquote($::syntax::node(input, "body")) } };
 }
 syntax DuplicateEnum : statement { prefix "duplicate_enum"; match body:stmt; expand duplicate_enum; }

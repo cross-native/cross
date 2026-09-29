@@ -393,6 +393,8 @@ copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 v
 }
 
 #include "tag_lookup.x"
+#include "local_tag_scope.x"
+#include "local_tag_splice.x"
 
 namespace TagTreeDefinition {
     enum E [[underlying(u16)]] { TagValue };
@@ -448,6 +450,9 @@ namespace PatternComposition {
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
+    if (LocalTagSplice::run(9u32) != 9u32) return 0u32;
+    if (LocalTagScope::first(11u32) != 18u32 || LocalTagScope::second(65549u32) != 65560u32 ||
+        LocalTagScope::loops() != 3u32 || LocalTagScope::unions(65549u32) != 65549u32) return 0u32;
     if (TagLookup::Invocation::run(9u32) != 9u32 ||
         TagTreeInvocation::run(7u32) != 17u32) return 0u32;
     if (PatternComposition::run(4u32) != 29u32) return 0u32;

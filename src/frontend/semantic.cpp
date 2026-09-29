@@ -325,7 +325,8 @@ std::optional<std::string> value_namespace(
             if (function->name == candidate && visible(*function)) return candidate;
         for (const auto& enumeration : program.enumerations)
             for (const auto& enumerator : enumeration.enumerators)
-                if (enumerator.name == candidate) return candidate;
+                if (enumerator.binding.kind != ValueBinding::Kind::Enumerator &&
+                    enumerator.name == candidate) return candidate;
     }
     return std::nullopt;
 }
@@ -1763,6 +1764,7 @@ std::optional<ResolvedEnumerator> exact_enumerator(
     std::optional<ResolvedEnumerator> result;
     for (const auto& enumeration : program.enumerations) {
         for (const auto& enumerator : enumeration.enumerators) {
+            if (enumerator.binding.kind == ValueBinding::Kind::Enumerator) continue;
             if (enumerator.name != name) continue;
             if (result) return std::nullopt;
             result = ResolvedEnumerator{&enumeration, &enumerator};
@@ -1774,6 +1776,13 @@ std::optional<ResolvedEnumerator> exact_enumerator(
 std::optional<ResolvedEnumerator> resolve_enumerator(
     const Program& program, const FunctionDecl* caller,
     std::string_view current_namespace, NameUse name) {
+    if (name.context && name.context->value_binding.kind == ValueBinding::Kind::Enumerator) {
+        for (const auto& enumeration : program.enumerations)
+            for (const auto& enumerator : enumeration.enumerators)
+                if (enumerator.binding == name.context->value_binding)
+                    return ResolvedEnumerator{&enumeration, &enumerator};
+        return {};
+    }
     const auto selected = value_namespace(program, caller, name, current_namespace);
     return selected ? exact_enumerator(program, *selected) : std::nullopt;
 }
@@ -7433,7 +7442,8 @@ bool evaluate_enumerations(Program& program, Diagnostics& diagnostics) {
         const auto type = enum_type(enumeration);
         std::optional<EvalValue> previous;
         for (auto& enumerator : enumeration.enumerators) {
-            if (!names.insert(enumerator.name).second) {
+            if (enumerator.binding.kind != ValueBinding::Kind::Enumerator &&
+                !names.insert(enumerator.name).second) {
                 diagnostics.error(enumerator.location,
                                   "enumerator '" + enumerator.name +
                                       "' is declared more than once");

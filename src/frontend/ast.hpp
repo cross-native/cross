@@ -357,6 +357,7 @@ struct EnumDecl {
         std::string name;
         std::unique_ptr<Expr> initializer;
         std::optional<Expr::IntegerConstant> value;
+        ValueBinding binding{};
     };
 
     SourceLocation location;

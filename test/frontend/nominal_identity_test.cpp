@@ -102,8 +102,8 @@ int main() {
         require(interned.intern_type(callable) == interned.intern_type(copied));
     }
 
-    // Until scoped parser bindings allocate these identities, deliberately
-    // rename two parsed nominal declarations to the same display name. Every
+    // Independently of lexical parser binding, deliberately rename two parsed
+    // nominal declarations to the same display name. Every
     // downstream operation must select the retained identity, not that name.
     for (const auto& [triple, abi] : {
             std::pair{"x86_64-unknown-linux-gnu", "sysv_abi"},

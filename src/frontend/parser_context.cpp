@@ -101,13 +101,20 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     for (const auto& scope : local_scopes_) {
         add(32);
         for (const auto& [entry, binding] : scope) {
-            (void)binding; name(entry.spelling); add(64);
+            name(entry.spelling); add(80);
+            if (binding.enumeration) {
+                add(80); name(binding.enumeration->source_unit);
+            }
         }
     }
     add(scope_origins_.size() * 40);
     for (const auto& scope : local_type_scopes_) {
         add(32);
         for (const auto& [entry, value] : scope) { name(entry.spelling); type(value); }
+    }
+    for (const auto& scope : local_tag_scopes_) {
+        add(32);
+        for (const auto& [entry, tag] : scope) { name(entry.spelling); type(tag.type); add(8); }
     }
     for (const auto& [entry, value] : type_aliases_) { name(entry); type(value); }
     for (const auto& [entry, value] : enum_types_) { (void)value; name(entry); add(16); }
@@ -150,6 +157,10 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     result->ordinary_values = known_ordinary_values_;
     result->values = local_scopes_;
     result->local_aliases = local_type_scopes_;
+    result->local_tags = local_tag_scopes_;
+    result->nominal_occurrence = nominal_occurrence_;
+    for (auto& scope : result->local_tags)
+        for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     result->scope_origins = scope_origins_;
     result->scope_event_base = scope_events_->size();
     result->header_bindings = header_bindings_;
@@ -206,6 +217,10 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
     known_ordinary_values_ = environment.ordinary_values;
     local_scopes_ = environment.values;
     local_type_scopes_ = environment.local_aliases;
+    local_tag_scopes_ = environment.local_tags;
+    if (environment.nominal_occurrence) nominal_occurrence_ = environment.nominal_occurrence;
+    for (auto& scope : local_tag_scopes_)
+        for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     scope_origins_ = environment.scope_origins;
     for (auto& scope : local_type_scopes_)
         for (auto& [entry, value] : scope) { (void)entry; value = copy_type(value); }
@@ -261,6 +276,8 @@ void Parser::restore_deferred_environment(const SyntaxParseEnvironment& environm
                 local_scopes_[captured].emplace(key, binding);
             for (const auto& [key, type] : event.aliases)
                 local_type_scopes_[captured].try_emplace(key, copy_type(type));
+            for (const auto& [key, tag] : event.tags)
+                local_tag_scopes_[captured][key] = Parser::LocalTag{copy_type(tag.type), tag.complete};
         }
     }
 }

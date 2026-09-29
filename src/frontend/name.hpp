@@ -100,6 +100,7 @@ struct NameKeyHash {
         mix(std::hash<std::size_t>{}(name.binding.declaration.offset));
         mix(std::hash<std::uint64_t>{}(name.binding.declaration.expansion.value));
         mix(std::hash<std::size_t>{}(name.binding.declaration.output_position));
+        mix(std::hash<const NominalTypeIdentity*>{}(name.binding.enumeration.get()));
         mix(std::hash<const FreshIdentifier*>{}(name.fresh.get()));
         return result;
     }

@@ -460,6 +460,11 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->known_ordinary_values_ = known_ordinary_values_;
     child->local_scopes_ = local_scopes_;
     child->local_type_scopes_ = local_type_scopes_;
+    child->local_tag_scopes_ = local_tag_scopes_;
+    child->nominal_occurrence_ = nominal_occurrence_;
+    child->tag_destination_ = tag_destination_;
+    child->tag_destination_depth_ = tag_destination_depth_;
+    child->enum_rebindings_ = enum_rebindings_;
     child->scope_origins_ = scope_origins_;
     child->scope_events_ = scope_events_;
     child->active_namespace_ = active_namespace_;
@@ -1032,8 +1037,10 @@ void Parser::require_public_name_context(std::string_view name, SourceLocation l
     if (name.find("::") == std::string_view::npos) {
         const NameKey key(name, location.valid() ? location : current().location);
         for (auto depth = local_scopes_.size(); depth != 0; --depth) {
-            if (!local_scopes_[depth - 1].contains(key) &&
-                !local_type_scopes_[depth - 1].contains(key)) continue;
+            if (domain == PublicNameDomain::Tag) {
+                if (!local_tag_scopes_[depth - 1].contains(key)) continue;
+            } else if (!local_scopes_[depth - 1].contains(key) &&
+                       !local_type_scopes_[depth - 1].contains(key)) continue;
             // A closer or same-scope established binding cannot be legally
             // retargeted by an opaque declaration in an outer/same scope.
             if (std::none_of(public_uncertain_binding_depths_.begin(),
@@ -1365,6 +1372,8 @@ void Parser::adopt_replacement(Parser& child) {
     known_ordinary_values_ = std::move(child.known_ordinary_values_);
     local_scopes_ = std::move(child.local_scopes_);
     local_type_scopes_ = std::move(child.local_type_scopes_);
+    local_tag_scopes_ = std::move(child.local_tag_scopes_);
+    enum_rebindings_ = std::move(child.enum_rebindings_);
     scope_origins_ = std::move(child.scope_origins_);
     enum_types_ = std::move(child.enum_types_);
     pending_enumerations_.insert(pending_enumerations_.end(),
@@ -1383,15 +1392,84 @@ void Parser::adopt_replacement(Parser& child) {
         static_assertions_.push_back(std::move(assertion));
 }
 
+Parser::TagState Parser::tag_state() const {
+    return {record_types_, local_tag_scopes_.empty() ? NameMap<LocalTag>{}
+                                                    : local_tag_scopes_.back(),
+            local_tag_scopes_.size()};
+}
+
+void Parser::prepare_tag_destination(const Parser& destination) {
+    tag_destination_depth_ = local_tag_scopes_.size();
+    if (!destination.local_tag_scopes_.empty())
+        tag_destination_ = destination.local_tag_scopes_.back();
+    else tag_destination_.reset();
+}
+
 bool Parser::transfer_spliced_tags(
-    Parser& child, const std::unordered_map<std::string, RecordTag>& prior_records,
+    Parser& child, const TagState& before,
     SourceLocation location) {
+    const auto& prior_records = before.records;
     const auto previous_errors = diagnostics_.errors();
+    NameMap<LocalTag> transferred;
+    NameMap<ValueBinding> transferred_enumerators;
+    if (before.depth && child.local_tag_scopes_.size() == before.depth)
+        for (const auto& [key, tag] : child.local_tag_scopes_.back()) {
+            const auto prior = before.local.find(key);
+            if (prior != before.local.end() && prior->second.complete == tag.complete &&
+                same_type(prior->second.type, tag.type)) continue;
+            if (local_tag_scopes_.empty()) {
+                diagnostics_.error(location, "moving a local tag declaration to file scope is not yet supported");
+                continue;
+            }
+            const auto destination = local_tag_scopes_.back().find(key);
+            if (destination != local_tag_scopes_.back().end()) {
+                const auto& existing = destination->second;
+                const bool record = tag.type->kind == Type::Kind::Record;
+                const bool other_record = existing.type->kind == Type::Kind::Record;
+                const auto subject = record ? "spliced record tag '" : "spliced enumeration '";
+                if (record != other_record)
+                    diagnostics_.error(location, subject + key.spelling +
+                        (record ? "' conflicts with a destination enumeration" :
+                                  "' conflicts with a destination record"));
+                else if (record && tag.type->is_union != existing.type->is_union)
+                    diagnostics_.error(location, subject + key.spelling + "' conflicts with the destination record kind");
+                else if (!record && tag.type->builtin != existing.type->builtin)
+                    diagnostics_.error(location, subject + key.spelling + "' conflicts with the destination underlying type");
+                else if (tag.complete && existing.complete &&
+                    (std::any_of(child.pending_records_.begin(), child.pending_records_.end(),
+                         [&](const auto& declaration) {
+                             return declaration.nominal_identity == tag.type->nominal_identity;
+                         }) ||
+                     std::any_of(child.pending_enumerations_.begin(), child.pending_enumerations_.end(),
+                         [&](const auto& declaration) {
+                             return declaration.nominal_identity == tag.type->nominal_identity;
+                         })))
+                    diagnostics_.error(location, subject + key.spelling + "' duplicates a destination definition");
+                else if (!same_type(tag.type, existing.type))
+                    diagnostics_.error(location, subject + key.spelling + "' conflicts with the destination type identity");
+            }
+            transferred.emplace(key, tag);
+        }
+    for (const auto& enumeration : child.pending_enumerations_) {
+        if (!enumeration.nominal_identity || local_scopes_.empty() ||
+            std::none_of(transferred.begin(), transferred.end(), [&](const auto& entry) {
+                return entry.second.type->nominal_identity == enumeration.nominal_identity;
+            })) continue;
+        for (const auto& enumerator : enumeration.enumerators) {
+            const NameKey key(enumerator.name, enumerator.location);
+            const auto existing = local_scopes_.back().find(key);
+            if (local_type_scopes_.back().contains(key) ||
+                (existing != local_scopes_.back().end() && existing->second != enumerator.binding))
+                diagnostics_.error(location, "spliced local enumerator '" + enumerator.name +
+                    "' conflicts with a destination declaration");
+            else transferred_enumerators.emplace(key, enumerator.binding);
+        }
+    }
     for (const auto& [name, tag] : child.record_types_) {
-        const auto before = prior_records.find(name);
-        if (before != prior_records.end() &&
-            before->second.is_union == tag.is_union &&
-            before->second.complete == tag.complete) continue;
+        const auto prior = prior_records.find(name);
+        if (prior != prior_records.end() &&
+            prior->second.is_union == tag.is_union &&
+            prior->second.complete == tag.complete) continue;
         if (enum_types_.contains(name))
             diagnostics_.error(location,
                 "spliced record tag '" + name + "' conflicts with a destination enumeration");
@@ -1405,6 +1483,7 @@ bool Parser::transfer_spliced_tags(
                 "spliced record tag '" + name + "' duplicates a destination definition");
     }
     for (const auto& enumeration : child.pending_enumerations_) {
+        if (enumeration.nominal_identity) continue;
         if (record_types_.contains(enumeration.name))
             diagnostics_.error(location,
                 "spliced enumeration '" + enumeration.name + "' conflicts with a destination record");
@@ -1416,20 +1495,28 @@ bool Parser::transfer_spliced_tags(
                 "' conflicts with the destination underlying type");
     }
     if (diagnostics_.errors() != previous_errors) return false;
+    for (const auto& [key, tag] : transferred) local_tag_scopes_.back()[key] = tag;
+    for (const auto& [key, binding] : transferred_enumerators) local_scopes_.back()[key] = binding;
+    for (const auto& [key, binding] : child.enum_rebindings_)
+        if (std::any_of(transferred_enumerators.begin(), transferred_enumerators.end(),
+                [&](const auto& entry) { return entry.second == binding; }))
+            enum_rebindings_[key] = binding;
     for (const auto& [name, tag] : child.record_types_) {
-        const auto before = prior_records.find(name);
-        if (before != prior_records.end() &&
-            before->second.is_union == tag.is_union &&
-            before->second.complete == tag.complete) continue;
+        const auto prior = prior_records.find(name);
+        if (prior != prior_records.end() &&
+            prior->second.is_union == tag.is_union &&
+            prior->second.complete == tag.complete) continue;
         auto [destination, inserted] = record_types_.emplace(name, tag);
         if (!inserted && tag.complete) destination->second.complete = true;
     }
     for (auto& record : child.pending_records_)
         pending_records_.push_back(std::move(record));
     for (auto& enumeration : child.pending_enumerations_) {
-        enum_types_[enumeration.name] = enumeration.underlying;
-        for (const auto& enumerator : enumeration.enumerators)
-            known_ordinary_values_.insert(enumerator.name);
+        if (!enumeration.nominal_identity) {
+            enum_types_[enumeration.name] = enumeration.underlying;
+            for (const auto& enumerator : enumeration.enumerators)
+                known_ordinary_values_.insert(enumerator.name);
+        }
         pending_enumerations_.push_back(std::move(enumeration));
     }
     return true;
@@ -1913,6 +2000,12 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
 }
 
 TypePtr Parser::resolve_tag_type(std::string_view name, SourceLocation location) const {
+    if (name.find("::") == std::string_view::npos) {
+        const NameKey key(name, location);
+        for (auto scope = local_tag_scopes_.rbegin(); scope != local_tag_scopes_.rend(); ++scope)
+            if (const auto found = scope->find(key); found != scope->end())
+                return copy_type(found->second.type);
+    }
     const auto origin = token_origin(location);
     // All three tag kinds share one lookup space. Select the nearest name
     // before checking its requested kind, and use the name token's context:
@@ -1926,6 +2019,41 @@ TypePtr Parser::resolve_tag_type(std::string_view name, SourceLocation location)
             return enum_type(candidate, found->second);
     }
     return {};
+}
+
+TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool complete) {
+    const NameKey key(type->nominal_name, location);
+    auto& scope = local_tag_scopes_.back();
+    if (tag_destination_ && tag_destination_depth_ == local_tag_scopes_.size()) {
+        const auto destination = tag_destination_->find(key);
+        if (destination != tag_destination_->end() && (!destination->second.complete || !complete) &&
+            destination->second.type->kind == type->kind &&
+            destination->second.type->is_union == type->is_union &&
+            destination->second.type->builtin == type->builtin)
+            scope[key] = destination->second;
+    }
+    auto found = scope.find(key);
+    if (found != scope.end()) {
+        const auto& prior = found->second.type;
+        if (prior->kind != type->kind)
+            diagnostics_.error(location, "tag '" + key.spelling + "' was previously declared as " +
+                (prior->kind == Type::Kind::Record ? "a record" : "an enumeration"));
+        else if (prior->kind == Type::Kind::Record && prior->is_union != type->is_union)
+            diagnostics_.error(location, "record tag '" + key.spelling + "' was previously declared with the other record kind");
+        else if (prior->kind != Type::Kind::Record && prior->builtin != type->builtin)
+            diagnostics_.error(location, "enumeration '" + key.spelling + "' redeclared with a different underlying type");
+        else if (complete && found->second.complete)
+            diagnostics_.error(location, "duplicate definition of " +
+                std::string(prior->kind == Type::Kind::Record ? "record '" : "enumeration '") + key.spelling + "'");
+        found->second.complete = found->second.complete || complete;
+        return copy_type(prior);
+    }
+    const auto origin = token_origin(location);
+    type->nominal_identity = std::make_shared<const NominalTypeIdentity>(NominalTypeIdentity{
+        origin.identity, location.file ? location.file->source_unit_at(location.line) : std::string{},
+        ++*nominal_occurrence_});
+    scope.emplace(key, LocalTag{copy_type(type), complete});
+    return type;
 }
 
 bool Parser::type_start(TypeProbe probe) {
@@ -1980,7 +2108,7 @@ bool Parser::type_start(TypeProbe probe) {
 
 TypePtr Parser::parse_type(bool record_specifiers,
                            std::function<bool()> storage_specifier,
-                           std::vector<Attribute>* declaration_attributes) {
+                           std::vector<Attribute>* declaration_attributes, bool tag_declaration) {
     ProductionScope specifiers(*this, record_specifiers
         ? SyntaxProduction::DeclarationSpecifiers : SyntaxProduction::None);
     bool is_const = false;
@@ -2063,7 +2191,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 if (!probing_header_type_)
                     diagnostics_.error(token.location, "internal prepared type cannot enter a public capture");
             } else if (auto child = prepared_fragment_parser(token)) {
-                const auto prior_records = child->record_types_;
+                const auto prior_records = child->tag_state();
+                child->prepare_tag_destination(*this);
                 const auto previous_errors = diagnostics_.errors();
                 auto parsed = child->parse_type();
                 std::optional<std::string> name;
@@ -2113,7 +2242,8 @@ TypePtr Parser::parse_type(bool record_specifiers,
                             child->restore_environment(
                                 *item.splice->context->parse_environment,
                                 *item.splice->context);
-                        const auto prior_records = child->record_types_;
+                        const auto prior_records = child->tag_state();
+                        child->prepare_tag_destination(*this);
                         const auto previous_errors = diagnostics_.errors();
                         auto parsed = child->parse_type();
                         std::optional<std::string> declarator_name;
@@ -2193,13 +2323,14 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 return {};
             }
             auto record_attributes = parse_attributes();
+            const bool local_tag = !local_tag_scopes_.empty() && name->find("::") == std::string::npos;
             if (current().is("{")) {
                 RecordDecl declaration;
                 declaration.location = location;
-                declaration.name = join_namespace(active_namespace_, *name);
+                declaration.name = local_tag ? *name : join_namespace(active_namespace_, *name);
                 declaration.is_union = is_union;
                 declaration.complete = true;
-                if (enum_types_.contains(declaration.name))
+                if (!local_tag && enum_types_.contains(declaration.name))
                     diagnostics_.error(name_location, "tag '" + declaration.name +
                         "' was previously declared as an enumeration");
                 if (declaration_attributes)
@@ -2209,29 +2340,38 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 declaration.attributes.insert(declaration.attributes.end(),
                     std::make_move_iterator(record_attributes.begin()),
                     std::make_move_iterator(record_attributes.end()));
-                auto [tag, inserted] = record_types_.emplace(
-                    declaration.name, RecordTag{is_union, true});
-                if (!inserted && tag->second.is_union != is_union) {
-                    diagnostics_.error(location, "record tag '" + declaration.name +
-                        "' was previously declared with the other record kind");
-                } else if (!inserted && tag->second.complete) {
-                    diagnostics_.error(location,
-                        "duplicate definition of record '" + declaration.name + "'");
+                if (local_tag) {
+                    type = declare_local_tag(record_type(*name, is_union), name_location, true);
+                    declaration.nominal_identity = type->nominal_identity;
+                } else {
+                    auto [tag, inserted] = record_types_.emplace(
+                        declaration.name, RecordTag{is_union, true});
+                    if (!inserted && tag->second.is_union != is_union) {
+                        diagnostics_.error(location, "record tag '" + declaration.name +
+                            "' was previously declared with the other record kind");
+                    } else if (!inserted && tag->second.complete) {
+                        diagnostics_.error(location,
+                            "duplicate definition of record '" + declaration.name + "'");
+                    }
+                    tag->second.complete = true;
                 }
-                tag->second.complete = true;
                 if (defer_public_header_group(allow_public_header_deferral_
                         ? bounded_group_end(index_) : std::nullopt, [&] {
                         consume("{");
                         parse_record_members(declaration);
                     })) declaration.members.clear();
-                type = record_type(declaration.name, is_union, is_const, is_volatile);
+                type = record_type(declaration);
                 pending_records_.push_back(std::move(declaration));
             } else {
                 require_public_name_context(*name, name_location, PublicNameDomain::Tag);
                 for (const auto& attribute : record_attributes)
                     diagnostics_.error(attribute.location,
                         "record attributes on a type use are not yet supported");
-                type = resolve_tag_type(*name, name_location);
+                type = local_tag && tag_declaration && current().is(";")
+                    ? declare_local_tag(record_type(*name, is_union), name_location, false)
+                    : resolve_tag_type(*name, name_location);
+                if (!type && local_tag)
+                    type = declare_local_tag(record_type(*name, is_union), name_location, false);
                 if (!type) {
                     const auto origin = token_origin(name_location);
                     const auto& name_space = origin.context
@@ -2260,11 +2400,12 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 return {};
             }
             auto enum_attributes = parse_attributes();
+            const bool local_tag = !local_tag_scopes_.empty() && name->find("::") == std::string::npos;
             if (current().is("{")) {
                 EnumDecl declaration;
                 declaration.location = location;
-                declaration.name = join_namespace(active_namespace_, *name);
-                if (record_types_.contains(declaration.name))
+                declaration.name = local_tag ? *name : join_namespace(active_namespace_, *name);
+                if (!local_tag && record_types_.contains(declaration.name))
                     diagnostics_.error(name_location, "tag '" + declaration.name +
                         "' was previously declared as a record");
                 if (declaration_attributes)
@@ -2275,20 +2416,28 @@ TypePtr Parser::parse_type(bool record_specifiers,
                     std::make_move_iterator(enum_attributes.begin()),
                     std::make_move_iterator(enum_attributes.end()));
                 declaration.underlying = enum_underlying(declaration.attributes);
+                if (local_tag) {
+                    type = declare_local_tag(enum_type(*name, declaration.underlying), name_location, true);
+                    declaration.nominal_identity = type->nominal_identity;
+                }
                 if (defer_public_header_group(allow_public_header_deferral_
                         ? bounded_group_end(index_) : std::nullopt, [&] {
                         parse_enumerators(declaration, active_namespace_);
                     })) declaration.enumerators.clear();
-                const auto found = enum_types_.find(declaration.name);
-                if (found != enum_types_.end() && found->second != declaration.underlying) {
-                    diagnostics_.error(location, "enumeration '" + declaration.name +
-                        "' redeclared with a different underlying type");
-                } else {
-                    enum_types_[declaration.name] = declaration.underlying;
+                if (!local_tag) {
+                    const auto found = enum_types_.find(declaration.name);
+                    if (found != enum_types_.end() && found->second != declaration.underlying) {
+                        diagnostics_.error(location, "enumeration '" + declaration.name +
+                            "' redeclared with a different underlying type");
+                    } else {
+                        enum_types_[declaration.name] = declaration.underlying;
+                    }
                 }
-                type = enum_type(declaration.name, declaration.underlying,
-                                 is_const, is_volatile);
+                type = enum_type(declaration);
                 pending_enumerations_.push_back(std::move(declaration));
+            } else if (local_tag && tag_declaration && current().is(";")) {
+                type = declare_local_tag(enum_type(*name, enum_underlying(enum_attributes)),
+                                         name_location, false);
             } else {
                 require_public_name_context(*name, name_location, PublicNameDomain::Tag);
                 for (const auto& attribute : enum_attributes)
@@ -2726,7 +2875,7 @@ void Parser::remember_function(const FunctionDecl& function) {
 
 const Parser::GenericSignature* Parser::known_generic_parameters(const Expr& name) const {
     const auto binding = name_key(name).binding.kind;
-    if (binding == ValueBinding::Kind::Local) return nullptr;
+    if (binding == ValueBinding::Kind::Local || binding == ValueBinding::Kind::Enumerator) return nullptr;
     if (binding == ValueBinding::Kind::Unknown && current().is("<"))
         require_public_name_context(name.text, name.location);
     if (binding == ValueBinding::Kind::Unknown && name.text.find("::") == std::string::npos)
@@ -3327,7 +3476,8 @@ void Parser::parse_external_node_splice(
     else
         child->restore_environment(*item.splice->context->parse_environment,
                                    *item.splice->context);
-    const auto prior_records = child->record_types_;
+    const auto prior_records = child->tag_state();
+    child->prepare_tag_destination(*this);
     const auto previous_errors = diagnostics_.errors();
     Program parsed;
     child->parse_external(parsed, name_space);
@@ -3519,7 +3669,8 @@ void Parser::parse_function_header_splice(
                                            *item.splice->context, item.splice->span.first);
     else child->restore_environment(*item.splice->context->parse_environment,
                                      *item.splice->context);
-    const auto prior_records = child->record_types_;
+    const auto prior_records = child->tag_state();
+    child->prepare_tag_destination(*this);
     child->parsing_public_fragment_ = parsing_public_fragment_;
     child->parsing_public_function_header_ = true;
     Program parsed;
@@ -4007,6 +4158,7 @@ void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_sp
     while (!current().is("}") && current().kind != TokenKind::End) {
         ProductionScope entry(*this, SyntaxProduction::Enumerator);
         expand_inline_macro_fragments();
+        const auto enumerator_index = index_;
         const auto token = consume_kind(TokenKind::Identifier);
         if (!token) {
             error_here("expected enumerator name");
@@ -4017,8 +4169,28 @@ void Parser::parse_enumerators(EnumDecl& declaration, const std::string& name_sp
         } else {
             EnumDecl::Enumerator enumerator;
             enumerator.location = token->location;
-            enumerator.name = join_namespace(name_space, identifier_binding_name(*token));
-            known_ordinary_values_.insert(enumerator.name);
+            enumerator.name = identifier_binding_name(*token);
+            if (declaration.nominal_identity) {
+                const NameKey key(enumerator.name, token->location);
+                enumerator.binding = {ValueBinding::Kind::Enumerator,
+                    token_origin(token->location).identity, key.context,
+                    declaration.nominal_identity};
+                const auto incoming = token->value_binding.kind != ValueBinding::Kind::Unknown
+                    ? token->value_binding : token_origin(token->location).value_binding;
+                if (incoming.kind == ValueBinding::Kind::Enumerator && incoming != enumerator.binding) {
+                    auto prior = key;
+                    prior.bind(incoming);
+                    enum_rebindings_[prior] = enumerator.binding;
+                }
+                if (!preparing_header_) tokens_[enumerator_index].value_binding = enumerator.binding;
+                if (local_scopes_.back().contains(key) || local_type_scopes_.back().contains(key))
+                    diagnostics_.error(token->location,
+                        "local enumerator '" + enumerator.name + "' conflicts with an existing declaration");
+                else local_scopes_.back().emplace(key, enumerator.binding);
+            } else {
+                enumerator.name = join_namespace(name_space, enumerator.name);
+                known_ordinary_values_.insert(enumerator.name);
+            }
             if (consume("=")) enumerator.initializer = parse_constant_expression();
             declaration.enumerators.push_back(std::move(enumerator));
         }
@@ -4414,11 +4586,19 @@ Parser::parse_local_declaration(std::vector<Attribute> attributes,
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         (void)consume_storage();
     }
-    auto base_type = parse_type(false, consume_storage, &attributes);
+    auto base_type = parse_type(false, consume_storage, &attributes, true);
     specifiers.finish();
     if (typedef_seen) {
         parse_typedef({}, std::move(attributes), std::move(base_type), location,
                       consume_semicolon);
+        auto statement = std::make_unique<Statement>();
+        statement->kind = Statement::Kind::Empty;
+        statement->location = location;
+        return statement;
+    }
+    if (current().is(";") && base_type && !base_type->nominal_key().empty() &&
+        !storage_register && !storage_stack && !storage_static) {
+        if (consume_semicolon) consume(";");
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Empty;
         statement->location = location;
@@ -4543,6 +4723,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     const auto saved_scope_imports = current_scope_imports_;
     const auto saved_values_depth = local_scopes_.size();
     const auto saved_types_depth = local_type_scopes_.size();
+    const auto saved_enum_rebindings = enum_rebindings_;
     const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
     const auto saved_recording = recording_public_tree_;
     const auto saved_generic_argument = parsing_generic_argument_;
@@ -4554,6 +4735,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     current_scope_imports_ = 0;
     local_scopes_.emplace_back();
     local_type_scopes_.emplace_back();
+    local_tag_scopes_.emplace_back();
     scope_origins_.push_back(token_origin(current().location).identity);
     if (syntax_) syntax_->push_scope();
     if (local_scopes_.size() == 1 && active_function_)
@@ -4585,7 +4767,9 @@ std::unique_ptr<Statement> Parser::parse_compound() {
                 statement_origin.valid() && scope_origins_.back().source_unit;
             NameSet prior_values;
             NameSet prior_aliases;
+            NameMap<LocalTag> prior_tags;
             if (record_bindings) {
+                prior_tags = local_tag_scopes_.back();
                 for (const auto& [key, binding] : local_scopes_.back()) {
                     (void)binding;
                     prior_values.insert(key);
@@ -4626,7 +4810,13 @@ std::unique_ptr<Statement> Parser::parse_compound() {
                 for (const auto& [key, type] : local_type_scopes_.back())
                     if (!prior_aliases.contains(key))
                         event.aliases.emplace(key, copy_type(type));
-                if (!event.values.empty() || !event.aliases.empty())
+                for (const auto& [key, tag] : local_tag_scopes_.back()) {
+                    const auto prior = prior_tags.find(key);
+                    if (prior == prior_tags.end() || prior->second.complete != tag.complete ||
+                        !same_type(prior->second.type, tag.type))
+                        event.tags.emplace(key, LocalTag{copy_type(tag.type), tag.complete});
+                }
+                if (!event.values.empty() || !event.aliases.empty() || !event.tags.empty())
                     scope_events_->push_back(std::move(event));
             }
             if (index_ == before && current().kind != TokenKind::End) ++index_;
@@ -4667,6 +4857,8 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     current_scope_imports_ = saved_scope_imports;
     local_scopes_.resize(saved_values_depth);
     local_type_scopes_.resize(saved_types_depth);
+    local_tag_scopes_.resize(saved_types_depth);
+    enum_rebindings_ = saved_enum_rebindings;
     scope_origins_.resize(saved_values_depth);
     public_uncertain_binding_depths_.resize(saved_uncertain_count);
     if (syntax_) syntax_->pop_scope();
@@ -4750,13 +4942,15 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         if (child->local_scopes_.empty() && !syntax_compound_node(*item.splice)) {
             child->local_scopes_.emplace_back();
             child->local_type_scopes_.emplace_back();
+            child->local_tag_scopes_.emplace_back();
             child->scope_origins_.emplace_back();
         }
         const auto prior_values = child->local_scopes_.empty()
             ? NameMap<ValueBinding>{} : child->local_scopes_.back();
         const auto prior_aliases = child->local_type_scopes_.empty()
             ? NameMap<TypePtr>{} : child->local_type_scopes_.back();
-        const auto prior_records = child->record_types_;
+        const auto prior_records = child->tag_state();
+        child->prepare_tag_destination(*this);
         const auto previous_errors = diagnostics_.errors();
         auto statement = child->parse_statement();
         if (child->current().kind != TokenKind::End)
@@ -4989,9 +5183,11 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
     }
     if (consume("for")) {
         statement->kind = Statement::Kind::For;
+        const auto saved_enum_rebindings = enum_rebindings_;
         const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
         local_scopes_.emplace_back();
         local_type_scopes_.emplace_back();
+        local_tag_scopes_.emplace_back();
         scope_origins_.push_back(token_origin(current().location).identity);
         expect("(");
         {
@@ -5034,6 +5230,8 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         statement->second = parse_statement();
         local_scopes_.pop_back();
         local_type_scopes_.pop_back();
+        local_tag_scopes_.pop_back();
+        enum_rebindings_ = saved_enum_rebindings;
         scope_origins_.pop_back();
         public_uncertain_binding_depths_.resize(saved_uncertain_count);
         return statement;
@@ -5757,7 +5955,20 @@ std::unique_ptr<Expr> Parser::parse_primary() {
                             }
                 }
             }
-            if (context->value_binding.kind == ValueBinding::Kind::Local)
+            if (context->value_binding.kind == ValueBinding::Kind::Enumerator) {
+                NameKey key(result->text, item.location);
+                // Nested copies can retain an earlier generation's binding,
+                // directly or through a captured scope. Each edge was created
+                // by a declaration in this placement, not a destination lookup.
+                for (std::size_t remaining = enum_rebindings_.size(); remaining; --remaining) {
+                    key.bind(context->value_binding);
+                    const auto replacement = enum_rebindings_.find(key);
+                    if (replacement == enum_rebindings_.end()) break;
+                    context->value_binding = replacement->second;
+                }
+            }
+            if (context->value_binding.kind == ValueBinding::Kind::Local ||
+                context->value_binding.kind == ValueBinding::Kind::Enumerator)
                 context->kind = NameLookupContext::Kind::Local;
             // This belongs to the private token provenance. Public trees still
             // expose syntax only, while projection preserves an exact use.

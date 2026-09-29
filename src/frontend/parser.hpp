@@ -137,9 +137,11 @@ private:
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
     TypePtr resolve_tag_type(std::string_view name, SourceLocation location) const;
+    TypePtr declare_local_tag(TypePtr type, SourceLocation location, bool complete);
     TypePtr parse_type(bool record_specifiers = true,
                        std::function<bool()> storage_specifier = {},
-                       std::vector<Attribute>* declaration_attributes = nullptr);
+                       std::vector<Attribute>* declaration_attributes = nullptr,
+                       bool tag_declaration = false);
     // TypePrefix ends before the separately written angle-generic value name.
     enum class DeclaratorContext { Named, Parameter, TypeName, TypePrefix };
     TypePtr
@@ -281,6 +283,17 @@ private:
     // Classifier spelling/mark -> exact local value declaration identity.
     std::vector<NameMap<ValueBinding>> local_scopes_;
     std::vector<NameMap<TypePtr>> local_type_scopes_;
+    struct LocalTag {
+        TypePtr type;
+        bool complete{};
+    };
+    std::vector<NameMap<LocalTag>> local_tag_scopes_;
+    std::shared_ptr<std::uint64_t> nominal_occurrence_ = std::make_shared<std::uint64_t>();
+    std::optional<NameMap<LocalTag>> tag_destination_;
+    std::size_t tag_destination_depth_{};
+    // Only declarations reintroduced by the currently placed subtree remap
+    // captured enumerator uses. Unrelated destination names never do so.
+    NameMap<ValueBinding> enum_rebindings_;
     // Original opening-token identities distinguish a captured lexical block
     // from a different destination block with the same local names.
     std::vector<TokenIdentity> scope_origins_;
@@ -289,6 +302,7 @@ private:
         SourceLocation statement;
         NameMap<ValueBinding> values;
         NameMap<TypePtr> aliases;
+        NameMap<LocalTag> tags;
     };
     // Shared by replacement parsers; speculative recognition does not publish.
     std::shared_ptr<std::vector<ScopeEvent>> scope_events_ =
@@ -302,8 +316,15 @@ private:
         bool complete{};
     };
     std::unordered_map<std::string, RecordTag> record_types_;
+    struct TagState {
+        std::unordered_map<std::string, RecordTag> records;
+        NameMap<LocalTag> local;
+        std::size_t depth{};
+    };
+    TagState tag_state() const;
+    void prepare_tag_destination(const Parser& destination);
     bool transfer_spliced_tags(Parser& child,
-        const std::unordered_map<std::string, RecordTag>& prior_records,
+        const TagState& before,
         SourceLocation location);
     std::unordered_map<std::string, TypePtr> type_aliases_;
     struct DeclaredAlias {
@@ -358,6 +379,8 @@ private:
     std::unordered_set<std::string> ordinary_values;
     std::vector<NameMap<ValueBinding>> values;
     std::vector<NameMap<TypePtr>> local_aliases;
+    std::vector<NameMap<Parser::LocalTag>> local_tags;
+    std::shared_ptr<std::uint64_t> nominal_occurrence;
     std::vector<TokenIdentity> scope_origins;
     std::size_t scope_event_base{};
     std::unordered_map<std::string, TypePtr> aliases;

@@ -16,6 +16,7 @@ namespace cross {
 struct SourceFile;
 struct SyntaxParseEnvironment;
 struct SyntaxNode;
+struct NominalTypeIdentity;
 
 struct SourceLocation {
     const SourceFile* file{};
@@ -60,9 +61,12 @@ struct TokenIdentity {
 // subsequently introduced local. Local names retain the declaring token's
 // identity and syntax mark independently of the use token's own identity.
 struct ValueBinding {
-    enum class Kind { Unknown, Local, Nonlocal } kind{Kind::Unknown};
+    enum class Kind { Unknown, Local, Nonlocal, Enumerator } kind{Kind::Unknown};
     TokenIdentity declaration;
     ExpansionId mark;
+    // Local enumerators belong to a particular placement of their enum, not
+    // just the declaring token (which is shared by copied public subtrees).
+    std::shared_ptr<const NominalTypeIdentity> enumeration{};
     bool operator==(const ValueBinding&) const = default;
 };
 
