@@ -1139,6 +1139,20 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
                                  diagnostics, state, mangling);
         }
     }
+    // Assertions are required expressions too. Instantiating one can append
+    // assertions from the substituted body, so drain the growing list before
+    // removing generic definitions. Do not hold a vector element reference
+    // across a rewrite that may reallocate that same list.
+    for (std::size_t index = 0; index < program.static_assertions.size(); ++index) {
+        FunctionDecl context;
+        context.source_namespace = program.static_assertions[index].source_namespace;
+        const auto location = program.static_assertions[index].location;
+        if (location.file)
+            context.source_unit = location.file->source_unit_at(location.line);
+        auto condition = std::move(program.static_assertions[index].condition);
+        rewrite_generic_expr(condition, &context, program, diagnostics, state, mangling);
+        program.static_assertions[index].condition = std::move(condition);
+    }
     program.functions.erase(
         std::remove_if(program.functions.begin(), program.functions.end(),
                        [](const auto& function) {

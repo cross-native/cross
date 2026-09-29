@@ -292,6 +292,13 @@ if(BUILD_TESTING)
                      -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
                      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-actual-floats
                      -P "${CMAKE_SOURCE_DIR}/test/language/generic_actual_floats.cmake")
+    add_test(NAME cross_generic_assertions
+             COMMAND "${CMAKE_COMMAND}"
+                     -DCC=$<TARGET_FILE:cross_cc>
+                     -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_assertions.x
+                     -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-assertions
+                     -P "${CMAKE_SOURCE_DIR}/test/language/generic_assertions.cmake")
     foreach(level O0 O2)
         add_test(NAME cross_generic_group_runtime_${level}
                  COMMAND "${CMAKE_COMMAND}"

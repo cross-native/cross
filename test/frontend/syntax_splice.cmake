@@ -140,8 +140,7 @@ $::static_assert(composed() == 7u32 && header_type() == 3u32, \"assembled invoca
     };
 }
 make!(identity)
-static u32 entry() { return identity(7u32); }
-$::static_assert(entry() == 7u32, \"private generic identity was lost in lookahead\");")
+$::static_assert(identity(7u32) == 7u32, \"private generic identity was lost in lookahead\");")
     accept_splice(token_macro_owner_first_${mode} "${parameter_prefix}
 [[macro]] static $::meta::tokens discard(in $::meta::tokens input) { return $::quote {}; }
 discard! { [[macro]] invalid declaration; unknown!{ not Cross } }

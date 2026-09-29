@@ -52,6 +52,20 @@ static struct generic_memory_pair make_memory_pair(in u32 value) {
     return result;
 }
 
+[[abi("odd_abi")]] static T assertion_register<T>(in T value) { return value; }
+[[abi("stack_result_abi")]] static T assertion_stack<T>(in T value) { return value; }
+[[abi("memory_result_abi")]]
+static struct generic_memory_pair assertion_memory<T>(in T value) {
+    struct generic_memory_pair result = { (u64)value, (u64)value + 1u64 };
+    return result;
+}
+$::static_assert(assertion_register(9i32) == 9i32,
+    "assertion instantiates arbitrary-register result interface");
+$::static_assert(assertion_stack(14i32) == 14i32,
+    "assertion instantiates stack-result interface");
+$::static_assert(assertion_memory(22u32).low == 22u64,
+    "assertion instantiates indirect-memory result interface");
+
 [[abi("cross")]] global i32 generic_angle_custom_abi_entry() {
     odd_callback callback = add_seven;
     odd_callback inferred = copy(callback);
