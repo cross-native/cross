@@ -462,6 +462,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->local_type_scopes_ = local_type_scopes_;
     child->local_tag_scopes_ = local_tag_scopes_;
     child->nominal_occurrence_ = nominal_occurrence_;
+    child->generic_tag_owner_ = generic_tag_owner_;
     child->tag_destination_ = tag_destination_;
     child->tag_destination_depth_ = tag_destination_depth_;
     child->enum_rebindings_ = enum_rebindings_;
@@ -803,6 +804,7 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     if (active_function_) {
         function_context.parameters = active_function_->parameters;
         function_context.generic_parameters = active_function_->generic_parameters;
+        function_context.generic_tag_owner = active_function_->generic_tag_owner;
         child->active_function_ = &function_context;
     }
     child->index_ = first;
@@ -1402,6 +1404,7 @@ Parser::TagState Parser::tag_state() const {
 }
 
 void Parser::prepare_tag_destination(const Parser& destination) {
+    generic_tag_owner_ = destination.generic_tag_owner_;
     tag_destination_depth_ = local_tag_scopes_.size();
     if (!destination.local_tag_scopes_.empty())
         tag_destination_ = destination.local_tag_scopes_.back();
@@ -2118,7 +2121,7 @@ TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool co
     const auto origin = token_origin(location);
     type->nominal_identity = std::make_shared<const NominalTypeIdentity>(NominalTypeIdentity{
         origin.identity, location.file ? location.file->source_unit_at(location.line) : std::string{},
-        ++*nominal_occurrence_});
+        ++*nominal_occurrence_, generic_tag_owner_});
     scope.emplace(key, LocalTag{copy_type(type), complete});
     return type;
 }
@@ -3774,13 +3777,16 @@ void Parser::parse_function_header_splice(
             FunctionDecl* function;
             std::string name_space;
             std::vector<std::string> generic_types;
+            std::shared_ptr<const GenericTagOwner> tag_owner;
             ~Restore() {
                 parser.active_function_ = function;
                 parser.active_namespace_ = std::move(name_space);
                 parser.active_generic_types_ = std::move(generic_types);
+                parser.generic_tag_owner_ = std::move(tag_owner);
             }
-        } restore{*this, active_function_, active_namespace_, active_generic_types_};
+        } restore{*this, active_function_, active_namespace_, active_generic_types_, generic_tag_owner_};
         active_function_ = function.get();
+        generic_tag_owner_ = function->generic_tag_owner;
         active_namespace_ = name_space;
         active_generic_types_.clear();
         for (const auto& parameter : function->generic_parameters)
@@ -4084,9 +4090,12 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                         index_ = *end;
                     } else {
                         auto* previous_function = active_function_;
+                        auto previous_tag_owner = generic_tag_owner_;
                         active_function_ = function.get();
+                        generic_tag_owner_ = function->generic_tag_owner;
                         function->body = parse_compound();
                         active_function_ = previous_function;
+                        generic_tag_owner_ = std::move(previous_tag_owner);
                     }
                 }
                 program.functions.push_back(std::move(function));
@@ -4551,6 +4560,8 @@ Parser::parse_function(SourceLocation location, std::string name,
         else
             function->generic_parameters = std::move(angle_parameters);
     }
+    if (!function->generic_parameters.empty())
+        function->generic_tag_owner = std::make_shared<const GenericTagOwner>();
     // Attributes preceding a function header are parsed before its generic
     // parameter list becomes part of the active function. Bind their scalar
     // expressions now, without rebinding a copied token that already has an
@@ -5839,12 +5850,15 @@ std::unique_ptr<Expr> Parser::parse_primary() {
             if (!probing_header_type_)
                 diagnostics_.error(item.location, "internal prepared expression cannot enter a public capture");
         } else if (auto child = prepared_fragment_parser(item)) {
+            const auto prior_tags = child->tag_state();
+            child->prepare_tag_destination(*this);
             grouped->left = child->parse_assignment();
             if (child->current().kind != TokenKind::End)
                 child->error_here("prepared expression must contain one assignment expression");
             // A structured splice's context is for lookup, not for replacing
             // the destination's active syntax/import/type environment.
             if (!item.prepared->context) adopt_replacement(*child);
+            else if (!transfer_spliced_tags(*child, prior_tags, item.location)) grouped->left.reset();
         }
         if (!grouped->left) {
             grouped->left = std::make_unique<Expr>();
@@ -5903,6 +5917,8 @@ std::unique_ptr<Expr> Parser::parse_primary() {
                                        *item.splice->context);
         child->parsing_public_fragment_ = parsing_public_fragment_;
         child->recording_public_tree_ = parsing_public_fragment_;
+        const auto prior_tags = child->tag_state();
+        child->prepare_tag_destination(*this);
         auto parsed = child->parse_assignment();
         if (child->current().kind != TokenKind::End)
             child->error_here("structured expression splice must contain one complete expression");
@@ -5910,6 +5926,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
             retain_prepared_fragment(item_index, {std::move(child->tokens_), item.location},
                 SyntaxParseCategory::Expression, item.splice->context,
                 item.splice->kind == SyntaxNode::Kind::Deferred, item.splice->span.first);
+        if (!preparing_header_ && !transfer_spliced_tags(*child, prior_tags, item.location)) return invalid();
         if (!parsed) return invalid();
         auto grouped = std::make_unique<Expr>();
         grouped->kind = Expr::Kind::Parenthesized;

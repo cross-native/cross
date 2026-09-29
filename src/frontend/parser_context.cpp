@@ -18,7 +18,8 @@ void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_
         if (!next || !seen.insert(next.get()).second) continue;
         add(128); name(next->generic_name); name(next->nominal_name);
         if (next->nominal_identity) {
-            add(80); name(next->nominal_identity->source_unit);
+            add(112); name(next->nominal_identity->source_unit);
+            name(next->nominal_identity->instance_key);
         }
         pending.push_back(next->pointee);
         pending.push_back(next->element);
@@ -103,7 +104,8 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
         for (const auto& [entry, binding] : scope) {
             name(entry.spelling); add(80);
             if (binding.enumeration) {
-                add(80); name(binding.enumeration->source_unit);
+                add(112); name(binding.enumeration->source_unit);
+                name(binding.enumeration->instance_key);
             }
         }
     }
@@ -159,6 +161,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     result->local_aliases = local_type_scopes_;
     result->local_tags = local_tag_scopes_;
     result->nominal_occurrence = nominal_occurrence_;
+    result->generic_tag_owner = generic_tag_owner_;
     for (auto& scope : result->local_tags)
         for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     result->scope_origins = scope_origins_;
@@ -219,6 +222,7 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
     local_type_scopes_ = environment.local_aliases;
     local_tag_scopes_ = environment.local_tags;
     if (environment.nominal_occurrence) nominal_occurrence_ = environment.nominal_occurrence;
+    generic_tag_owner_ = environment.generic_tag_owner;
     for (auto& scope : local_tag_scopes_)
         for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     scope_origins_ = environment.scope_origins;
@@ -240,6 +244,7 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
         for (auto& parameter : restored_function_context_->parameters)
             parameter.type = copy_type(parameter.type);
         restored_function_context_->generic_parameters = environment.generic_parameters;
+        restored_function_context_->generic_tag_owner = environment.generic_tag_owner;
         for (auto& parameter : restored_function_context_->generic_parameters)
             parameter.value_type = copy_type(parameter.value_type);
         active_function_ = restored_function_context_.get();

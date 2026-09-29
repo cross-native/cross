@@ -329,6 +329,7 @@ struct FunctionDecl {
     std::vector<ParameterDecl> parameters;
     std::vector<Attribute> attributes;
     std::vector<GenericParameter> generic_parameters;
+    std::shared_ptr<const GenericTagOwner> generic_tag_owner{};
     std::vector<StaticAssertDecl> deferred_static_assertions;
     std::optional<std::string> result_location;
     std::unique_ptr<Statement> body;

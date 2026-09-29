@@ -215,5 +215,55 @@ int main() {
         require(finalize_target_constants(program, diagnostics, size_of, align_of));
         const auto module = hir::build(program, options, *target, diagnostics);
         require(diagnostics.errors() == 0 && module.records.size() == 2);
+
+        const auto* generic_source = sources.add("generic_nominal_identity.x", R"(
+            [[noinline]] static T pass<T>(in T value) { return value; }
+            [[noinline]] static T local<T>(in T input) {
+                struct Fixed { u16 value; } fixed = {3u16};
+                struct Fixed copy = pass(fixed);
+                struct Node { T value; struct Node *next; } node;
+                node.value = input;
+                node.next = &node;
+                enum E [[underlying(u32)]] { A = (u32)sizeof(T) } item = pass(A);
+                return node.next->value + (T)copy.value + (T)item;
+            }
+            static T unused<T>(in T input) { struct Unused { T value; }; return input; }
+            global u32 entry() {
+                return local(7u32) + (u32)local(9u16) + local(11u32);
+            }
+        )");
+        Parser generic_parser(Lexer(*generic_source, diagnostics).lex(), diagnostics, {}, model->address_bits);
+        auto generic_program = generic_parser.parse();
+        require(diagnostics.errors() == 0 && generic_program.records.size() == 3);
+        generic_program.address_bits = model->address_bits;
+        require(expand_semantics(generic_program, diagnostics, false, "default", abi));
+        require(generic_program.records.size() == 4 && generic_program.enumerations.size() == 2);
+        std::unordered_set<NominalTypeKey, NominalTypeKeyHash> keys;
+        std::unordered_set<std::string> serializations;
+        unsigned fixed_instances = 0;
+        for (const auto& record : generic_program.records) {
+            require(record.nominal_identity && !record.nominal_identity->generic_owner);
+            const NominalTypeKey key{record.name, record.nominal_identity};
+            require(keys.insert(key).second && serializations.insert(key.canonical_name()).second);
+            if (record.name == "Node") {
+                require(record.members[1].type->pointee->nominal_identity == record.nominal_identity);
+            } else {
+                require(record.name == "Fixed");
+                ++fixed_instances;
+            }
+        }
+        require(fixed_instances == 2);
+        for (const auto& declaration : generic_program.enumerations) {
+            require(declaration.nominal_identity && !declaration.nominal_identity->generic_owner);
+            require(declaration.enumerators.front().binding.enumeration == declaration.nominal_identity);
+            require(declaration.enumerators.front().value.has_value());
+        }
+        unsigned fixed_passes = 0;
+        for (const auto& function : generic_program.functions)
+            if (function->name.starts_with("pass$") && function->return_type->nominal_name == "Fixed")
+                ++fixed_passes;
+        require(fixed_passes == 2); // Same spelling/layout, different enclosing instances.
+        const auto generic_module = hir::build(generic_program, options, *target, diagnostics);
+        require(diagnostics.errors() == 0 && generic_module.records.size() == 4);
     }
 }

@@ -37,6 +37,17 @@ file(READ "${CMAKE_CURRENT_LIST_DIR}/tag_lookup.x" tag_lookup_source)
 file(READ "${CMAKE_CURRENT_LIST_DIR}/local_tag_scope.x" local_tag_scope_source)
 accept_splice(local_tag_scope_core "${local_tag_scope_source}")
 accept_splice(local_tag_scope_syntax "syntax Enabled : rule { match \"unused\"; }\n${local_tag_scope_source}")
+file(READ "${CMAKE_CURRENT_LIST_DIR}/local_tag_generic.x" local_tag_generic_source)
+accept_splice(local_tag_generic_core "${local_tag_generic_source}")
+accept_splice(local_tag_generic_syntax "syntax Enabled : rule { match \"unused\"; }\n${local_tag_generic_source}")
+reject_splice(local_tag_generic_invalid_member "record member has an incomplete or non-object type" [=[
+    static u32 broken<T>() { struct Local { T value; }; return 1u32; }
+    global u32 entry() { return broken<void>(); }
+]=])
+reject_splice(local_tag_generic_enum_overflow "not representable" [=[
+    static u32 broken<u32 N>() { enum Local [[underlying(u16)]] { A = N }; return (u32)A; }
+    global u32 entry() { return broken<65536u32>(); }
+]=])
 reject_splice(local_enum_not_visible "unknown|unresolved"
     "static u32 first() { enum E { Value }; return (u32)Value; } $::static_assert((u32)Value == 0u32, \"scope\");")
 reject_splice(local_enum_duplicate_value "local enumerator 'Value' conflicts"
