@@ -184,6 +184,24 @@ namespace Source {
 [[macro]] static $::meta::tokens nested_parameter_list(in $::meta::tokens input) {
     return $::quote { parameter_list_fragment!($::unquote(input)) };
 }
+[[syntax_expander]] static $::meta::tokens deferred_header_value(in $::meta::syntax_match input) {
+    $::meta::syntax value = $::syntax::node(input, "value");
+    if (!$::meta::is_kind(value, "deferred"))
+        $::syntax::error($::syntax::span(input), "header dependency was classified too soon");
+    return $::quote { $::unquote(value) };
+}
+syntax DeferredHeaderValue : expression {
+    prefix "header_value"; match "(" value:expr ")"; expand deferred_header_value;
+}
+syntax DeferredHeaderValue;
+[[noinline]] static T captured_header_identity(in T value)
+    [[aligned(header_value(sizeof(T *))), generic(parameter_list_fragment!(T))]] {
+    return value;
+}
+[[noinline]] static u32 captured_header_value(in u32 value)
+    [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
+    return value + N;
+}
 namespace HeaderFragments { typedef u32 Value; }
 [[noinline]] static T header_fragment_identity(in T value)
     [[parameter_list_fragment!(generic(T))]] { return value; }
@@ -261,6 +279,14 @@ struct HeaderMemoryResult { u64 low; u64 high; };
 assign_header_abi "memory_result_abi"
 static struct HeaderMemoryResult memory_header_function(parameter_fragment!(value)) {
     struct HeaderMemoryResult result = { (u64)value + 10u64, (u64)value + 11u64 };
+    return result;
+}
+[[noinline, abi("stack_result_abi")]] static u32 captured_stack_header_value(in u32 value)
+    [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] { return value + N; }
+[[noinline, abi("memory_result_abi")]]
+static struct HeaderMemoryResult captured_memory_header_value(in u32 value)
+    [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
+    struct HeaderMemoryResult result = { (u64)value + (u64)N, (u64)value + (u64)N + 1u64 };
     return result;
 }
 #endif
@@ -347,7 +373,10 @@ global u32 syntax_raw_entry() {
 #ifdef CUSTOM_SYNTAX_ABI
     u32 seed = header_runtime_seed;
     struct HeaderMemoryResult memory = memory_header_function(seed);
-    if (stack_header_function(seed) != 14u32 || memory.low != 15u64 || memory.high != 16u64)
+    struct HeaderMemoryResult captured_memory = captured_memory_header_value<16u32>(seed);
+    if (stack_header_function(seed) != 14u32 || memory.low != 15u64 || memory.high != 16u64 ||
+        captured_stack_header_value<16u32>(seed) != 21u32 ||
+        captured_memory.low != 21u64 || captured_memory.high != 22u64)
         return 0u32;
 #endif
     syntax Multiply;
@@ -371,7 +400,9 @@ global u32 syntax_raw_entry() {
     transplant_type fragmented_type HeaderFragments parameter_list_fragment!(::Value);
     fragmented_type = header_runtime_seed;
     if (header_fragment_identity(fragmented_type) != 5u32 ||
-        angle_fragment_identity(fragmented_type) != 5u32) return 0u32;
+        angle_fragment_identity(fragmented_type) != 5u32 ||
+        captured_header_identity(fragmented_type) != 5u32 ||
+        captured_header_value<16u32>(fragmented_type) != 21u32) return 0u32;
     if (multiplied(amount parameter_list_fragment!(+) 2u32) != 18u32)
         return 0u32;
     u32 declarator_name!(named_by_macro) = 5u32;

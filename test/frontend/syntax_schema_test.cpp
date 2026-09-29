@@ -6,6 +6,21 @@
 #include <iostream>
 #include <sstream>
 
+namespace cross {
+struct SyntaxParseEnvironmentTestAccess {
+    static void header(SyntaxParseEnvironment& environment,
+                       std::shared_ptr<const SyntaxHeaderBindings> bindings) {
+        environment.header_bindings = std::move(bindings);
+    }
+    static auto header(const SyntaxParseEnvironment& environment) {
+        return environment.header_bindings;
+    }
+    static void alias(SyntaxParseEnvironment& environment, std::string name, TypePtr type) {
+        environment.aliases.emplace(std::move(name), std::move(type));
+    }
+};
+} // namespace cross
+
 namespace {
 using namespace cross;
 using Node = std::shared_ptr<const SyntaxNode>;
@@ -81,6 +96,41 @@ int main() {
     };
     using P = SyntaxProduction;
     using K = SyntaxPatternElement::Kind;
+
+    {
+        auto header = std::make_shared<SyntaxHeaderBindings>();
+        auto environment = std::make_shared<SyntaxParseEnvironment>();
+        SyntaxParseEnvironmentTestAccess::header(*environment, header);
+        auto context = std::make_shared<SyntaxContext>();
+        context->parse_environment = environment;
+        const auto* source = sources.add("header-capture.x", "sizeof(T *)");
+        const auto input = Lexer(*source, diagnostics).lex();
+        auto captured = Parser::parse_syntax_tokens(SyntaxParseCategory::Expression,
+                                                    input, context, diagnostics);
+        require(captured && captured->kind == SyntaxNode::Kind::Deferred &&
+                SyntaxParseEnvironmentTestAccess::header(*captured->context->parse_environment) == header,
+                "pending capture lost its original header dependency");
+        const auto before = syntax_node_storage(*captured);
+        header->parameters.push_back({"T", {}, input[2].location});
+        header->storage += 64;
+        header->complete = true;
+        require(syntax_node_storage(*captured) > before,
+                "completed header bindings were omitted from context storage");
+        auto destination = std::make_shared<SyntaxHeaderBindings>();
+        destination->parameters.push_back({"T", builtin_type(BuiltinType::U32), input[2].location});
+        destination->complete = true;
+        SyntaxParseEnvironmentTestAccess::header(*environment, destination);
+        SyntaxParseEnvironmentTestAccess::alias(*environment, "Later", builtin_type(BuiltinType::U32));
+        auto reparsed = Parser::parse_syntax_tokens(SyntaxParseCategory::Expression,
+            input, captured->context, diagnostics);
+        require(reparsed && reparsed->kind == SyntaxNode::Kind::Core,
+                "relocated capture used destination generic bindings");
+        const auto* later_source = sources.add("later-type.x", "Later");
+        require(!Parser::parse_syntax_tokens(SyntaxParseCategory::Type,
+                    Lexer(*later_source, diagnostics).lex(), captured->context, diagnostics),
+                "header completion exposed unrelated later aliases");
+        require(diagnostics.errors() == 0, "header recognition leaked speculative diagnostics");
+    }
 
     const auto bound_tokens = syntax_node_tokens(*parse(
         "{ u32 value = 7u32; value += 1u32; }", K::Statement));

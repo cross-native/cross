@@ -303,6 +303,7 @@ const SyntaxDefinition* Parser::active_syntax(bool item) const {
 }
 
 std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
+    auto& expansion_diagnostics = expansion_diagnostics_ ? *expansion_diagnostics_ : diagnostics_;
     const auto location = current().location;
     const auto origin = token_origin(location);
     const auto& name_space = origin.context ? origin.context->name_space : active_namespace_;
@@ -326,7 +327,8 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
                 stack.push_back(spelling == "(" ? ")" : spelling == "[" ? "]" : spelling == "[[" ? "]]" : "}");
             else if (spelling == ")" || spelling == "]" || spelling == "]]" || spelling == "}") {
                 if (stack.back() != spelling) {
-                    error_here("mismatched procedural macro token-tree delimiter");
+                    expansion_diagnostics.error(current().location,
+                        "mismatched procedural macro token-tree delimiter");
                     ++index_;
                     return {};
                 }
@@ -336,14 +338,14 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
             ++index_;
         }
         if (!stack.empty()) {
-            diagnostics_.error(location, "unterminated procedural macro token tree");
+            expansion_diagnostics.error(location, "unterminated procedural macro token tree");
             return {};
         }
         const auto search_imports = origin.context
             ? std::vector<std::vector<std::string>>{imports} : syntax_->imports();
         const auto function = execution->find_function(*name, name_space, search_imports, false);
         if (!function) {
-            diagnostics_.error(location, "procedural macro is not visible: '" + *name + "'");
+            expansion_diagnostics.error(location, "procedural macro is not visible: '" + *name + "'");
             return {};
         }
         return execution->expand(*function, std::move(input), {}, location, name_space, imports, bindings,
@@ -351,7 +353,7 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
     }
     const auto* definition = active_syntax(item);
     if (!definition) return {};
-    const auto matched = syntax_->match(*definition, tokens_, index_, diagnostics_,
+    const auto matched = syntax_->match(*definition, tokens_, index_, expansion_diagnostics,
         [&](std::size_t first, std::size_t body_open) {
             return validate_syntax_function_header(first, body_open, name_space, imports);
         }, [&](SyntaxPatternElement::Kind kind, std::size_t first) {
@@ -453,6 +455,9 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     auto child = std::make_unique<Parser>(std::move(output.tokens),
         diagnostics ? *diagnostics : diagnostics_, nullptr, address_bits_);
     child->syntax_ = syntax_;
+    child->preparing_header_ = preparing_header_;
+    child->expansion_diagnostics_ = expansion_diagnostics_;
+    child->header_bindings_ = header_bindings_;
     child->replacement_ = true;
     child->active_imports_ = active_imports_;
     child->current_scope_imports_ = current_scope_imports_;
@@ -475,6 +480,118 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->public_uncertain_binding_depths_ = public_uncertain_binding_depths_;
     child->switch_depth_ = switch_depth_;
     child->switch_default_seen_ = switch_default_seen_;
+    return child;
+}
+
+void Parser::prepare_header() {
+    if (!syntax_ || preparing_header_ || parsing_public_fragment_ ||
+        current().is("namespace") || current().is("using") ||
+        current().is("$::static_assert")) return;
+    // Only discovery-visible procedural fragments can change header-wide
+    // bindings. An ordinary syntax expression alone must not make otherwise
+    // settled captures opaque. This probe shares discovery's boundaries and
+    // never executes a fragment or looks inside an expression owner's input.
+    bool pending_fragments = false;
+    (void)preview_generic_types(&pending_fragments);
+    if (!pending_fragments) return;
+    const auto first = index_;
+    const auto location = tokens_[first].location;
+    std::ostringstream ignored;
+    Diagnostics provisional(ignored);
+    auto child = replacement_parser({std::move(tokens_), location}, &provisional);
+    child->index_ = first;
+    child->preparing_header_ = true;
+    child->parsing_public_function_header_ = true;
+    child->expansion_diagnostics_ = &diagnostics_;
+    auto bindings = std::make_shared<SyntaxHeaderBindings>();
+    child->header_bindings_ = bindings;
+    Program header;
+    try {
+        child->parse_external(header, active_namespace_);
+    } catch (const HeaderPrepared&) {
+        // Object initializers and function bodies are not header work.
+    }
+    bindings->finish(header.functions.empty() ? std::vector<GenericParameter>{}
+        : std::move(header.functions.front()->generic_parameters), *syntax_->execution(), location);
+    header_bindings_ = std::move(bindings);
+    tokens_ = std::move(child->tokens_);
+    index_ = first;
+}
+
+bool Parser::probe_header_type() {
+    // During preparation an as-yet unknown generic name can begin a cast or
+    // sizeof type. Prove only its grammatical shape, with nested invocations
+    // opaque; the final header parse still decides whether this is a type.
+    // Failed alternatives cannot execute code or mutate the live token cursor.
+    auto execution = syntax_->execution();
+    if (!execution->begin_fragment(current().location, tokens_.size())) return false;
+    struct End { SyntaxExecution& execution; ~End() { execution.end_fragment(); } } end{*execution};
+    std::ostringstream ignored;
+    Diagnostics provisional(ignored);
+    auto child = replacement_parser({tokens_, current().location}, &provisional);
+    child->index_ = index_;
+    child->parsing_public_fragment_ = true;
+    child->probing_header_type_ = true;
+    try {
+        auto type = child->parse_type();
+        std::optional<std::string> name;
+        if (type) type = child->parse_declarator(std::move(type), name);
+        return type && !name && child->current().is(")") && provisional.errors() == 0;
+    } catch (const DeferredNameRecognition&) {
+        return false;
+    }
+}
+
+void Parser::retain_prepared_fragment(std::size_t first, SyntaxExecution::Output output,
+    SyntaxParseCategory category, std::shared_ptr<const SyntaxContext> context, bool deferred,
+    SourceLocation original_position) {
+    const auto location = tokens_[first].location;
+    const auto maximum = std::min(syntax_->execution()->limits().bytes,
+                                  syntax_->execution()->limits().memory);
+    std::uint64_t storage = 128;
+    bool over_budget = storage > maximum;
+    const auto add = [&](std::uint64_t bytes) {
+        if (bytes > maximum - std::min(storage, maximum)) over_budget = true;
+        else storage += bytes;
+    };
+    for (const auto& token : output.tokens) {
+        add(meta_token_storage_bytes); add(token.text.size());
+        if (token.prepared) add(token.prepared->storage);
+        if (token.splice) add(syntax_node_storage(*token.splice, maximum));
+    }
+    if (context) add(syntax_context_storage(*context));
+    if (over_budget) {
+        syntax_->execution()->tree_limit_error(location);
+        output.tokens = {{TokenKind::End, {}, location}};
+    }
+    auto fragment = std::make_shared<PreparedSyntaxFragment>();
+    fragment->output = std::move(output);
+    fragment->category = category;
+    fragment->context = std::move(context);
+    fragment->deferred = deferred;
+    fragment->original_position = original_position;
+    fragment->storage = storage;
+    Token token{TokenKind::PreparedFragment, {}, location};
+    token.prepared = std::move(fragment);
+    tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+                  tokens_.begin() + static_cast<std::ptrdiff_t>(index_));
+    tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(first), std::move(token));
+    index_ = first + 1;
+}
+
+std::unique_ptr<Parser> Parser::prepared_fragment_parser(const Token& token) {
+    if (!token.prepared || !syntax_ ||
+        !syntax_->execution()->begin_fragment(token.location, token.prepared->output.tokens.size())) return {};
+    auto child = replacement_parser(token.prepared->output);
+    child->prepared_fragment_frame_ = std::make_unique<PreparedFragmentFrame>();
+    child->prepared_fragment_frame_->execution = syntax_->execution();
+    if (token.prepared->context && token.prepared->context->parse_environment) {
+        if (token.prepared->deferred)
+            child->restore_deferred_environment(*token.prepared->context->parse_environment,
+                *token.prepared->context, token.prepared->original_position);
+        else child->restore_environment(*token.prepared->context->parse_environment,
+                                        *token.prepared->context);
+    }
     return child;
 }
 
@@ -866,8 +983,10 @@ std::shared_ptr<const SyntaxNode> Parser::parse_syntax_tokens(
 }
 
 void Parser::require_public_name_context(std::string_view name, SourceLocation location) const {
-    if (!parsing_public_fragment_ || public_uncertain_binding_depths_.empty() ||
-        name.empty() || is_reserved_identifier(name)) return;
+    if (!parsing_public_fragment_ || name.empty() || is_reserved_identifier(name)) return;
+    if (probing_header_type_) return;
+    if (header_bindings_ && !header_bindings_->complete) throw DeferredNameRecognition{};
+    if (public_uncertain_binding_depths_.empty()) return;
     if (name.find("::") == std::string_view::npos) {
         const NameKey key(name, location.valid() ? location : current().location);
         for (auto depth = local_scopes_.size(); depth != 0; --depth) {
@@ -1299,6 +1418,7 @@ std::unique_ptr<Statement> Parser::parse_statement_replacement() {
 }
 
 std::unique_ptr<Expr> Parser::parse_expression_replacement() {
+    const auto first = index_;
     const auto location = current().location;
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::Integer;
@@ -1318,14 +1438,22 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
     }
     struct End { SyntaxExecution& execution; ~End() { execution.end_replacement(); } } end{*execution};
     auto output = expand_at_position(false);
-    if (!output) return result;
+    if (!output) {
+        if (preparing_header_)
+            retain_prepared_fragment(first, {{{TokenKind::End, {}, location}}, location},
+                                     SyntaxParseCategory::Expression);
+        return result;
+    }
     auto child = replacement_parser(std::move(*output));
     if (child->current().kind == TokenKind::End)
         diagnostics_.error(location, "expression expansion must produce one assignment expression");
     else result = child->parse_assignment();
     if (child->current().kind != TokenKind::End)
         child->error_here("expression expansion must produce one assignment expression without a semicolon");
-    adopt_replacement(*child);
+    if (preparing_header_) {
+        retain_prepared_fragment(first, {std::move(child->tokens_), location},
+                                 SyntaxParseCategory::Expression);
+    } else adopt_replacement(*child);
     // The parsed root is a subtree, so caller operators cannot reassociate
     // across the expansion boundary (even without textual parentheses).
     auto grouped = std::make_unique<Expr>();
@@ -1695,6 +1823,8 @@ bool Parser::type_start(TypeProbe probe) {
         if (owner->kind == SyntaxKind::Expression) return false;
     } else normalize_qualified_name();
     const auto token = current();
+    if (token.kind == TokenKind::PreparedFragment)
+        return token.prepared && token.prepared->category == SyntaxParseCategory::Type;
     if (token.kind == TokenKind::StructuredSplice)
         return token.splice && syntax_type_node(*token.splice);
     if (token.kind == TokenKind::Identifier) {
@@ -1704,6 +1834,11 @@ bool Parser::type_start(TypeProbe probe) {
         require_public_name_context(token.text);
     }
     const auto name = std::as_const(*this).peek_qualified_name();
+    if (preparing_header_ && (!parsing_public_fragment_ || probing_header_type_) &&
+        token.kind == TokenKind::Identifier && !is_reserved_identifier(token.text)) {
+        if (probe == TypeProbe::Required) return true;
+        if (!parsing_public_fragment_ && probe_header_type()) return true;
+    }
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
@@ -1794,8 +1929,33 @@ TypePtr Parser::parse_type(bool record_specifiers,
                                            ? SyntaxProduction::BuiltinName
                                            : SyntaxProduction::None);
         if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
-        if (current().kind == TokenKind::StructuredSplice) {
+        if (current().kind == TokenKind::PreparedFragment) {
+            const auto token = current();
+            ++index_;
+            type = builtin_type(BuiltinType::I32);
+            if (!token.prepared || token.prepared->category != SyntaxParseCategory::Type) {
+                diagnostics_.error(token.location, "prepared expression is not a type");
+            } else if (parsing_public_fragment_) {
+                if (!probing_header_type_)
+                    diagnostics_.error(token.location, "internal prepared type cannot enter a public capture");
+            } else if (auto child = prepared_fragment_parser(token)) {
+                const auto prior_records = child->record_types_;
+                const auto previous_errors = diagnostics_.errors();
+                auto parsed = child->parse_type();
+                std::optional<std::string> name;
+                if (parsed) parsed = child->parse_declarator(std::move(parsed), name);
+                if (name || child->current().kind != TokenKind::End)
+                    child->error_here("prepared type must contain one complete nameless type");
+                if (diagnostics_.errors() == previous_errors && parsed &&
+                    transfer_spliced_tags(*child, prior_records, token.location)) {
+                    for (auto& assertion : child->static_assertions_)
+                        static_assertions_.push_back(std::move(assertion));
+                    type = std::move(parsed);
+                }
+            }
+        } else if (current().kind == TokenKind::StructuredSplice) {
             const auto item = current();
+            const auto item_index = index_;
             ++index_;
             type = builtin_type(BuiltinType::I32, is_const, is_volatile);
             if (!item.splice || !syntax_type_node(*item.splice)) {
@@ -1844,6 +2004,11 @@ TypePtr Parser::parse_type(bool record_specifiers,
                                 static_assertions_.push_back(std::move(assertion));
                             type = std::move(parsed);
                         }
+                        if (preparing_header_)
+                            retain_prepared_fragment(item_index,
+                                {std::move(child->tokens_), item.location}, SyntaxParseCategory::Type,
+                                item.splice->context, item.splice->kind == SyntaxNode::Kind::Deferred,
+                                item.splice->span.first);
                     }
                 }
             }
@@ -2038,7 +2203,10 @@ TypePtr Parser::parse_type(bool record_specifiers,
                                        active_generic_types_.end(), alias_name);
         const auto alias = alias_name.empty() || generic != active_generic_types_.end()
             ? TypePtr{} : resolve_type_alias(alias_name);
-        if (!type && !kind && generic == active_generic_types_.end() && !alias) {
+        const bool provisional_type = preparing_header_ &&
+            (!parsing_public_fragment_ || probing_header_type_) &&
+            current().kind == TokenKind::Identifier && !is_reserved_identifier(current().text);
+        if (!type && !kind && generic == active_generic_types_.end() && !alias && !provisional_type) {
             if (const auto message = familiar_c_spelling(current().text)) {
                 error_here(*message);
                 ++index_;
@@ -2101,13 +2269,13 @@ TypePtr Parser::parse_type(bool record_specifiers,
     return type;
 }
 
-std::vector<std::string> Parser::preview_generic_types() {
+std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) {
     // Generic bindings cover the complete function header, even when written
     // after the result type. Only discover bare type parameters here; normal
     // parsing still validates the declaration and every parameter. Do not
     // inspect a body, initializer, parameter attribute, or next declarator.
     std::vector<std::string> result;
-    const auto execution = syntax_ && (recording_public_tree_ || replacement_)
+    const auto execution = syntax_ && (pending_fragments || recording_public_tree_ || replacement_)
         ? syntax_->execution() : nullptr;
     const auto work = [&](std::size_t at) {
         if (!execution || execution->work(tokens_[at].location)) return true;
@@ -2122,7 +2290,16 @@ std::vector<std::string> Parser::preview_generic_types() {
         return {};
     };
     const auto expose = [&](std::size_t at) {
-        if (parsing_public_fragment_ || !syntax_) return;
+        if (pending_fragments) {
+            if (at >= tokens_.size() || tokens_[at].kind != TokenKind::Identifier) return;
+            while (at + 2 < tokens_.size() && tokens_[at + 1].is("::") &&
+                   tokens_[at + 2].kind == TokenKind::Identifier) at += 2;
+            if (at + 2 < tokens_.size() && tokens_[at + 1].is("!") &&
+                (tokens_[at + 2].is("(") || tokens_[at + 2].is("[") ||
+                 tokens_[at + 2].is("{"))) *pending_fragments = true;
+            return;
+        }
+        if (parsing_public_fragment_ || preparing_header_ || !syntax_) return;
         const auto saved = index_;
         index_ = at;
         normalize_qualified_name();
@@ -3209,6 +3386,12 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         std::vector<std::string> previous;
         ~GenericTypesRestore() { value = std::move(previous); }
     } generic_restore{active_generic_types_, active_generic_types_};
+    struct HeaderRestore {
+        std::shared_ptr<const SyntaxHeaderBindings>& value;
+        std::shared_ptr<const SyntaxHeaderBindings> previous;
+        ~HeaderRestore() { value = std::move(previous); }
+    } header_restore{header_bindings_, header_bindings_};
+    prepare_header();
     active_generic_types_ = preview_generic_types();
     auto attributes = parse_attributes();
     if (current().is("$::static_assert")) {
@@ -3858,11 +4041,12 @@ Parser::parse_function(SourceLocation location, std::string name,
                 context->kind = NameLookupContext::Kind::Local;
                 context->value_binding = name_key(parameter).binding;
                 expression.name_context = std::move(context);
-                for (auto& token : tokens_)
-                    if (token.location.file == expression.location.file &&
-                        token.location.offset == expression.location.offset &&
-                        token.text == expression.text)
-                        token.value_binding = expression.name_context->value_binding;
+                if (!preparing_header_)
+                    for (auto& token : tokens_)
+                        if (token.location.file == expression.location.file &&
+                            token.location.offset == expression.location.offset &&
+                            token.text == expression.text)
+                            token.value_binding = expression.name_context->value_binding;
                 break;
             }
         }
@@ -3890,6 +4074,7 @@ std::unique_ptr<ObjectDecl> Parser::parse_object(
     object->type = std::move(type);
     object->linkage = linkage;
     object->attributes = std::move(attributes);
+    if (preparing_header_) throw HeaderPrepared{};
     if (consume("=")) object->initializer = parse_initializer();
     if (object->type && object->type->kind == Type::Kind::Array &&
         object->type->lanes == 0 && object->initializer &&
@@ -5076,6 +5261,32 @@ std::unique_ptr<Expr> Parser::parse_primary() {
     }
     const auto item = current();
     const auto item_index = index_;
+    if (item.kind == TokenKind::PreparedFragment) {
+        ++index_;
+        auto grouped = std::make_unique<Expr>();
+        grouped->kind = Expr::Kind::Parenthesized;
+        grouped->location = item.location;
+        if (!item.prepared || item.prepared->category != SyntaxParseCategory::Expression) {
+            diagnostics_.error(item.location, "prepared type is not an expression");
+        } else if (parsing_public_fragment_) {
+            if (!probing_header_type_)
+                diagnostics_.error(item.location, "internal prepared expression cannot enter a public capture");
+        } else if (auto child = prepared_fragment_parser(item)) {
+            grouped->left = child->parse_assignment();
+            if (child->current().kind != TokenKind::End)
+                child->error_here("prepared expression must contain one assignment expression");
+            // A structured splice's context is for lookup, not for replacing
+            // the destination's active syntax/import/type environment.
+            if (!item.prepared->context) adopt_replacement(*child);
+        }
+        if (!grouped->left) {
+            grouped->left = std::make_unique<Expr>();
+            grouped->left->kind = Expr::Kind::Integer;
+            grouped->left->text = "0";
+            grouped->left->location = item.location;
+        }
+        return grouped;
+    }
     if (item.kind == TokenKind::StructuredSplice) {
         ++index_;
         auto invalid = [&] {
@@ -5128,6 +5339,10 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         auto parsed = child->parse_assignment();
         if (child->current().kind != TokenKind::End)
             child->error_here("structured expression splice must contain one complete expression");
+        if (preparing_header_)
+            retain_prepared_fragment(item_index, {std::move(child->tokens_), item.location},
+                SyntaxParseCategory::Expression, item.splice->context,
+                item.splice->kind == SyntaxNode::Kind::Deferred, item.splice->span.first);
         if (!parsed) return invalid();
         auto grouped = std::make_unique<Expr>();
         grouped->kind = Expr::Kind::Parenthesized;
@@ -5263,7 +5478,7 @@ std::unique_ptr<Expr> Parser::parse_primary() {
                 context->kind = NameLookupContext::Kind::Local;
             // This belongs to the private token provenance. Public trees still
             // expose syntax only, while projection preserves an exact use.
-            tokens_[item_index].value_binding = context->value_binding;
+            if (!preparing_header_) tokens_[item_index].value_binding = context->value_binding;
             result->name_context = std::move(context);
             return result;
         }

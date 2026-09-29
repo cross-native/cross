@@ -17,6 +17,28 @@
 
 namespace cross {
 
+// Internal expansion records are not public syntax nodes or textual groups.
+// They keep an already executed owner bounded until header types are known.
+struct PreparedSyntaxFragment {
+    SyntaxExecution::Output output;
+    SyntaxParseCategory category{SyntaxParseCategory::Expression};
+    std::shared_ptr<const SyntaxContext> context;
+    SourceLocation original_position;
+    std::uint64_t storage{};
+    bool deferred{};
+};
+
+// A monotonic dependency: captures can retain this header before its generic
+// list is complete, then use that same list after relocation. It owns no AST
+// expressions or contexts and therefore cannot form a provenance cycle.
+struct SyntaxHeaderBindings {
+    bool complete{};
+    std::vector<GenericParameter> parameters;
+    std::uint64_t storage{64};
+    void finish(std::vector<GenericParameter> values, SyntaxExecution& execution,
+                SourceLocation location);
+};
+
 class Parser {
 public:
     Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
@@ -61,6 +83,13 @@ private:
     std::optional<SyntaxExecution::Output> expand_at_position(bool item);
     void expand_inline_macro_fragments();
     void normalize_qualified_name();
+    void prepare_header();
+    bool probe_header_type();
+    struct HeaderPrepared {};
+    void retain_prepared_fragment(std::size_t first, SyntaxExecution::Output output,
+        SyntaxParseCategory category, std::shared_ptr<const SyntaxContext> context = {},
+        bool deferred = false, SourceLocation original_position = {});
+    std::unique_ptr<Parser> prepared_fragment_parser(const Token& token);
     bool validate_syntax_function_header(std::size_t first, std::size_t body_open,
                                          std::string_view name_space,
                                          const std::vector<std::string>& imports) const;
@@ -110,7 +139,7 @@ private:
                          angle_parameters = nullptr, bool abstract_only = false);
     std::vector<FunctionDecl::GenericParameter>
     parse_angle_generic_parameters();
-    std::vector<std::string> preview_generic_types();
+    std::vector<std::string> preview_generic_types(bool* pending_fragments = nullptr);
     bool consume_generic_close();
     bool known_generic_name(const Expr& name) const;
     void apply_callable_attributes(TypePtr& type,
@@ -213,6 +242,15 @@ private:
     std::size_t index_{};
     std::optional<SyntaxState> syntax_;
     unsigned raw_token_depth_{};
+    bool preparing_header_{};
+    bool probing_header_type_{};
+    Diagnostics* expansion_diagnostics_{};
+    std::shared_ptr<const SyntaxHeaderBindings> header_bindings_;
+    struct PreparedFragmentFrame {
+        std::shared_ptr<SyntaxExecution> execution;
+        ~PreparedFragmentFrame() { execution->end_fragment(); }
+    };
+    std::unique_ptr<PreparedFragmentFrame> prepared_fragment_frame_;
     bool replacement_{};
     std::vector<std::string> active_imports_;
     std::size_t current_scope_imports_{};
@@ -283,6 +321,7 @@ private:
 // Its weak executor link prevents contexts stored by expansion functions from
 // keeping their owning executor alive through a reference cycle.
 struct SyntaxParseEnvironment {
+    friend struct SyntaxParseEnvironmentTestAccess;
 private:
     friend class Parser;
     friend std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment&);
@@ -307,6 +346,7 @@ private:
     std::vector<std::size_t> uncertain_depths;
     bool function_context{};
     bool procedural_body{};
+    std::shared_ptr<const SyntaxHeaderBindings> header_bindings;
     unsigned switch_depth{};
     std::vector<bool> switch_defaults;
     std::uint64_t storage{};

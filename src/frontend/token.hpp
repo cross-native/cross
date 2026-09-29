@@ -11,10 +11,11 @@
 namespace cross {
 
 struct SyntaxNode;
+struct PreparedSyntaxFragment;
 
 enum class TokenKind {
     End, Identifier, BuiltinName, Integer, Floating, String, Character,
-    Punctuator, StructuredSplice, Invalid,
+    Punctuator, StructuredSplice, PreparedFragment, Invalid,
 };
 
 // A grammar may consume the two characters of a lexical >> separately.
@@ -31,6 +32,7 @@ struct Token {
     SourceLocation location;
     ValueBinding value_binding;
     std::shared_ptr<const SyntaxNode> splice;
+    std::shared_ptr<const PreparedSyntaxFragment> prepared;
     std::shared_ptr<const SplitTokenSource> split_source;
     std::size_t split_offset{};
 

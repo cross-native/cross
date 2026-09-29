@@ -6,9 +6,62 @@
 #include <unordered_set>
 
 namespace cross {
+namespace {
+
+template<class Add, class Name>
+void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_budget) {
+    std::unordered_set<const Type*> seen;
+    std::vector<TypePtr> pending{root};
+    while (!pending.empty() && !over_budget) {
+        auto next = std::move(pending.back());
+        pending.pop_back();
+        if (!next || !seen.insert(next.get()).second) continue;
+        add(128); name(next->generic_name); name(next->nominal_name);
+        pending.push_back(next->pointee);
+        pending.push_back(next->element);
+        if (next->function) {
+            add(96); name(next->function->abi);
+            if (next->function->result_location) name(*next->function->result_location);
+            if (next->function->stack_cleanup) name(*next->function->stack_cleanup);
+            for (const auto& clobber : next->function->clobbers) name(clobber);
+            pending.push_back(next->function->result);
+            for (const auto& parameter : next->function->parameters) {
+                add(64); name(parameter.name);
+                if (parameter.location_name) name(*parameter.location_name);
+                pending.push_back(parameter.type);
+            }
+        }
+    }
+}
+
+} // namespace
+
+void SyntaxHeaderBindings::finish(std::vector<GenericParameter> values,
+    SyntaxExecution& execution, SourceLocation location) {
+    const auto maximum = std::min(execution.limits().bytes, execution.limits().memory);
+    bool over_budget = storage > maximum;
+    std::uint64_t work = 1;
+    const auto add = [&](std::uint64_t bytes) {
+        ++work;
+        if (bytes > maximum - std::min(storage, maximum)) over_budget = true;
+        else storage += bytes;
+    };
+    const auto name = [&](std::string_view text) { add(32); add(text.size()); };
+    for (const auto& parameter : values) {
+        add(32); name(parameter.name);
+        type_storage(parameter.value_type, add, name, over_budget);
+    }
+    complete = true;
+    if (over_budget || !execution.work(location, work)) {
+        if (over_budget) execution.tree_limit_error(location);
+        return;
+    }
+    parameters = std::move(values);
+    for (auto& parameter : parameters) parameter.value_type = copy_type(parameter.value_type);
+}
 
 std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment& environment) {
-    return environment.storage;
+    return environment.storage + (environment.header_bindings ? environment.header_bindings->storage : 0);
 }
 
 std::optional<SyntaxEntityId> syntax_resolve_entity(
@@ -36,30 +89,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
         else storage += size;
     };
     const auto name = [&](std::string_view text) { add(32); add(text.size()); };
-    const auto type = [&](const TypePtr& root) {
-        std::unordered_set<const Type*> seen;
-        std::vector<TypePtr> pending{root};
-        while (!pending.empty() && !over_budget) {
-            auto next = std::move(pending.back());
-            pending.pop_back();
-            if (!next || !seen.insert(next.get()).second) continue;
-            add(128); name(next->generic_name); name(next->nominal_name);
-            pending.push_back(next->pointee);
-            pending.push_back(next->element);
-            if (next->function) {
-                add(96); name(next->function->abi);
-                if (next->function->result_location) name(*next->function->result_location);
-                if (next->function->stack_cleanup) name(*next->function->stack_cleanup);
-                for (const auto& clobber : next->function->clobbers) name(clobber);
-                pending.push_back(next->function->result);
-                for (const auto& parameter : next->function->parameters) {
-                    add(64); name(parameter.name);
-                    if (parameter.location_name) name(*parameter.location_name);
-                    pending.push_back(parameter.type);
-                }
-            }
-        }
-    };
+    const auto type = [&](const TypePtr& root) { type_storage(root, add, name, over_budget); };
     for (const auto& entry : active_generic_types_) name(entry);
     for (const auto& entry : known_generic_functions_) name(entry);
     for (const auto& entry : known_ordinary_values_) name(entry);
@@ -94,6 +124,8 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
         }
     }
     add(8 * public_uncertain_binding_depths_.size() + switch_default_seen_.size());
+    if (header_bindings_ && header_bindings_->storage > maximum - std::min(storage, maximum))
+        over_budget = true;
     if (over_budget || (execution && !execution->work(current().location, work))) {
         if (over_budget) {
             if (execution) execution->tree_limit_error(current().location);
@@ -115,6 +147,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     result->local_aliases = local_type_scopes_;
     result->scope_origins = scope_origins_;
     result->scope_event_base = scope_events_->size();
+    result->header_bindings = header_bindings_;
     for (auto& scope : result->local_aliases)
         for (auto& [entry, value] : scope) { (void)entry; value = copy_type(value); }
     for (const auto& [entry, value] : type_aliases_)
@@ -177,6 +210,7 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
     enum_types_ = environment.enumerations;
     record_types_ = environment.records;
     public_uncertain_binding_depths_ = environment.uncertain_depths;
+    header_bindings_ = environment.header_bindings;
     parsing_procedural_body_ = environment.procedural_body;
     switch_depth_ = environment.switch_depth;
     switch_default_seen_ = environment.switch_defaults;
@@ -189,6 +223,18 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
         for (auto& parameter : restored_function_context_->generic_parameters)
             parameter.value_type = copy_type(parameter.value_type);
         active_function_ = restored_function_context_.get();
+    }
+    if (header_bindings_ && header_bindings_->complete) {
+        if (!environment.function_context) {
+            restored_function_context_ = std::make_unique<FunctionDecl>();
+            active_function_ = restored_function_context_.get();
+        }
+        active_function_->generic_parameters = header_bindings_->parameters;
+        for (auto& parameter : active_function_->generic_parameters)
+            parameter.value_type = copy_type(parameter.value_type);
+        active_generic_types_.clear();
+        for (const auto& parameter : header_bindings_->parameters)
+            if (!parameter.value_type) active_generic_types_.push_back(parameter.name);
     }
 }
 
