@@ -120,6 +120,32 @@ global u32 entry() { return recur!(); }")
 parameters!([[macro]] static $::meta::tokens introduced(in $::meta::tokens input) { return input; })")
 endforeach()
 
+set(raw_header_prefix [=[
+[[syntax_expander]] static $::meta::tokens discard_raw(in $::meta::syntax_match input) {
+    return $::quote {};
+}
+[[syntax_expander]] static $::meta::tokens copy_raw(in $::meta::syntax_match input) {
+    return $::syntax::capture(input, "body");
+}
+syntax DiscardRaw : item { prefix "discard_raw"; match body:function_raw; expand discard_raw; }
+syntax CopyRaw : item { prefix "copy_raw"; match body:function_raw; expand copy_raw; }
+syntax DiscardRaw, CopyRaw;
+]=])
+accept_splice(raw_header_discard_parameters "${raw_header_prefix}
+discard_raw static u32 discarded(unknown!(in u32 value)) { not core syntax; }
+discard_raw static T generic<T>(unknown!()) { unknown!{unbalanced semantics}; }
+discard_raw static u32 (*callback(in u32 seed))(unknown!()) { not core syntax; }")
+accept_splice(raw_header_copy_parameters "${parameter_list_macros}${raw_header_prefix}
+copy_raw static u32 copied(parameters!(in u32 value)) { return value + 1u32; }
+copy_raw static u32 empty(parameters!()) { return copied(4u32); }
+$::static_assert(empty() == 5u32, \"raw header was not expanded after its owner\");")
+reject_splice(raw_header_pointer_object "requires a direct core function header"
+    "${raw_header_prefix}
+discard_raw static u32 (*object)(unknown!()) { not a function; }")
+reject_splice(raw_header_opaque_declarator "requires a direct core function header"
+    "${raw_header_prefix}
+discard_raw static u32 unknown!(declarator) { cannot prove a function; }")
+
 set(declaration_expander [=[
 [[syntax_expander]] static $::meta::tokens copy_decl(in $::meta::syntax_match input) {
     return $::quote { $::unquote($::syntax::node(input, "body")) };

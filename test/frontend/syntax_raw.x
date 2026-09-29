@@ -527,8 +527,8 @@ drop_parsed no_such_macro! { owner drops this before lookup; };
 drop_parsed $::quote { syntax is a DSL; $::unquote(no_such_macro! { foreign input; }) };
 drop_parsed explode ();
 drop_parsed unexecuted::<nested::<3u32>>;
-copy_fn [[noinline]] static RawResult copied_function(in u32 value) { return forwarded! (value) + 17u32; }
-drop_fn static u32 discarded_function(in u32 value) { no_such_macro!(); this is a foreign body; }
+copy_fn [[noinline]] static RawResult copied_function(copied!(in u32 value)) { return copied! (value) + 17u32; }
+drop_fn static u32 discarded_function(no_such_parameters!()) { no_such_macro!(); this is a foreign body; }
 namespace reopened {
     syntax flow::Chain;
     static u32 first() { return chain (2u32); }

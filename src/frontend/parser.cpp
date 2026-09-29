@@ -188,9 +188,10 @@ void Parser::error_here(std::string message) {
 }
 
 void Parser::synchronize_external() {
-    while (current().kind != TokenKind::End) {
-        if (consume(";")) return;
-        if (current().is("}")) return;
+    // Recovery skips source; it must not execute macros in rejected input.
+    while (std::as_const(*this).current().kind != TokenKind::End) {
+        if (std::as_const(*this).current().is(";")) { ++index_; return; }
+        if (std::as_const(*this).current().is("}")) return;
         ++index_;
     }
 }
@@ -407,28 +408,20 @@ void Parser::expand_inline_macro_fragments() {
 
 bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body_open,
     std::string_view name_space, const std::vector<std::string>& imports) const {
-    // Parse the actual header in the caller's type/name environment, with a
-    // synthetic empty body. A raw body belongs exclusively to the extension
-    // and must not be core-parsed (or expanded) during recognition.
+    // Reuse direct-function recognition, including opaque parameter groups.
+    // The body is absent from this bounded input: it belongs exclusively to
+    // the raw owner and must not be core-parsed or expanded for validation.
     std::vector<Token> header(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
-                              tokens_.begin() + static_cast<std::ptrdiff_t>(body_open + 1));
-    header.push_back({TokenKind::Punctuator, "}", tokens_[body_open].location});
+                              tokens_.begin() + static_cast<std::ptrdiff_t>(body_open));
     header.push_back({TokenKind::End, {}, tokens_[body_open].location});
     auto child = replacement_parser({std::move(header), tokens_[first].location});
-    child->syntax_.reset();
-    child->replacement_ = false;
     child->active_namespace_ = name_space;
     child->active_imports_ = imports;
-    const auto errors = diagnostics_.errors();
-    Program parsed;
-    child->parse_external(parsed, std::string(name_space));
-    const bool direct = child->current().kind == TokenKind::End && parsed.functions.size() == 1 &&
-        parsed.functions.front()->body && parsed.objects.empty() &&
-        parsed.records.empty() && parsed.enumerations.empty() &&
-        parsed.global_labels.empty();
+    const auto parsed = child->parse_syntax_fragment(SyntaxPatternElement::Kind::FunctionHeader, 0);
+    const bool direct = parsed && parsed->end + 1 == child->tokens_.size();
     if (!direct) diagnostics_.error(tokens_[first].location,
         "syntax function capture requires a direct core function header");
-    return direct && diagnostics_.errors() == errors;
+    return direct;
 }
 
 std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output output,
