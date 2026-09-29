@@ -84,10 +84,18 @@ syntax UseExpr : statement { prefix "use_expr"; match value:expr ";"; expand use
 syntax DeferredExprInner : statement {
     prefix "deferred_expr_inner"; match value:expr ";"; expand deferred_expr_drop;
 }
+syntax DeferredTypeInner : statement {
+    prefix "deferred_type_inner"; match value:type ";"; expand deferred_expr_drop;
+}
+syntax DeferredStmtInner : statement {
+    prefix "deferred_stmt_inner"; match value:stmt; expand deferred_expr_drop;
+}
 [[syntax_expander]] static $::meta::tokens deferred_expr_owner(in $::meta::syntax_match input) {
     $::meta::syntax body = $::syntax::node(input, "body");
     $::meta::syntax block = $::meta::child($::meta::child(body, 0uptr), 0uptr);
     $::meta::syntax inner = body;
+    $::meta::syntax type_inner = body;
+    $::meta::syntax stmt_inner = body;
     for (uptr at = 0uptr; at < $::meta::child_count(block); ++at) {
         $::meta::syntax statement = $::meta::child(block, at);
         for (uptr nested = 0uptr; nested < $::meta::child_count(statement); ++nested) {
@@ -95,18 +103,34 @@ syntax DeferredExprInner : statement {
             for (uptr leaf = 0uptr; leaf < $::meta::child_count(child); ++leaf) {
                 $::meta::syntax candidate = $::meta::child(child, leaf);
                 if ($::meta::is_extension(candidate, "DeferredExprInner")) inner = candidate;
+                if ($::meta::is_extension(candidate, "DeferredTypeInner")) type_inner = candidate;
+                if ($::meta::is_extension(candidate, "DeferredStmtInner")) stmt_inner = candidate;
             }
         }
     }
     if (!$::meta::is_extension(inner, "DeferredExprInner"))
         $::syntax::error($::syntax::span(input), "deferred expression owner lost nested extension");
+    if (!$::meta::is_extension(type_inner, "DeferredTypeInner"))
+        $::syntax::error($::syntax::span(input), "deferred type owner lost nested extension");
+    if (!$::meta::is_extension(stmt_inner, "DeferredStmtInner"))
+        $::syntax::error($::syntax::span(input), "deferred statement owner lost nested extension");
     $::meta::syntax value = $::syntax::node($::meta::extension_match(inner), "value");
+    $::meta::syntax type_value = $::syntax::node($::meta::extension_match(type_inner), "value");
+    $::meta::syntax stmt_value = $::syntax::node($::meta::extension_match(stmt_inner), "value");
     if (!$::meta::is_kind(value, "deferred"))
         $::syntax::error($::syntax::span(input), "expected deferred expression capture");
+    if (!$::meta::is_kind(type_value, "deferred"))
+        $::syntax::error($::syntax::span(input), "expected deferred type capture");
+    if (!$::meta::is_kind(stmt_value, "deferred"))
+        $::syntax::error($::syntax::span(input), "expected deferred statement capture");
     return $::quote {
         $::unquote($::meta::tokens($::meta::child(block, 0uptr)))
         $::unquote($::meta::child(block, 1uptr))
         if ($::unquote(value) != 5uptr) return 0u32;
+        typedef $::unquote(type_value) DeferredAlias;
+        if (sizeof(DeferredAlias) != sizeof(uptr)) return 0u32;
+        $::unquote(stmt_value)
+        if ($::unquote($::meta::call_site($::quote { check })) != 5uptr) return 0u32;
         $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))
     };
 }
@@ -114,10 +138,12 @@ syntax DeferredExprOwner : statement {
     prefix "deferred_expr_owner"; match name:ident body:stmt; expand deferred_expr_owner;
 }
 [[noinline]] static u32 deferred_expression_splice() {
-    syntax DeferredExprOwner, DeferredExprInner;
+    syntax DeferredExprOwner, DeferredExprInner, DeferredTypeInner, DeferredStmtInner;
     deferred_expr_owner ExprWord {
         deferred_expr_type!(ExprWord);
         deferred_expr_inner (ExprWord)5uptr;
+        deferred_type_inner ExprWord;
+        deferred_stmt_inner ExprWord check = 5uptr;
     }
     return 1u32;
 }

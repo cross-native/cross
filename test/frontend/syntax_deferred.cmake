@@ -92,6 +92,39 @@ global u32 entry() {
 }
 ]=])
 accept(deferred_expression_splice "${deferred_expression_source}")
+function(as_deferred_type result source)
+    string(REPLACE "match value:expr" "match value:type" type_source "${source}")
+    string(REPLACE "inner (Later)5uptr;" "inner Later;" type_source "${type_source}")
+    string(REPLACE "if ($::unquote(value) != 5uptr) return 0u32;"
+        "typedef $::unquote(value) Composed;\n        $::static_assert(sizeof(Composed) == sizeof(uptr), \"original type alias selected\");"
+        type_source "${type_source}")
+    string(REPLACE "$::static_assert(sizeof($::unquote(value)) == sizeof(uptr), \"original block alias selected\");"
+        "typedef $::unquote(value) Composed;\n          $::static_assert(sizeof(Composed) == sizeof(uptr), \"original type alias selected\");"
+        type_source "${type_source}")
+    set(${result} "${type_source}" PARENT_SCOPE)
+endfunction()
+as_deferred_type(deferred_type_source "${deferred_expression_source}")
+accept(deferred_type_original_block "${deferred_type_source}")
+string(REPLACE "match value:expr \";\"" "match value:stmt"
+    deferred_statement_source "${deferred_expression_source}")
+string(REPLACE "inner (Later)5uptr;" "inner Later object = 5uptr;"
+    deferred_statement_source "${deferred_statement_source}")
+string(REPLACE "if ($::unquote(value) != 5uptr) return 0u32;"
+    "$::unquote(value)\n        if ($::unquote($::meta::call_site($::quote { object })) != 5uptr) return 0u32;"
+    deferred_statement_source "${deferred_statement_source}")
+accept(deferred_statement_original_block "${deferred_statement_source}")
+function(as_deferred_statement_alias result source)
+    string(REPLACE "match value:expr \";\"" "match value:stmt" statement_source "${source}")
+    string(REPLACE "inner (Later)5uptr;" "inner typedef Later Composed;"
+        statement_source "${statement_source}")
+    string(REPLACE "if ($::unquote(value) != 5uptr) return 0u32;"
+        "$::unquote(value)\n        $::static_assert(sizeof($::unquote($::meta::call_site($::quote { Composed }))) == sizeof(uptr), \"original statement alias selected\");"
+        statement_source "${statement_source}")
+    string(REPLACE "$::static_assert(sizeof($::unquote(value)) == sizeof(uptr), \"original block alias selected\");"
+        "$::unquote(value)\n          $::static_assert(sizeof($::unquote($::meta::call_site($::quote { Composed }))) == sizeof(uptr), \"original statement alias selected\");"
+        statement_source "${statement_source}")
+    set(${result} "${statement_source}" PARENT_SCOPE)
+endfunction()
 string(REPLACE "$::unquote($::meta::child(block, 1uptr))" "typedef uptr Later;"
     definition_site_alias "${deferred_expression_source}")
 reject_expansion(deferred_expression_hygiene
@@ -104,6 +137,10 @@ string(REPLACE "$::unquote($::meta::tokens($::meta::child(block, $::meta::child_
 reject_expansion(deferred_expression_relocated
     "structured expression splice must contain one complete expression"
     "${relocated_expression}")
+as_deferred_type(relocated_type "${relocated_expression}")
+reject_expansion(deferred_type_relocated
+    "expected Cross type|structured type splice must contain one complete type"
+    "${relocated_type}")
 string(REPLACE
     "return $::quote {\n        $::unquote($::meta::tokens($::meta::child(block, 0uptr)))"
     "return $::quote {\n        {\n        $::unquote($::meta::tokens($::meta::child(block, 0uptr)))"
@@ -113,6 +150,10 @@ string(REPLACE
     "$::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))\n        { typedef u8 $::unquote($::syntax::capture(input, \"name\"));\n          $::static_assert(sizeof($::unquote(value)) == sizeof(uptr), \"original block alias selected\"); }\n        }"
     relocated_original "${relocated_original}")
 accept(deferred_expression_original_block_after_exit "${relocated_original}")
+as_deferred_type(moved_type "${relocated_original}")
+accept(deferred_type_original_block_after_exit "${moved_type}")
+as_deferred_statement_alias(moved_statement "${relocated_original}")
+accept(deferred_statement_original_block_after_exit "${moved_statement}")
 string(REPLACE "owner Later { define_type!(Later); inner (Later)5uptr; }"
     "owner Later { define_type!(Other); inner (Later)5uptr; define_type!(Later); }"
     later_original_alias "${relocated_original}")
@@ -122,6 +163,14 @@ string(REPLACE "$::unquote($::meta::child(block, 1uptr))\n        $::unquote($::
 reject_expansion(deferred_expression_later_original_alias
     "structured expression splice must contain one complete expression"
     "${later_original_alias}")
+as_deferred_type(later_type "${later_original_alias}")
+reject_expansion(deferred_type_later_original_alias
+    "expected Cross type|structured type splice must contain one complete type"
+    "${later_type}")
+as_deferred_statement_alias(later_statement "${later_original_alias}")
+reject_expansion(deferred_statement_later_original_alias
+    "expected Cross type|structured statement splice must contain one complete statement"
+    "${later_statement}")
 
 reject(known_error "syntax-match error for active prefix"
     "${discard}${owner} global u32 entry() { syntax Owner; owner { u32 = ; future!{}; NewType value; } return 0u32; }")

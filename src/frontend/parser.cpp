@@ -1667,8 +1667,14 @@ TypePtr Parser::parse_type(bool record_specifiers,
                         *item.splice, item.location, SyntaxParseCategory::Type);
                     if (output) {
                         auto child = replacement_parser(std::move(*output));
-                        child->restore_environment(*item.splice->context->parse_environment,
-                                                   *item.splice->context);
+                        if (item.splice->kind == SyntaxNode::Kind::Deferred)
+                            child->restore_deferred_environment(
+                                *item.splice->context->parse_environment,
+                                *item.splice->context, item.splice->span.first);
+                        else
+                            child->restore_environment(
+                                *item.splice->context->parse_environment,
+                                *item.splice->context);
                         const auto prior_records = child->record_types_;
                         const auto previous_errors = diagnostics_.errors();
                         auto parsed = child->parse_type();
@@ -3732,8 +3738,13 @@ std::unique_ptr<Statement> Parser::parse_statement() {
             *item.splice, item.location, SyntaxParseCategory::Statement);
         if (!output) return invalid;
         auto child = replacement_parser(std::move(*output));
-        child->restore_environment(*item.splice->context->parse_environment,
-                                   *item.splice->context);
+        if (item.splice->kind == SyntaxNode::Kind::Deferred)
+            child->restore_deferred_environment(
+                *item.splice->context->parse_environment,
+                *item.splice->context, item.splice->span.first);
+        else
+            child->restore_environment(*item.splice->context->parse_environment,
+                                       *item.splice->context);
         // Name lookup belongs to the captured node; control-flow placement
         // (notably switch labels) belongs to the destination statement.
         child->switch_depth_ = switch_depth_;
