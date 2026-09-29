@@ -461,6 +461,14 @@ global u32 syntax_raw_entry() {
             multiplied(ProbeType *) != 21u32) return 0u32;
     }
     u32 amount = 4u32;
+    transplant_type attributed_pointer [[address_space(0)]] u32 *;
+    attributed_pointer = ([[address_space(0)]] u32 *)&amount;
+    u32 attributed_values[2] = { 5u32, 8u32 };
+    transplant_type attributed_array [[address_space(0)]] u32 (*)[2u32];
+    attributed_array = &attributed_values;
+    if (*attributed_pointer != 4u32 || (*attributed_array)[1] != 8u32 ||
+        sizeof([[atomic]] u32) != sizeof(u32) ||
+        sizeof([[address_space(0)]] u32 *) != sizeof(u32 *)) return 0u32;
     transplant_type fragmented_type HeaderFragments parameter_list_fragment!(::Value);
     fragmented_type = header_runtime_seed;
     u32 (parameter_list_fragment!(*grouped_callback))(in u32 value) = &parameter_function;

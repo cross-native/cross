@@ -33,6 +33,10 @@ function(reject_splice case expected source)
     endif()
 endfunction()
 
+reject_splice(leading_type_attribute_unknown_space "address space 17 is not registered"
+    "[[syntax_expander]] static $::meta::tokens declare(in $::meta::syntax_match input) { return $::quote { $::unquote($::syntax::node(input, \"body\")) value; }; } syntax Value : statement { prefix \"value\"; match \"(\" body:type \")\"; expand declare; } global u32 entry() { syntax Value; value ([[address_space(17)]] u32 *) return 0u32; }\n"
+    note)
+
 set(parameter_list_macros [=[
 [[macro]] static $::meta::tokens parameters(in $::meta::tokens input) { return input; }
 [[macro]] static $::meta::tokens nested_parameters(in $::meta::tokens input) {

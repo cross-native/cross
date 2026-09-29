@@ -1941,7 +1941,7 @@ bool Parser::type_start(TypeProbe probe) {
         if (!parsing_public_fragment_ &&
             probe_header_type(probe == TypeProbe::GenericArgumentAlternative)) return true;
     }
-    return token.is("const") || token.is("volatile") ||
+    return token.is("[[") || token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
            token.is("$::meta::syntax_match") ||
            token.is("$::meta::syntax") ||

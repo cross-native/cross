@@ -276,6 +276,12 @@ accept(recursive_repeat_distinct_continuation
     "${expander}syntax Tail : rule { match \"a\" branch:choice(stop:(parts:repeat1(\"x\")) | next:(rule(Tail))); } syntax Value : expression { prefix \"value\"; match \"(\" rule(Tail) \")\"; expand expand; } syntax Value; $::static_assert(value (a a x x) == 1u32, \"recursive repeat\");\n")
 accept(reused_repeat_distinct_continuations
     "${expander}syntax Tail : rule { match parts:repeat0(\"x\"); } syntax Round : expression { prefix \"round\"; match \"(\" rule(Tail) \")\"; expand expand; } syntax Square : expression { prefix \"square\"; match \"[\" rule(Tail) \"]\"; expand expand; } syntax Round, Square; $::static_assert(round (x x) + square [x] == 2u32, \"reused rule\");\n")
+accept(leading_type_attribute_capture
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" body:type \")\"; expand expand; } syntax Value; $::static_assert(value ([[atomic]] const u32) + value ([[address_space(17)]] u32 *) == 2u32, \"discarded attributed types\");\n")
+accept(leading_type_attribute_queries
+    "$::static_assert(sizeof([[atomic]] u32) == sizeof(u32), \"atomic layout\"); $::static_assert(sizeof([[address_space(0)]] u32 *) == sizeof(u32 *), \"pointer layout\"); static uptr width<T>() { return sizeof(T); } $::static_assert(width::<[[atomic]] u32>() == sizeof(u32), \"generic attributed type\");\n")
+reject(leading_type_attribute_nonpointer "syntax-match error for active prefix"
+    "${expander}syntax Value : expression { prefix \"value\"; match \"(\" body:type \")\"; expand expand; } syntax Value; global u32 entry() { return value ([[address_space(0)]] u32); }\n")
 # The number of derivations is exponential, but declaration/activation analysis
 # must memoize rule summaries rather than enumerate them. No invocation occurs.
 set(diamond "${expander}syntax D0 : rule { match \"x\"; }\n")

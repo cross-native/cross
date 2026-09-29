@@ -241,6 +241,43 @@ int main() {
     child(pointer, 2, P::AttributeSpecifier, 3);
     child(pointer, 3, P::TypeQualifier, 1);
 
+    // Type attributes are ordinary grammar occurrences at their written
+    // positions, including registry numbers not interpreted by tree inspection.
+    for (const auto text : {
+             "[[atomic]] const u32 volatile", "const [[atomic]] u32 volatile",
+             "const u32 [[atomic]] volatile", "const u32 volatile [[atomic]]",
+             "[[address_space(17)]] const u32 * volatile",
+             "const [[address_space(17)]] u32 * volatile",
+             "const u32 [[address_space(17)]] (* volatile)",
+             "const u32 * [[address_space(17)]] volatile",
+             "u32 * [[atomic]] const * volatile [[address_space(23)]]",
+             "u32 (* const [[address_space(17)]] [3u32])(in u16)",
+             "[[address_space(17)]] u32 (* volatile)[3u32]",
+             "$::meta::bytes", "const $::meta::buffer"})
+        (void)parse(text, K::Type);
+    auto leading_qualified = production(parse("[[atomic]] const u32 volatile", K::Type),
+                                         P::TypeName, 1);
+    auto trailing_qualified = production(parse("const u32 volatile [[atomic]]", K::Type),
+                                          P::TypeName, 1);
+    auto leading_specifiers = child(leading_qualified, 0, P::DeclarationSpecifiers, 4);
+    auto trailing_specifiers = child(trailing_qualified, 0, P::DeclarationSpecifiers, 4);
+    child(child(leading_specifiers, 0, P::DeclarationSpecifier, 1), 0, P::AttributeSpecifier, 3);
+    child(child(trailing_specifiers, 3, P::DeclarationSpecifier, 1), 0, P::AttributeSpecifier, 3);
+    auto builtin_specifier = descendant(parse("$::meta::bytes", K::Type), P::TypeSpecifier);
+    child(child(builtin_specifier, 0, P::TargetScalarBuiltinName, 1), 0, P::BuiltinName, 1);
+    {
+        std::string error;
+        auto replaced_specifier = syntax_replace_child(*leading_specifiers, 0,
+            trailing_specifiers->children[3], error);
+        require(replaced_specifier && replaced_specifier->children[0] == trailing_specifiers->children[3],
+                "type-attribute replacement lost the exact source child");
+        require(replaced_specifier->children[1] == leading_specifiers->children[1],
+                "type-attribute replacement changed an untouched qualifier");
+        require(!syntax_replace_child(*leading_specifiers, 0,
+            trailing_specifiers->children[3]->children[0], error),
+                "a bare attribute bypassed its declaration-specifier wrapper");
+    }
+
     type = production(parse("u32 (* const)(in u16 p \"abi.input\", out u32 *, ...) "
                             "-> \"memory.result\" [[abi(\"custom\")]]", K::Type), P::TypeName, 2);
     abstract = child(type, 1, P::AbstractDeclarator, 4);
