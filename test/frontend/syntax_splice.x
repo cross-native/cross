@@ -155,6 +155,21 @@ namespace Source {
 [[macro]] static $::meta::tokens declare_spliced(in $::meta::tokens name) {
     return $::quote { u32 $::unquote(name) = 11u32; };
 }
+[[macro]] static $::meta::tokens declarator_name(in $::meta::tokens name) {
+    return $::quote { $::unquote(name) };
+}
+[[macro]] static $::meta::tokens declarator_pointer(in $::meta::tokens name) {
+    return $::quote { *$::unquote(name) };
+}
+[[macro]] static $::meta::tokens declarator_array(in $::meta::tokens ignored) {
+    return $::quote { [2] };
+}
+[[macro]] static $::meta::tokens declarator_function(in $::meta::tokens name) {
+    return $::quote { (in u32 $::unquote(name)) };
+}
+[[noinline]] static u32 suffix_function declarator_function!(value) {
+    return value + 3u32;
+}
 
 #ifdef CUSTOM_SYNTAX_ABI
 [[abi(HOST_ABI)]]
@@ -172,7 +187,11 @@ global u32 syntax_raw_entry() {
     syntax TransplantSpecifier;
     syntax CopyDeclaration;
     u32 amount = 4u32;
+    u32 declarator_name!(named_by_macro) = 5u32;
+    u32 declarator_pointer!(pointer_by_macro) = &amount;
+    u32 array_by_macro declarator_array!() = { 2u32, 3u32 };
     copy_declaration register u32 local_spliced_value = external_spliced_value;
+    copy_declaration u32 copied_array declarator_array!() = { 1u32, 8u32 };
     copy_declaration typedef u16 LocalSplicedType;
     LocalSplicedType local_spliced_alias = 6u16;
     ExternalSplicedType external_spliced_alias = 7u16;
@@ -214,7 +233,10 @@ global u32 syntax_raw_entry() {
         array_value[0] + array_value[1] != 7u32 ||
         record_pointer->field != 12u32 || base_value != 8u16 ||
         local_spliced_value != 17u32 || local_spliced_alias != 6u16 ||
-        external_spliced_alias != 7u16 ||
+        external_spliced_alias != 7u16 || named_by_macro != 5u32 ||
+        *pointer_by_macro != amount || array_by_macro[1] != 3u32 ||
+        copied_array[1] != 8u32 ||
+        suffix_function(5u32) != 8u32 ||
         sizeof(Source::Destination::moved) != 2uptr)
         return 0u32;
     return 61u32;

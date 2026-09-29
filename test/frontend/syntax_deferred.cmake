@@ -33,6 +33,16 @@ function(reject_expansion case expected source)
     endif()
 endfunction()
 
+function(reject_driver case expected source)
+    set(input "${OUTPUT}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/${case}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
+    endif()
+endfunction()
+
 function(accept case source)
     set(input "${OUTPUT}/${case}.x")
     file(WRITE "${input}" "${source}")
@@ -121,6 +131,59 @@ string(REPLACE "if ($::unquote(value) != 5uptr) return 0u32;"
     "$::unquote(value)\n        if ($::unquote($::meta::call_site($::quote { object })) != 5uptr) return 0u32;"
     deferred_declaration_source "${deferred_declaration_source}")
 accept(deferred_declaration_original_block "${deferred_declaration_source}")
+accept(discard_nested_declarator_macro [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    return $::quote { ; };
+}
+syntax Drop : statement { prefix "drop"; match body:declaration; expand discard; }
+global u32 entry() {
+    syntax Drop;
+    drop u32 discarded missing_suffix!();
+    return 1u32;
+}
+]=])
+accept(survive_nested_declarator_macro [=[
+[[macro]] static $::meta::tokens array_suffix(in $::meta::tokens ignored) {
+    return $::quote { [2] };
+}
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+syntax Copy : statement { prefix "copy"; match body:declaration; expand copy; }
+global u32 entry() {
+    syntax Copy;
+    copy u32 values array_suffix!() = { 2u32, 3u32 };
+    return values[1];
+}
+]=])
+accept(result_location_declarator_macro [=[
+[[macro]] static $::meta::tokens result_location(in $::meta::tokens ignored) {
+    return $::quote { -> "rax" };
+}
+global u64 entry() result_location!() { return 1u64; }
+]=])
+reject_expansion(nested_declarator_macro_multiple_statements
+    "structured statement splice must contain one complete statement" [=[
+[[macro]] static $::meta::tokens extra(in $::meta::tokens ignored) {
+    return $::quote { [2]; u32 another = 1u32 };
+}
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "body")) };
+}
+syntax Copy : statement { prefix "copy"; match body:declaration; expand copy; }
+global u32 entry() {
+    syntax Copy;
+    copy u32 values extra!();
+    return 0u32;
+}
+]=])
+reject_driver(nested_declarator_macro_recursion
+    "procedural macro expansion exceeded 128 explicit invocations" [=[
+[[macro]] static $::meta::tokens again(in $::meta::tokens ignored) {
+    return $::quote { again!() };
+}
+global u32 entry() { u32 value again!(); return 0u32; }
+]=])
 function(as_deferred_statement_alias result source)
     string(REPLACE "match value:expr \";\"" "match value:stmt" statement_source "${source}")
     string(REPLACE "inner (Later)5uptr;" "inner typedef Later Composed;"

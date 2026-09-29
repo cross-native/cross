@@ -351,6 +351,39 @@ std::optional<SyntaxExecution::Output> Parser::expand_at_position(bool item) {
                              context->parse_environment, definition);
 }
 
+void Parser::expand_declarator_macros() {
+    while (syntax_ && macro_start()) {
+        // Captures only recognize syntax; they cannot execute a nested macro
+        // to discover a declarator's shape or its bound names.
+        if (parsing_public_fragment_) throw DeferredNameRecognition{};
+        const auto first = index_;
+        auto execution = syntax_->execution();
+        if (!execution->begin_replacement(current().location)) {
+            ++index_;
+            return;
+        }
+        struct End {
+            SyntaxExecution& execution;
+            ~End() { execution.end_replacement(); }
+        } end{*execution};
+        auto output = expand_at_position(false);
+        if (!output) return;
+        if (output->tokens.empty() || output->tokens.back().kind != TokenKind::End) {
+            diagnostics_.error(output->location,
+                "procedural declarator macro produced no token boundary");
+            return;
+        }
+        output->tokens.pop_back();
+        const auto after = index_;
+        tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+                      tokens_.begin() + static_cast<std::ptrdiff_t>(after));
+        tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+            std::make_move_iterator(output->tokens.begin()),
+            std::make_move_iterator(output->tokens.end()));
+        index_ = first;
+    }
+}
+
 bool Parser::validate_syntax_function_header(std::size_t first, std::size_t body_open,
     std::string_view name_space, const std::vector<std::string>& imports) const {
     // Parse the actual header in the caller's type/name environment, with a
@@ -2200,6 +2233,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
                                  SourceLocation* name_location,
                                  std::vector<FunctionDecl::GenericParameter>* angle_parameters,
                                  bool abstract_only) {
+    expand_declarator_macros();
     const bool written = current().is("*") || current().is("(") || current().is("[") ||
                          (!abstract_only && current().kind == TokenKind::Identifier);
     ProductionScope declarator(*this,
@@ -2221,8 +2255,10 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
             base->address_space_location = pending_address_space->second;
             pending_address_space.reset();
         }
-        while (current().is("const") || current().is("volatile") || current().is("restrict") ||
-               current().is("[[")) {
+        for (;;) {
+            expand_declarator_macros();
+            if (!current().is("const") && !current().is("volatile") &&
+                !current().is("restrict") && !current().is("[[")) break;
             if (current().is("[[")) {
                 apply_type_attributes(base);
                 continue;
@@ -2238,6 +2274,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
             }
         }
     }
+    expand_declarator_macros();
     const bool grouped = current().is("(") && (current(1).is("*") || current(1).is("("));
     if (pending_address_space) {
         if (grouped)
@@ -2271,9 +2308,11 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         if (name && angle_parameters && current().is("<"))
             *angle_parameters = parse_angle_generic_parameters();
     }
+    expand_declarator_macros();
     if (current().is("[")) {
         base = parse_array_suffix(std::move(base), parameter, dynamic_outer_bound);
     }
+    expand_declarator_macros();
     if (current().is("(")) {
         ProductionScope suffix(*this, SyntaxProduction::FunctionSuffix);
         consume("(");
@@ -2301,6 +2340,7 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         }
         expect(")", "after function parameters");
         base = function_type(std::move(base), std::move(parameters), variadic);
+        expand_declarator_macros();
         if (current().is("->")) {
             ProductionScope result_location(*this, SyntaxProduction::ResultLocation);
             consume("->");
