@@ -30,6 +30,157 @@ function(check case source expected_status)
     endif()
 endfunction()
 
+set(compose [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    $::static_assert($::meta::is_kind(header, "deferred"), "header was classified before its fragments");
+    return $::quote { $::unquote(header) $::unquote($::syntax::capture(input, "body")) };
+}
+syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
+syntax Compose;
+]=])
+
+foreach(header
+        "static u32 test() [[generic(params!(u32 N))]]"
+        "[[generic(params!(u32 N))]] static u32 test()"
+        "static [[generic(params!(u32 N))]] u32 test()"
+        "static u32 [[generic(params!(u32 N))]] test()"
+        "static u32 test() [[params!(generic(u32 N))]]"
+        "static u32 test<params!(u32 N)>()")
+    string(MD5 case "${header}")
+    check(captured_value_header_${case} "${compose}
+compose ${header} { return N; }
+$::static_assert(test<7u32>() == 7u32, \"value header generic was lost\");" 0)
+endforeach()
+
+foreach(header
+        "static T test(in T value) [[generic(params!(T))]]"
+        "[[generic(params!(T))]] static T test(in T value)"
+        "static T test<params!(T)>(in T value)"
+        "static T test(in T value) [[params!(generic(T))]]")
+    string(MD5 case "${header}")
+    check(captured_type_header_${case} "${compose}
+compose ${header} { return value; }
+$::static_assert(test(7u32) == 7u32, \"type header generic was lost\");" 0)
+endforeach()
+
+check(captured_shadowed_alias "${compose}
+typedef u32 T();
+compose static T test(in T value) [[generic(params!(T))]] { return value; }
+$::static_assert(test(9u32) == 9u32, \"late generic did not shadow the callable alias\");" 0)
+
+check(captured_angle_value_alias "${compose}
+typedef u32 Count;
+compose static u32 test<Count N, params!(T)>() { return N; }
+$::static_assert(test<7u32, u32>() == 7u32, \"pending angle header rejected a scalar alias\");" 0)
+
+check(captured_tag_types "${compose}
+struct Pair { u32 value; };
+enum Code { code = 4 };
+compose static struct Pair record(in u32 value) [[generic(params!(u32 N))]] {
+    struct Pair result = { value + N }; return result;
+}
+compose static enum Code enumeration() [[generic(params!(u32 N))]] { return code; }
+$::static_assert(record<3u32>(4u32).value == 7u32, \"record header classification failed\");
+$::static_assert((u32)enumeration<3u32>() == 4u32, \"enum header classification failed\");" 0)
+
+check(captured_qualified_alias "${compose}
+namespace Types { typedef u32 Value; }
+compose static Types::Value test(in Types::Value value) [[generic(params!(u32 N))]] {
+    return value + N;
+}
+$::static_assert(test<3u32>(4u32) == 7u32, \"qualified header alias was deferred as an unknown generic\");" 0)
+
+check(independent_capture_with_pending_generics [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+struct Tag { u32 value; };
+namespace Types { typedef u32 Value; }
+[[syntax_expander]] static $::meta::tokens known(in $::meta::syntax_match input) {
+    $::meta::syntax value = $::syntax::node(input, "value");
+    $::static_assert(!$::meta::is_kind(value, "deferred"), "independent lookup was deferred");
+    return $::quote { $::unquote(value) };
+}
+syntax Known : expression { prefix "known"; match "(" value:expr ")"; expand known; }
+syntax Known;
+static u32 first() [[aligned(known(sizeof(struct Tag))), generic(params!(T))]] { return 1u32; }
+static u32 second() [[aligned(known(sizeof(Types::Value))), generic(params!(T))]] { return 2u32; }
+$::static_assert(first<u32>() + second<u32>() == 3u32, "independent capture changed");
+]=] 0)
+
+set(discard_header [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    $::static_assert($::meta::is_kind($::syntax::node(input, "header"), "deferred"),
+                    "opaque header did not defer");
+    return $::quote {};
+}
+syntax Discard : item { prefix "discard"; match header:function_header body:block; expand discard; }
+syntax Discard;
+]=])
+foreach(header
+        "static u32 discarded() [[generic(unknown!(u32 N))]]"
+        "static T discarded(in T value) [[generic(unknown!(T))]]"
+        "static T discarded<unknown!(T)>(in T value)"
+        "[[unknown!(noinline)]] static u32 discarded()"
+        "static u32 discarded() [[abi(unknown!(\"not-an-abi\"))]]"
+        "static u32 (*discarded(in u32 value))(unknown!()) [[generic(unknown!(T))]]")
+    string(MD5 case "${header}")
+    check(discarded_header_${case} "${discard_header}
+discard ${header} { completely noncore body; unknown!{discarded}; }" 0)
+endforeach()
+
+foreach(header
+        "static u32 (*not_function)(unknown!()) [[generic(unknown!(T))]]"
+        "static T not_function [[generic(unknown!(T))]]"
+        "static u32 unknown!(not_function) [[generic(unknown!(T))]]"
+        "[[, generic(unknown!(T))]] static u32 not_function()"
+        "static u32 not_function(unknown!()) [[generic()]]"
+        "static T not_function<unknown!(T)(in T value)"
+        "static absent::T not_function() [[generic(unknown!(T))]]")
+    string(MD5 case "${header}")
+    check(rejected_header_${case} "${discard_header}
+discard ${header} { unknown!{discarded}; }" 1 "error: syntax-match error for active prefix")
+endforeach()
+
+foreach(category function_decl function_def)
+    set(suffix ";")
+    set(after "global T kept(in T value) [[generic(T)]] { return value; }")
+    if(category STREQUAL "function_def")
+        set(suffix "{ return value; }")
+        set(after "")
+    endif()
+    check(captured_${category} "
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    $::meta::syntax unit = $::syntax::node(input, \"unit\");
+    $::static_assert($::meta::is_kind(unit, \"deferred\"), \"function unit was classified early\");
+    return $::quote { $::unquote(unit) };
+}
+syntax Copy : item { prefix \"copy\"; match unit:${category}; expand copy; }
+syntax Copy;
+copy global T kept(in T value) [[generic(params!(T))]] ${suffix}
+${after}
+$::static_assert(kept(11u32) == 11u32, \"function category lost its generic\");" 0)
+endforeach()
+
+foreach(category function function_raw)
+    check(raw_${category}_discard "
+[[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; }
+syntax Drop : item { prefix \"drop\"; match body:${category}; expand drop; }
+syntax Drop;
+drop static T ignored(in T value) [[generic(unknown!(T))]] { not core syntax; unknown!{}; }
+drop static T ignored_angle<unknown!(T)>(in T value) { not core syntax; unknown!{}; }" 0)
+    check(raw_${category}_copy "
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+    return $::syntax::capture(input, \"body\");
+}
+syntax Copy : item { prefix \"copy\"; match body:${category}; expand copy; }
+syntax Copy;
+copy static T kept(in T value) [[generic(params!(T))]] { return value; }
+$::static_assert(kept(13u32) == 13u32, \"raw function generic was lost\");" 0)
+endforeach()
+
 set(prefix [=[
 [[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
 [[macro]] static $::meta::tokens bad(in $::meta::tokens input) {
@@ -143,3 +294,77 @@ foreach(limit "-feval-depth-limit=2" "-feval-step-limit=64" "-feval-memory-limit
         message(FATAL_ERROR "header ${limit} was not bounded\n${out}\n${err}")
     endif()
 endforeach()
+
+check(captured_header_owner_order "${prefix}
+[[syntax_expander]] static $::meta::tokens owner(in $::meta::syntax_match input) {
+    $::syntax::note($::syntax::span(input), \"header-capture-owner\");
+    return $::quote { $::unquote($::syntax::node(input, \"header\"))
+                     $::unquote($::syntax::capture(input, \"body\")) };
+}
+syntax Owner : item { prefix \"owner\"; match header:function_header body:block; expand owner; }
+syntax Owner;
+owner static u32 test() [[aligned(notice(unknown!{discarded})), generic(bad!(T))]] { return 0u32; }"
+    1 "note: header-capture-owner" "note: earlier-header-owner" "error: division by zero")
+
+check(captured_header_parse_roundtrip [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    $::meta::syntax decorated = $::meta::parse("function_header",
+        $::quote { [[params!(noinline)]] $::unquote(header) }, $::syntax::context(input));
+    $::static_assert($::meta::is_kind(decorated, "deferred"), "decorated header was not deferred");
+    $::meta::syntax definition = $::meta::parse("function_def", $::quote {
+        $::unquote(decorated) $::unquote($::syntax::capture(input, "body"))
+    }, $::syntax::context(input));
+    return $::quote { $::unquote(definition) };
+}
+syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
+syntax Compose;
+compose static T test(in T value) [[generic(params!(T))]] { return value; }
+$::static_assert(test(17u32) == 17u32, "header parse roundtrip lost its generic");
+]=] 0)
+
+check(decorated_core_header [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    $::static_assert(!$::meta::is_kind(header, "deferred"), "original header was not settled");
+    header = $::meta::parse("function_header", $::quote {
+        [[params!(noinline)]] $::unquote(header) [[generic(params!(u32 N))]]
+    }, $::syntax::context(input));
+    $::static_assert($::meta::is_kind(header, "deferred"), "opaque decoration was not deferred");
+    return $::quote { $::unquote(header) $::unquote($::syntax::capture(input, "body")) };
+}
+syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
+syntax Compose;
+compose static u32 kept(in u32 value) { return value; }
+$::static_assert(kept<3u32>(19u32) == 19u32, "decorated core header lost its generic");
+]=] 0)
+
+check(header_before_body_fragment "${prefix}
+[[macro]] static $::meta::tokens body(in $::meta::tokens input) {
+    u32 value = 1u32 / 0u32;
+    return $::quote { { return 0u32; } };
+}
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, \"header\")) body!() };
+}
+syntax Compose : item { prefix \"compose\"; match header:function_header \";\"; expand compose; }
+syntax Compose;
+compose static u32 kept() [[aligned(notice(unknown!{discarded})), generic(params!(T))]];"
+    1 "note: earlier-header-owner" "error: division by zero")
+
+check(header_body_fragment_context [=[
+[[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+[[macro]] static $::meta::tokens body(in $::meta::tokens input) { return input; }
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    return $::quote {
+        $::unquote($::syntax::node(input, "header"))
+        body!($::unquote($::syntax::capture(input, "body")))
+    };
+}
+syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
+syntax Compose;
+compose static T kept(in T value) [[generic(params!(T))]] { T copy = value; return copy; }
+$::static_assert(kept(23u32) == 23u32, "body fragment lost header generic bindings");
+]=] 0)

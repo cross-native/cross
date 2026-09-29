@@ -96,7 +96,9 @@ private:
     std::shared_ptr<const SyntaxNode> parse_opaque_invocation(SyntaxKind category);
     bool opaque_statement_has_expression_continuation() const;
     struct DeferredNameRecognition {};
-    void require_public_name_context(std::string_view name, SourceLocation location = {}) const;
+    enum class PublicNameDomain { Ordinary, Tag };
+    void require_public_name_context(std::string_view name, SourceLocation location = {},
+                                    PublicNameDomain domain = PublicNameDomain::Ordinary) const;
     void mark_public_binding_uncertainty();
     std::optional<std::size_t> bounded_group_end(std::size_t first);
     std::optional<std::size_t> fenced_fragment_end(std::size_t first, bool expression);
@@ -114,6 +116,10 @@ private:
     enum class AttributeParseMode { Semantic, SyntaxOnly };
     std::vector<Attribute> parse_attributes(bool one_specifier = false,
         AttributeParseMode mode = AttributeParseMode::Semantic);
+    std::vector<Attribute> parse_attributes_impl(bool one_specifier, AttributeParseMode mode);
+    bool defer_public_header_group(std::optional<std::size_t> end,
+                                   const std::function<void()>& parse);
+    std::optional<std::size_t> generic_parameter_group_end(std::size_t first);
     void apply_type_attributes(
         TypePtr& type,
         std::optional<std::pair<std::uint32_t, SourceLocation>>*
@@ -139,6 +145,8 @@ private:
                          angle_parameters = nullptr, bool abstract_only = false);
     std::vector<FunctionDecl::GenericParameter>
     parse_angle_generic_parameters();
+    std::vector<FunctionDecl::GenericParameter>
+    parse_angle_generic_parameters_impl();
     std::vector<std::string> preview_generic_types(bool* pending_fragments = nullptr);
     bool consume_generic_close();
     bool known_generic_name(const Expr& name) const;
@@ -300,11 +308,12 @@ private:
     bool parsing_procedural_body_{};
     bool parsing_public_fragment_{};
     bool parsing_public_function_header_{};
-    // A known parameter group can be opaque while declarator binding is still
-    // recognized by the ordinary parser. These flags are speculative only;
-    // no placeholder signature may leave a deferred public-tree capture.
-    bool allow_public_parameter_deferral_{};
-    bool public_deferred_parameters_{};
+    // Known parameter/attribute/generic groups can be opaque while declarator
+    // binding is still recognized by the ordinary parser. These flags are
+    // speculative only; no placeholder signature may leave a deferred capture.
+    bool allow_public_header_deferral_{};
+    bool public_deferred_header_{};
+    bool public_header_uncertain_names_{};
     bool recording_public_tree_{};
     bool public_tree_failed_{};
     std::vector<std::size_t> public_uncertain_binding_depths_;

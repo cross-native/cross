@@ -194,11 +194,22 @@ syntax DeferredHeaderValue : expression {
     prefix "header_value"; match "(" value:expr ")"; expand deferred_header_value;
 }
 syntax DeferredHeaderValue;
+[[syntax_expander]] static $::meta::tokens captured_header(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    if (!$::meta::is_kind(header, "deferred"))
+        $::syntax::error($::syntax::span(input), "generated generic header did not defer");
+    return $::quote { $::unquote(header) $::unquote($::syntax::capture(input, "body")) };
+}
+syntax CapturedHeader : item {
+    prefix "captured_header"; match header:function_header body:block; expand captured_header;
+}
+syntax CapturedHeader;
+captured_header
 [[noinline]] static T captured_header_identity(in T value)
     [[aligned(header_value(sizeof(T *))), generic(parameter_list_fragment!(T))]] {
     return value;
 }
-[[noinline]] static u32 captured_header_value(in u32 value)
+captured_header [[noinline]] static u32 captured_header_value(in u32 value)
     [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
     return value + N;
 }
@@ -281,9 +292,10 @@ static struct HeaderMemoryResult memory_header_function(parameter_fragment!(valu
     struct HeaderMemoryResult result = { (u64)value + 10u64, (u64)value + 11u64 };
     return result;
 }
-[[noinline, abi("stack_result_abi")]] static u32 captured_stack_header_value(in u32 value)
+assign_header_abi "stack_result_abi"
+static u32 captured_stack_header_value(in u32 value)
     [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] { return value + N; }
-[[noinline, abi("memory_result_abi")]]
+assign_header_abi "memory_result_abi"
 static struct HeaderMemoryResult captured_memory_header_value(in u32 value)
     [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
     struct HeaderMemoryResult result = { (u64)value + (u64)N, (u64)value + (u64)N + 1u64 };

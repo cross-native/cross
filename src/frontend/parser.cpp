@@ -458,6 +458,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->preparing_header_ = preparing_header_;
     child->expansion_diagnostics_ = expansion_diagnostics_;
     child->header_bindings_ = header_bindings_;
+    child->public_header_uncertain_names_ = public_header_uncertain_names_;
     child->replacement_ = true;
     child->active_imports_ = active_imports_;
     child->current_scope_imports_ = current_scope_imports_;
@@ -771,7 +772,7 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         child->active_imports_ = origin.context->imports;
     }
     const auto initial_context = child->public_fragment_context(first);
-    child->allow_public_parameter_deferral_ = kind == K::FunctionHeader ||
+    child->allow_public_header_deferral_ = kind == K::FunctionHeader ||
         kind == K::FunctionDeclaration || kind == K::FunctionDefinition;
     const auto deferred_category = [&]() {
         switch (kind) {
@@ -897,7 +898,7 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
         } else {
             return {};
         }
-        if (child->public_deferred_parameters_)
+        if (child->public_deferred_header_)
             deferred_root = child->deferred_node(first, child->index_, deferred_slot,
                                                  deferred_category, initial_context);
     } catch (const DeferredNameRecognition&) {
@@ -982,10 +983,13 @@ std::shared_ptr<const SyntaxNode> Parser::parse_syntax_tokens(
     return fragment->node;
 }
 
-void Parser::require_public_name_context(std::string_view name, SourceLocation location) const {
+void Parser::require_public_name_context(std::string_view name, SourceLocation location,
+                                         PublicNameDomain domain) const {
     if (!parsing_public_fragment_ || name.empty() || is_reserved_identifier(name)) return;
     if (probing_header_type_) return;
-    if (header_bindings_ && !header_bindings_->complete) throw DeferredNameRecognition{};
+    if (domain == PublicNameDomain::Ordinary && name.find("::") == std::string_view::npos &&
+        (public_header_uncertain_names_ || (header_bindings_ && !header_bindings_->complete)))
+        throw DeferredNameRecognition{};
     if (public_uncertain_binding_depths_.empty()) return;
     if (name.find("::") == std::string_view::npos) {
         const NameKey key(name, location.valid() ? location : current().location);
@@ -1463,13 +1467,66 @@ std::unique_ptr<Expr> Parser::parse_expression_replacement() {
     return grouped;
 }
 
+bool Parser::defer_public_header_group(std::optional<std::size_t> end,
+                                      const std::function<void()>& parse) {
+    if (!allow_public_header_deferral_ || !end) {
+        parse();
+        return false;
+    }
+    const auto first = index_;
+    const auto end_input = public_input_indices_[*end];
+    const auto context = public_fragment_context(first);
+    const auto production_depth = production_stack_.size();
+    const auto saved_generic_argument = parsing_generic_argument_;
+    const auto saved_recording = recording_public_tree_;
+    const auto saved_records = pending_records_.size();
+    const auto saved_enumerations = pending_enumerations_.size();
+    try {
+        parse();
+        return false;
+    } catch (const DeferredNameRecognition&) {
+        if (!context || !context->parse_environment || public_tree_failed_) throw;
+        // This boundary was proved from written delimiters, before recognition
+        // changed any classifier state or split a token. Only the group is
+        // skipped; ordinary declarator binding must still prove a function.
+        const auto after = std::find(public_input_indices_.begin() +
+            static_cast<std::ptrdiff_t>(first), public_input_indices_.end(), end_input);
+        if (after == public_input_indices_.end()) throw;
+        restore_environment(*context->parse_environment, *context);
+        pending_records_.resize(saved_records);
+        pending_enumerations_.resize(saved_enumerations);
+        parsing_generic_argument_ = saved_generic_argument;
+        recording_public_tree_ = saved_recording;
+        production_stack_.resize(production_depth);
+        index_ = static_cast<std::size_t>(after - public_input_indices_.begin());
+        public_deferred_header_ = true;
+        return true;
+    }
+}
+
 std::vector<Attribute> Parser::parse_attributes(bool one_specifier, AttributeParseMode mode) {
+    if (!allow_public_header_deferral_) return parse_attributes_impl(one_specifier, mode);
+    std::vector<Attribute> result;
+    while (current().is("[[")) {
+        std::vector<Attribute> attributes;
+        if (defer_public_header_group(bounded_group_end(index_), [&] {
+                attributes = parse_attributes_impl(true, mode);
+            })) attributes.clear();
+        result.insert(result.end(), std::make_move_iterator(attributes.begin()),
+                      std::make_move_iterator(attributes.end()));
+        if (one_specifier) break;
+    }
+    return result;
+}
+
+std::vector<Attribute> Parser::parse_attributes_impl(bool one_specifier, AttributeParseMode mode) {
     std::vector<Attribute> result;
     while (current().is("[[")) {
         ProductionScope attribute_specifier(*this, SyntaxProduction::AttributeSpecifier);
         consume("[[");
         do {
             ProductionScope attribute_production(*this, SyntaxProduction::Attribute);
+            normalize_qualified_name();
             if (current().kind == TokenKind::BuiltinName) {
                 diagnostics_.error(
                     current().location,
@@ -1610,6 +1667,7 @@ std::vector<Attribute> Parser::parse_attributes(bool one_specifier, AttributePar
                     unsigned depth = 1;
                     std::string argument;
                     while (depth != 0 && current().kind != TokenKind::End) {
+                        expand_inline_macro_fragments();
                         if (current().is("(") ) { ++depth; argument += current().text; ++index_; continue; }
                         if (current().is(")")) {
                             --depth;
@@ -1827,11 +1885,17 @@ bool Parser::type_start(TypeProbe probe) {
         return token.prepared && token.prepared->category == SyntaxParseCategory::Type;
     if (token.kind == TokenKind::StructuredSplice)
         return token.splice && syntax_type_node(*token.splice);
+    if (allow_public_header_deferral_ && public_header_uncertain_names_ && probe == TypeProbe::Required &&
+        token.kind == TokenKind::Identifier && !is_reserved_identifier(token.text) &&
+        std::as_const(*this).peek_qualified_name().find("::") == std::string::npos) {
+        public_deferred_header_ = true;
+        return true;
+    }
     if (token.kind == TokenKind::Identifier) {
         const auto binding = token.value_binding.kind != ValueBinding::Kind::Unknown
             ? token.value_binding : token_origin(token.location).value_binding;
         if (binding.kind != ValueBinding::Kind::Unknown) return false;
-        require_public_name_context(token.text);
+        require_public_name_context(std::as_const(*this).peek_qualified_name());
     }
     const auto name = std::as_const(*this).peek_qualified_name();
     if (preparing_header_ && (!parsing_public_fragment_ || probing_header_type_) &&
@@ -2093,7 +2157,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 type = record_type(declaration.name, is_union, is_const, is_volatile);
                 pending_records_.push_back(std::move(declaration));
             } else {
-                require_public_name_context(*name, name_location);
+                require_public_name_context(*name, name_location, PublicNameDomain::Tag);
                 for (const auto& attribute : record_attributes)
                     diagnostics_.error(attribute.location,
                         "record attributes on a type use are not yet supported");
@@ -2169,7 +2233,7 @@ TypePtr Parser::parse_type(bool record_specifiers,
                                  is_const, is_volatile);
                 pending_enumerations_.push_back(std::move(declaration));
             } else {
-                require_public_name_context(*name, name_location);
+                require_public_name_context(*name, name_location, PublicNameDomain::Tag);
                 for (const auto& attribute : enum_attributes)
                     diagnostics_.error(attribute.location,
                         "enumeration attributes on a type use are not yet supported");
@@ -2201,11 +2265,15 @@ TypePtr Parser::parse_type(bool record_specifiers,
         const auto alias_name = type ? std::string{} : peek_qualified_name();
         const auto generic = std::find(active_generic_types_.begin(),
                                        active_generic_types_.end(), alias_name);
-        const auto alias = alias_name.empty() || generic != active_generic_types_.end()
+        const bool uncertain_header_type = allow_public_header_deferral_ && public_header_uncertain_names_ &&
+            !alias_name.empty() && alias_name.find("::") == std::string::npos &&
+            !is_reserved_identifier(alias_name);
+        if (uncertain_header_type) public_deferred_header_ = true;
+        const auto alias = alias_name.empty() || generic != active_generic_types_.end() || uncertain_header_type
             ? TypePtr{} : resolve_type_alias(alias_name);
-        const bool provisional_type = preparing_header_ &&
+        const bool provisional_type = uncertain_header_type || (preparing_header_ &&
             (!parsing_public_fragment_ || probing_header_type_) &&
-            current().kind == TokenKind::Identifier && !is_reserved_identifier(current().text);
+            current().kind == TokenKind::Identifier && !is_reserved_identifier(current().text));
         if (!type && !kind && generic == active_generic_types_.end() && !alias && !provisional_type) {
             if (const auto message = familiar_c_spelling(current().text)) {
                 error_here(*message);
@@ -2422,6 +2490,49 @@ std::vector<std::string> Parser::preview_generic_types(bool* pending_fragments) 
 
 std::vector<FunctionDecl::GenericParameter>
 Parser::parse_angle_generic_parameters() {
+    if (!allow_public_header_deferral_) return parse_angle_generic_parameters_impl();
+    std::vector<FunctionDecl::GenericParameter> result;
+    if (defer_public_header_group(generic_parameter_group_end(index_), [&] {
+            result = parse_angle_generic_parameters_impl();
+        })) result.clear();
+    return result;
+}
+
+std::optional<std::size_t> Parser::generic_parameter_group_end(std::size_t first) {
+    if (first >= tokens_.size() || !tokens_[first].is("<")) return {};
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    const auto limits = execution ? execution->limits() : EvaluationLimits{};
+    unsigned depth = 1;
+    for (auto at = first + 1; at < tokens_.size(); ++at) {
+        if (execution && !execution->work(tokens_[at].location)) {
+            public_tree_failed_ = true;
+            return {};
+        }
+        if (tokens_[at].kind == TokenKind::End || tokens_[at].is(";")) return {};
+        if (tokens_[at].is("(") || tokens_[at].is("[") || tokens_[at].is("[[") || tokens_[at].is("{")) {
+            const auto end = bounded_group_end(at);
+            if (!end) return {};
+            at = *end - 1;
+        } else if (tokens_[at].is("<")) {
+            if (depth >= limits.depth) {
+                public_tree_failed_ = true;
+                if (execution) execution->tree_limit_error(tokens_[at].location);
+                return {};
+            }
+            ++depth;
+        } else if (tokens_[at].is(">") || tokens_[at].is(">>")) {
+            const unsigned closed = tokens_[at].is(">>") ? 2 : 1;
+            if (closed > depth) return {};
+            depth -= closed;
+            if (!depth) return at + 1;
+        } else if (tokens_[at].is(")") || tokens_[at].is("]") ||
+                   tokens_[at].is("]]") || tokens_[at].is("}")) return {};
+    }
+    return {};
+}
+
+std::vector<FunctionDecl::GenericParameter>
+Parser::parse_angle_generic_parameters_impl() {
     ProductionScope list(*this, SyntaxProduction::GenericParameterList);
     std::vector<FunctionDecl::GenericParameter> result;
     consume("<");
@@ -2450,6 +2561,7 @@ Parser::parse_angle_generic_parameters() {
                 name = identifier_binding_name(*token);
             if (value_type && !is_integer(value_type) &&
                 value_type->kind != Type::Kind::Pointer &&
+                !(public_header_uncertain_names_ && value_type->kind == Type::Kind::Generic) &&
                 !(value_type->kind == Type::Kind::Builtin &&
                   value_type->builtin == BuiltinType::Label))
                 diagnostics_.error(location,
@@ -2613,47 +2725,17 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     expand_inline_macro_fragments();
     if (current().is("(")) {
         ProductionScope suffix(*this, SyntaxProduction::FunctionSuffix);
-        const auto parameter_first = index_;
-        const auto production_depth = production_stack_.size();
-        const auto parameter_context = allow_public_parameter_deferral_
-            ? public_fragment_context(parameter_first) : nullptr;
-        const auto saved_generic_argument = parsing_generic_argument_;
-        const auto saved_records = pending_records_.size();
-        const auto saved_enumerations = pending_enumerations_.size();
-        std::optional<std::size_t> end_input;
-        if (allow_public_parameter_deferral_)
-            if (const auto end = bounded_group_end(parameter_first))
-                end_input = public_input_indices_[*end];
-        consume("(");
         std::vector<ParameterDecl> parameters;
         bool variadic = false;
-        try {
-            parse_parameter_list(parameters, variadic);
-        } catch (const DeferredNameRecognition&) {
-            if (!allow_public_parameter_deferral_ || !end_input ||
-                !parameter_context || !parameter_context->parse_environment ||
-                public_tree_failed_) throw;
-            // The grammar parser identified this exact parameter group.
-            // Preserve its opacity, then finish parsing the declarator to
-            // distinguish a direct function from a function-pointer object.
-            // The signature below is only a speculative shape placeholder;
-            // the entire public capture becomes deferred, never typed HIR.
-            const auto end = std::find(public_input_indices_.begin() +
-                static_cast<std::ptrdiff_t>(parameter_first),
-                public_input_indices_.end(), *end_input);
-            if (end == public_input_indices_.end()) throw;
-            restore_environment(*parameter_context->parse_environment,
-                                *parameter_context);
-            pending_records_.resize(saved_records);
-            pending_enumerations_.resize(saved_enumerations);
-            parsing_generic_argument_ = saved_generic_argument;
-            production_stack_.resize(production_depth);
-            index_ = static_cast<std::size_t>(end - public_input_indices_.begin()) - 1;
+        if (defer_public_header_group(allow_public_header_deferral_
+                ? bounded_group_end(index_) : std::nullopt, [&] {
+                consume("(");
+                parse_parameter_list(parameters, variadic);
+                expect(")", "after function parameters");
+            })) {
             parameters.clear();
             variadic = false;
-            public_deferred_parameters_ = true;
         }
-        expect(")", "after function parameters");
         base = function_type(std::move(base), std::move(parameters), variadic);
         expand_inline_macro_fragments();
         if (current().is("->")) {
@@ -3177,7 +3259,25 @@ void Parser::parse_function_header_splice(
     // Record the published attribute trees now, but interpret all attributes
     // together with the retained header in the bounded parser below. This
     // keeps generic/ABI/variadic handling on the ordinary declaration path.
-    (void)parse_attributes(false, AttributeParseMode::SyntaxOnly);
+    const auto attributes = [&] {
+        if (parsing_public_fragment_) {
+            (void)parse_attributes(false, AttributeParseMode::SyntaxOnly);
+            return true;
+        }
+        // Ordinary parsing merely transfers the written groups here. Running
+        // their macros would both reorder header work and invalidate the
+        // saved header index before the bounded parser receives the tokens.
+        while (std::as_const(*this).current().is("[[")) {
+            const auto end = bounded_group_end(index_);
+            if (!end) {
+                error_here("structured header requires balanced attributes");
+                return false;
+            }
+            index_ = *end;
+        }
+        return true;
+    };
+    if (!attributes()) return;
     {
         ProductionScope header(*this, SyntaxProduction::FunctionHeader);
         ++index_;
@@ -3185,13 +3285,15 @@ void Parser::parse_function_header_splice(
             production_events_[header.event].opaque = item.splice;
     }
     const auto trailing_first = index_;
-    (void)parse_attributes(false, AttributeParseMode::SyntaxOnly);
+    if (!attributes()) return;
     const auto header_end = index_;
     const bool header_only = parsing_public_function_header_;
-    const bool body = current().is("{") ||
-        (current().kind == TokenKind::StructuredSplice && current().splice &&
-         syntax_compound_node(*current().splice));
-    if (!header_only && !body && !current().is(";")) {
+    const auto compound_start = [](const Token& token) {
+        return token.is("{") || (token.kind == TokenKind::StructuredSplice &&
+            token.splice && syntax_compound_node(*token.splice));
+    };
+    bool body = compound_start(std::as_const(*this).current());
+    if (parsing_public_fragment_ && !header_only && !body && !current().is(";")) {
         error_here("structured function header requires a body or ';'");
         return;
     }
@@ -3199,7 +3301,7 @@ void Parser::parse_function_header_splice(
         // A failed header still owns this already delimited tail. Do not
         // misdiagnose its body as a sequence of unrelated external items.
         if (header_only) return;
-        if (body && current().is("{")) {
+        if (body && std::as_const(*this).current().is("{")) {
             if (const auto end = bounded_group_end(index_)) index_ = *end;
         } else ++index_;
     };
@@ -3213,8 +3315,10 @@ void Parser::parse_function_header_splice(
         : body ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration;
     if (production_event < production_events_.size())
         production_events_[production_event].production = slot;
-    if (parsing_public_fragment_ && item.splice->kind == SyntaxNode::Kind::Deferred) {
-        // The header has a proven category, but unknown parameter/type names.
+    if (parsing_public_fragment_ &&
+        (item.splice->kind == SyntaxNode::Kind::Deferred || public_deferred_header_)) {
+        // The header has a proven category, but unknown parameters/types or
+        // an opaque attribute attached around an otherwise settled header.
         // Keep the whole composed unit deferred, including the header marker;
         // no speculative signature is allowed to classify its body.
         auto end = header_only ? std::optional{header_end}
@@ -3284,7 +3388,7 @@ void Parser::parse_function_header_splice(
     auto function = std::move(parsed.functions.front());
     if (function->generic_parameters.empty()) known_ordinary_values_.insert(function->name);
     else known_generic_functions_.insert(function->name);
-    if (body && !header_only) {
+    if (!header_only) {
         struct Restore {
             Parser& parser;
             FunctionDecl* function;
@@ -3301,8 +3405,19 @@ void Parser::parse_function_header_splice(
         active_generic_types_.clear();
         for (const auto& parameter : function->generic_parameters)
             if (!parameter.value_type) active_generic_types_.push_back(parameter.name);
-        function->body = parse_compound();
-    } else if (!header_only) expect(";", "after structured function header");
+        if (!parsing_public_fragment_) {
+            // A textual token macro may supply the following body or semicolon,
+            // but only after surviving header expansions have completed and
+            // its generic context is available to the body invocation.
+            body = compound_start(current());
+            if (!body && !current().is(";")) {
+                error_here("structured function header requires a body or ';'");
+                return;
+            }
+        }
+        if (body) function->body = parse_compound();
+        else expect(";", "after structured function header");
+    }
     program.functions.push_back(std::move(function));
     for (auto& assertion : child->static_assertions_)
         static_assertions_.push_back(std::move(assertion));
@@ -3392,6 +3507,8 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         ~HeaderRestore() { value = std::move(previous); }
     } header_restore{header_bindings_, header_bindings_};
     prepare_header();
+    if (allow_public_header_deferral_)
+        (void)preview_generic_types(&public_header_uncertain_names_);
     active_generic_types_ = preview_generic_types();
     auto attributes = parse_attributes();
     if (current().is("$::static_assert")) {
@@ -3578,7 +3695,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                         parsing_public_function_header_ ? SyntaxProduction::FunctionHeader
                                                         : SyntaxProduction::FunctionDefinition;
                 if (!parsing_public_function_header_) {
-                    if (public_deferred_parameters_) {
+                    if (public_deferred_header_) {
                         const auto end = bounded_group_end(index_);
                         if (!end) {
                             error_here("deferred function requires a balanced body");
