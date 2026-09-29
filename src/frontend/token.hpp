@@ -33,6 +33,7 @@ struct Token {
     SourceLocation location;
     ValueBinding value_binding;
     std::shared_ptr<const TagBinding> tag_binding;
+    std::shared_ptr<const AliasBinding> alias_binding;
     std::shared_ptr<const SyntaxNode> splice;
     std::shared_ptr<const PreparedSyntaxFragment> prepared;
     std::shared_ptr<const SplitTokenSource> split_source;
@@ -68,6 +69,7 @@ struct MetaToken {
         if (token.value_binding.kind != ValueBinding::Kind::Unknown)
             origin.value_binding = token.value_binding;
         if (token.tag_binding) origin.tag_binding = token.tag_binding;
+        if (token.alias_binding) origin.alias_binding = token.alias_binding;
     }
 };
 
@@ -75,11 +77,12 @@ using TokenSequence = std::vector<MetaToken>;
 
 // Logical resource accounting includes the optional owned-splice handle and
 // is independent of the host C++ object layout.
-inline constexpr std::uint64_t meta_token_storage_bytes = 224;
+inline constexpr std::uint64_t meta_token_storage_bytes = 240;
 
 inline std::uint64_t token_binding_storage(const Token& token) {
-    return tag_binding_storage(token.tag_binding ? token.tag_binding
-                                                : token_origin(token.location).tag_binding);
+    const auto origin = token_origin(token.location);
+    return tag_binding_storage(token.tag_binding ? token.tag_binding : origin.tag_binding) +
+           alias_binding_storage(token.alias_binding ? token.alias_binding : origin.alias_binding);
 }
 
 } // namespace cross

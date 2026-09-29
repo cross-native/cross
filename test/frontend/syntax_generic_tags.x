@@ -3,6 +3,7 @@
 
 #include "local_tag_generic.x"
 #include "local_tag_splice.x"
+#include "type_alias_binding.x"
 
 [[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
     return $::quote { $::unquote($::syntax::node(input, "body")) };
@@ -110,13 +111,15 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
-    if (LocalTagGeneric::run(65549u32) != 65549u32 ||
+    if (AliasBindingTests::run(65549u32) != 65549u32 ||
+        LocalTagGeneric::run(65549u32) != 65549u32 ||
         copied_generic_local(65549u32) != 65549u32 || copied_generic_local(7u16) != 7u16 ||
         header_generic_local(65549u32) != 65549u32 || header_generic_local(7u16) != 7u16 ||
         deferred_generic_local(65549u32) != 65549u32 || deferred_generic_local(7u16) != 7u16 ||
         generic_copy<u32, 5u32>(65549u32) != 65549u32 || generic_copy<u16, 7u32>(9u16) != 9u16)
         return 0u32;
 #ifdef CUSTOM_SYNTAX_ABI
+    if (AliasBindingTests::custom(65549u32) != 65549u32) return 0u32;
     if (custom_transport(65549u32) != 65549u32 || custom_transport(7u16) != 7u16) return 0u32;
 #endif
     return 61u32;

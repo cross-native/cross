@@ -78,4 +78,34 @@ inline std::uint64_t tag_binding_storage(const std::shared_ptr<const TagBinding>
                                       binding->type.identity->instance_key.size() : 0);
 }
 
+struct Type;
+
+// A typedef is transparent to type equality and ABI classification. This handle
+// identifies only its source binding and owns an immutable, detached type graph;
+// consumers always obtain a fresh graph, never the stored mutable Type objects.
+class AliasDefinition {
+public:
+    AliasDefinition(const std::shared_ptr<Type>& type, std::uint64_t storage);
+    [[nodiscard]] std::shared_ptr<Type> instantiate() const;
+    [[nodiscard]] std::uint64_t storage() const { return storage_; }
+private:
+    std::shared_ptr<Type> type_;
+    std::uint64_t storage_;
+};
+using AliasDefinitionPtr = std::shared_ptr<const AliasDefinition>;
+
+struct AliasBinding {
+    enum class Role { Use, Declaration } role;
+    std::string spelling;
+    AliasDefinitionPtr definition;
+};
+
+inline std::uint64_t alias_binding_storage(const std::shared_ptr<const AliasBinding>& binding) {
+    return binding ? 64 + binding->spelling.size() + binding->definition->storage() : 0;
+}
+
+inline std::uint64_t origin_binding_storage(const TokenOrigin& origin) {
+    return tag_binding_storage(origin.tag_binding) + alias_binding_storage(origin.alias_binding);
+}
+
 } // namespace cross

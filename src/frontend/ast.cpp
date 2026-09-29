@@ -12,6 +12,11 @@
 
 namespace cross {
 
+AliasDefinition::AliasDefinition(const TypePtr& type, std::uint64_t storage)
+    : type_(copy_type(type)), storage_(storage) {}
+
+TypePtr AliasDefinition::instantiate() const { return copy_type(type_); }
+
 TypePtr tokens_type() {
     auto type = std::make_shared<Type>();
     type->kind = Type::Kind::Tokens;

@@ -602,6 +602,7 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
         origin.context = context;
         origin.value_binding = {};
         origin.tag_binding.reset();
+        origin.alias_binding.reset();
         origins.push_back({begin, text.size(), std::move(origin), token.splice});
         text += ' ';
     }

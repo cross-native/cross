@@ -468,6 +468,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->tag_destination_depth_ = tag_destination_depth_;
     child->enum_rebindings_ = enum_rebindings_;
     child->tag_rebindings_ = tag_rebindings_;
+    child->alias_rebindings_ = alias_rebindings_;
     child->scope_origins_ = scope_origins_;
     child->scope_events_ = scope_events_;
     child->active_namespace_ = active_namespace_;
@@ -1380,6 +1381,7 @@ void Parser::adopt_replacement(Parser& child) {
     local_tag_scopes_ = std::move(child.local_tag_scopes_);
     enum_rebindings_ = std::move(child.enum_rebindings_);
     tag_rebindings_ = std::move(child.tag_rebindings_);
+    alias_rebindings_ = std::move(child.alias_rebindings_);
     scope_origins_ = std::move(child.scope_origins_);
     enum_types_ = std::move(child.enum_types_);
     pending_enumerations_.insert(pending_enumerations_.end(),
@@ -1997,7 +1999,40 @@ std::string Parser::peek_qualified_name() const {
     return result;
 }
 
-TypePtr Parser::resolve_type_alias(std::string_view name) const {
+AliasDefinitionPtr Parser::bound_type_alias(std::string_view name) const {
+    const auto binding = current().alias_binding ? current().alias_binding
+        : token_origin(current().location).alias_binding;
+    if (!binding || binding->spelling != name) return {};
+    auto definition = binding->definition;
+    for (std::size_t remaining = alias_rebindings_.size(); remaining; --remaining) {
+        const auto replacement = alias_rebindings_.find(definition);
+        if (replacement == alias_rebindings_.end()) break;
+        definition = replacement->second;
+    }
+    return definition;
+}
+
+void Parser::remember_alias_binding(std::size_t token_index, std::string_view spelling,
+                                    AliasDefinitionPtr definition, bool declaration) {
+    if (!definition || preparing_header_) return;
+    auto& token = tokens_[token_index];
+    const auto incoming = token.alias_binding ? token.alias_binding
+        : token_origin(token.location).alias_binding;
+    if (declaration && incoming && incoming->role == AliasBinding::Role::Declaration &&
+        incoming->spelling == spelling && incoming->definition != definition)
+        alias_rebindings_[incoming->definition] = definition;
+    token.alias_binding = std::make_shared<const AliasBinding>(AliasBinding{
+        declaration ? AliasBinding::Role::Declaration : AliasBinding::Role::Use,
+        std::string(spelling), std::move(definition)});
+}
+
+void Parser::transfer_alias_rebindings(const Parser& child, const AliasDefinitionPtr& definition) {
+    for (const auto& [old, replacement] : child.alias_rebindings_)
+        if (replacement == definition) alias_rebindings_[old] = replacement;
+}
+
+AliasDefinitionPtr Parser::resolve_type_alias(std::string_view name) const {
+    if (const auto binding = bound_type_alias(name)) return binding;
     require_public_name_context(name);
     if (name.find("::") == std::string_view::npos) {
         const NameKey key(name, current().location);
@@ -2007,9 +2042,9 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
             if (local_scopes_[scope - 1].contains(key)) return {};
         }
     }
-    const auto find = [&](std::string_view candidate) -> TypePtr {
+    const auto find = [&](std::string_view candidate) -> AliasDefinitionPtr {
         const auto found = type_aliases_.find(std::string(candidate));
-        return found == type_aliases_.end() ? TypePtr{} : found->second;
+        return found == type_aliases_.end() ? AliasDefinitionPtr{} : found->second;
     };
     const auto origin = token_origin(current().location);
     for (const auto& candidate : namespace_candidates(NameUse(name),
@@ -2560,12 +2595,14 @@ TypePtr Parser::parse_type(bool record_specifiers,
         const auto alias_name = type ? std::string{} : peek_qualified_name();
         const auto generic = std::find(active_generic_types_.begin(),
                                        active_generic_types_.end(), alias_name);
+        const auto bound_alias = bound_type_alias(alias_name);
         const bool uncertain_header_type = allow_public_header_deferral_ && public_header_uncertain_names_ &&
-            !alias_name.empty() && alias_name.find("::") == std::string::npos &&
+            !bound_alias && !alias_name.empty() && alias_name.find("::") == std::string::npos &&
             !is_reserved_identifier(alias_name);
         if (uncertain_header_type) public_deferred_header_ = true;
-        const auto alias = alias_name.empty() || generic != active_generic_types_.end() || uncertain_header_type
-            ? TypePtr{} : resolve_type_alias(alias_name);
+        const auto alias = bound_alias ? bound_alias :
+            (alias_name.empty() || generic != active_generic_types_.end() || uncertain_header_type
+                ? AliasDefinitionPtr{} : resolve_type_alias(alias_name));
         const bool provisional_type = uncertain_header_type || (preparing_header_ &&
             (!parsing_public_fragment_ || probing_header_type_) &&
             current().kind == TokenKind::Identifier && !is_reserved_identifier(current().text));
@@ -2581,8 +2618,10 @@ TypePtr Parser::parse_type(bool record_specifiers,
         if (!type) {
             if (alias) {
                 ProductionScope alias_production(*this, SyntaxProduction::TypedefName);
+                const auto name_index = index_;
                 (void)parse_qualified_name();
-                type = copy_type(alias);
+                remember_alias_binding(name_index, alias_name, alias, false);
+                type = alias->instantiate();
                 type->is_const = type->is_const || is_const;
                 type->is_volatile = type->is_volatile || is_volatile;
             } else {
@@ -3024,7 +3063,8 @@ bool Parser::consume_generic_close() {
 TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name, DeclaratorContext context,
                                  std::unique_ptr<Expr>* dynamic_outer_bound,
                                  SourceLocation* name_location,
-                                 std::vector<FunctionDecl::GenericParameter>* angle_parameters) {
+                                 std::vector<FunctionDecl::GenericParameter>* angle_parameters,
+                                 std::size_t* name_token_index) {
     const bool parameter = context == DeclaratorContext::Parameter;
     const bool abstract_only = context == DeclaratorContext::TypePrefix;
     expand_inline_macro_fragments();
@@ -3111,15 +3151,17 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
         consume("(");
         hole = std::make_shared<Type>();
         nested = parse_declarator(hole, name, context, nullptr, name_location,
-                                   angle_parameters);
+                                   angle_parameters, name_token_index);
         expect(")", "after parenthesized declarator");
     } else if (!abstract_only) {
         const auto location = current().location;
+        const auto token_index = index_;
         name = parse_qualified_name();
         if (probing_header_type_ && context == DeclaratorContext::TypeName && name)
             throw HeaderProbeRejected{};
         if (name && name_location)
             *name_location = location;
+        if (name && name_token_index) *name_token_index = token_index;
         if (name && angle_parameters && current().is("<"))
             *angle_parameters = parse_angle_generic_parameters();
     }
@@ -3406,13 +3448,15 @@ void Parser::parse_typedef(const std::string& name_space,
         ProductionScope item(*this, SyntaxProduction::InitDeclarator);
         std::optional<std::string> name;
         auto name_location = location;
+        auto name_index = index_;
         auto type = parse_declarator(copy_type(base_type), name, DeclaratorContext::Named,
-                                     nullptr, &name_location);
+                                     nullptr, &name_location, nullptr, &name_index);
         if (!type || !name) {
             if (!name) error_here("expected typedef name");
             synchronize_external();
             return;
         }
+        const auto spelling = *name;
         if (local_type_scopes_.empty()) *name = join_namespace(name_space, *name);
         else if (name->find("::") != std::string::npos)
             diagnostics_.error(name_location, "a local typedef name must be unqualified");
@@ -3420,13 +3464,14 @@ void Parser::parse_typedef(const std::string& name_space,
         auto trailing = parse_attributes();
         item_attributes.insert(item_attributes.end(),
             std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
-        register_typedef(name_location, std::move(*name), std::move(type), item_attributes);
+        auto definition = register_typedef(name_location, std::move(*name), std::move(type), item_attributes);
+        remember_alias_binding(name_index, spelling, std::move(definition), true);
     } while (consume(","));
     list.finish();
     if (consume_semicolon) expect(";", "after typedef declaration");
 }
 
-void Parser::register_typedef(SourceLocation location, std::string name, TypePtr type,
+AliasDefinitionPtr Parser::register_typedef(SourceLocation location, std::string name, TypePtr type,
                               const std::vector<Attribute>& attributes) {
     apply_callable_attributes(type, attributes);
 
@@ -3489,21 +3534,21 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
                         if (address_bits_ == 0) {
                             diagnostics_.error(vector_attribute->location,
                                 "vector_size of a target-sized element requires a resolved target");
-                            return;
+                            return {};
                         }
                         element_bits = address_bits_;
                     }
                     if (amount > std::numeric_limits<std::uint64_t>::max() / 8U) {
                         diagnostics_.error(vector_attribute->location,
                                            "vector size is out of range");
-                        return;
+                        return {};
                     }
                     const auto total_bits = amount * 8U;
                     if (element_bits == 0 || total_bits % element_bits != 0) {
                         diagnostics_.error(
                             vector_attribute->location,
                             "vector size must be a multiple of the element size");
-                        return;
+                        return {};
                     } else {
                         lanes = total_bits / element_bits;
                     }
@@ -3521,33 +3566,36 @@ void Parser::register_typedef(SourceLocation location, std::string name, TypePtr
         }
     }
 
-    if (replacement_)
-        declared_aliases_.push_back({name, copy_type(type),
-                                     local_type_scopes_.size()});
+    auto definition = make_alias_definition(type);
+    if (!definition) return {};
     auto& aliases = type_aliases_;
     if (!local_type_scopes_.empty()) {
         const NameKey key(name, location);
         if (local_scopes_.back().contains(key)) {
             diagnostics_.error(location, "typedef '" + name + "' conflicts with a local value");
-            return;
+            return {};
         }
         auto& local = local_type_scopes_.back();
         const auto found = local.find(key);
-        if (found != local.end() && !same_type(found->second, type)) {
+        if (found != local.end() && !same_type(found->second->instantiate(), type)) {
             diagnostics_.error(location, "typedef '" + name + "' redeclared with a different type");
-            return;
+            return {};
         }
-        local[key] = std::move(type);
-        return;
+        if (found != local.end()) definition = found->second;
+        local[key] = definition;
+    } else {
+        const auto found = aliases.find(name);
+        if (found != aliases.end() && !same_type(found->second->instantiate(), type)) {
+            diagnostics_.error(location,
+                               "typedef '" + name + "' redeclared with a different type");
+            return {};
+        }
+        if (found != aliases.end()) definition = found->second;
+        aliases[name] = definition;
     }
-    const auto found = aliases.find(name);
-    if (found != aliases.end() && !same_type(found->second, type)) {
-        diagnostics_.error(location,
-                           "typedef '" + name +
-                               "' redeclared with a different type");
-        return;
-    }
-    aliases[std::move(name)] = std::move(type);
+    if (replacement_)
+        declared_aliases_.push_back({std::move(name), definition, local_type_scopes_.size()});
+    return definition;
 }
 
 void Parser::parse_external_node_splice(
@@ -3608,7 +3656,8 @@ void Parser::parse_external_node_splice(
     for (const auto& alias : child->declared_aliases_) {
         if (alias.scope_depth != 0) continue;
         if (const auto found = type_aliases_.find(alias.name);
-            found != type_aliases_.end() && !same_type(found->second, alias.type))
+            found != type_aliases_.end() &&
+            !same_type(found->second->instantiate(), alias.definition->instantiate()))
             diagnostics_.error(item.location,
                 "spliced typedef '" + alias.name + "' has a different destination type");
     }
@@ -3625,8 +3674,10 @@ void Parser::parse_external_node_splice(
     if (diagnostics_.errors() != previous_errors ||
         !transfer_spliced_tags(*child, prior_records, item.location)) return;
     for (const auto& alias : child->declared_aliases_)
-        if (alias.scope_depth == 0)
-            type_aliases_.try_emplace(alias.name, copy_type(alias.type));
+        if (alias.scope_depth == 0) {
+            type_aliases_.try_emplace(alias.name, alias.definition);
+            transfer_alias_rebindings(*child, alias.definition);
+        }
     for (const auto& function : parsed.functions) remember_function(*function);
     for (const auto& object : parsed.objects)
         known_ordinary_values_.insert(object->name);
@@ -4854,6 +4905,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     const auto saved_types_depth = local_type_scopes_.size();
     const auto saved_enum_rebindings = enum_rebindings_;
     const auto saved_tag_rebindings = tag_rebindings_;
+    const auto saved_alias_rebindings = alias_rebindings_;
     const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
     const auto saved_recording = recording_public_tree_;
     const auto saved_generic_argument = parsing_generic_argument_;
@@ -4939,7 +4991,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
                     if (!prior_values.contains(key)) event.values.emplace(key, binding);
                 for (const auto& [key, type] : local_type_scopes_.back())
                     if (!prior_aliases.contains(key))
-                        event.aliases.emplace(key, copy_type(type));
+                        event.aliases.emplace(key, type);
                 for (const auto& [key, tag] : local_tag_scopes_.back()) {
                     const auto prior = prior_tags.find(key);
                     if (prior == prior_tags.end() || prior->second.complete != tag.complete ||
@@ -4990,6 +5042,7 @@ std::unique_ptr<Statement> Parser::parse_compound() {
     local_tag_scopes_.resize(saved_types_depth);
     enum_rebindings_ = saved_enum_rebindings;
     tag_rebindings_ = saved_tag_rebindings;
+    alias_rebindings_ = saved_alias_rebindings;
     scope_origins_.resize(saved_values_depth);
     public_uncertain_binding_depths_.resize(saved_uncertain_count);
     if (syntax_) syntax_->pop_scope();
@@ -5079,7 +5132,7 @@ std::unique_ptr<Statement> Parser::parse_statement() {
         const auto prior_values = child->local_scopes_.empty()
             ? NameMap<ValueBinding>{} : child->local_scopes_.back();
         const auto prior_aliases = child->local_type_scopes_.empty()
-            ? NameMap<TypePtr>{} : child->local_type_scopes_.back();
+            ? NameMap<AliasDefinitionPtr>{} : child->local_type_scopes_.back();
         const auto prior_records = child->tag_state();
         child->prepare_tag_destination(*this);
         const auto previous_errors = diagnostics_.errors();
@@ -5107,10 +5160,11 @@ std::unique_ptr<Statement> Parser::parse_statement() {
                         "spliced typedef '" + key.spelling + "' conflicts with a destination value");
                 else if (const auto found = local_type_scopes_.back().find(key);
                          found != local_type_scopes_.back().end()) {
-                    if (!same_type(found->second, type))
+                    if (!same_type(found->second->instantiate(), type->instantiate()))
                         diagnostics_.error(item.location,
                             "spliced typedef '" + key.spelling + "' has a different destination type");
-                } else local_type_scopes_.back().emplace(key, copy_type(type));
+                } else local_type_scopes_.back().emplace(key, type);
+                transfer_alias_rebindings(*child, type);
             }
         }
         if (diagnostics_.errors() != previous_errors) return invalid;
@@ -5316,6 +5370,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         statement->kind = Statement::Kind::For;
         const auto saved_enum_rebindings = enum_rebindings_;
         const auto saved_tag_rebindings = tag_rebindings_;
+        const auto saved_alias_rebindings = alias_rebindings_;
         const auto saved_uncertain_count = public_uncertain_binding_depths_.size();
         local_scopes_.emplace_back();
         local_type_scopes_.emplace_back();
@@ -5365,6 +5420,7 @@ std::unique_ptr<Statement> Parser::parse_unattributed_statement(
         local_tag_scopes_.pop_back();
         enum_rebindings_ = saved_enum_rebindings;
         tag_rebindings_ = saved_tag_rebindings;
+        alias_rebindings_ = saved_alias_rebindings;
         scope_origins_.pop_back();
         public_uncertain_binding_depths_.resize(saved_uncertain_count);
         return statement;

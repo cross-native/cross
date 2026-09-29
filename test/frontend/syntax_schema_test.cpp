@@ -16,7 +16,8 @@ struct SyntaxParseEnvironmentTestAccess {
         return environment.header_bindings;
     }
     static void alias(SyntaxParseEnvironment& environment, std::string name, TypePtr type) {
-        environment.aliases.emplace(std::move(name), std::move(type));
+        environment.aliases.emplace(std::move(name),
+            std::make_shared<const AliasDefinition>(type, 224));
     }
 };
 } // namespace cross
@@ -96,6 +97,41 @@ int main() {
     };
     using P = SyntaxProduction;
     using K = SyntaxPatternElement::Kind;
+
+    {
+        const auto node = parse("{ typedef u32 (*Alias)(in u16 *value); Alias object; }", K::Statement);
+        const auto projected = syntax_node_tokens(*node);
+        std::shared_ptr<const AliasBinding> declaration;
+        std::shared_ptr<const AliasBinding> use;
+        MetaToken use_token;
+        for (const auto& token : projected) {
+            if (token.text != "Alias") continue;
+            require(token.origin.alias_binding != nullptr, "parsed typedef token lost its binding");
+            if (token.origin.alias_binding->role == AliasBinding::Role::Declaration)
+                declaration = token.origin.alias_binding;
+            else { use = token.origin.alias_binding; use_token = token; }
+        }
+        require(declaration && use && declaration->definition == use->definition,
+                "typedef declaration and use did not share their opaque definition");
+        auto changed = use->definition->instantiate();
+        auto signature = changed->pointee->function;
+        signature->abi = "changed_by_consumer";
+        signature->result->builtin = BuiltinType::U8;
+        signature->parameters[0].type->pointee->builtin = BuiltinType::U64;
+        const auto original = use->definition->instantiate()->pointee->function;
+        require(original->abi.empty() && original->result->builtin == BuiltinType::U32 &&
+                original->parameters[0].type->pointee->builtin == BuiltinType::U16,
+                "typedef consumers mutated the retained callable type graph");
+        SyntaxNode leaf;
+        leaf.kind = SyntaxNode::Kind::Token;
+        leaf.tokens.push_back(use_token);
+        const auto retained_storage = syntax_node_storage(leaf);
+        leaf.tokens.front().origin.alias_binding.reset();
+        require(retained_storage - syntax_node_storage(leaf) == alias_binding_storage(use),
+                "public-tree storage did not account for a retained typedef type graph");
+        require(use->definition->storage() > 128,
+                "retained typedef graph storage omitted its callable and pointer children");
+    }
 
     {
         auto header = std::make_shared<SyntaxHeaderBindings>();

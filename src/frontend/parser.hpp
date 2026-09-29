@@ -135,7 +135,12 @@ private:
         SyntaxProduction production = SyntaxProduction::QualifiedName);
     std::string peek_qualified_name();
     std::string peek_qualified_name() const;
-    TypePtr resolve_type_alias(std::string_view name) const;
+    AliasDefinitionPtr bound_type_alias(std::string_view name) const;
+    AliasDefinitionPtr resolve_type_alias(std::string_view name) const;
+    AliasDefinitionPtr make_alias_definition(const TypePtr& type) const;
+    void remember_alias_binding(std::size_t token_index, std::string_view spelling,
+                                AliasDefinitionPtr definition, bool declaration);
+    void transfer_alias_rebindings(const Parser& child, const AliasDefinitionPtr& definition);
     TypePtr resolve_tag_type(std::string_view name, const Token& token) const;
     TypePtr rebind_tag_types(TypePtr type) const;
     void remember_tag_binding(std::size_t token_index, std::string_view spelling,
@@ -154,7 +159,8 @@ private:
                      std::unique_ptr<Expr>* dynamic_outer_bound = nullptr,
                      SourceLocation* name_location = nullptr,
                      std::vector<FunctionDecl::GenericParameter>*
-                         angle_parameters = nullptr);
+                         angle_parameters = nullptr,
+                     std::size_t* name_token_index = nullptr);
     std::vector<FunctionDecl::GenericParameter>
     parse_angle_generic_parameters();
     std::vector<FunctionDecl::GenericParameter>
@@ -181,7 +187,7 @@ private:
     void parse_typedef(const std::string& name_space,
                        std::vector<Attribute> attributes, TypePtr base_type,
                        SourceLocation location, bool consume_semicolon = true);
-    void register_typedef(SourceLocation location, std::string name, TypePtr type,
+    AliasDefinitionPtr register_typedef(SourceLocation location, std::string name, TypePtr type,
                           const std::vector<Attribute>& attributes);
     void parse_enum_declaration(Program& program, const std::string& name_space,
                                 std::vector<Attribute> attributes);
@@ -286,7 +292,7 @@ private:
     std::unordered_set<std::string> known_ordinary_values_;
     // Classifier spelling/mark -> exact local value declaration identity.
     std::vector<NameMap<ValueBinding>> local_scopes_;
-    std::vector<NameMap<TypePtr>> local_type_scopes_;
+    std::vector<NameMap<AliasDefinitionPtr>> local_type_scopes_;
     struct LocalTag {
         TypePtr type;
         bool complete{};
@@ -302,6 +308,8 @@ private:
     NameMap<ValueBinding> enum_rebindings_;
     std::unordered_map<NominalTypeKey, std::shared_ptr<const TagBinding>, NominalTypeKeyHash>
         tag_rebindings_;
+    // Transparent typedef identity is parser provenance, not nominal type identity.
+    std::unordered_map<AliasDefinitionPtr, AliasDefinitionPtr> alias_rebindings_;
     // Original opening-token identities distinguish a captured lexical block
     // from a different destination block with the same local names.
     std::vector<TokenIdentity> scope_origins_;
@@ -309,7 +317,7 @@ private:
         TokenIdentity block;
         SourceLocation statement;
         NameMap<ValueBinding> values;
-        NameMap<TypePtr> aliases;
+        NameMap<AliasDefinitionPtr> aliases;
         NameMap<LocalTag> tags;
     };
     // Shared by replacement parsers; speculative recognition does not publish.
@@ -335,10 +343,10 @@ private:
     bool transfer_spliced_tags(Parser& child,
         const TagState& before,
         SourceLocation location);
-    std::unordered_map<std::string, TypePtr> type_aliases_;
+    std::unordered_map<std::string, AliasDefinitionPtr> type_aliases_;
     struct DeclaredAlias {
         std::string name;
-        TypePtr type;
+        AliasDefinitionPtr definition;
         std::size_t scope_depth{};
     };
     std::vector<DeclaredAlias> declared_aliases_;
@@ -387,12 +395,12 @@ private:
     std::unordered_map<std::string, Parser::GenericSignature> generic_functions;
     std::unordered_set<std::string> ordinary_values;
     std::vector<NameMap<ValueBinding>> values;
-    std::vector<NameMap<TypePtr>> local_aliases;
+    std::vector<NameMap<AliasDefinitionPtr>> local_aliases;
     std::vector<NameMap<Parser::LocalTag>> local_tags;
     std::shared_ptr<std::uint64_t> nominal_occurrence;
     std::vector<TokenIdentity> scope_origins;
     std::size_t scope_event_base{};
-    std::unordered_map<std::string, TypePtr> aliases;
+    std::unordered_map<std::string, AliasDefinitionPtr> aliases;
     std::unordered_map<std::string, BuiltinType> enumerations;
     std::unordered_map<std::string, Parser::RecordTag> records;
     std::vector<ParameterDecl> parameters;

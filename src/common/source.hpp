@@ -18,6 +18,7 @@ struct SyntaxParseEnvironment;
 struct SyntaxNode;
 struct NominalTypeIdentity;
 struct TagBinding;
+struct AliasBinding;
 
 struct SourceLocation {
     const SourceFile* file{};
@@ -120,6 +121,7 @@ struct TokenOrigin {
     std::shared_ptr<const FreshIdentifier> fresh;
     // Opaque frontend tag-name provenance, retained by token projection.
     std::shared_ptr<const TagBinding> tag_binding;
+    std::shared_ptr<const AliasBinding> alias_binding;
 
     TokenOrigin() = default;
     TokenOrigin(SourceLocation span, TokenIdentity identity,
@@ -127,11 +129,12 @@ struct TokenOrigin {
                 std::shared_ptr<const EmbedIdentity> embed, unsigned embed_piece,
                 ValueBinding value_binding,
                 std::shared_ptr<const FreshIdentifier> fresh = {},
-                std::shared_ptr<const TagBinding> tag_binding = {})
+                std::shared_ptr<const TagBinding> tag_binding = {},
+                std::shared_ptr<const AliasBinding> alias_binding = {})
         : span(span), identity(identity), context(std::move(context)),
           embed(std::move(embed)), embed_piece(embed_piece),
           value_binding(value_binding), fresh(std::move(fresh)),
-          tag_binding(std::move(tag_binding)) {}
+          tag_binding(std::move(tag_binding)), alias_binding(std::move(alias_binding)) {}
 };
 
 struct SourceTokenOrigin {

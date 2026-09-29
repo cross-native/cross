@@ -3,6 +3,7 @@
 #include "frontend/parser.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
 
 namespace cross {
@@ -48,7 +49,7 @@ void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_
             for (const auto& fragment : expression->quote_fragments)
                 for (const auto& token : fragment) {
                     add(meta_token_storage_bytes); name(token.text);
-                    add(tag_binding_storage(token.origin.tag_binding));
+                    add(origin_binding_storage(token.origin));
                     if (token.splice) add(syntax_node_storage(*token.splice, maximum));
                 }
             continue;
@@ -80,6 +81,30 @@ void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_
 }
 
 } // namespace
+
+AliasDefinitionPtr Parser::make_alias_definition(const TypePtr& type) const {
+    const auto execution = syntax_ ? syntax_->execution() : nullptr;
+    const auto maximum = execution ? std::min(execution->limits().bytes, execution->limits().memory)
+                                   : std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t storage = 32;
+    std::uint64_t work = 1;
+    bool over_budget = storage > maximum;
+    const auto add = [&](std::uint64_t bytes) {
+        ++work;
+        if (bytes > maximum - std::min(storage, maximum)) over_budget = true;
+        else storage += bytes;
+    };
+    const auto name = [&](std::string_view text) { add(32); add(text.size()); };
+    type_storage(type, add, name, over_budget, maximum);
+    if (over_budget || (execution && !execution->work(current().location, work))) {
+        if (over_budget) {
+            if (execution) execution->tree_limit_error(current().location);
+            else diagnostics_.error(current().location, "typedef binding storage exceeds the supported size");
+        }
+        return {};
+    }
+    return std::make_shared<const AliasDefinition>(type, storage);
+}
 
 void SyntaxHeaderBindings::finish(std::vector<GenericParameter> values,
     SyntaxExecution& execution, SourceLocation location) {
@@ -153,13 +178,13 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     add(scope_origins_.size() * 40);
     for (const auto& scope : local_type_scopes_) {
         add(32);
-        for (const auto& [entry, value] : scope) { name(entry.spelling); type(value); }
+        for (const auto& [entry, value] : scope) { name(entry.spelling); add(value->storage()); }
     }
     for (const auto& scope : local_tag_scopes_) {
         add(32);
         for (const auto& [entry, tag] : scope) { name(entry.spelling); type(tag.type); add(8); }
     }
-    for (const auto& [entry, value] : type_aliases_) { name(entry); type(value); }
+    for (const auto& [entry, value] : type_aliases_) { name(entry); add(value->storage()); }
     for (const auto& [entry, value] : enum_types_) { (void)value; name(entry); add(16); }
     for (const auto& [entry, value] : record_types_) { (void)value; name(entry); add(16); }
     if (syntax_) {
@@ -209,10 +234,7 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     result->scope_origins = scope_origins_;
     result->scope_event_base = scope_events_->size();
     result->header_bindings = header_bindings_;
-    for (auto& scope : result->local_aliases)
-        for (auto& [entry, value] : scope) { (void)entry; value = copy_type(value); }
-    for (const auto& [entry, value] : type_aliases_)
-        result->aliases.emplace(entry, copy_type(value));
+    result->aliases = type_aliases_;
     result->enumerations = enum_types_;
     result->records = record_types_;
     result->function_context = active_function_ != nullptr;
@@ -269,11 +291,7 @@ void Parser::restore_environment(const SyntaxParseEnvironment& environment,
     for (auto& scope : local_tag_scopes_)
         for (auto& [entry, tag] : scope) { (void)entry; tag.type = copy_type(tag.type); }
     scope_origins_ = environment.scope_origins;
-    for (auto& scope : local_type_scopes_)
-        for (auto& [entry, value] : scope) { (void)entry; value = copy_type(value); }
-    type_aliases_.clear();
-    for (const auto& [entry, value] : environment.aliases)
-        type_aliases_.emplace(entry, copy_type(value));
+    type_aliases_ = environment.aliases;
     enum_types_ = environment.enumerations;
     record_types_ = environment.records;
     public_uncertain_binding_depths_ = environment.uncertain_depths;
@@ -323,7 +341,7 @@ void Parser::restore_deferred_environment(const SyntaxParseEnvironment& environm
             for (const auto& [key, binding] : event.values)
                 local_scopes_[captured].emplace(key, binding);
             for (const auto& [key, type] : event.aliases)
-                local_type_scopes_[captured].try_emplace(key, copy_type(type));
+                local_type_scopes_[captured].try_emplace(key, type);
             for (const auto& [key, tag] : event.tags)
                 local_tag_scopes_[captured][key] = Parser::LocalTag{copy_type(tag.type), tag.complete};
         }
