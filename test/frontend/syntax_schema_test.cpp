@@ -278,6 +278,49 @@ int main() {
                 "a bare attribute bypassed its declaration-specifier wrapper");
     }
 
+    for (const auto operand : {"u32", "struct Tag *", "value", "(value + other)"}) {
+        const auto tree = parse(std::string("$::alignof(") + operand + ")", K::Expr);
+        const auto primary = production(descendant(tree, P::PrimaryExpression), P::PrimaryExpression, 4);
+        token(primary->children[0], "$::alignof");
+        token(primary->children[1], "(");
+        token(primary->children[3], ")");
+        const auto type_operand = std::string_view(operand) == "u32" ||
+                                  std::string_view(operand) == "struct Tag *";
+        require(primary->children[2]->production == (type_operand ? P::TypeName : P::Expression),
+                "alignof operand lost its type/expression shape");
+        std::string error;
+        require(!syntax_replace_child(*primary, 2, primary->children[0], error),
+                "alignof accepted an unstructured operand token");
+    }
+
+    for (const auto tag : {"struct", "union"}) {
+        const auto attributed = std::string(tag) + " Attributed [[packed]] [[aligned(8)]] { u32 value; }";
+        for (const auto kind : {K::Type, K::Declaration, K::Statement, K::FunctionHeader,
+                                K::FunctionDefinition}) {
+            const auto source = kind == K::Type ? attributed :
+                kind == K::Declaration || kind == K::Statement ? attributed + " object;" :
+                "static " + attributed + " function() { return 7u32; }";
+            const auto tree = parse(source, kind);
+            const auto record = production(descendant(tree, P::StructOrUnionSpecifier),
+                                           P::StructOrUnionSpecifier, 7);
+            token(record->children[0], tag);
+            child(record, 1, P::QualifiedName, 1);
+            const auto packed = child(record, 2, P::AttributeSpecifier, 3);
+            const auto aligned = child(record, 3, P::AttributeSpecifier, 3);
+            token(record->children[4], "{");
+            child(record, 5, P::MemberDeclaration, 3);
+            token(record->children[6], "}");
+            std::string error;
+            const auto replaced = syntax_replace_child(*record, 2, aligned, error);
+            require(replaced != nullptr, "record attribute replacement was rejected");
+            require(replaced->children[1] == record->children[1] &&
+                    replaced->children[5] == record->children[5],
+                    "record attribute replacement changed untouched children");
+            require(!syntax_replace_child(*record, 4, packed, error),
+                    "record attribute replaced a required opening brace");
+        }
+    }
+
     type = production(parse("u32 (* const)(in u16 p \"abi.input\", out u32 *, ...) "
                             "-> \"memory.result\" [[abi(\"custom\")]]", K::Type), P::TypeName, 2);
     abstract = child(type, 1, P::AbstractDeclarator, 4);

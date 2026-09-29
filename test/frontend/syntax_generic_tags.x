@@ -36,32 +36,40 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
 [[noinline]] static T generic_copy<T, u32 N>(in T amount) {
     syntax LocalTagSplice::Copy, LocalTagSplice::Type, LocalTagSplice::Twice,
            LocalTagSplice::TextTwice, Expression;
-    tag_copy struct Local { T value; u8 padding[N]; };
+    tag_copy struct Local [[aligned(8)]] { T value; u8 padding[N]; };
     enum LocalLayout [[underlying(uptr)]] { LocalBytes = sizeof(struct Local) };
-    if ((uptr)LocalBytes < sizeof(T) + (uptr)N) return (T)0u32;
+    if ((uptr)LocalBytes < sizeof(T) + (uptr)N || $::alignof(struct Local) != 8uptr) return (T)0u32;
     struct Local first = {amount};
     tag_type second, struct TypeTag { T value; T grid[N]; };
     second.value = first.value;
+    tag_copy union Union [[packed, aligned(8)]] { T value; u8 byte; };
+    union Union variant;
+    variant.value = amount;
+    if (sizeof(variant) != 8uptr || variant.value != amount) return (T)0u32;
+    u32 side_effect = 0u32;
+    uptr expression_alignment = tag_expression($::alignof(++side_effect));
+    if (side_effect != 0u32 || expression_alignment != $::alignof(u32)) return (T)0u32;
     uptr expression_size = tag_expression(sizeof(struct ExpressionTag { T value; }));
     struct ExpressionTag expression_object = {amount};
     if (expression_size != sizeof(T) || expression_object.value != amount) return (T)0u32;
     tag_twice {
-        struct Repeated { T value; struct Repeated *next; u8 padding[N]; } repeated;
+        struct Repeated [[aligned(8)]] { T value; struct Repeated *next; u8 padding[N]; } repeated;
         repeated.value = second.value;
         repeated.next = &repeated;
         if (!LocalTagGeneric::same(&repeated, repeated.next) || repeated.next->value != amount) return (T)0u32;
         enum RepeatedEnum [[underlying(u32)]] { A = N, B = A + (u32)sizeof(T) } item = B;
         if (LocalTagSplice::enum_pair(item, B) != 2u32 * (N + (u32)sizeof(T))) return (T)0u32;
         enum RepeatedLayout [[underlying(uptr)]] { Bytes = sizeof(struct Repeated) };
-        if ((uptr)Bytes < sizeof(T) + sizeof(uptr) + (uptr)N) return (T)0u32;
+        if ((uptr)Bytes < sizeof(T) + sizeof(uptr) + (uptr)N ||
+            $::alignof(struct Repeated) != 8uptr) return (T)0u32;
     }
     tag_text_twice {
-        struct Text { T value; u8 padding[N]; } text = {amount};
+        struct Text [[aligned(8)]] { T value; u8 padding[N]; } text = {amount};
         if (text.value != amount) return (T)0u32;
         enum TextEnum [[underlying(u32)]] { TextA = N } item = TextA;
         if (LocalTagSplice::enum_pair(item, TextA) != 2u32 * N) return (T)0u32;
         enum TextLayout [[underlying(uptr)]] { TextBytes = sizeof(struct Text) };
-        if ((uptr)TextBytes < sizeof(T) + (uptr)N) return (T)0u32;
+        if ((uptr)TextBytes < sizeof(T) + (uptr)N || $::alignof(struct Text) != 8uptr) return (T)0u32;
     }
     return second.value;
 }

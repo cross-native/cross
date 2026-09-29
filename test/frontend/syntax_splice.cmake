@@ -93,6 +93,37 @@ accept_splice(early_record_layout [=[
     $::static_assert((uptr)Bytes == 8uptr && (uptr)Next == 9uptr, "early layout chain");
     $::static_assert($::alignof(struct Matrix) == 8uptr, "member layout dependency");
 ]=])
+accept_splice(record_attribute_capture [=[
+    [[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+        return $::quote { $::unquote($::syntax::node(input, "body")) };
+    }
+    syntax Copy : item { prefix "copy"; match body:declaration; expand copy; }
+    syntax Copy;
+    copy struct Record [[packed, aligned(8)]] { u8 first; u32 second; };
+    $::static_assert(sizeof(struct Record) == 8uptr, "attributed captured record");
+]=])
+accept_splice(discard_record_attribute [=[
+    [[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) {
+        return $::quote { ; };
+    }
+    syntax Drop : statement { prefix "drop"; match body:stmt; expand drop; }
+    global u32 entry() {
+        syntax Drop;
+        drop struct Invalid [[aligned(3)]] { u32 value; };
+        return 7u32;
+    }
+]=])
+reject_splice(surviving_record_attribute "positive power-of-two integer constant" [=[
+    [[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
+        return $::quote { $::unquote($::syntax::node(input, "body")) };
+    }
+    syntax Copy : statement { prefix "copy"; match body:stmt; expand copy; }
+    global u32 entry() {
+        syntax Copy;
+        copy struct Invalid [[aligned(3)]] { u32 value; };
+        return 7u32;
+    }
+]=] "note")
 reject_splice(early_layout_cycle "required constant expression|cyclic|cycle" [=[
     struct Local { u8 data[sizeof(struct Local)]; };
     enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };

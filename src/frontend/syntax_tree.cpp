@@ -392,7 +392,7 @@ const auto& public_tree_rules() {
         set(P::ScalarType, terminals({"void", "bool", "i8", "i16", "i32", "i64", "i128", "iptr",
             "u8", "u16", "u32", "u64", "u128", "uptr", "f32", "f64", "f80", "f128", "fptr", "label"}));
         set(P::StructOrUnionSpecifier, sequence({terminals({"struct", "union"}),
-            optional(reference(P::QualifiedName)), optional(sequence({terminal("{"),
+            optional(reference(P::QualifiedName)), attrs, optional(sequence({terminal("{"),
                 repeated(reference(P::MemberDeclaration)), terminal("}")}))}));
         set(P::EnumSpecifier, sequence({terminal("enum"), optional(reference(P::QualifiedName)), attrs,
             optional(sequence({terminal("{"), reference(P::Enumerator),
@@ -515,6 +515,8 @@ const auto& public_tree_rules() {
             sequence({terminals({".", "->"}), id}), terminals({"++", "--"}), reference(P::GenericArguments)}))}));
         set(P::PrimaryExpression, choice({reference(P::QualifiedName), reference(P::BuiltinName), reference(P::Literal),
             sequence({terminal("("), reference(P::Expression), terminal(")")}),
+            sequence({terminal("$::alignof"), terminal("("),
+                choice({reference(P::TypeName), reference(P::Expression)}), terminal(")")}),
             reference(P::EmbedExpression), reference(P::QuoteExpression), opaque(P::PrimaryExpression)}));
         set(P::ArgumentList, optional(sequence({reference(P::AssignmentExpression),
             repeated(sequence({terminal(","), reference(P::AssignmentExpression)}))})));
