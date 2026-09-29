@@ -92,6 +92,7 @@ bool syntax_expression_node(const SyntaxNode& node);
 bool syntax_statement_node(const SyntaxNode& node);
 bool syntax_compound_node(const SyntaxNode& node);
 bool syntax_declaration_node(const SyntaxNode& node);
+bool syntax_function_header_node(const SyntaxNode& node);
 bool syntax_function_definition_node(const SyntaxNode& node);
 bool syntax_type_node(const SyntaxNode& node);
 std::optional<SyntaxEntityId> syntax_resolve_entity(

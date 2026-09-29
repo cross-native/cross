@@ -110,6 +110,14 @@ bool syntax_function_definition_node(const SyntaxNode& node) {
          node.deferred_category == SyntaxParseCategory::FunctionDefinition);
 }
 
+bool syntax_function_header_node(const SyntaxNode& node) {
+    return (node.kind == SyntaxNode::Kind::Core &&
+            node.production == SyntaxProduction::FunctionHeader) ||
+        (node.kind == SyntaxNode::Kind::Deferred &&
+         node.slot_production == SyntaxProduction::FunctionHeader &&
+         node.deferred_category == SyntaxParseCategory::FunctionHeader);
+}
+
 bool syntax_type_node(const SyntaxNode& node) {
     const auto core_type = node.production == SyntaxProduction::TypeName ||
         node.production == SyntaxProduction::TypeSpecifier ||
@@ -191,7 +199,8 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node) {
         auto [next, owner] = std::move(pending.back());
         pending.pop_back();
         std::shared_ptr<const SyntaxNode> fragment;
-        if (next != &node && next->kind == SyntaxNode::Kind::Deferred)
+        if (next != &node && (next->kind == SyntaxNode::Kind::Deferred ||
+                             syntax_function_header_node(*next)))
             fragment = std::move(owner);
         if (next->kind == SyntaxNode::Kind::Core && next->structured_splice &&
             next->children.size() == 1 && next->children.front() &&
@@ -360,12 +369,15 @@ const auto& public_tree_rules() {
             if (semicolon) rule.rules.push_back(terminal(";"));
             return rule;
         };
-        set(P::Declaration, declaration(true));
+        set(P::Declaration, choice({declaration(true),
+            sequence({reference(P::FunctionHeader), terminal(";")})}));
         set(P::DeclarationWithoutFinalSemicolon, declaration(false));
         set(P::FunctionHeader, sequence({attrs, reference(P::DeclarationSpecifiers),
             reference(P::Declarator), attrs}));
-        set(P::FunctionDefinition, sequence({attrs, reference(P::DeclarationSpecifiers),
-            reference(P::Declarator), attrs, reference(P::CompoundStatement)}));
+        set(P::FunctionDefinition, choice({
+            sequence({attrs, reference(P::DeclarationSpecifiers),
+                reference(P::Declarator), attrs, reference(P::CompoundStatement)}),
+            sequence({reference(P::FunctionHeader), reference(P::CompoundStatement)})}));
         set(P::TypeName, sequence({reference(P::DeclarationSpecifiers),
             optional(reference(P::AbstractDeclarator))}));
         set(P::DeclarationSpecifiers, sequence({reference(P::DeclarationSpecifier),

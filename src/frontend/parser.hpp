@@ -117,6 +117,8 @@ private:
     void parse_external(Program& program, const std::string& name_space);
     void parse_external_node_splice(Program& program,
                                     const std::string& name_space);
+    void parse_function_header_splice(Program& program, const std::string& name_space,
+                                      std::size_t production_event);
     void parse_typedef(const std::string& name_space,
                        std::vector<Attribute> attributes, TypePtr base_type,
                        SourceLocation location, bool consume_semicolon = true);

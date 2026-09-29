@@ -644,9 +644,17 @@ std::optional<SyntaxParsedFragment> Parser::parse_syntax_fragment(
     }();
     std::shared_ptr<const SyntaxNode> deferred_root;
     try {
-        if ((kind == K::Declaration || kind == K::FunctionDeclaration ||
+        const bool header_splice = child->current().kind == TokenKind::StructuredSplice &&
+            child->current().splice && syntax_function_header_node(*child->current().splice);
+        if (kind == K::FunctionHeader && header_splice) {
+            ProductionScope header(*child, SyntaxProduction::FunctionHeader);
+            const auto item = child->current();
+            ++child->index_;
+            if (header.event < child->production_events_.size())
+                child->production_events_[header.event].opaque = item.splice;
+        } else if ((kind == K::Declaration || kind == K::FunctionDeclaration ||
              kind == K::FunctionDefinition) &&
-            child->current().kind == TokenKind::StructuredSplice) {
+            child->current().kind == TokenKind::StructuredSplice && !header_splice) {
             ProductionScope declaration(*child, kind == K::FunctionDefinition
                 ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration);
             const auto item = child->current();
@@ -2929,6 +2937,121 @@ void Parser::parse_external_node_splice(
         static_assertions_.push_back(std::move(assertion));
 }
 
+void Parser::parse_function_header_splice(
+    Program& program, const std::string& name_space, std::size_t production_event) {
+    const auto first = index_;
+    const auto item = current();
+    {
+        ProductionScope header(*this, SyntaxProduction::FunctionHeader);
+        ++index_;
+        if (header.event < production_events_.size())
+            production_events_[header.event].opaque = item.splice;
+    }
+    const bool body = current().is("{") ||
+        (current().kind == TokenKind::StructuredSplice && current().splice &&
+         syntax_compound_node(*current().splice));
+    if (!body && !current().is(";")) {
+        error_here("structured function header requires a body or ';'");
+        return;
+    }
+    const auto discard_tail = [&] {
+        // A failed header still owns this already delimited tail. Do not
+        // misdiagnose its body as a sequence of unrelated external items.
+        if (body && current().is("{")) {
+            if (const auto end = bounded_group_end(index_)) index_ = *end;
+        } else ++index_;
+    };
+    if (!syntax_ || !item.splice->context || !item.splice->context->parse_environment) {
+        diagnostics_.error(item.location,
+            "structured function header has no retained parse environment");
+        discard_tail();
+        return;
+    }
+    if (body && production_event < production_events_.size())
+        production_events_[production_event].production = SyntaxProduction::FunctionDefinition;
+    if (parsing_public_fragment_ && item.splice->kind == SyntaxNode::Kind::Deferred) {
+        // The header has a proven category, but unknown parameter/type names.
+        // Keep the whole composed unit deferred, including the header marker;
+        // no speculative signature is allowed to classify its body.
+        auto end = body && current().is("{") ? bounded_group_end(index_)
+                                              : std::optional{index_ + 1};
+        if (!end) {
+            error_here("structured function header requires a balanced body");
+            return;
+        }
+        const auto slot = body ? SyntaxProduction::FunctionDefinition
+                               : SyntaxProduction::Declaration;
+        const auto category = body ? SyntaxParseCategory::FunctionDefinition
+                                   : SyntaxParseCategory::FunctionDeclaration;
+        if (production_event < production_events_.size())
+            production_events_[production_event].opaque = deferred_node(
+                first, *end, slot, category,
+                production_events_[production_event].context);
+        index_ = *end;
+        auto function = std::make_unique<FunctionDecl>();
+        if (body) {
+            function->body = std::make_unique<Statement>();
+            function->body->kind = Statement::Kind::Compound;
+        }
+        program.functions.push_back(std::move(function));
+        return;
+    }
+    const auto previous_errors = diagnostics_.errors();
+    auto output = syntax_->execution()->materialize_node(
+        *item.splice, item.location, SyntaxParseCategory::FunctionHeader);
+    if (!output) { discard_tail(); return; }
+    auto child = replacement_parser(std::move(*output));
+    if (item.splice->kind == SyntaxNode::Kind::Deferred)
+        child->restore_deferred_environment(*item.splice->context->parse_environment,
+                                           *item.splice->context, item.splice->span.first);
+    else child->restore_environment(*item.splice->context->parse_environment,
+                                     *item.splice->context);
+    const auto prior_records = child->record_types_;
+    child->parsing_public_fragment_ = parsing_public_fragment_;
+    child->parsing_public_function_header_ = true;
+    Program parsed;
+    child->parse_external(parsed, name_space);
+    if (child->current().kind != TokenKind::End || parsed.functions.size() != 1 ||
+        parsed.functions.front()->body || !parsed.objects.empty() ||
+        !parsed.records.empty() || !parsed.enumerations.empty() ||
+        !parsed.global_labels.empty()) {
+        diagnostics_.error(item.location,
+            "structured function header must contain one complete direct-function header");
+        discard_tail();
+        return;
+    }
+    if (diagnostics_.errors() != previous_errors ||
+        !transfer_spliced_tags(*child, prior_records, item.location)) {
+        discard_tail();
+        return;
+    }
+    auto function = std::move(parsed.functions.front());
+    if (function->generic_parameters.empty()) known_ordinary_values_.insert(function->name);
+    else known_generic_functions_.insert(function->name);
+    if (body) {
+        struct Restore {
+            Parser& parser;
+            FunctionDecl* function;
+            std::string name_space;
+            std::vector<std::string> generic_types;
+            ~Restore() {
+                parser.active_function_ = function;
+                parser.active_namespace_ = std::move(name_space);
+                parser.active_generic_types_ = std::move(generic_types);
+            }
+        } restore{*this, active_function_, active_namespace_, active_generic_types_};
+        active_function_ = function.get();
+        active_namespace_ = name_space;
+        active_generic_types_.clear();
+        for (const auto& parameter : function->generic_parameters)
+            if (!parameter.value_type) active_generic_types_.push_back(parameter.name);
+        function->body = parse_compound();
+    } else expect(";", "after structured function header");
+    program.functions.push_back(std::move(function));
+    for (auto& assertion : child->static_assertions_)
+        static_assertions_.push_back(std::move(assertion));
+}
+
 void Parser::parse_external(Program& program, const std::string& name_space) {
     drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_
@@ -2943,7 +3066,9 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
         return;
     }
     if (current().kind == TokenKind::StructuredSplice) {
-        if (parsing_public_fragment_) {
+        if (current().splice && syntax_function_header_node(*current().splice))
+            parse_function_header_splice(program, name_space, production.event);
+        else if (parsing_public_fragment_) {
             const auto item = current();
             ++index_;
             if (!item.splice || (!syntax_declaration_node(*item.splice) &&

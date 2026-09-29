@@ -38,6 +38,135 @@ set(declaration_expander [=[
     return $::quote { $::unquote($::syntax::node(input, "body")) };
 }
 ]=])
+set(header_expander [=[
+[[syntax_expander]] static $::meta::tokens compose_header(in $::meta::syntax_match input) {
+    return $::quote {
+        $::unquote($::syntax::node(input, "header"))
+        $::unquote($::syntax::capture(input, "body"))
+    };
+}
+syntax ComposeHeader : item {
+    prefix "compose_header"; match header:function_header body:block; expand compose_header;
+}
+syntax ComposeHeader;
+]=])
+accept_splice(function_header_body "${header_expander}
+compose_header static u32 composed(in u32 value) { return value + 1u32; }
+global u32 entry() { return composed(4u32); }")
+accept_splice(function_header_generic_body "${header_expander}
+compose_header static T composed<T>(in T value) { T copy = value; return copy; }
+global u32 entry() { return composed(4u32); }")
+accept_splice(function_header_prototype [=[
+[[syntax_expander]] static $::meta::tokens declare(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "header")); };
+}
+syntax Declare : item { prefix "declare"; match header:function_header ";"; expand declare; }
+syntax Declare;
+declare global u32 composed(in u32 value);
+global u32 composed(in u32 value) { return value; }
+]=])
+set(header_reparse_expander [=[
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    $::meta::syntax header = $::syntax::node(input, "header");
+    header = $::meta::parse("function_header", $::quote { $::unquote(header) },
+        $::syntax::context(input));
+    $::meta::syntax definition = $::meta::parse("function_def", $::quote {
+        $::unquote(header) $::unquote($::syntax::capture(input, "body"))
+    }, $::syntax::context(input));
+    if ($::meta::is_kind(header, "deferred")) {
+        if (!$::meta::is_kind(definition, "deferred"))
+            $::syntax::error($::syntax::span(input), "composed function must defer");
+    } else if (!$::meta::is_production(definition, "function_definition") ||
+               $::meta::child_count(definition) != 2uptr ||
+               !$::meta::is_production($::meta::child(definition, 0uptr), "function_header")) {
+        $::syntax::error($::syntax::span(input), "composed function lost its header root");
+    }
+    return $::quote { $::unquote(definition) };
+}
+syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
+syntax Compose;
+]=])
+accept_splice(function_header_reparse "${header_reparse_expander}
+compose static T composed<T>(in T value) { T copy = value; return copy; }
+global u32 entry() { return composed(4u32); }")
+accept_splice(function_header_deferred_reparse "${header_reparse_expander}
+[[macro]] static $::meta::tokens parameter(in $::meta::tokens name) {
+    return $::quote { in u32 $::unquote(name) };
+}
+compose static u32 composed(parameter!(value)) { return value + 1u32; }
+global u32 entry() { return composed(4u32); }")
+accept_splice(function_header_discard_deferred [=[
+[[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+    $::meta::syntax definition = $::meta::parse("function_def", $::quote {
+        $::unquote($::syntax::node(input, "header"))
+        $::unquote($::syntax::capture(input, "body"))
+    }, $::syntax::context(input));
+    if (!$::meta::is_kind(definition, "deferred"))
+        $::syntax::error($::syntax::span(input), "composed function must defer");
+    return $::quote {};
+}
+syntax Discard : item { prefix "discard"; match header:function_header body:block; expand discard; }
+syntax Discard;
+discard static u32 unused(undefined_parameter!()) { NotYetTyped value; return value; }
+global u32 entry() { return 1u32; }
+]=])
+accept_splice(function_header_prototype_reparse [=[
+[[syntax_expander]] static $::meta::tokens declare(in $::meta::syntax_match input) {
+    $::meta::syntax node = $::meta::parse("function_decl", $::quote {
+        $::unquote($::syntax::node(input, "header"));
+    }, $::syntax::context(input));
+    if (!$::meta::is_production(node, "declaration") ||
+        !$::meta::is_production($::meta::child(node, 0uptr), "function_header"))
+        $::syntax::error($::syntax::span(input), "prototype lost its header root");
+    return $::quote { $::unquote(node) };
+}
+syntax Declare : item { prefix "declare"; match header:function_header ";"; expand declare; }
+syntax Declare;
+declare global u32 composed(in u32 value);
+global u32 composed(in u32 value) { return value; }
+]=])
+accept_splice(function_header_namespace_hygiene [=[
+[[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
+    return $::quote {
+        namespace Destination {
+            typedef u8 Result;
+            $::unquote($::syntax::node(input, "header"))
+            $::unquote($::syntax::capture(input, "body"))
+        }
+    };
+}
+syntax Move : item { prefix "move"; match header:function_header body:block; expand move; }
+namespace Source {
+    typedef u16 Result;
+    syntax Move;
+    move global Result composed(in Result value) { return value; }
+}
+global u32 entry() {
+    $::static_assert(sizeof(Source::Destination::composed(4u16)) == sizeof(u16),
+        "header lookup must remain in its captured context");
+    return Source::Destination::composed(4u16);
+}
+]=])
+reject_splice(function_header_missing_tail "structured function header requires a body or ';'" [=[
+[[syntax_expander]] static $::meta::tokens incomplete(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "header")) };
+}
+syntax Incomplete : item { prefix "incomplete"; match header:function_header ";"; expand incomplete; }
+syntax Incomplete;
+incomplete static u32 composed();
+]=])
+reject_splice(function_header_cannot_escape
+    "structured function header must contain one complete direct-function header" [=[
+[[macro]] static $::meta::tokens escape(in $::meta::tokens ignored) {
+    return $::quote { in u32 value; u32 injected };
+}
+[[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+    return $::quote { $::unquote($::syntax::node(input, "header")) { return 1u32; } };
+}
+syntax Compose : item { prefix "compose"; match header:function_header ";"; expand compose; }
+syntax Compose;
+compose static u32 function(escape!());
+]=])
 accept_splice(declaration_block "${declaration_expander}
 syntax Copy : statement { prefix \"copy\"; match body:declaration; expand copy_decl; }
 global u32 entry() { syntax Copy; copy u32 copied = 5u32; return copied; }")

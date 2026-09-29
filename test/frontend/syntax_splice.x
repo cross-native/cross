@@ -182,7 +182,7 @@ namespace Source {
     if (!$::meta::is_kind(header, "deferred"))
         $::syntax::error($::syntax::span(input), "function header was parsed too early");
     return $::quote {
-        $::unquote($::meta::tokens(header))
+        $::unquote(header)
         $::unquote($::syntax::capture(input, "body"))
     };
 }
@@ -194,6 +194,39 @@ syntax CopyParameterHeader : item {
 syntax CopyParameterHeader;
 copy_parameter_header [[noinline]] static u32 header_function(parameter_fragment!(value)) {
     return value + 4u32;
+}
+#ifdef CUSTOM_SYNTAX_ABI
+global volatile u32 header_runtime_seed = 5u32;
+copy_parameter_header [[abi("stack_result_abi"), noinline]]
+static u32 stack_header_function(parameter_fragment!(value)) { return value + 9u32; }
+struct HeaderMemoryResult { u64 low; u64 high; };
+copy_parameter_header [[abi("memory_result_abi"), noinline]]
+static struct HeaderMemoryResult memory_header_function(parameter_fragment!(value)) {
+    struct HeaderMemoryResult result = { (u64)value + 10u64, (u64)value + 11u64 };
+    return result;
+}
+#endif
+[[syntax_expander]] static $::meta::tokens compose_plain_header(
+    in $::meta::syntax_match input) {
+    $::meta::syntax definition = $::meta::parse("function_def", $::quote {
+        $::unquote($::syntax::node(input, "header"))
+        $::unquote($::syntax::capture(input, "body"))
+    }, $::syntax::context(input));
+    return $::quote { $::unquote(definition) };
+}
+syntax ComposePlainHeader : item {
+    prefix "compose_plain_header";
+    match header:function_header body:block;
+    expand compose_plain_header;
+}
+syntax ComposePlainHeader;
+compose_plain_header [[noinline]] static T generic_header<T>(in T value) {
+    T copy = value;
+    return copy;
+}
+compose_plain_header [[noinline]] static u32 recursive_header(in u32 value) {
+    if (value <= 1u32) return 1u32;
+    return value * recursive_header(value - 1u32);
 }
 [[syntax_expander]] static $::meta::tokens copy_parameter_prototype(
     in $::meta::syntax_match input) {
@@ -240,6 +273,12 @@ copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 v
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
+#ifdef CUSTOM_SYNTAX_ABI
+    u32 seed = header_runtime_seed;
+    struct HeaderMemoryResult memory = memory_header_function(seed);
+    if (stack_header_function(seed) != 14u32 || memory.low != 15u64 || memory.high != 16u64)
+        return 0u32;
+#endif
     syntax Multiply;
     syntax ParseThenSplice;
     syntax ProjectThenSplice;
@@ -306,6 +345,7 @@ global u32 syntax_raw_entry() {
         copied_function(5u32) != 11u32 ||
         deferred_copied_function(5u32) != 12u32 ||
         deferred_body_function(5u32) != 13u32 ||
+        generic_header(5uptr) != 5uptr || recursive_header(5u32) != 120u32 ||
         sizeof(Source::Destination::moved) != 2uptr)
         return 0u32;
     return 61u32;

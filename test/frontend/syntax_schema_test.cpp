@@ -291,6 +291,14 @@ int main() {
     child(suffix, 3, P::ResultLocation, 2);
     child(header, 2, P::AttributeSpecifier, 3);
     auto definition = production(parse(function_source, K::FunctionDefinition), P::FunctionDefinition, 4);
+    auto composed = std::make_shared<SyntaxNode>(*definition);
+    composed->children = {header, definition->children.back()};
+    std::string header_shape_error;
+    require(syntax_validate_node(*composed, header_shape_error),
+            "composed header/body public shape is invalid");
+    const auto composed_fragments = syntax_node_fragments(*composed);
+    require(!composed_fragments.empty() && composed_fragments.front().splice == header,
+            "composed function flattened its retained header identity");
     child(definition, 1, P::Declarator, 1);
     child(definition, 3, P::CompoundStatement, 3);
     declaration = production(parse("global u32 fn(in u16 value) -> \"stack.result\" "
