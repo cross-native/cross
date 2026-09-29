@@ -1392,6 +1392,9 @@ bool Parser::transfer_spliced_tags(
         if (before != prior_records.end() &&
             before->second.is_union == tag.is_union &&
             before->second.complete == tag.complete) continue;
+        if (enum_types_.contains(name))
+            diagnostics_.error(location,
+                "spliced record tag '" + name + "' conflicts with a destination enumeration");
         const auto destination = record_types_.find(name);
         if (destination == record_types_.end()) continue;
         if (destination->second.is_union != tag.is_union)
@@ -1402,6 +1405,9 @@ bool Parser::transfer_spliced_tags(
                 "spliced record tag '" + name + "' duplicates a destination definition");
     }
     for (const auto& enumeration : child.pending_enumerations_) {
+        if (record_types_.contains(enumeration.name))
+            diagnostics_.error(location,
+                "spliced enumeration '" + enumeration.name + "' conflicts with a destination record");
         if (const auto destination = enum_types_.find(enumeration.name);
             destination != enum_types_.end() &&
             destination->second != enumeration.underlying)
@@ -1906,6 +1912,22 @@ TypePtr Parser::resolve_type_alias(std::string_view name) const {
     return {};
 }
 
+TypePtr Parser::resolve_tag_type(std::string_view name, SourceLocation location) const {
+    const auto origin = token_origin(location);
+    // All three tag kinds share one lookup space. Select the nearest name
+    // before checking its requested kind, and use the name token's context:
+    // a quoted keyword and a copied tag identifier can have different origins.
+    for (const auto& candidate : namespace_candidates(NameUse(name),
+            origin.context ? origin.context->name_space : active_namespace_,
+            origin.context ? origin.context->imports : active_imports_)) {
+        if (const auto found = record_types_.find(candidate); found != record_types_.end())
+            return record_type(candidate, found->second.is_union);
+        if (const auto found = enum_types_.find(candidate); found != enum_types_.end())
+            return enum_type(candidate, found->second);
+    }
+    return {};
+}
+
 bool Parser::type_start(TypeProbe probe) {
     // Cast/sizeof probes can be looking at an expression owner rather than
     // a type. Its input must stay opaque until the expression parser selects
@@ -2177,6 +2199,9 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 declaration.name = join_namespace(active_namespace_, *name);
                 declaration.is_union = is_union;
                 declaration.complete = true;
+                if (enum_types_.contains(declaration.name))
+                    diagnostics_.error(name_location, "tag '" + declaration.name +
+                        "' was previously declared as an enumeration");
                 if (declaration_attributes)
                     for (const auto& attribute : *declaration_attributes)
                         if (attribute.name == "packed" || attribute.name == "aligned")
@@ -2206,44 +2231,23 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 for (const auto& attribute : record_attributes)
                     diagnostics_.error(attribute.location,
                         "record attributes on a type use are not yet supported");
-                auto canonical = *name;
-                auto found = record_types_.end();
-                if (name->find("::") != std::string::npos) {
-                    found = record_types_.find(canonical);
-                } else {
-                    auto current_namespace = active_namespace_;
-                    while (!current_namespace.empty()) {
-                        canonical = join_namespace(current_namespace, *name);
-                        found = record_types_.find(canonical);
-                        if (found != record_types_.end())
-                            break;
-                        const auto separator = current_namespace.rfind("::");
-                        if (separator == std::string::npos)
-                            break;
-                        current_namespace.resize(separator);
-                    }
-                    for (const auto &imported : active_imports_) {
-                        if (found != record_types_.end())
-                            break;
-                        canonical = join_namespace(imported, *name);
-                        found = record_types_.find(canonical);
-                    }
-                    if (found == record_types_.end()) {
-                        canonical = *name;
-                        found = record_types_.find(canonical);
-                    }
-                }
-                if (found == record_types_.end()) {
-                    canonical = name->find("::") == std::string::npos && !active_namespace_.empty()
-                                    ? join_namespace(active_namespace_, *name)
-                                    : *name;
+                type = resolve_tag_type(*name, name_location);
+                if (!type) {
+                    const auto origin = token_origin(name_location);
+                    const auto& name_space = origin.context
+                        ? origin.context->name_space : active_namespace_;
+                    const auto canonical = name->find("::") == std::string::npos
+                        ? join_namespace(name_space, *name) : *name;
                     record_types_.emplace(canonical, RecordTag{is_union, false});
-                } else if (found->second.is_union != is_union) {
-                    diagnostics_.error(current().location,
+                    type = record_type(canonical, is_union);
+                } else if (type->kind != Type::Kind::Record) {
+                    diagnostics_.error(name_location, "tag '" + *name +
+                        "' was previously declared as an enumeration");
+                } else if (type->is_union != is_union) {
+                    diagnostics_.error(name_location,
                                        "record tag '" + *name +
                                            "' was previously declared with the other record kind");
                 }
-                type = record_type(canonical, is_union, is_const, is_volatile);
             }
         } else if (current().is("enum")) {
             ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
@@ -2260,6 +2264,9 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 EnumDecl declaration;
                 declaration.location = location;
                 declaration.name = join_namespace(active_namespace_, *name);
+                if (record_types_.contains(declaration.name))
+                    diagnostics_.error(name_location, "tag '" + declaration.name +
+                        "' was previously declared as a record");
                 if (declaration_attributes)
                     for (const auto& attribute : *declaration_attributes)
                         if (attribute.name == "underlying")
@@ -2287,27 +2294,14 @@ TypePtr Parser::parse_type(bool record_specifiers,
                 for (const auto& attribute : enum_attributes)
                     diagnostics_.error(attribute.location,
                         "enumeration attributes on a type use are not yet supported");
-                auto canonical = *name;
-                auto found = enum_types_.find(canonical);
-                if (found == enum_types_.end() && canonical.find("::") == std::string::npos &&
-                    !active_namespace_.empty()) {
-                    canonical = join_namespace(active_namespace_, canonical);
-                    found = enum_types_.find(canonical);
-                }
-                if (found == enum_types_.end() && name->find("::") == std::string::npos) {
-                    for (const auto &imported : active_imports_) {
-                        canonical = join_namespace(imported, *name);
-                        found = enum_types_.find(canonical);
-                        if (found != enum_types_.end())
-                            break;
-                    }
-                }
-                if (found == enum_types_.end()) {
-                    diagnostics_.error(current().location,
+                type = resolve_tag_type(*name, name_location);
+                if (!type) {
+                    diagnostics_.error(name_location,
                                        "unknown enumeration type '" + *name + "'");
                     type = enum_type(*name, BuiltinType::I32, is_const, is_volatile);
-                } else {
-                    type = enum_type(canonical, found->second, is_const, is_volatile);
+                } else if (type->kind == Type::Kind::Record) {
+                    diagnostics_.error(name_location, "tag '" + *name +
+                        "' was previously declared as a record");
                 }
             }
         }
@@ -3361,12 +3355,16 @@ void Parser::parse_external_node_splice(
             diagnostics_.error(item.location,
                 "spliced typedef '" + alias.name + "' has a different destination type");
     }
-    for (const auto& enumeration : parsed.enumerations)
+    for (const auto& enumeration : parsed.enumerations) {
+        if (record_types_.contains(enumeration.name))
+            diagnostics_.error(item.location,
+                "spliced enumeration '" + enumeration.name + "' conflicts with a destination record");
         if (const auto found = enum_types_.find(enumeration.name);
             found != enum_types_.end() && found->second != enumeration.underlying)
             diagnostics_.error(item.location,
                 "spliced enumeration '" + enumeration.name +
                 "' conflicts with the destination underlying type");
+    }
     if (diagnostics_.errors() != previous_errors ||
         !transfer_spliced_tags(*child, prior_records, item.location)) return;
     for (const auto& alias : child->declared_aliases_)
@@ -3939,6 +3937,9 @@ void Parser::parse_enum_declaration(Program& program,
         return;
     }
     *name = join_namespace(name_space, *name);
+    if (record_types_.contains(*name))
+        diagnostics_.error(location, "tag '" + *name +
+            "' was previously declared as a record");
     auto trailing = parse_attributes();
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
@@ -4051,6 +4052,9 @@ void Parser::parse_record_declaration(
 
     auto [tag, inserted] = record_types_.emplace(
         *name, RecordTag{is_union, false});
+    if (enum_types_.contains(*name))
+        diagnostics_.error(location, "tag '" + *name +
+            "' was previously declared as an enumeration");
     if (!inserted && tag->second.is_union != is_union) {
         diagnostics_.error(
             location, "record tag '" + *name +

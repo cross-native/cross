@@ -392,6 +392,31 @@ copy_function_definition [[noinline]] static u32 deferred_body_function(in u32 v
     return result;
 }
 
+#include "tag_lookup.x"
+
+namespace TagTreeDefinition {
+    enum E [[underlying(u16)]] { TagValue };
+    struct R { u16 value; };
+    [[syntax_expander]] static $::meta::tokens size(in $::meta::syntax_match input) {
+        $::meta::tokens name = $::syntax::capture(input, "name");
+        $::meta::syntax parsed = $::meta::parse("type",
+            $::quote { struct $::unquote(name) }, $::syntax::context(input));
+        // The keyword's definition context must not replace the copied name's
+        // invocation context, even after a public-tree parse and splice.
+        return $::quote { (u32)(sizeof($::unquote(parsed)) + sizeof(enum E) +
+            sizeof($::unquote($::syntax::node(input, "type")))) };
+    }
+    syntax Size : expression { prefix "tag_size"; match "(" name:ident "," type:type ")"; expand size; }
+}
+namespace TagTreeInvocation {
+    enum E [[underlying(u32)]] { TagValue };
+    struct R { u32 value; };
+    [[noinline]] static u32 run(in u32 amount) {
+        syntax TagTreeDefinition::Size;
+        return amount + tag_size(R, enum E);
+    }
+}
+
 namespace PatternComposition {
     syntax Fence : rule { match ";"; }
     [[syntax_expander]] static $::meta::tokens select_value(in $::meta::syntax_match input) {
@@ -423,6 +448,8 @@ namespace PatternComposition {
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
+    if (TagLookup::Invocation::run(9u32) != 9u32 ||
+        TagTreeInvocation::run(7u32) != 17u32) return 0u32;
     if (PatternComposition::run(4u32) != 29u32) return 0u32;
     u32 textual_precedence = parameter_list_fragment!(1u32 + 2u32) * 3u32;
     u32 textual_value = 1u32;

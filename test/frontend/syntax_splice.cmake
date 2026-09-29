@@ -33,6 +33,79 @@ function(reject_splice case expected source)
     endif()
 endfunction()
 
+file(READ "${CMAKE_CURRENT_LIST_DIR}/tag_lookup.x" tag_lookup_source)
+accept_splice(tag_lookup_macro_only "${tag_lookup_source}")
+accept_splice(tag_lookup_syntax_enabled
+    "syntax Enabled : rule { match \"unused\"; }\n${tag_lookup_source}")
+foreach(kind struct union)
+    reject_splice(tag_${kind}_skips_nearer_enum "previously declared as an enumeration"
+        "${kind} Tag { u32 value; }; namespace N { enum Tag { Value }; ${kind} Tag *wrong; }")
+    reject_splice(tag_enum_skips_nearer_${kind} "previously declared as a record"
+        "enum Tag { Value }; namespace N { ${kind} Tag { u32 value; }; enum Tag wrong; }")
+    reject_splice(tag_enum_redefines_${kind} "previously declared as a record"
+        "${kind} Tag; enum Tag { Value };")
+    reject_splice(tag_${kind}_redefines_enum "previously declared as an enumeration"
+        "enum Tag { Value }; ${kind} Tag { u32 value; };")
+    reject_splice(tag_inline_enum_redefines_${kind} "previously declared as a record"
+        "${kind} Tag; enum Tag { Value } object;")
+    reject_splice(tag_inline_${kind}_redefines_enum "previously declared as an enumeration"
+        "enum Tag { Value }; ${kind} Tag { u32 value; } object;")
+    reject_splice(tag_imported_${kind}_skips_enum "previously declared as an enumeration"
+        "namespace First { enum Tag { Value }; } namespace Second { ${kind} Tag { u32 value; }; }
+         using First; using Second; ${kind} Tag *wrong;")
+    reject_splice(tag_imported_enum_skips_${kind} "previously declared as a record"
+        "namespace First { ${kind} Tag { u32 value; }; } namespace Second { enum Tag { Value }; }
+         using First; using Second; enum Tag wrong;")
+endforeach()
+
+foreach(category stmt type declaration external)
+    set(owner statement)
+    set(scope "{")
+    set(record_body "struct Tag { u16 value; } moved;")
+    set(enum_body "enum Tag [[underlying(u16)]] { Later } moved;")
+    set(capture "body:${category}")
+    set(tail "")
+    if(category STREQUAL type)
+        set(record_body "struct Tag { u16 value; }")
+        set(enum_body "enum Tag [[underlying(u16)]] { Later }")
+        set(capture "\"(\" body:type \")\"")
+        set(record_body "(${record_body})")
+        set(enum_body "(${enum_body})")
+        set(tail "moved;")
+    elseif(category STREQUAL external)
+        set(owner item)
+        set(scope "namespace Destination {")
+        set(capture "body:declaration")
+    endif()
+    foreach(destination record enumeration)
+        if(destination STREQUAL record)
+            set(prior "struct $::unquote(tag) { u32 value; };")
+            set(body "${enum_body}")
+            set(expected "spliced enumeration '.*Tag' conflicts with a destination record")
+        else()
+            set(prior "enum $::unquote(tag) { Earlier };")
+            set(body "${record_body}")
+            set(expected "spliced record tag '.*Tag' conflicts with a destination enumeration")
+        endif()
+        # Local tag-only declarations are still outside the accepted local
+        # declaration grammar; give the generated local declaration an object.
+        if(NOT category STREQUAL external)
+            string(REGEX REPLACE ";$" " prior;" prior "${prior}")
+        endif()
+        set(source "[[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
+            $::meta::tokens tag = $::meta::call_site($::meta::parse(\"Tag\"));
+            return $::quote { ${scope} ${prior} $::unquote($::syntax::node(input, \"body\")) ${tail} } };
+        }
+        syntax Move : ${owner} { prefix \"move\"; match ${capture}; expand move; }")
+        if(category STREQUAL external)
+            string(APPEND source " syntax Move; move ${body}")
+        else()
+            string(APPEND source " global u32 entry() { syntax Move; move ${body} return 0u32; }")
+        endif()
+        reject_splice(tag_transfer_${category}_${destination} "${expected}" "${source}")
+    endforeach()
+endforeach()
+
 reject_splice(leading_type_attribute_unknown_space "address space 17 is not registered"
     "[[syntax_expander]] static $::meta::tokens declare(in $::meta::syntax_match input) { return $::quote { $::unquote($::syntax::node(input, \"body\")) value; }; } syntax Value : statement { prefix \"value\"; match \"(\" body:type \")\"; expand declare; } global u32 entry() { syntax Value; value ([[address_space(17)]] u32 *) return 0u32; }\n"
     note)

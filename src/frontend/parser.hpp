@@ -136,6 +136,7 @@ private:
     std::string peek_qualified_name();
     std::string peek_qualified_name() const;
     TypePtr resolve_type_alias(std::string_view name) const;
+    TypePtr resolve_tag_type(std::string_view name, SourceLocation location) const;
     TypePtr parse_type(bool record_specifiers = true,
                        std::function<bool()> storage_specifier = {},
                        std::vector<Attribute>* declaration_attributes = nullptr);
