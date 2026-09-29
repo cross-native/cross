@@ -667,11 +667,11 @@ private:
 
     void collect_record_shells() {
         for (const auto& declaration : program_.records) {
-            auto found = module_.record_ids.find(declaration.name);
+            auto found = module_.record_ids.find(declaration.nominal_key());
             RecordId id;
             if (found == module_.record_ids.end()) {
                 id = {static_cast<std::uint32_t>(module_.records.size())};
-                module_.record_ids.emplace(declaration.name, id);
+                module_.record_ids.emplace(declaration.nominal_key(), id);
                 Record record;
                 record.id = id;
                 record.location = declaration.location;
@@ -2309,6 +2309,7 @@ TypeId Module::intern_type(const TypePtr& source) {
                                                           : Type::Kind::Builtin;
         candidate.builtin = source->builtin;
         candidate.nominal_name = source->nominal_name;
+        candidate.nominal_identity = source->nominal_identity;
         candidate.is_const = source->is_const;
         candidate.is_volatile = source->is_volatile;
         candidate.is_atomic = source->is_atomic;
@@ -2343,10 +2344,10 @@ TypeId Module::intern_type(const TypePtr& source) {
             candidate.lanes = source->lanes;
             candidate.scalable = source->scalable;
         } else if (source->kind == cross::Type::Kind::Record) {
-            auto found = record_ids.find(source->nominal_name);
+            auto found = record_ids.find(source->nominal_key());
             if (found == record_ids.end()) {
                 const RecordId id{static_cast<std::uint32_t>(records.size())};
-                record_ids.emplace(source->nominal_name, id);
+                record_ids.emplace(source->nominal_key(), id);
                 Record record;
                 record.id = id;
                 record.source_name = source->nominal_name;
@@ -2367,7 +2368,7 @@ TypeId Module::intern_type(const TypePtr& source) {
             type.element == candidate.element &&
             type.lanes == candidate.lanes &&
             type.scalable == candidate.scalable &&
-            type.nominal_name == candidate.nominal_name &&
+            type.nominal_key() == candidate.nominal_key() &&
             type.is_const == candidate.is_const &&
             type.is_volatile == candidate.is_volatile &&
             type.is_restrict == candidate.is_restrict &&
@@ -2406,7 +2407,7 @@ TypeId Module::pointer_to(TypeId pointee) {
             candidate.pointee == pointee && !candidate.is_const &&
             !candidate.is_volatile && !candidate.is_atomic &&
             !candidate.is_restrict && candidate.address_space == 0 &&
-            candidate.nominal_name.empty()) {
+            candidate.nominal_key().empty()) {
             return {index};
         }
     }
@@ -2433,7 +2434,7 @@ TypeId Module::without_top_level_const(TypeId id) {
             existing.element == candidate.element &&
             existing.lanes == candidate.lanes &&
             existing.scalable == candidate.scalable &&
-            existing.nominal_name == candidate.nominal_name &&
+            existing.nominal_key() == candidate.nominal_key() &&
             existing.is_const == candidate.is_const &&
             existing.is_volatile == candidate.is_volatile &&
             existing.is_restrict == candidate.is_restrict &&
@@ -2466,7 +2467,7 @@ TypeId Module::unqualified(TypeId id) {
             existing.element == candidate.element &&
             existing.lanes == candidate.lanes &&
             existing.scalable == candidate.scalable &&
-            existing.nominal_name == candidate.nominal_name &&
+            existing.nominal_key() == candidate.nominal_key() &&
             existing.address_space == candidate.address_space &&
             !existing.is_const && !existing.is_volatile &&
             !existing.is_atomic && !existing.is_restrict) {
@@ -2497,7 +2498,7 @@ TypeId Module::add_qualifiers(TypeId id, bool is_const,
             existing.element == candidate.element &&
             existing.lanes == candidate.lanes &&
             existing.scalable == candidate.scalable &&
-            existing.nominal_name == candidate.nominal_name &&
+            existing.nominal_key() == candidate.nominal_key() &&
             existing.is_const == candidate.is_const &&
             existing.is_volatile == candidate.is_volatile &&
             existing.is_restrict == candidate.is_restrict &&
@@ -2552,8 +2553,8 @@ TypeId Module::array_of(TypeId element, std::uint32_t elements) {
     return id;
 }
 
-const Record* Module::record(std::string_view name) const {
-    const auto found = record_ids.find(std::string(name));
+const Record* Module::record(const NominalTypeKey& key) const {
+    const auto found = record_ids.find(key);
     return found == record_ids.end() ? nullptr
                                     : &records.at(found->second.value);
 }
@@ -2722,7 +2723,7 @@ std::string type_name(const Module& module, TypeId id) {
         return prefix + (record.is_union ? "union " : "struct ") +
                record.source_name;
     }
-    if (!type.nominal_name.empty()) {
+    if (!type.nominal_key().empty()) {
         return prefix + "enum " + type.nominal_name;
     }
     static constexpr std::string_view names[] = {

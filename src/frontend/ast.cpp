@@ -185,6 +185,18 @@ TypePtr enum_type(std::string name, BuiltinType underlying, bool is_const,
     return type;
 }
 
+TypePtr record_type(const RecordDecl& declaration) {
+    auto type = record_type(declaration.name, declaration.is_union);
+    type->nominal_identity = declaration.nominal_identity;
+    return type;
+}
+
+TypePtr enum_type(const EnumDecl& declaration) {
+    auto type = enum_type(declaration.name, declaration.underlying);
+    type->nominal_identity = declaration.nominal_identity;
+    return type;
+}
+
 std::string type_name(const TypePtr& type) {
     if (!type) return "<invalid>";
     if (type->kind == Type::Kind::Tokens) return "$::meta::tokens";
@@ -253,7 +265,7 @@ std::string type_name(const TypePtr& type) {
         "void", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
         "i128", "u128", "iptr", "uptr", "f32", "f64", "f80", "f128", "fptr", "label"
     };
-    if (!type->nominal_name.empty()) {
+    if (!type->nominal_key().empty()) {
         return prefix + "enum " + type->nominal_name;
     }
     return prefix + names[static_cast<unsigned>(type->builtin)];
@@ -330,12 +342,12 @@ std::string canonical_type_name(const TypePtr& type) {
     }
     if (type->kind == Type::Kind::Record) {
         result += type->is_union ? "union " : "struct ";
-        result += type->nominal_name;
+        result += type->nominal_key().canonical_name();
         return result;
     }
-    if (!type->nominal_name.empty()) {
+    if (!type->nominal_key().empty()) {
         result += "enum ";
-        result += type->nominal_name;
+        result += type->nominal_key().canonical_name();
         return result;
     }
     static constexpr std::string_view names[] = {
@@ -396,14 +408,14 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
     }
     if (left->kind == Type::Kind::Record) {
         return left->is_union == right->is_union &&
-               left->nominal_name == right->nominal_name;
+               left->nominal_key() == right->nominal_key();
     }
     if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
         left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span ||
         left->kind == Type::Kind::Context || left->kind == Type::Kind::Bytes ||
         left->kind == Type::Kind::Buffer) return true;
     return left->builtin == right->builtin &&
-           left->nominal_name == right->nominal_name;
+           left->nominal_key() == right->nominal_key();
 }
 
 TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode) {
@@ -467,7 +479,7 @@ bool is_vector(const TypePtr& type) {
 
 bool is_nominal(const TypePtr& type) {
     return type && ((type->kind == Type::Kind::Builtin &&
-                     !type->nominal_name.empty()) ||
+                     !type->nominal_key().empty()) ||
                     type->kind == Type::Kind::Record);
 }
 

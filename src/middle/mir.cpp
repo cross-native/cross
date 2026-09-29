@@ -240,7 +240,7 @@ bool representation_compatible(const hir::Module& module, hir::TypeId left,
            lhs.function == rhs.function && lhs.element == rhs.element &&
            lhs.lanes == rhs.lanes && lhs.scalable == rhs.scalable &&
            lhs.is_atomic == rhs.is_atomic &&
-           lhs.nominal_name == rhs.nominal_name;
+           lhs.nominal_key() == rhs.nominal_key();
 }
 
 bool unqualified_representation_compatible(const hir::Module& module,
@@ -252,7 +252,7 @@ bool unqualified_representation_compatible(const hir::Module& module,
            lhs.pointee == rhs.pointee && lhs.element == rhs.element &&
            lhs.address_space == rhs.address_space &&
            lhs.function == rhs.function && lhs.lanes == rhs.lanes &&
-           lhs.scalable == rhs.scalable && lhs.nominal_name == rhs.nominal_name;
+           lhs.scalable == rhs.scalable && lhs.nominal_key() == rhs.nominal_key();
 }
 
 bool vector_element_compatible(const hir::Module& module,

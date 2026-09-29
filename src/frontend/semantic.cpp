@@ -113,7 +113,7 @@ TypePtr clone_type(const TypePtr& source,
     if (!source) return {};
     TypePtr result;
     if (source->kind == Type::Kind::Builtin) {
-        result = source->nominal_name.empty()
+        result = source->nominal_key().empty()
                      ? builtin_type(source->builtin)
                      : enum_type(source->nominal_name, source->builtin);
     } else if (source->kind == Type::Kind::Pointer) {
@@ -168,6 +168,8 @@ TypePtr clone_type(const TypePtr& source,
     result->address_space = source->address_space;
     result->address_space_location = source->address_space_location;
     result->pending_address_space = source->pending_address_space;
+    // A substituted generic may already carry a nominal identity of its own.
+    if (source->nominal_identity) result->nominal_identity = source->nominal_identity;
     return result;
 }
 
@@ -402,7 +404,7 @@ std::vector<ManglingArgument> generic_argument_descriptors(
                 }
             }
             if (argument.value && argument.value->type &&
-                !argument.value->type->nominal_name.empty()) {
+                !argument.value->type->nominal_key().empty()) {
                 spelling = canonical_type_name(argument.value->type) + "=" + spelling;
             }
             rendered.push_back(
@@ -1934,7 +1936,7 @@ private:
         const auto definition = std::find_if(
             program_.records.begin(), program_.records.end(),
             [&](const RecordDecl& candidate) {
-                return candidate.name == base->nominal_name &&
+                return candidate.nominal_key() == base->nominal_key() &&
                        candidate.complete;
             });
         if (definition == program_.records.end()) return {};
@@ -2528,7 +2530,7 @@ TypePtr infer_generic_actual(const Expr& expression,
             const auto record = std::find_if(
                 program.records.begin(), program.records.end(),
                 [&](const RecordDecl& candidate) {
-                    return candidate.name == base->nominal_name &&
+                    return candidate.nominal_key() == base->nominal_key() &&
                            candidate.complete;
                 });
             if (record == program.records.end()) return {};
@@ -3388,7 +3390,7 @@ private:
         const auto record = std::find_if(
             program_.records.begin(), program_.records.end(),
             [&](const RecordDecl& candidate) {
-                return candidate.name == owner->nominal_name &&
+                return candidate.nominal_key() == owner->nominal_key() &&
                        candidate.complete;
             });
         if (record == program_.records.end()) return nullptr;
@@ -4036,8 +4038,7 @@ private:
                     program_, current_function_, current_namespace_,
                     expression);
                 found && found->enumerator->value) {
-                return enum_type(found->enumeration->name,
-                                 found->enumeration->underlying);
+                return enum_type(*found->enumeration);
             }
             return {};
         case Expr::Kind::Parenthesized:
@@ -4847,8 +4848,7 @@ private:
             found && found->enumerator->value) {
             return EvalValue{
                 found->enumerator->value->value,
-                enum_type(found->enumeration->name,
-                          found->enumeration->underlying)};
+                enum_type(*found->enumeration)};
         }
         if (pointer_resolver_) {
             auto source = clone_expr(expression);
@@ -5017,8 +5017,8 @@ private:
         if (!size || offset > *size || length > *size - offset) return false;
         if (offset == 0 && length == *size && same_meta_object_type(owner, requested))
             return true;
-        if (offset == 0 && length == *size && owner->nominal_name.empty() &&
-            requested->nominal_name.empty() && meta_scalar_type(owner) &&
+        if (offset == 0 && length == *size && owner->nominal_key().empty() &&
+            requested->nominal_key().empty() && meta_scalar_type(owner) &&
             meta_scalar_type(requested) && compatible_meta_type(owner->builtin, requested->builtin)) return true;
         if (owner->kind == Type::Kind::Array || owner->kind == Type::Kind::Vector) {
             const auto stride = meta_object_size(owner->element);
@@ -5029,7 +5029,7 @@ private:
         if (owner->kind != Type::Kind::Record || owner->is_union) return false;
         const auto record = std::find_if(program_.records.begin(), program_.records.end(),
             [&](const RecordDecl& candidate) {
-                return candidate.name == owner->nominal_name && candidate.complete;
+                return candidate.nominal_key() == owner->nominal_key() && candidate.complete;
             });
         if (record == program_.records.end()) return false;
         for (const auto& member : record->members) {
@@ -5079,7 +5079,7 @@ private:
     bool register_meta_record(EvalBuffer& storage, std::size_t offset,
                               const TypePtr& type, SourceLocation location) {
         if (type->kind != Type::Kind::Record && type->kind != Type::Kind::Pointer &&
-            type->nominal_name.empty()) return true;
+            type->nominal_key().empty()) return true;
         const auto size = meta_object_size(type);
         if (!size) return false;
         for (const auto& object : storage.typed_objects)
@@ -5127,7 +5127,7 @@ private:
         if (type->is_union) return true;
         const auto record = std::find_if(program_.records.begin(), program_.records.end(),
             [&](const RecordDecl& candidate) {
-                return candidate.name == type->nominal_name && candidate.complete;
+                return candidate.nominal_key() == type->nominal_key() && candidate.complete;
             });
         if (record == program_.records.end()) return false;
         for (const auto& member : record->members) {
@@ -5183,7 +5183,7 @@ private:
         if (type->is_union) return true;
         const auto record = std::find_if(program_.records.begin(), program_.records.end(),
             [&](const RecordDecl& candidate) {
-                return candidate.name == type->nominal_name && candidate.complete;
+                return candidate.nominal_key() == type->nominal_key() && candidate.complete;
             });
         if (record == program_.records.end()) return false;
         for (const auto& member : record->members) {
@@ -5256,7 +5256,7 @@ private:
         if (type->kind != Type::Kind::Record) return false;
         const auto record = std::find_if(program_.records.begin(), program_.records.end(),
             [&](const RecordDecl& candidate) {
-                return candidate.name == type->nominal_name && candidate.complete;
+                return candidate.nominal_key() == type->nominal_key() && candidate.complete;
             });
         if (record == program_.records.end()) return false;
         for (const auto& member : record->members) {
@@ -7430,7 +7430,7 @@ bool signed_builtin(BuiltinType type) {
 bool evaluate_enumerations(Program& program, Diagnostics& diagnostics) {
     std::unordered_set<std::string> names;
     for (auto& enumeration : program.enumerations) {
-        const auto type = enum_type(enumeration.name, enumeration.underlying);
+        const auto type = enum_type(enumeration);
         std::optional<EvalValue> previous;
         for (auto& enumerator : enumeration.enumerators) {
             if (!names.insert(enumerator.name).second) {
@@ -7563,9 +7563,7 @@ private:
                 found && found->enumerator->value) {
                 expression->kind = Expr::Kind::Integer;
                 expression->evaluated_integer = found->enumerator->value;
-                expression->type = enum_type(
-                    found->enumeration->name,
-                    found->enumeration->underlying);
+                expression->type = enum_type(*found->enumeration);
                 expression->text = to_decimal(
                     found->enumerator->value->value);
                 return;
@@ -7737,7 +7735,7 @@ void replace_eval_value(std::unique_ptr<Expr>& expression,
         to_decimal(value.integer) + literal_suffix(value.type);
     replacement->evaluated_integer = Expr::IntegerConstant{
         value.integer, value.type->builtin};
-    if (!value.type->nominal_name.empty()) {
+    if (!value.type->nominal_key().empty()) {
         replacement->type = clone_type(value.type);
     }
     expression = std::move(replacement);
@@ -8300,7 +8298,7 @@ TypePtr initializer_child_type(const Program& program, const TypePtr& parent,
     const auto record = std::find_if(
         program.records.begin(), program.records.end(),
         [&](const RecordDecl& candidate) {
-            return candidate.name == parent->nominal_name &&
+            return candidate.nominal_key() == parent->nominal_key() &&
                    candidate.complete;
         });
     if (record == program.records.end()) return {};
@@ -8351,7 +8349,7 @@ void fold_static_initializer(Expr& initializer, TypePtr type,
             const auto record = std::find_if(
                 program.records.begin(), program.records.end(),
                 [&](const RecordDecl& candidate) {
-                    return candidate.name == type->nominal_name &&
+                    return candidate.nominal_key() == type->nominal_key() &&
                            candidate.complete;
                 });
             if (record != program.records.end()) {
@@ -8980,7 +8978,7 @@ private:
                     const auto record = std::find_if(
                         program_.records.begin(), program_.records.end(),
                         [&](const RecordDecl& candidate) {
-                            return candidate.name == destination->nominal_name &&
+                            return candidate.nominal_key() == destination->nominal_key() &&
                                    candidate.complete;
                         });
                     if (record != program_.records.end()) {

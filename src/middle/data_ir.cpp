@@ -521,7 +521,7 @@ std::uint64_t source_storage_size(const hir::Module& module,
     if (type->kind == Type::Kind::Pointer)
         return (module.address_bits + 7U) / 8U;
     if (type->kind == Type::Kind::Record) {
-        const auto* record = module.record(type->nominal_name);
+        const auto* record = module.record(type->nominal_key());
         return record && record->complete ? record->size : 0;
     }
     if (type->kind == Type::Kind::Array && type->element) {
@@ -621,7 +621,7 @@ bool compatible_static_pointee(const hir::Module& module, hir::TypeId source,
     case Type::Kind::Builtin:
         return from.kind == hir::Type::Kind::Builtin &&
                from.builtin == destination->builtin &&
-               from.nominal_name == destination->nominal_name;
+               from.nominal_key() == destination->nominal_key();
     case Type::Kind::Pointer:
         return from.kind == hir::Type::Kind::Pointer && from.pointee &&
                from.address_space == destination->address_space &&
@@ -635,7 +635,7 @@ bool compatible_static_pointee(const hir::Module& module, hir::TypeId source,
                                           destination->element, depth + 1);
     case Type::Kind::Record:
         return from.kind == hir::Type::Kind::Record &&
-               from.nominal_name == destination->nominal_name;
+               from.nominal_key() == destination->nominal_key();
     case Type::Kind::Vector:
         return from.kind == hir::Type::Kind::Vector && from.element &&
                from.lanes == destination->lanes &&
@@ -695,7 +695,7 @@ std::optional<AddressValue> address_designator(
                    base->cast_pointee->kind == Type::Kind::Record) {
             base->owner_const = base->owner_const || base->cast_pointee->is_const;
             base->owner_volatile = base->owner_volatile || base->cast_pointee->is_volatile;
-            record = module.record(base->cast_pointee->nominal_name);
+            record = module.record(base->cast_pointee->nominal_key());
         }
         if (!record) return std::nullopt;
         const auto* member = module.member(record->id,

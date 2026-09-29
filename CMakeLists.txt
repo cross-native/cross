@@ -355,6 +355,13 @@ if(BUILD_TESTING)
     add_test(NAME cross_callable_type
              COMMAND $<TARGET_FILE:cross_callable_type_test>)
 
+    add_executable(cross_nominal_identity_test
+                   test/frontend/nominal_identity_test.cpp)
+    target_link_libraries(cross_nominal_identity_test PRIVATE cross_middle)
+    cross_component(cross_nominal_identity_test)
+    add_test(NAME cross_nominal_identity
+             COMMAND $<TARGET_FILE:cross_nominal_identity_test>)
+
     add_executable(cross_options_test test/common/options_test.cpp)
     target_link_libraries(cross_options_test PRIVATE cross_targets)
     cross_component(cross_options_test)

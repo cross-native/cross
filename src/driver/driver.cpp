@@ -919,7 +919,7 @@ int cc_main(int argc, char** argv) {
                 self(self, type->element);
                 if (type->kind != Type::Kind::Record) return;
                 for (const auto& record : current.records) {
-                    if (record.name != type->nominal_name || !record.complete) continue;
+                    if (record.nominal_key() != type->nominal_key() || !record.complete) continue;
                     for (const auto& member : record.members) self(self, member.type);
                     break;
                 }

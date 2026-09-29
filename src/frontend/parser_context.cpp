@@ -17,6 +17,9 @@ void type_storage(const TypePtr& root, Add&& add, Name&& name, const bool& over_
         pending.pop_back();
         if (!next || !seen.insert(next.get()).second) continue;
         add(128); name(next->generic_name); name(next->nominal_name);
+        if (next->nominal_identity) {
+            add(80); name(next->nominal_identity->source_unit);
+        }
         pending.push_back(next->pointee);
         pending.push_back(next->element);
         if (next->function) {

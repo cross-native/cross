@@ -6,6 +6,7 @@
 #include "common/uint128.hpp"
 #include "frontend/token.hpp"
 #include "frontend/name.hpp"
+#include "frontend/nominal.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -54,6 +55,8 @@ struct Type {
     bool scalable{};
     std::string generic_name;
     std::string nominal_name;
+    std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
+    [[nodiscard]] NominalTypeKey nominal_key() const { return {nominal_name, nominal_identity}; }
     bool is_union{};
     bool is_const{};
     bool is_volatile{};
@@ -361,6 +364,8 @@ struct EnumDecl {
     BuiltinType underlying{BuiltinType::I32};
     std::vector<Attribute> attributes;
     std::vector<Enumerator> enumerators;
+    std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
+    [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity}; }
 };
 
 struct RecordMemberDecl {
@@ -378,7 +383,12 @@ struct RecordDecl {
     bool complete{};
     std::vector<Attribute> attributes;
     std::vector<RecordMemberDecl> members;
+    std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
+    [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity}; }
 };
+
+TypePtr record_type(const RecordDecl& declaration);
+TypePtr enum_type(const EnumDecl& declaration);
 
 struct GlobalLabelDecl {
     SourceLocation location;

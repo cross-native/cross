@@ -100,6 +100,8 @@ struct Type {
     std::optional<FunctionSignature> function{};
     bool is_restrict{};
     std::uint32_t address_space{};
+    std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
+    [[nodiscard]] NominalTypeKey nominal_key() const { return {nominal_name, nominal_identity}; }
 };
 
 struct RecordMember {
@@ -225,7 +227,7 @@ public:
         return records.at(id.value);
     }
     [[nodiscard]] Record& record(RecordId id) { return records.at(id.value); }
-    [[nodiscard]] const Record* record(std::string_view name) const;
+    [[nodiscard]] const Record* record(const NominalTypeKey& key) const;
     [[nodiscard]] const RecordMember* member(RecordId record,
                                              std::string_view name) const;
     [[nodiscard]] const Function& function(FunctionId id) const {
@@ -255,7 +257,7 @@ public:
     std::vector<Label> labels;
     std::unordered_map<const FunctionDecl*, FunctionId> function_ids;
     std::unordered_map<const ObjectDecl*, ObjectId> object_ids;
-    std::unordered_map<std::string, RecordId> record_ids;
+    std::unordered_map<NominalTypeKey, RecordId, NominalTypeKeyHash> record_ids;
 };
 
 Module build(Program& program, const CompilerOptions& options,
