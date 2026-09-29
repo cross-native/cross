@@ -521,6 +521,102 @@ check(grouped_late_failure_order "${prefix}
     return value;
 }" 1 "note: earlier-header-owner" "error: division by zero")
 
+foreach(expression
+        "sizeof(T (params!(*))(in u32))"
+        "sizeof(T params!(*))"
+        "sizeof(T (*)(params!(in u32)))"
+        "sizeof(T [params!(2uptr)])"
+        "$::alignof(T (params!(*))(in u32))"
+        "sizeof((T (params!(*))(in u32))0uptr)"
+        "alignment::<T (params!(*))(in u32)>()")
+    string(MD5 case "${expression}")
+    check(opaque_header_type_order_${case} "${prefix}
+static u32 alignment<U>() { return 16u32; }
+static T test(in T value)
+    [[aligned(${expression} + notice(unknown!{discarded})), generic(bad!(T))]] {
+    return value;
+}" 1 "note: earlier-header-owner" "error: division by zero")
+    check(opaque_header_type_valid_${case} "${prefix}
+static u32 alignment<U>() { return 16u32; }
+static T test(in T value)
+    [[aligned((${expression} != 0uptr ? 16u32 : 16u32) +
+               notice(unknown!{discarded}) - 16u32), generic(params!(T))]] {
+    return value;
+}
+$::static_assert(test(300u32) == 300u32, \"opaque type damaged final generic bindings\");"
+        0 "note: earlier-header-owner")
+endforeach()
+
+foreach(expression "sizeof(T [notice(unknown!{discarded})])"
+                   "sizeof(T (*)(in u32 values[notice(unknown!{discarded})]))")
+    string(MD5 case "${expression}")
+    check(opaque_type_owner_order_${case} "${prefix}
+static T test(in T value) [[aligned(${expression}), generic(bad!(T))]] { return value; }"
+        1 "note: earlier-header-owner" "error: division by zero")
+endforeach()
+
+check(opaque_header_value_order "${prefix}
+static u32 test() [[aligned(sizeof(N params!(+ 1u32)) + notice(unknown!{discarded})),
+                   generic(bad!(u32 N))]] { return N; }"
+    1 "note: earlier-header-owner" "error: division by zero")
+
+check(opaque_header_value_valid "${prefix}
+static u32 test() [[aligned(sizeof(N params!(+ 1u32)) + notice(unknown!{discarded}) - sizeof(u32)),
+                   generic(params!(u32 N))]] { return N; }
+$::static_assert(test<300u32>() == 300u32, \"value generic was forced into type grammar\");"
+    0 "note: earlier-header-owner")
+
+foreach(expression "sizeof(N * notice(unknown!{discarded}))"
+                   "sizeof(Target(notice(unknown!{discarded})))")
+    string(MD5 case "${expression}")
+    check(opaque_header_expression_owner_${case} "${prefix}
+static u32 Target(in u32 value) { return value; }
+static u32 test() [[aligned(${expression} + 16u32 - sizeof(u32)),
+                   generic(params!(u32 N))]] { return N; }
+$::static_assert(test<300u32>() == 300u32, \"type probing damaged an expression owner\");"
+        0 "note: earlier-header-owner")
+endforeach()
+
+check(opaque_probe_split_token_position "${prefix}
+static u32 alignment<U>() { return 16u32; }
+static T test(in T value)
+    [[aligned(sizeof(T [alignment::<alignment::<u32>>() + notice(unknown!{discarded})])),
+      generic(bad!(T))]] { return value; }"
+    1 "note: earlier-header-owner" "error: division by zero")
+
+check(generic_function_alignment [=[
+static u32 alignment<u32 N>() { return N; }
+[[aligned(alignment<16u32>())]] static u32 first() { return 1u32; }
+[[aligned(alignment<N>())]] static T second<T, u32 N>(in T value) { return value; }
+$::static_assert(first() == 1u32 && second<u32, 32u32>(300u32) == 300u32,
+                "generic function alignment did not instantiate");
+]=] 0)
+
+foreach(wrapper "" "compose ")
+    string(MD5 case "${wrapper}")
+    check(known_generic_type_slot_${case} "${compose}
+typedef u32 Param;
+[[syntax_expander]] static $::meta::tokens wrong(in $::meta::syntax_match input) {
+    $::syntax::error($::syntax::span(input), \"required parameter type dispatched expression syntax\");
+    return $::quote { 16u32 };
+}
+syntax ParameterOwner : expression { prefix \"Param\"; match input:paren; expand wrong; }
+syntax ParameterOwner;
+namespace Helpers {
+    static u32 alignment<u32 N, U>() { return N; }
+}
+${wrapper}static T test(in T value)
+    [[aligned(Helpers::alignment::<16u32, T(Param(params!(in u32)))>()),
+      generic(params!(T))]] { return value; }
+$::static_assert(test(300u32) == 300u32, \"known type slot lost nested callable grammar\");" 0)
+endforeach()
+
+check(known_generic_type_slot_prefix_priority "${prefix}
+static u32 alignment<U>() { return 16u32; }
+static T test(in T value)
+    [[aligned(alignment::<notice(unknown!{discarded})>()), generic(bad!(T))]] { return value; }"
+    1 "note: earlier-header-owner" "error: division by zero")
+
 check(grouped_macro_input_opaque "${prefix}
 [[macro]] static $::meta::tokens choose(in $::meta::tokens ignored) {
     return $::quote { (function) };

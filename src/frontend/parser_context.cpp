@@ -91,7 +91,9 @@ std::shared_ptr<const SyntaxParseEnvironment> Parser::snapshot_environment() con
     const auto name = [&](std::string_view text) { add(32); add(text.size()); };
     const auto type = [&](const TypePtr& root) { type_storage(root, add, name, over_budget); };
     for (const auto& entry : active_generic_types_) name(entry);
-    for (const auto& entry : known_generic_functions_) name(entry);
+    for (const auto& [entry, parameters] : known_generic_functions_) {
+        name(entry); add(32 + parameters.size() * 8);
+    }
     for (const auto& entry : known_ordinary_values_) name(entry);
     for (const auto& scope : local_scopes_) {
         add(32);

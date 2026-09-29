@@ -157,6 +157,8 @@ const Token& Parser::current(std::size_t lookahead) {
     // Procedural macros replace tokens, not grammar subtrees. Only expose
     // expanded tokens when the core parser reaches them; raw captures and
     // speculative public-tree recognition must keep their input opaque.
+    if (!raw_token_depth_ && probing_header_type_ && macro_start())
+        throw HeaderProbeInvocation{public_input_indices_[index_], true};
     if (!raw_token_depth_ && !parsing_public_fragment_ && !public_tree_failed_)
         expand_inline_macro_fragments();
     return std::as_const(*this).current(lookahead);
@@ -382,6 +384,8 @@ void Parser::expand_inline_macro_fragments() {
     while (syntax_ && macro_start()) {
         // Captures only recognize syntax; they cannot execute a nested macro
         // to discover a declarator's shape or its bound names.
+        if (probing_header_type_)
+            throw HeaderProbeInvocation{public_input_indices_[index_], true};
         if (parsing_public_fragment_) throw DeferredNameRecognition{};
         const auto first = index_;
         const auto discard_failed_invocation = [&] {
@@ -508,27 +512,72 @@ void Parser::prepare_header() {
     index_ = first;
 }
 
-bool Parser::probe_header_type() {
+bool Parser::probe_header_type(bool generic_argument) {
     // During preparation an as-yet unknown generic name can begin a cast or
     // sizeof type. Prove only its grammatical shape, with nested invocations
     // opaque; the final header parse still decides whether this is a type.
-    // Failed alternatives cannot execute code or mutate the live token cursor.
-    auto execution = syntax_->execution();
-    if (!execution->begin_fragment(current().location, tokens_.size())) return false;
-    struct End { SyntaxExecution& execution; ~End() { execution.end_fragment(); } } end{*execution};
-    std::ostringstream ignored;
-    Diagnostics provisional(ignored);
-    auto child = replacement_parser({tokens_, current().location}, &provisional);
-    child->index_ = index_;
-    child->parsing_public_fragment_ = true;
-    child->probing_header_type_ = true;
-    try {
-        auto type = child->parse_type();
-        std::optional<std::string> name;
-        if (type) type = child->parse_declarator(std::move(type), name, DeclaratorContext::TypeName);
-        return type && !name && child->current().is(")") && provisional.errors() == 0;
-    } catch (const DeferredNameRecognition&) {
-        return false;
+    // Individual probes cannot execute code or mutate the live token cursor.
+    // When they prove a common next invocation, expose it once and try again.
+    enum class Outcome { Complete, Rejected, Uncertain, Invocation };
+    struct Probe {
+        Outcome outcome{Outcome::Rejected};
+        HeaderProbeInvocation invocation{};
+    };
+    const auto execution = syntax_->execution();
+    const auto probe = [&](bool type) -> Probe {
+        if (!execution->begin_fragment(current().location, tokens_.size()))
+            return {Outcome::Uncertain};
+        struct End { SyntaxExecution& execution; ~End() { execution.end_fragment(); } } end{*execution};
+        std::ostringstream ignored;
+        Diagnostics provisional(ignored);
+        auto child = replacement_parser({tokens_, current().location}, &provisional);
+        child->index_ = index_;
+        child->parsing_public_fragment_ = true;
+        child->probing_header_type_ = true;
+        child->parsing_generic_argument_ = generic_argument;
+        for (std::size_t at = 0; at < tokens_.size(); ++at)
+            child->public_input_indices_.push_back(at);
+        try {
+            if (type) {
+                auto parsed = child->parse_type();
+                std::optional<std::string> name;
+                if (parsed) parsed = child->parse_declarator(
+                    std::move(parsed), name, DeclaratorContext::TypeName);
+                if (!parsed || name) return {};
+            } else {
+                (void)child->parse_assignment();
+            }
+            const bool at_end = generic_argument
+                ? child->current().is(",") || child->current().is(">") || child->current().is(">>")
+                : child->current().is(")");
+            return {at_end && provisional.errors() == 0 ? Outcome::Complete : Outcome::Rejected};
+        } catch (const HeaderProbeInvocation& invocation) {
+            return {provisional.errors() == 0 ? Outcome::Invocation : Outcome::Rejected, invocation};
+        } catch (const HeaderProbeRejected&) {
+            return {};
+        } catch (const DeferredNameRecognition&) {
+            return {Outcome::Uncertain};
+        }
+    };
+    for (;;) {
+        const auto type = probe(true);
+        if (type.outcome == Outcome::Complete) return true;
+        if (type.outcome != Outcome::Invocation) return false;
+        const auto expression = probe(false);
+        // Only execute an invocation proved to be reached under either
+        // interpretation, or when the expression grammar already failed.
+        // In particular, never expose a macro hidden in a custom owner's input
+        // merely because the tentative type parser could reach its tokens.
+        if (expression.outcome != Outcome::Rejected &&
+            (expression.outcome != Outcome::Invocation ||
+             expression.invocation != type.invocation)) return false;
+        const auto first = index_;
+        index_ = type.invocation.position;
+        if (type.invocation.macro) expand_inline_macro_fragments();
+        else (void)parse_expression_replacement();
+        index_ = first;
+        // Expanded tokens may change the grammatical alternative. Re-probe;
+        // neither speculative AST nor speculative name bindings are retained.
     }
 }
 
@@ -1862,7 +1911,7 @@ bool Parser::type_start(TypeProbe probe) {
     // a type. Its input must stay opaque until the expression parser selects
     // it, even if the next token happens to begin a procedural invocation.
     const auto* owner = active_syntax(false);
-    if (probe == TypeProbe::ExpressionAlternative && owner) {
+    if (probe != TypeProbe::Required && owner) {
         // Activation commits before name-sensitive type/expression probing.
         // Required type slots remain unaffected by expression activation.
         if (owner->kind == SyntaxKind::Expression) return false;
@@ -1887,8 +1936,10 @@ bool Parser::type_start(TypeProbe probe) {
     const auto name = std::as_const(*this).peek_qualified_name();
     if (preparing_header_ && (!parsing_public_fragment_ || probing_header_type_) &&
         token.kind == TokenKind::Identifier && !is_reserved_identifier(token.text)) {
-        if (probe == TypeProbe::Required) return true;
-        if (!parsing_public_fragment_ && probe_header_type()) return true;
+        if (probe == TypeProbe::Required || probe == TypeProbe::GenericTypeArgumentAlternative)
+            return true;
+        if (!parsing_public_fragment_ &&
+            probe_header_type(probe == TypeProbe::GenericArgumentAlternative)) return true;
     }
     return token.is("const") || token.is("volatile") ||
            token.is("$::meta::tokens") ||
@@ -2668,28 +2719,37 @@ Parser::parse_angle_generic_parameters_impl() {
     return result;
 }
 
-bool Parser::known_generic_name(const Expr& name) const {
+void Parser::remember_function(const FunctionDecl& function) {
+    if (function.generic_parameters.empty()) {
+        known_ordinary_values_.insert(function.name);
+        return;
+    }
+    GenericSignature signature;
+    for (const auto& parameter : function.generic_parameters)
+        signature.push_back(parameter.value_type ? GenericParameterKind::Value : GenericParameterKind::Type);
+    known_generic_functions_.try_emplace(function.name, std::move(signature));
+}
+
+const Parser::GenericSignature* Parser::known_generic_parameters(const Expr& name) const {
     const auto binding = name_key(name).binding.kind;
-    if (binding == ValueBinding::Kind::Local) return false;
+    if (binding == ValueBinding::Kind::Local) return nullptr;
     if (binding == ValueBinding::Kind::Unknown && current().is("<"))
         require_public_name_context(name.text, name.location);
     if (binding == ValueBinding::Kind::Unknown && name.text.find("::") == std::string::npos)
         for (auto scope = local_scopes_.rbegin();
              scope != local_scopes_.rend(); ++scope)
-            if (scope->contains(NameKey(name.text, name.location))) return false;
-    const auto lookup = [&](std::string_view candidate)
-        -> std::optional<bool> {
-        if (known_ordinary_values_.contains(std::string(candidate)))
-            return false;
-        if (known_generic_functions_.contains(std::string(candidate)))
-            return true;
-        return std::nullopt;
-    };
+            if (scope->contains(NameKey(name.text, name.location))) return nullptr;
     for (const auto& candidate : namespace_candidates(
-             NameUse{name}, active_namespace_, active_imports_))
-        if (const auto found = lookup(candidate))
-            return *found;
-    return false;
+             NameUse{name}, active_namespace_, active_imports_)) {
+        if (known_ordinary_values_.contains(candidate)) return nullptr;
+        if (const auto found = known_generic_functions_.find(candidate);
+            found != known_generic_functions_.end()) return &found->second;
+    }
+    return nullptr;
+}
+
+bool Parser::known_generic_name(const Expr& name) const {
+    return known_generic_parameters(name) != nullptr;
 }
 
 bool Parser::consume_generic_close() {
@@ -2708,7 +2768,7 @@ bool Parser::consume_generic_close() {
     tokens_[index_].split_source = source;
     tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(index_) + 1,
                    remainder);
-    if (recording_public_tree_)
+    if (recording_public_tree_ || probing_header_type_)
         public_input_indices_.insert(public_input_indices_.begin() +
             static_cast<std::ptrdiff_t>(index_) + 1, public_input_indices_[index_]);
     ++index_;
@@ -2810,6 +2870,8 @@ TypePtr Parser::parse_declarator(TypePtr base, std::optional<std::string>& name,
     } else if (!abstract_only) {
         const auto location = current().location;
         name = parse_qualified_name();
+        if (probing_header_type_ && context == DeclaratorContext::TypeName && name)
+            throw HeaderProbeRejected{};
         if (name && name_location)
             *name_location = location;
         if (name && angle_parameters && current().is("<"))
@@ -3310,11 +3372,7 @@ void Parser::parse_external_node_splice(
     for (const auto& alias : child->declared_aliases_)
         if (alias.scope_depth == 0)
             type_aliases_.try_emplace(alias.name, copy_type(alias.type));
-    for (const auto& function : parsed.functions) {
-        if (function->generic_parameters.empty())
-            known_ordinary_values_.insert(function->name);
-        else known_generic_functions_.insert(function->name);
-    }
+    for (const auto& function : parsed.functions) remember_function(*function);
     for (const auto& object : parsed.objects)
         known_ordinary_values_.insert(object->name);
     for (const auto& enumeration : parsed.enumerations) {
@@ -3483,8 +3541,7 @@ void Parser::parse_function_header_splice(
         return;
     }
     auto function = std::move(parsed.functions.front());
-    if (function->generic_parameters.empty()) known_ordinary_values_.insert(function->name);
-    else known_generic_functions_.insert(function->name);
+    remember_function(*function);
     if (!header_only) {
         struct Restore {
             Parser& parser;
@@ -3770,10 +3827,7 @@ void Parser::parse_external(Program& program, const std::string& name_space) {
                 std::move(angle_parameters));
             if (function) function->fresh = token_origin(name_location).fresh;
             if (function) {
-                if (!function->generic_parameters.empty())
-                    known_generic_functions_.insert(function->name);
-                else
-                    known_ordinary_values_.insert(function->name);
+                remember_function(*function);
             }
             const bool compound_start = current().is("{") ||
                 (current().kind == TokenKind::StructuredSplice && current().splice &&
@@ -5281,7 +5335,15 @@ std::unique_ptr<Expr> Parser::parse_postfix(std::unique_ptr<Expr> seed) {
                         Expr::GenericArgument argument;
                         (void)current();
                         if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
-                        if (type_start(TypeProbe::ExpressionAlternative)) {
+                        auto probe = TypeProbe::GenericArgumentAlternative;
+                        if (preparing_header_ && expression->kind == Expr::Kind::Name) {
+                            const auto* parameters = known_generic_parameters(*expression);
+                            const auto ordinal = expression->generic_arguments.size();
+                            if (parameters && ordinal < parameters->size() &&
+                                (*parameters)[ordinal] == GenericParameterKind::Type)
+                                probe = TypeProbe::GenericTypeArgumentAlternative;
+                        }
+                        if (type_start(probe)) {
                             ProductionScope type_name(*this, SyntaxProduction::TypeName);
                             argument.type = parse_type();
                             std::optional<std::string> declared;
@@ -5461,6 +5523,8 @@ std::unique_ptr<Expr> Parser::parse_primary() {
         return result;
     }
     if (syntax_ && (macro_start() || active_syntax(false))) {
+        if (probing_header_type_)
+            throw HeaderProbeInvocation{public_input_indices_[index_], macro_start()};
         if (parsing_public_fragment_) {
             auto placeholder = std::make_unique<Expr>();
             placeholder->kind = Expr::Kind::Integer;

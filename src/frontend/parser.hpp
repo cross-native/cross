@@ -84,7 +84,13 @@ private:
     void expand_inline_macro_fragments();
     void normalize_qualified_name();
     void prepare_header();
-    bool probe_header_type();
+    bool probe_header_type(bool generic_argument = false);
+    struct HeaderProbeInvocation {
+        std::size_t position;
+        bool macro;
+        bool operator==(const HeaderProbeInvocation&) const = default;
+    };
+    struct HeaderProbeRejected {};
     struct HeaderPrepared {};
     void retain_prepared_fragment(std::size_t first, SyntaxExecution::Output output,
         SyntaxParseCategory category, std::shared_ptr<const SyntaxContext> context = {},
@@ -154,7 +160,10 @@ private:
     TypePtr parse_array_suffix(
         TypePtr element, bool parameter = false,
         std::unique_ptr<Expr>* dynamic_outer_bound = nullptr);
-    enum class TypeProbe { Required, ExpressionAlternative };
+    enum class TypeProbe {
+        Required, ExpressionAlternative, GenericArgumentAlternative,
+        GenericTypeArgumentAlternative,
+    };
     bool type_start(TypeProbe probe = TypeProbe::Required);
     void parse_external(Program& program, const std::string& name_space);
     void parse_external_node_splice(Program& program,
@@ -262,7 +271,11 @@ private:
     std::vector<std::string> active_imports_;
     std::size_t current_scope_imports_{};
     std::vector<std::string> active_generic_types_;
-    std::unordered_set<std::string> known_generic_functions_;
+    enum class GenericParameterKind { Type, Value };
+    using GenericSignature = std::vector<GenericParameterKind>;
+    std::unordered_map<std::string, GenericSignature> known_generic_functions_;
+    void remember_function(const FunctionDecl& function);
+    const GenericSignature* known_generic_parameters(const Expr& name) const;
     std::unordered_set<std::string> known_ordinary_values_;
     // Classifier spelling/mark -> exact local value declaration identity.
     std::vector<NameMap<ValueBinding>> local_scopes_;
@@ -340,7 +353,7 @@ private:
     std::weak_ptr<SyntaxExecution> execution;
     std::size_t scope_imports{};
     std::vector<std::string> generic_types;
-    std::unordered_set<std::string> generic_functions;
+    std::unordered_map<std::string, Parser::GenericSignature> generic_functions;
     std::unordered_set<std::string> ordinary_values;
     std::vector<NameMap<ValueBinding>> values;
     std::vector<NameMap<TypePtr>> local_aliases;

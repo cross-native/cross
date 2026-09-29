@@ -204,9 +204,11 @@ syntax CapturedHeader : item {
     prefix "captured_header"; match header:function_header body:block; expand captured_header;
 }
 syntax CapturedHeader;
+static uptr header_alignment<U>() { return sizeof(U); }
 captured_header
 [[noinline]] static T captured_header_identity(in T value)
-    [[aligned(header_value(sizeof(T *))), generic(parameter_list_fragment!(T))]] {
+    [[aligned(header_value(header_alignment::<T (parameter_list_fragment!(*))(in u32)>())),
+      generic(parameter_list_fragment!(T))]] {
     return value;
 }
 captured_header [[noinline]] static u32 captured_header_value(in u32 value)

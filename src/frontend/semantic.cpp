@@ -890,6 +890,15 @@ void rewrite_generic_function(FunctionDecl& function, Program& program,
         state.locals.push_back(name_key(parameter));
         state.local_types.emplace_back(name_key(parameter), parameter.type);
     }
+    // Function attributes contain required expressions too. Rewrite after
+    // generic substitution, before evaluating alignment, and detach the shared
+    // expression so declarations/instances cannot mutate one another's tree.
+    for (auto& attribute : function.attributes) {
+        if (!attribute.expression_argument) continue;
+        auto expression = clone_expr(*attribute.expression_argument);
+        rewrite_generic_expr(expression, &function, program, diagnostics, state, mangling);
+        attribute.expression_argument = std::shared_ptr<Expr>(std::move(expression));
+    }
     rewrite_generic_statement(*function.body, &function, program, diagnostics,
                               state, mangling);
     state.locals = std::move(saved_locals);
