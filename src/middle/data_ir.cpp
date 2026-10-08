@@ -1503,7 +1503,8 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
         }
         if (node->kind == Expr::Kind::Binary && node->left && node->right) {
             if (node->text == "index") {
-                co_return (co_await self(self, node->left)) && (co_await fold_integer(node->right));
+                if (!(co_await self(self, node->left))) co_return false;
+                co_return co_await fold_integer(node->right);
             }
             if (node->text == "+" || node->text == "-") {
                 // Fold pointer-producing calls before deciding which operand

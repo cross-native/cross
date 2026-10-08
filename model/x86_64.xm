@@ -810,6 +810,20 @@ abi "sysv_abi" {
         require_natural_alignment = true;
     }
 
+    # An aggregate whose eightbytes classify as X87 and X87UP, such as a
+    # record holding one f80, returns in st0. The merge list admits only the
+    # x87 bank, so any other member falls through to memory.
+    rule "aggregate-x87-result" {
+        match = ["aggregate", "array"];
+        action = "flatten";
+        min_bits = 128;
+        max_bits = 128;
+        unit_bits = 64;
+        merge_banks = ["extended-floating"];
+        require_natural_alignment = true;
+        applies_to = ["results"];
+    }
+
     rule "aggregate-result-memory" {
         match = ["aggregate", "array"];
         action = "indirect";

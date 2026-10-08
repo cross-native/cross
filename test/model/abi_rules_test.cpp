@@ -719,9 +719,10 @@ bool validate_shipped_abis() {
         !stack_is(sysv_f80_record.layout.arguments[0], 0, 0) ||
         sysv_f80_record.layout.arguments[0].stack_size != 16 ||
         sysv_f80_record.layout.arguments[0].stack_alignment != 16 ||
-        !sysv_f80_record_result || !sysv_f80_record_result.indirect ||
-        !register_is(sysv_f80_record_result, 0, "rdi")) {
-        std::cerr << "SysV non-flattenable aggregate fallback mismatch\n";
+        !sysv_f80_record_result || sysv_f80_record_result.indirect ||
+        sysv_f80_record_result.pieces.size() != 1 ||
+        !register_is(sysv_f80_record_result, 0, "st0")) {
+        std::cerr << "SysV x87 aggregate transport mismatch\n";
         return false;
     }
 

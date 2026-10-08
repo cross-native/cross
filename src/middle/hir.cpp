@@ -1048,8 +1048,8 @@ private:
                 co_return co_await evaluate_target_integer_constant_async(program_, *expression, diagnostics_,
                     size_of, align_of, source_namespace);
             });
-        co_return evaluated &&
-               (co_await set_bit_field_width_async(member, *evaluated, member.location));
+        if (!evaluated) co_return false;
+        co_return co_await set_bit_field_width_async(member, *evaluated, member.location);
     }
 
     ContinuationTask<bool> resolve_member_bounds_async(TypePtr type, std::string_view name_space, bool layout_only = false) {

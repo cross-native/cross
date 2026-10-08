@@ -10502,6 +10502,11 @@ private:
                         unsigned bits) {
         const auto bytes = (bits + 7U) / 8U;
         const auto* view = find_register_view(target);
+        if (view && view->register_class == RegisterClass::x87) {
+            // An x87 result piece is the extended payload pushed onto st0.
+            instruction("fldt", source(0));
+            return;
+        }
         const bool simd = view && view->register_class == RegisterClass::simd;
         if (simd) {
             const auto opcode = bytes >= 16 ? "movdqu"
@@ -10569,6 +10574,10 @@ private:
                          unsigned bits) {
         const auto bytes = (bits + 7U) / 8U;
         const auto* view = find_register_view(source);
+        if (view && view->register_class == RegisterClass::x87) {
+            instruction("fstpt", destination(0));
+            return;
+        }
         const bool simd = view && view->register_class == RegisterClass::simd;
         if (simd) {
             const auto opcode = bytes >= 16 ? "movdqu"

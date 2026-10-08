@@ -14,6 +14,14 @@
 #define CROSS_GCC_STRUCT
 #endif
 
+// LLVM returns an x87 value through a hidden pointer on Win64 even for a
+// sysv_abi function, where the SysV psABI (and GCC) use st0.
+#if defined(_WIN64) && defined(__clang__)
+#define CROSS_HOST_SYSV_X87_RESULT 0
+#else
+#define CROSS_HOST_SYSV_X87_RESULT 1
+#endif
+
 struct pair_i32 { std::int32_t left, right; };
 struct pair_f32 { float left, right; };
 struct pair_f64 { double left, right; };
@@ -100,7 +108,9 @@ int main() {
     const auto split = cross_sysv_split_mixed({7, 8.5});
     const auto large = cross_sysv_triple_i64({7, 8, 9});
     const auto packed = cross_sysv_packed_i64({10, 11});
+#if CROSS_HOST_SYSV_X87_RESULT
     const auto f80 = cross_sysv_wrapped_f80({1.25L});
+#endif
     integer_or_float union_input{};
     union_input.integer = 12;
     const auto union_value = cross_sysv_union(union_input);
@@ -138,7 +148,9 @@ int main() {
     check(large.first == 8 && large.second == 10 && large.third == 12,
           "SysV memory");
     check(packed.tag == 11 && packed.value == 13, "SysV packed");
-    check(f80.value == 2.25L, "SysV x87 aggregate memory");
+#if CROSS_HOST_SYSV_X87_RESULT
+    check(f80.value == 2.25L, "SysV x87 aggregate in st0");
+#endif
     check(union_value.integer == 16, "SysV union merge");
     check(ms_i32.left == 15 && ms_i32.right == 17, "Win64 eight-byte");
     check(ms_odd.first == 15 && ms_odd.second == 17 && ms_odd.third == 19,
