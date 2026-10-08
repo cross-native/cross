@@ -782,7 +782,7 @@ def runner_fragments(
 
 
 def gcc_flags(level: str) -> tuple[str, ...]:
-    """Return the Ultra64 toolchain's standalone VR4300/o32 policy."""
+    """Return the standalone VR4300/o32 flags for the MIPS GCC toolchain."""
 
     return (
         f"-{level}",
@@ -2204,7 +2204,7 @@ async def configuration_from_arguments(
             / revision_directory
             / slugify(run_name)
         )
-    gcc = resolve_tool(arguments.gcc, "Ultra64 MIPS GCC")
+    gcc = resolve_tool(arguments.gcc, "MIPS GCC")
     if arguments.target_ld is not None:
         target_ld = resolve_tool(arguments.target_ld, "MIPS GNU linker")
     else:
