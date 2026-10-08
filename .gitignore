@@ -1,6 +1,7 @@
 # Only the compiler, tests, documentation, benchmarks, models, and license
 # belong in this repository. Add any new top-level entry here explicitly.
 /*
+!/.github/
 !/.gitignore
 !/CMakeLists.txt
 !/LICENSE
