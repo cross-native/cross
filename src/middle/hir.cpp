@@ -3024,6 +3024,17 @@ bool stabilize_label_address(Module& module, LabelId id,
     return true;
 }
 
+bool manual_interface(const Function& function) {
+    const auto manual = [](const std::optional<std::string>& location) {
+        return location && *location != "auto";
+    };
+    return manual(function.result_location) ||
+           std::any_of(function.parameters.begin(), function.parameters.end(),
+                       [&](const Parameter& parameter) {
+                           return manual(parameter.physical_location);
+                       });
+}
+
 std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,
                std::optional<TypeId> indirect) {

@@ -219,6 +219,16 @@ bool atomic_object_type(const hir::Module& module, hir::TypeId id) {
               type.builtin == BuiltinType::Label));
 }
 
+// Scalar promotion's cell rule, apart from `live_on_return`.
+bool promotable_scalar_slot(const ManagedSlot& slot,
+                            const hir::Module& module) {
+    const auto& type = module.type(slot.type);
+    return !slot.is_volatile && !slot.physical_location &&
+           !slot.address_taken && !type.is_atomic &&
+           (type.kind == hir::Type::Kind::Builtin ||
+            type.kind == hir::Type::Kind::Pointer);
+}
+
 bool atomic_intrinsic(std::string_view name) {
     return atomic_builtin(name) != AtomicBuiltin::None;
 }
@@ -1026,6 +1036,7 @@ private:
         case_blocks_.clear();
         scopes_.clear();
         loops_.clear();
+        copy_outs_.clear();
         current_ = {};
         current_.source = function.id;
         address_taken_names_.clear();
@@ -1054,11 +1065,17 @@ private:
         }
         enter(current_.entry);
         scopes_.emplace_back();
+        // Without a manual interface an `out`/`inout` parameter is its
+        // transport pointer, and its cell copies in and out through it.
+        const bool pointer_transport = !hir::manual_interface(function);
         for (std::uint32_t index = 0; index < function.parameters.size(); ++index) {
             const auto& parameter = function.parameters[index];
-            const auto value = add_value(ValueKind::Parameter,
-                                         parameter.type,
-                                         parameter.location);
+            const bool transport =
+                pointer_transport && parameter.mode != ParameterMode::In;
+            const auto value = add_value(
+                ValueKind::Parameter,
+                transport ? hir_.pointer_to(parameter.type) : parameter.type,
+                parameter.location);
             current_.values[value.value].parameter_index = index;
             current_.parameters.push_back(value);
             // An atomic-qualified parameter is still transported by value,
@@ -1085,7 +1102,8 @@ private:
                 {slot, parameter.location, cell_type,
                  "$param." + std::to_string(index), std::nullopt, false,
                  address_taken_names_.contains(name_key(parameter)),
-                 parameter.mode != ParameterMode::In, 1, index});
+                 parameter.mode != ParameterMode::In && !transport, 1,
+                 index});
             const LocalBinding binding{slot, cell_type, std::nullopt,
                                        std::nullopt};
             if (!scopes_.back().bindings.emplace(name_key(parameter), binding).second) {
@@ -1094,7 +1112,15 @@ private:
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot,
                            parameter.location);
-            if (parameter.mode != ParameterMode::Out) {
+            if (transport) {
+                copy_outs_.push_back({binding, value});
+                if (parameter.mode == ParameterMode::InOut) {
+                    const auto incoming =
+                        load_pointer(value, parameter.location);
+                    if (!incoming) failed_ = true;
+                    else (void)store_slot(binding, *incoming, parameter.location);
+                }
+            } else if (parameter.mode != ParameterMode::Out) {
                 (void)store_slot(binding, value, parameter.location);
             }
         }
@@ -1140,6 +1166,7 @@ private:
         if (current_block_) {
             if (void_type(hir_, function.result_type) &&
                 !function.definition->attribute("noreturn")) {
+                copy_out_parameters(function.location);
                 terminate(TerminatorKind::Return, function.location, std::nullopt, {});
             } else {
                 terminate(TerminatorKind::Unreachable, function.location, std::nullopt, {});
@@ -2786,6 +2813,15 @@ private:
                     scopes_[scope_index - 1].dynamic_stack_mark) {
                 (void)dynamic_stack_restore(*mark, location);
             }
+        }
+    }
+
+    // Runs at a normal return, after the return value is saved.
+    void copy_out_parameters(SourceLocation location) {
+        for (const auto& [cell, pointer] : copy_outs_) {
+            const auto value = load_slot(cell, location);
+            current_.values[value.value].copy_out_read = true;
+            if (!store_pointer(pointer, value, location)) failed_ = true;
         }
     }
 
@@ -6164,6 +6200,7 @@ private:
                 failed_ = true;
                 return;
             }
+            copy_out_parameters(statement.location);
             end_lifetimes_from(0, statement.location);
             terminate(TerminatorKind::Return, statement.location,
                       void_result ? std::nullopt : result, {});
@@ -6512,6 +6549,9 @@ private:
     std::optional<BlockId> current_block_;
     std::optional<EffectId> current_effect_;
     NameMap<ValueId> parameter_values_;
+    // Parameter cells and the transport pointers their normal returns copy
+    // them through.
+    std::vector<std::pair<LocalBinding, ValueId>> copy_outs_;
     NameSet address_taken_names_;
     NameSet modified_names_;
     NameSet local_names_;
@@ -6707,9 +6747,11 @@ void check_out_definite_assignment(const ManagedFunction& function,
             auto assigned = assigned_in[block.id.value];
             for (const auto id : block.values) {
                 const auto& value = function.values[id.value];
-                const bool direct_read =
-                    value.kind == ValueKind::Load && value.slot == slot.id;
+                const bool direct_read = value.kind == ValueKind::Load &&
+                                         value.slot == slot.id &&
+                                         !value.copy_out_read;
                 const bool pointer_read = !value.bit_field_update_read &&
+                    !value.copy_out_read &&
                     (value.kind == ValueKind::PointerLoad ||
                      (value.kind == ValueKind::Atomic &&
                       value.atomic != AtomicOperation::Store));
@@ -8543,12 +8585,9 @@ public:
           occurrences_(function.slots.size()), candidates_(function.slots.size()),
           inserted_phis_(function.blocks.size()) {
         for (std::uint32_t index = 0; index < function.slots.size(); ++index) {
-            const SlotId slot{index};
-            const auto& type = hir_module.type(function.slots[index].type);
-            candidates_[index] = optimizable_slot(function, slot) &&
-                !function.slots[index].live_on_return && !type.is_atomic &&
-                (type.kind == hir::Type::Kind::Builtin ||
-                 type.kind == hir::Type::Kind::Pointer);
+            candidates_[index] =
+                promotable_scalar_slot(function.slots[index], hir_module) &&
+                !function.slots[index].live_on_return;
         }
         for (const auto& value : function.values) {
             if (value.slot && value.kind != ValueKind::Load &&

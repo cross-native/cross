@@ -159,6 +159,9 @@ struct ManagedValue {
     // source read of otherwise uninitialized neighboring fields.
     std::optional<BitFieldRegion> bit_field_region;
     bool bit_field_update_read{};
+    // The load that copies an `out`/`inout` cell out at a normal return.
+    // Definite assignment checks it as that return, not as a source read.
+    bool copy_out_read{};
     std::optional<hir::FunctionId> callee;
     // Indirect calls carry their stable function TypeId and place the target
     // value first in operands. Direct calls retain only canonical callee ID.
@@ -194,8 +197,9 @@ struct ManagedSlot {
     std::optional<std::string> physical_location;
     bool is_volatile{};
     bool address_taken{};
-    // `out`/`inout` parameter cells are consumed by ABI copy-out after the
-    // source-level body. Optimizers must model that implicit return-edge read.
+    // An `out`/`inout` cell of a manual interface: its target copies it to the
+    // caller after the body. Optimizers must model that implicit return-edge
+    // read.
     bool live_on_return{};
     unsigned minimum_alignment{1};
     // Present only for a source parameter cell. Kept through lowering so

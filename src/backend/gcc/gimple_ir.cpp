@@ -484,7 +484,8 @@ public:
             if (block.terminator.kind != mir::TerminatorKind::Return) continue;
             for (std::size_t index = 0; index < entity_.parameters.size();
                  ++index) {
-                if (entity_.parameters[index].mode == ParameterMode::In)
+                if (entity_.parameters[index].mode == ParameterMode::In ||
+                    transport_pointer(entity_.parameters[index]))
                     continue;
                 copyouts_.push_back({block.id, index, next_version_++});
             }
@@ -594,7 +595,7 @@ private:
         if (value.kind == mir::ValueKind::Parameter) {
             const auto& parameter =
                 entity_.parameters.at(value.parameter_index);
-            if (!parameter_cell(parameter)) {
+            if (!parameter_cell(parameter) || transport_pointer(parameter)) {
                 return "arg" + std::to_string(value.parameter_index) + '_' +
                        std::to_string(value.id.value + 1) + "(D)";
             }
@@ -629,7 +630,8 @@ private:
         case ValueKind::SlotAddress:
         case ValueKind::GlobalAddress: return false;
         case ValueKind::Parameter:
-            return parameter_cell(entity_.parameters.at(value.parameter_index));
+            return parameter_cell(entity_.parameters.at(value.parameter_index)) &&
+                   !transport_pointer(entity_.parameters.at(value.parameter_index));
         case ValueKind::Atomic:
             return value.atomic != AtomicOperation::Store &&
                    value.atomic != AtomicOperation::ThreadFence &&
@@ -864,7 +866,7 @@ private:
         if (value.kind == ValueKind::Parameter) {
             const auto& parameter =
                 entity_.parameters.at(value.parameter_index);
-            if (!parameter_cell(parameter) ||
+            if (!parameter_cell(parameter) || transport_pointer(parameter) ||
                 parameter.mode == ParameterMode::Out) {
                 return;
             }
@@ -1226,11 +1228,21 @@ private:
         }
     }
 
+    // Outside a manual interface an `out`/`inout` parameter's MIR value is
+    // its transport pointer, and MIR performs the copy-in and copy-out.
+    bool transport_pointer(const hir::Parameter& parameter) const {
+        return parameter.mode != ParameterMode::In &&
+               !hir::manual_interface(entity_);
+    }
+
     void emit_parameter_copyout(mir::BlockId block) {
         for (std::size_t index = 0; index < entity_.parameters.size();
              ++index) {
             const auto& parameter = entity_.parameters[index];
-            if (parameter.mode == ParameterMode::In) continue;
+            if (parameter.mode == ParameterMode::In ||
+                transport_pointer(parameter)) {
+                continue;
+            }
             const auto expected_name = "$param." + std::to_string(index);
             const auto slot =
                 std::find_if(function_.slots.begin(), function_.slots.end(),

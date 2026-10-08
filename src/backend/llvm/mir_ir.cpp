@@ -335,7 +335,7 @@ public:
                 const auto& parameter =
                     entity_.parameters[value.parameter_index];
                 references_[value.id.value] =
-                    parameter_cell(parameter)
+                    parameter_cell(parameter) && !transport_pointer(parameter)
                         ? "%mir.param." + std::to_string(value.parameter_index)
                         : "%arg" + std::to_string(value.parameter_index);
             } else if (value.kind == mir::ValueKind::ConstantInteger) {
@@ -819,7 +819,7 @@ private:
         if (value.kind == ValueKind::Parameter) {
             const auto& parameter =
                 entity_.parameters[value.parameter_index];
-            if (!parameter_cell(parameter)) return;
+            if (!parameter_cell(parameter) || transport_pointer(parameter)) return;
             if (parameter.mode != ParameterMode::Out) {
                 const auto& type = hir_.type(parameter.type);
                 out_ << "  " << reference(value.id) << " = load "
@@ -1348,10 +1348,20 @@ private:
         }
     }
 
+    // Outside a manual interface an `out`/`inout` parameter's MIR value is
+    // its transport pointer, and MIR performs the copy-in and copy-out.
+    bool transport_pointer(const hir::Parameter& parameter) const {
+        return parameter.mode != ParameterMode::In &&
+               !hir::manual_interface(entity_);
+    }
+
     void emit_parameter_copyout(mir::BlockId block) {
         for (std::size_t index = 0; index < entity_.parameters.size(); ++index) {
             const auto& parameter = entity_.parameters[index];
-            if (parameter.mode == ParameterMode::In) continue;
+            if (parameter.mode == ParameterMode::In ||
+                transport_pointer(parameter)) {
+                continue;
+            }
             const auto name = "$param." + std::to_string(index);
             const auto slot = std::find_if(
                 function_.slots.begin(), function_.slots.end(),

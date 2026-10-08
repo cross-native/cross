@@ -1134,18 +1134,6 @@ private:
             current_.stack_slots.push_back(std::move(result_pointer));
         }
         for (std::size_t index = 0; index < entity.parameters.size(); ++index) {
-            if (entity.parameters[index].mode != ParameterMode::In) {
-                machine::StackSlot pointer;
-                pointer.id = {
-                    static_cast<std::uint32_t>(
-                        current_.stack_slots.size())};
-                pointer.kind = machine::StackSlotKind::Local;
-                pointer.size = 8;
-                pointer.alignment = 8;
-                pointer.location = entity.parameters[index].location;
-                pointer.name = "$paramptr." + std::to_string(index);
-                current_.stack_slots.push_back(std::move(pointer));
-            }
             if (manual) {
                 const auto& parameter = manual->parameters[index];
                 if (parameter.mode != ParameterMode::Out &&
@@ -1259,12 +1247,13 @@ private:
             instruction.operands.push_back(
                 immediate_operand(value.parameter_index, 0, machine::i32));
             instruction.defs.push_back(reg(value.id));
-            // Even an unread out value has an observable incoming pointer:
-            // the late return boundary copies its cell through that pointer.
+            // A manual out value has an observable incoming pointer even when
+            // unread: the late return boundary copies its cell through it.
             instruction.has_side_effects =
+                manual_plans_.find(current_.source) &&
                 hir_.function(current_.source)
-                    .parameters[value.parameter_index]
-                    .mode != ParameterMode::In;
+                        .parameters[value.parameter_index]
+                        .mode != ParameterMode::In;
             return instruction;
         }
         if (value.kind == ValueKind::ConstantInteger) {
@@ -6325,7 +6314,8 @@ private:
                             reg.id < count) {
                             parameter_definitions.emplace_back(
                                 reg.id, parameter_index);
-                            if (parameter_index <
+                            if (manual_plans_.find(current_.source) &&
+                                parameter_index <
                                     hir_.function(current_.source)
                                         .parameters.size() &&
                                 hir_.function(current_.source)
@@ -9594,6 +9584,9 @@ ParameterStoragePlan parameter_storage_plan(
     const auto locations = dynamic
         ? dynamic_argument_locations(*dynamic)
         : stable.arguments;
+    // Without a manual interface an `out`/`inout` parameter is captured as
+    // its transport pointer, like an `in` pointer.
+    const bool pointer_transport = !hir::manual_interface(entity);
     for (std::size_t index = 0; index < locations.size(); ++index) {
         const auto& location = locations[index];
         for (const auto& piece : location.pieces) {
@@ -9603,7 +9596,8 @@ ParameterStoragePlan parameter_storage_plan(
             }
         }
         if (index >= entity.parameters.size() ||
-            entity.parameters[index].mode != ParameterMode::In ||
+            (entity.parameters[index].mode != ParameterMode::In &&
+             !pointer_transport) ||
             location.indirect || location.pieces.size() != 1 ||
             !location.pieces.front().in_register) {
             continue;
@@ -9627,10 +9621,12 @@ ParameterStoragePlan parameter_storage_plan(
         // Direct scalar, fixed-vector, and ordinary multi-piece captures can
         // write their final home/color without a temporary. Aggregates may
         // contain odd-sized integer pieces, whose exact-byte transport uses
-        // RAX, and output channels must dereference a pointer through R10.
+        // RAX, and manual output channels dereference a pointer through R10.
+        const bool pointer = parameter.mode != ParameterMode::In;
         const bool scratch_free =
-            parameter.mode == ParameterMode::In && !location.indirect &&
-            all_registers && !is_aggregate(hir_module, parameter.type);
+            (!pointer || pointer_transport) && !location.indirect &&
+            all_registers &&
+            (pointer || !is_aggregate(hir_module, parameter.type));
         result.scratch_free_capture[index] = scratch_free;
         result.needs_capture_scratch |= !scratch_free;
     }
@@ -17590,39 +17586,6 @@ private:
         }
     }
 
-    void capture_automatic_output_registers(const machine::Function& function,
-                                           const hir::Function& entity) {
-        if (manual_plans_.find(function.source)) return;
-        const auto* abi = abi_model(function.abi);
-        if (!abi) return;
-        std::vector<AutomaticAbiValue> parameters;
-        for (const auto& parameter : entity.parameters)
-            parameters.push_back(automatic_value(hir_, parameter.type, *abi,
-                                                 parameter.mode != ParameterMode::In));
-        std::optional<AutomaticAbiValue> result;
-        if (!is_void(hir_, entity.result_type))
-            result = automatic_value(hir_, entity.result_type, *abi);
-        const auto stable = classify_scalar_signature(parameters, result, function.abi,
-                                                      std::nullopt, subtarget_.enabled_features());
-        const auto* dynamic = dynamic_plans_.find(function.source);
-        const auto locations = dynamic ? dynamic_argument_locations(*dynamic) : stable.arguments;
-        // Snapshot every register-carried output pointer without a scratch
-        // register, before any parameter's copy-in can consume R10/RAX/XMM0.
-        // The model/dynamic plan, not a default register list, owns endpoints.
-        for (std::size_t index = 0; index < entity.parameters.size() && index < locations.size(); ++index) {
-            if (entity.parameters[index].mode == ParameterMode::In ||
-                locations[index].pieces.empty() || !locations[index].pieces.front().in_register) continue;
-            const auto home = named_slot_offset(function, "$paramptr." + std::to_string(index));
-            if (!home) {
-                diagnostics_.error(entity.parameters[index].location,
-                                   "output parameter has no native pointer home");
-                continue;
-            }
-            instruction("movq", register_name(locations[index].pieces.front().reg, 64) +
-                                    ", " + memory(*home));
-        }
-    }
-
     void emit_parameter(const machine::Function& function,
                         const machine::Instruction& value) {
         const auto index = static_cast<std::size_t>(
@@ -17714,44 +17677,13 @@ private:
         const auto& location = locations[index];
         const auto& parameter = entity.parameters[index];
         if (parameter.mode != ParameterMode::In) {
-            const auto pointer_slot = named_slot_offset(
-                function, "$paramptr." + std::to_string(index));
-            if (!pointer_slot) {
-                diagnostics_.error(value.location,
-                                   "output parameter has no native pointer home");
-                return;
-            }
+            // The managed body copies in and out through this pointer.
             const auto& source = location.pieces.front();
             if (source.in_register) {
-                instruction("movq", memory(*pointer_slot) + ", %r10");
+                store(function, target, source.reg);
             } else {
-                instruction(
-                    "movq", incoming_memory(source.stack_offset) +
-                                ", %r10");
-            }
-            if (!source.in_register)
-                instruction("movq", "%r10, " + memory(*pointer_slot));
-            if (parameter.mode == ParameterMode::Out) return;
-            if (is_aggregate(hir_, parameter.type)) {
-                copy_pointer_to_frame(
-                    "r10", vreg_offset(function, target),
-                    storage_size(hir_, parameter.type));
-            } else if (is_vector(hir_, parameter.type)) {
-                copy_pointer_to_frame(
-                    "r10", vreg_offset(function, target),
-                    storage_size(hir_, parameter.type));
-            } else if (target.mode.bits == 80) {
-                instruction("fldt", "0(%r10)");
-                store_x87(function, target);
-            } else if (target.mode.bits == 128) {
-                instruction("movq", "0(%r10), %rax");
-                instruction("movq", "8(%r10), %rdx");
-                store(function, target, "rax", "rdx");
-            } else {
-                instruction("mov" +
-                                std::string(1, suffix(target.mode.bits)),
-                            "0(%r10), " +
-                                register_name("rax", target.mode.bits));
+                instruction("movq", incoming_memory(source.stack_offset) +
+                                        ", %rax");
                 store(function, target, "rax");
             }
             return;
@@ -22014,47 +21946,6 @@ private:
         if (emit_manual_epilogue(function, value)) return;
         restore_hard_registers(function, "$hard.abi.");
         const auto& entity = hir_.function(function.source);
-        for (std::size_t index = 0; index < entity.parameters.size(); ++index) {
-            const auto& parameter = entity.parameters[index];
-            if (parameter.mode == ParameterMode::In) continue;
-            const auto pointer = named_slot_offset(
-                function, "$paramptr." + std::to_string(index));
-            const auto cell = named_slot_offset(
-                function, "$param." + std::to_string(index));
-            if (!pointer || !cell) {
-                diagnostics_.error(
-                    value.location,
-                    "output parameter is missing its native cell");
-                continue;
-            }
-            instruction("movq", memory(*pointer) + ", %r10");
-            const auto mode = mode_for(hir_, parameter.type);
-            if (is_aggregate(hir_, parameter.type)) {
-                copy_frame_to_pointer(
-                    *cell, "r10", storage_size(hir_, parameter.type));
-            } else if (is_vector(hir_, parameter.type)) {
-                copy_frame_to_pointer(
-                    *cell, "r10", storage_size(hir_, parameter.type));
-            } else if (mode.bits == 80) {
-                instruction("fldt", memory(*cell));
-                instruction("fstpt", "0(%r10)");
-            } else if (mode.bits == 128) {
-                instruction("movq", memory(*cell) + ", %rax");
-                instruction("movq", memory(*cell + 8) + ", %rdx");
-                instruction("movq", "%rax, 0(%r10)");
-                instruction("movq", "%rdx, 8(%r10)");
-            } else {
-                instruction("mov" + std::string(1, suffix(mode.bits)),
-                            memory(*cell) + ", " +
-                                register_name("rax", mode.bits));
-                const auto& parameter_type = hir_.type(parameter.type);
-                instruction(
-                    parameter_type.is_atomic
-                        ? "xchg" + std::string(1, suffix(mode.bits))
-                        : "mov" + std::string(1, suffix(mode.bits)),
-                    register_name("rax", mode.bits) + ", 0(%r10)");
-            }
-        }
         if (!value.uses.empty()) {
             std::optional<ReturnAssignment> classified_result;
             if (const auto* dynamic =
@@ -23440,7 +23331,6 @@ private:
             capture_manual_x87_inputs(function, *manual);
             capture_manual_register_inputs(function, *manual);
         }
-        capture_automatic_output_registers(function, entity);
         std::optional<ReturnAssignment> managed_result;
         if (!manual_plans_.find(function.source)) {
             if (const auto* dynamic = dynamic_plans_.find(function.source);

@@ -833,7 +833,6 @@ private:
             current_.stack_slots.push_back(std::move(target));
         }
 
-        const auto& entity = hir_.function(source.source);
         if (std::any_of(source.values.begin(), source.values.end(),
                         [](const mir::ManagedValue& value) {
                             return value.kind == mir::ValueKind::DynamicAlloca;
@@ -850,18 +849,6 @@ private:
             mark.location = source.location;
             mark.name = "$dynamic.call.sp";
             current_.stack_slots.push_back(std::move(mark));
-        }
-        for (std::size_t index = 0; index < entity.parameters.size(); ++index) {
-            if (entity.parameters[index].mode == ParameterMode::In) continue;
-            machine::StackSlot pointer;
-            pointer.id = {
-                static_cast<std::uint32_t>(current_.stack_slots.size())};
-            pointer.kind = machine::StackSlotKind::Local;
-            pointer.size = (hir_.address_bits + 7U) / 8U;
-            pointer.alignment = pointer.size;
-            pointer.location = entity.parameters[index].location;
-            pointer.name = "$paramptr." + std::to_string(index);
-            current_.stack_slots.push_back(std::move(pointer));
         }
 
         for (std::size_t index = 0;
@@ -1037,10 +1024,6 @@ private:
             result.operands.push_back(immediate_operand(
                 value.parameter_index, 0, machine::i32));
             result.defs.push_back(reg(value.id));
-            const auto& parameters = hir_.function(source_->source).parameters;
-            result.has_side_effects =
-                value.parameter_index < parameters.size() &&
-                parameters[value.parameter_index].mode != ParameterMode::In;
             return result;
         }
         if (value.kind == ValueKind::ConstantInteger ||
@@ -5366,15 +5349,14 @@ private:
             return false;
         }
         const auto& entity = hir_.function(function.source);
-        if (index >= entity.parameters.size() ||
-            entity.parameters[index].mode != ParameterMode::In) {
-            return false;
-        }
+        if (index >= entity.parameters.size()) return false;
+        // An `out`/`inout` parameter arrives as its transport pointer.
+        const bool pointer = entity.parameters[index].mode != ParameterMode::In;
         const auto& assignment =
             active_signature_->layout.call.arguments[index];
         const auto target = parameter_target(function, index);
         if (!target) return false;
-        if (is_floating(hir_, entity.parameters[index].type)) {
+        if (!pointer && is_floating(hir_, entity.parameters[index].type)) {
             return assignment.pieces.size() == 1 &&
                 assignment.pieces.front().location.kind ==
                     LocationKind::Register &&
@@ -5388,7 +5370,9 @@ private:
                         })) {
             return false;
         }
-        const auto bits = type_bits(hir_, entity.parameters[index].type);
+        const auto bits = pointer
+            ? hir_.address_bits
+            : type_bits(hir_, entity.parameters[index].type);
         return assignment.pieces.size() == 1 ||
             (subtarget_.has_feature(Feature::Mips3) && bits <= 64);
     }
@@ -6461,41 +6445,34 @@ private:
                                "MIPS ABI parameter has no transport piece");
             return;
         }
+        if (parameter.mode != ParameterMode::In) {
+            // The managed body copies in and out through this pointer. A
+            // 32-bit ABI address carried by a MIPS-III 64-bit GPR must be
+            // canonical before it is dereferenced.
+            const auto& piece = assignment.pieces.front();
+            if (direct_parameter_capture(function, index)) {
+                const auto destination = assigned_gpr(function, target);
+                if (!destination) return;
+                if (*destination != piece.location.reg) {
+                    instruction("move", reg_name(*destination) + "," +
+                                            reg_name(piece.location.reg));
+                }
+                if (!abi_supplies_canonical_word(piece, hir_.address_bits)) {
+                    normalize_integer(*destination, hir_.address_bits, true);
+                }
+                return;
+            }
+            load_abi_piece(function, piece, *active_signature_->abi, "t0",
+                           !output_pointer_in_register(function, index));
+            normalize_integer("t0", hir_.address_bits, true);
+            store_vreg(function, target, "t0", value.location);
+            return;
+        }
         if (is_aggregate(hir_, parameter.type)) {
-            if (parameter.mode != ParameterMode::In) {
-                const auto* pointer =
-                    named_slot(function, "$paramptr." + std::to_string(index));
-                if (!pointer || !pointer->frame_offset) {
-                    diagnostics_.error(
-                        value.location,
-                        "MIPS aggregate output parameter has no pointer home");
-                    return;
-                }
-                load_abi_piece(function, assignment.pieces.front(),
-                               *active_signature_->abi, "t0",
-                               !output_pointer_in_register(function, index));
-                normalize_integer("t0", hir_.address_bits, true);
-                instruction(address_store(),
-                            "$t0," + memory(*pointer->frame_offset));
-                const auto home = vreg_offset(function, target, value.location);
-                if (parameter.mode == ParameterMode::Out) {
-                    for (unsigned byte = 0; byte < target.mode.bits / 8U;
-                         ++byte) {
-                        instruction(
-                            "sb",
-                            "$zero," +
-                                memory(static_cast<std::int64_t>(home) + byte));
-                    }
-                } else {
-                    copy_bytes(frame_base(), home, "t0", 0,
-                               target.mode.bits / 8U);
-                }
-            } else {
-                for (const auto& piece : assignment.pieces) {
-                    capture_aggregate_piece(function, target, piece,
-                                            *active_signature_->abi, true,
-                                            value.location);
-                }
+            for (const auto& piece : assignment.pieces) {
+                capture_aggregate_piece(function, target, piece,
+                                        *active_signature_->abi, true,
+                                        value.location);
             }
             return;
         }
@@ -6663,44 +6640,6 @@ private:
                     is_address_value(hir_, parameter.type));
             return;
         }
-        if (parameter.mode != ParameterMode::In) {
-            const auto* pointer = named_slot(
-                function, "$paramptr." + std::to_string(index));
-            if (!pointer || !pointer->frame_offset) {
-                diagnostics_.error(value.location,
-                                   "MIPS output parameter has no pointer home");
-                return;
-            }
-            load_abi_piece(function, assignment.pieces.front(),
-                           *active_signature_->abi, "t0",
-                           !output_pointer_in_register(function, index));
-            // A 32-bit ABI address carried by a MIPS-III 64-bit GPR must be
-            // canonical before it is dereferenced.  Indexed address
-            // formation used to provide this sign extension accidentally;
-            // direct pointer loads (and pointer induction variables) do not.
-            normalize_integer("t0", hir_.address_bits, true);
-            instruction(address_store(),
-                        "$t0," + memory(*pointer->frame_offset));
-            // An `out` cell starts unassigned; its initial value is never read.
-            if (parameter.mode == ParameterMode::Out) return;
-            if (is_floating(hir_, parameter.type)) {
-                instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
-                            "$f0,0($t0)");
-                store_fvreg(function, target, "f0", value.location);
-            } else {
-                if (legalizes_to_pair(target)) {
-                    load_pair_memory("t1", "t2", 0, "t0");
-                    store_vreg_pair(function, target, "t1", "t2",
-                                    value.location);
-                } else {
-                    load_integer_memory(
-                        "t1", "0($t0)", target.mode.bits,
-                        is_signed_integer(hir_, parameter.type));
-                    store_vreg(function, target, "t1", value.location);
-                }
-            }
-            return;
-        }
         if (is_floating(hir_, parameter.type) &&
             assignment.pieces.size() == 1 &&
             assignment.pieces.front().location.kind ==
@@ -6744,49 +6683,6 @@ private:
             }
         } else {
             store_vreg(function, target, "t0", value.location);
-        }
-    }
-
-    void emit_copyouts(const machine::Function& function,
-                       SourceLocation location) {
-        const auto& entity = hir_.function(function.source);
-        for (std::size_t index = 0; index < entity.parameters.size(); ++index) {
-            const auto& parameter = entity.parameters[index];
-            if (parameter.mode == ParameterMode::In) continue;
-            const auto* pointer = named_slot(
-                function, "$paramptr." + std::to_string(index));
-            const auto* local = named_slot(
-                function, "$param." + std::to_string(index));
-            if (!pointer || !pointer->frame_offset || !local ||
-                !local->frame_offset) {
-                diagnostics_.error(
-                    location,
-                    "MIPS output parameter lacks its managed copy-out cells");
-                continue;
-            }
-            instruction(address_load(),
-                        "$t0," + memory(*pointer->frame_offset));
-            const auto bits = type_bits(hir_, parameter.type);
-            if (is_aggregate(hir_, parameter.type)) {
-                copy_bytes("t0", 0, frame_base(), *local->frame_offset,
-                           bits / 8U);
-            } else if (is_floating(hir_, parameter.type)) {
-                instruction(bits == 32 ? "lwc1" : "ldc1",
-                            "$f0," + memory(*local->frame_offset));
-                instruction(bits == 32 ? "swc1" : "sdc1",
-                            "$f0,0($t0)");
-            } else {
-                if (bits > 32 &&
-                    !subtarget_.has_feature(Feature::Mips3)) {
-                    load_pair_memory("t1", "t2", *local->frame_offset);
-                    store_pair_memory("t1", "t2", 0, "t0");
-                } else {
-                    load_integer_memory(
-                        "t1", memory(*local->frame_offset), bits,
-                        is_signed_integer(hir_, parameter.type));
-                    store_integer_memory("t1", "0($t0)", bits);
-                }
-            }
         }
     }
 
@@ -7631,7 +7527,6 @@ private:
     void place_return(const machine::Function& function,
                       const machine::Instruction& value,
                       bool fallthrough_epilogue) {
-        emit_copyouts(function, value.location);
         const auto& entity = hir_.function(function.source);
         if (!value.uses.empty()) {
             if (!active_signature_ ||

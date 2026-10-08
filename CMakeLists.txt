@@ -4953,6 +4953,78 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/middle/aggregate_members_errors.cmake")
     set_tests_properties(cross_aggregate_members_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;middle;feature.records")
+    # `out`/`inout` copy-in and copy-out: host runs per private-function ABI,
+    # QEMU runs per ABI, CPU and byte order, and a frame-traffic check.
+    foreach(level O0 O2)
+        foreach(mode native cross custom)
+            add_test(NAME cross_parameter_copy_out_${mode}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out.x
+                    -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_driver.cpp
+                    -DMODEL=${CMAKE_SOURCE_DIR}/test/model/custom.y
+                    -DMODE=${mode} -DLEVEL=${level}
+                    -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/parameter-copy-out-${mode}-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out.cmake")
+            set_tests_properties(cross_parameter_copy_out_${mode}_${level} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.parameters;profile.${mode};opt.${level}")
+        endforeach()
+        foreach(cpu r3000 vr4300)
+            foreach(endian b l)
+                if(endian STREQUAL b)
+                    set(endian_label big)
+                else()
+                    set(endian_label little)
+                endif()
+                set(name cross_parameter_copy_out_o32_${cpu}_${endian}_${level})
+                add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/parameter-copy-out-o32-${cpu}-${endian}-${level}
+                    -DMIPS_CPUS=${cpu} -DMIPS_ENDIANS=${endian} -DMIPS_SINGLE_CASE=ON
+                    -DEXPECTED=P "-DCC_FLAGS=-${level};-fno-eval-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+                set_tests_properties(${name} PROPERTIES
+                    LABELS "check.runtime;arch.mips;backend.native;middle;feature.parameters;profile.o32;isa.${cpu};endian.${endian_label};opt.${level}"
+                    SKIP_REGULAR_EXPRESSION "skipping MIPS")
+            endforeach()
+        endforeach()
+        foreach(endian big little)
+            set(name cross_parameter_copy_out_n64_${endian}_${level})
+            add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/parameter-copy-out-n64-${endian}-${level}
+                -DN64_ENDIAN=${endian} "-DEXTRA_FLAGS=-${level} -fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(${name} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;middle;feature.parameters;profile.n64;endian.${endian};opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_parameter_copy_out_codegen_x86_64 COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_codegen.x
+        -DARCH=x86_64 "-DTARGET_FLAGS=-target;x86_64-unknown-linux-gnu"
+        "-DFLAT=copy_out_quotient;copy_out_bump;copy_out_status"
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/parameter-copy-out-codegen-x86_64
+        -P "${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_codegen.cmake")
+    set_tests_properties(cross_parameter_copy_out_codegen_x86_64 PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;middle;feature.parameters;opt.O2")
+    add_test(NAME cross_parameter_copy_out_codegen_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_codegen.x
+        -DARCH=mips -DTARGET_FLAGS=-mprofile=vr4300-o32
+        "-DFLAT=copy_out_quotient;copy_out_bump;copy_out_status"
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/parameter-copy-out-codegen-mips
+        -P "${CMAKE_SOURCE_DIR}/test/middle/parameter_copy_out_codegen.cmake")
+    set_tests_properties(cross_parameter_copy_out_codegen_mips PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;middle;feature.parameters;profile.o32;isa.vr4300;endian.big;opt.O2")
     foreach(constants_mode O0 O3)
         add_test(NAME cross_required_constants_mips_${constants_mode} COMMAND "${CMAKE_COMMAND}"
             -DCC=$<TARGET_FILE:cross_cc>

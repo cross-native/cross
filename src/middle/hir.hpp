@@ -320,6 +320,10 @@ bool validate_source_address_spaces(Program& program,
                                     const CompilerOptions& options,
                                     const TargetInfo& target,
                                     Diagnostics& diagnostics);
+// A manual interface places its result or a parameter itself. Its targets copy
+// `out`/`inout` cells to the caller; every other managed function copies them
+// out in MIR through the transport pointer.
+[[nodiscard]] bool manual_interface(const Function& function);
 [[nodiscard]] std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,
                std::optional<TypeId> indirect);
