@@ -28,6 +28,8 @@ void destroy_and_poison(Value* value) noexcept {
     for (std::size_t index = 0; index < sizeof(Value); ++index) bytes[index] = 0xA5;
     ::operator delete(value);
 }
+// Out of line so GCC does not pair an inlined free() with an operator new call.
+[[gnu::noinline]] void release(void* pointer) noexcept { std::free(pointer); }
 } // namespace
 
 void* operator new(std::size_t bytes) {
@@ -36,10 +38,10 @@ void* operator new(std::size_t bytes) {
     throw std::bad_alloc();
 }
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete[](void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete(void* pointer) noexcept { release(pointer); }
+void operator delete[](void* pointer) noexcept { release(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { release(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { release(pointer); }
 
 int main() {
     using namespace cross;

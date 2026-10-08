@@ -5397,11 +5397,10 @@ private:
                 if (std::any_of(
                         instructions[begin + index].defs.begin(),
                         instructions[begin + index].defs.end(),
-                        [&](machine::Register definition) {
-                            return definition.kind ==
+                        [&](machine::Register reg) {
+                            return reg.kind ==
                                        machine::RegisterKind::Virtual &&
-                                   backedge_phi_sources.contains(
-                                       definition.id);
+                                   backedge_phi_sources.contains(reg.id);
                         })) {
                     prefer_early[index] = true;
                 }
@@ -19196,13 +19195,13 @@ private:
                   std::get<machine::ImmediateOperand>(
                       value.operands[4]).value)
             : std::int64_t{};
-        const auto address_register = [&](machine::Register value,
+        const auto address_register = [&](machine::Register reg,
                                           std::string_view scratch) {
             if (const auto* assigned =
-                    assigned_integer_register(function, value)) {
+                    assigned_integer_register(function, reg)) {
                 return std::string(assigned->storage_name);
             }
-            load(function, value, scratch);
+            load(function, reg, scratch);
             return std::string(scratch);
         };
         const auto base_register = address_register(base, "rax");
@@ -21436,12 +21435,12 @@ private:
                     const auto* target = assigned_simd_register(
                         function, copy.target);
                     if (rematerialized_immediate(function, copy.source)) {
-                        const auto destination = target
+                        const auto load_register = target
                             ? std::string_view(target->name)
                             : std::string_view("xmm2");
-                        load_float(function, copy.source, destination);
+                        load_float(function, copy.source, load_register);
                         if (!target) {
-                            store_float(function, copy.target, destination);
+                            store_float(function, copy.target, load_register);
                         }
                         return;
                     }

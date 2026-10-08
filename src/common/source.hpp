@@ -121,12 +121,14 @@ struct ValueBinding {
     ValueBinding(ValueBinding&&) = default;
     ValueBinding& operator=(const ValueBinding&) = default;
     ValueBinding& operator=(ValueBinding&&) = default;
-    ValueBinding(Kind kind, TokenIdentity declaration, ExpansionId mark,
-                 std::shared_ptr<const NominalTypeIdentity> enumeration = {},
-                 std::shared_ptr<const ValuePlacementIdentity> placement = {},
+    ValueBinding(Kind binding_kind, TokenIdentity declaring_token,
+                 ExpansionId expansion_mark,
+                 std::shared_ptr<const NominalTypeIdentity> enumeration_identity = {},
+                 std::shared_ptr<const ValuePlacementIdentity> placement_identity = {},
                  std::shared_ptr<const ValueDeclarationSource> source = {})
-        : kind(kind), declaration(declaration), mark(mark),
-          enumeration(std::move(enumeration)), placement(std::move(placement)),
+        : kind(binding_kind), declaration(declaring_token), mark(expansion_mark),
+          enumeration(std::move(enumeration_identity)),
+          placement(std::move(placement_identity)),
           declaration_source(std::move(source)) {}
     ~ValueBinding();
     TokenIdentity declaration;
@@ -156,8 +158,8 @@ struct ValueDeclarationSource {
     ValueDeclarationSource(ValueDeclarationSource&&) = default;
     ValueDeclarationSource& operator=(const ValueDeclarationSource&) = default;
     ValueDeclarationSource& operator=(ValueDeclarationSource&&) = default;
-    ValueDeclarationSource(ValueBinding binding, std::uint64_t storage)
-        : binding(std::move(binding)), storage(storage) {}
+    ValueDeclarationSource(ValueBinding value_binding, std::uint64_t storage_bytes)
+        : binding(std::move(value_binding)), storage(storage_bytes) {}
     ValueBinding binding;
     std::uint64_t storage{};
 private:
@@ -260,17 +262,17 @@ struct TokenOrigin {
     SourceLocation last_span() const { return span_end.valid() ? span_end : span; }
 
     TokenOrigin() = default;
-    TokenOrigin(SourceLocation span, TokenIdentity identity,
-                std::shared_ptr<const SyntaxContext> context,
-                std::shared_ptr<const EmbedIdentity> embed, unsigned embed_piece,
-                ValueBinding value_binding,
-                std::shared_ptr<const FreshIdentifier> fresh = {},
-                std::shared_ptr<const TagBinding> tag_binding = {},
-                std::shared_ptr<const AliasBinding> alias_binding = {})
-        : span(span), identity(identity), context(std::move(context)),
-          embed(std::move(embed)), embed_piece(embed_piece),
-          value_binding(value_binding), fresh(std::move(fresh)),
-          tag_binding(std::move(tag_binding)), alias_binding(std::move(alias_binding)) {}
+    TokenOrigin(SourceLocation origin_span, TokenIdentity token_identity,
+                std::shared_ptr<const SyntaxContext> syntax_context,
+                std::shared_ptr<const EmbedIdentity> embed_identity, unsigned piece,
+                ValueBinding binding,
+                std::shared_ptr<const FreshIdentifier> fresh_identifier = {},
+                std::shared_ptr<const TagBinding> tag = {},
+                std::shared_ptr<const AliasBinding> alias = {})
+        : span(origin_span), identity(token_identity), context(std::move(syntax_context)),
+          embed(std::move(embed_identity)), embed_piece(piece),
+          value_binding(binding), fresh(std::move(fresh_identifier)),
+          tag_binding(std::move(tag)), alias_binding(std::move(alias)) {}
 };
 
 struct SourceTokenOrigin {
@@ -282,9 +284,10 @@ struct SourceTokenOrigin {
     std::shared_ptr<const SyntaxNode> splice;
 
     SourceTokenOrigin() = default;
-    SourceTokenOrigin(std::size_t begin, std::size_t end, TokenOrigin origin,
-                      std::shared_ptr<const SyntaxNode> splice = {})
-        : begin(begin), end(end), origin(std::move(origin)), splice(std::move(splice)) {}
+    SourceTokenOrigin(std::size_t begin_offset, std::size_t end_offset, TokenOrigin token,
+                      std::shared_ptr<const SyntaxNode> fragment = {})
+        : begin(begin_offset), end(end_offset), origin(std::move(token)),
+          splice(std::move(fragment)) {}
 };
 
 TokenOrigin token_origin(SourceLocation location);
@@ -300,13 +303,13 @@ struct SourceExpansion {
     SourceLocation expander;
 
     SourceExpansion() = default;
-    SourceExpansion(std::size_t begin, std::size_t end, std::string name,
-                    SourceLocation invocation, SourceLocation definition,
-                    Kind kind = Kind::ProceduralMacro,
-                    SourceLocation expander = {})
-        : begin(begin), end(end), macro_name(std::move(name)),
-          invocation(invocation), definition(definition), kind(kind),
-          expander(expander) {}
+    SourceExpansion(std::size_t begin_offset, std::size_t end_offset, std::string name,
+                    SourceLocation invocation_site, SourceLocation definition_site,
+                    Kind expansion_kind = Kind::ProceduralMacro,
+                    SourceLocation expander_site = {})
+        : begin(begin_offset), end(end_offset), macro_name(std::move(name)),
+          invocation(invocation_site), definition(definition_site), kind(expansion_kind),
+          expander(expander_site) {}
 };
 
 struct SourceFile {

@@ -96,7 +96,7 @@ private:
         std::shared_ptr<const SyntaxParseEnvironment>>> public_namespace_contexts_;
     struct NamespaceContextCacheScope {
         const Parser& parser;
-        explicit NamespaceContextCacheScope(const Parser& parser) : parser(parser) {
+        explicit NamespaceContextCacheScope(const Parser& owner) : parser(owner) {
             ++parser.namespace_context_cache_depth_;
         }
         ~NamespaceContextCacheScope() {
@@ -140,8 +140,8 @@ private:
     struct ResourceEpoch {
         const Parser& parser;
         std::uint64_t previous;
-        explicit ResourceEpoch(const Parser& parser)
-            : parser(parser), previous(parser.resource_epoch_) {
+        explicit ResourceEpoch(const Parser& owner)
+            : parser(owner), previous(owner.resource_epoch_) {
             parser.resource_epoch_ = parser.syntax_ ? parser.syntax_->execution()->resource_errors() : 0;
         }
         ~ResourceEpoch() { parser.resource_epoch_ = previous; }
@@ -414,7 +414,7 @@ private:
     struct ProductionScope {
         Parser& parser;
         std::size_t event;
-        ProductionScope(Parser& parser, SyntaxProduction production);
+        ProductionScope(Parser& owner, SyntaxProduction production);
         ~ProductionScope();
         void finish();
     };
@@ -497,8 +497,8 @@ private:
         Parser& parser;
         std::size_t depth;
         bool shared{};
-        explicit PrototypeScopeFrame(Parser& parser, bool shared = false)
-            : parser(parser), depth(parser.prototype_scopes_.size()), shared(shared) {}
+        explicit PrototypeScopeFrame(Parser& owner, bool share_scope = false)
+            : parser(owner), depth(owner.prototype_scopes_.size()), shared(share_scope) {}
         void finish() {
             if (parser.prototype_scopes_.size() > depth) parser.prototype_scopes_.resize(depth);
         }

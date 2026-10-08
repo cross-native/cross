@@ -177,11 +177,11 @@ private:
         EvaluationInstructionOperand::Memory memory;
         using Shape = EvaluationInstructionOperand::Memory::Shape;
         const RegisterEntry* index_register = nullptr;
-        const auto register_fact = [&](const Expr& expression) {
+        const auto register_fact = [&](const Expr& operand) {
             EvaluationInstructionOperand::Memory::Register result;
-            if (expression.kind != Expr::Kind::Name) return result;
-            const auto binding = bindings_.find(name_key(expression));
-            const auto type = binding_types_.find(name_key(expression));
+            if (operand.kind != Expr::Kind::Name) return result;
+            const auto binding = bindings_.find(name_key(operand));
+            const auto type = binding_types_.find(name_key(operand));
             if (binding == bindings_.end() || type == binding_types_.end()) return result;
             result.object = true;
             result.type = type->second;

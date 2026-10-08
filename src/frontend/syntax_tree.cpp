@@ -494,7 +494,7 @@ struct TreeRule {
     TokenKind token_kind{TokenKind::Invalid};
     SyntaxProduction production{SyntaxProduction::None};
     std::vector<TreeRule> rules;
-    explicit TreeRule(Kind kind = Kind::Reject) : kind(kind) {}
+    explicit TreeRule(Kind rule_kind = Kind::Reject) : kind(rule_kind) {}
 };
 
 TreeRule terminal(std::string_view text) {

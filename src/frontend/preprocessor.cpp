@@ -392,9 +392,9 @@ std::string Preprocessor::evaluate_query(
             return true;
         }
         bool enabled = false;
-        for (const auto& selected : options_.target_features) {
-            if (selected == "+" + std::string(feature)) enabled = true;
-            else if (selected == "-" + std::string(feature)) enabled = false;
+        for (const std::string_view selected : options_.target_features) {
+            if (selected.starts_with('+') && selected.substr(1) == feature) enabled = true;
+            else if (selected.starts_with('-') && selected.substr(1) == feature) enabled = false;
         }
         return enabled;
     };

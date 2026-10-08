@@ -13981,17 +13981,17 @@ bool vectorize_reduction_loop(
         transformed.type = vector_type_for(source.type);
         if (source.kind == ValueKind::Binary &&
             comparison(source.binary) && !source.operands.empty()) {
-            const auto element_bits = type_bits(
+            const auto bits = type_bits(
                 hir_module,
                 function.values[source.operands.front().value].type);
-            const auto mask = element_bits == 8
+            const auto mask_element = bits == 8
                 ? hir_module.builtin(BuiltinType::I8)
-                : element_bits == 16
+                : bits == 16
                 ? hir_module.builtin(BuiltinType::I16)
-                : element_bits == 32
+                : bits == 32
                 ? hir_module.builtin(BuiltinType::I32)
                 : hir_module.builtin(BuiltinType::I64);
-            transformed.type = hir_module.vector_of(*mask, lanes);
+            transformed.type = hir_module.vector_of(*mask_element, lanes);
         }
         transformed.kind = source.kind;
         transformed.unary = source.unary;

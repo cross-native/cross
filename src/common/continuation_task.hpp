@@ -15,7 +15,10 @@ namespace cross {
 // language/resource controls, evaluation order, typed operands and target policy.
 // Keep conditional awaits in explicit if/else statements: the GCC 16.1 Windows
 // host was observed to resume an unselected `condition ? co_await task : value`
-// arm. This is a host implementation constraint, not a Cross evaluation rule.
+// arm. Likewise, a structured binding whose object needs destruction must not
+// stay in scope across co_await: GCC 16.1 keeps its cleanup guard outside the
+// frame and skips the destructor. These are host implementation constraints,
+// not Cross evaluation rules.
 struct ContinuationSchedule {
     std::coroutine_handle<> next;
 };

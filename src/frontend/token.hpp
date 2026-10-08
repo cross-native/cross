@@ -43,8 +43,8 @@ struct Token {
     std::size_t split_offset{};
 
     Token() = default;
-    Token(TokenKind kind, std::string_view text, SourceLocation location)
-        : kind(kind), text(text), location(location) {}
+    Token(TokenKind token_kind, std::string_view token_text, SourceLocation token_location)
+        : kind(token_kind), text(token_text), location(token_location) {}
 
     [[nodiscard]] bool is(std::string_view spelling) const { return text == spelling; }
 };

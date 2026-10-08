@@ -38,11 +38,11 @@ template <class Traits>
 PointerJoinResult<typename Traits::Type> join_pointer_pointees(
     Traits& traits, typename Traits::Type left, typename Traits::Type right,
     unsigned depth = 0) {
-    using Type = typename Traits::Type;
-    using Result = PointerJoinResult<Type>;
+    using TypeRef = typename Traits::Type;
+    using Result = PointerJoinResult<TypeRef>;
     struct Frame {
-        Type base;
-        PointerJoinNode<Type> a, b, result;
+        TypeRef base;
+        PointerJoinNode<TypeRef> a, b, result;
         bool deferred{};
     };
     // Follow the single structural child iteratively, then rebuild inside out.

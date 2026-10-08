@@ -335,10 +335,10 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                     result.pieces.front().bank->register_bits;
             if (!preserve_wide) {
                 std::vector<PieceRequest> merged;
-                const auto precedence = [&](const AbiRegisterBank* bank) {
+                const auto precedence = [&](const AbiRegisterBank* piece_bank) {
                     const auto found = std::find(
                         rule->merge_banks.begin(), rule->merge_banks.end(),
-                        bank ? bank->canonical_name : std::string{});
+                        piece_bank ? piece_bank->canonical_name : std::string{});
                     return found == rule->merge_banks.end()
                                ? rule->merge_banks.size()
                                : static_cast<std::size_t>(

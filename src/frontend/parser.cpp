@@ -918,8 +918,8 @@ std::unique_ptr<Parser> Parser::prepared_fragment_parser(const Token& token) {
     return child;
 }
 
-Parser::ProductionScope::ProductionScope(Parser& parser, SyntaxProduction production)
-    : parser(parser), event(parser.begin_production(production)) {}
+Parser::ProductionScope::ProductionScope(Parser& owner, SyntaxProduction production)
+    : parser(owner), event(owner.begin_production(production)) {}
 
 Parser::ProductionScope::~ProductionScope() { finish(); }
 
@@ -4106,8 +4106,8 @@ Parser::parse_angle_generic_parameters_impl_async() {
             diagnostics_.error(location,
                                "expected an unqualified generic parameter name");
         } else if (std::any_of(result.begin(), result.end(),
-                               [&](const auto& parameter) {
-                                   return parameter.name == *name;
+                               [&](const auto& existing) {
+                                   return existing.name == *name;
                                })) {
             diagnostics_.error(location,
                                "duplicate generic parameter '" + *name + "'");
@@ -6545,8 +6545,8 @@ Parser::parse_function_async(std::size_t header_first, SourceLocation location, 
     // Definitions nested in a header live in the declaration tables, not in
     // its nominal Type leaves. Bind their generic uses after the complete
     // parameter list is known, just like header bounds and attributes above.
-    const auto bind_attributes = [&](std::vector<Attribute>& attributes) {
-        for (auto& attribute : attributes)
+    const auto bind_attributes = [&](std::vector<Attribute>& nested) {
+        for (auto& attribute : nested)
             if (attribute.expression_argument)
                 bind_attribute_name(bind_attribute_name, *attribute.expression_argument);
     };
@@ -6648,12 +6648,12 @@ Parser::parse_local_declaration_async(std::vector<Attribute> attributes,
         else if ((co_await current_async()).is("stack")) selected = &storage_stack;
         else if ((co_await current_async()).is("static")) selected = &storage_static;
         if (!selected) co_return false;
-        const auto location = (co_await current_async()).location;
+        const auto storage_location = (co_await current_async()).location;
         ++index_;
         if (typedef_seen)
-            diagnostics_.error(location, "typedef cannot combine with another storage specifier");
+            diagnostics_.error(storage_location, "typedef cannot combine with another storage specifier");
         else if (storage_register || storage_stack || storage_static)
-            diagnostics_.error(location, "local declaration has more than one storage specifier");
+            diagnostics_.error(storage_location, "local declaration has more than one storage specifier");
         *selected = true;
         co_return true;
     };

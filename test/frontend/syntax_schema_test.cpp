@@ -894,18 +894,18 @@ int main() {
         const auto parse_decorated = [&](Node input, std::string_view text, K kind) {
             const auto* source = sources.add("decorated-header.x", std::string(text));
             auto tokens = Lexer(*source, diagnostics).lex();
-            for (auto& item : tokens) {
-                if (!item.is("header_marker")) continue;
-                item.kind = TokenKind::StructuredSplice;
-                item.splice = input;
+            for (auto& candidate : tokens) {
+                if (!candidate.is("header_marker")) continue;
+                candidate.kind = TokenKind::StructuredSplice;
+                candidate.splice = input;
             }
             Parser parser(tokens, diagnostics, header_execution, 64);
-            const auto result = parser.parse_syntax_fragment(kind, 0);
-            require(result && result->end + 1 == tokens.size(),
+            const auto fragment = parser.parse_syntax_fragment(kind, 0);
+            require(fragment && fragment->end + 1 == tokens.size(),
                     "decorated header did not consume its bounded input");
-            require(syntax_validate_node(*result->node, header_shape_error),
+            require(syntax_validate_node(*fragment->node, header_shape_error),
                     "decorated header public tree failed validation");
-            return result->node;
+            return fragment->node;
         };
         Node nested = header;
         for (unsigned at = 0; at < 4; ++at) {
@@ -1574,8 +1574,8 @@ int main() {
         const auto retained_parse = [&](const Node& node, SyntaxParseCategory category,
                                          const std::shared_ptr<const SyntaxContext>& context,
                                          bool compound = false) {
-            const auto* source = sources.add("retained-declaration-context.x", compound ? "{ marker }" : "marker");
-            auto tokens = Lexer(*source, diagnostics).lex();
+            const auto* marker_source = sources.add("retained-declaration-context.x", compound ? "{ marker }" : "marker");
+            auto tokens = Lexer(*marker_source, diagnostics).lex();
             auto& marker = tokens[compound ? 1 : 0];
             marker.kind = TokenKind::StructuredSplice;
             marker.splice = node;

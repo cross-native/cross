@@ -38,8 +38,8 @@ int run_with_compiler_stack(int (*entry)(int, char**), int argc, char** argv) {
 #if defined(_WIN32)
     const HANDLE thread = CreateThread(nullptr, compiler_stack_bytes,
         [](LPVOID data) -> DWORD {
-            auto& call = *static_cast<EntryCall*>(data);
-            call.result = call.entry(call.argc, call.argv);
+            auto& request = *static_cast<EntryCall*>(data);
+            request.result = request.entry(request.argc, request.argv);
             return 0;
         },
         &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
@@ -53,8 +53,8 @@ int run_with_compiler_stack(int (*entry)(int, char**), int argc, char** argv) {
     pthread_t thread;
     const bool started = pthread_create(&thread, &attributes,
         [](void* data) -> void* {
-            auto& call = *static_cast<EntryCall*>(data);
-            call.result = call.entry(call.argc, call.argv);
+            auto& request = *static_cast<EntryCall*>(data);
+            request.result = request.entry(request.argc, request.argv);
             return nullptr;
         },
         &call) == 0;

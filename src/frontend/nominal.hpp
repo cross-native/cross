@@ -97,13 +97,13 @@ struct TagBinding {
     TagBinding(TagBinding&&) = default;
     TagBinding& operator=(const TagBinding&) = default;
     TagBinding& operator=(TagBinding&&) = default;
-    TagBinding(Kind kind, Role role, std::string spelling, NominalTypeKey type,
-               BuiltinType underlying,
-               std::shared_ptr<const CapturedTypeErrors> errors = {},
+    TagBinding(Kind tag_kind, Role tag_role, std::string tag_spelling, NominalTypeKey type_key,
+               BuiltinType underlying_type,
+               std::shared_ptr<const CapturedTypeErrors> type_errors = {},
                std::shared_ptr<const TagBinding> source = {},
                std::uint64_t storage = {})
-        : kind(kind), role(role), spelling(std::move(spelling)), type(std::move(type)),
-          underlying(underlying), errors(std::move(errors)),
+        : kind(tag_kind), role(tag_role), spelling(std::move(tag_spelling)), type(std::move(type_key)),
+          underlying(underlying_type), errors(std::move(type_errors)),
           declaration_source(std::move(source)), source_storage(storage) {}
     ~TagBinding();
     std::string spelling;

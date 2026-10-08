@@ -15,6 +15,8 @@
 
 namespace {
 bool forbid_release_allocation{};
+// Out of line so GCC does not pair an inlined free() with an operator new call.
+[[gnu::noinline]] void release(void* memory) noexcept { std::free(memory); }
 }
 
 void* operator new(std::size_t bytes) {
@@ -26,10 +28,10 @@ void* operator new(std::size_t bytes) {
     throw std::bad_alloc();
 }
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
-void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete[](void* memory) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete(void* memory) noexcept { release(memory); }
+void operator delete[](void* memory) noexcept { release(memory); }
+void operator delete(void* memory, std::size_t) noexcept { release(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { release(memory); }
 
 namespace {
 using namespace cross;

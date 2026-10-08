@@ -659,10 +659,10 @@ private:
         for (const auto& attribute : attributes) {
             if (resource_failed()) co_return result;
             if (attribute.name != "aligned") continue;
-            const auto [size_of, align_of] = record_layout_queries(attribute.location);
+            const auto queries = record_layout_queries(attribute.location);
             LayoutServiceScope services(*this, attribute.location);
             const auto value = co_await evaluate_alignment_attribute_async(
-                program_, attribute, diagnostics_, size_of, align_of, subject, source_namespace);
+                program_, attribute, diagnostics_, queries.first, queries.second, subject, source_namespace);
             if (value) result = std::max(result, *value);
         }
         co_return result;
@@ -1032,9 +1032,9 @@ private:
     template<class Evaluate>
     auto with_record_layout_async(SourceLocation location, Evaluate evaluate)
         -> std::invoke_result_t<Evaluate, const LayoutQuery&, const LayoutQuery&> {
-        const auto [size_of, align_of] = record_layout_queries(location);
+        const auto queries = record_layout_queries(location);
         LayoutServiceScope services(*this, location);
-        co_return co_await evaluate(size_of, align_of);
+        co_return co_await evaluate(queries.first, queries.second);
     }
 
     ContinuationTask<bool> resolve_bit_field_width_async(RecordMember& member,

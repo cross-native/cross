@@ -842,8 +842,8 @@ struct GenericExpansionState {
 struct GenericResourceFrame {
     GenericExpansionState& state;
     std::optional<std::uint64_t> previous;
-    GenericResourceFrame(GenericExpansionState& state, const Program& program)
-        : state(state), previous(state.resource_epoch) {
+    GenericResourceFrame(GenericExpansionState& expansion, const Program& program)
+        : state(expansion), previous(expansion.resource_epoch) {
         if (!previous) state.resource_epoch = program.evaluation_resource_errors;
     }
     ~GenericResourceFrame() { state.resource_epoch = previous; }
@@ -6357,21 +6357,21 @@ public:
     enum class ResourceReporting { Required, Speculative };
     void resource_reporting(ResourceReporting reporting) { resource_reporting_ = reporting; }
 
-    Evaluator(Program& program, Diagnostics& diagnostics,
-              const FunctionDecl* caller = nullptr,
+    Evaluator(Program& program, Diagnostics& reporter,
+              const FunctionDecl* current_function = nullptr,
               std::string current_namespace = {},
-              const LayoutQuery* size_of = nullptr,
-              const LayoutQuery* align_of = nullptr,
+              const LayoutQuery* size_of_query = nullptr,
+              const LayoutQuery* align_of_query = nullptr,
               const GenericPointerResolver* pointer_resolver = nullptr,
               std::shared_ptr<const SyntaxContext> macro_context = {},
               SyntaxParseCallback syntax_parse = {},
               std::shared_ptr<const SyntaxContext> call_context = {})
-        : program_(program), diagnostics_(diagnostics),
-          current_function_(caller),
+        : program_(program), diagnostics_(reporter),
+          current_function_(current_function),
           current_namespace_(std::move(current_namespace)),
-          size_of_(size_of ? size_of :
+          size_of_(size_of_query ? size_of_query :
               (program.evaluation_size_of ? &program.evaluation_size_of : nullptr)),
-          align_of_(align_of ? align_of :
+          align_of_(align_of_query ? align_of_query :
               (program.evaluation_align_of ? &program.evaluation_align_of : nullptr)),
           pointer_resolver_(pointer_resolver ? pointer_resolver :
               (program.evaluation_pointer_resolver ? &program.evaluation_pointer_resolver : nullptr)),
@@ -6429,9 +6429,9 @@ public:
                     }
                     if (context == EvaluationIntegerContext::StagedDefinition && caller &&
                         caller->definition() && evaluation_only(*caller)) {
-                        const auto value = co_await probe.probe_integer_async(source, local_types, &needs_context, true);
-                        if (!value) co_return std::nullopt;
-                        co_return EvalValue{value->value, builtin_type(value->type)};
+                        const auto probed = co_await probe.probe_integer_async(source, local_types, &needs_context, true);
+                        if (!probed) co_return std::nullopt;
+                        co_return EvalValue{probed->value, builtin_type(probed->type)};
                     }
                     co_return co_await probe.required_integer_with_types_async(source, local_types);
                 }, optional);
@@ -7646,10 +7646,10 @@ public:
                 }
                 if (const auto inferred = inferred_arrays.find(source.get()); inferred != inferred_arrays.end()) {
                     const bool ready = co_await prepare_inferred_array_async(*inferred->second, program_, bindings.local_types,
-                        [&](const Expr& expression, std::span<const std::pair<NameKey, TypePtr>> types,
+                        [&](const Expr& operand, std::span<const std::pair<NameKey, TypePtr>> types,
                             const TypePtr& destination) -> EvaluationTask<SourceConstantProbe> {
                             SourceConstantProbe result;
-                            result.value = co_await probe_integer_async(expression, types,
+                            result.value = co_await probe_integer_async(operand, types,
                                 phase == SourceValidationPhase::Definition ? &result.needs_invocation_context : nullptr,
                                 true, destination);
                             co_return result;
@@ -7711,12 +7711,12 @@ public:
         co_return true;
     }
 
-    EvaluationTask<bool> validate_source_body_async(const FunctionDecl& source,
+    EvaluationTask<bool> validate_source_body_async(const FunctionDecl& original,
         SourceValidationPhase phase = SourceValidationPhase::Definition) {
         if (!(co_await validate_generic_definitions_async())) co_return false;
-        auto definition = phase == SourceValidationPhase::Definition && evaluation_only(source)
-            ? copy_evaluation_declaration(source) : nullptr;
-        const auto& function = definition ? *definition : source;
+        auto definition = phase == SourceValidationPhase::Definition && evaluation_only(original)
+            ? copy_evaluation_declaration(original) : nullptr;
+        const auto& function = definition ? *definition : original;
         const auto previous_phase = validation_phase_;
         validation_phase_ = phase;
         if (phase == SourceValidationPhase::Definition) reset_record_views();
@@ -16149,9 +16149,9 @@ struct ExpansionSemantics::Impl {
     decltype(Program::evaluation_prepare_enumerator) previous_enumerator;
     GenericAbiCanonicalizer previous_abi;
 
-    Impl(Program& declarations, Diagnostics& errors, std::string model,
+    Impl(Program& declarations, Diagnostics& reporter, std::string model,
          GenericAbiCanonicalizer canonical_abi)
-        : program(declarations), diagnostics(errors), mangling(std::move(model)),
+        : program(declarations), diagnostics(reporter), mangling(std::move(model)),
           operators(program, diagnostics),
           previous_type(std::move(program.evaluation_prepare_type)),
           previous_function(std::move(program.evaluation_prepare_function)),

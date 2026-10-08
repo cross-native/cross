@@ -209,9 +209,9 @@ inline std::optional<FragmentNamespaceName> fragment_namespace_name(
     const FragmentNamespaceLookup& lookup, FragmentNameDomain domain, std::string_view spelling = {}) {
     if (spelling.empty()) spelling = lookup.key.spelling;
     const auto matching = [&](const auto& table, const FragmentNamespaceLookup::Scope& scope,
-                              std::string_view spelling) -> const FragmentNamespaceName* {
+                              std::string_view name) -> const FragmentNamespaceName* {
         auto key = lookup.key;
-        key.spelling = spelling;
+        key.spelling = name;
         key.context = scope.mark;
         const auto found = table.find(key);
         if (found == table.end()) return nullptr;

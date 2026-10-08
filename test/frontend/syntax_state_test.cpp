@@ -75,7 +75,8 @@ syntax Pack : bundle { use First; use Item; }
     require(activate({{"Pack", {}, {}}}), "different dispatch families conflicted");
     const auto bindings = state.bindings();
     require(bindings.size() == 2, "bundle was not fully flattened");
-    require(activate({{"First", {}, {}}}) && state.bindings() == bindings, "repeated binding was not harmless");
+    const bool reactivated = activate({{"First", {}, {}}});
+    require(reactivated && state.bindings() == bindings, "repeated binding was not harmless");
     state.push_scope();
     require(!activate({{"Second", {}, {}}}), "inherited dispatch conflict succeeded");
     require(state.bindings() == bindings, "inherited failure mutated activation");

@@ -109,7 +109,8 @@ void graph_failure_and_stability(unsigned bits) {
     f.require(f.declare(R"SOURCE(
 syntax Owner : expression { prefix "candidate"; match "(" parts:repeat0(rule(Leaf)) ")"; expand expand; }
 )SOURCE", "Near::Deep"), "declaration bound an already visible nullable rule too early");
-    f.require(!f.activate({{"Near::Deep::Owner", {}, {}}}) && f.state.bindings().empty(),
+    const bool activated = f.activate({{"Near::Deep::Owner", {}, {}}});
+    f.require(!activated && f.state.bindings().empty(),
               "nullable-body activation succeeded or leaked its prefix");
     f.require(f.messages.str().find("body may be nullable") != std::string::npos,
               "activation failed for a reason other than graph-dependent progress");
@@ -144,7 +145,8 @@ syntax Conflict : expression { prefix "candidate"; match "conflict"; expand expa
 syntax Owner : expression { prefix "candidate"; match rule(Leaf); expand expand; }
 syntax Pack : bundle { use Owner; use Conflict; }
 )", "Near"), "bundle declarations failed");
-    f.require(!f.activate({{"Near::Pack", {}, {}}}) && f.state.bindings().empty(),
+    const bool activated = f.activate({{"Near::Pack", {}, {}}});
+    f.require(!activated && f.state.bindings().empty(),
               "conflicting bundle partially committed");
     f.require(f.declare("syntax Leaf : rule { match \"inner\"; }", "Near"),
               "closer rule declaration after conflict failed");
@@ -190,8 +192,8 @@ syntax Good : expression { prefix "good"; match rule(Leaf); expand expand; }
 syntax Recursive : rule { match rule(Recursive); }
 syntax Bad : expression { prefix "bad"; match rule(Recursive); expand expand; }
 )", "Near"), "late graph failure was diagnosed during declaration");
-    f.require(!f.activate({{"Near::Good", {}, {}}, {"Near::Bad", {}, {}}}) &&
-              f.state.bindings() == original_bindings,
+    const bool activated = f.activate({{"Near::Good", {}, {}}, {"Near::Bad", {}, {}}});
+    f.require(!activated && f.state.bindings() == original_bindings,
               "late graph failure partially committed or damaged previous bindings");
     for (const auto* expected : {"requested by syntax activation 'Near::Good'",
                                 "requested by syntax activation 'Near::Bad'",
