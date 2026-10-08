@@ -96,3 +96,26 @@ string(REPEAT "[1]" 2400 dimensions)
 compile(deep_array_object -O0 "[[eval_only]] static uptr deep_array() {\n\
     u8 value${dimensions};\n    *((u8 *)&value) = 7u8;\n    return (uptr)*((u8 *)&value);\n}\n\
 $::static_assert($::eval(deep_array()) == 7uptr, \"deep array object\");\n")
+
+# Interning the layers of a deep array for an initializer plan finds each
+# type by hash instead of scanning every interned type.
+string(REPEAT "[1]" 3600 dimensions)
+compile(deep_array_initializer -O0 "[[eval_only]] static uptr deep_array_zero() {\n\
+    u8 value${dimensions} = {};\n    return sizeof(value);\n}\n\
+$::static_assert($::eval(deep_array_zero()) == 1uptr, \"deep array initializer\");\n")
+
+# A demand-driven layout context creates shells only for the records it
+# reaches and looks them up through the program's shared index.
+set(unrelated_records "")
+set(queried_locals "")
+foreach(index RANGE 0 5999)
+    string(APPEND unrelated_records "struct U${index} { u8 value; };\n")
+    if(index LESS 3000)
+        math(EXPR extent "${index} + 1")
+        string(APPEND queried_locals
+            "    struct Q${index} { u8 value[${extent}]; };\n    total += sizeof(struct Q${index});\n")
+    endif()
+endforeach()
+compile(layout_contexts -O0 "${unrelated_records}[[eval_only]] static uptr total_size() {\n\
+    uptr total = 0uptr;\n${queried_locals}    return total;\n}\n\
+$::static_assert($::eval(total_size()) == 4501500uptr, \"layout contexts\");\n")

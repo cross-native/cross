@@ -271,6 +271,10 @@ public:
     // Source spelling is resolved only at the AST-to-HIR interning boundary.
     std::unordered_map<std::string, AbiId> abi_names;
     std::vector<Type> types;
+    // Interned type IDs by a hash of kind, links and extent. Filled lazily, so
+    // types appended to `types` directly are found as well.
+    mutable std::unordered_map<std::size_t, std::vector<std::uint32_t>> type_index;
+    mutable std::size_t indexed_types{};
     std::vector<Record> records;
     std::vector<Function> functions;
     std::vector<Object> objects;
@@ -278,9 +282,6 @@ public:
     std::unordered_map<const FunctionDecl*, FunctionId> function_ids;
     std::unordered_map<const ObjectDecl*, ObjectId> object_ids;
     std::unordered_map<NominalTypeKey, RecordId, NominalTypeKeyHash> record_ids;
-    // Published source-record positions of the Program this layout reads,
-    // shared by its builder and later coverage checks; it refreshes itself.
-    mutable RecordSourceIndex source_records;
 };
 
 Module build(Program& program, const CompilerOptions& options,

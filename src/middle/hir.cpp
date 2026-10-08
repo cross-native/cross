@@ -160,17 +160,6 @@ std::string source_namespace(std::string_view name) {
                : std::string(name.substr(0, separator));
 }
 
-// Program::record_definition with indexed published positions.
-std::shared_ptr<const RecordDecl> record_definition(const Program& program,
-    const NominalTypeKey& key, RecordSourceIndex& index) {
-    if (program.evaluation_record_definition) {
-        // A nested layout query may replace the scoped provider while running.
-        const auto query = program.evaluation_record_definition;
-        if (auto view = query(key)) return view;
-    }
-    return {std::shared_ptr<const RecordDecl>{}, index.definition(program, key)};
-}
-
 enum class LayoutViewCoverage { PendingAllowed, Complete };
 
 // Resolves each by-value record of the graph once per call, so a changed
@@ -197,7 +186,7 @@ bool layout_view_matches_records(const Module& module, const Program& program,
             const auto* cached = module.record(key);
             if (cached ? visited[cached->id.value] : !uncached.insert(key).second) continue;
             if (cached) visited[cached->id.value] = true;
-            auto definition = record_definition(program, key, module.source_records);
+            auto definition = program.record_definition(key);
             if (!definition) return false;
             if (coverage == LayoutViewCoverage::Complete && (!cached || !cached->complete)) return false;
             if (cached && cached->complete && cached->definition != definition.get()) return false;
@@ -281,8 +270,9 @@ public:
     }
 
     ContinuationTask<Module> required_layout_context_async(TypePtr type, EvaluationLayoutKind kind) {
+        // Interning creates the shells of the records this query reaches;
+        // layout resolves their definitions.
         required_layout_query_ = true;
-        collect_record_shells();
         // Nested source probes replace the dynamically scoped callback. Keep
         // this callable alive until its continuation has fully returned.
         const auto prepare = program_.evaluation_prepare_layout;
@@ -966,12 +956,12 @@ private:
             NominalTypeKey key;
             ~Pop() { active.erase(key); }
         } pop{alignment_active_, key};
-        const auto definition = record_definition(program_, key, module_.source_records);
+        const auto definition = program_.record_definition(key);
         if (!definition) {
             diagnostics_.error(location, "incomplete record type cannot provide alignment");
             co_return {};
         }
-        if (const auto error = record_source_error(*definition, program_, module_.source_records,
+        if (const auto error = record_source_error(*definition, program_, program_.record_index,
                 &record_source_proofs_)) {
             diagnostics_.error(error->location, error->message);
             co_return {};
@@ -1106,7 +1096,7 @@ private:
             !(co_await prepare_type.async(type, EvaluationLayoutKind::Complete))) co_return false;
         // Preparation can publish generic definitions and relocate the source
         // vector. Refresh this pointer from its typed nominal key, not spelling.
-        auto definition = record_definition(program_, key, module_.source_records);
+        auto definition = program_.record_definition(key);
         module_.record(id).definition = definition.get();
         module_.record(id).retained_definition = std::move(definition);
         // A required layout expression may intern an implicit pointer tag and
@@ -1120,7 +1110,7 @@ private:
                     "' cannot be used as an object or member");
             co_return false;
         }
-        if (const auto error = record_source_error(*record.definition, program_, module_.source_records,
+        if (const auto error = record_source_error(*record.definition, program_, program_.record_index,
                 &record_source_proofs_)) {
             diagnostics_.error(error->location, error->message);
             layout_state_[id.value] = 3;
@@ -2508,6 +2498,55 @@ private:
     std::unordered_map<std::string, ObjectId> object_keys_;
 };
 
+// The fields every interning helper below compares, so equal types share a
+// bucket; names and qualifiers stay in each helper's own test.
+std::size_t type_hash(const Type& type) {
+    std::size_t hash = static_cast<std::size_t>(type.kind);
+    const auto mix = [&](std::size_t value) { hash = hash * 31 + value; };
+    if (type.kind == Type::Kind::Builtin) mix(static_cast<std::size_t>(type.builtin));
+    mix(type.pointee ? type.pointee->value + 1 : 0);
+    mix(type.element ? type.element->value + 1 : 0);
+    mix(type.record ? type.record->value + 1 : 0);
+    mix(type.lanes);
+    if (type.function) {
+        mix(type.function->result_type.value);
+        for (const auto& parameter : type.function->parameters) mix(parameter.type.value);
+    }
+    return hash;
+}
+
+// The lowest ID whose type satisfies `same`, which must imply equal hashes.
+template<class Same>
+std::optional<TypeId> find_type(const Module& module, const Type& candidate, Same same) {
+    if (module.indexed_types > module.types.size()) {
+        module.type_index.clear();
+        module.indexed_types = 0;
+    }
+    for (; module.indexed_types < module.types.size(); ++module.indexed_types)
+        module.type_index[type_hash(module.types[module.indexed_types])].push_back(
+            static_cast<std::uint32_t>(module.indexed_types));
+    if (const auto found = module.type_index.find(type_hash(candidate)); found != module.type_index.end())
+        for (const auto index : found->second)
+            if (same(module.types[index])) return TypeId{index};
+    return std::nullopt;
+}
+
+bool identical(const Type& type, const Type& candidate) {
+    return type.kind == candidate.kind && type.builtin == candidate.builtin &&
+        type.pointee == candidate.pointee &&
+        type.record == candidate.record &&
+        type.function == candidate.function &&
+        type.element == candidate.element &&
+        type.lanes == candidate.lanes &&
+        type.scalable == candidate.scalable &&
+        type.nominal_key() == candidate.nominal_key() &&
+        type.is_const == candidate.is_const &&
+        type.is_volatile == candidate.is_volatile &&
+        type.is_restrict == candidate.is_restrict &&
+        type.is_atomic == candidate.is_atomic &&
+        type.address_space == candidate.address_space;
+}
+
 } // namespace
 
 const Function* Module::function(const FunctionDecl& declaration) const {
@@ -2516,15 +2555,13 @@ const Function* Module::function(const FunctionDecl& declaration) const {
 }
 
 std::optional<TypeId> Module::builtin(BuiltinType kind) const {
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& candidate = types[index];
-        if (candidate.kind == Type::Kind::Builtin && candidate.builtin == kind &&
+    Type type;
+    type.builtin = kind;
+    return find_type(*this, type, [&](const Type& candidate) {
+        return candidate.kind == Type::Kind::Builtin && candidate.builtin == kind &&
             !candidate.is_const && !candidate.is_volatile &&
-            !candidate.is_atomic && !candidate.is_restrict) {
-            return TypeId{index};
-        }
-    }
-    return std::nullopt;
+            !candidate.is_atomic && !candidate.is_restrict;
+    });
 }
 
 TypeId Module::intern_type(const TypePtr& source) {
@@ -2590,24 +2627,9 @@ TypeId Module::intern_type(const TypePtr& source) {
             }
         }
     }
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& type = types[index];
-        if (type.kind == candidate.kind && type.builtin == candidate.builtin &&
-            type.pointee == candidate.pointee &&
-            type.record == candidate.record &&
-            type.function == candidate.function &&
-            type.element == candidate.element &&
-            type.lanes == candidate.lanes &&
-            type.scalable == candidate.scalable &&
-            type.nominal_key() == candidate.nominal_key() &&
-            type.is_const == candidate.is_const &&
-            type.is_volatile == candidate.is_volatile &&
-            type.is_restrict == candidate.is_restrict &&
-            type.is_atomic == candidate.is_atomic &&
-            type.address_space == candidate.address_space) {
-            return {index};
-        }
-    }
+    if (const auto found = find_type(*this, candidate,
+            [&](const Type& type) { return identical(type, candidate); }))
+        return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(candidate));
     return id;
@@ -2618,14 +2640,13 @@ TypeId Module::function_type(FunctionSignature signature) {
         if (parameter.mode == ParameterMode::In)
             parameter.type = without_top_level_const(parameter.type);
     }
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        if (types[index].kind == Type::Kind::Function &&
-            types[index].function == signature)
-            return {index};
-    }
     Type type;
     type.kind = Type::Kind::Function;
     type.function = std::move(signature);
+    if (const auto found = find_type(*this, type, [&](const Type& candidate) {
+            return candidate.kind == Type::Kind::Function && candidate.function == type.function;
+        }))
+        return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(type));
     return id;
@@ -2635,13 +2656,6 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
     struct Traits {
         using Type = TypeId;
         Module& module;
-        static bool same(const hir::Type& a, const hir::Type& b) {
-            return a.kind == b.kind && a.builtin == b.builtin && a.pointee == b.pointee &&
-                a.element == b.element && a.record == b.record && a.function == b.function &&
-                a.lanes == b.lanes && a.scalable == b.scalable && a.nominal_key() == b.nominal_key() &&
-                a.is_const == b.is_const && a.is_volatile == b.is_volatile &&
-                a.is_atomic == b.is_atomic && a.is_restrict == b.is_restrict && a.address_space == b.address_space;
-        }
         PointerJoinNode<Type> describe(Type id) const {
             const auto& type = module.type(id);
             PointerJoinNode<Type> node;
@@ -2668,7 +2682,7 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
             auto a = module.type(left), b = module.type(right);
             a.is_const = b.is_const = a.is_volatile = b.is_volatile = false;
             a.is_restrict = b.is_restrict = false;
-            return same(a, b) ? PointerJoinEquality::Same : PointerJoinEquality::Different;
+            return identical(a, b) ? PointerJoinEquality::Same : PointerJoinEquality::Different;
         }
         Type rebuild(Type base, const PointerJoinNode<Type>& node) {
             auto result = module.type(base);
@@ -2680,8 +2694,9 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
             if (node.kind == PointerJoinKind::Pointer) result.pointee = node.child;
             else if (node.kind == PointerJoinKind::Array || node.kind == PointerJoinKind::Vector)
                 result.element = node.child;
-            for (std::uint32_t index = 0; index < module.types.size(); ++index)
-                if (same(module.types[index], result)) return {index};
+            if (const auto found = find_type(module, result,
+                    [&](const hir::Type& existing) { return identical(existing, result); }))
+                return *found;
             const Type id{static_cast<std::uint32_t>(module.types.size())};
             module.types.push_back(std::move(result));
             return id;
@@ -2691,19 +2706,17 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
 }
 
 TypeId Module::pointer_to(TypeId pointee) {
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& candidate = types[index];
-        if (candidate.kind == Type::Kind::Pointer &&
-            candidate.pointee == pointee && !candidate.is_const &&
-            !candidate.is_volatile && !candidate.is_atomic &&
-            !candidate.is_restrict && candidate.address_space == 0 &&
-            candidate.nominal_key().empty()) {
-            return {index};
-        }
-    }
     Type type;
     type.kind = Type::Kind::Pointer;
     type.pointee = pointee;
+    if (const auto found = find_type(*this, type, [&](const Type& candidate) {
+            return candidate.kind == Type::Kind::Pointer &&
+                candidate.pointee == pointee && !candidate.is_const &&
+                !candidate.is_volatile && !candidate.is_atomic &&
+                !candidate.is_restrict && candidate.address_space == 0 &&
+                candidate.nominal_key().empty();
+        }))
+        return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(type));
     return id;
@@ -2714,24 +2727,9 @@ TypeId Module::without_top_level_const(TypeId id) {
     if (!source.is_const) return id;
     Type candidate = source;
     candidate.is_const = false;
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& existing = types[index];
-        if (existing.kind == candidate.kind &&
-            existing.builtin == candidate.builtin &&
-            existing.pointee == candidate.pointee &&
-            existing.record == candidate.record &&
-            existing.function == candidate.function &&
-            existing.element == candidate.element &&
-            existing.lanes == candidate.lanes &&
-            existing.scalable == candidate.scalable &&
-            existing.nominal_key() == candidate.nominal_key() &&
-            existing.is_const == candidate.is_const &&
-            existing.is_volatile == candidate.is_volatile &&
-            existing.is_restrict == candidate.is_restrict &&
-            existing.is_atomic == candidate.is_atomic &&
-            existing.address_space == candidate.address_space)
-            return {index};
-    }
+    if (const auto found = find_type(*this, candidate,
+            [&](const Type& existing) { return identical(existing, candidate); }))
+        return *found;
     const TypeId result{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(candidate));
     return result;
@@ -2748,22 +2746,9 @@ TypeId Module::unqualified(TypeId id) {
     candidate.is_volatile = false;
     candidate.is_atomic = false;
     candidate.is_restrict = false;
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& existing = types[index];
-        if (existing.kind == candidate.kind &&
-            existing.builtin == candidate.builtin &&
-            existing.pointee == candidate.pointee &&
-            existing.record == candidate.record &&
-            existing.element == candidate.element &&
-            existing.lanes == candidate.lanes &&
-            existing.scalable == candidate.scalable &&
-            existing.nominal_key() == candidate.nominal_key() &&
-            existing.address_space == candidate.address_space &&
-            !existing.is_const && !existing.is_volatile &&
-            !existing.is_atomic && !existing.is_restrict) {
-            return {index};
-        }
-    }
+    if (const auto found = find_type(*this, candidate,
+            [&](const Type& existing) { return identical(existing, candidate); }))
+        return *found;
     const TypeId result{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(candidate));
     return result;
@@ -2779,24 +2764,9 @@ TypeId Module::add_qualifiers(TypeId id, bool is_const,
     Type candidate = source;
     candidate.is_const = candidate.is_const || is_const;
     candidate.is_volatile = candidate.is_volatile || is_volatile;
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& existing = types[index];
-        if (existing.kind == candidate.kind &&
-            existing.builtin == candidate.builtin &&
-            existing.pointee == candidate.pointee &&
-            existing.record == candidate.record &&
-            existing.element == candidate.element &&
-            existing.lanes == candidate.lanes &&
-            existing.scalable == candidate.scalable &&
-            existing.nominal_key() == candidate.nominal_key() &&
-            existing.is_const == candidate.is_const &&
-            existing.is_volatile == candidate.is_volatile &&
-            existing.is_restrict == candidate.is_restrict &&
-            existing.is_atomic == candidate.is_atomic &&
-            existing.address_space == candidate.address_space) {
-            return {index};
-        }
-    }
+    if (const auto found = find_type(*this, candidate,
+            [&](const Type& existing) { return identical(existing, candidate); }))
+        return *found;
     const TypeId result{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(candidate));
     return result;
@@ -2804,40 +2774,36 @@ TypeId Module::add_qualifiers(TypeId id, bool is_const,
 
 TypeId Module::vector_of(TypeId element, std::uint32_t lanes,
                          bool scalable) {
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& candidate = types[index];
-        if (candidate.kind == Type::Kind::Vector &&
-            candidate.element == element && candidate.lanes == lanes &&
-            candidate.scalable == scalable && !candidate.is_const &&
-            !candidate.is_volatile && !candidate.is_atomic &&
-            !candidate.is_restrict) {
-            return {index};
-        }
-    }
     Type type;
     type.kind = Type::Kind::Vector;
     type.element = element;
     type.lanes = lanes;
     type.scalable = scalable;
+    if (const auto found = find_type(*this, type, [&](const Type& candidate) {
+            return candidate.kind == Type::Kind::Vector &&
+                candidate.element == element && candidate.lanes == lanes &&
+                candidate.scalable == scalable && !candidate.is_const &&
+                !candidate.is_volatile && !candidate.is_atomic &&
+                !candidate.is_restrict;
+        }))
+        return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(type));
     return id;
 }
 
 TypeId Module::array_of(TypeId element, std::uint32_t elements) {
-    for (std::uint32_t index = 0; index < types.size(); ++index) {
-        const auto& candidate = types[index];
-        if (candidate.kind == Type::Kind::Array &&
-            candidate.element == element && candidate.lanes == elements &&
-            !candidate.is_const && !candidate.is_volatile &&
-            !candidate.is_atomic && !candidate.is_restrict) {
-            return {index};
-        }
-    }
     Type type;
     type.kind = Type::Kind::Array;
     type.element = element;
     type.lanes = elements;
+    if (const auto found = find_type(*this, type, [&](const Type& candidate) {
+            return candidate.kind == Type::Kind::Array &&
+                candidate.element == element && candidate.lanes == elements &&
+                !candidate.is_const && !candidate.is_volatile &&
+                !candidate.is_atomic && !candidate.is_restrict;
+        }))
+        return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(type));
     return id;
