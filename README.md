@@ -25,8 +25,9 @@ This repository contains the compiler `cc`, the preprocessor `cpp`, the
 compiler models, tests, and benchmarks. One `cc` build targets x86-64 (ELF,
 COFF, and Mach-O) and MIPS (MIPS I to MIPS64, including the VR4300 and
 Allegrex). Cross is a pre-1.0 draft: the compiler implements part of the
-current draft, and drafts do not promise source or binary compatibility with
-one another.
+current specification draft ([doc/spec.md](doc/spec.md), 0.9), `cc --version`
+reports the draft it conforms to, and drafts do not promise source or binary
+compatibility with one another.
 
 ## Quick start
 
@@ -48,9 +49,12 @@ it compiles for the host it was built on.
 - [doc/install.md](doc/install.md): building, configuration, and tests.
 - [doc/invoke.md](doc/invoke.md): `cc` and `cpp` options.
 - [doc/language.md](doc/language.md): the language, for C programmers.
+- [doc/spec.md](doc/spec.md): the language specification.
 - [doc/metaprogramming.md](doc/metaprogramming.md): macros, syntax
   extensions, and embedded files.
 - [doc/targets.md](doc/targets.md): targets, profiles, and ABIs.
+- [doc/models.md](doc/models.md): the model files that define ABIs,
+  manglings, option presets, and profiles.
 - [benchmark/x86_64](benchmark/x86_64/README.md) and
   [benchmark/mips32](benchmark/mips32/README.md): code-generation comparisons
   with GCC and Clang.
@@ -81,9 +85,9 @@ The copyright holders read the license as follows:
 
 - Using Cross carries no obligation. Programs written in Cross, with or without
   AI assistance, are not works based on Cross, whether or not the manual, the
-  examples, the models, or the test programs were used as reference, and the
-  compiler's output carries no obligation either: `cc` adds no runtime code to
-  your program.
+  specification, the examples, the models, or the test programs were used as
+  reference, and the compiler's output carries no obligation either: `cc` adds
+  no runtime code to your program.
 - Reusing the compiler does. If you give the compiler sources (`src/`,
   `model/`, `benchmark/`, or `test/`) to an AI model as reference, in a prompt,
   as context, or through retrieval, and use what it writes as part of another

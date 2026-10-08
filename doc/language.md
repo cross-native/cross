@@ -3,7 +3,8 @@
 Cross keeps C99's statements, expressions, declarators, and preprocessor, and
 changes the parts that C leaves implicit: type widths, linkage, parameter
 dataflow, evaluation order, ABIs, and every compiler-provided facility. This
-guide assumes knowledge of C and describes the differences.
+guide assumes knowledge of C and describes the differences; the language
+specification, [spec.md](spec.md), is the complete reference.
 
 A Cross program gets no library, runtime, startup code, or entry point. The
 compiler never inserts a call that the source did not write; an operation the
@@ -224,7 +225,8 @@ The preprocessor is C99's with these changes:
   `$::language::version`.
 - Queries test what the compiler and target provide: `$::has_feature`,
   `$::has_builtin`, `$::has_intrinsic`, `$::has_instruction`,
-  `$::has_attribute`, `$::has_abi`, `$::has_profile`, and `$::has_include`.
+  `$::has_attribute`, `$::has_abi`, `$::has_mangling`, `$::has_profile`, and
+  `$::has_include`.
 
 ```x
 #require $::has_abi("sysv_abi"), "needs the System V ABI"

@@ -42,7 +42,7 @@ separately and link only `global` entities to combine objects.
 | `-mFEATURE`, `-mno-FEATURE` | Target features, such as `-mavx2` or `-mno-red-zone`. |
 | `-mOPTION=VALUE` | Other target options, such as `-mcmodel=large`. |
 | `-mabi=NAME` | ABI for global, unresolved, and indirect calls (normally the Cross ABI). |
-| `-mmangling=NAME` | Link-name encoding: `cross` (default), `simple`, `itanium`, or `msvc`. |
+| `-mmangling=NAME` | Link-name encoding: `cross` (default), `simple`, `itanium`, or `msvc`. `itanium` and `msvc` match C++ names only for scalar and pointer-to-scalar types. |
 | `-mprofile=NAME` | A profile: target, ABI, mangling, optimization preset, and options together. |
 
 Without `-target` or `-mprofile`, `cc` uses the default target configured at
@@ -53,8 +53,8 @@ each target, profile, and target option.
 Profiles, ABIs, link-name encodings, and optimization presets are declarative
 models built into `cc`; the readable shipped definitions are in `model/`.
 `--model=FILE` loads an additional model file, and `--model-path=DIR` adds a
-directory in which to find `--model` names. The model format is not yet
-stable.
+directory in which to find `--model` names. [models.md](models.md) describes
+the model format, which is unversioned and may change before 1.0.
 
 ## Optimization
 

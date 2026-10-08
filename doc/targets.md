@@ -5,7 +5,8 @@
 `-target TRIPLE`, or a whole configuration with `-mprofile=NAME`; see
 [invoke.md](invoke.md). `--print-abis`, `--print-options=target`,
 `--print-features`, `--print-instructions`, and `--print-registers` describe
-the selected target.
+the selected target. The model files that define ABIs, manglings, option
+presets, and profiles are described in [models.md](models.md).
 
 ## Object formats
 
@@ -26,6 +27,9 @@ An alias must name a compatible definition in the same compilation.
 `[[hot]]` and `[[cold]]` functions go to separate text sections. `[[used]]`
 forces emission. `[[no_stack_protector]]` and `[[no_sanitize("name")]]` are
 accepted; Cross generates neither kind of instrumentation.
+
+Mach-O output does not prefix symbol names with an underscore, so a C symbol
+needs its full name, as in `[[link_name("_write")]]`.
 
 `-funwind-tables` (or `-fasynchronous-unwind-tables`) emits CFI or SEH unwind
 records; no unwinder is linked. By default functions assume nothing unwinds
@@ -64,6 +68,7 @@ Target options:
 | `-mcmodel=` | `small` (default), `kernel`, `medium`, `large` |
 | `-mred-zone`, `-mno-red-zone` | Let leaf functions use the area below the stack pointer (not with COFF). |
 | `-mprefer-vector-width=` | `none`, `128`, `256`, `512`: widest vector the compiler chooses on its own. |
+| `-mrisc-cisc-balance=` | `0` to `100`, default `50`: weighs optimization cost estimates from load/store RISC (`0`) to CISC (`100`) behavior; it changes code choices, not the instruction set. The x86-64 profiles set `100`; MIPS also accepts the option, and its profiles set `0`. |
 
 Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
@@ -148,7 +153,7 @@ call a software floating-point library.
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 hard-float `f32` and `f64`, structures and unions by value under every ABI,
 function pointers, variable-length arrays, computed goto, `$::patch` values,
-and LL/SC atomics. Not supported yet: vectors, integers wider than 64 bits,
+and LL/SC atomics. Not supported: vectors, integers wider than 64 bits,
 variadic function definitions, manual register locations, machine-instruction
 built-ins, position-independent code (`-mabicalls`), thread-local storage,
 MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used.
@@ -161,4 +166,4 @@ MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used.
 - Function pointers can be converted to another ABI only when the function is
   named directly; see [language.md](language.md#function-pointers).
 - `[[aligned(N)]]` applies to objects, records, members, and function
-  definitions, but not yet to a typedef of a non-record type.
+  definitions; it is not supported on a typedef of a non-record type.
