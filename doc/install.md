@@ -35,7 +35,9 @@ cmake --build build
 
 The executables are written to `build/bin/` (`cc.exe` and `cpp.exe` on
 Windows). Add `-G Ninja` to choose a generator, or
-`-DCMAKE_CXX_COMPILER=clang++` to choose a compiler.
+`-DCMAKE_CXX_COMPILER=clang++` to choose a compiler. GCC needs several
+gigabytes of memory per job on the largest sources, so on a machine with many
+cores limit the parallelism, for example `cmake --build build -j 6`.
 
 | Option | Default | Effect |
 | --- | --- | --- |
