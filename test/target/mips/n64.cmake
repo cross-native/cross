@@ -27,9 +27,11 @@ set(large_assembly "${OUTPUT}.large.s")
 set(big_object "${OUTPUT}.be.o")
 set(little_object "${OUTPUT}.le.o")
 
-run_cc(n64-assembly -S -O2 -mprofile=mips64-n64 "${SOURCE}" -o "${assembly}")
-run_cc(n64-large-assembly -S -O2 -mprofile=mips64-n64 -mcmodel=large
-       "${SOURCE}" -o "${large_assembly}")
+# The profiles default to the Cross ABI; n64 is the explicit C ABI.
+run_cc(n64-assembly -S -O2 -mprofile=mips64-n64 -mabi=n64 "${SOURCE}"
+       -o "${assembly}")
+run_cc(n64-large-assembly -S -O2 -mprofile=mips64-n64 -mabi=n64
+       -mcmodel=large "${SOURCE}" -o "${large_assembly}")
 
 # The default sym32 model never needs the upper relocation halves; the large
 # model materializes every symbol address from all four and calls through
@@ -45,8 +47,9 @@ foreach(pattern
             "n64 large-model assembly is missing '${pattern}'\n${large_text}")
     endif()
 endforeach()
-run_cc(n64-object -c -O2 -mprofile=mips64-n64 "${SOURCE}" -o "${big_object}")
-run_cc(n64el-object -c -O2 -mprofile=mips64el-n64 "${SOURCE}"
+run_cc(n64-object -c -O2 -mprofile=mips64-n64 -mabi=n64 "${SOURCE}"
+       -o "${big_object}")
+run_cc(n64el-object -c -O2 -mprofile=mips64el-n64 -mabi=n64 "${SOURCE}"
        -o "${little_object}")
 
 file(READ "${assembly}" text)
@@ -150,8 +153,8 @@ expect_error(o32-on-mips64 "cannot be selected for a mips64 target triple"
     -c -O2 -target mips64-unknown-elf -mabi=o32 "${SOURCE}"
     -o "${OUTPUT}.mismatch.o")
 expect_error(n64-without-mips3 "needs the 64-bit MIPS III register file"
-    -c -O2 -mprofile=mips64-n64 -march=mips1 "${SOURCE}"
+    -c -O2 -mprofile=mips64-n64 -mabi=n64 -march=mips1 "${SOURCE}"
     -o "${OUTPUT}.mismatch.o")
 expect_error(n64-single-float "defined on a 64-bit FPU"
-    -c -O2 -mprofile=mips64-n64 -msingle-float "${SOURCE}"
+    -c -O2 -mprofile=mips64-n64 -mabi=n64 -msingle-float "${SOURCE}"
     -o "${OUTPUT}.mismatch.o")

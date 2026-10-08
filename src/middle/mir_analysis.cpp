@@ -352,120 +352,31 @@ std::optional<BlockId> UseLists::definition_block(ValueId value) const {
 }
 
 DominatorTree::DominatorTree(const ManagedFunction& function)
-    : reachable_(function.blocks.size()),
-      dominators_(function.blocks.size(),
-                  std::vector<std::uint64_t>(
-                      (function.blocks.size() + 63U) / 64U)),
-      immediate_dominators_(function.blocks.size()),
+    : dominance_(function.blocks.size(), function.entry.value,
+                 [&](std::uint32_t block) -> const std::vector<BlockId>& {
+                     return function.blocks[block].terminator.successors;
+                 },
+                 [&](std::uint32_t block) -> const std::vector<BlockId>& {
+                     return function.blocks[block].predecessors;
+                 }),
       children_(function.blocks.size()) {
-    const auto count = function.blocks.size();
-    if (function.entry.value >= count) return;
-
-    std::vector<BlockId> pending{function.entry};
-    while (!pending.empty()) {
-        const auto block = pending.back();
-        pending.pop_back();
-        if (block.value >= count || reachable_[block.value]) continue;
-        reachable_[block.value] = true;
-        for (const auto successor :
-             function.blocks[block.value].terminator.successors) {
-            if (successor.value < count && !reachable_[successor.value]) {
-                pending.push_back(successor);
-            }
-        }
-    }
-
-    std::vector<std::uint64_t> all((count + 63U) / 64U);
-    for (std::size_t block = 0; block < count; ++block) {
-        if (reachable_[block]) {
-            all[block / 64U] |= std::uint64_t{1} << (block % 64U);
-        }
-    }
-    for (std::size_t block = 0; block < count; ++block) {
-        if (reachable_[block]) dominators_[block] = all;
-    }
-    std::fill(dominators_[function.entry.value].begin(),
-              dominators_[function.entry.value].end(), 0);
-    dominators_[function.entry.value][function.entry.value / 64U] |=
-        std::uint64_t{1} << (function.entry.value % 64U);
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (const auto& block : function.blocks) {
-            if (block.id.value >= count || !reachable_[block.id.value] ||
-                block.id == function.entry) {
-                continue;
-            }
-            std::vector<std::uint64_t> next;
-            bool saw_predecessor = false;
-            for (const auto predecessor : block.predecessors) {
-                if (predecessor.value >= count ||
-                    !reachable_[predecessor.value]) {
-                    continue;
-                }
-                if (!saw_predecessor) {
-                    next = dominators_[predecessor.value];
-                    saw_predecessor = true;
-                } else {
-                    for (std::size_t word = 0; word < next.size(); ++word) {
-                        next[word] &= dominators_[predecessor.value][word];
-                    }
-                }
-            }
-            if (!saw_predecessor) next.assign(all.size(), 0);
-            next[block.id.value / 64U] |=
-                std::uint64_t{1} << (block.id.value % 64U);
-            if (next != dominators_[block.id.value]) {
-                dominators_[block.id.value] = std::move(next);
-                changed = true;
-            }
-        }
-    }
-
-    for (const auto& block : function.blocks) {
-        if (!reachable(block.id) || block.id == function.entry) continue;
-        std::optional<BlockId> best;
-        unsigned best_depth{};
-        for (std::size_t candidate = 0; candidate < count; ++candidate) {
-            const BlockId id{static_cast<std::uint32_t>(candidate)};
-            if (id == block.id || !dominates(id, block.id)) continue;
-            unsigned depth{};
-            for (const auto word : dominators_[candidate]) {
-                depth += static_cast<unsigned>(std::popcount(word));
-            }
-            if (!best || depth > best_depth) {
-                best = id;
-                best_depth = depth;
-            }
-        }
-        immediate_dominators_[block.id.value] = best;
-        if (best) children_[best->value].push_back(block.id);
-    }
-}
-
-bool DominatorTree::bit(BlockId block, BlockId candidate) const {
-    if (block.value >= dominators_.size() ||
-        candidate.value >= reachable_.size()) {
-        return false;
-    }
-    return (dominators_[block.value][candidate.value / 64U] &
-            (std::uint64_t{1} << (candidate.value % 64U))) != 0;
+    for (std::uint32_t block = 0; block < children_.size(); ++block)
+        for (const auto child : dominance_.children(block))
+            children_[block].push_back(BlockId{child});
 }
 
 bool DominatorTree::reachable(BlockId block) const {
-    return block.value < reachable_.size() && reachable_[block.value];
+    return dominance_.reachable(block.value);
 }
 
 bool DominatorTree::dominates(BlockId dominator, BlockId block) const {
-    return reachable(dominator) && reachable(block) && bit(block, dominator);
+    return dominance_.dominates(dominator.value, block.value);
 }
 
 std::optional<BlockId> DominatorTree::immediate_dominator(
     BlockId block) const {
-    return block.value < immediate_dominators_.size()
-        ? immediate_dominators_[block.value]
-        : std::nullopt;
+    const auto dominator = dominance_.immediate_dominator(block.value);
+    return dominator ? std::optional<BlockId>(BlockId{*dominator}) : std::nullopt;
 }
 
 const std::vector<BlockId>& DominatorTree::children(BlockId block) const {

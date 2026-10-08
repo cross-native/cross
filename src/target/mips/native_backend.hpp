@@ -9,9 +9,17 @@
 #include "middle/mir.hpp"
 #include "target/subtarget.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 
 namespace cross::mips {
+
+// The ELF ABI tag an ABI model requests through `elf_abi_tag`. Default keeps
+// the tag the object writer derives from the triple; an unknown spelling
+// yields nullopt.
+enum class ElfAbiTag : std::uint8_t { Default, Eabi32 };
+[[nodiscard]] std::optional<ElfAbiTag> elf_abi_tag(const AbiEntry& abi);
 
 [[nodiscard]] machine::Module lower_managed_machine(
     const mir::ManagedModule& managed, const hir::Module& hir_module,

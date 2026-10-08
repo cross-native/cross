@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <sstream>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace cross {
@@ -160,18 +161,6 @@ std::string binary_name(mir::BinaryOperation operation) {
 
 std::string block_name(mir::BlockId id) {
     return id.value == 0 ? "entry" : "mir.bb" + std::to_string(id.value);
-}
-
-std::string sanitize_identifier(std::string_view text) {
-    std::string result;
-    result.reserve(text.size());
-    for (const char ch : text) {
-        const bool valid = (ch >= 'A' && ch <= 'Z') ||
-                           (ch >= 'a' && ch <= 'z') ||
-                           (ch >= '0' && ch <= '9');
-        result.push_back(valid ? ch : '_');
-    }
-    return result;
 }
 
 unsigned ir_alignment(const hir::Module& module, hir::TypeId id) {
@@ -374,18 +363,16 @@ public:
                     "0xL" + hexadecimal(value.integer, 16) +
                     hexadecimal(value.integer_high, 16);
             } else if (value.kind == mir::ValueKind::LabelAddress) {
-                const auto binding = std::find_if(
-                    function_.labels.begin(), function_.labels.end(),
-                    [&](const mir::ManagedLabel& candidate) {
-                        return value.label &&
-                               candidate.label == *value.label;
-                    });
-                references_[value.id.value] =
-                    binding == function_.labels.end()
-                        ? "null"
-                        : "blockaddress(" +
-                              symbol_name(entity_.link_symbol) + ", %" +
-                              block_reference(binding->block) + ')';
+                const auto& label = hir_.labels.at(value.label->value);
+                const auto& owner = hir_.function(label.owner);
+                if (!label.definition || owner.naked) {
+                    diagnostics_.error(value.location,
+                        "LLVM debug serialization cannot represent an external or raw-assembly label address");
+                    references_[value.id.value] = "null";
+                } else {
+                    references_[value.id.value] = "blockaddress(" +
+                        symbol_name(owner.link_symbol) + ", %" + llvm_label_name(label.id) + ')';
+                }
             } else if (value.kind == mir::ValueKind::SlotAddress &&
                        value.slot) {
                 references_[value.id.value] =
@@ -466,8 +453,7 @@ private:
                 return candidate.block == id;
             });
         if (binding == function_.labels.end()) return block_name(id);
-        const auto& label = hir_.labels.at(binding->label.value);
-        return "cross.label." + sanitize_identifier(label.source_name);
+        return llvm_label_name(binding->label);
     }
 
     static bool splits_llvm_block(const mir::ManagedValue& value) {
@@ -849,7 +835,8 @@ private:
             }
             return;
         }
-        if (value.kind == ValueKind::ConstantInteger ||
+        if (value.kind == ValueKind::VoidValue ||
+            value.kind == ValueKind::ConstantInteger ||
             value.kind == ValueKind::LabelAddress ||
             value.kind == ValueKind::SlotAddress ||
             value.kind == ValueKind::GlobalAddress ||
@@ -1136,13 +1123,13 @@ private:
                                    "this $::patch value type");
                 return;
             }
-            auto assembly = mnemonic + " $$" +
-                            to_decimal({value.integer, value.integer_high}) +
-                            ", " + register_modifier;
-            if (value.patch_sink) {
-                assembly += "\n.Lcross.patch.value." +
-                            std::to_string(value.patch_id) + ".end:";
-            }
+            const auto end = ".Lcross.patch.value." + std::to_string(value.patch_id) + ".end";
+            const bool first_use = emitted_patch_cells_.insert(value.patch_id).second;
+            auto assembly = first_use
+                ? mnemonic + " $$" + to_decimal({value.integer, value.integer_high}) +
+                    ", " + register_modifier + "\n" + end + ":"
+                : (bits == 64 ? std::string("movq") : mnemonic) + " " + end + "-" +
+                    std::to_string(bits / 8U) + "(%rip), " + register_modifier;
             out_ << "  " << result << " = call " << ir_type(hir_, value.type)
                  << " asm sideeffect " << llvm_string(assembly) << ", "
                  << llvm_string("=r") << "()\n";
@@ -1489,6 +1476,7 @@ private:
     std::vector<std::string> references_;
     std::string active_label_;
     std::ostringstream out_;
+    std::unordered_set<std::uint32_t> emitted_patch_cells_;
 };
 
 } // namespace

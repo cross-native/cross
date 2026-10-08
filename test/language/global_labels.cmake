@@ -110,25 +110,27 @@ if(position EQUAL -1)
     message(FATAL_ERROR "COFF global label lacks an external code-symbol definition")
 endif()
 
-execute_process(
-    COMMAND "${CC}" -S "${ERROR_SOURCE}" -o "${OUTPUT}-errors.s"
-    RESULT_VARIABLE error_status
-    OUTPUT_VARIABLE error_stdout
-    ERROR_VARIABLE error_stderr
-)
-if(error_status EQUAL 0)
-    message(FATAL_ERROR "invalid global labels unexpectedly compiled")
-endif()
-foreach(pattern
+set(label_errors
         "a global label definition requires a global stable-ABI function"
         "global label declarations use different link names"
         "global label declaration disagrees with a local label definition"
         "global label declaration has no matching definition"
         "a function containing a global label cannot be always_inline")
-    string(FIND "${error_stderr}" "${pattern}" position)
-    if(position EQUAL -1)
+# Source constraints may stop before HIR/linkage checks. Exercise each invalid
+# declaration independently so an earlier diagnostic does not hide coverage.
+foreach(case RANGE 0 4)
+    list(GET label_errors ${case} pattern)
+    execute_process(
+        COMMAND "${CC}" -S "-DLABEL_ERROR_CASE=${case}"
+                "${ERROR_SOURCE}" -o "${OUTPUT}-errors-${case}.s"
+        RESULT_VARIABLE error_status
+        OUTPUT_VARIABLE error_stdout
+        ERROR_VARIABLE error_stderr
+    )
+    if(NOT error_status EQUAL 1 OR NOT error_stderr MATCHES "${pattern}" OR
+       NOT error_stderr MATCHES "global_label_errors.x:[0-9]+:[0-9]+: error:")
         message(FATAL_ERROR
-            "global-label diagnostics are missing '${pattern}'\n${error_stderr}")
+            "global-label case ${case} is missing '${pattern}'\n${error_stdout}\n${error_stderr}")
     endif()
 endforeach()
 

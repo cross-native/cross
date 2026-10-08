@@ -7,7 +7,7 @@ global i32 musttail_callee(in i32 value) {
 }
 
 global i32 musttail_caller(in i32 value) {
-    [[musttail]] return musttail_callee(value);
+    [[musttail]] return ((musttail_callee(value)));
 }
 
 global i32 musttail_local_lifetime(in i32 value) {

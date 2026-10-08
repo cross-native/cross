@@ -6,6 +6,7 @@
 #include "common/floating_bits.hpp"
 #include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
+#include "common/relocation_addend.hpp"
 #include "frontend/ast.hpp"
 #include "frontend/semantic.hpp"
 #include "middle/initializer.hpp"
@@ -539,125 +540,108 @@ std::uint64_t source_storage_size(const hir::Module& module,
 }
 
 bool add_address_addend(AddressConstant& address, std::uint64_t bytes) {
-    if (bytes > static_cast<std::uint64_t>(
-                    std::numeric_limits<std::int64_t>::max())) return false;
-    const auto amount = static_cast<std::int64_t>(bytes);
-    if (address.addend > std::numeric_limits<std::int64_t>::max() - amount)
-        return false;
-    address.addend += amount;
+    const auto sum = offset_relocation_addend(relocation_addend(address.addend),
+                                              {UInt128{bytes}, false}, 1, true);
+    const auto value = sum ? relocation_addend_i64(*sum) : std::nullopt;
+    if (!value) return false;
+    address.addend = *value;
     return true;
 }
 
-std::optional<std::int64_t> address_offset(const Expr& expression, unsigned address_bits) {
-    if (expression.kind == Expr::Kind::Parenthesized && expression.left)
-        return address_offset(*expression.left, address_bits);
-    if (expression.kind == Expr::Kind::Unary && expression.left &&
-        (expression.text == "+" || expression.text == "-")) {
-        auto value = address_offset(*expression.left, address_bits);
-        if (value && expression.text == "-") {
-            if (*value == std::numeric_limits<std::int64_t>::min()) return std::nullopt;
-            *value = -*value;
-        }
-        return value;
-    }
-    auto value = integer_value(expression);
-    if (!value) return std::nullopt;
-    bool negative = false;
+std::optional<RelocationAddend> address_offset(const Expr& expression, unsigned address_bits) {
+    // Required proofs already include unary promotion/wrapping. Inspect those
+    // typed bits before considering the legacy unprepared literal syntax.
     if (expression.evaluated_integer) {
-        const auto type = expression.evaluated_integer->type;
+        const auto& value = *expression.evaluated_integer;
+        const auto type = value.type;
         const auto width = type == BuiltinType::Iptr || type == BuiltinType::Uptr
             ? address_bits : type_bits(builtin_type(type));
         const bool signed_type = type == BuiltinType::I8 || type == BuiltinType::I16 ||
             type == BuiltinType::I32 || type == BuiltinType::I64 ||
             type == BuiltinType::I128 || type == BuiltinType::Iptr;
-        negative = signed_type && bit(*value, width - 1);
-        if (negative) *value = mask_to(negate(*value), width);
+        return relocation_addend(value.value, {width, signed_type});
     }
-    const auto limit = std::uint64_t{1} << 63;
-    if (value->high || value->low > limit - (negative ? 0 : 1)) return std::nullopt;
-    if (negative && value->low == limit) return std::numeric_limits<std::int64_t>::min();
-    const auto magnitude = static_cast<std::int64_t>(value->low);
-    return negative ? -magnitude : magnitude;
+    if (expression.kind == Expr::Kind::Parenthesized && expression.left)
+        return address_offset(*expression.left, address_bits);
+    if (expression.kind == Expr::Kind::Unary && expression.left &&
+        (expression.text == "+" || expression.text == "-")) {
+        auto value = address_offset(*expression.left, address_bits);
+        if (value && expression.text == "-" && value->magnitude != UInt128{})
+            value->negative = !value->negative;
+        return value;
+    }
+    const auto value = integer_value(expression);
+    return value ? std::optional{RelocationAddend{*value, false}} : std::nullopt;
 }
 
 bool apply_address_offset(AddressConstant& address, const Expr& expression,
                           std::uint64_t scale, bool addition, unsigned address_bits) {
     const auto offset = address_offset(expression, address_bits);
-    if (!offset || scale == 0) return false;
-    const bool negative = (*offset < 0) != !addition;
-    const auto magnitude = *offset < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(*offset)
-                                       : static_cast<std::uint64_t>(*offset);
-    const auto limit = (std::uint64_t{1} << 63) - (negative ? 0 : 1);
-    if (magnitude > limit / scale) return false;
-    const auto bytes = magnitude * scale;
-    if (!negative) return add_address_addend(address, bytes);
-    if (bytes == (std::uint64_t{1} << 63)) {
-        if (address.addend < 0) return false;
-        address.addend += std::numeric_limits<std::int64_t>::min();
-    } else {
-        const auto amount = static_cast<std::int64_t>(bytes);
-        if (address.addend < std::numeric_limits<std::int64_t>::min() + amount) return false;
-        address.addend -= amount;
-    }
+    const auto sum = offset ? offset_relocation_addend(relocation_addend(address.addend), *offset,
+                                                       scale, addition) : std::nullopt;
+    const auto value = sum ? relocation_addend_i64(*sum) : std::nullopt;
+    if (!value) return false;
+    address.addend = *value;
     return true;
 }
 
 bool compatible_static_pointee(const hir::Module& module, hir::TypeId source,
                                const TypePtr& destination,
                                unsigned depth = 0, bool nested_qualification = true) {
-    if (!destination || depth >= 32) return false;
-    const auto& from = module.type(source);
-    if ((from.is_const && !destination->is_const) ||
-        (from.is_volatile && !destination->is_volatile) ||
-        from.is_atomic != destination->is_atomic) return false;
-    if (!nested_qualification &&
-        ((!from.is_const && destination->is_const) ||
-         (!from.is_volatile && destination->is_volatile))) return false;
-    if (depth == 0 &&
-        ((destination->kind == Type::Kind::Builtin && destination->builtin == BuiltinType::Void) ||
-         (from.kind == hir::Type::Kind::Builtin && from.builtin == BuiltinType::Void)))
-        return from.kind != hir::Type::Kind::Function && destination->kind != Type::Kind::Function;
-    switch (destination->kind) {
-    case Type::Kind::Builtin:
-        return from.kind == hir::Type::Kind::Builtin &&
-               from.builtin == destination->builtin &&
-               from.nominal_key() == destination->nominal_key();
-    case Type::Kind::Pointer:
-        return from.kind == hir::Type::Kind::Pointer && from.pointee &&
-               from.address_space == destination->address_space &&
-               compatible_static_pointee(module, *from.pointee,
-                                          destination->pointee, depth + 1,
-                                          nested_qualification && destination->is_const);
-    case Type::Kind::Array:
-        return from.kind == hir::Type::Kind::Array && from.element &&
-               from.lanes == destination->lanes &&
-               compatible_static_pointee(module, *from.element,
-                                          destination->element, depth + 1);
-    case Type::Kind::Record:
-        return from.kind == hir::Type::Kind::Record &&
-               from.nominal_key() == destination->nominal_key();
-    case Type::Kind::Vector:
-        return from.kind == hir::Type::Kind::Vector && from.element &&
-               from.lanes == destination->lanes &&
-               from.scalable == destination->scalable &&
-               compatible_static_pointee(module, *from.element,
-                                          destination->element, depth + 1);
-    default:
-        return false;
+    auto to = destination;
+    bool immediate = depth == 0;
+    while (to) {
+        const auto& from = module.type(source);
+        if ((from.is_const && !to->is_const) ||
+            (from.is_volatile && !to->is_volatile) ||
+            from.is_atomic != to->is_atomic) return false;
+        if (!nested_qualification &&
+            ((!from.is_const && to->is_const) ||
+             (!from.is_volatile && to->is_volatile))) return false;
+        if (immediate &&
+            ((to->kind == Type::Kind::Builtin && to->builtin == BuiltinType::Void) ||
+             (from.kind == hir::Type::Kind::Builtin && from.builtin == BuiltinType::Void)))
+            return from.kind != hir::Type::Kind::Function && to->kind != Type::Kind::Function;
+        immediate = false;
+        switch (to->kind) {
+        case Type::Kind::Builtin:
+            return from.kind == hir::Type::Kind::Builtin && from.builtin == to->builtin &&
+                   from.nominal_key() == to->nominal_key();
+        case Type::Kind::Pointer:
+            if (from.kind != hir::Type::Kind::Pointer || !from.pointee ||
+                from.address_space != to->address_space) return false;
+            nested_qualification = nested_qualification && to->is_const;
+            source = *from.pointee;
+            to = to->pointee;
+            break;
+        case Type::Kind::Array:
+        case Type::Kind::Vector:
+            if ((to->kind == Type::Kind::Array ? from.kind != hir::Type::Kind::Array
+                                              : from.kind != hir::Type::Kind::Vector) ||
+                !from.element || from.lanes != to->lanes || from.scalable != to->scalable) return false;
+            source = *from.element;
+            to = to->element;
+            break;
+        case Type::Kind::Record:
+            return from.kind == hir::Type::Kind::Record && from.nominal_key() == to->nominal_key();
+        default:
+            return false;
+        }
     }
+    return false;
 }
 
-std::optional<AddressValue> address_value(
+ContinuationTask<std::optional<AddressValue>> address_value_async(
     const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget);
 
-std::optional<AddressValue> address_designator(
+ContinuationTask<std::optional<AddressValue>> address_designator_async(
     const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget) {
     if (expression.kind == Expr::Kind::Parenthesized && expression.left)
-        return address_designator(module, scope, *expression.left, subtarget);
+        co_return co_await address_designator_async(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Unary && expression.text == "*" && expression.left)
-        return address_value(module, scope, *expression.left, subtarget);
+        co_return co_await address_value_async(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
                 find_object(module, expression, scope)) {
@@ -665,25 +649,26 @@ std::optional<AddressValue> address_designator(
             result.address.kind = AddressKind::Object;
             result.address.object = object->id;
             result.pointee = object->type;
-            return result;
+            co_return result;
         }
         if (const auto* function =
                 find_function(module, expression, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
-            return result;
+            co_return result;
         }
-        return std::nullopt;
+        co_return std::nullopt;
     }
     if (expression.kind != Expr::Kind::Binary || !expression.left ||
-        !expression.right) return std::nullopt;
+        !expression.right) co_return std::nullopt;
     if ((expression.text == "member" || expression.text == "pointer_member") &&
         expression.right->kind == Expr::Kind::Name) {
-        auto base = expression.text == "member"
-            ? address_designator(module, scope, *expression.left, subtarget)
-            : address_value(module, scope, *expression.left, subtarget);
-        if (!base) return std::nullopt;
+        std::optional<AddressValue> base;
+        if (expression.text == "member")
+            base = co_await address_designator_async(module, scope, *expression.left, subtarget);
+        else base = co_await address_value_async(module, scope, *expression.left, subtarget);
+        if (!base) co_return std::nullopt;
         const hir::Record* record{};
         if (base->pointee) {
             const auto& type = module.type(*base->pointee);
@@ -697,124 +682,149 @@ std::optional<AddressValue> address_designator(
             base->owner_volatile = base->owner_volatile || base->cast_pointee->is_volatile;
             record = module.record(base->cast_pointee->nominal_key());
         }
-        if (!record) return std::nullopt;
+        if (!record) co_return std::nullopt;
         const auto* member = module.member(record->id,
-                                            expression.right->text);
+                                            member_name(*expression.right));
         if (!member || member->bit_width ||
             !add_address_addend(base->address, member->offset))
-            return std::nullopt;
+            co_return std::nullopt;
         base->pointee = member->type;
         base->cast_pointee.reset();
-        return base;
+        co_return base;
     }
     if (expression.text == "index") {
-        auto base = address_designator(module, scope, *expression.left,
+        auto base = co_await address_designator_async(module, scope, *expression.left,
                                        subtarget);
         if (base && base->pointee) {
             const auto& selected = module.type(*base->pointee);
-            if (selected.kind == hir::Type::Kind::Array && selected.element) {
+            if ((selected.kind == hir::Type::Kind::Array ||
+                 (selected.kind == hir::Type::Kind::Vector && !selected.scalable)) && selected.element) {
                 base->owner_const = base->owner_const || selected.is_const;
                 base->owner_volatile = base->owner_volatile || selected.is_volatile;
                 base->pointee = *selected.element;
             } else {
                 base.reset();
             }
+        } else if (base && base->cast_pointee) {
+            if (base->cast_pointee->kind == Type::Kind::Array ||
+                (base->cast_pointee->kind == Type::Kind::Vector && !base->cast_pointee->scalable))
+                base->cast_pointee = qualified_element_type(base->cast_pointee);
+            else base.reset();
         }
         if (!base)
-            base = address_value(module, scope, *expression.left, subtarget);
+            base = co_await address_value_async(module, scope, *expression.left, subtarget);
         if (!base || (!base->pointee && !base->cast_pointee) ||
-            base->integer) return std::nullopt;
+            base->integer) co_return std::nullopt;
         const auto size = base->cast_pointee
             ? source_storage_size(module, base->cast_pointee, subtarget)
             : type_size(module, *base->pointee, subtarget);
         if (!apply_address_offset(base->address, *expression.right, size,
                                    true, module.address_bits))
-            return std::nullopt;
-        return base;
+            co_return std::nullopt;
+        co_return base;
     }
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
-std::optional<AddressValue> address_value(
+ContinuationTask<std::optional<AddressValue>> address_value_async(
     const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget) {
+    if (expression.name_context && expression.name_context->label_address) {
+        const auto* label = module.label(*expression.name_context->label_address);
+        if (!label) co_return std::nullopt;
+        AddressValue result;
+        result.address.kind = AddressKind::Label;
+        result.address.function = label->owner;
+        result.address.label = label->id;
+        co_return result;
+    }
     if (expression.kind == Expr::Kind::Address && expression.evaluated_address) {
         const auto& source = *expression.evaluated_address;
         AddressValue result;
         if (source.kind == cross::AddressConstant::Kind::Object && source.object) {
             const auto* object = module.object(*source.object);
-            if (!object) return std::nullopt;
+            if (!object) co_return std::nullopt;
             result.address.kind = AddressKind::Object;
             result.address.object = object->id;
         } else if (source.kind == cross::AddressConstant::Kind::Function && source.function) {
             const auto* function = module.function(*source.function);
-            if (!function) return std::nullopt;
+            if (!function) co_return std::nullopt;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
-        } else return std::nullopt;
+        } else co_return std::nullopt;
         result.address.addend = source.addend;
         if (expression.type && expression.type->kind == Type::Kind::Pointer)
             result.cast_pointee = expression.type->pointee;
-        return result;
+        co_return result;
     }
     if (expression.kind == Expr::Kind::Parenthesized && expression.left)
-        return address_value(module, scope, *expression.left, subtarget);
+        co_return co_await address_value_async(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Unary && expression.text == "&" &&
         expression.left)
-        return address_designator(module, scope, *expression.left, subtarget);
+        co_return co_await address_designator_async(module, scope, *expression.left, subtarget);
     if (expression.kind == Expr::Kind::Name) {
         if (const auto* object =
                 find_object(module, expression, scope)) {
             const auto& type = module.type(object->type);
             if (type.kind != hir::Type::Kind::Array || !type.element)
-                return std::nullopt;
+                co_return std::nullopt;
             AddressValue result;
             result.address.kind = AddressKind::Object;
             result.address.object = object->id;
             result.pointee = *type.element;
             result.owner_const = type.is_const;
             result.owner_volatile = type.is_volatile;
-            return result;
+            co_return result;
         }
         if (const auto* function =
                 find_function(module, expression, scope)) {
             AddressValue result;
             result.address.kind = AddressKind::Function;
             result.address.function = function->id;
-            return result;
+            co_return result;
         }
         const auto split = expression.text.rfind("::");
-        if (split == std::string::npos) return std::nullopt;
-        const auto* function = find_function(
-            module, expression.text.substr(0, split), scope);
-        if (!function) return std::nullopt;
-        const auto* label = module.label(
-            function->id, expression.text.substr(split + 2));
-        if (!label) return std::nullopt;
+        if (split == std::string::npos) co_return std::nullopt;
+        NameUse owner_name(expression);
+        owner_name.spelling = std::string_view(expression.text).substr(0, split);
+        const auto* function = find_function(module, owner_name, scope);
+        if (!function) co_return std::nullopt;
+        const auto qualified = function->source_name + expression.text.substr(split);
+        NameUse label_name(expression);
+        label_name.spelling = qualified;
+        const auto* label = module.label(function->id, label_name);
+        if (!label) co_return std::nullopt;
         AddressValue result;
         result.address.kind = AddressKind::Label;
         result.address.function = function->id;
         result.address.label = label->id;
-        return result;
+        co_return result;
     }
-    if (expression.kind == Expr::Kind::Binary &&
-        (expression.text == "member" || expression.text == "pointer_member")) {
-        auto value = address_designator(module, scope, expression,
+    if ((expression.kind == Expr::Kind::Binary &&
+         (expression.text == "member" || expression.text == "pointer_member" || expression.text == "index")) ||
+        (expression.kind == Expr::Kind::Unary && expression.text == "*")) {
+        auto value = co_await address_designator_async(module, scope, expression,
                                          subtarget);
-        if (!value || !value->pointee) return std::nullopt;
+        if (!value) co_return std::nullopt;
+        if (value->cast_pointee) {
+            if (value->cast_pointee->kind != Type::Kind::Array) co_return std::nullopt;
+            value->cast_pointee = qualified_element_type(value->cast_pointee);
+            co_return value;
+        }
+        if (!value->pointee) co_return std::nullopt;
         const auto& selected = module.type(*value->pointee);
         if (selected.kind != hir::Type::Kind::Array || !selected.element)
-            return std::nullopt;
+            co_return std::nullopt;
         value->pointee = *selected.element;
         value->owner_const = value->owner_const || selected.is_const;
         value->owner_volatile = value->owner_volatile || selected.is_volatile;
-        return value;
+        co_return value;
     }
     if (expression.kind == Expr::Kind::Cast && expression.left &&
         expression.type) {
-        auto value = address_value(module, scope, *expression.left,
+        auto value = co_await address_value_async(module, scope, *expression.left,
                                    subtarget);
-        if (!value) return std::nullopt;
+        if (!value) co_return std::nullopt;
         if (expression.type->kind == Type::Kind::Builtin) {
             const auto kind = expression.type->builtin;
             if ((kind != BuiltinType::Uptr && kind != BuiltinType::Iptr &&
@@ -823,12 +833,12 @@ std::optional<AddressValue> address_value(
                 (kind == BuiltinType::Uptr || kind == BuiltinType::Iptr
                     ? module.address_bits
                     : type_bits(expression.type)) != module.address_bits) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
             value->integer = true;
             value->pointee.reset();
             value->cast_pointee.reset();
-            return value;
+            co_return value;
         }
         if (expression.type->kind == Type::Kind::Pointer) {
             if (!expression.type->pointee ||
@@ -841,29 +851,29 @@ std::optional<AddressValue> address_value(
                 (value->cast_pointee &&
                  !compatible_pointee(value->cast_pointee,
                                       expression.type->pointee))) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
             value->integer = false;
             value->pointee.reset();
             value->cast_pointee = expression.type->pointee;
             value->owner_const = false;
             value->owner_volatile = false;
-            return value;
+            co_return value;
         }
-        return std::nullopt;
+        co_return std::nullopt;
     }
     if (expression.kind == Expr::Kind::Binary && expression.left &&
         expression.right &&
         (expression.text == "+" || expression.text == "-")) {
-        auto value = address_value(module, scope, *expression.left,
+        auto value = co_await address_value_async(module, scope, *expression.left,
                                    subtarget);
         const Expr* offset_expression = expression.right.get();
         if (!value && expression.text == "+") {
-            value = address_value(module, scope, *expression.right,
+            value = co_await address_value_async(module, scope, *expression.right,
                                   subtarget);
             offset_expression = expression.left.get();
         }
-        if (!value) return std::nullopt;
+        if (!value) co_return std::nullopt;
         const auto scale = value->integer ? std::uint64_t{1}
             : value->cast_pointee
                 ? source_storage_size(module, value->cast_pointee, subtarget)
@@ -872,10 +882,16 @@ std::optional<AddressValue> address_value(
                 : std::uint64_t{0};
         if (!apply_address_offset(value->address, *offset_expression, scale,
                                    expression.text == "+", module.address_bits))
-            return std::nullopt;
-        return value;
+            co_return std::nullopt;
+        co_return value;
     }
-    return std::nullopt;
+    co_return std::nullopt;
+}
+
+std::optional<AddressValue> address_value(
+    const hir::Module& module, AddressScope scope,
+    const Expr& expression, const Subtarget& subtarget) {
+    return address_value_async(module, scope, expression, subtarget).run();
 }
 
 bool lower_scalar_initializer(Object& result, const hir::Module& module,
@@ -890,9 +906,47 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
         result.bits = expression.evaluated_address->absolute;
         return true;
     }
+    if (type.kind == hir::Type::Kind::Builtin && type.builtin == BuiltinType::Label &&
+        expression.evaluated_integer && expression.evaluated_integer->type == BuiltinType::Label) {
+        if (subtarget.target().data_layout.code_addresses != CodeAddressRepresentation::Flat) {
+            diagnostics.error(expression.location, "target does not provide numeric code-address representation");
+            return false;
+        }
+        result.initializer = InitializerKind::Integer;
+        result.bits = mask_to(expression.evaluated_integer->value, module.address_bits);
+        return true;
+    }
     if (type.kind == hir::Type::Kind::Pointer ||
         (type.kind == hir::Type::Kind::Builtin &&
          type.builtin == BuiltinType::Label)) {
+        if (type.kind == hir::Type::Kind::Pointer) {
+            const Expr* source = &expression;
+            while (source->left && (source->kind == Expr::Kind::Parenthesized ||
+                (source->kind == Expr::Kind::Unary && (source->text == "+" || source->text == "-"))))
+                source = source->left.get();
+            // Numeric code-label bits are not an integer null-pointer constant.
+            const auto integer = source->evaluated_integer &&
+                source->evaluated_integer->type == BuiltinType::Label
+                ? std::nullopt : integer_value(expression);
+            if (integer && *integer == UInt128{}) {
+                const auto* space = find_address_space(subtarget.target(), type.address_space);
+                if (!space || !space->native_lowering) {
+                    diagnostics.error(expression.location,
+                        "pointer initializer has no native address-space representation");
+                    return false;
+                }
+                const auto bits = space->pointer_bits ? space->pointer_bits : module.address_bits;
+                const UInt128 null{space->null_low, space->null_high};
+                if (bits != result.size * 8U || !fits_unsigned(null, bits)) {
+                    diagnostics.error(expression.location,
+                        "null pointer representation does not fit the destination storage");
+                    return false;
+                }
+                result.initializer = InitializerKind::Integer;
+                result.bits = null;
+                return true;
+            }
+        }
         const auto address = relocatable_address(
             module, {entity.source_name, entity.source_unit}, expression,
             subtarget, false);
@@ -1060,7 +1114,16 @@ bool append_image_relocations(Object& result, const Expr& expression,
         source.kind = Expr::Kind::Address;
         source.location = expression.location;
         source.type = relocation.type;
-        source.evaluated_address = relocation.address;
+        if (const auto* address = std::get_if<cross::AddressConstant>(&relocation.address)) {
+            source.evaluated_address = *address;
+        } else {
+            source.kind = Expr::Kind::Name;
+            auto context = std::make_shared<NameLookupContext>();
+            context->kind = NameLookupContext::Kind::Exact;
+            context->label_address = std::make_shared<const LabelAddressConstant>(
+                std::get<LabelAddressConstant>(relocation.address));
+            source.name_context = std::move(context);
+        }
         const auto address = relocatable_address(module,
             {entity.source_name, entity.source_unit}, source, subtarget, false);
         if (!address || (address->kind == AddressKind::Object && address->object &&
@@ -1256,15 +1319,28 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                                const CompilerOptions& options,
                                const Subtarget& subtarget,
                                Diagnostics& diagnostics) {
+    return normalize_generic_pointer_async(program, expression, destination, caller, locals,
+        options, subtarget, diagnostics).run();
+}
+
+ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::unique_ptr<Expr>& expression,
+                               const TypePtr& destination,
+                               const FunctionDecl* caller,
+                               std::span<const NameKey> locals,
+                               const CompilerOptions& options,
+                               const Subtarget& subtarget,
+                               Diagnostics& diagnostics) {
+    const auto initial_errors = diagnostics.errors();
+    const auto initial_resources = program.evaluation_resource_errors;
     if (!expression || !destination || destination->kind != Type::Kind::Pointer)
-        return false;
-    auto module = hir::build_constant_context(program, options, subtarget.target(),
+        co_return false;
+    auto module = co_await hir::build_constant_context_async(program, options, subtarget.target(),
                                                diagnostics);
-    if (diagnostics.errors() != 0) return false;
+    if (diagnostics.errors() != initial_errors || program.evaluation_resource_errors != initial_resources) co_return false;
     const auto* space = find_address_space(subtarget.target(), destination->address_space);
     if (!space || !space->native_lowering) {
         diagnostics.error(expression->location, "generic pointer type has no native address-space representation");
-        return false;
+        co_return false;
     }
     const auto address_bits = space->pointer_bits ? space->pointer_bits : module.address_bits;
     const AddressScope scope{caller ? caller->name : std::string_view{},
@@ -1284,144 +1360,173 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
     };
     // Bind in the caller's source context before substitution moves the value
     // to the generic definition. Runtime cells can never become relocations.
-    const auto bind = [&](const auto& self, Expr& node) -> bool {
-        if (node.kind == Expr::Kind::Name) {
-            if (std::find(locals.begin(), locals.end(), name_key(node)) != locals.end())
-                return reject(node.location,
-                    "generic pointer argument cannot depend on an automatic local or parameter");
-            const auto candidates = namespace_candidates(node,
-                caller ? caller->source_namespace : std::string{},
-                caller ? caller->imports : std::vector<std::string>{});
-            const hir::Object* object{};
-            const hir::Function* function{};
-            for (const auto& candidate : candidates) {
-                object = find_object(module, candidate, scope.source_unit);
-                function = find_function(module, candidate, scope.source_unit);
-                if (object || function) break;
+    const auto bind = [&](Expr& root) -> bool {
+        std::vector<Expr*> pending{&root};
+        while (!pending.empty()) {
+            auto& node = *pending.back();
+            pending.pop_back();
+            if (node.kind == Expr::Kind::Name) {
+                if (std::find(locals.begin(), locals.end(), name_key(node)) != locals.end())
+                    return reject(node.location,
+                        "generic pointer argument cannot depend on an automatic local or parameter");
+                const auto candidates = namespace_candidates(node,
+                    caller ? caller->source_namespace : std::string{},
+                    caller ? caller->imports : std::vector<std::string>{});
+                const hir::Object* object{};
+                const hir::Function* function{};
+                for (const auto& candidate : candidates) {
+                    object = find_object(module, candidate, scope.source_unit);
+                    function = find_function(module, candidate, scope.source_unit);
+                    if (object || function) break;
+                }
+                if (object) bind_exact_name(node, object->source_name);
+                else if (function) bind_exact_name(node, function->source_name);
+                else if (node.text == "$::runtime")
+                    return reject(node.location, "runtime expression is not permitted in a generic pointer argument");
+                else if (node.text != "$::eval")
+                    return reject(node.location, "unresolved name in generic pointer argument: '" + node.text + "'");
             }
-            if (object) bind_exact_name(node, object->source_name);
-            else if (function) bind_exact_name(node, function->source_name);
-            else if (node.text == "$::runtime")
-                return reject(node.location, "runtime expression is not permitted in a generic pointer argument");
-            else if (node.text != "$::eval")
-                return reject(node.location, "unresolved name in generic pointer argument: '" + node.text + "'");
+            const bool member = node.kind == Expr::Kind::Binary &&
+                (node.text == "member" || node.text == "pointer_member");
+            for (auto argument = node.arguments.rbegin(); argument != node.arguments.rend(); ++argument)
+                pending.push_back(argument->get());
+            if (node.third) pending.push_back(node.third.get());
+            if (node.right && !member) pending.push_back(node.right.get());
+            if (node.left) pending.push_back(node.left.get());
         }
-        if (node.left && !self(self, *node.left)) return false;
-        const bool member = node.kind == Expr::Kind::Binary &&
-            (node.text == "member" || node.text == "pointer_member");
-        if (node.right && !member && !self(self, *node.right)) return false;
-        if (node.third && !self(self, *node.third)) return false;
-        for (auto& argument : node.arguments)
-            if (!self(self, *argument)) return false;
         return true;
     };
-    if (!expression || !bind(bind, *expression)) return false;
+    if (!expression || !bind(*expression)) co_return false;
     const auto integer = [&](const Expr& node) {
-        return evaluate_target_integer_constant(program, node, diagnostics,
+        return evaluate_target_integer_constant_async(program, node, diagnostics,
                                                 size_of, align_of, name_space);
     };
-    const auto fold_integer = [&](std::unique_ptr<Expr>& node) -> bool {
-        const auto value = integer(*node);
-        if (!value) return false;
+    const auto fold_integer = [&](std::unique_ptr<Expr>& node) -> ContinuationTask<bool> {
+        const auto value = co_await integer(*node);
+        if (!value) co_return false;
         auto folded = std::make_unique<Expr>();
         folded->location = node->location;
         folded->kind = Expr::Kind::Integer;
         folded->evaluated_integer = *value;
         folded->text = to_decimal(value->value);
         node = std::move(folded);
-        return true;
+        co_return true;
     };
-    const auto has_address = [&](const auto& self, const Expr& node) -> bool {
-        if (node.kind == Expr::Kind::Address)
-            return node.evaluated_address &&
-                node.evaluated_address->kind != cross::AddressConstant::Kind::Absolute;
-        if (node.kind == Expr::Kind::Unary && node.text == "&") return true;
-        if (node.kind == Expr::Kind::Name) {
-            const auto* object = find_object(module, node, scope);
-            return (object && module.type(object->type).kind == hir::Type::Kind::Array) ||
-                   find_function(module, node, scope);
+    const auto has_address = [&](const Expr& root) -> bool {
+        std::vector<const Expr*> pending{&root};
+        while (!pending.empty()) {
+            const auto& node = *pending.back();
+            pending.pop_back();
+            if (node.kind == Expr::Kind::Address) {
+                if (node.evaluated_address &&
+                    node.evaluated_address->kind != cross::AddressConstant::Kind::Absolute) return true;
+                continue;
+            }
+            if (node.kind == Expr::Kind::Unary && node.text == "&") return true;
+            if (node.kind == Expr::Kind::Name) {
+                const auto* object = find_object(module, node, scope);
+                if ((object && module.type(object->type).kind == hir::Type::Kind::Array) ||
+                       find_function(module, node, scope)) return true;
+                continue;
+            }
+            if (node.kind == Expr::Kind::Call || node.kind == Expr::Kind::Sizeof ||
+                node.kind == Expr::Kind::Alignof) continue;
+            if (node.third) pending.push_back(node.third.get());
+            if (node.right) pending.push_back(node.right.get());
+            if (node.left) pending.push_back(node.left.get());
         }
-        if (node.kind == Expr::Kind::Call || node.kind == Expr::Kind::Sizeof ||
-            node.kind == Expr::Kind::Alignof) return false;
-        return (node.left && self(self, *node.left)) ||
-               (node.right && self(self, *node.right)) ||
-               (node.third && self(self, *node.third));
+        return false;
     };
     const GenericPointerResolver resolve_pointer =
         [&](std::unique_ptr<Expr>& node, const TypePtr& type,
             const FunctionDecl* context, std::span<const NameKey> local_names) {
-            return normalize_generic_pointer(program, node, type, context, local_names,
+            return normalize_generic_pointer_async(program, node, type, context, local_names,
                                               options, subtarget, diagnostics);
         };
-    const auto pointer_type_of = [&](const auto& self, const Expr& node) -> TypePtr {
-        if (node.type && node.type->kind == Type::Kind::Pointer) return node.type;
-        if (node.kind == Expr::Kind::Parenthesized && node.left) return self(self, *node.left);
-        if (node.kind == Expr::Kind::Call && node.left && node.left->kind == Expr::Kind::Name) {
-            if (node.left->text == "$::eval" && node.arguments.size() == 1)
-                return self(self, *node.arguments.front());
-            if (const auto* function = find_function(module, *node.left, scope)) {
-                const auto* source = function->definition ? function->definition : function->declarations.back();
-                if (source->return_type->kind == Type::Kind::Pointer) return source->return_type;
+    const auto pointer_type_of = [&](const Expr& root) -> TypePtr {
+        std::vector<const Expr*> pending{&root};
+        while (!pending.empty()) {
+            const auto& node = *pending.back();
+            pending.pop_back();
+            if (node.type && node.type->kind == Type::Kind::Pointer) return node.type;
+            if (node.kind == Expr::Kind::Parenthesized && node.left) pending.push_back(node.left.get());
+            if (node.kind == Expr::Kind::Call && node.left && node.left->kind == Expr::Kind::Name) {
+                if (node.left->text == "$::eval" && node.arguments.size() == 1)
+                    pending.push_back(node.arguments.front().get());
+                if (const auto* function = find_function(module, *node.left, scope)) {
+                    const auto* source = function->definition ? function->definition : function->declarations.back();
+                    if (source->return_type->kind == Type::Kind::Pointer) return source->return_type;
+                }
             }
-        }
-        if (node.kind == Expr::Kind::Binary && (node.text == "+" || node.text == "-")) {
-            if (node.left) if (auto type = self(self, *node.left)) return type;
-            if (node.text == "+" && node.right) return self(self, *node.right);
+            if (node.kind == Expr::Kind::Binary && (node.text == "+" || node.text == "-")) {
+                if (node.text == "+" && node.right) pending.push_back(node.right.get());
+                if (node.left) pending.push_back(node.left.get());
+            }
         }
         return {};
     };
-    const auto fold = [&](const auto& self, std::unique_ptr<Expr>& node) -> bool {
+    const auto fold = [&](const auto& self, std::unique_ptr<Expr>& node) -> ContinuationTask<bool> {
+        if (node->kind == Expr::Kind::Unary && node->text == "&" && node->left) {
+            auto* designator = node->left.get();
+            while (designator->kind == Expr::Kind::Parenthesized && designator->left)
+                designator = designator->left.get();
+            if (designator->kind == Expr::Kind::Unary && designator->text == "*" && designator->left) {
+                auto pointer = std::move(designator->left);
+                node = std::move(pointer);
+                co_return (co_await self(self, node));
+            }
+        }
         if (node->kind == Expr::Kind::Call && node->left &&
             node->left->kind == Expr::Kind::Name && node->left->text == "$::eval") {
             if (node->arguments.size() != 1)
-                return reject(node->location, "$::eval requires exactly one expression");
+                co_return reject(node->location, "$::eval requires exactly one expression");
             auto operand = std::move(node->arguments.front());
             node = std::move(operand);
-            return self(self, node);
+            co_return (co_await self(self, node));
         }
-        if (node->kind == Expr::Kind::Call && pointer_type_of(pointer_type_of, *node)) {
-            auto value = evaluate_target_pointer_constant(program, *node,
-                pointer_type_of(pointer_type_of, *node), caller, diagnostics,
+        if (node->kind == Expr::Kind::Call && pointer_type_of(*node)) {
+            auto value = co_await evaluate_target_pointer_constant_async(program, *node,
+                pointer_type_of(*node), caller, diagnostics,
                 size_of, align_of, resolve_pointer);
-            if (!value) return false;
+            if (!value) co_return false;
             node = std::move(value);
-            return true;
+            co_return true;
         }
         if (node->kind == Expr::Kind::Conditional && node->left &&
             node->right && node->third) {
-            const auto condition = integer(*node->left);
-            if (!condition) return false;
+            const auto condition = co_await integer(*node->left);
+            if (!condition) co_return false;
             auto selected = condition->value == UInt128{}
                 ? std::move(node->third) : std::move(node->right);
             node = std::move(selected);
-            return self(self, node);
+            co_return (co_await self(self, node));
         }
         if (node->kind == Expr::Kind::Binary && node->left && node->right) {
             if (node->text == "index") {
-                return self(self, node->left) && fold_integer(node->right);
+                co_return (co_await self(self, node->left)) && (co_await fold_integer(node->right));
             }
             if (node->text == "+" || node->text == "-") {
                 // Fold pointer-producing calls before deciding which operand
                 // supplies the address and which supplies the integer offset.
-                if (!self(self, node->left) || !self(self, node->right)) return false;
-                const bool left_address = has_address(has_address, *node->left);
-                const bool right_address = has_address(has_address, *node->right);
+                if (!(co_await self(self, node->left)) || !(co_await self(self, node->right))) co_return false;
+                const bool left_address = has_address(*node->left);
+                const bool right_address = has_address(*node->right);
                 if (left_address && !right_address)
-                    return fold_integer(node->right);
+                    co_return (co_await fold_integer(node->right));
                 if (!left_address && right_address && node->text == "+")
-                    return fold_integer(node->left);
-                const auto left_type = pointer_type_of(pointer_type_of, *node->left);
-                const auto right_type = pointer_type_of(pointer_type_of, *node->right);
+                    co_return (co_await fold_integer(node->left));
+                const auto left_type = pointer_type_of(*node->left);
+                const auto right_type = pointer_type_of(*node->right);
                 if ((left_type && !right_type) || (!left_type && right_type && node->text == "+")) {
                     auto& base = left_type ? node->left : node->right;
                     auto& offset = left_type ? node->right : node->left;
                     const auto type = left_type ? left_type : right_type;
-                    if (!resolve_pointer(base, type, caller, locals) || !fold_integer(offset)) return false;
-                    const auto scale = size_of(type->pointee);
+                    if (!(co_await resolve_pointer.async(base, type, caller, locals)) || !(co_await fold_integer(offset))) co_return false;
+                    const auto scale = co_await size_of.async(type->pointee);
                     AddressConstant delta;
                     if (!scale || !apply_address_offset(delta, *offset, *scale,
                                                         node->text == "+", address_bits))
-                        return reject(node->location, "generic pointer arithmetic requires a complete object type and representable offset");
+                        co_return reject(node->location, "generic pointer arithmetic requires a complete object type and representable offset");
                     auto value = *base->evaluated_address;
                     const bool negative = delta.addend < 0;
                     const auto magnitude = negative ? std::uint64_t{0} - static_cast<std::uint64_t>(delta.addend)
@@ -1430,7 +1535,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                     const auto sum = negative ? subtract(value.absolute, amount) : add(value.absolute, amount);
                     if ((negative && value.absolute < amount) ||
                         (!negative && sum < value.absolute) || !fits_unsigned(sum, address_bits))
-                        return reject(node->location, "generic pointer arithmetic overflows the selected target width");
+                        co_return reject(node->location, "generic pointer arithmetic overflows the selected target width");
                     value.absolute = sum;
                     auto result = std::make_unique<Expr>();
                     result->kind = Expr::Kind::Address;
@@ -1438,15 +1543,15 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                     result->type = type;
                     result->evaluated_address = value;
                     node = std::move(result);
-                    return true;
+                    co_return true;
                 }
-                return true;
+                co_return true;
             }
         }
-        if (node->left && !self(self, node->left)) return false;
-        return true;
+        if (node->left && !(co_await self(self, node->left))) co_return false;
+        co_return true;
     };
-    if (!fold(fold, expression)) return false;
+    if (!(co_await fold(fold, expression)) || program.evaluation_resource_errors != initial_resources) co_return false;
 
     const auto check_conversion = [&](const TypePtr& from, const TypePtr& to,
                                       SourceLocation location) {
@@ -1471,23 +1576,29 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
         while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
         return node;
     };
-    const auto check_casts = [&](const auto& self, const Expr& node) -> bool {
-        if (node.kind == Expr::Kind::Cast && node.left &&
-            !check_conversion(unparen(node.left.get())->type, node.type, node.location))
-            return false;
-        return (!node.left || self(self, *node.left)) &&
-               (!node.right || self(self, *node.right)) &&
-               (!node.third || self(self, *node.third));
+    const auto check_casts = [&](const Expr& root) -> bool {
+        std::vector<const Expr*> pending{&root};
+        while (!pending.empty()) {
+            const auto& node = *pending.back();
+            pending.pop_back();
+            if (node.kind == Expr::Kind::Cast && node.left &&
+                !check_conversion(unparen(node.left.get())->type, node.type, node.location))
+                return false;
+            if (node.third) pending.push_back(node.third.get());
+            if (node.right) pending.push_back(node.right.get());
+            if (node.left) pending.push_back(node.left.get());
+        }
+        return true;
     };
-    if (!check_casts(check_casts, *expression) ||
+    if (!check_casts(*expression) ||
         !check_conversion(unparen(expression.get())->type, destination, expression->location))
-        return false;
+        co_return false;
 
     cross::AddressConstant normalized;
-    if (has_address(has_address, *expression)) {
-        const auto value = address_value(module, scope, *expression, subtarget);
+    if (has_address(*expression)) {
+        const auto value = co_await address_value_async(module, scope, *expression, subtarget);
         if (!value || value->integer || value->address.kind == AddressKind::Label)
-            return reject(expression->location, "generic pointer argument is not a supported address constant");
+            co_return reject(expression->location, "generic pointer argument is not a supported address constant");
         const bool function_pointer = destination->pointee &&
             destination->pointee->kind == Type::Kind::Function;
         if (value->address.kind == AddressKind::Function) {
@@ -1496,24 +1607,24 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
             auto actual = hir::call_signature(module, function.id, {});
             if (!function_pointer || !actual || !expected.pointee ||
                 !module.type(*expected.pointee).function)
-                return reject(expression->location, "generic pointer argument has an incompatible function type");
+                co_return reject(expression->location, "generic pointer argument has an incompatible function type");
             auto signature = *module.type(*expected.pointee).function;
             // Contextual registered-ABI adapters run after instantiation.
             actual->abi = signature.abi;
             if (*actual != signature || value->address.addend != 0)
-                return reject(expression->location, "generic pointer argument has an incompatible function signature");
+                co_return reject(expression->location, "generic pointer argument has an incompatible function signature");
             normalized.kind = cross::AddressConstant::Kind::Function;
             normalized.function = function.definition ? function.definition
                                                       : function.declarations.back();
             if (normalized.function->attribute("eval_only") ||
                 normalized.function->has_meta_signature() ||
                 normalized.function->attribute("always_inline"))
-                return reject(expression->location,
+                co_return reject(expression->location,
                               "generic pointer argument requires a function with a runtime address");
         } else {
             const auto& object = module.object(*value->address.object);
             if (object.is_thread_local)
-                return reject(expression->location, "a thread-local address is not a generic pointer constant");
+                co_return reject(expression->location, "a thread-local address is not a generic pointer constant");
             const auto pointee = value->cast_pointee
                 ? std::optional<hir::TypeId>(module.intern_type(value->cast_pointee))
                 : value->pointee;
@@ -1521,14 +1632,14 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                 (value->owner_const && !destination->pointee->is_const) ||
                 (value->owner_volatile && !destination->pointee->is_volatile) ||
                 !compatible_static_pointee(module, *pointee, destination->pointee))
-                return reject(expression->location, "generic pointer argument has an incompatible pointed-to type or qualifiers");
+                co_return reject(expression->location, "generic pointer argument has an incompatible pointed-to type or qualifiers");
             normalized.kind = cross::AddressConstant::Kind::Object;
             normalized.object = object.definition ? object.definition
                                                   : object.declarations.back();
             const auto extent = hir::layout_size(module, object.type, subtarget.target());
             if (value->address.addend < 0 ||
                 (extent && static_cast<std::uint64_t>(value->address.addend) > *extent))
-                return reject(expression->location,
+                co_return reject(expression->location,
                               "generic pointer address is outside its object or one-past bound");
         }
         normalized.addend = value->address.addend;
@@ -1542,7 +1653,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
             if (source->kind == Expr::Kind::Cast) {
                 explicitly_pointer = true;
                 if (source->type->address_space != destination->address_space)
-                    return reject(source->location, "generic pointer conversion changes address space");
+                    co_return reject(source->location, "generic pointer conversion changes address space");
             }
             source = source->left.get();
         }
@@ -1550,13 +1661,13 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
             source->evaluated_address &&
             source->evaluated_address->kind == cross::AddressConstant::Kind::Absolute;
         if (normalized_absolute) explicitly_pointer = true;
-        const auto value = normalized_absolute
-            ? std::optional<Expr::IntegerConstant>({source->evaluated_address->absolute,
-                                                    BuiltinType::Uptr})
-            : integer(*source);
-        if (!value) return false;
+        std::optional<Expr::IntegerConstant> value;
+        if (normalized_absolute)
+            value = Expr::IntegerConstant{source->evaluated_address->absolute, BuiltinType::Uptr};
+        else value = co_await integer(*source);
+        if (!value) co_return false;
         if (!explicitly_pointer && value->value != UInt128{})
-            return reject(source->location, "a nonzero integer generic pointer argument requires an explicit pointer cast");
+            co_return reject(source->location, "a nonzero integer generic pointer argument requires an explicit pointer cast");
         auto width = type_bits(builtin_type(value->type));
         if (value->type == BuiltinType::Uptr || value->type == BuiltinType::Iptr)
             width = program.address_bits;
@@ -1568,7 +1679,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
         normalized.absolute = convert_integer(value->value, from, to);
         if (width > address_bits &&
             convert_integer(normalized.absolute, to, from) != value->value)
-            return reject(source->location, "generic pointer address is not representable in the selected target width");
+            co_return reject(source->location, "generic pointer address is not representable in the selected target width");
         if (value->value == UInt128{} && !normalized_absolute)
             normalized.absolute = UInt128{space->null_low, space->null_high};
     }
@@ -1578,7 +1689,7 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
     result->type = destination;
     result->evaluated_address = normalized;
     expression = std::move(result);
-    return true;
+    co_return true;
 }
 
 std::optional<AddressConstant> relocatable_address(
@@ -1690,22 +1801,17 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                                     subtarget, diagnostics);
         }
         result.object_indices.emplace(entity.id.value, result.objects.size());
-        if (object.address &&
-            (object.address->kind == AddressKind::Function ||
-             object.address->kind == AddressKind::Label) &&
-            object.address->function) {
-            (void)hir::stabilize_function_address(
-                hir_module, *object.address->function, declaration->location,
-                diagnostics);
-        }
+        const auto stabilize = [&](const AddressConstant& address) {
+            if (address.kind == AddressKind::Label && address.label)
+                (void)hir::stabilize_label_address(hir_module, *address.label,
+                                                  declaration->location, diagnostics);
+            else if (address.kind == AddressKind::Function && address.function)
+                (void)hir::stabilize_function_address(hir_module, *address.function,
+                                                     declaration->location, diagnostics);
+        };
+        if (object.address) stabilize(*object.address);
         for (const auto& relocation : object.relocations) {
-            if ((relocation.address.kind == AddressKind::Function ||
-                 relocation.address.kind == AddressKind::Label) &&
-                relocation.address.function) {
-                (void)hir::stabilize_function_address(
-                    hir_module, *relocation.address.function,
-                    declaration->location, diagnostics);
-            }
+            stabilize(relocation.address);
         }
         result.objects.push_back(std::move(object));
     }

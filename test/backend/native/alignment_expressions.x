@@ -31,6 +31,25 @@ static i32 generic_alignment() {
                : 0;
 }
 
+static uptr type_alignment<T>() { return sizeof(T) * 8uptr; }
+
+[[noinline]] static i32 lexical_alignment(in u32 input) {
+    u64 seed;
+    [[aligned(sizeof(seed) * 8uptr), aligned(sizeof(input))]] stack u8 outer[3];
+    [[aligned(type_alignment<u64>())]] stack u8 generic[3];
+    outer[0] = (u8)input;
+    generic[0] = outer[0] + 1u8;
+    if (((uptr)&outer[0] & 63uptr) != 0uptr ||
+        ((uptr)&generic[0] & 63uptr) != 0uptr) return 0;
+    {
+        u16 seed;
+        [[aligned(sizeof(seed) * 16uptr)]] stack u8 inner[3];
+        inner[0] = generic[0];
+        if (((uptr)&inner[0] & 31uptr) != 0uptr || inner[0] != (u8)(input + 1u32)) return 0;
+    }
+    return outer[0] == (u8)input && generic[0] == (u8)(input + 1u32);
+}
+
 [[link_name("alignment_expression_entry")]]
 global i32 alignment_expression_entry() {
     [[aligned($::alignof(struct expression_aligned_record))]]
@@ -39,7 +58,8 @@ global i32 alignment_expression_entry() {
     if (((uptr)&expression_aligned_object & 63uptr) != 0uptr ||
         ((uptr)&local[0] & 63uptr) != 0uptr) return 0;
     return expression_aligned_object == 7u8 && local[0] == 3u8 &&
-                   generic_alignment::<64uptr>() == 64i32
+                   generic_alignment::<64uptr>() == 64i32 &&
+                   $::runtime(lexical_alignment(11u32)) == 1i32
                ? 1
                : 0;
 }

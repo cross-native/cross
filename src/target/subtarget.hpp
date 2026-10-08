@@ -86,6 +86,9 @@ public:
     // Text lookup is retained for source/model supplied requirements. Hot
     // target code should resolve once and use TargetFeatureId instead.
     [[nodiscard]] bool has_feature(std::string_view name) const;
+    // Registry requirements also permit an empty name, "base", or the target
+    // architecture as baseline markers; these are not optional feature bits.
+    [[nodiscard]] bool supports_registry_feature(std::string_view name) const;
     [[nodiscard]] std::optional<TargetFeatureId> feature_id(
         std::string_view name) const;
     [[nodiscard]] std::string_view feature_name(

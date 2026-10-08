@@ -1,6 +1,15 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+[[macro]] static $::meta::tokens define_fresh(in $::meta::tokens input) {
+    $::meta::tokens state = $::meta::gensym("arguments");
+    return $::quote {
+        [[abi("sysv_abi"), noinline, variadic(u64 *$::unquote(state) "gp_arg_area")]]
+        static u64 fresh_registers(in u64 tag, ...) { return $::unquote(state)[0]; }
+    };
+}
+define_fresh!()
+
 [[abi("sysv_abi"), noinline,
   variadic(u32 gp "gp_offset", u32 fp "fp_offset",
            u64 *gp_args "gp_arg_area", f64 *fp_args "fp_arg_area")]]
@@ -58,5 +67,6 @@ global i32 variadic_ms_entry() {
 }
 
 global i32 variadic_entry() {
+    if (fresh_registers(0u64, 21u64) != 21u64) return 0;
     return variadic_sysv_entry() + variadic_ms_entry();
 }

@@ -308,21 +308,23 @@ TargetInfo make_target(ByteOrder order,
         {order, 8, 16, 8,
          order == ByteOrder::Big
              ? BitFieldOrder::MostSignificantFirst
-             : BitFieldOrder::LeastSignificantFirst},
+             : BitFieldOrder::LeastSignificantFirst,
+         BitFieldUnitSharing::SameUnqualifiedBase,
+         BitFieldPlacement::AlignedUnits, CodeAddressRepresentation::Flat},
         target_registers(),
         {
-            {"i8", 8, "mips1", true, false},
-            {"u8", 8, "mips1", true, false},
-            {"i16", 16, "mips1", true, false},
-            {"u16", 16, "mips1", true, false},
-            {"i32", 32, "mips1", true, false},
-            {"u32", 32, "mips1", true, false},
+            {"i8", 8, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"u8", 8, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"i16", 16, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"u16", 16, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"i32", 32, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"u32", 32, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
             // MIPS I/II use target-legalized 32-bit GPR pairs; MIPS III and
             // later select native 64-bit GPR operations for the same types.
-            {"i64", 64, "mips1", true, false},
-            {"u64", 64, "mips1", true, false},
-            {"iptr", 32, "mips1", true, false},
-            {"uptr", 32, "mips1", true, false},
+            {"i64", 64, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"u64", 64, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"iptr", 32, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
+            {"uptr", 32, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
         },
         {},
         {{32, "llsc"}},
@@ -331,6 +333,8 @@ TargetInfo make_target(ByteOrder order,
         &subtargets,
         {integer_constant_materialization_cost},
         {{0, 0, 0, 0, true, true, true, true, false, true, true}},
+        {},
+        {{"atomics", "m.llsc"}},
     };
 }
 

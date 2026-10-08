@@ -44,6 +44,7 @@ Token Lexer::token(TokenKind kind, std::size_t start, SourceLocation location) c
     result.value_binding = token_origin(location).value_binding;
     result.tag_binding = token_origin(location).tag_binding;
     result.alias_binding = token_origin(location).alias_binding;
+    result.label_binding = token_origin(location).label_binding;
     if (const auto* origin = source_.source_token_origin_at(start);
         origin && origin->begin == start && origin->end == offset_ && origin->splice) {
         result.kind = TokenKind::StructuredSplice;

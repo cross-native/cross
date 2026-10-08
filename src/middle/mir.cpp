@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "middle/mir.hpp"
 
+#include "common/continuation_task.hpp"
 #include "common/floating_bits.hpp"
 #include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
 #include "common/uint128.hpp"
+#include "frontend/intrinsic_constraints.hpp"
 #include "middle/data_ir.hpp"
 #include "middle/initializer.hpp"
+#include "middle/initialization.hpp"
 #include "middle/mir_analysis.hpp"
 #include "middle/mir_pass.hpp"
 #include "middle/patch_sink.hpp"
@@ -20,6 +23,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -216,17 +220,7 @@ bool atomic_object_type(const hir::Module& module, hir::TypeId id) {
 }
 
 bool atomic_intrinsic(std::string_view name) {
-    return name == "$::atomic_load" || name == "$::atomic_store" ||
-           name == "$::atomic_exchange" ||
-           name == "$::atomic_compare_exchange" ||
-           name == "$::atomic_fetch_add" ||
-           name == "$::atomic_fetch_sub" ||
-           name == "$::atomic_fetch_and" ||
-           name == "$::atomic_fetch_xor" ||
-           name == "$::atomic_fetch_or" ||
-           name == "$::atomic_thread_fence" ||
-           name == "$::atomic_signal_fence" ||
-           name == "$::atomic_is_lock_free";
+    return atomic_builtin(name) != AtomicBuiltin::None;
 }
 
 bool representation_compatible(const hir::Module& module, hir::TypeId left,
@@ -461,6 +455,7 @@ std::optional<ParsedInteger> patch_initial(const Expr& expression,
 
 bool eligible_expression(const Expr& expression) {
     switch (expression.kind) {
+    case Expr::Kind::VoidValue: return true;
     case Expr::Kind::Quote: return false;
     case Expr::Kind::ByteSequence: return false;
     case Expr::Kind::Address:
@@ -590,52 +585,6 @@ bool eligible_expression(const Expr& expression) {
     return false;
 }
 
-bool valid_assumption_expression(const Expr& expression) {
-    switch (expression.kind) {
-    case Expr::Kind::Quote: return false;
-    case Expr::Kind::ByteSequence: return false;
-    case Expr::Kind::Address:
-        return expression.type && expression.evaluated_address;
-    case Expr::Kind::Integer:
-    case Expr::Kind::Floating:
-    case Expr::Kind::Name:
-    case Expr::Kind::Character:
-        return true;
-    case Expr::Kind::Parenthesized:
-        return expression.left &&
-               valid_assumption_expression(*expression.left);
-    case Expr::Kind::Cast:
-        return expression.type && expression.left &&
-               valid_assumption_expression(*expression.left);
-    case Expr::Kind::Sizeof:
-    case Expr::Kind::Alignof:
-        return expression.type ||
-               (expression.left &&
-                valid_assumption_expression(*expression.left));
-    case Expr::Kind::Unary:
-        return expression.left &&
-               (expression.text == "+" || expression.text == "-" ||
-                expression.text == "!" || expression.text == "~") &&
-               valid_assumption_expression(*expression.left);
-    case Expr::Kind::Binary:
-        return expression.left && expression.right &&
-               expression.text != "index" &&
-               valid_assumption_expression(*expression.left) &&
-               valid_assumption_expression(*expression.right);
-    case Expr::Kind::Conditional:
-        return expression.left && expression.right && expression.third &&
-               valid_assumption_expression(*expression.left) &&
-               valid_assumption_expression(*expression.right) &&
-               valid_assumption_expression(*expression.third);
-    case Expr::Kind::Assign:
-    case Expr::Kind::Call:
-    case Expr::Kind::String:
-    case Expr::Kind::AggregateInitializer:
-        return false;
-    }
-    return false;
-}
-
 bool eligible_array_element_type(const TypePtr& type) {
     if (!type || type->is_atomic) return false;
     if (type->kind == cross::Type::Kind::Array) {
@@ -655,6 +604,8 @@ bool eligible_array_element_type(const TypePtr& type) {
 
 bool eligible_statement(const Statement& statement) {
     switch (statement.kind) {
+    case Statement::Kind::StaticAssert:
+        return false; // Must be prepared and removed before runtime lowering.
     case Statement::Kind::Compound:
     case Statement::Kind::DeclarationList:
         return std::all_of(statement.statements.begin(), statement.statements.end(),
@@ -691,10 +642,6 @@ bool eligible_statement(const Statement& statement) {
                 statement.declaration->type->kind == cross::Type::Kind::Record ||
                 (statement.declaration->type->kind == cross::Type::Kind::Vector &&
                  !statement.declaration->type->scalable)) &&
-               (!statement.declaration->type->is_volatile ||
-                statement.declaration->storage_register ||
-                statement.declaration->storage_stack ||
-                statement.declaration->type->is_atomic) &&
                (!statement.declaration->initializer ||
                 eligible_expression(*statement.declaration->initializer));
     case Statement::Kind::Expression:
@@ -845,40 +792,43 @@ bool contains_dynamic_array(const Statement& statement) {
            (statement.second && contains_dynamic_array(*statement.second));
 }
 
+enum class CallTypeUse { Result, Input, Output, Variadic };
+
+bool supported_call_type(const hir::Module& module, hir::TypeId type,
+                         CallTypeUse use) {
+    const auto& value = module.type(type);
+    // A result is a transported value, not a callee parameter cell. Its
+    // top-level cv qualifiers need neither mutable nor volatile storage.
+    // Keep the original qualified type and all nested/pointee qualifiers.
+    const bool allow_const = use == CallTypeUse::Result || use == CallTypeUse::Input;
+    const bool allow_volatile = use == CallTypeUse::Result;
+    const bool cv_supported = (!value.is_const || allow_const) &&
+                              (!value.is_volatile || allow_volatile);
+    if (value.kind == hir::Type::Kind::Pointer)
+        return value.is_atomic || !value.is_volatile || allow_volatile;
+    if (value.kind == hir::Type::Kind::Vector)
+        return cv_supported && !value.is_atomic && !value.scalable &&
+               value.element && type_bits(module, type) != 0;
+    if (value.kind == hir::Type::Kind::Record)
+        return cv_supported && record_value_type(module, type);
+    return value.kind == hir::Type::Kind::Builtin &&
+           (value.is_atomic || cv_supported) &&
+           ((use == CallTypeUse::Result && value.builtin == BuiltinType::Void) ||
+            integer_type(module, type) || floating_type(module, type) ||
+            label_type(module, type));
+}
+
 bool eligible_function(const hir::Module& module, const hir::Function& function,
                        const TargetInfo& target) {
     if (!function.definition || function.naked) return false;
     const auto* abi = find_abi(target, function.abi);
     if (!abi || !abi->function_selectable ||
         (function.variadic && !abi->variadic_supported)) return false;
-    const auto supported_type = [&](hir::TypeId type,
-                                    bool allow_local_const = false) {
-        const auto& value = module.type(type);
-        if (value.kind == hir::Type::Kind::Pointer) {
-            return value.is_atomic || !value.is_volatile;
-        }
-        if (value.kind == hir::Type::Kind::Vector) {
-            return (!value.is_const || allow_local_const) && !value.is_volatile &&
-                   !value.is_atomic && !value.scalable &&
-                   value.element && type_bits(module, type) != 0;
-        }
-        if (value.kind == hir::Type::Kind::Record) {
-            return (!value.is_const || allow_local_const) && !value.is_volatile &&
-                   record_value_type(module, type);
-        }
-        const bool qualifiers_supported =
-            value.is_atomic ||
-            ((!value.is_const || allow_local_const) && !value.is_volatile);
-        return value.kind == hir::Type::Kind::Builtin &&
-               qualifiers_supported &&
-               (value.builtin == BuiltinType::Void || integer_type(module, type) ||
-                floating_type(module, type) || label_type(module, type));
-    };
-    if (!supported_type(function.result_type)) return false;
+    if (!supported_call_type(module, function.result_type, CallTypeUse::Result)) return false;
     for (const auto& parameter : function.parameters) {
-        if (!supported_type(parameter.type,
-                            parameter.mode == ParameterMode::In) ||
-            void_type(module, parameter.type)) return false;
+        if (!supported_call_type(module, parameter.type,
+                parameter.mode == ParameterMode::In ? CallTypeUse::Input : CallTypeUse::Output))
+            return false;
     }
     for (const auto& attribute : function.definition->attributes) {
         if (attribute.name != "abi" && attribute.name != "aligned" &&
@@ -935,6 +885,7 @@ private:
         hir::TypeId type;
         std::optional<ValueId> dynamic_address;
         std::optional<ValueId> dynamic_size;
+        bool register_storage{};
     };
 
     struct Scope {
@@ -966,6 +917,13 @@ private:
         hir::TypeId type;
         unsigned alignment{1};
         std::optional<BitFieldAccess> bit_field{};
+    };
+
+    struct VectorLane {
+        std::optional<LocalBinding> local;
+        std::optional<DesignatorAddress> memory;
+        ValueId index;
+        hir::TypeId element_type;
     };
 
     enum class ObjectAccess { Designator, Value };
@@ -1016,7 +974,7 @@ private:
         }
         if (statement.kind == Statement::Kind::Label) {
             if (const auto* label =
-                    hir_.label(function, statement.label_name)) {
+                    hir_.label(function, statement)) {
                 label_control_points_.emplace(
                     label->id.value,
                     ControlPoint{scope_depth, dynamic_arrays});
@@ -1060,6 +1018,7 @@ private:
     std::optional<ManagedFunction> lower_function(const hir::Function& function) {
         failed_ = false;
         current_patch_sinks_.clear();
+        current_patch_origins_.clear();
         parameter_values_.clear();
         label_blocks_.clear();
         label_control_points_.clear();
@@ -1299,31 +1258,6 @@ private:
         return nullptr;
     }
 
-    bool call_type(hir::TypeId type, bool allow_void,
-                   bool allow_local_const = false) const {
-        const auto& value = hir_.type(type);
-        if (value.kind == hir::Type::Kind::Pointer) {
-            return value.is_atomic || !value.is_volatile;
-        }
-        if (value.kind == hir::Type::Kind::Vector) {
-            return (!value.is_const || allow_local_const) && !value.is_volatile &&
-                   !value.is_atomic && !value.scalable &&
-                   value.element && type_bits(hir_, type) != 0;
-        }
-        if (value.kind == hir::Type::Kind::Record) {
-            return (!value.is_const || allow_local_const) && !value.is_volatile &&
-                   record_value_type(hir_, type);
-        }
-        const bool qualifiers_supported =
-            value.is_atomic ||
-            ((!value.is_const || allow_local_const) && !value.is_volatile);
-        return value.kind == hir::Type::Kind::Builtin &&
-               qualifiers_supported &&
-               ((allow_void && value.builtin == BuiltinType::Void) ||
-                integer_type(hir_, type) || floating_type(hir_, type) ||
-                label_type(hir_, type));
-    }
-
     bool global_scalar(const hir::Object& object) const {
         return managed_value_type(hir_, object.type);
     }
@@ -1383,6 +1317,14 @@ private:
                 const Expr* actual = expression.arguments[index].get();
                 while (actual && actual->kind == Expr::Kind::Parenthesized &&
                        actual->left) actual = actual->left.get();
+                // A lane/member output may modify an in parameter's local
+                // cell too. Do not leave that root as a value-only SSA binding.
+                while (actual && actual->kind == Expr::Kind::Binary && actual->left &&
+                       (actual->text == "index" || actual->text == "member")) {
+                    actual = actual->left.get();
+                    while (actual->kind == Expr::Kind::Parenthesized && actual->left)
+                        actual = actual->left.get();
+                }
                 if (actual && actual->kind == Expr::Kind::Name)
                     modified_names_.insert(name_key(*actual));
             }
@@ -1436,19 +1378,24 @@ private:
         return resolve_value_name(name).second;
     }
 
-    const hir::Label* resolve_label(std::string_view name) const {
+    const hir::Label* resolve_label(NameUse name) const {
         if (const auto* local = hir_.label(current_.source, name)) {
             return local;
         }
-        return name.find("::") == std::string_view::npos
-                   ? nullptr
-                   : hir_.global_label(name);
+        const auto split = name.spelling.rfind("::");
+        if (split == std::string_view::npos) return nullptr;
+        NameUse owner_name = name;
+        owner_name.spelling = name.spelling.substr(0, split);
+        const auto* owner = resolve_function(owner_name);
+        if (!owner) return nullptr;
+        const auto qualified = owner->source_name + std::string(name.spelling.substr(split));
+        name.spelling = qualified;
+        return hir_.label(owner->id, name);
     }
 
     ValueId label_address(const hir::Label& label,
                           SourceLocation location) {
-        (void)hir::stabilize_function_address(
-            hir_, label.owner, location, diagnostics_);
+        (void)hir::stabilize_label_address(hir_, label.id, location, diagnostics_);
         const auto value = add_value(
             ValueKind::LabelAddress, *hir_.builtin(BuiltinType::Label),
             location);
@@ -1456,21 +1403,13 @@ private:
         return value;
     }
 
-    std::optional<PatchSink> resolve_patch_sink(const Expr& expression) {
+    std::optional<PatchSink> resolve_patch_sink(
+        const Expr& expression, PatchAddressRepresentation representation) {
         auto result = resolve_patch_sink_designator(
-            expression, hir_, target_,
+            expression, hir_, target_, representation,
             [&](NameUse name) { return resolve_object(name); },
             diagnostics_);
         if (!result) {
-            failed_ = true;
-            return std::nullopt;
-        }
-        const auto key = std::pair{result->object.value, result->offset};
-        if (patch_sinks_.contains(key) ||
-            !current_patch_sinks_.insert(key).second) {
-            diagnostics_.error(
-                expression.location,
-                "$::patch address sink is used by more than one site");
             failed_ = true;
             return std::nullopt;
         }
@@ -1478,15 +1417,16 @@ private:
     }
 
     bool callable(const hir::Function& function) const {
-        if (!call_type(function.result_type, true)) {
+        if (!supported_call_type(hir_, function.result_type, CallTypeUse::Result)) {
             return false;
         }
         const auto* abi = find_abi(target_, function.abi);
         if (!abi || !abi->function_selectable ||
             (function.variadic && !abi->variadic_supported)) return false;
         for (const auto& parameter : function.parameters) {
-            if (!call_type(parameter.type, false,
-                           parameter.mode == ParameterMode::In)) return false;
+            if (!supported_call_type(hir_, parameter.type,
+                    parameter.mode == ParameterMode::In ? CallTypeUse::Input : CallTypeUse::Output))
+                return false;
         }
         return true;
     }
@@ -1581,7 +1521,7 @@ private:
     }
 
     const hir::RecordMember* resolve_member(hir::TypeId record_type,
-                                            std::string_view name,
+                                            const MemberName& name,
                                             SourceLocation location,
                                             bool diagnose = true) {
         const auto& type = hir_.type(record_type);
@@ -1607,7 +1547,7 @@ private:
             diagnostics_.error(location,
                                "record '" + record.source_name +
                                    "' has no member named '" +
-                                   std::string(name) + "'");
+                                   name.spelling + "'");
             failed_ = true;
         }
         return member;
@@ -1640,16 +1580,16 @@ private:
                                    source.is_volatile);
     }
 
-    std::optional<DesignatorAddress> lower_designator_address(
+    ContinuationTask<std::optional<DesignatorAddress>> lower_designator_address_async(
         const Expr& expression, ObjectAccess access = ObjectAccess::Designator) {
         if (expression.kind == Expr::Kind::Parenthesized &&
             expression.left) {
-            return lower_designator_address(*expression.left, access);
+            co_return co_await lower_designator_address_async(*expression.left, access);
         }
         if (expression.kind == Expr::Kind::Name) {
             if (const auto* local = find_local(name_key(expression))) {
                 if (local->dynamic_address) {
-                    return DesignatorAddress{
+                    co_return DesignatorAddress{
                         cast(*local->dynamic_address,
                              hir_.pointer_to(local->type),
                              expression.location),
@@ -1657,31 +1597,31 @@ private:
                         storage_alignment(hir_, local->type, target_)};
                 }
                 if (current_.slots[local->slot.value].physical_location) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                return DesignatorAddress{
+                co_return DesignatorAddress{
                     slot_address(*local, expression.location), local->type,
                     storage_alignment(hir_, local->type, target_)};
             }
             if (const auto* object = resolve_object(expression);
                 object && global_object(*object)) {
-                return DesignatorAddress{
+                co_return DesignatorAddress{
                     global_address(*object, expression.location), object->type,
                     storage_alignment(hir_, object->type, target_)};
             }
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (expression.kind == Expr::Kind::Unary &&
             expression.text == "*" && expression.left) {
-            auto address = lower_expression(*expression.left);
-            if (!address) return std::nullopt;
+            auto address = co_await lower_expression_async(*expression.left);
+            if (!address) co_return std::nullopt;
             const auto& pointer =
                 hir_.type(current_.values[address->value].type);
             if (pointer.kind != hir::Type::Kind::Pointer ||
                 !pointer.pointee) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return DesignatorAddress{
+            co_return DesignatorAddress{
                 *address, *pointer.pointee,
                 storage_alignment(hir_, *pointer.pointee, target_)};
         }
@@ -1695,9 +1635,13 @@ private:
             // not an array designator, and probing its address would execute
             // a side-effecting base twice before the fallback value load.
             const auto aggregate_type = designator_type(*expression.left, nullptr, access);
+            if (aggregate_type && vector_type(hir_, *aggregate_type)) {
+                const auto lane = co_await lower_vector_lane_async(expression, true);
+                co_return lane ? lane->memory : std::nullopt;
+            }
             if (aggregate_type && array_type(hir_, *aggregate_type)) {
-                const auto aggregate = lower_designator_address(*expression.left, access);
-                if (!aggregate) return std::nullopt;
+                const auto aggregate = co_await lower_designator_address_async(*expression.left, access);
+                if (!aggregate) co_return std::nullopt;
                 element = qualified_array_element(aggregate->type);
                 base = decay_array_address(aggregate->address,
                                            aggregate->type,
@@ -1706,24 +1650,24 @@ private:
                     aggregate->alignment,
                     storage_alignment(hir_, element, target_));
             } else {
-                base = lower_expression(*expression.left);
-                if (!base) return std::nullopt;
+                base = co_await lower_expression_async(*expression.left);
+                if (!base) co_return std::nullopt;
                 const auto& pointer =
                     hir_.type(current_.values[base->value].type);
                 if (pointer.kind != hir::Type::Kind::Pointer ||
                     !pointer.pointee) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
                 element = *pointer.pointee;
                 base_alignment =
                     storage_alignment(hir_, element, target_);
             }
-            auto index = lower_expression(*expression.right);
+            auto index = co_await lower_expression_async(*expression.right);
             if (!index ||
                 !integer_type(hir_, current_.values[index->value].type)) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return DesignatorAddress{
+            co_return DesignatorAddress{
                 indexed_address(*base, *index, element,
                                 expression.location),
                 element, base_alignment};
@@ -1735,9 +1679,9 @@ private:
             expression.right->kind == Expr::Kind::Name) {
             std::optional<DesignatorAddress> base;
             if (expression.text == "member") {
-                base = lower_designator_address(*expression.left, access);
+                base = co_await lower_designator_address_async(*expression.left, access);
             } else {
-                auto address = lower_expression(*expression.left);
+                auto address = co_await lower_expression_async(*expression.left);
                 if (address) {
                     const auto& pointer =
                         hir_.type(current_.values[address->value].type);
@@ -1757,12 +1701,12 @@ private:
                         "a member of a record value is not an object designator");
                     failed_ = true;
                 }
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto* member = resolve_member(
-                base->type, expression.right->text,
+                base->type, member_name(*expression.right),
                 expression.right->location);
-            if (!member) return std::nullopt;
+            if (!member) co_return std::nullopt;
             const auto member_type =
                 qualified_member_type(base->type, *member);
             auto address = cast(
@@ -1782,7 +1726,7 @@ private:
                                           : member_type;
             address = cast(address, hir_.pointer_to(address_type),
                            expression.location);
-            return DesignatorAddress{
+            co_return DesignatorAddress{
                 address, member_type,
                 std::max(1U, std::min(base->alignment,
                                      member->alignment)),
@@ -1794,8 +1738,8 @@ private:
         if (access == ObjectAccess::Value) {
             const auto type = infer_type(expression);
             if (type && record_value_type(hir_, *type)) {
-                const auto value = lower_expression(expression);
-                if (!value) return std::nullopt;
+                const auto value = co_await lower_expression_async(expression);
+                if (!value) co_return std::nullopt;
                 // A record SSA result has no source designator. Give this
                 // occurrence a typed storage home for common member/bit-field
                 // projection; target ABI lowering still owns its transport.
@@ -1807,11 +1751,16 @@ private:
                 (void)lifetime(ValueKind::LifetimeStart, slot, expression.location);
                 const LocalBinding temporary{slot, *type, std::nullopt, std::nullopt};
                 (void)store_slot(temporary, *value, expression.location);
-                return DesignatorAddress{slot_address(temporary, expression.location),
+                co_return DesignatorAddress{slot_address(temporary, expression.location),
                     *type, storage_alignment(hir_, *type, target_)};
             }
         }
-        return std::nullopt;
+        co_return std::nullopt;
+    }
+
+    std::optional<DesignatorAddress> lower_designator_address(
+        const Expr& expression, ObjectAccess access = ObjectAccess::Designator) {
+        return lower_designator_address_async(expression, access).run();
     }
 
     std::optional<hir::TypeId> designator_type(
@@ -1846,6 +1795,9 @@ private:
             expression.text == "index" && expression.left) {
             const auto pointer_id = infer_type(*expression.left);
             if (!pointer_id) return std::nullopt;
+            if (vector_type(hir_, *pointer_id) && designator_type(*expression.left)) {
+                return qualified_array_element(*pointer_id);
+            }
             const auto& pointer = hir_.type(*pointer_id);
             return pointer.kind == hir::Type::Kind::Pointer &&
                            pointer.pointee
@@ -1870,7 +1822,7 @@ private:
                 owner = pointer.pointee;
             }
             const auto* member = resolve_member(
-                *owner, expression.right->text,
+                *owner, member_name(*expression.right),
                 expression.right->location, false);
             if (member && is_bit_field) {
                 *is_bit_field = member->bit_width.has_value();
@@ -1886,18 +1838,114 @@ private:
         return std::nullopt;
     }
 
-    std::optional<AtomicLvalue> lower_atomic_lvalue(
+    const Expr* vector_lane_expression(const Expr& expression) {
+        const auto* node = &expression;
+        while (node->kind == Expr::Kind::Parenthesized && node->left) {
+            node = node->left.get();
+        }
+        if (node->kind != Expr::Kind::Binary || node->text != "index" ||
+            !node->left || !node->right) return nullptr;
+        const auto type = infer_type(*node->left);
+        return type && vector_type(hir_, *type) ? node : nullptr;
+    }
+
+    ContinuationTask<std::optional<VectorLane>> lower_vector_lane_async(const Expr& expression,
+                                                bool require_address = false) {
+        const auto type = designator_type(*expression.left);
+        if (!type || !vector_type(hir_, *type)) co_return std::nullopt;
+        const auto lanes = hir_.type(*type).lanes;
+        const auto element = qualified_array_element(*type);
+        std::optional<LocalBinding> local;
+        std::optional<DesignatorAddress> memory;
+        const auto name = local_name(*expression.left);
+        const auto* binding = name ? find_local(*name) : nullptr;
+        // Keep ordinary and hard-bound vector cells in SSA. Volatile memory
+        // lanes instead use scalar addresses, without widening an access to
+        // the whole vector. A physical register has no memory address.
+        if (!require_address && binding && !binding->dynamic_address &&
+            (!hir_.type(*type).is_volatile ||
+             current_.slots[binding->slot.value].physical_location)) {
+            local = *binding;
+        } else {
+            memory = co_await lower_designator_address_async(*expression.left);
+            if (!memory) co_return std::nullopt;
+        }
+        const auto index = co_await lower_expression_async(*expression.right);
+        if (!index || !integer_type(hir_, current_.values[index->value].type)) {
+            co_return std::nullopt;
+        }
+        const auto& value = current_.values[index->value];
+        const auto literal = patch_initial(*expression.right, hir_.address_bits);
+        if ((literal && (literal->value.high != 0 || literal->value.low >= lanes)) ||
+            (value.kind == ValueKind::ConstantInteger &&
+             (value.integer_high != 0 || value.integer >= lanes))) {
+            diagnostics_.error(expression.right->location,
+                               "fixed-vector lane index is out of range");
+            failed_ = true;
+            co_return std::nullopt;
+        }
+        if (memory) {
+            const auto base = cast(memory->address, hir_.pointer_to(element),
+                                   expression.location);
+            memory->address = indexed_address(base, *index, element,
+                                               expression.location);
+            memory->type = element;
+            memory->alignment = std::min(memory->alignment,
+                                         storage_alignment(hir_, element, target_));
+        }
+        co_return VectorLane{local, memory, *index, element};
+    }
+
+    std::optional<VectorLane> lower_vector_lane(const Expr& expression,
+                                                bool require_address = false) {
+        return lower_vector_lane_async(expression, require_address).run();
+    }
+
+    std::optional<ValueId> load_vector_lane(const VectorLane& lane,
+                                             SourceLocation location) {
+        if (lane.memory) {
+            return load_pointer(lane.memory->address, location,
+                                lane.memory->alignment);
+        }
+        const auto vector = load_slot(*lane.local, location);
+        const auto value = add_value(ValueKind::ExtractElement,
+                                     lane.element_type, location);
+        current_.values[value.value].operands = {vector, lane.index};
+        return value;
+    }
+
+    std::optional<ValueId> store_vector_lane(const VectorLane& lane,
+                                              ValueId value,
+                                              SourceLocation location) {
+        if (hir_.type(lane.element_type).is_const) return std::nullopt;
+        value = assignment_cast(value, lane.element_type, location);
+        if (lane.memory) {
+            if (!store_pointer(lane.memory->address, value, location,
+                               lane.memory->alignment)) return std::nullopt;
+        } else {
+            // The RHS may have changed other lanes. Reload the current cell
+            // before inserting only the remembered destination lane.
+            const auto vector = load_slot(*lane.local, location);
+            const auto inserted = add_value(ValueKind::InsertElement,
+                                             lane.local->type, location);
+            current_.values[inserted.value].operands = {vector, lane.index, value};
+            (void)store_slot(*lane.local, inserted, location);
+        }
+        return value;
+    }
+
+    ContinuationTask<std::optional<AtomicLvalue>> lower_atomic_lvalue_async(
         const Expr& expression) {
         const auto object_type = designator_type(expression);
         if (!object_type || !atomic_object_type(hir_, *object_type)) {
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto& object = hir_.type(*object_type);
         if (object.is_const) {
             diagnostics_.error(expression.location,
                                "cannot modify a const atomic object");
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (!lock_free_atomic_type(hir_.unqualified(*object_type))) {
             diagnostics_.error(
@@ -1906,10 +1954,10 @@ private:
                     "' has no runtime-free atomic operation for " +
                     hir::type_name(hir_, hir_.unqualified(*object_type)));
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
 
-        if (auto designator = lower_designator_address(expression)) {
+        if (auto designator = co_await lower_designator_address_async(expression)) {
             const auto natural = storage_alignment(
                 hir_, *object_type, target_);
             if (designator->alignment < natural) {
@@ -1917,9 +1965,9 @@ private:
                     expression.location,
                     "an atomic object cannot be accessed through an under-aligned packed member");
                 failed_ = true;
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return AtomicLvalue{designator->address, *object_type,
+            co_return AtomicLvalue{designator->address, *object_type,
                                 object.is_volatile};
         }
 
@@ -1935,7 +1983,7 @@ private:
                         source->location,
                         "an atomic object cannot be bound to a machine register");
                     failed_ = true;
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
                 address = slot_address(*local, source->location);
             } else if (const auto* global = resolve_object(*source);
@@ -1944,20 +1992,25 @@ private:
             }
         } else if (source->kind == Expr::Kind::Unary &&
                    source->text == "*" && source->left) {
-            address = lower_expression(*source->left);
+            address = co_await lower_expression_async(*source->left);
         } else if (source->kind == Expr::Kind::Binary &&
                    source->text == "index" && source->left &&
                    source->right) {
-            auto base = lower_expression(*source->left);
-            auto index = lower_expression(*source->right);
+            auto base = co_await lower_expression_async(*source->left);
+            auto index = co_await lower_expression_async(*source->right);
             if (base && index &&
                 integer_type(hir_, current_.values[index->value].type)) {
                 address = indexed_address(*base, *index, *object_type,
                                           source->location);
             }
         }
-        if (!address) return std::nullopt;
-        return AtomicLvalue{*address, *object_type, object.is_volatile};
+        if (!address) co_return std::nullopt;
+        co_return AtomicLvalue{*address, *object_type, object.is_volatile};
+    }
+
+    std::optional<AtomicLvalue> lower_atomic_lvalue(
+        const Expr& expression) {
+        return lower_atomic_lvalue_async(expression).run();
     }
 
     ValueId atomic_operation(AtomicOperation operation, hir::TypeId type,
@@ -2747,8 +2800,24 @@ private:
         return pointer.pointee;
     }
 
+    // Memoized for the current bindings: lower_statement and every new
+    // binding discard the results.
     std::optional<hir::TypeId> infer_type(const Expr& expression) {
+        if (const auto found = inferred_types_.find(&expression);
+            found != inferred_types_.end())
+            return found->second;
+        const auto type = compute_type(expression);
+        inferred_types_.emplace(&expression, type);
+        return type;
+    }
+
+    void forget_types() {
+        if (!inferred_types_.empty()) inferred_types_ = {};
+    }
+
+    std::optional<hir::TypeId> compute_type(const Expr& expression) {
         switch (expression.kind) {
+        case Expr::Kind::VoidValue: return hir_.builtin(BuiltinType::Void);
         case Expr::Kind::Quote: return std::nullopt;
         case Expr::Kind::ByteSequence: return std::nullopt;
         case Expr::Kind::Address:
@@ -2799,7 +2868,7 @@ private:
             if (const auto* function = resolve_function(expression)) {
                 return function_pointer_type(*function);
             }
-            return resolve_label(expression.text)
+            return resolve_label(expression)
                        ? hir_.builtin(BuiltinType::Label) : std::nullopt;
         }
         case Expr::Kind::Parenthesized:
@@ -2960,7 +3029,7 @@ private:
                 return left;
             }
             if (expression.text == "-" && left_pointer && right_pointer &&
-                *left == *right) {
+                representation_compatible(hir_, *left, *right)) {
                 return hir_.builtin(BuiltinType::Iptr);
             }
             if (expression.text == "==" || expression.text == "!=" ||
@@ -2979,7 +3048,7 @@ private:
         case Expr::Kind::Conditional: {
             const auto then_type = infer_type(*expression.right);
             const auto else_type = infer_type(*expression.third);
-            return then_type && else_type ? common_type(*then_type, *else_type)
+            return then_type && else_type ? conditional_type(*then_type, *else_type)
                                           : std::nullopt;
         }
         case Expr::Kind::Assign: {
@@ -3016,7 +3085,8 @@ private:
                 if (expression.arguments.empty()) return std::nullopt;
                 const auto initial = patch_initial(
                     *expression.arguments.front(), hir_.address_bits);
-                return initial ? hir_.builtin(initial->type) : std::nullopt;
+                return initial ? hir_.builtin(initial->type)
+                               : infer_type(*expression.arguments.front());
             }
             if (expression.left->text == "$::alignof") {
                 return hir_.builtin(BuiltinType::Uptr);
@@ -3071,6 +3141,16 @@ private:
                                           : std::optional<hir::TypeId>(type);
     }
 
+    std::optional<hir::TypeId> conditional_type(hir::TypeId left, hir::TypeId right) {
+        const bool a = pointer_type(hir_, left), b = pointer_type(hir_, right);
+        if (a && b) return hir_.common_pointer_type(left, right);
+        // Source validation owns the integer-zero proof, retained on the source arm.
+        // Destination-typed lowering applies the selected null representation.
+        if (a && integer_type(hir_, right)) return hir_.unqualified(left);
+        if (b && integer_type(hir_, left)) return hir_.unqualified(right);
+        return common_type(left, right);
+    }
+
     std::optional<hir::TypeId> common_type(hir::TypeId left, hir::TypeId right) {
         if (representation_compatible(hir_, left, right) &&
             hir_.type(left).kind == hir::Type::Kind::Record) {
@@ -3109,8 +3189,9 @@ private:
                                             shape.scalable))
                        : std::nullopt;
         }
-        if (left == right &&
-            (label_type(hir_, left) || pointer_type(hir_, left))) return left;
+        if (pointer_type(hir_, left) && pointer_type(hir_, right))
+            return hir_.common_pointer_type(left, right);
+        if (representation_compatible(hir_, left, right) && label_type(hir_, left)) return left;
         if (floating_type(hir_, left) && floating_type(hir_, right)) {
             return type_bits(hir_, left) >= type_bits(hir_, right) ? left : right;
         }
@@ -3232,9 +3313,11 @@ private:
             const auto value = add_value(ValueKind::Cast, destination, location);
             auto& cast_value = current_.values[value.value];
             cast_value.operands.push_back(source);
-            cast_value.cast = type_bits(hir_, source_type) < type_bits(hir_, destination)
-                                  ? CastOperation::FloatExtend
-                                  : CastOperation::FloatTruncate;
+            const auto from_bits = type_bits(hir_, source_type);
+            const auto to_bits = type_bits(hir_, destination);
+            cast_value.cast = from_bits < to_bits ? CastOperation::FloatExtend
+                            : from_bits > to_bits ? CastOperation::FloatTruncate
+                                                  : CastOperation::Reinterpret;
             return value;
         }
         if (integer_type(hir_, source_type) &&
@@ -3276,27 +3359,39 @@ private:
                                        hir::TypeId destination,
                                        unsigned depth = 0,
                                        bool intermediate_const = true) const {
-        const auto& from = hir_.type(source);
-        const auto& to = hir_.type(destination);
-        if ((from.is_const && !to.is_const) ||
-            (from.is_volatile && !to.is_volatile) ||
-            from.is_atomic != to.is_atomic) return false;
-        if (depth != 0 && !intermediate_const &&
-            ((!from.is_const && to.is_const) ||
-             (!from.is_volatile && to.is_volatile))) return false;
-        if (depth == 0 &&
-            (void_type(hir_, source) || void_type(hir_, destination))) {
-            return from.kind != hir::Type::Kind::Function &&
-                   to.kind != hir::Type::Kind::Function;
+        bool immediate = depth == 0;
+        for (;;) {
+            const auto& from = hir_.type(source);
+            const auto& to = hir_.type(destination);
+            if ((from.is_const && !to.is_const) ||
+                (from.is_volatile && !to.is_volatile) ||
+                from.is_atomic != to.is_atomic) return false;
+            if (!immediate && !intermediate_const &&
+                ((!from.is_const && to.is_const) ||
+                 (!from.is_volatile && to.is_volatile))) return false;
+            if (immediate &&
+                (void_type(hir_, source) || void_type(hir_, destination))) {
+                return from.kind != hir::Type::Kind::Function &&
+                       to.kind != hir::Type::Kind::Function;
+            }
+            immediate = false;
+            if (from.kind == hir::Type::Kind::Pointer &&
+                to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee) {
+                if (from.address_space != to.address_space) return false;
+                intermediate_const = intermediate_const && to.is_const;
+                source = *from.pointee;
+                destination = *to.pointee;
+                continue;
+            }
+            if ((from.kind == hir::Type::Kind::Array || from.kind == hir::Type::Kind::Vector) &&
+                from.kind == to.kind && from.element && to.element) {
+                if (from.lanes != to.lanes || from.scalable != to.scalable) return false;
+                source = *from.element;
+                destination = *to.element;
+                continue;
+            }
+            return representation_compatible(hir_, source, destination);
         }
-        if (from.kind == hir::Type::Kind::Pointer &&
-            to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee) {
-            if (from.address_space != to.address_space) return false;
-            return compatible_pointer_conversion(
-                *from.pointee, *to.pointee, depth + 1,
-                intermediate_const && to.is_const);
-        }
-        return representation_compatible(hir_, source, destination);
     }
 
     ValueId assignment_cast(ValueId source, hir::TypeId destination,
@@ -3331,6 +3426,24 @@ private:
         return value;
     }
 
+    std::optional<ValueId> null_pointer_constant(hir::TypeId type,
+                                                 SourceLocation location) {
+        const auto* space = find_address_space(target_, hir_.type(type).address_space);
+        if (!space || !space->native_lowering) {
+            diagnostics_.error(location,
+                "pointer conversion has no native address-space representation");
+            return std::nullopt;
+        }
+        const auto bits = space->pointer_bits ? space->pointer_bits : hir_.address_bits;
+        const UInt128 null{space->null_low, space->null_high};
+        if (bits != type_bits(hir_, type) || !fits_unsigned(null, bits)) {
+            diagnostics_.error(location,
+                "null pointer representation does not fit the pointer type");
+            return std::nullopt;
+        }
+        return constant(null, type, location);
+    }
+
     ValueId booleanize(ValueId source, SourceLocation location) {
         const auto type = current_.values[source.value].type;
         if (!scalar_type(hir_, type)) {
@@ -3339,30 +3452,45 @@ private:
             failed_ = true;
             return constant(0, *hir_.builtin(BuiltinType::Bool), location);
         }
-        const auto zero = floating_type(hir_, type)
-                              ? floating_constant(0, type, 0, location)
-                              : constant(0, type, location);
+        std::optional<ValueId> zero;
+        if (pointer_type(hir_, type)) zero = null_pointer_constant(type, location);
+        else zero = floating_type(hir_, type)
+            ? floating_constant(0, type, 0, location) : constant(0, type, location);
+        if (!zero) {
+            failed_ = true;
+            return constant(0, *hir_.builtin(BuiltinType::Bool), location);
+        }
         const auto result = add_value(ValueKind::Binary,
                                       *hir_.builtin(BuiltinType::Bool), location);
         auto& value = current_.values[result.value];
         value.binary = BinaryOperation::NotEqual;
-        value.operands = {source, zero};
+        value.operands = {source, *zero};
         return result;
     }
 
-    std::optional<ValueId> lower_expression(const Expr& expression,
+    ContinuationTask<std::optional<ValueId>> lower_expression_async(const Expr& expression,
                                             std::optional<hir::TypeId> destination = {}) {
-        if (!current_block_) return std::nullopt;
+        if (!current_block_) co_return std::nullopt;
+        if (destination && pointer_type(hir_, *destination) && expression.evaluated_integer &&
+            expression.evaluated_integer->value == UInt128{}) {
+            const auto source = infer_type(expression);
+            if (source && integer_type(hir_, *source))
+                co_return null_pointer_constant(*destination, expression.location);
+        }
         std::optional<ValueId> result;
         switch (expression.kind) {
+        case Expr::Kind::VoidValue:
+            result = add_value(ValueKind::VoidValue, *hir_.builtin(BuiltinType::Void),
+                               expression.location);
+            break;
         case Expr::Kind::Quote:
             diagnostics_.error(expression.location,
                 "translation-time token quotation cannot enter runtime lowering");
-            return std::nullopt;
+            co_return std::nullopt;
         case Expr::Kind::ByteSequence:
             diagnostics_.error(expression.location,
                 "materialized bytes cannot enter runtime lowering");
-            return std::nullopt;
+            co_return std::nullopt;
         case Expr::Kind::Address: {
             if (!expression.type || !expression.evaluated_address) break;
             const auto type = hir_.intern_type(expression.type);
@@ -3437,26 +3565,43 @@ private:
                         result = load_global(*object, expression.location);
                     }
                 } else if (const auto* label =
-                               resolve_label(expression.text)) {
+                               resolve_label(expression)) {
                     result = label_address(*label, expression.location);
                 } else if (const auto* function =
                                resolve_function(expression)) {
                     result = function_address(*function, expression.location);
+                } else if (resolved_label_binding(expression).kind == LabelBinding::Kind::Reference) {
+                    const auto location = expression.name_context &&
+                        expression.name_context->last_component_location.valid()
+                            ? expression.name_context->last_component_location : expression.location;
+                    diagnostics_.error(location,
+                        "label address does not name a visible label in its retained source binding");
                 }
             }
             break;
         }
         case Expr::Kind::Parenthesized:
-            if (expression.left) result = lower_expression(*expression.left);
+            if (expression.left) result = co_await lower_expression_async(*expression.left);
             break;
         case Expr::Kind::Cast: {
             if (!expression.left || !expression.type) break;
             const auto destination_type = hir_.intern_type(expression.type);
-            auto source = lower_expression(*expression.left);
+            if (pointer_type(hir_, destination_type) && expression.left->evaluated_integer &&
+                expression.left->evaluated_integer->value == UInt128{}) {
+                const auto source_type = infer_type(*expression.left);
+                if (source_type && integer_type(hir_, *source_type)) {
+                    result = null_pointer_constant(destination_type, expression.location);
+                    break;
+                }
+            }
+            auto source = co_await lower_expression_async(*expression.left);
             if (!source) break;
             const auto source_type = current_.values[source->value].type;
-            if ((!scalar_type(hir_, source_type) ||
-                 !scalar_type(hir_, destination_type)) &&
+            // An explicit scalar-to-vector cast splats, like the implicit conversion.
+            const bool splat = vector_type(hir_, destination_type) &&
+                (integer_type(hir_, source_type) || floating_type(hir_, source_type));
+            if (!splat && (!scalar_type(hir_, source_type) ||
+                           !scalar_type(hir_, destination_type)) &&
                 !representation_compatible(hir_, source_type,
                                            destination_type)) {
                 diagnostics_.error(
@@ -3595,12 +3740,35 @@ private:
                 }
                 if (operand && operand->kind == Expr::Kind::Unary &&
                     operand->text == "*" && operand->left) {
-                    result = lower_expression(*operand->left);
+                    result = co_await lower_expression_async(*operand->left);
                     break;
                 }
                 if (operand) {
+                    // A register object, including a lane of a register
+                    // vector, has no address.
+                    const Expr* root = operand;
+                    if (root->kind == Expr::Kind::Binary && root->text == "index" &&
+                        root->left) {
+                        const Expr* base = root->left.get();
+                        while (base->kind == Expr::Kind::Parenthesized && base->left)
+                            base = base->left.get();
+                        if (const auto type = infer_type(*base); type && vector_type(hir_, *type))
+                            root = base;
+                    }
+                    const auto name = local_name(*root);
+                    const auto* local = name ? find_local(*name) : nullptr;
+                    if (local && !local->dynamic_address &&
+                        (local->register_storage ||
+                         current_.slots[local->slot.value].physical_location)) {
+                        diagnostics_.error(expression.location,
+                                           "a register object has no address");
+                        failed_ = true;
+                        break;
+                    }
+                }
+                if (operand) {
                     if (auto designator =
-                            lower_designator_address(*operand)) {
+                            co_await lower_designator_address_async(*operand)) {
                         if (designator->bit_field) {
                             diagnostics_.error(
                                 expression.location,
@@ -3623,8 +3791,8 @@ private:
                     operand->text == "index" && operand->left &&
                     operand->right) {
                     const auto pointee = designator_type(*operand);
-                    auto base = lower_expression(*operand->left);
-                    auto index = lower_expression(*operand->right);
+                    auto base = co_await lower_expression_async(*operand->left);
+                    auto index = co_await lower_expression_async(*operand->right);
                     if (pointee && base && index &&
                         integer_type(hir_,
                                      current_.values[index->value].type)) {
@@ -3636,15 +3804,6 @@ private:
                 const auto name = operand ? local_name(*operand)
                                           : std::nullopt;
                 const auto* found = name ? find_local(*name) : nullptr;
-                if (found && !found->dynamic_address &&
-                    current_.slots[found->slot.value]
-                        .physical_location) {
-                    diagnostics_.error(
-                        expression.location,
-                        "a register object has no address");
-                    failed_ = true;
-                    break;
-                }
                 if (found) {
                     if (found->dynamic_address) {
                         result = cast(*found->dynamic_address,
@@ -3676,6 +3835,21 @@ private:
             }
             if (expression.text == "++" || expression.text == "--" ||
                 expression.text == "post++" || expression.text == "post--") {
+                if (const auto* node = vector_lane_expression(*expression.left)) {
+                    const auto lane = co_await lower_vector_lane_async(*node);
+                    if (!lane) break;
+                    const auto old = load_vector_lane(*lane, expression.location);
+                    if (!old) break;
+                    const auto one = unit_value(lane->element_type,
+                                                 expression.location);
+                    const auto updated = compound_value(
+                        expression.text.ends_with("++") ? "+=" : "-=",
+                        *old, one, lane->element_type, expression.location);
+                    if (!updated || !store_vector_lane(*lane, *updated,
+                                                       expression.location)) break;
+                    result = expression.text.starts_with("post") ? *old : *updated;
+                    break;
+                }
                 const auto object_type = expression.left
                                              ? designator_type(*expression.left)
                                              : std::nullopt;
@@ -3688,7 +3862,7 @@ private:
                             "atomic update requires an integer or floating object");
                         break;
                     }
-                    auto lvalue = lower_atomic_lvalue(*expression.left);
+                    auto lvalue = co_await lower_atomic_lvalue_async(*expression.left);
                     if (!lvalue) break;
                     const auto one = unit_value(value_type,
                                                 expression.location);
@@ -3696,8 +3870,7 @@ private:
                         *lvalue, one,
                         expression.text == "++" ||
                                 expression.text == "post++"
-                            ? BinaryOperation::Add
-                            : BinaryOperation::Subtract,
+                            ? "+=" : "-=",
                         expression.location,
                         expression.text.starts_with("post"));
                     break;
@@ -3706,7 +3879,7 @@ private:
                 const auto* found = name ? find_local(*name) : nullptr;
                 if (!found) {
                     auto designator =
-                        lower_designator_address(*expression.left);
+                        co_await lower_designator_address_async(*expression.left);
                     if (designator && hir_.type(designator->type).is_const) {
                         diagnostics_.error(expression.location, "cannot write a const subobject");
                         failed_ = true;
@@ -3747,16 +3920,9 @@ private:
                     } else {
                         const auto one = unit_value(
                             designator->type, expression.location);
-                        const auto value = add_value(
-                            ValueKind::Binary, designator->type,
-                            expression.location);
-                        auto& binary = current_.values[value.value];
-                        binary.binary = expression.text == "++" ||
-                                                expression.text == "post++"
-                                            ? BinaryOperation::Add
-                                            : BinaryOperation::Subtract;
-                        binary.operands = {*old, one};
-                        updated = value;
+                        updated = compound_value(
+                            expression.text.ends_with("++") ? "+=" : "-=",
+                            *old, one, designator->type, expression.location);
                     }
                     if (!updated) break;
                     const auto stored = designator->bit_field
@@ -3807,18 +3973,15 @@ private:
                 if (one_type != binding.type) {
                     one = cast(one, binding.type, expression.location);
                 }
-                const auto updated = add_value(ValueKind::Binary, binding.type,
-                                               expression.location);
-                auto& binary = current_.values[updated.value];
-                binary.binary = expression.text == "++" || expression.text == "post++"
-                                    ? BinaryOperation::Add
-                                    : BinaryOperation::Subtract;
-                binary.operands = {old, one};
-                (void)store_slot(binding, updated, expression.location);
-                result = expression.text.starts_with("post") ? old : updated;
+                const auto updated = compound_value(
+                    expression.text.ends_with("++") ? "+=" : "-=",
+                    old, one, binding.type, expression.location);
+                if (!updated) break;
+                (void)store_slot(binding, *updated, expression.location);
+                result = expression.text.starts_with("post") ? old : *updated;
                 break;
             }
-            auto operand = lower_expression(*expression.left);
+            auto operand = co_await lower_expression_async(*expression.left);
             if (!operand) break;
             if (expression.text == "*") {
                 const auto& pointer =
@@ -3835,10 +3998,9 @@ private:
             const bool operand_vector = vector_type(hir_, operand_type);
             if (expression.text == "!" &&
                 pointer_type(hir_, operand_type)) {
-                // Pointer truth uses the target-width null representation;
-                // integer promotion does not apply to pointer operands.
-                operand = cast(*operand, *hir_.builtin(BuiltinType::Uptr),
-                               expression.location);
+                // Test against the selected null encoding before negating;
+                // neither an uptr cast nor a raw zero test defines pointer truth.
+                operand = booleanize(*operand, expression.location);
             } else if (!floating_type(hir_, operand_type) &&
                        !operand_vector) {
                 const auto promoted = promote(operand_type);
@@ -3870,7 +4032,7 @@ private:
         case Expr::Kind::Binary:
             if (expression.text == "member" ||
                 expression.text == "pointer_member") {
-                auto designator = lower_designator_address(expression, ObjectAccess::Value);
+                auto designator = co_await lower_designator_address_async(expression, ObjectAccess::Value);
                 if (designator) {
                     const auto& type = hir_.type(designator->type);
                     if (type.kind == hir::Type::Kind::Array &&
@@ -3894,10 +4056,16 @@ private:
             } else if (expression.text == "index") {
                 const auto aggregate_type =
                     infer_type(*expression.left);
+                if (aggregate_type && vector_type(hir_, *aggregate_type) &&
+                    designator_type(*expression.left)) {
+                    const auto lane = co_await lower_vector_lane_async(expression);
+                    if (lane) result = load_vector_lane(*lane, expression.location);
+                    break;
+                }
                 if (!aggregate_type ||
                     !vector_type(hir_, *aggregate_type)) {
                     if (auto designator =
-                            lower_designator_address(expression, ObjectAccess::Value);
+                            co_await lower_designator_address_async(expression, ObjectAccess::Value);
                         designator &&
                         (managed_value_type(hir_, designator->type) ||
                          array_type(hir_, designator->type))) {
@@ -3907,8 +4075,8 @@ private:
                         break;
                     }
                 }
-                auto base = lower_expression(*expression.left);
-                auto index = lower_expression(*expression.right);
+                auto base = co_await lower_expression_async(*expression.left);
+                auto index = co_await lower_expression_async(*expression.right);
                 if (base && index &&
                     vector_type(hir_, current_.values[base->value].type)) {
                     const auto& vector =
@@ -3931,19 +4099,20 @@ private:
                                           expression.location);
                 }
             } else {
-                result = expression.text == "&&" || expression.text == "||"
-                             ? lower_logical(expression)
-                             : lower_binary(expression);
+                if (expression.text == "&&" || expression.text == "||")
+                    result = co_await lower_logical_async(expression);
+                else
+                    result = co_await lower_binary_async(expression);
             }
             break;
         case Expr::Kind::Conditional:
-            result = lower_conditional(expression);
+            result = co_await lower_conditional_async(expression);
             break;
         case Expr::Kind::Assign:
-            result = lower_assignment(expression);
+            result = co_await lower_assignment_async(expression);
             break;
         case Expr::Kind::Call:
-            result = lower_call(expression);
+            result = co_await lower_call_async(expression);
             break;
         case Expr::Kind::Character: {
             const auto value = decode_character_literal(expression.text);
@@ -3960,29 +4129,56 @@ private:
         }
         if (!result) {
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
-        return destination ? std::optional<ValueId>(assignment_cast(*result, *destination,
+        co_return destination ? std::optional<ValueId>(assignment_cast(*result, *destination,
                                                          expression.location))
                            : result;
     }
 
-    std::optional<ValueId> lower_binary(const Expr& expression) {
+    std::optional<ValueId> lower_expression(const Expr& expression,
+                                            std::optional<hir::TypeId> destination = {}) {
+        return lower_expression_async(expression, destination).run();
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_binary_async(const Expr& expression) {
         const auto left_type = infer_type(*expression.left);
         const auto right_type = infer_type(*expression.right);
-        if (!left_type || !right_type) return std::nullopt;
+        if (!left_type || !right_type) co_return std::nullopt;
         const bool left_pointer = pointer_type(hir_, *left_type);
         const bool right_pointer = pointer_type(hir_, *right_type);
+        if ((expression.text == "==" || expression.text == "!=") && left_pointer != right_pointer) {
+            const auto& integer = left_pointer ? *expression.right : *expression.left;
+            const auto integer_type_id = left_pointer ? *right_type : *left_type;
+            if (!integer_type(hir_, integer_type_id) || !integer.evaluated_integer ||
+                integer.evaluated_integer->value != UInt128{}) {
+                diagnostics_.error(integer.location,
+                    "pointer/integer equality requires an integer constant zero");
+                co_return std::nullopt;
+            }
+            const auto pointer_type_id = left_pointer ? *left_type : *right_type;
+            const auto pointer = co_await lower_expression_async(left_pointer ? *expression.left : *expression.right,
+                                                   pointer_type_id);
+            if (!pointer) co_return std::nullopt;
+            const auto zero = null_pointer_constant(pointer_type_id, integer.location);
+            if (!zero) co_return std::nullopt;
+            const auto result = add_value(ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), expression.location);
+            auto& value = current_.values[result.value];
+            value.binary = expression.text == "==" ? BinaryOperation::Equal : BinaryOperation::NotEqual;
+            value.operands = left_pointer ? std::vector<ValueId>{*pointer, *zero}
+                                          : std::vector<ValueId>{*zero, *pointer};
+            co_return result;
+        }
         const bool addition = expression.text == "+";
         const bool subtraction = expression.text == "-";
         if ((addition || subtraction) &&
             (left_pointer || right_pointer)) {
             if (left_pointer && right_pointer) {
-                if (!subtraction || *left_type != *right_type) {
+                if (!subtraction || !representation_compatible(hir_, *left_type, *right_type)) {
                     diagnostics_.error(
                         expression.location,
                         "pointer subtraction requires matching pointer types");
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
                 const auto& pointer = hir_.type(*left_type);
                 if (!pointer.pointee ||
@@ -3990,11 +4186,11 @@ private:
                     diagnostics_.error(
                         expression.location,
                         "pointer subtraction requires a complete pointed-to object type");
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                auto left = lower_expression(*expression.left);
-                auto right = lower_expression(*expression.right);
-                if (!left || !right) return std::nullopt;
+                auto left = co_await lower_expression_async(*expression.left);
+                auto right = co_await lower_expression_async(*expression.right);
+                if (!left || !right) co_return std::nullopt;
                 const auto iptr = *hir_.builtin(BuiltinType::Iptr);
                 left = cast(*left, iptr, expression.left->location);
                 right = cast(*right, iptr, expression.right->location);
@@ -4005,7 +4201,7 @@ private:
                 difference.operands = {*left, *right};
                 const auto element_size =
                     storage_size(hir_, *pointer.pointee, target_);
-                if (element_size == 1) return bytes;
+                if (element_size == 1) co_return bytes;
                 const auto divisor = constant(UInt128{element_size}, iptr,
                                               expression.location);
                 const auto result = add_value(ValueKind::Binary, iptr,
@@ -4013,7 +4209,7 @@ private:
                 auto& quotient = current_.values[result.value];
                 quotient.binary = BinaryOperation::SignedDivide;
                 quotient.operands = {bytes, divisor};
-                return result;
+                co_return result;
             }
 
             const bool pointer_on_left = left_pointer;
@@ -4023,7 +4219,7 @@ private:
                 diagnostics_.error(
                     expression.location,
                     "pointer arithmetic requires one pointer and one integer operand");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto pointer_type_id =
                 pointer_on_left ? *left_type : *right_type;
@@ -4033,13 +4229,13 @@ private:
                 diagnostics_.error(
                     expression.location,
                     "pointer arithmetic requires a complete pointed-to object type");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            auto base = lower_expression(
+            auto base = co_await lower_expression_async(
                 *(pointer_on_left ? expression.left : expression.right));
-            auto index = lower_expression(
+            auto index = co_await lower_expression_async(
                 *(pointer_on_left ? expression.right : expression.left));
-            if (!base || !index) return std::nullopt;
+            if (!base || !index) co_return std::nullopt;
             const auto iptr = *hir_.builtin(BuiltinType::Iptr);
             index = cast(*index, iptr,
                          pointer_on_left ? expression.right->location
@@ -4052,7 +4248,7 @@ private:
                 unary.operands.push_back(*index);
                 index = negated;
             }
-            return indexed_address(*base, *index, *pointer.pointee,
+            co_return indexed_address(*base, *index, *pointer.pointee,
                                    expression.location);
         }
         const bool shift = expression.text == "<<" || expression.text == ">>";
@@ -4061,18 +4257,19 @@ private:
                               vector_floating_type(hir_, *left_type) ||
                               vector_floating_type(hir_, *right_type);
         if (floating && shift) {
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto common = shift ? promote(*left_type)
                                   : common_type(*left_type, *right_type);
-        if (!common) return std::nullopt;
-        auto left = lower_expression(*expression.left, *common);
-        auto right = shift ? lower_expression(*expression.right)
-                           : lower_expression(*expression.right, *common);
-        if (!left || !right) return std::nullopt;
+        if (!common) co_return std::nullopt;
+        auto left = co_await lower_expression_async(*expression.left, *common);
+        std::optional<ValueId> right;
+        if (shift) right = co_await lower_expression_async(*expression.right);
+        else right = co_await lower_expression_async(*expression.right, *common);
+        if (!left || !right) co_return std::nullopt;
         if (shift) {
             const auto right_promoted = promote(current_.values[right->value].type);
-            if (!right_promoted) return std::nullopt;
+            if (!right_promoted) co_return std::nullopt;
             right = cast(*right, *right_promoted, expression.right->location);
             right = cast(*right, *common, expression.right->location);
         }
@@ -4083,19 +4280,19 @@ private:
                              pointer_type(hir_, *right_type);
         if (pointer &&
             (!pointer_type(hir_, *left_type) ||
-             !pointer_type(hir_, *right_type) || *left_type != *right_type ||
+             !pointer_type(hir_, *right_type) ||
              !comparison)) {
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (floating && expression.text == "%") {
             diagnostics_.error(
                 expression.location,
                 "floating remainder has no runtime-free lowering on this target");
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (floating && expression.text != "+" && expression.text != "-" &&
             expression.text != "*" && expression.text != "/" && !comparison) {
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto result_type = comparison && vector_type(hir_, *common)
                                      ? *vector_mask_type(*common)
@@ -4130,8 +4327,12 @@ private:
             ? BinaryOperation::SignedGreater : BinaryOperation::UnsignedGreater;
         else if (expression.text == ">=") value.binary = sign || floating
             ? BinaryOperation::SignedGreaterEqual : BinaryOperation::UnsignedGreaterEqual;
-        else return std::nullopt;
-        return result;
+        else co_return std::nullopt;
+        co_return result;
+    }
+
+    std::optional<ValueId> lower_binary(const Expr& expression) {
+        return lower_binary_async(expression).run();
     }
 
     std::optional<BinaryOperation> compound_operation(
@@ -4187,6 +4388,33 @@ private:
         return std::nullopt;
     }
 
+    std::optional<ValueId> compound_value(std::string_view spelling,
+                                           ValueId left, ValueId right,
+                                           hir::TypeId destination,
+                                           SourceLocation location) {
+        const auto left_type = current_.values[left.value].type;
+        const auto right_type = current_.values[right.value].type;
+        const bool shift = spelling == "<<=" || spelling == ">>=";
+        if (shift && (!integer_type(hir_, right_type) &&
+                      !vector_integer_type(hir_, right_type))) return std::nullopt;
+        const auto common = shift ? promote(left_type)
+                                  : common_type(left_type, right_type);
+        if (!common) return std::nullopt;
+        const auto operation = compound_operation(spelling, *common, location);
+        if (!operation) return std::nullopt;
+        left = cast(left, *common, location);
+        if (shift) {
+            const auto promoted = promote(right_type);
+            if (!promoted) return std::nullopt;
+            right = cast(right, *promoted, location);
+        }
+        right = cast(right, *common, location);
+        const auto result = add_value(ValueKind::Binary, *common, location);
+        current_.values[result.value].operands = {left, right};
+        current_.values[result.value].binary = *operation;
+        return assignment_cast(result, destination, location);
+    }
+
     ValueId unit_value(hir::TypeId type, SourceLocation location) {
         const auto& value = hir_.type(type);
         if (value.kind == hir::Type::Kind::Builtin &&
@@ -4238,7 +4466,7 @@ private:
     }
 
     std::optional<ValueId> atomic_update(
-        const AtomicLvalue& lvalue, ValueId right, BinaryOperation operation,
+        const AtomicLvalue& lvalue, ValueId right, std::string_view spelling,
         SourceLocation location, bool return_old = false) {
         const auto type = hir_.unqualified(lvalue.object_type);
         if (!integer_type(hir_, type) && !floating_type(hir_, type)) {
@@ -4248,72 +4476,133 @@ private:
             return std::nullopt;
         }
 
+        const auto right_type = current_.values[right.value].type;
+        if ((spelling == "<<=" || spelling == ">>=") &&
+            !integer_type(hir_, right_type)) return std::nullopt;
+        const auto common = spelling == "<<=" || spelling == ">>="
+                                ? promote(type) : common_type(type, right_type);
+        if (!common) return std::nullopt;
+        const auto operation = compound_operation(spelling, *common, location);
+        if (!operation) return std::nullopt;
+        if (floating_type(hir_, type) ||
+            !representation_compatible(hir_, type, *common)) {
+            // A target FetchUpdate operates in the object's representation.
+            // Wider/mixed arithmetic instead runs in a shared CAS loop. The
+            // captured address and RHS dominate the loop and execute once.
+            const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
+            current_.slots.push_back({slot, location, type,
+                "$atomic.expected." + std::to_string(slot.value), std::nullopt,
+                false, true, false, storage_alignment(hir_, type, target_), std::nullopt});
+            const LocalBinding expected{slot, type, std::nullopt, std::nullopt};
+            (void)lifetime(ValueKind::LifetimeStart, slot, location);
+            const auto initial = atomic_operation(
+                AtomicOperation::Load, type, {lvalue.address}, MemoryOrder::SeqCst,
+                location, MemoryOrder::SeqCst, lvalue.is_volatile);
+            (void)store_slot(expected, initial, location);
+            const auto expected_address = slot_address(expected, location);
+            const auto loop = new_block(location);
+            const auto end = new_block(location);
+            terminate(TerminatorKind::Branch, location, std::nullopt, {loop});
+            enter(loop);
+            const auto old = load_slot(expected, location);
+            const auto updated = compound_value(spelling, old, right, type, location);
+            if (!updated) return std::nullopt;
+            const auto success = atomic_operation(
+                AtomicOperation::CompareExchange, *hir_.builtin(BuiltinType::Bool),
+                {lvalue.address, expected_address, *updated}, MemoryOrder::SeqCst,
+                location, MemoryOrder::SeqCst, lvalue.is_volatile);
+            terminate(TerminatorKind::ConditionalBranch, location, success, {end, loop});
+            enter(end);
+            (void)lifetime(ValueKind::LifetimeEnd, slot, location);
+            return return_old ? old : *updated;
+        }
+
+        right = assignment_cast(right, type, location);
+
         AtomicOperation atomic = AtomicOperation::FetchUpdate;
         if (integer_type(hir_, type)) {
-            if (operation == BinaryOperation::Add) {
+            if (*operation == BinaryOperation::Add) {
                 atomic = AtomicOperation::FetchAdd;
-            } else if (operation == BinaryOperation::Subtract) {
+            } else if (*operation == BinaryOperation::Subtract) {
                 atomic = AtomicOperation::FetchSub;
-            } else if (operation == BinaryOperation::BitAnd) {
+            } else if (*operation == BinaryOperation::BitAnd) {
                 atomic = AtomicOperation::FetchAnd;
-            } else if (operation == BinaryOperation::BitXor) {
+            } else if (*operation == BinaryOperation::BitXor) {
                 atomic = AtomicOperation::FetchXor;
-            } else if (operation == BinaryOperation::BitOr) {
+            } else if (*operation == BinaryOperation::BitOr) {
                 atomic = AtomicOperation::FetchOr;
             }
         }
         const auto old = atomic_operation(
             atomic, type, {lvalue.address, right}, MemoryOrder::SeqCst,
             location, MemoryOrder::SeqCst, lvalue.is_volatile);
-        current_.values[old.value].binary = operation;
+        current_.values[old.value].binary = *operation;
         if (return_old) return old;
 
         const auto updated = add_value(ValueKind::Binary, type, location);
         auto& binary = current_.values[updated.value];
-        binary.binary = operation;
+        binary.binary = *operation;
         binary.operands = {old, right};
         return updated;
     }
 
-    std::optional<ValueId> lower_atomic_assignment(
+    ContinuationTask<std::optional<ValueId>> lower_atomic_assignment_async(
         const Expr& expression, hir::TypeId object_type) {
         const auto value_type = hir_.unqualified(object_type);
         if (expression.text == "=") {
-            auto lvalue = lower_atomic_lvalue(*expression.left);
-            auto source = lower_expression(*expression.right, value_type);
-            if (!lvalue || !source) return std::nullopt;
+            auto lvalue = co_await lower_atomic_lvalue_async(*expression.left);
+            auto source = co_await lower_expression_async(*expression.right, value_type);
+            if (!lvalue || !source) co_return std::nullopt;
             (void)atomic_operation(
                 AtomicOperation::Store, *hir_.builtin(BuiltinType::Void),
                 {lvalue->address, *source}, MemoryOrder::SeqCst,
                 expression.location, MemoryOrder::SeqCst,
                 lvalue->is_volatile);
-            return source;
+            co_return source;
         }
         if (!integer_type(hir_, value_type) &&
             !floating_type(hir_, value_type)) {
             diagnostics_.error(
                 expression.location,
                 "atomic compound operations require an integer or floating object");
-            return std::nullopt;
+            co_return std::nullopt;
         }
-        auto lvalue = lower_atomic_lvalue(*expression.left);
-        if (!lvalue) return std::nullopt;
-        auto right = lower_expression(*expression.right, value_type);
-        const auto operation = compound_operation(
-            expression.text, value_type, expression.location);
-        if (!right || !operation) return std::nullopt;
-        return atomic_update(*lvalue, *right, *operation,
+        auto lvalue = co_await lower_atomic_lvalue_async(*expression.left);
+        if (!lvalue) co_return std::nullopt;
+        auto right = co_await lower_expression_async(*expression.right);
+        if (!right) co_return std::nullopt;
+        co_return atomic_update(*lvalue, *right, expression.text,
                              expression.location);
     }
 
-    std::optional<ValueId> lower_assignment(const Expr& expression) {
+    std::optional<ValueId> lower_atomic_assignment(
+        const Expr& expression, hir::TypeId object_type) {
+        return lower_atomic_assignment_async(expression, object_type).run();
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_assignment_async(const Expr& expression) {
         const Expr* target = expression.left.get();
         while (target && target->kind == Expr::Kind::Parenthesized &&
                target->left) target = target->left.get();
-        if (!target) return std::nullopt;
+        if (!target) co_return std::nullopt;
+        if (const auto* node = vector_lane_expression(*target)) {
+            const auto lane = co_await lower_vector_lane_async(*node);
+            if (!lane || hir_.type(lane->element_type).is_const) co_return std::nullopt;
+            std::optional<ValueId> old;
+            if (expression.text != "=") {
+                old = load_vector_lane(*lane, expression.location);
+                if (!old) co_return std::nullopt;
+            }
+            auto source = co_await lower_expression_async(*expression.right);
+            if (!source) co_return std::nullopt;
+            if (old) source = compound_value(expression.text, *old, *source,
+                                             lane->element_type, expression.location);
+            co_return source ? store_vector_lane(*lane, *source, expression.location)
+                          : std::nullopt;
+        }
         const auto object_type = designator_type(*target);
         if (object_type && atomic_object_type(hir_, *object_type)) {
-            return lower_atomic_assignment(expression, *object_type);
+            co_return co_await lower_atomic_assignment_async(expression, *object_type);
         }
         if (target->kind == Expr::Kind::Binary &&
             (target->text == "member" ||
@@ -4328,42 +4617,40 @@ private:
             if (!aggregate_type ||
                 !vector_type(hir_, *aggregate_type)) {
                 designator =
-                    lower_designator_address(*target);
+                    co_await lower_designator_address_async(*target);
             }
             if (designator) {
                 if (hir_.type(designator->type).is_const) {
                     diagnostics_.error(expression.location, "cannot write a const subobject");
                     failed_ = true;
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
                 if (!managed_value_type(hir_, designator->type)) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
             if (expression.text == "=") {
-                auto source = lower_expression(*expression.right,
+                auto source = co_await lower_expression_async(*expression.right,
                                                designator->type);
                 if (!source) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
                 if (designator->bit_field) {
-                    return store_bit_field(*designator, *source,
+                    co_return store_bit_field(*designator, *source,
                                            expression.location);
                 }
                 if (!store_pointer(designator->address, *source,
                                    expression.location,
                                    designator->alignment)) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                return source;
+                co_return source;
             }
             std::optional<ValueId> left;
-            std::optional<ValueId> loaded_storage;
             if (designator->bit_field) {
                 const auto loaded = load_bit_field(*designator,
                                                    expression.location);
                 if (loaded) {
                     left = loaded->value;
-                    loaded_storage = loaded->storage;
                 }
             } else {
                 left = load_pointer(designator->address,
@@ -4372,10 +4659,10 @@ private:
             }
             if (left && pointer_type(hir_, designator->type)) {
                 if (expression.text != "+=" && expression.text != "-=") {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                auto right = lower_expression(*expression.right);
-                if (!right) return std::nullopt;
+                auto right = co_await lower_expression_async(*expression.right);
+                if (!right) co_return std::nullopt;
                 const auto result = pointer_offset(
                     *left, designator->type, *right,
                     expression.text == "+=", expression.location);
@@ -4383,41 +4670,27 @@ private:
                     !store_pointer(designator->address, *result,
                                    expression.location,
                                    designator->alignment)) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                return result;
+                co_return result;
             }
-            auto right = lower_expression(*expression.right,
-                                          designator->type);
-            const auto operation = compound_operation(
-                expression.text, designator->type,
-                expression.location);
-            if (!left || !right || !operation ||
-                (!integer_type(hir_, designator->type) &&
-                 !floating_type(hir_, designator->type) &&
-                 !vector_type(hir_, designator->type))) {
-                return std::nullopt;
-            }
-            const auto result = add_value(ValueKind::Binary,
-                                          designator->type,
-                                          expression.location);
-            auto& binary = current_.values[result.value];
-            binary.operands = {*left, *right};
-            binary.binary = *operation;
+            const auto right = co_await lower_expression_async(*expression.right);
+            if (!left || !right) co_return std::nullopt;
+            const auto result = compound_value(expression.text, *left, *right,
+                                                designator->type, expression.location);
+            if (!result) co_return std::nullopt;
             const auto stored = designator->bit_field
                                     ? store_bit_field(
-                                          *designator, result,
-                                          expression.location,
-                                          loaded_storage)
+                                          *designator, *result,
+                                          expression.location)
                                     : store_pointer(
-                                          designator->address, result,
+                                          designator->address, *result,
                                           expression.location,
                                           designator->alignment);
             if (!stored) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return designator->bit_field ? stored
-                                         : std::optional<ValueId>(result);
+            co_return designator->bit_field ? stored : result;
             }
         }
         if (target->kind == Expr::Kind::Binary &&
@@ -4426,193 +4699,121 @@ private:
             const auto element_type = designator_type(*target);
             if (element_type && managed_value_type(hir_, *element_type) &&
                 !hir_.type(*element_type).is_const) {
-                auto base = lower_expression(*target->left);
-                auto index = lower_expression(*target->right);
+                auto base = co_await lower_expression_async(*target->left);
+                auto index = co_await lower_expression_async(*target->right);
                 if (!base || !index ||
                     !integer_type(hir_, current_.values[index->value].type)) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
                 const auto address = indexed_address(
                     *base, *index, *element_type, expression.location);
-                ValueId result;
                 if (expression.text == "=") {
-                    auto source = lower_expression(*expression.right,
+                    auto source = co_await lower_expression_async(*expression.right,
                                                    *element_type);
                     if (!source ||
                         !store_pointer(address, *source,
                                        expression.location)) {
-                        return std::nullopt;
+                        co_return std::nullopt;
                     }
-                    return source;
+                    co_return source;
                 }
                 auto left = load_pointer(address, expression.location);
                 if (left && pointer_type(hir_, *element_type)) {
                     if (expression.text != "+=" &&
                         expression.text != "-=") {
-                        return std::nullopt;
+                        co_return std::nullopt;
                     }
-                    auto right = lower_expression(*expression.right);
-                    if (!right) return std::nullopt;
+                    auto right = co_await lower_expression_async(*expression.right);
+                    if (!right) co_return std::nullopt;
                     const auto pointer_result = pointer_offset(
                         *left, *element_type, *right,
                         expression.text == "+=", expression.location);
                     if (!pointer_result ||
                         !store_pointer(address, *pointer_result,
                                        expression.location)) {
-                        return std::nullopt;
+                        co_return std::nullopt;
                     }
-                    return pointer_result;
+                    co_return pointer_result;
                 }
-                auto right = lower_expression(*expression.right,
-                                              *element_type);
-                const auto operation = compound_operation(
-                    expression.text, *element_type, expression.location);
-                if (!left || !right || !operation ||
-                    (!integer_type(hir_, *element_type) &&
-                     !floating_type(hir_, *element_type) &&
-                     !vector_type(hir_, *element_type))) {
-                    return std::nullopt;
+                const auto right = co_await lower_expression_async(*expression.right);
+                if (!left || !right) co_return std::nullopt;
+                const auto result = compound_value(expression.text, *left, *right,
+                                                    *element_type, expression.location);
+                if (!result || !store_pointer(address, *result, expression.location)) {
+                    co_return std::nullopt;
                 }
-                result = add_value(ValueKind::Binary, *element_type,
-                                   expression.location);
-                auto& binary = current_.values[result.value];
-                binary.operands = {*left, *right};
-                binary.binary = *operation;
-                if (!store_pointer(address, result, expression.location)) {
-                    return std::nullopt;
-                }
-                return result;
+                co_return result;
             }
-        }
-        if (target->kind == Expr::Kind::Binary &&
-            target->text == "index" &&
-            target->left && target->right &&
-            expression.text == "=") {
-            const auto name = local_name(*target->left);
-            const auto* local = name ? find_local(*name) : nullptr;
-            const auto* object = local || !name ? nullptr
-                                                : resolve_object(*target->left);
-            const auto vector_type_id = local ? local->type
-                                      : object ? object->type
-                                               : hir::TypeId{};
-            if ((!local && !object) ||
-                !vector_type(hir_, vector_type_id) ||
-                hir_.type(vector_type_id).is_const) {
-                return std::nullopt;
-            }
-            const auto& vector = hir_.type(vector_type_id);
-            auto index = lower_expression(*target->right);
-            auto element = lower_expression(*expression.right,
-                                             *vector.element);
-            if (!index || !element ||
-                !integer_type(hir_, current_.values[index->value].type)) {
-                return std::nullopt;
-            }
-            const auto& index_value = current_.values[index->value];
-            if (index_value.kind == ValueKind::ConstantInteger &&
-                (index_value.integer_high != 0 ||
-                 index_value.integer >= vector.lanes)) {
-                diagnostics_.error(target->right->location,
-                                   "fixed-vector lane index is out of range");
-                failed_ = true;
-                return std::nullopt;
-            }
-            const auto original = local
-                                      ? load_slot(*local, expression.location)
-                                      : load_global(*object,
-                                                    expression.location);
-            const auto inserted = add_value(ValueKind::InsertElement,
-                                            vector_type_id,
-                                            expression.location);
-            current_.values[inserted.value].operands = {
-                original, *index, *element};
-            if (local) {
-                (void)store_slot(*local, inserted, expression.location);
-            } else {
-                (void)store_global(*object, inserted,
-                                   expression.location);
-            }
-            return *element;
         }
         if (target->kind == Expr::Kind::Unary &&
             target->text == "*" && target->left) {
-            auto address = lower_expression(*target->left);
+            auto address = co_await lower_expression_async(*target->left);
             const auto type = infer_type(*target);
-            if (!address || !type) return std::nullopt;
+            if (!address || !type) co_return std::nullopt;
             if (expression.text == "=") {
-                auto source = lower_expression(*expression.right, *type);
+                auto source = co_await lower_expression_async(*expression.right, *type);
                 if (!source ||
                     !store_pointer(*address, *source, expression.location)) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                return source;
+                co_return source;
             }
             auto left = load_pointer(*address, expression.location);
             if (left && pointer_type(hir_, *type)) {
                 if (expression.text != "+=" && expression.text != "-=") {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                auto right = lower_expression(*expression.right);
-                if (!right) return std::nullopt;
+                auto right = co_await lower_expression_async(*expression.right);
+                if (!right) co_return std::nullopt;
                 const auto result = pointer_offset(
                     *left, *type, *right, expression.text == "+=",
                     expression.location);
                 if (!result ||
                     !store_pointer(*address, *result,
                                    expression.location)) {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                return result;
+                co_return result;
             }
-            auto right = lower_expression(*expression.right, *type);
-            const auto operation = compound_operation(
-                expression.text, *type, expression.location);
-            if (!left || !right || !operation ||
-                (!integer_type(hir_, *type) &&
-                 !floating_type(hir_, *type) &&
-                 !vector_type(hir_, *type))) {
-                return std::nullopt;
+            const auto right = co_await lower_expression_async(*expression.right);
+            if (!left || !right) co_return std::nullopt;
+            const auto result = compound_value(expression.text, *left, *right,
+                                                *type, expression.location);
+            if (!result || !store_pointer(*address, *result, expression.location)) {
+                co_return std::nullopt;
             }
-            const auto result = add_value(ValueKind::Binary, *type,
-                                          expression.location);
-            auto& binary = current_.values[result.value];
-            binary.operands = {*left, *right};
-            binary.binary = *operation;
-            if (!store_pointer(*address, result, expression.location)) {
-                return std::nullopt;
-            }
-            return result;
+            co_return result;
         }
         const auto name = local_name(*target);
         const auto* found = name ? find_local(*name) : nullptr;
         const auto* object = found || !name ? nullptr : resolve_object(*target);
         if (found && (found->dynamic_address ||
                       array_type(hir_, found->type))) {
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (!found && (!object || !global_scalar(*object) ||
                        hir_.type(object->type).is_const)) {
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto type = found ? found->type : object->type;
         ValueId result;
         if (expression.text == "=") {
-            auto source = lower_expression(*expression.right, type);
-            if (!source) return std::nullopt;
+            auto source = co_await lower_expression_async(*expression.right, type);
+            if (!source) co_return std::nullopt;
             result = *source;
         } else {
             const auto left = found ? load_slot(*found, expression.location)
                                     : load_global(*object, expression.location);
             if (pointer_type(hir_, type)) {
                 if (expression.text != "+=" && expression.text != "-=") {
-                    return std::nullopt;
+                    co_return std::nullopt;
                 }
-                auto right = lower_expression(*expression.right);
-                if (!right) return std::nullopt;
+                auto right = co_await lower_expression_async(*expression.right);
+                if (!right) co_return std::nullopt;
                 const auto updated = pointer_offset(
                     left, type, *right, expression.text == "+=",
                     expression.location);
-                if (!updated) return std::nullopt;
+                if (!updated) co_return std::nullopt;
                 result = *updated;
                 if (found) {
                     (void)store_slot(*found, result, expression.location);
@@ -4620,121 +4821,41 @@ private:
                     (void)store_global(*object, result,
                                        expression.location);
                 }
-                return result;
+                co_return result;
             }
-            auto right = lower_expression(*expression.right, type);
-            if (!right) return std::nullopt;
-            if (!integer_type(hir_, type) && !floating_type(hir_, type) &&
-                !vector_type(hir_, type)) {
-                return std::nullopt;
-            }
-            result = add_value(ValueKind::Binary, type, expression.location);
-            auto& binary = current_.values[result.value];
-            binary.operands = {left, *right};
-            const auto operation = compound_operation(
-                expression.text, type, expression.location);
-            if (!operation) return std::nullopt;
-            binary.binary = *operation;
+            auto right = co_await lower_expression_async(*expression.right);
+            if (!right) co_return std::nullopt;
+            const auto updated = compound_value(expression.text, left, *right,
+                                                  type, expression.location);
+            if (!updated) co_return std::nullopt;
+            result = *updated;
         }
         if (found) {
             (void)store_slot(*found, result, expression.location);
         } else {
             (void)store_global(*object, result, expression.location);
         }
-        return result;
+        co_return result;
+    }
+
+    std::optional<ValueId> lower_assignment(const Expr& expression) {
+        return lower_assignment_async(expression).run();
     }
 
     std::optional<MemoryOrder> parse_memory_order(const Expr& expression) {
-        const Expr* source = &expression;
-        while (source->kind == Expr::Kind::Parenthesized && source->left) {
-            source = source->left.get();
-        }
-        if (source->kind != Expr::Kind::Name) return std::nullopt;
-        if (source->text == "$::memory::relaxed") {
-            return MemoryOrder::Relaxed;
-        }
-        if (source->text == "$::memory::acquire") {
-            return MemoryOrder::Acquire;
-        }
-        if (source->text == "$::memory::release") {
-            return MemoryOrder::Release;
-        }
-        if (source->text == "$::memory::acq_rel") {
-            return MemoryOrder::AcqRel;
-        }
-        if (source->text == "$::memory::seq_cst") {
-            return MemoryOrder::SeqCst;
-        }
-        return std::nullopt;
+        return parse_source_memory_order(expression);
     }
 
     bool lock_free_atomic_type(hir::TypeId type) const {
-        const auto& value = hir_.type(type);
-        if (value.kind != hir::Type::Kind::Builtin &&
-            value.kind != hir::Type::Kind::Pointer) {
-            return false;
-        }
-        const auto bits = type_bits(hir_, type);
-        return std::any_of(
-            target_.lock_free_atomic_widths.begin(),
-            target_.lock_free_atomic_widths.end(),
-            [&](const AtomicWidthEntry& entry) {
-                return entry.bits == bits &&
-                       (entry.feature.empty() || entry.feature == "base" ||
-                        entry.feature == target_.architecture ||
-                        subtarget_.has_feature(entry.feature));
-            });
-    }
-
-    std::optional<hir::TypeId> builtin_type_argument(const Expr& expression) {
-        const Expr* source = &expression;
-        while (source->kind == Expr::Kind::Parenthesized && source->left) {
-            source = source->left.get();
-        }
-        if (source->kind != Expr::Kind::Name) return std::nullopt;
-        static constexpr std::pair<std::string_view, BuiltinType> types[]{
-            {"bool", BuiltinType::Bool}, {"i8", BuiltinType::I8},
-            {"u8", BuiltinType::U8}, {"i16", BuiltinType::I16},
-            {"u16", BuiltinType::U16}, {"i32", BuiltinType::I32},
-            {"u32", BuiltinType::U32}, {"i64", BuiltinType::I64},
-            {"u64", BuiltinType::U64}, {"i128", BuiltinType::I128},
-            {"u128", BuiltinType::U128}, {"iptr", BuiltinType::Iptr},
-            {"uptr", BuiltinType::Uptr}, {"f32", BuiltinType::F32},
-            {"f64", BuiltinType::F64}, {"f80", BuiltinType::F80},
-            {"f128", BuiltinType::F128}, {"fptr", BuiltinType::Fptr},
-        };
-        const auto found = std::find_if(
-            std::begin(types), std::end(types),
-            [&](const auto& candidate) {
-                return candidate.first == source->text;
-            });
-        return found == std::end(types) ? std::nullopt
-                                        : hir_.builtin(found->second);
+        return hir::lock_free_atomic_type(hir_, type, target_, subtarget_);
     }
 
     bool valid_failure_order(MemoryOrder success,
                              MemoryOrder failure) const {
-        if (failure == MemoryOrder::Release ||
-            failure == MemoryOrder::AcqRel) {
-            return false;
-        }
-        switch (success) {
-        case MemoryOrder::Relaxed:
-        case MemoryOrder::Release:
-            return failure == MemoryOrder::Relaxed;
-        case MemoryOrder::Acquire:
-        case MemoryOrder::AcqRel:
-            return failure == MemoryOrder::Relaxed ||
-                   failure == MemoryOrder::Acquire;
-        case MemoryOrder::SeqCst:
-            return failure == MemoryOrder::Relaxed ||
-                   failure == MemoryOrder::Acquire ||
-                   failure == MemoryOrder::SeqCst;
-        }
-        return false;
+        return valid_atomic_failure_order(success, failure);
     }
 
-    std::optional<ValueId> lower_atomic_call(const Expr& expression) {
+    ContinuationTask<std::optional<ValueId>> lower_atomic_call_async(const Expr& expression) {
         const auto& name = expression.left->text;
         const auto diagnose_order = [&](const Expr& order_expression) {
             diagnostics_.error(
@@ -4743,19 +4864,19 @@ private:
                 "acq_rel, or seq_cst");
         };
         if (name == "$::atomic_is_lock_free") {
-            if (expression.arguments.size() != 1) {
+            if (expression.arguments.size() + (expression.type ? 1U : 0U) != 1) {
                 diagnostics_.error(expression.location,
                                    "$::atomic_is_lock_free requires one type or expression");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            auto type = builtin_type_argument(*expression.arguments.front());
-            if (!type) type = infer_type(*expression.arguments.front());
+            auto type = expression.type ? std::optional<hir::TypeId>(hir_.intern_type(expression.type))
+                : infer_type(*expression.arguments.front());
             if (!type || !scalar_type(hir_, *type)) {
-                diagnostics_.error(expression.arguments.front()->location,
+                diagnostics_.error(expression.location,
                                    "$::atomic_is_lock_free requires a scalar type or expression");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return constant(lock_free_atomic_type(*type) ? 1U : 0U,
+            co_return constant(lock_free_atomic_type(*type) ? 1U : 0U,
                             *hir_.builtin(BuiltinType::Bool),
                             expression.location);
         }
@@ -4765,15 +4886,15 @@ private:
                 diagnostics_.error(
                     expression.location,
                     name + " requires one memory-order argument");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto order = parse_memory_order(
                 *expression.arguments.front());
             if (!order) {
                 diagnose_order(*expression.arguments.front());
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return atomic_operation(
+            co_return atomic_operation(
                 name == "$::atomic_thread_fence"
                     ? AtomicOperation::ThreadFence
                     : AtomicOperation::SignalFence,
@@ -4789,14 +4910,14 @@ private:
                 expression.location,
                 name + " requires " + std::to_string(required) +
                     " arguments");
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto pointee = atomic_pointee(*expression.arguments[0]);
         if (!pointee) {
             diagnostics_.error(
                 expression.arguments[0]->location,
                 name + " requires a pointer to an atomic-qualified scalar");
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto atomic_type = *pointee;
         const auto value_type = hir_.unqualified(atomic_type);
@@ -4805,7 +4926,7 @@ private:
             diagnostics_.error(
                 expression.arguments[0]->location,
                 name + " cannot modify a const atomic object");
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (!lock_free_atomic_type(value_type)) {
             diagnostics_.error(
@@ -4813,25 +4934,25 @@ private:
                 "selected target '" + std::string(target_.architecture) +
                     "' has no runtime-free atomic operation for " +
                     hir::type_name(hir_, value_type));
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto is_volatile = hir_.type(atomic_type).is_volatile;
-        auto address = lower_expression(*expression.arguments[0]);
-        if (!address) return std::nullopt;
+        auto address = co_await lower_expression_async(*expression.arguments[0]);
+        if (!address) co_return std::nullopt;
 
         if (name == "$::atomic_load") {
             const auto order = parse_memory_order(*expression.arguments[1]);
             if (!order) {
                 diagnose_order(*expression.arguments[1]);
-                return std::nullopt;
+                co_return std::nullopt;
             }
             if (*order == MemoryOrder::Release ||
                 *order == MemoryOrder::AcqRel) {
                 diagnostics_.error(expression.arguments[1]->location,
                                    "atomic load order must be relaxed, acquire, or seq_cst");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return atomic_operation(AtomicOperation::Load, value_type,
+            co_return atomic_operation(AtomicOperation::Load, value_type,
                                     {*address}, *order,
                                     expression.location,
                                     MemoryOrder::SeqCst, is_volatile);
@@ -4840,14 +4961,14 @@ private:
         if (name == "$::atomic_compare_exchange") {
             const auto expected_pointer =
                 infer_type(*expression.arguments[1]);
-            if (!expected_pointer) return std::nullopt;
+            if (!expected_pointer) co_return std::nullopt;
             const auto expected_pointer_value = hir_.type(*expected_pointer);
             if (expected_pointer_value.kind != hir::Type::Kind::Pointer ||
                 !expected_pointer_value.pointee) {
                 diagnostics_.error(
                     expression.arguments[1]->location,
                     "$::atomic_compare_exchange expected argument must be a pointer");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto expected_type = *expected_pointer_value.pointee;
             if (hir_.type(expected_type).is_const ||
@@ -4856,43 +4977,43 @@ private:
                 diagnostics_.error(
                     expression.arguments[1]->location,
                     "$::atomic_compare_exchange expected pointer has an incompatible type");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            auto expected = lower_expression(*expression.arguments[1]);
-            auto desired = lower_expression(*expression.arguments[2],
+            auto expected = co_await lower_expression_async(*expression.arguments[1]);
+            auto desired = co_await lower_expression_async(*expression.arguments[2],
                                             value_type);
             const auto success = parse_memory_order(*expression.arguments[3]);
             const auto failure = parse_memory_order(*expression.arguments[4]);
             if (!success) diagnose_order(*expression.arguments[3]);
             if (!failure) diagnose_order(*expression.arguments[4]);
             if (!expected || !desired || !success || !failure) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
             if (!valid_failure_order(*success, *failure)) {
                 diagnostics_.error(
                     expression.arguments[4]->location,
                     "compare-exchange failure order is invalid or stronger than success");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return atomic_operation(
+            co_return atomic_operation(
                 AtomicOperation::CompareExchange,
                 *hir_.builtin(BuiltinType::Bool),
                 {*address, *expected, *desired}, *success,
                 expression.location, *failure, is_volatile);
         }
 
-        auto source = lower_expression(*expression.arguments[1], value_type);
+        auto source = co_await lower_expression_async(*expression.arguments[1], value_type);
         const auto order = parse_memory_order(*expression.arguments[2]);
         if (!order) diagnose_order(*expression.arguments[2]);
-        if (!source || !order) return std::nullopt;
+        if (!source || !order) co_return std::nullopt;
         if (name == "$::atomic_store") {
             if (*order == MemoryOrder::Acquire ||
                 *order == MemoryOrder::AcqRel) {
                 diagnostics_.error(expression.arguments[2]->location,
                                    "atomic store order must be relaxed, release, or seq_cst");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return atomic_operation(
+            co_return atomic_operation(
                 AtomicOperation::Store,
                 *hir_.builtin(BuiltinType::Void), {*address, *source},
                 *order, expression.location, MemoryOrder::SeqCst,
@@ -4909,27 +5030,31 @@ private:
             diagnostics_.error(
                 expression.arguments[0]->location,
                 "atomic fetch arithmetic and bitwise operations require an integer object");
-            return std::nullopt;
+            co_return std::nullopt;
         }
-        return atomic_operation(operation, value_type,
+        co_return atomic_operation(operation, value_type,
                                 {*address, *source}, *order,
                                 expression.location, MemoryOrder::SeqCst,
                                 is_volatile);
     }
 
-    std::optional<ValueId> lower_call(const Expr& expression) {
+    std::optional<ValueId> lower_atomic_call(const Expr& expression) {
+        return lower_atomic_call_async(expression).run();
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_call_async(const Expr& expression) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
-            return lower_indirect_call(expression);
+            co_return co_await lower_indirect_call_async(expression);
         }
         if (expression.left->text == "$::patch") {
-            return lower_patch(expression);
+            co_return lower_patch(expression);
         }
         if (atomic_intrinsic(expression.left->text)) {
-            return lower_atomic_call(expression);
+            co_return co_await lower_atomic_call_async(expression);
         }
         if (expression.left->text == "$::alignof") {
             if (expression.arguments.size() != 1) {
-                return std::nullopt;
+                co_return std::nullopt;
             }
             static constexpr std::pair<std::string_view, BuiltinType> types[]{
                 {"bool", BuiltinType::Bool},
@@ -4961,17 +5086,17 @@ private:
             if (!queried) {
                 queried = infer_type(*expression.arguments.front());
             }
-            if (!queried) return std::nullopt;
+            if (!queried) co_return std::nullopt;
             const auto alignment = storage_alignment(
                 hir_, *queried, target_);
-            return constant(alignment, *hir_.builtin(BuiltinType::Uptr),
+            co_return constant(alignment, *hir_.builtin(BuiltinType::Uptr),
                             expression.location);
         }
         if (expression.left->text == "$::expect") {
             if (expression.arguments.size() != 2) {
                 diagnostics_.error(expression.location,
                                    "$::expect requires two arguments");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto type = infer_type(*expression.arguments.front());
             const auto expected = patch_initial(
@@ -4980,16 +5105,16 @@ private:
                 diagnostics_.error(
                     expression.arguments.front()->location,
                     "$::expect requires a boolean, integer, or enumeration value");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             if (!expected) {
                 diagnostics_.error(
                     expression.arguments[1]->location,
                     "$::expect requires an integer constant expectation");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            auto source = lower_expression(*expression.arguments.front());
-            if (!source) return std::nullopt;
+            auto source = co_await lower_expression_async(*expression.arguments.front());
+            if (!source) co_return std::nullopt;
             source = cast(*source, *type, expression.location);
             const auto result = add_value(ValueKind::Intrinsic, *type,
                                           expression.location);
@@ -5000,38 +5125,31 @@ private:
             const auto converted = mask_to(expected->value, bits);
             intrinsic.integer = converted.low;
             intrinsic.integer_high = converted.high;
-            return result;
+            co_return result;
         }
         if (expression.left->text == "$::assume") {
             if (expression.arguments.size() != 1) {
                 diagnostics_.error(expression.location,
                                    "$::assume requires one argument");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto& condition = *expression.arguments.front();
-            if (!valid_assumption_expression(condition)) {
-                diagnostics_.error(
-                    condition.location,
-                    "$::assume condition must be side-effect-free and is not evaluated");
-                return std::nullopt;
-            }
             const auto type = infer_type(condition);
             if (!type || !scalar_type(hir_, *type)) {
                 diagnostics_.error(condition.location,
                                    "$::assume requires a scalar condition");
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            const auto nonvolatile = [&](const auto& self, const Expr& node) -> bool {
-                const auto inferred = infer_type(node);
-                if (!inferred || hir_.type(*inferred).is_volatile || hir_.type(*inferred).is_atomic)
-                    return false;
-                return (!node.left || self(self, *node.left)) &&
-                       (!node.right || self(self, *node.right)) &&
-                       (!node.third || self(self, *node.third));
-            };
-            if (!nonvolatile(nonvolatile, condition)) {
-                diagnostics_.error(condition.location, "$::assume requires a non-volatile, non-atomic condition");
-                return std::nullopt;
+            if (const auto violation = assumption_violation(condition, [&](const Expr& node) {
+                    auto queried = designator_type(node, nullptr, ObjectAccess::Value);
+                    if (!queried) queried = infer_type(node);
+                    if (!queried) return false;
+                    const auto& source = hir_.type(*queried);
+                    return source.kind != hir::Type::Kind::Array && source.kind != hir::Type::Kind::Function &&
+                        (source.is_volatile || source.is_atomic);
+                })) {
+                diagnostics_.error(violation->expression->location, violation->message());
+                co_return std::nullopt;
             }
             const auto result = add_effectful(
                 ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void),
@@ -5062,7 +5180,7 @@ private:
                     }
                 }
             }
-            return result;
+            co_return result;
         }
         if (expression.left->text == "$::unreachable" ||
             expression.left->text == "$::trap") {
@@ -5072,7 +5190,7 @@ private:
                     expression.location,
                     trap ? "$::trap takes no arguments"
                          : "$::unreachable takes no arguments");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto result = add_effectful(
                 ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void),
@@ -5083,42 +5201,42 @@ private:
             terminate(trap ? TerminatorKind::Trap
                            : TerminatorKind::Unreachable,
                       expression.location, std::nullopt, {});
-            return result;
+            co_return result;
         }
         if (expression.left->text == "$::_nop") {
             if (!expression.arguments.empty()) {
                 diagnostics_.error(expression.location,
                                    "$::_nop takes no arguments");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             if (!target_has_instruction(target_, expression.left->text)) {
                 diagnostics_.error(
                     expression.location,
                     "target instruction '$::_nop' is not available for '" +
                         std::string(target_.architecture) + "'");
-                return std::nullopt;
+                co_return std::nullopt;
             }
             const auto result = add_effectful(
                 ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void),
                 expression.location);
             current_.values[result.value].intrinsic =
                 IntrinsicOperation::MachineNop;
-            return result;
+            co_return result;
         }
         if (expression.left->text == "$::_movabs" ||
             expression.left->text == "$::_add" ||
             expression.left->text == "$::_cmp") {
-            if (expression.arguments.size() != 2) return std::nullopt;
+            if (expression.arguments.size() != 2) co_return std::nullopt;
             const auto name = local_name(*expression.arguments.front());
             const auto* found = name ? find_local(*name) : nullptr;
-            if (!found || found->dynamic_address) return std::nullopt;
+            if (!found || found->dynamic_address) co_return std::nullopt;
             const auto binding = *found;
-            auto right = lower_expression(*expression.arguments[1],
+            auto right = co_await lower_expression_async(*expression.arguments[1],
                                           binding.type);
-            if (!right) return std::nullopt;
+            if (!right) co_return std::nullopt;
             if (expression.left->text == "$::_movabs") {
                 (void)store_slot(binding, *right, expression.location);
-                return *right;
+                co_return *right;
             }
             const auto left = load_slot(binding, expression.location);
             const auto comparison =
@@ -5134,7 +5252,7 @@ private:
             if (!comparison) {
                 (void)store_slot(binding, result, expression.location);
             }
-            return result;
+            co_return result;
         }
         if (expression.left->text.starts_with("$::_")) {
             diagnostics_.error(
@@ -5142,22 +5260,26 @@ private:
                 "target instruction '" + expression.left->text +
                     "' is only available in a naked function or has no "
                     "managed MIR form");
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if (find_local(name_key(*expression.left)) ||
             parameter_values_.contains(name_key(*expression.left)) ||
             resolve_object(*expression.left))
-            return lower_indirect_call(expression);
+            co_return co_await lower_indirect_call_async(expression);
         const auto* callee = resolve_function(*expression.left);
-        if (!callee || !callable(*callee)) return std::nullopt;
-        return lower_resolved_call(
+        if (!callee || !callable(*callee)) co_return std::nullopt;
+        co_return co_await lower_resolved_call_async(
             expression, *hir::call_signature(hir_, callee->id, {}), callee);
     }
 
-    std::optional<ValueId> lower_indirect_call(const Expr& expression) {
-        if (!expression.left) return std::nullopt;
-        const auto target = lower_expression(*expression.left);
-        if (!target) return std::nullopt;
+    std::optional<ValueId> lower_call(const Expr& expression) {
+        return lower_call_async(expression).run();
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_indirect_call_async(const Expr& expression) {
+        if (!expression.left) co_return std::nullopt;
+        const auto target = co_await lower_expression_async(*expression.left);
+        if (!target) co_return std::nullopt;
         const auto& pointer = hir_.type(current_.values[target->value].type);
         if (pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee ||
             hir_.type(*pointer.pointee).kind != hir::Type::Kind::Function ||
@@ -5166,7 +5288,7 @@ private:
                 expression.location,
                 "indirect call requires a typed function pointer");
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
         const auto type = *pointer.pointee;
         const auto signature = *hir_.type(type).function;
@@ -5178,7 +5300,7 @@ private:
                 expression.location,
                 "indirect call has no compatible registered ABI");
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
         if ((signature.result_location &&
              *signature.result_location != "auto") ||
@@ -5190,7 +5312,7 @@ private:
                                "extra clobbers, or callee stack cleanup are "
                                "not implemented yet");
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
         for (const auto& parameter : signature.parameters) {
             if (parameter.physical_location &&
@@ -5199,14 +5321,18 @@ private:
                                    "manual function-pointer endpoints are not "
                                    "implemented yet");
                 failed_ = true;
-                return std::nullopt;
+                co_return std::nullopt;
             }
         }
-        return lower_resolved_call(expression, signature, nullptr, *target,
+        co_return co_await lower_resolved_call_async(expression, signature, nullptr, *target,
                                    type);
     }
 
-    std::optional<ValueId> lower_resolved_call(
+    std::optional<ValueId> lower_indirect_call(const Expr& expression) {
+        return lower_indirect_call_async(expression).run();
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_resolved_call_async(
         const Expr& expression, hir::FunctionSignature signature,
         const hir::Function* callee, std::optional<ValueId> target = {},
         std::optional<hir::TypeId> indirect_signature = {}) {
@@ -5222,13 +5348,14 @@ private:
                     std::to_string(signature.parameters.size()) +
                     (signature.variadic ? " or more arguments" : " arguments"));
             failed_ = true;
-            return std::nullopt;
+            co_return std::nullopt;
         }
         struct PendingCopyOut {
             SlotId cell;
             std::optional<LocalBinding> local;
             std::optional<hir::ObjectId> object;
-            std::optional<ValueId> address;
+            std::optional<DesignatorAddress> designator;
+            std::optional<VectorLane> lane;
             SourceLocation location;
             bool copy_out = true;
         };
@@ -5242,16 +5369,16 @@ private:
                                      parameter.physical_location &&
                                      *parameter.physical_location != "auto";
             if (parameter.mode == ParameterMode::In && !manual_cell) {
-                auto argument = lower_expression(actual, parameter.type);
-                if (!argument) return std::nullopt;
+                auto argument = co_await lower_expression_async(actual, parameter.type);
+                if (!argument) co_return std::nullopt;
                 arguments.push_back(
                     {*argument, std::nullopt, parameter.type, false});
                 continue;
             }
             std::optional<LocalBinding> actual_local;
             const hir::Object* actual_object{};
-            std::optional<ValueId> actual_address;
-            bool address_modifiable{};
+            std::optional<DesignatorAddress> actual_designator;
+            std::optional<VectorLane> actual_lane;
             if (!manual_cell) {
                 if (const auto name = local_name(actual)) {
                     if (const auto* found = find_local(*name)) {
@@ -5259,23 +5386,13 @@ private:
                     } else {
                         actual_object = resolve_object(actual);
                     }
-                } else {
-                    const Expr* designator = &actual;
-                    while (designator->kind == Expr::Kind::Parenthesized &&
-                           designator->left) {
-                        designator = designator->left.get();
-                    }
-                    if (designator->kind == Expr::Kind::Unary &&
-                        designator->text == "*" && designator->left) {
-                        actual_address = lower_expression(*designator->left);
-                        if (!actual_address) return std::nullopt;
-                        const auto& pointer = hir_.type(
-                            current_.values[actual_address->value].type);
-                        address_modifiable =
-                            pointer.kind == hir::Type::Kind::Pointer &&
-                            pointer.pointee &&
-                            !hir_.type(*pointer.pointee).is_const;
-                    }
+                } else if (const auto* lane = vector_lane_expression(actual);
+                           lane && designator_type(actual)) {
+                    actual_lane = co_await lower_vector_lane_async(*lane);
+                    if (!actual_lane) co_return std::nullopt;
+                } else if (designator_type(actual)) {
+                    actual_designator = co_await lower_designator_address_async(actual);
+                    if (!actual_designator) co_return std::nullopt;
                 }
             }
             const SlotId cell{
@@ -5291,7 +5408,7 @@ private:
             if (parameter.mode == ParameterMode::InOut || manual_cell) {
                 std::optional<ValueId> initial;
                 if (manual_cell) {
-                    initial = lower_expression(actual, parameter.type);
+                    initial = co_await lower_expression_async(actual, parameter.type);
                 } else if (actual_local) {
                     initial = assignment_cast(
                         load_slot(*actual_local, actual.location),
@@ -5300,48 +5417,62 @@ private:
                     initial = assignment_cast(
                         load_global(*actual_object, actual.location),
                         parameter.type, actual.location);
-                } else if (actual_address) {
-                    initial = load_pointer(*actual_address, actual.location);
+                } else if (actual_lane) {
+                    initial = load_vector_lane(*actual_lane, actual.location);
+                    if (initial) initial = assignment_cast(*initial, parameter.type, actual.location);
+                } else if (actual_designator) {
+                    if (actual_designator->bit_field) {
+                        const auto loaded = load_bit_field(*actual_designator, actual.location);
+                        if (loaded) initial = loaded->value;
+                    } else {
+                        initial = load_pointer(actual_designator->address, actual.location,
+                                               actual_designator->alignment);
+                    }
                     if (initial) {
                         initial = assignment_cast(*initial, parameter.type,
                                                   actual.location);
                     }
                 } else {
-                    initial = lower_expression(actual, parameter.type);
+                    initial = co_await lower_expression_async(actual, parameter.type);
                 }
-                if (!initial) return std::nullopt;
+                if (!initial) co_return std::nullopt;
                 (void)store_slot(temporary, *initial, actual.location);
-            } else if (!actual_local && !actual_object && !actual_address) {
+            } else if (!actual_local && !actual_object && !actual_designator && !actual_lane) {
                 // A non-lvalue `out` actual is still evaluated once for its
                 // source-visible effects; only its eventual copy-out is
                 // discarded.
-                if (!lower_expression(actual)) return std::nullopt;
+                if (!co_await lower_expression_async(actual)) co_return std::nullopt;
             }
             arguments.push_back({std::nullopt, cell, parameter.type, false});
             PendingCopyOut copyout;
             copyout.cell = cell;
             copyout.location = actual.location;
             copyout.copy_out = !manual_cell;
-            if (actual_local && !hir_.type(actual_local->type).is_const) {
+            const auto modifiable = [&](hir::TypeId type) {
+                const auto& object = hir_.type(type);
+                return !object.is_const && object.kind != hir::Type::Kind::Array &&
+                    object.kind != hir::Type::Kind::Function;
+            };
+            if (actual_local && modifiable(actual_local->type)) {
                 copyout.local = actual_local;
             }
-            if (actual_object && !hir_.type(actual_object->type).is_const) {
+            if (actual_object && modifiable(actual_object->type)) {
                 copyout.object = actual_object->id;
             }
-            if (actual_address && address_modifiable) {
-                copyout.address = actual_address;
-            }
+            if (actual_designator && modifiable(actual_designator->type))
+                copyout.designator = actual_designator;
+            if (actual_lane && modifiable(actual_lane->element_type)) copyout.lane = actual_lane;
             copyouts.push_back(std::move(copyout));
         }
         for (std::size_t index = signature.parameters.size();
              index < expression.arguments.size(); ++index) {
             const auto& actual = *expression.arguments[index];
             auto type = infer_type(actual);
-            if (!type || !call_type(*type, false) || void_type(hir_, *type)) {
+            if (!type || !supported_call_type(hir_, *type, CallTypeUse::Variadic)) {
                 diagnostics_.error(actual.location,
                                    "unsupported variadic argument type");
                 failed_ = true;
-                return std::nullopt;
+                co_return std::nullopt;
             }
             auto promoted = *type;
             if (integer_type(hir_, promoted) &&
@@ -5351,8 +5482,8 @@ private:
                        hir_.type(promoted).builtin == BuiltinType::F32) {
                 promoted = *hir_.builtin(BuiltinType::F64);
             }
-            auto value = lower_expression(actual, promoted);
-            if (!value) return std::nullopt;
+            auto value = co_await lower_expression_async(actual, promoted);
+            if (!value) co_return std::nullopt;
             value = cast(*value, promoted, actual.location);
             arguments.push_back({*value, std::nullopt, promoted, true});
         }
@@ -5378,7 +5509,7 @@ private:
         if (noreturn) {
             terminate(TerminatorKind::Unreachable, expression.location,
                       std::nullopt, {});
-            return result;
+            co_return result;
         }
         for (const auto& copyout : copyouts) {
             const LocalBinding temporary{
@@ -5391,15 +5522,29 @@ private:
                 } else if (copyout.object) {
                     (void)store_global(hir_.object(*copyout.object), value,
                                        copyout.location);
-                } else if (copyout.address) {
-                    (void)store_pointer(*copyout.address, value,
-                                        copyout.location);
+                } else if (copyout.lane) {
+                    if (!store_vector_lane(*copyout.lane, value, copyout.location))
+                        co_return std::nullopt;
+                } else if (copyout.designator) {
+                    const auto& destination = *copyout.designator;
+                    const auto stored = destination.bit_field
+                        ? store_bit_field(destination, value, copyout.location)
+                        : store_pointer(destination.address, value, copyout.location,
+                                        destination.alignment);
+                    if (!stored) co_return std::nullopt;
                 }
             }
             (void)lifetime(ValueKind::LifetimeEnd, copyout.cell,
                            copyout.location);
         }
-        return result;
+        co_return result;
+    }
+
+    std::optional<ValueId> lower_resolved_call(
+        const Expr& expression, hir::FunctionSignature signature,
+        const hir::Function* callee, std::optional<ValueId> target = {},
+        std::optional<hir::TypeId> indirect_signature = {}) {
+        return lower_resolved_call_async(expression, std::move(signature), callee, target, indirect_signature).run();
     }
 
     std::optional<ValueId> lower_patch(const Expr& expression) {
@@ -5458,12 +5603,15 @@ private:
                     failed_ = true;
                     return std::nullopt;
                 }
-                if ((initial_address->kind == data::AddressKind::Function ||
-                     initial_address->kind == data::AddressKind::Label) &&
-                    initial_address->function &&
-                    !hir::stabilize_function_address(
-                        hir_, *initial_address->function,
-                        initial_expression.location, diagnostics_)) {
+                const bool stabilized = initial_address->kind == data::AddressKind::Label &&
+                        initial_address->label
+                    ? hir::stabilize_label_address(hir_, *initial_address->label,
+                                                  initial_expression.location, diagnostics_)
+                    : initial_address->kind != data::AddressKind::Function ||
+                        !initial_address->function ||
+                        hir::stabilize_function_address(hir_, *initial_address->function,
+                                                       initial_expression.location, diagnostics_);
+                if (!stabilized) {
                     failed_ = true;
                     return std::nullopt;
                 }
@@ -5479,7 +5627,7 @@ private:
         const auto source_type = builtin_type(initial_type);
         const auto materializer = find_patch_value_materializer(
             target_, type_name(source_type));
-        if (!materializer) {
+        if (!materializer || !subtarget_.supports_registry_feature(materializer->feature)) {
             diagnostics_.error(
                 expression.arguments.front()->location,
                 "selected target has no contiguous $::patch materializer for " +
@@ -5500,15 +5648,50 @@ private:
         }
         std::optional<PatchSink> sink;
         if (expression.arguments.size() == 2) {
-            if (!materializer->supports_address_sink) {
+            if (materializer->patch_address == PatchAddressRepresentation::Unavailable) {
                 diagnostics_.error(
                     expression.arguments[1]->location,
                     "selected target does not support a $::patch address sink for this materializer");
                 failed_ = true;
                 return std::nullopt;
             }
-            sink = resolve_patch_sink(*expression.arguments[1]);
+            sink = resolve_patch_sink(*expression.arguments[1], materializer->patch_address);
             if (!sink) return std::nullopt;
+        }
+        const auto origin = token_origin(expression.left->location).identity;
+        const auto previous = current_patch_origins_.find(origin);
+        const bool copied = origin.source_unit && previous != current_patch_origins_.end();
+        std::uint32_t identity{};
+        if (copied) {
+            const auto& original = current_.values[previous->second.value];
+            if (original.type != *type || original.patch_sink != sink ||
+                original.patch_initial_address != initial_address ||
+                original.integer != (initial ? initial->value.low : 0) ||
+                original.integer_high != (initial ? initial->value.high : 0)) {
+                diagnostics_.error(expression.location,
+                    "copies of one $::patch expression disagree on type, initial value, or address sink");
+                diagnostics_.note(original.location, "first use of this patch expression is here");
+                failed_ = true;
+                return std::nullopt;
+            }
+            if (!materializer->supports_shared_cell) {
+                diagnostics_.error(expression.location,
+                    "selected target cannot share one $::patch cell across copied uses");
+                failed_ = true;
+                return std::nullopt;
+            }
+            identity = original.patch_id;
+        } else {
+            if (sink) {
+                const auto key = std::pair{sink->object.value, sink->offset};
+                if (patch_sinks_.contains(key) || !current_patch_sinks_.insert(key).second) {
+                    diagnostics_.error(expression.arguments[1]->location,
+                        "$::patch address sink is used by more than one site");
+                    failed_ = true;
+                    return std::nullopt;
+                }
+            }
+            identity = next_patch_id_++;
         }
         const auto result = add_value(ValueKind::PatchValue, *type,
                                       expression.location);
@@ -5519,14 +5702,15 @@ private:
         } else {
             patch.patch_initial_address = *initial_address;
         }
-        patch.patch_id = next_patch_id_++;
+        patch.patch_id = identity;
         if (sink) patch.patch_sink = *sink;
+        if (origin.source_unit && !copied) current_patch_origins_.emplace(origin, result);
         return result;
     }
 
-    std::optional<ValueId> lower_logical(const Expr& expression) {
-        auto left = lower_expression(*expression.left);
-        if (!left || !current_block_) return std::nullopt;
+    ContinuationTask<std::optional<ValueId>> lower_logical_async(const Expr& expression) {
+        auto left = co_await lower_expression_async(*expression.left);
+        if (!left || !current_block_) co_return std::nullopt;
         left = booleanize(*left, expression.left->location);
         const auto short_predecessor = *current_block_;
         const auto short_value = constant(expression.text == "||" ? 1 : 0,
@@ -5540,8 +5724,8 @@ private:
                   {first, second});
 
         enter(right_block);
-        auto right = lower_expression(*expression.right);
-        if (!right) return std::nullopt;
+        auto right = co_await lower_expression_async(*expression.right);
+        if (!right) co_return std::nullopt;
         right = booleanize(*right, expression.right->location);
         const auto right_predecessor = *current_block_;
         terminate(TerminatorKind::Branch, expression.location, std::nullopt,
@@ -5554,17 +5738,25 @@ private:
         current_.values[result.value].incoming = {
             {short_predecessor, short_value}, {right_predecessor, *right},
         };
-        return result;
+        co_return result;
     }
 
-    std::optional<ValueId> lower_conditional(const Expr& expression) {
+    std::optional<ValueId> lower_logical(const Expr& expression) {
+        return lower_logical_async(expression).run();
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_conditional_async(const Expr& expression) {
         const auto then_type = infer_type(*expression.right);
         const auto else_type = infer_type(*expression.third);
-        if (!then_type || !else_type) return std::nullopt;
-        const auto common = common_type(*then_type, *else_type);
-        if (!common) return std::nullopt;
-        auto condition = lower_expression(*expression.left);
-        if (!condition || !current_block_) return std::nullopt;
+        if (!then_type || !else_type) co_return std::nullopt;
+        const auto common = void_type(hir_, *then_type) && void_type(hir_, *else_type)
+            ? then_type : conditional_type(*then_type, *else_type);
+        if (!common) {
+            diagnostics_.error(expression.location, "conditional operands have no compatible common type");
+            co_return std::nullopt;
+        }
+        auto condition = co_await lower_expression_async(*expression.left);
+        if (!condition || !current_block_) co_return std::nullopt;
         condition = booleanize(*condition, expression.left->location);
         const auto then_block = new_block(expression.right->location);
         const auto else_block = new_block(expression.third->location);
@@ -5573,29 +5765,36 @@ private:
                   {then_block, else_block});
 
         enter(then_block);
-        auto then_value = lower_expression(*expression.right, *common);
-        if (!then_value || !current_block_) return std::nullopt;
+        auto then_value = co_await lower_expression_async(*expression.right, *common);
+        if (!then_value || !current_block_) co_return std::nullopt;
         const auto then_predecessor = *current_block_;
         terminate(TerminatorKind::Branch, expression.location, std::nullopt,
                   {merge_block});
 
         enter(else_block);
-        auto else_value = lower_expression(*expression.third, *common);
-        if (!else_value || !current_block_) return std::nullopt;
+        auto else_value = co_await lower_expression_async(*expression.third, *common);
+        if (!else_value || !current_block_) co_return std::nullopt;
         const auto else_predecessor = *current_block_;
         terminate(TerminatorKind::Branch, expression.location, std::nullopt,
                   {merge_block});
 
         enter(merge_block);
+        if (void_type(hir_, *common))
+            co_return add_value(ValueKind::VoidValue, *common, expression.location);
         const auto result = add_value(ValueKind::Phi, *common, expression.location);
         current_.values[result.value].incoming = {
             {then_predecessor, *then_value}, {else_predecessor, *else_value},
         };
-        return result;
+        co_return result;
+    }
+
+    std::optional<ValueId> lower_conditional(const Expr& expression) {
+        return lower_conditional_async(expression).run();
     }
 
     void lower_statement(const Statement& statement) {
         if (failed_) return;
+        forget_types();
         switch (statement.kind) {
         case Statement::Kind::DeclarationList:
             for (const auto& child : statement.statements) {
@@ -5621,6 +5820,10 @@ private:
             return;
         }
         case Statement::Kind::Empty:
+            return;
+        case Statement::Kind::StaticAssert:
+            diagnostics_.error(statement.location, "block assertion reached runtime lowering unprepared");
+            failed_ = true;
             return;
         case Statement::Kind::Case:
         case Statement::Kind::Default: {
@@ -5831,6 +6034,7 @@ private:
                     return;
                 }
                 scopes_.back().bindings.emplace(name_key(declaration), binding);
+                forget_types();
                 return;
             }
             const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
@@ -5844,8 +6048,10 @@ private:
             current_.slots.back().minimum_alignment =
                 declaration.explicit_alignment;
             const LocalBinding binding{slot, type, std::nullopt,
-                                       std::nullopt};
+                                       std::nullopt,
+                                       declaration.storage_register};
             scopes_.back().bindings.emplace(name_key(declaration), binding);
+            forget_types();
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot, declaration.location);
             if (declaration.initializer) {
@@ -5883,13 +6089,7 @@ private:
                 if (attribute.name == "musttail") musttail = &attribute;
             }
             if (musttail) {
-                const Expr* expression = statement.expression.get();
-                while (expression &&
-                       expression->kind == Expr::Kind::Parenthesized &&
-                       expression->left) {
-                    expression = expression->left.get();
-                }
-                if (!expression || expression->kind != Expr::Kind::Call) {
+                if (!returned_call(statement)) {
                     diagnostics_.error(
                         musttail->location,
                         "musttail requires returning a call expression directly");
@@ -5959,7 +6159,8 @@ private:
             }
             const bool void_result = void_type(hir_, current_.result_type);
             if ((!result && !void_result) ||
-                (result && void_result && !musttail)) {
+                (result && void_result &&
+                 !void_type(hir_, current_.values[result->value].type))) {
                 failed_ = true;
                 return;
             }
@@ -5982,7 +6183,7 @@ private:
             return;
         case Statement::Kind::Label: {
             const auto* label =
-                hir_.label(current_.source, statement.label_name);
+                hir_.label(current_.source, statement);
             if (!label) { failed_ = true; return; }
             const auto found = label_blocks_.find(label->id.value);
             if (found == label_blocks_.end()) { failed_ = true; return; }
@@ -6002,7 +6203,7 @@ private:
             if (statement.expression->kind == Expr::Kind::Name &&
                 statement.expression->text.find("::") == std::string::npos) {
                 if (const auto* label = hir_.label(
-                        current_.source, statement.expression->text)) {
+                        current_.source, *statement.expression)) {
                     const auto found = label_blocks_.find(label->id.value);
                     if (found == label_blocks_.end()) {
                         failed_ = true;
@@ -6028,10 +6229,26 @@ private:
                               std::nullopt, {found->second});
                     return;
                 }
+                if (resolved_label_binding(*statement.expression).kind == LabelBinding::Kind::Reference) {
+                    diagnostics_.error(statement.expression->location,
+                        "goto target does not name a visible label in its retained source binding");
+                    failed_ = true;
+                    return;
+                }
             }
             auto destination = lower_expression(*statement.expression);
             if (!destination ||
                 !label_type(hir_, current_.values[destination->value].type)) {
+                diagnostics_.error(statement.expression->location,
+                    "goto target does not name a visible label or label-valued expression");
+                failed_ = true;
+                return;
+            }
+            const auto& destination_value = current_.values[destination->value];
+            if (destination_value.kind == ValueKind::LabelAddress && destination_value.label &&
+                hir_.labels.at(destination_value.label->value).owner != current_.source) {
+                diagnostics_.error(statement.expression->location,
+                    "managed goto target must belong to the current function");
                 failed_ = true;
                 return;
             }
@@ -6303,9 +6520,11 @@ private:
     std::unordered_map<const Statement*, ControlPoint> goto_control_points_;
     std::unordered_map<const Statement*, BlockId> case_blocks_;
     std::vector<Scope> scopes_;
+    std::unordered_map<const Expr*, std::optional<hir::TypeId>> inferred_types_;
     std::vector<LoopContext> loops_;
     std::set<std::pair<std::uint32_t, std::uint64_t>> patch_sinks_;
     std::set<std::pair<std::uint32_t, std::uint64_t>> current_patch_sinks_;
+    std::unordered_map<TokenIdentity, ValueId, TokenIdentityHash> current_patch_origins_;
     std::uint32_t next_patch_id_{};
     bool has_dynamic_arrays_{};
     bool failed_{};
@@ -6315,12 +6534,7 @@ bool comparison(BinaryOperation operation) {
     return operation >= BinaryOperation::Equal;
 }
 
-struct OutBitInterval {
-    std::uint64_t begin{};
-    std::uint64_t end{};
-    friend bool operator==(const OutBitInterval&,
-                           const OutBitInterval&) = default;
-};
+using OutBitInterval = InitializedBitRange;
 using OutBitIntervals = std::vector<OutBitInterval>;
 
 void add_out_interval(OutBitIntervals& intervals, OutBitInterval added) {
@@ -6371,48 +6585,9 @@ bool out_intervals_cover(const OutBitIntervals& assigned,
 
 bool out_type_complete(const hir::Module& module, const TargetInfo& target,
                        hir::TypeId id, std::uint64_t base_bits,
-                       const OutBitIntervals& assigned,
-                       unsigned depth = 0) {
-    if (depth >= 32) return false;
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        const auto& record = module.record(*type.record);
-        bool any_member = false;
-        bool any_complete = false;
-        for (const auto& member : record.members) {
-            if (member.name.empty() && member.bit_width) continue;
-            any_member = true;
-            const auto member_base = base_bits + member.offset * 8;
-            bool complete = false;
-            if (member.bit_width) {
-                complete = out_intervals_cover(assigned,
-                    {{member_base + member.bit_offset,
-                      member_base + member.bit_offset + *member.bit_width}});
-            } else {
-                complete = out_type_complete(module, target, member.type,
-                                             member_base, assigned, depth + 1);
-            }
-            if (!record.is_union && !complete) return false;
-            any_complete |= complete;
-        }
-        return !record.is_union || !any_member || any_complete;
-    }
-    if (type.kind == hir::Type::Kind::Array && type.element) {
-        const auto element_size = storage_size(module, *type.element, target);
-        if (type.lanes > 4096) {
-            return out_intervals_cover(assigned,
-                {{base_bits, base_bits + element_size * type.lanes * 8}});
-        }
-        for (std::uint32_t index = 0; index < type.lanes; ++index) {
-            if (!out_type_complete(module, target, *type.element,
-                    base_bits + element_size * index * 8, assigned,
-                    depth + 1)) return false;
-        }
-        return true;
-    }
-    const auto size = storage_size(module, id, target);
-    return out_intervals_cover(assigned,
-                               {{base_bits, base_bits + size * 8}});
+                       const OutBitIntervals& assigned) {
+    return initialized_type(module, id, base_bits, assigned,
+        [&](hir::TypeId type) { return storage_size(module, type, target); });
 }
 
 // Run this on source MIR, before inlining or slot promotion can erase the
@@ -6823,33 +6998,14 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
     }
     if (!valid) return false;
 
-    const auto count = function.blocks.size();
-    std::vector<std::vector<bool>> dominates(count, std::vector<bool>(count, true));
-    std::fill(dominates[function.entry.value].begin(),
-              dominates[function.entry.value].end(), false);
-    dominates[function.entry.value][function.entry.value] = true;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (std::size_t index = 0; index < count; ++index) {
-            if (index == function.entry.value) continue;
-            std::vector<bool> next(count, true);
-            const auto& predecessors = function.blocks[index].predecessors;
-            if (predecessors.empty()) std::fill(next.begin(), next.end(), false);
-            for (const auto predecessor : predecessors) {
-                for (std::size_t bit = 0; bit < count; ++bit) {
-                    next[bit] = next[bit] && dominates[predecessor.value][bit];
-                }
-            }
-            next[index] = true;
-            if (next != dominates[index]) {
-                dominates[index] = std::move(next);
-                changed = true;
-            }
-        }
-    }
+    // Code in an unreachable block never runs, so its uses are only ordered
+    // within that block.
+    const DominatorTree dominance(function);
+    const auto dominates = [&](BlockId block, BlockId definition) {
+        return !dominance.reachable(block) || dominance.dominates(definition, block);
+    };
 
-    std::unordered_set<std::uint32_t> patch_ids;
+    std::unordered_map<std::uint32_t, const ManagedValue*> patch_ids;
     for (const auto& block : function.blocks) {
         for (std::size_t order = 0; order < block.values.size(); ++order) {
             const auto& value = function.values[block.values[order].value];
@@ -6882,6 +7038,8 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                 }
             }
             if (value.kind == ValueKind::Phi) {
+                if (void_type(hir_module, value.type))
+                    fail(value.location, "phi must carry a value");
                 if (value.incoming.size() != block.predecessors.size()) {
                     fail(value.location, "phi predecessor count mismatch");
                 }
@@ -6902,7 +7060,7 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     }
                     const auto defining = *definition_block[incoming.value.value];
                     if (defining != incoming.predecessor &&
-                        !dominates[incoming.predecessor.value][defining.value]) {
+                        !dominates(incoming.predecessor, defining)) {
                         fail(value.location, "phi incoming value does not dominate its edge");
                     }
                 }
@@ -6919,7 +7077,7 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     if (definition_order[operand.value] >= order) {
                         fail(value.location, "value is used before its definition");
                     }
-                } else if (!dominates[block.id.value][defining.value]) {
+                } else if (!dominates(block.id, defining)) {
                     fail(value.location, "value definition does not dominate its use");
                 }
             }
@@ -7293,7 +7451,8 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     }
                 }
             }
-            if ((value.kind == ValueKind::Parameter ||
+            if ((value.kind == ValueKind::VoidValue ||
+                 value.kind == ValueKind::Parameter ||
                  value.kind == ValueKind::ConstantInteger ||
                  value.kind == ValueKind::ConstantFloating ||
                  value.kind == ValueKind::LabelAddress ||
@@ -7312,11 +7471,20 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                 !floating_type(hir_module, value.type)) {
                 fail(value.location, "floating constant has a non-floating type");
             }
+            if (value.kind == ValueKind::ConstantInteger &&
+                !integer_type(hir_module, value.type) &&
+                !pointer_type(hir_module, value.type) &&
+                !label_type(hir_module, value.type)) {
+                fail(value.location, "integer constant has a non-integer/pointer/label type");
+            }
+            if (value.kind == ValueKind::VoidValue &&
+                !void_type(hir_module, value.type)) {
+                fail(value.location, "void value has a non-void type");
+            }
             if (value.kind == ValueKind::LabelAddress) {
                 if (!value.label ||
                     value.label->value >= hir_module.labels.size() ||
-                    (hir_module.labels[value.label->value].owner !=
-                         function.source &&
+                    (!hir_module.labels[value.label->value].definition &&
                      !hir_module.labels[value.label->value].is_global) ||
                     !label_type(hir_module, value.type)) {
                     fail(value.location, "invalid label address");
@@ -7681,14 +7849,24 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                              "invalid relocatable patch initial");
                     }
                 }
-                if (!patch_ids.insert(value.patch_id).second) {
-                    fail(value.location, "duplicate patch-value site id");
+                const auto [patch, first_use] = patch_ids.emplace(value.patch_id, &value);
+                if (!first_use && (patch->second->type != value.type ||
+                    patch->second->integer != value.integer ||
+                    patch->second->integer_high != value.integer_high ||
+                    patch->second->patch_initial_address != value.patch_initial_address ||
+                    patch->second->patch_sink != value.patch_sink)) {
+                    fail(value.location, "inconsistent uses of a shared patch-value site");
                 }
                 if (value.patch_sink &&
                     value.patch_sink->object.value >=
                         hir_module.objects.size()) {
                     fail(value.location, "patch-value sink is out of range");
                 } else if (value.patch_sink) {
+                    const auto storage_bytes = patch_address_storage_bytes(
+                        value.patch_sink->representation, hir_module.address_bits);
+                    if (!storage_bytes || value.patch_sink->storage_bytes != storage_bytes) {
+                        fail(value.location, "invalid patch-value sink representation");
+                    }
                     const auto& sink = hir_module.object(
                         value.patch_sink->object);
                     if (!sink.definition) {
@@ -7710,7 +7888,7 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
             } else {
                 const auto defining = *definition_block[terminator.value->value];
                 if (defining != block.id &&
-                    !dominates[block.id.value][defining.value]) {
+                    !dominates(block.id, defining)) {
                     fail(terminator.location,
                          "terminator value definition does not dominate its use");
                 }
@@ -7784,7 +7962,8 @@ bool verify(const ManagedModule& module, const hir::Module& hir_module,
             Diagnostics& diagnostics) {
     bool valid = true;
     std::unordered_set<std::uint32_t> seen;
-    std::set<std::pair<std::uint32_t, std::uint64_t>> seen_patch_sinks;
+    std::map<std::pair<std::uint32_t, std::uint64_t>, std::uint32_t> seen_patch_sinks;
+    std::unordered_map<std::uint32_t, hir::FunctionId> patch_owners;
     std::unordered_set<std::uint32_t> seen_patch_sink_objects;
     for (const auto& function : module.functions) {
         if (function.source.value >= hir_module.functions.size()) {
@@ -7811,13 +7990,19 @@ bool verify(const ManagedModule& module, const hir::Module& hir_module,
         }
         valid = verify_function(function, hir_module, diagnostics) && valid;
         for (const auto& value : function.values) {
-            if (value.kind != ValueKind::PatchValue || !value.patch_sink) {
-                continue;
+            if (value.kind != ValueKind::PatchValue) continue;
+            const auto [owner, first_use] = patch_owners.emplace(value.patch_id, function.source);
+            if (!first_use && owner->second != function.source) {
+                diagnostics.error(value.location,
+                    "invalid managed MIR: patch identity has multiple function owners");
+                valid = false;
             }
+            if (!value.patch_sink) continue;
             const auto sink = std::pair{
                 value.patch_sink->object.value, value.patch_sink->offset};
             seen_patch_sink_objects.insert(sink.first);
-            if (!seen_patch_sinks.insert(sink).second) {
+            const auto [site, first_sink] = seen_patch_sinks.emplace(sink, value.patch_id);
+            if (!first_sink && site->second != value.patch_id) {
                 diagnostics.error(
                     value.location,
                     "invalid managed MIR: patch sink is used by multiple sites");
@@ -7880,6 +8065,7 @@ std::size_t inline_cost(const ManagedFunction& function) {
         function.values.begin(), function.values.end(),
         [](const ManagedValue& value) {
             return value.kind != ValueKind::Parameter &&
+                   value.kind != ValueKind::VoidValue &&
                    value.kind != ValueKind::LifetimeStart &&
                    value.kind != ValueKind::LifetimeEnd;
         }));
@@ -7936,6 +8122,31 @@ void replace_effect_inputs(ManagedFunction& function, EffectId from,
     for (auto& block : function.blocks) {
         if (block.terminator.effect == from) block.terminator.effect = to;
     }
+}
+
+// Rewrites every reference to a recorded effect to the end of its chain.
+void forward_effects(ManagedFunction& function,
+                     std::unordered_map<std::uint32_t, EffectId>& forwarded) {
+    const auto resolve = [&](EffectId effect) {
+        auto target = effect;
+        for (auto found = forwarded.find(target.value); found != forwarded.end();
+             found = forwarded.find(target.value))
+            target = found->second;
+        for (auto found = forwarded.find(effect.value); found != forwarded.end();
+             found = forwarded.find(effect.value)) {
+            effect = found->second;
+            found->second = target;
+        }
+        return target;
+    };
+    for (auto& value : function.values)
+        if (value.effect_input) value.effect_input = resolve(*value.effect_input);
+    for (auto& effect : function.effects) {
+        if (effect.input) effect.input = resolve(*effect.input);
+        for (auto& incoming : effect.incoming) incoming.effect = resolve(incoming.effect);
+    }
+    for (auto& block : function.blocks)
+        block.terminator.effect = resolve(block.terminator.effect);
 }
 
 void replace_value_uses(ManagedFunction& function, ValueId from, ValueId to) {
@@ -8282,12 +8493,13 @@ void remove_effectful_values(
     ManagedFunction& function,
     const std::unordered_set<std::uint32_t>& removed) {
     if (removed.empty()) return;
+    std::unordered_map<std::uint32_t, EffectId> forwarded;
     for (const auto id : removed) {
-        auto& value = function.values[id];
-        if (!value.effect_input || !value.effect_output) continue;
-        replace_effect_inputs(function, *value.effect_output,
-                              *value.effect_input);
+        const auto& value = function.values[id];
+        if (value.effect_input && value.effect_output && *value.effect_input != *value.effect_output)
+            forwarded[value.effect_output->value] = *value.effect_input;
     }
+    forward_effects(function, forwarded);
     for (auto& block : function.blocks) {
         std::erase_if(block.values, [&](ValueId value) {
             return removed.contains(value.value);
@@ -8301,38 +8513,6 @@ bool optimizable_slot(const ManagedFunction& function, SlotId slot) {
     const auto& value = function.slots[slot.value];
     return !value.is_volatile && !value.physical_location &&
            !value.address_taken;
-}
-
-bool promotable_scalar_slot(const ManagedFunction& function,
-                            const hir::Module& hir_module, SlotId slot) {
-    if (!optimizable_slot(function, slot) ||
-        function.slots[slot.value].live_on_return) {
-        return false;
-    }
-    const auto& type = hir_module.type(function.slots[slot.value].type);
-    if (type.is_atomic ||
-        (type.kind != hir::Type::Kind::Builtin &&
-         type.kind != hir::Type::Kind::Pointer)) {
-        return false;
-    }
-    for (const auto& value : function.values) {
-        if (value.slot == slot &&
-            value.kind != ValueKind::Load &&
-            value.kind != ValueKind::Store &&
-            value.kind != ValueKind::LifetimeStart &&
-            value.kind != ValueKind::LifetimeEnd) {
-            return false;
-        }
-        if (value.kind == ValueKind::Call &&
-            std::any_of(value.call_arguments.begin(),
-                        value.call_arguments.end(),
-                        [&](const CallArgument& argument) {
-                            return argument.cell == slot;
-                        })) {
-            return false;
-        }
-    }
-    return true;
 }
 
 std::vector<bool> mir_reachable_blocks(const ManagedFunction& function) {
@@ -8353,221 +8533,251 @@ std::vector<bool> mir_reachable_blocks(const ManagedFunction& function) {
     return reachable;
 }
 
-bool slot_definitely_assigned(const ManagedFunction& function, SlotId slot,
-                              const std::vector<bool>& reachable,
-                              std::vector<bool>& assigned_in,
-                              std::vector<bool>& assigned_out) {
-    const auto count = function.blocks.size();
-    // Definite assignment is a forward intersection problem. Initialize
-    // reachable non-entry blocks to the lattice top so initialized loop-carried
+// Scalar slot promotion visits each slot's own loads, stores, and lifetime
+// markers rather than the whole function, and defers phi insertion, use
+// replacement, and value removal to one pass after every slot is decided.
+class ScalarSlotPromotion {
+public:
+    ScalarSlotPromotion(ManagedFunction& function, const hir::Module& hir_module)
+        : function_(function), reachable_(mir_reachable_blocks(function)),
+          occurrences_(function.slots.size()), candidates_(function.slots.size()),
+          inserted_phis_(function.blocks.size()) {
+        for (std::uint32_t index = 0; index < function.slots.size(); ++index) {
+            const SlotId slot{index};
+            const auto& type = hir_module.type(function.slots[index].type);
+            candidates_[index] = optimizable_slot(function, slot) &&
+                !function.slots[index].live_on_return && !type.is_atomic &&
+                (type.kind == hir::Type::Kind::Builtin ||
+                 type.kind == hir::Type::Kind::Pointer);
+        }
+        for (const auto& value : function.values) {
+            if (value.slot && value.kind != ValueKind::Load &&
+                value.kind != ValueKind::Store &&
+                value.kind != ValueKind::LifetimeStart &&
+                value.kind != ValueKind::LifetimeEnd) {
+                candidates_[value.slot->value] = false;
+            }
+            if (value.kind == ValueKind::Call)
+                for (const auto& argument : value.call_arguments)
+                    if (argument.cell) candidates_[argument.cell->value] = false;
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto id : block.values) {
+                const auto& value = function.values[id.value];
+                if (!value.slot || !candidates_[value.slot->value]) continue;
+                auto& groups = occurrences_[value.slot->value];
+                if (groups.empty() || groups.back().first != block.id.value)
+                    groups.push_back({block.id.value, {}});
+                groups.back().second.push_back(id);
+            }
+        }
+    }
+
+    // Returns the promoted slots.
+    std::vector<bool> run() {
+        std::vector<bool> promoted(function_.slots.size());
+        if (!function_.labels.empty()) return promoted;
+        for (std::uint32_t index = 0; index < function_.slots.size(); ++index)
+            promoted[index] = candidates_[index] && promote(SlotId{index});
+        // Each promotion put its phi first in the block, so the last slot's
+        // phi leads.
+        for (auto& block : function_.blocks) {
+            auto& phis = inserted_phis_[block.id.value];
+            if (phis.empty()) continue;
+            block.values.insert(block.values.begin(), phis.rbegin(), phis.rend());
+        }
+        replacements_.apply(function_);
+        remove_effectful_values(function_, removed_);
+        return promoted;
+    }
+
+private:
+    using Group = std::pair<std::uint32_t, std::vector<ValueId>>;
+
+    // Definite assignment is a forward intersection problem. Reachable
+    // non-entry blocks start at the lattice top so initialized loop-carried
     // cells converge to true instead of being rejected on the first round.
-    assigned_in.assign(count, true);
-    assigned_out.assign(count, true);
-    for (std::size_t index = 0; index < count; ++index) {
-        if (!reachable[index]) {
-            assigned_in[index] = false;
-            assigned_out[index] = false;
-        }
-    }
-    assigned_in[function.entry.value] = false;
-
-    const auto transfer = [&](const ManagedBlock& block, bool assigned) {
-        for (const auto id : block.values) {
-            const auto& value = function.values[id.value];
-            if (value.slot != slot) continue;
-            if (value.kind == ValueKind::Store) assigned = true;
-            else if (value.kind == ValueKind::LifetimeStart ||
-                     value.kind == ValueKind::LifetimeEnd) {
-                assigned = false;
+    void definitely_assigned(const std::vector<const Group*>& by_block,
+                             std::vector<bool>& assigned_in,
+                             std::vector<bool>& assigned_out) const {
+        const auto count = function_.blocks.size();
+        assigned_in.assign(count, true);
+        assigned_out.assign(count, true);
+        for (std::size_t index = 0; index < count; ++index) {
+            if (!reachable_[index]) {
+                assigned_in[index] = false;
+                assigned_out[index] = false;
             }
         }
-        return assigned;
-    };
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (const auto& block : function.blocks) {
-            if (!reachable[block.id.value]) continue;
-            bool next_in = false;
-            if (block.id != function.entry &&
-                !block.predecessors.empty()) {
-                next_in = std::all_of(
-                    block.predecessors.begin(), block.predecessors.end(),
-                    [&](BlockId predecessor) {
-                        return predecessor.value < reachable.size() &&
-                               reachable[predecessor.value] &&
-                               assigned_out[predecessor.value];
-                    });
+        assigned_in[function_.entry.value] = false;
+        const auto transfer = [&](std::uint32_t block, bool assigned) {
+            if (!by_block[block]) return assigned;
+            for (const auto id : by_block[block]->second) {
+                const auto& value = function_.values[id.value];
+                if (value.kind == ValueKind::Store) assigned = true;
+                else if (value.kind == ValueKind::LifetimeStart ||
+                         value.kind == ValueKind::LifetimeEnd) {
+                    assigned = false;
+                }
             }
-            const auto next_out = transfer(block, next_in);
-            if (assigned_in[block.id.value] != next_in ||
-                assigned_out[block.id.value] != next_out) {
-                assigned_in[block.id.value] = next_in;
-                assigned_out[block.id.value] = next_out;
-                changed = true;
-            }
-        }
-    }
-
-    for (const auto& block : function.blocks) {
-        if (!reachable[block.id.value]) {
-            if (std::any_of(block.values.begin(), block.values.end(),
-                            [&](ValueId id) {
-                                return function.values[id.value].slot == slot;
-                            })) {
-                return false;
-            }
-            continue;
-        }
-        bool assigned = assigned_in[block.id.value];
-        for (const auto id : block.values) {
-            const auto& value = function.values[id.value];
-            if (value.slot != slot) continue;
-            if (value.kind == ValueKind::Load && !assigned) return false;
-            if (value.kind == ValueKind::Store) {
-                if (value.operands.size() != 1) return false;
-                assigned = true;
-            } else if (value.kind == ValueKind::LifetimeStart ||
-                       value.kind == ValueKind::LifetimeEnd) {
-                assigned = false;
+            return assigned;
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& block : function_.blocks) {
+                if (!reachable_[block.id.value]) continue;
+                bool next_in = false;
+                if (block.id != function_.entry && !block.predecessors.empty()) {
+                    next_in = std::all_of(
+                        block.predecessors.begin(), block.predecessors.end(),
+                        [&](BlockId predecessor) {
+                            return predecessor.value < reachable_.size() &&
+                                   reachable_[predecessor.value] &&
+                                   assigned_out[predecessor.value];
+                        });
+                }
+                const auto next_out = transfer(block.id.value, next_in);
+                if (assigned_in[block.id.value] != next_in ||
+                    assigned_out[block.id.value] != next_out) {
+                    assigned_in[block.id.value] = next_in;
+                    assigned_out[block.id.value] = next_out;
+                    changed = true;
+                }
             }
         }
     }
-    return true;
-}
 
-bool promote_scalar_slot(ManagedFunction& function,
-                         const hir::Module& hir_module, SlotId slot) {
-    if (!promotable_scalar_slot(function, hir_module, slot) ||
-        !function.labels.empty()) {
-        return false;
-    }
-    const auto reachable = mir_reachable_blocks(function);
-    std::vector<bool> assigned_in;
-    std::vector<bool> assigned_out;
-    if (!slot_definitely_assigned(function, slot, reachable,
-                                  assigned_in, assigned_out)) {
-        return false;
-    }
+    bool promote(SlotId slot) {
+        const auto& groups = occurrences_[slot.value];
+        const auto count = function_.blocks.size();
+        std::vector<const Group*> by_block(count);
+        for (const auto& group : groups) by_block[group.first] = &group;
 
-    struct ReachingValue {
-        bool resolved{};
-        std::optional<ValueId> value;
-    };
-    std::vector<ReachingValue> entry(function.blocks.size());
-    std::vector<ReachingValue> outgoing(function.blocks.size());
-    std::vector<std::optional<ValueId>> phis(function.blocks.size());
-    std::vector<std::pair<BlockId, ValueId>> inserted_phis;
-
-    for (auto& block : function.blocks) {
-        if (!reachable[block.id.value]) continue;
-        if (!assigned_in[block.id.value]) {
-            entry[block.id.value].resolved = true;
-            continue;
-        }
-        if (block.predecessors.size() <= 1) continue;
-        ManagedValue phi;
-        phi.id = {static_cast<std::uint32_t>(function.values.size())};
-        phi.location = block.location;
-        phi.type = function.slots[slot.value].type;
-        phi.kind = ValueKind::Phi;
-        function.values.push_back(std::move(phi));
-        block.values.insert(block.values.begin(),
-                            function.values.back().id);
-        phis[block.id.value] = function.values.back().id;
-        entry[block.id.value] = {true, function.values.back().id};
-        inserted_phis.emplace_back(block.id, function.values.back().id);
-    }
-
-    const auto simulate = [&](const ManagedBlock& block,
-                              std::optional<ValueId> current) {
-        for (const auto id : block.values) {
-            const auto& value = function.values[id.value];
-            if (value.slot != slot) continue;
-            if (value.kind == ValueKind::Store) {
-                current = value.operands.front();
-            } else if (value.kind == ValueKind::LifetimeStart ||
-                       value.kind == ValueKind::LifetimeEnd) {
-                current.reset();
+        std::vector<bool> assigned_in;
+        std::vector<bool> assigned_out;
+        definitely_assigned(by_block, assigned_in, assigned_out);
+        for (const auto& [block, values] : groups) {
+            if (!reachable_[block]) return false;
+            bool assigned = assigned_in[block];
+            for (const auto id : values) {
+                const auto& value = function_.values[id.value];
+                if (value.kind == ValueKind::Load && !assigned) return false;
+                if (value.kind == ValueKind::Store) {
+                    if (value.operands.size() != 1) return false;
+                    assigned = true;
+                } else if (value.kind == ValueKind::LifetimeStart ||
+                           value.kind == ValueKind::LifetimeEnd) {
+                    assigned = false;
+                }
             }
         }
-        return current;
-    };
 
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (const auto& block : function.blocks) {
-            if (!reachable[block.id.value] ||
-                outgoing[block.id.value].resolved) {
+        struct ReachingValue {
+            bool resolved{};
+            std::optional<ValueId> value;
+        };
+        std::vector<ReachingValue> entry(count);
+        std::vector<ReachingValue> outgoing(count);
+        std::vector<std::optional<ValueId>> phis(count);
+        std::vector<BlockId> phi_blocks;
+        const auto first_phi = function_.values.size();
+        for (const auto& block : function_.blocks) {
+            if (!reachable_[block.id.value]) continue;
+            if (!assigned_in[block.id.value]) {
+                entry[block.id.value].resolved = true;
                 continue;
             }
-            auto& block_entry = entry[block.id.value];
-            if (!block_entry.resolved) {
-                if (block.predecessors.size() != 1) continue;
-                const auto predecessor = block.predecessors.front();
-                if (!outgoing[predecessor.value].resolved) continue;
-                block_entry = outgoing[predecessor.value];
-            }
-            outgoing[block.id.value] = {
-                true, simulate(block, block_entry.value)};
-            progress = true;
+            if (block.predecessors.size() <= 1) continue;
+            ManagedValue phi;
+            phi.id = {static_cast<std::uint32_t>(function_.values.size())};
+            phi.location = block.location;
+            phi.type = function_.slots[slot.value].type;
+            phi.kind = ValueKind::Phi;
+            function_.values.push_back(std::move(phi));
+            phis[block.id.value] = function_.values.back().id;
+            entry[block.id.value] = {true, function_.values.back().id};
+            phi_blocks.push_back(block.id);
         }
-    }
-    const bool unresolved = std::any_of(
-        function.blocks.begin(), function.blocks.end(),
-        [&](const ManagedBlock& block) {
-            return reachable[block.id.value] &&
-                   !outgoing[block.id.value].resolved;
-        });
-    if (unresolved) {
-        for (auto item = inserted_phis.rbegin();
-             item != inserted_phis.rend(); ++item) {
-            auto& values = function.blocks[item->first.value].values;
-            std::erase(values, item->second);
-            function.values.pop_back();
-        }
-        return false;
-    }
+        const auto discard_phis = [&] { function_.values.resize(first_phi); };
 
-    for (const auto& block : function.blocks) {
-        if (!phis[block.id.value]) continue;
-        auto& phi = function.values[phis[block.id.value]->value];
-        for (const auto predecessor : block.predecessors) {
-            if (!outgoing[predecessor.value].value) {
-                // Definite assignment guaranteed an incoming value here.
+        const auto simulate = [&](std::uint32_t block, std::optional<ValueId> current) {
+            if (!by_block[block]) return current;
+            for (const auto id : by_block[block]->second) {
+                const auto& value = function_.values[id.value];
+                if (value.kind == ValueKind::Store) {
+                    current = value.operands.front();
+                } else if (value.kind == ValueKind::LifetimeStart ||
+                           value.kind == ValueKind::LifetimeEnd) {
+                    current.reset();
+                }
+            }
+            return current;
+        };
+        for (bool progress = true; progress;) {
+            progress = false;
+            for (const auto& block : function_.blocks) {
+                if (!reachable_[block.id.value] || outgoing[block.id.value].resolved) {
+                    continue;
+                }
+                auto& block_entry = entry[block.id.value];
+                if (!block_entry.resolved) {
+                    if (block.predecessors.size() != 1) continue;
+                    const auto predecessor = block.predecessors.front();
+                    if (!outgoing[predecessor.value].resolved) continue;
+                    block_entry = outgoing[predecessor.value];
+                }
+                outgoing[block.id.value] = {true, simulate(block.id.value, block_entry.value)};
+                progress = true;
+            }
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (reachable_[index] && !outgoing[index].resolved) {
+                discard_phis();
                 return false;
             }
-            phi.incoming.push_back(
-                {predecessor, *outgoing[predecessor.value].value});
         }
-    }
-
-    std::unordered_set<std::uint32_t> removed;
-    for (auto& block : function.blocks) {
-        if (!reachable[block.id.value]) continue;
-        auto current = entry[block.id.value].value;
-        for (const auto id : block.values) {
-            auto& value = function.values[id.value];
-            if (value.slot != slot) continue;
-            if (value.kind == ValueKind::Load) {
-                if (!current) return false;
-                replace_value_uses(function, id, *current);
-                removed.insert(id.value);
-            } else if (value.kind == ValueKind::Store) {
-                current = value.operands.front();
-                removed.insert(id.value);
-            } else if (value.kind == ValueKind::LifetimeStart ||
-                       value.kind == ValueKind::LifetimeEnd) {
-                current.reset();
-                removed.insert(id.value);
+        for (const auto block : phi_blocks) {
+            auto& phi = function_.values[phis[block.value]->value];
+            for (const auto predecessor : function_.blocks[block.value].predecessors) {
+                if (!outgoing[predecessor.value].value) {
+                    // Definite assignment guaranteed an incoming value here.
+                    discard_phis();
+                    return false;
+                }
+                phi.incoming.push_back({predecessor, *outgoing[predecessor.value].value});
             }
         }
+        for (const auto block : phi_blocks)
+            inserted_phis_[block.value].push_back(*phis[block.value]);
+
+        std::vector<std::uint32_t> removed;
+        for (const auto& [block, values] : groups) {
+            auto current = entry[block].value;
+            for (const auto id : values) {
+                const auto& value = function_.values[id.value];
+                if (value.kind == ValueKind::Load) {
+                    if (!current) return false;
+                    replacements_.add(id, *current);
+                } else if (value.kind == ValueKind::Store) {
+                    current = replacements_.resolve(value.operands.front());
+                } else {
+                    current.reset();
+                }
+                removed.push_back(id.value);
+            }
+        }
+        removed_.insert(removed.begin(), removed.end());
+        return true;
     }
-    remove_effectful_values(function, removed);
-    return true;
-}
+
+    ManagedFunction& function_;
+    std::vector<bool> reachable_;
+    std::vector<std::vector<Group>> occurrences_;
+    std::vector<bool> candidates_;
+    std::vector<std::vector<ValueId>> inserted_phis_;
+    ValueReplacements replacements_;
+    std::unordered_set<std::uint32_t> removed_;
+};
 
 void compact_promoted_slots(ManagedFunction& function,
                             const std::vector<bool>& promoted) {
@@ -8606,12 +8816,7 @@ void compact_promoted_slots(ManagedFunction& function,
 
 void promote_scalar_slots(ManagedFunction& function,
                           const hir::Module& hir_module) {
-    const auto count = function.slots.size();
-    std::vector<bool> promoted(count);
-    for (std::uint32_t index = 0; index < count; ++index) {
-        promoted[index] = promote_scalar_slot(
-            function, hir_module, SlotId{index});
-    }
+    const auto promoted = ScalarSlotPromotion(function, hir_module).run();
     if (std::any_of(promoted.begin(), promoted.end(),
                     [](bool value) { return value; })) {
         compact_promoted_slots(function, promoted);
@@ -9098,18 +9303,21 @@ std::optional<std::string> redundant_expression_key(
 
 void eliminate_fully_redundant_expressions(ManagedFunction& function) {
     std::unordered_set<std::uint32_t> removed;
+    ValueReplacements replacements;
     for (const auto& block : function.blocks) {
         std::unordered_map<std::string, ValueId> available;
         for (const auto id : block.values) {
+            replacements.rewrite(function.values[id.value]);
             const auto key = redundant_expression_key(
                 function.values[id.value]);
             if (!key) continue;
             const auto [found, inserted] = available.emplace(*key, id);
             if (inserted) continue;
-            replace_value_uses(function, id, found->second);
+            replacements.add(id, found->second);
             removed.insert(id.value);
         }
     }
+    replacements.apply(function);
     remove_replaced_values(function, removed);
 }
 
@@ -9129,7 +9337,9 @@ void make_integer_constant(ManagedValue& value, UInt128 integer) {
 void simplify_integer_operations(ManagedFunction& function,
                                  const hir::Module& hir_module) {
     std::unordered_set<std::uint32_t> removed;
+    ValueReplacements replacements;
     for (auto& value : function.values) {
+        replacements.rewrite(value);
         if (value.kind != ValueKind::Binary || value.operands.size() != 2) {
             continue;
         }
@@ -9217,9 +9427,10 @@ void simplify_integer_operations(ManagedFunction& function,
         default: break;
         }
         if (!replacement || *replacement == value.id) continue;
-        replace_value_uses(function, value.id, *replacement);
+        replacements.add(value.id, *replacement);
         removed.insert(value.id.value);
     }
+    replacements.apply(function);
     remove_replaced_values(function, removed);
 }
 
@@ -9495,7 +9706,9 @@ void simplify_floating_math(ManagedFunction& function,
                             const hir::Module& hir_module,
                             const CompilerOptions& options) {
     std::unordered_set<std::uint32_t> removed;
+    ValueReplacements replacements;
     for (auto& value : function.values) {
+        replacements.rewrite(value);
         if (value.kind != ValueKind::Binary || value.operands.size() != 2) {
             continue;
         }
@@ -9566,18 +9779,22 @@ void simplify_floating_math(ManagedFunction& function,
         default: break;
         }
         if (!replacement || *replacement == value.id) continue;
-        replace_value_uses(function, value.id, *replacement);
+        replacements.add(value.id, *replacement);
         removed.insert(value.id.value);
     }
+    replacements.apply(function);
     remove_replaced_values(function, removed);
 }
 
 std::vector<bool> reachable_blocks(
     const ManagedFunction& function,
     std::optional<BlockId> edge_owner = std::nullopt,
-    std::optional<BlockId> ignored_successor = std::nullopt) {
+    std::optional<BlockId> ignored_successor = std::nullopt,
+    bool preserve_labels = false) {
     std::vector<bool> reachable(function.blocks.size());
     std::vector<BlockId> pending{function.entry};
+    if (preserve_labels)
+        for (const auto& label : function.labels) pending.push_back(label.block);
     while (!pending.empty()) {
         const auto id = pending.back();
         pending.pop_back();
@@ -9593,20 +9810,14 @@ std::vector<bool> reachable_blocks(
 }
 
 void eliminate_unreachable_blocks(ManagedFunction& function) {
-    const auto reachable = reachable_blocks(function);
+    // Labels are observable addresses even outside ordinary entry flow.
+    // Keep their forward closure, but still remove detached non-label blocks
+    // after edge rewrites; skipping compaction would leave stale CFG edges.
+    const auto reachable = reachable_blocks(function, {}, {}, true);
     if (std::all_of(reachable.begin(), reachable.end(),
                     [](bool value) { return value; })) {
         return;
     }
-    // A label is an observable machine-code address. Constant CFG cleanup may
-    // not discard it even when ordinary flow cannot currently reach it.
-    if (std::any_of(function.labels.begin(), function.labels.end(),
-                    [&](const ManagedLabel& label) {
-                        return !reachable[label.block.value];
-                    })) {
-        return;
-    }
-
     for (auto& block : function.blocks) {
         if (!reachable[block.id.value]) continue;
         std::erase_if(block.predecessors, [&](BlockId predecessor) {
@@ -10107,10 +10318,14 @@ bool unpredictable_memory_condition(const ManagedFunction& function,
     return value_depends_on_ordinary_memory(function, *data, visited);
 }
 
+// Converts the diamond owned by OWNER_INDEX. Disconnected arms stay in place
+// as unreachable blocks, and effects to be replaced are recorded in FORWARDED
+// (from -> to); if_convert_diamonds applies both once at the end.
 bool if_convert_one_diamond(ManagedFunction& function,
                             const hir::Module& hir_module,
                             std::size_t owner_index,
-                            const CompilerOptions& options) {
+                            const CompilerOptions& options,
+                            std::unordered_map<std::uint32_t, EffectId>& forwarded) {
     auto& owner = function.blocks[owner_index];
     if (owner.terminator.kind != TerminatorKind::ConditionalBranch ||
         !owner.terminator.value ||
@@ -10289,7 +10504,6 @@ bool if_convert_one_diamond(ManagedFunction& function,
         owner.terminator.successors.clear();
         disconnect(truth);
         disconnect(falsity);
-        eliminate_unreachable_blocks(function);
         return true;
     }
 
@@ -10403,8 +10617,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
     if (!merge_has_label && !merge_has_phi &&
         merge.predecessors.size() == 1 &&
         merge.predecessors.front() == owner.id) {
-        const auto owner_effect = owner.terminator.effect;
-        replace_effect_inputs(function, merge.effect, owner_effect);
+        forwarded[merge.effect.value] = owner.terminator.effect;
         owner.values.insert(owner.values.end(), merge.values.begin(),
                             merge.values.end());
         merge.values.clear();
@@ -10432,26 +10645,30 @@ bool if_convert_one_diamond(ManagedFunction& function,
         }
         disconnect(merge);
     }
-    eliminate_unreachable_blocks(function);
     return true;
 }
 
 bool if_convert_diamonds(ManagedFunction& function,
                          const hir::Module& hir_module,
                          const CompilerOptions& options) {
+    // Converting a diamond can expose another one at the same owner (its
+    // absorbed merge ends in a branch) or at an earlier block (an enclosing
+    // diamond whose arm was this one), so sweep until nothing changes.
+    std::unordered_map<std::uint32_t, EffectId> forwarded;
     bool changed = false;
-    for (;;) {
-        bool converted = false;
+    for (bool converted = true; converted;) {
+        converted = false;
         for (std::size_t index = 0; index < function.blocks.size(); ++index) {
-            if (if_convert_one_diamond(
-                    function, hir_module, index, options)) {
-                converted = true;
-                changed = true;
-                break;
-            }
+            while (if_convert_one_diamond(function, hir_module, index, options,
+                                          forwarded))
+                converted = changed = true;
         }
-        if (!converted) return changed;
     }
+    if (changed) {
+        forward_effects(function, forwarded);
+        eliminate_unreachable_blocks(function);
+    }
+    return changed;
 }
 
 bool safely_loop_invariant(const ManagedValue& value,

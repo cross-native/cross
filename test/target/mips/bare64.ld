@@ -11,5 +11,9 @@ SECTIONS
     /DISCARD/ : {
         *(.MIPS.abiflags) *(.MIPS.options) *(.reginfo)
         *(.text) *(.data) *(.bss) *(.comment)
+        /* The wrapper contains only a byte-for-byte payload, with no GOT
+           references. LLD's synthetic GOT would overlap the payload's
+           unmaterialized BSS immediately after its last file-backed byte. */
+        *(.got .got.*)
     }
 }

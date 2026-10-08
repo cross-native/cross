@@ -144,6 +144,7 @@ global i32 generic_pointer_entry() {
     const u32 *absolute_math = pointer_identity::<4 + (const u32 *)0x40000ff0uptr>();
     const u32 *absolute_back = pointer_identity::<(const u32 *)0x40001004uptr - 1>();
     const u32 *cancel = pointer_identity::<&*(numbers + 2)>();
+    const u32 *absolute_cancel = pointer_identity::<&*((const u32*)0x40001000uptr)>();
     const u32 *arrow = pointer_identity::<&(&object)->values[1]>();
     const u32 *call = pointer_identity::<advance_constant(numbers, 2u32)>();
     const u32 *recursive = pointer_identity::<recursive_address(2u32)>();
@@ -162,6 +163,7 @@ global i32 generic_pointer_entry() {
         recursive != first || selected != first || forced != first ||
         member_call != member || index_call != first) return 0;
     if (absolute_math != absolute || absolute_back != absolute || absolute_call != absolute) return 0;
+    if (absolute_cancel != absolute) return 0;
     if (instance_counter::<numbers + (1 + 1)>() != 1u32 ||
         instance_counter::<&pointer_values::numbers[2]>() != 2u32 ||
         instance_counter::<advance_constant(numbers, 2u32)>() != 3u32 ||

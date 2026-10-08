@@ -226,6 +226,12 @@ bool common_option(int argc, char** argv, int& index, CompilerOptions& options,
         options.system_include_paths.emplace_back(value);
         return true;
     }
+    if (argument == "-include" || argument == "-imacros") {
+        if (!take_value(argc, argv, index, argument, value, diagnostics)) return true;
+        (argument == "-include" ? options.forced_includes : options.macro_includes)
+            .emplace_back(value);
+        return true;
+    }
     if (argument == "-D" || argument.starts_with("-D")) {
         if (!take_value(argc, argv, index, "-D", value, diagnostics)) return true;
         options.macro_definitions.push_back(value);
@@ -618,6 +624,11 @@ bool resolve_registered_options(
                 diagnostics.command_error(
                     "option '-fno-builtin' has no Cross meaning because Cross "
                     "has no implicit library builtins");
+            } else if (assignment.name == "f.freestanding") {
+                diagnostics.command_error(
+                    "option '" + assignment.source +
+                    "' has no Cross meaning because Cross code is always "
+                    "freestanding");
             } else {
                 const OptionDefinition* suggestion{};
                 std::size_t best = std::numeric_limits<std::size_t>::max();
@@ -976,6 +987,14 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         if (argument == "--print-instructions") { options.print_instructions = true; continue; }
         if (argument == "--print-features") { options.print_features = true; continue; }
         if (common_option(argc, argv, index, options, diagnostics)) continue;
+        if (argument == "-e" || argument.starts_with("-L") ||
+            argument.starts_with("-l") || argument == "-nostdlib" ||
+            argument == "-nodefaultlibs" || argument == "-nostartfiles") {
+            diagnostics.command_error("'" + std::string(argument) +
+                                      "' is a linker option; cc does not link");
+            if (argument == "-e") ++index;
+            continue;
+        }
         if (!argument.empty() && argument.front() == '-') {
             diagnostics.command_error("unknown argument '" +
                                       std::string(argument) + "'");
@@ -1009,8 +1028,11 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
     return diagnostics.errors() == 0;
 }
 
+std::string_view default_target() { return CROSS_DEFAULT_TARGET; }
+
 void print_version() {
     std::cout << "Cross toolchain 0.1.0 (language 0.8)\n"
+                 "Default target: " << default_target() << "\n"
                  "Copyright (C) 2026 Cross contributors\n"
                  "License GPLv3+: GNU GPL version 3 or later\n";
 }
@@ -1025,6 +1047,8 @@ void print_cc_help() {
   -emit-gimple=rtl      serialize optimized GIMPLE SSA for GCC RTL passes
   -o FILE               write output to FILE
   -I DIR/-isystem DIR   add ordered source search directories
+  -include FILE         process FILE before each input
+  -imacros FILE         keep only the macros FILE defines
   -M/-MM                emit Make dependencies instead of source
   -MD/-MMD              emit source and a Make dependency file
   -MF FILE              set dependency output path
@@ -1068,6 +1092,8 @@ void print_cpp_help() {
   -Uname                undefine a macro
   -Ipath                add an include directory
   -isystem DIR          add a later-searched include directory
+  -include FILE         process FILE before each input
+  -imacros FILE         keep only the macros FILE defines
   -M/-MM                emit Make dependencies instead of source
   -MD/-MMD              emit source and a Make dependency file
   -MF FILE              set dependency output path

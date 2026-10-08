@@ -30,5 +30,21 @@ global i32 patch_relocatable_entry() {
     uptr *function_field = (uptr *)patch_function_sink;
     if (*function_field != (uptr)&patch_helper) return 6;
     if (patch_box::read_local() != (uptr)&patch_box::local_target[1]) return 7;
+
+    // Unsigned offset magnitudes are mathematical displacement operands, not
+    // signed-host casts. Both final signed addends fit the relocation record.
+    uptr minimum = $::patch((uptr)&patch_target - 0x8000000000000000u64);
+    if (minimum - (uptr)&patch_target != 0x8000000000000000uptr) return 8;
+    uptr maximum = $::patch((uptr)&patch_target - 0x8000000000000000u64 + 0xffffffffffffffffu64);
+    if (maximum - (uptr)&patch_target != 0x7fffffffffffffffuptr) return 9;
+    // Cancellation and address formation never access the numeric address.
+    if ($::patch((uptr)&*((u32*)0x1000uptr)) != 0x1000uptr) return 10;
+    if ($::patch((uptr)((u32*)0x1000uptr + 2u32)) != 0x1008uptr) return 11;
+    if ($::patch((uptr)&((u32*)0x1000uptr)[2u32]) != 0x1008uptr) return 12;
+    struct NumericAddress { u8 pad; u32 values[3]; };
+    struct NumericAddress layout;
+    if ($::patch((uptr)((struct NumericAddress*)0x1000uptr)->values) !=
+        0x1000uptr + (uptr)&layout.values[0] - (uptr)&layout) return 13;
+    if ($::patch((uptr)((u32 (*)[3])0x1000uptr)[1u32]) != 0x100cuptr) return 14;
     return 0;
 }

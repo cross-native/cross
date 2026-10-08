@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#ifndef TEST_REMAINDER
 global void x87_hole(in f80 value "st1") {}
 
 global void x87_duplicate(in f80 first "st0", in f80 second "st0") {}
@@ -20,6 +21,8 @@ global void x87_hard_local() {
     register f80 value "st0" = 1.0f80;
 }
 
+#else
 global f80 x87_remainder(in f80 left, in f80 right) {
     return left % right;
 }
+#endif

@@ -11,6 +11,6 @@ static label label_identity_error() {
     return L;
 }
 
-global label generic_local_label_error() {
-    return label_identity_error::<local_label_owner::local_target>();
+global label generic_missing_label_error() {
+    return label_identity_error::<local_label_owner::missing_target>();
 }

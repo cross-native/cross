@@ -470,11 +470,16 @@ private:
             events.push_back(
                 {relocation.offset, relocation.size, &relocation, nullptr});
         }
-        const auto address_bytes =
-            (module_.data().address_bits + 7U) / 8U;
         for (const auto* patch : patches) {
+            const auto storage_bytes = patch_address_storage_bytes(
+                patch->sink.representation, module_.data().address_bits);
+            if (!storage_bytes || patch->sink.storage_bytes != storage_bytes) {
+                diagnostics_.error(object.location,
+                    "target has no $::patch sink relocation for this address representation");
+                return;
+            }
             events.push_back(
-                {patch->sink.offset, address_bytes, nullptr, patch});
+                {patch->sink.offset, patch->sink.storage_bytes, nullptr, patch});
         }
         std::ranges::sort(events, {}, &Event::offset);
         std::uint64_t offset{};

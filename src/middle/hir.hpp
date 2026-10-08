@@ -5,6 +5,7 @@
 #include "common/diagnostic.hpp"
 #include "common/options.hpp"
 #include "frontend/ast.hpp"
+#include "frontend/record_constraints.hpp"
 #include "target/target.hpp"
 
 #include <cstdint>
@@ -46,6 +47,7 @@ struct Parameter {
     TypeId type;
     ParameterMode mode{ParameterMode::In};
     std::optional<std::string> physical_location;
+    ValueBinding binding{};
 };
 
 struct FunctionSignature {
@@ -70,8 +72,9 @@ struct FunctionSignature {
         for (std::size_t index = 0; index < a.parameters.size(); ++index) {
             if (a.parameters[index].type != b.parameters[index].type ||
                 a.parameters[index].mode != b.parameters[index].mode ||
-                a.parameters[index].physical_location !=
-                    b.parameters[index].physical_location)
+                // An omitted endpoint and explicit auto are one interface.
+                a.parameters[index].physical_location.value_or("auto") !=
+                    b.parameters[index].physical_location.value_or("auto"))
                 return false;
         }
         return true;
@@ -115,6 +118,8 @@ struct RecordMember {
     const Expr* pending_bit_width{};
     TypePtr pending_source_type{};
     bool packed{};
+    std::shared_ptr<const FreshIdentifier> fresh;
+    [[nodiscard]] MemberName member_name() const { return {name, fresh}; }
 };
 
 struct Record {
@@ -125,12 +130,16 @@ struct Record {
     bool is_union{};
     bool complete{};
     bool packed{};
+    bool alignment_complete{};
     unsigned explicit_alignment{1};
     std::uint64_t size{};
     unsigned alignment{1};
     std::vector<RecordMember> members;
     std::vector<const RecordDecl*> declarations;
     const RecordDecl* definition{};
+    // Required-layout contexts may outlive the evaluator's active view scope.
+    // The ordinary Program table is borrowed; private views carry ownership.
+    std::shared_ptr<const RecordDecl> retained_definition;
 };
 
 struct VariadicBinding {
@@ -138,6 +147,7 @@ struct VariadicBinding {
     std::string name;
     TypeId type;
     AbiStateId state;
+    ValueBinding binding{};
 };
 
 enum class BodyOwnership { None, ManagedAst, ManagedMir, RawMir };
@@ -189,6 +199,8 @@ struct Label {
     std::vector<const GlobalLabelDecl*> declarations;
     const Statement* definition{};
     bool is_global{};
+    NameKey lookup_key;
+    LabelBinding binding;
 };
 
 struct Object {
@@ -225,13 +237,15 @@ public:
     [[nodiscard]] TypeId vector_of(TypeId element, std::uint32_t lanes,
                                    bool scalable = false);
     [[nodiscard]] TypeId array_of(TypeId element, std::uint32_t elements);
+    [[nodiscard]] std::optional<TypeId> common_pointer_type(TypeId left, TypeId right,
+                                                           const AddressSpaceJoin& spaces = {});
     [[nodiscard]] const Record& record(RecordId id) const {
         return records.at(id.value);
     }
     [[nodiscard]] Record& record(RecordId id) { return records.at(id.value); }
     [[nodiscard]] const Record* record(const NominalTypeKey& key) const;
     [[nodiscard]] const RecordMember* member(RecordId record,
-                                             std::string_view name) const;
+                                             const MemberName& name) const;
     [[nodiscard]] const Function& function(FunctionId id) const {
         return functions.at(id.value);
     }
@@ -241,7 +255,9 @@ public:
     [[nodiscard]] const Object& object(ObjectId id) const {
         return objects.at(id.value);
     }
-    [[nodiscard]] const Label* label(FunctionId function, std::string_view name) const;
+    [[nodiscard]] const Label* label(FunctionId function, NameUse name) const;
+    [[nodiscard]] const Label* label(FunctionId function, const Statement& definition) const;
+    [[nodiscard]] const Label* label(const LabelAddressConstant& address) const;
     [[nodiscard]] const Label* global_label(std::string_view qualified_name) const;
     [[nodiscard]] bool raw_owned(const FunctionDecl& declaration) const;
 
@@ -249,6 +265,8 @@ public:
     // the selected ABI width on HIR prevents the middle end from silently
     // assuming x86-64 when a 32-bit or capability-oriented target is added.
     unsigned address_bits{64};
+    // Private layout facts may be reused only in this exact prepared graph.
+    std::shared_ptr<const EvaluationLayoutScopeIdentity> evaluation_layout_scope;
     AbiId default_abi;
     // Source spelling is resolved only at the AST-to-HIR interning boundary.
     std::unordered_map<std::string, AbiId> abi_names;
@@ -260,23 +278,44 @@ public:
     std::unordered_map<const FunctionDecl*, FunctionId> function_ids;
     std::unordered_map<const ObjectDecl*, ObjectId> object_ids;
     std::unordered_map<NominalTypeKey, RecordId, NominalTypeKeyHash> record_ids;
+    // Published source-record positions of the Program this layout reads,
+    // shared by its builder and later coverage checks; it refreshes itself.
+    mutable RecordSourceIndex source_records;
 };
 
 Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics);
+ContinuationTask<Module> build_async(Program& program, const CompilerOptions& options,
+             const TargetInfo& target, Diagnostics& diagnostics);
 // Target layout and entity metadata for required constants before generic
 // bodies have been instantiated. Template declarations are deliberately absent.
+// An outer array bound inferred from an initializer may still be pending;
+// it has no size in this temporary view and is required by final HIR instead.
 Module build_constant_context(Program& program, const CompilerOptions& options,
+                              const TargetInfo& target, Diagnostics& diagnostics);
+ContinuationTask<Module> build_constant_context_async(Program& program, const CompilerOptions& options,
                               const TargetInfo& target, Diagnostics& diagnostics);
 // Early nominal layout without validating objects whose inferred bounds may
 // still be materialized by translation-time evaluation.
 Module build_record_layout_context(Program& program, const CompilerOptions& options,
                                    const TargetInfo& target, Diagnostics& diagnostics);
+ContinuationTask<Module> build_record_layout_context_async(Program& program, const CompilerOptions& options,
+                                   const TargetInfo& target, Diagnostics& diagnostics);
+// Reuse a settled layout only when all by-value records are complete and have
+// the same active definition owners. Private records additionally require the
+// exact non-null evaluation layout scope; nominal identity alone is insufficient.
+// Callers retain one resolved target/model and a prepared source graph.
+bool layout_view_covers(const Module& module, const Program& program, const TypePtr& type);
 // Demand-driven view for an early required query. Only the requested type and
 // its layout dependencies are completed; unrelated declarations stay lazy.
 Module build_required_layout_context(Program& program, const CompilerOptions& options,
                                      const TargetInfo& target, Diagnostics& diagnostics,
-                                     const TypePtr& type);
+                                     const TypePtr& type,
+                                     EvaluationLayoutKind kind = EvaluationLayoutKind::Complete);
+ContinuationTask<Module> build_required_layout_context_async(Program& program, const CompilerOptions& options,
+                                     const TargetInfo& target, Diagnostics& diagnostics,
+                                     TypePtr type,
+                                     EvaluationLayoutKind kind = EvaluationLayoutKind::Complete);
 bool validate_source_address_spaces(Program& program,
                                     const CompilerOptions& options,
                                     const TargetInfo& target,
@@ -289,11 +328,23 @@ call_signature(const Module& module, std::optional<FunctionId> direct,
 bool stabilize_function_address(Module& module, FunctionId function,
                                 SourceLocation location,
                                 Diagnostics& diagnostics);
+// A label is a code address, not a callable entry or an ABI adapter request.
+// Preserve the owner's canonical body and its explicit endpoint contract.
+bool stabilize_label_address(Module& module, LabelId label,
+                             SourceLocation location, Diagnostics& diagnostics);
 [[nodiscard]] std::string type_name(const Module& module, TypeId type);
 [[nodiscard]] std::optional<std::uint64_t>
 layout_size(const Module& module, TypeId type, const TargetInfo& target);
+// Prepared AST types used by raw lowering share the same storage contract.
+[[nodiscard]] std::optional<std::uint64_t>
+layout_size(const Module& module, const TypePtr& type, const TargetInfo& target);
 [[nodiscard]] std::optional<std::uint64_t>
 layout_alignment(const Module& module, TypeId type,
                  const TargetInfo& target);
+// Naturally aligned scalar capability shared by required evaluation and MIR.
+// Concrete access alignment/address-space checks remain in target lowering.
+[[nodiscard]] bool lock_free_atomic_type(const Module& module, TypeId type,
+                                        const TargetInfo& target,
+                                        const Subtarget& subtarget);
 
 } // namespace cross::hir

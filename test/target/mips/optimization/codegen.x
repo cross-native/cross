@@ -361,3 +361,15 @@ global f64 mips_fp_fixed_result(in f64 value) {
     if (value < 0.0f64) return -value;
     return value;
 }
+
+[[abi("o32"), noinline]]
+global u32 mips_paired_division(in u32 left, in u32 right) {
+    return left / right + left % right;
+}
+
+[[abi("o32"), noinline]]
+global void mips_output_division(in u32 left, in u32 right,
+                                 out u32 quotient, out u32 remainder) {
+    quotient = left / right;
+    remainder = left % right;
+}

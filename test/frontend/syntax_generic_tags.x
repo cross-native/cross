@@ -1,11 +1,18 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "block_assertions.x"
+#include "meta_control_flow.x"
 
 #include "local_tag_generic.x"
 #include "local_tag_splice.x"
 #include "type_alias_binding.x"
 #include "meta_helpers.x"
 #include "meta_helper_semantics.x"
+#include "direct_expander_objects.x"
+#include "meta_helper_operators.x"
+#include "meta_conditionals.x"
+#include "meta_type_validation.x"
+#include "vector_type_specifiers.x"
 
 [[syntax_expander]] static $::meta::tokens copy(in $::meta::syntax_match input) {
     return $::quote { $::unquote($::syntax::node(input, "body")) };
@@ -113,7 +120,13 @@ tag_header [[noinline]] static T deferred_generic_local(in T value)
 [[abi(HOST_ABI)]]
 #endif
 global u32 syntax_raw_entry() {
-    if (MetaHelperCaller::run() != 61u32 || MetaPreparation::run() != 67u32 ||
+    if (MetaControlFlow::run() != 79u32 || BlockAssertions::run() != 97u32 ||
+        MetaHelperCaller::run() != 61u32 || MetaPreparation::run() != 67u32 ||
+        DirectExpansionObjects::run() != 49u32 ||
+        MetaOperators::run() != 73u32 ||
+        MetaChoices::run() != 79u32 ||
+        MetaTypeValidation::run() != 83u32 ||
+        VectorTypeSpecifiers::run() != 89u32 ||
         AliasBindingTests::run(65549u32) != 65549u32 ||
         LocalTagGeneric::run(65549u32) != 65549u32 ||
         copied_generic_local(65549u32) != 65549u32 || copied_generic_local(7u16) != 7u16 ||

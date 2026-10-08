@@ -65,6 +65,19 @@ mir::ManagedModule valid_module() {
     return module;
 }
 
+mir::ManagedModule shared_patch_module() {
+    auto module = valid_module();
+    auto& function = module.functions.front();
+    function.values.front().kind = mir::ValueKind::PatchValue;
+    function.values.front().patch_id = 1;
+    auto copy = function.values.front();
+    copy.id = {1};
+    function.values.push_back(copy);
+    function.blocks.front().values.push_back({1});
+    function.blocks.front().terminator.value = mir::ValueId{1};
+    return module;
+}
+
 mir::ManagedModule indirect_module() {
     auto module = valid_module();
     auto& function = module.functions.front();
@@ -228,6 +241,56 @@ bool expect_invalid(mir::ManagedModule module, std::string_view expected) {
 } // namespace
 
 int main() {
+    for (const unsigned bits : {32U, 64U}) {
+        for (const auto representation : {PatchAddressRepresentation::Unavailable,
+                                           PatchAddressRepresentation::FlatUptr}) {
+            for (const unsigned storage_bytes : {0U, 4U, 8U, 16U}) {
+                auto hir = hir_fixture();
+                hir.address_bits = bits;
+                ObjectDecl declaration;
+                hir::Object object;
+                object.id = {0};
+                object.type = hir.intern_type(builtin_type(BuiltinType::Uptr));
+                object.definition = &declaration;
+                hir.objects.push_back(object);
+                auto module = shared_patch_module();
+                module.object_definitions.insert(0);
+                for (auto& value : module.functions.front().values)
+                    value.patch_sink = mir::PatchSink{{0}, 0, representation, storage_bytes};
+                std::ostringstream output;
+                Diagnostics diagnostics(output);
+                const bool expected = representation == PatchAddressRepresentation::FlatUptr &&
+                    storage_bytes == bits / 8;
+                if (mir::verify(module, hir, diagnostics) != expected ||
+                    (!expected && output.str().find("invalid patch-value sink representation") == std::string::npos)) {
+                    std::cerr << "incorrect patch sink representation verification:\n" << output.str();
+                    return 1;
+                }
+            }
+        }
+    }
+    {
+        auto hir = hir_fixture();
+        auto module = shared_patch_module();
+        std::ostringstream output;
+        Diagnostics diagnostics(output);
+        if (!mir::verify(module, hir, diagnostics)) {
+            std::cerr << "verifier rejected shared patch cell:\n" << output.str();
+            return 1;
+        }
+        auto other_hir = hir.functions.front();
+        other_hir.id = {1};
+        hir.functions.push_back(std::move(other_hir));
+        auto other = module.functions.front();
+        other.source = {1};
+        module.functions.push_back(std::move(other));
+        module.definitions.insert(1);
+        if (mir::verify(module, hir, diagnostics) ||
+            output.str().find("patch identity has multiple function owners") == std::string::npos) {
+            std::cerr << "verifier accepted a patch cell shared by concrete functions:\n" << output.str();
+            return 1;
+        }
+    }
     {
         auto hir = hir_fixture();
         auto module = indirect_module();
@@ -260,7 +323,44 @@ int main() {
         }
     }
 
+    {
+        auto hir = hir_fixture();
+        auto module = valid_module();
+        hir.functions.front().result_type = {0};
+        auto& function = module.functions.front();
+        function.result_type = {0};
+        function.values.front().kind = mir::ValueKind::VoidValue;
+        function.values.front().type = {0};
+        function.blocks.front().terminator.value.reset();
+        std::ostringstream output;
+        Diagnostics diagnostics(output);
+        if (!mir::verify(module, hir, diagnostics)) {
+            std::cerr << "verifier rejected valid void expression:\n" << output.str();
+            return 1;
+        }
+    }
     unsigned failures = 0;
+    {
+        auto module = valid_module();
+        module.functions.front().values.front().type = {0};
+        failures += !expect_invalid(std::move(module),
+            "integer constant has a non-integer/pointer/label type");
+    }
+    {
+        auto module = valid_module();
+        module.functions.front().values.front().kind = mir::ValueKind::VoidValue;
+        failures += !expect_invalid(std::move(module), "void value has a non-void type");
+    }
+    {
+        auto module = diamond_module();
+        module.functions.front().values.back().type = {0};
+        failures += !expect_invalid(std::move(module), "phi must carry a value");
+    }
+    {
+        auto module = shared_patch_module();
+        module.functions.front().values.back().integer = 9;
+        failures += !expect_invalid(std::move(module), "inconsistent uses of a shared patch-value site");
+    }
     {
         auto module = valid_module();
         module.functions[0].blocks[0].terminator = {};

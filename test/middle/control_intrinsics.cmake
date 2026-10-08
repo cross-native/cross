@@ -19,20 +19,21 @@ if(NOT assembly_status EQUAL 0)
         "${assembly_stdout}\n${assembly_stderr}")
 endif()
 
-execute_process(
-    COMMAND "${CC}" -S "${ERROR_SOURCE}" -o "${OUTPUT}.errors.s"
-    RESULT_VARIABLE error_status
-    OUTPUT_VARIABLE error_stdout
-    ERROR_VARIABLE error_stderr
-)
-if(error_status EQUAL 0)
-    message(FATAL_ERROR "invalid control intrinsics unexpectedly compiled")
-endif()
-foreach(pattern
-        "assume condition must be side-effect-free"
-        "expect requires an integer constant expectation"
-        "unreachable takes no arguments"
-        "$::_nop takes no arguments")
+set(error_patterns
+    "assume condition must be side-effect-free"
+    "runtime local or parameter is not a translation-time value"
+    "unreachable takes no arguments"
+    "$::_nop takes no arguments")
+# Source checks now precede target lowering. Test independent errors separately
+# so a valid early rejection does not hide the target-owned instruction case.
+foreach(case RANGE 0 3)
+    execute_process(
+        COMMAND "${CC}" -S "-DCONTROL_ERROR=${case}" "${ERROR_SOURCE}" -o "${OUTPUT}.errors-${case}.s"
+        RESULT_VARIABLE error_status OUTPUT_VARIABLE error_stdout ERROR_VARIABLE error_stderr)
+    if(NOT error_status EQUAL 1)
+        message(FATAL_ERROR "control error ${case}: expected rejection\n${error_stdout}\n${error_stderr}")
+    endif()
+    list(GET error_patterns ${case} pattern)
     string(FIND "${error_stderr}" "${pattern}" error_position)
     if(error_position EQUAL -1)
         message(FATAL_ERROR

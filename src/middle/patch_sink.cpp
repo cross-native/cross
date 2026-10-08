@@ -65,7 +65,7 @@ std::optional<Selection> select(
             return std::nullopt;
         }
         const auto* member = module.member(*owner.record,
-                                           expression.right->text);
+                                           member_name(*expression.right));
         if (!member) {
             diagnostics.error(
                 expression.right->location,
@@ -163,14 +163,20 @@ bool explicitly_initialized(const Selection& sink, const hir::Module& module,
 
 std::optional<PatchSink> resolve_patch_sink_designator(
     const Expr& expression, const hir::Module& module,
-    const TargetInfo& target, const PatchSinkObjectResolver& resolve_object,
-    Diagnostics& diagnostics) {
+    const TargetInfo& target, PatchAddressRepresentation representation,
+    const PatchSinkObjectResolver& resolve_object, Diagnostics& diagnostics) {
+    if (representation != PatchAddressRepresentation::FlatUptr) {
+        diagnostics.error(expression.location,
+                          "selected target patch entry has no supported address-sink representation");
+        return std::nullopt;
+    }
     const auto selected = select(expression, module, target, resolve_object,
                                  diagnostics);
     if (!selected) return std::nullopt;
     const auto& type = module.type(selected->type);
     if (type.kind != hir::Type::Kind::Builtin ||
-        type.builtin != BuiltinType::Uptr || selected->is_const ||
+        type.builtin != BuiltinType::Uptr || type.nominal_key() != NominalTypeKey{} ||
+        type.is_restrict || selected->is_const ||
         selected->is_volatile || selected->is_atomic ||
         selected->bit_field) {
         diagnostics.error(
@@ -186,9 +192,15 @@ std::optional<PatchSink> resolve_patch_sink_designator(
     }
     const auto object_size =
         hir::layout_size(module, selected->object->type, target);
-    const auto address_size = (module.address_bits + 7U) / 8U;
+    const auto sink_size = hir::layout_size(module, selected->type, target);
+    const auto storage_bytes = patch_address_storage_bytes(representation, module.address_bits);
+    if (!sink_size || !storage_bytes || *sink_size != storage_bytes) {
+        diagnostics.error(expression.location,
+                          "target has no $::patch sink relocation for this address representation");
+        return std::nullopt;
+    }
     if (!object_size || selected->offset > *object_size ||
-        address_size > *object_size - selected->offset) {
+        *sink_size > *object_size - selected->offset) {
         diagnostics.error(expression.location,
                           "$::patch address sink exceeds its static object");
         return std::nullopt;
@@ -200,7 +212,8 @@ std::optional<PatchSink> resolve_patch_sink_designator(
             "$::patch address sink must designate an uninitialized static-duration subobject");
         return std::nullopt;
     }
-    return PatchSink{selected->object->id, selected->offset};
+    return PatchSink{selected->object->id, selected->offset, representation,
+                     static_cast<unsigned>(*sink_size)};
 }
 
 } // namespace cross::mir

@@ -47,6 +47,14 @@ std::vector<RegisterEntry> target_registers() {
                           std::move(hard_modes),
                           view.storage_name == "rsp" ||
                               view.storage_name == "rbp"});
+        auto& entry = result.back();
+        entry.instruction_writable = view.storage_name != "rsp";
+        entry.instruction_vector_values = view.register_class == x86_64::RegisterClass::simd;
+        if (view.register_class == x86_64::RegisterClass::simd)
+            entry.instruction_scalar_modes = {{32, true}, {64, true}};
+        else if (view.register_class == x86_64::RegisterClass::x87)
+            entry.instruction_scalar_modes = {{80, true}};
+        else entry.instruction_scalar_modes = {{view.bits, false}};
     }
     return result;
 }
@@ -91,9 +99,26 @@ InstructionOperandEntry integer_memory_operand(
     return result;
 }
 
+InstructionOperandEntry patch_integer_operand(unsigned bits, std::vector<std::string_view> types) {
+    InstructionOperandEntry result;
+    result.allow_immediate = true;
+    result.immediate_bits = bits;
+    result.patchable = true;
+    result.patch_types = std::move(types);
+    result.patch_address = PatchAddressRepresentation::FlatUptr;
+    return result;
+}
+
 InstructionOperandEntry address_memory_operand(
     InstructionOperandRole role, bool allow_atomic = false) {
     return integer_memory_operand(role, 0, allow_atomic);
+}
+
+InstructionOperandEntry local_label_operand() {
+    InstructionOperandEntry result;
+    result.allow_label = true;
+    result.label_scope = InstructionLabelScope::SameFunction;
+    return result;
 }
 
 InstructionEntry integer_move_form(std::string_view name,
@@ -369,11 +394,10 @@ InstructionEntry integer_scan_form(
             {"flags"}, 0, InstructionControlEffect::None};
 }
 
-InstructionEntry integer_lea_form(unsigned memory_bits) {
+InstructionEntry integer_lea_form() {
     return {"$::_lea", "x86-64", "leaq",
             {integer_register_operand(InstructionOperandRole::Output, 64),
-             integer_memory_operand(InstructionOperandRole::Input,
-                                    memory_bits)},
+             address_memory_operand(InstructionOperandRole::Input, true)},
             {}, {}, 0, InstructionControlEffect::None};
 }
 
@@ -948,24 +972,24 @@ const TargetInfo target{
     {ByteOrder::Little, 16, 16, 16,
      BitFieldOrder::LeastSignificantFirst,
      BitFieldUnitSharing::SameStorageSize,
-     BitFieldPlacement::NextAvailableBit},
+     BitFieldPlacement::NextAvailableBit, CodeAddressRepresentation::Flat},
     target_registers(),
     {
-        {"i8", 8, "x86-64", true, false},
-        {"u8", 8, "x86-64", true, false},
-        {"i16", 16, "x86-64", true, false},
-        {"u16", 16, "x86-64", true, false},
-        {"i32", 32, "x86-64", true, false},
-        {"u32", 32, "x86-64", true, false},
-        {"i64", 64, "x86-64", true, true},
-        {"u64", 64, "x86-64", true, true},
-        {"iptr", 64, "x86-64", true, true},
-        {"uptr", 64, "x86-64", true, true},
+        {"i8", 8, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},
+        {"u8", 8, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},
+        {"i16", 16, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},
+        {"u16", 16, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},
+        {"i32", 32, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},
+        {"u32", 32, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},
+        {"i64", 64, "x86-64", PatchAddressRepresentation::FlatUptr, true, true},
+        {"u64", 64, "x86-64", PatchAddressRepresentation::FlatUptr, true, true},
+        {"iptr", 64, "x86-64", PatchAddressRepresentation::FlatUptr, true, true},
+        {"uptr", 64, "x86-64", PatchAddressRepresentation::FlatUptr, true, true},
     },
     {
         {"$::_movabs", "x86-64", "movabsq",
          {integer_register_operand(InstructionOperandRole::Output, 64),
-          {InstructionOperandRole::Input, false, true, 0, 64, false, false, true}},
+          patch_integer_operand(64, {"i64", "u64", "iptr", "uptr"})},
          {}, {}, 0, InstructionControlEffect::None},
         integer_binary_form("$::_add", "addq", 64, 32, true),
         integer_binary_form("$::_sub", "subq", 64, 32, true),
@@ -1237,13 +1261,7 @@ const TargetInfo target{
         CROSS_X86_EXTEND("$::_movsx", "movs", 64, 16, "wq"),
         CROSS_X86_EXTEND("$::_movsx", "movs", 64, 32, "lq"),
 #undef CROSS_X86_EXTEND
-        integer_lea_form(8),
-        integer_lea_form(16),
-        integer_lea_form(32),
-        integer_lea_form(64),
-        integer_lea_form(128),
-        integer_lea_form(256),
-        integer_lea_form(512),
+        integer_lea_form(),
 #define CROSS_X86_SCAN(name, stem, bits, suffix)                              \
         integer_scan_form(name, stem suffix, bits, false),                    \
         integer_scan_form(name, stem suffix, bits, true)
@@ -2545,47 +2563,47 @@ const TargetInfo target{
         {"$::_ret", "x86-64", "retq", {},
          {"rsp", "memory"}, {"rsp"}, 0, InstructionControlEffect::RawReturn},
         {"$::_jmp", "x86-64", "jmp",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {}, {}, 0, InstructionControlEffect::UnconditionalBranch},
         {"$::_jmp_indirect", "x86-64", "jmp",
          {{InstructionOperandRole::Input, true, false, 64, 0, false,
            false, false, "integer", true}},
          {}, {}, 0, InstructionControlEffect::UnconditionalBranch},
         {"$::_je", "x86-64", "je",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jne", "x86-64", "jne",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jp", "x86-64", "jp",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jnp", "x86-64", "jnp",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_ja", "x86-64", "ja",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jae", "x86-64", "jae",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jb", "x86-64", "jb",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jbe", "x86-64", "jbe",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jg", "x86-64", "jg",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jge", "x86-64", "jge",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jl", "x86-64", "jl",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
         {"$::_jle", "x86-64", "jle",
-         {{InstructionOperandRole::Input, false, false, 0, 0, false, true}},
+         {local_label_operand()},
          {"flags"}, {}, 0, InstructionControlEffect::ConditionalBranch},
     },
     {{8, "base"}, {16, "base"}, {32, "base"}, {64, "base"}},
@@ -2779,6 +2797,9 @@ const TargetInfo target{
     &subtargets,
     {integer_constant_materialization_cost},
     {{0, 0, 0, 0, true, true, true, true, false, true, true}},
+    {{64, 64, "integer", {0}, {1, 2, 4, 8}, {"rsp"}, 32, "base"}},
+    {{"integer128", {}}, {"binary128_storage", {}}, {"binary128_arithmetic", {}},
+     {"fixed_vectors", {}}, {"atomics", {}}, {"variadics", {}}, {"thread_local", {}}},
 };
 
 } // namespace

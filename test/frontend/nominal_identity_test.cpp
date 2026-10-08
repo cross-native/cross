@@ -4,7 +4,9 @@
 #include "frontend/lexer.hpp"
 #include "frontend/parser.hpp"
 #include "frontend/semantic.hpp"
+#include "frontend/record_constraints.hpp"
 #include "middle/hir.hpp"
+#include "middle/initializer.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -24,6 +26,101 @@ int main() {
             std::abort();
         }
     };
+    {
+        // An exact local placement must not depend on diagnostic spelling.
+        // Unresolved names, including paths through a private namespace, still
+        // need every component of their spelling to select a declaration.
+        const auto placement = std::make_shared<ValuePlacementIdentity>();
+        placement->name = "local";
+        ValueBinding binding;
+        binding.kind = ValueBinding::Kind::Local;
+        binding.placement = placement;
+        NameKey original("local");
+        original.bind(binding);
+        auto renamed = original;
+        renamed.spelling = "display_only";
+        require(original == renamed);
+        require(NameKeyHash{}(original) == NameKeyHash{}(renamed));
+        NameMap<unsigned> locals{{original, 17}};
+        require(locals.at(renamed) == 17);
+        auto other = renamed;
+        other.binding.placement = std::make_shared<ValuePlacementIdentity>(*placement);
+        require(other != original);
+        other = renamed;
+        other.context.value = 1;
+        require(other != original);
+        const auto fresh = std::make_shared<const FreshIdentifier>();
+        original.fresh = renamed.fresh = fresh;
+        require(original == renamed && NameKeyHash{}(original) == NameKeyHash{}(renamed));
+        other = renamed;
+        other.fresh = std::make_shared<const FreshIdentifier>();
+        require(other != original);
+
+        NameKey left("private_ns::left"), right("private_ns::right");
+        left.fresh = right.fresh = fresh;
+        require(left != right && NameSet{left, right}.size() == 2);
+        // An incomplete/synthetic binding is not an exact placement.
+        left.binding.kind = right.binding.kind = ValueBinding::Kind::Local;
+        require(left != right && NameSet{left, right}.size() == 2);
+        left.bind(binding);
+        right.bind(binding);
+        left.binding.kind = right.binding.kind = ValueBinding::Kind::Object;
+        left.spelling = "private_ns::left";
+        right.spelling = "private_ns::right";
+        require(left != right && NameSet{left, right}.size() == 2);
+    }
+    {
+        // Identical display/serialization metadata does not make independently
+        // allocated private identities equal. A copy keeps the opaque handle.
+        const auto first = std::make_shared<const FreshIdentifier>();
+        const auto second = std::make_shared<const FreshIdentifier>();
+        const MemberName a{"field", first}, b{"field", second}, ordinary{"field", {}};
+        require(a != b && a != ordinary && a == MemberName{"display-only", first});
+        std::unordered_set<MemberName, MemberNameHash> names{a, b, ordinary};
+        require(names.size() == 3 && names.contains(MemberName{"different display", first}));
+        RecordDecl source_record;
+        source_record.name = "PrivateMembers";
+        source_record.complete = true;
+        source_record.members.push_back({{}, "field", builtin_type(BuiltinType::U32), {}, {}, first});
+        source_record.members.push_back({{}, "field", builtin_type(BuiltinType::U32), {}, {}, second});
+        Program source_program;
+        require(!record_source_error(source_record, source_program));
+        const auto copied_record = copy_evaluation_declaration(source_record);
+        require(copied_record.members[0].member_name() == a && copied_record.members[1].member_name() == b);
+        source_record.members.push_back({{}, "field", builtin_type(BuiltinType::U32), {}, {}, first});
+        require(record_source_error(source_record, source_program).has_value());
+        hir::Module members;
+        members.records.emplace_back();
+        for (const auto& source_member : copied_record.members) {
+            hir::RecordMember member;
+            member.name = source_member.name;
+            member.fresh = source_member.fresh;
+            members.records[0].members.push_back(std::move(member));
+        }
+        require(members.member(hir::RecordId{0}, a) == &members.records[0].members[0]);
+        require(members.member(hir::RecordId{0}, b) == &members.records[0].members[1]);
+        require(!members.member(hir::RecordId{0}, ordinary));
+        ObjectDecl object;
+        object.type = builtin_type(BuiltinType::U32);
+        object.initializer = std::make_unique<Expr>();
+        object.initializer->kind = Expr::Kind::AggregateInitializer;
+        object.initializer->initializer_entries.emplace_back();
+        auto& entry = object.initializer->initializer_entries.back();
+        entry.value = std::make_unique<Expr>();
+        entry.value->kind = Expr::Kind::Integer;
+        entry.designators.emplace_back();
+        entry.designators.back().member = "field";
+        entry.designators.back().member_fresh = first;
+        const auto copy = copy_evaluation_declaration(object);
+        require(copy->initializer->initializer_entries[0].designators[0].member_name() == a);
+    }
+    FunctionDecl lexical_owner;
+    ObjectDecl lifted;
+    lifted.type = builtin_type(BuiltinType::Label);
+    lifted.lexical_function = lexical_owner.function_scope;
+    auto copied_lifted = copy_evaluation_declaration(lifted);
+    require(copied_lifted->lexical_function == lexical_owner.function_scope);
+
     SourceManager sources;
     const auto* source = sources.add("nominal_identity.x", R"(
         struct First { u16 value; };
@@ -191,7 +288,7 @@ int main() {
         };
         program.evaluation_size_of = size_of;
         program.evaluation_align_of = align_of;
-        program.evaluation_member_layout = [&](const TypePtr& type, std::string_view name)
+        program.evaluation_member_layout = [&](const TypePtr& type, const MemberName& name)
             -> std::optional<EvaluationMemberLayout> {
             const auto id = layout.intern_type(type);
             const auto record = layout.type(id).record;
@@ -262,6 +359,12 @@ int main() {
         auto generic_program = generic_parser.parse();
         require(diagnostics.errors() == 0 && generic_program.records.size() == 4);
         generic_program.address_bits = model->address_bits;
+        generic_program.evaluation_initializer_plan = [&](const Expr& expression, const TypePtr& destination) {
+            auto concrete_layout = hir::build_required_layout_context(
+                generic_program, options, *target, diagnostics, destination);
+            return initializer::build_for_evaluation(
+                expression, destination, generic_program, concrete_layout, *target);
+        };
         require(expand_semantics(generic_program, diagnostics, false, "default", abi));
         require(generic_program.records.size() == 6 && generic_program.enumerations.size() == 2);
         std::unordered_set<NominalTypeKey, NominalTypeKeyHash> keys;
@@ -296,5 +399,99 @@ int main() {
         require(anonymous_passes == 2);
         const auto generic_module = hir::build(generic_program, options, *target, diagnostics);
         require(diagnostics.errors() == 0 && generic_module.records.size() == 6);
+
+        const auto* header_source = sources.add("header_nominal_identity.x", R"(
+            static struct { T value; } *header<T>() { return (void *)0uptr; }
+            static struct { u16 value; } *fixed<T>() { return (void *)0uptr; }
+            global u32 entry() {
+                header<u32>(); header<u16>(); header<u32>();
+                fixed<u32>(); fixed<u16>(); fixed<u16>();
+                return 0u32;
+            }
+        )");
+        Parser header_parser(Lexer(*header_source, diagnostics).lex(), diagnostics, {}, model->address_bits);
+        auto header_program = header_parser.parse();
+        require(diagnostics.errors() == 0 && header_program.records.size() == 2);
+        for (const auto& record : header_program.records)
+            require(record.nominal_identity && record.nominal_identity->generic_owner);
+        header_program.address_bits = model->address_bits;
+        require(expand_semantics(header_program, diagnostics, false, "default", abi));
+        require(header_program.records.size() == 4 && header_program.functions.size() == 5);
+        keys.clear();
+        serializations.clear();
+        for (const auto& record : header_program.records) {
+            require(record.nominal_identity && !record.nominal_identity->generic_owner);
+            const NominalTypeKey key{record.name, record.nominal_identity};
+            require(keys.insert(key).second && serializations.insert(key.canonical_name()).second);
+        }
+        for (const auto& function : header_program.functions) {
+            if (function->name == "entry") continue;
+            require(function->return_type->kind == Type::Kind::Pointer);
+            const auto& result = function->return_type->pointee;
+            require(keys.contains(result->nominal_key()) &&
+                result->nominal_identity->function_scope == function->function_scope);
+        }
+        const auto header_module = hir::build(header_program, options, *target, diagnostics);
+        require(diagnostics.errors() == 0 && header_module.records.size() == 4);
+        const auto* named_header_source = sources.add("named_header_nominal_identity.x", R"(
+            static struct Named { T value; } *header<T>() { return (void *)0uptr; }
+            static enum Code { code = N } named_enum<u32 N>() { return code; }
+            global u32 named_entry() {
+                header<u32>(); header<u16>(); header<u32>();
+                return (u32)named_enum<3u32>() + (u32)named_enum<7u32>();
+            }
+        )");
+        Parser named_header_parser(Lexer(*named_header_source, diagnostics).lex(),
+                                   diagnostics, {}, model->address_bits);
+        auto named_header_program = named_header_parser.parse();
+        require(diagnostics.errors() == 0 && named_header_program.records.size() == 1 &&
+                named_header_program.enumerations.size() == 1);
+        require(named_header_program.records[0].nominal_identity->generic_owner &&
+                named_header_program.enumerations[0].nominal_identity->generic_owner &&
+                named_header_program.enumerations[0].local);
+        named_header_program.address_bits = model->address_bits;
+        require(expand_semantics(named_header_program, diagnostics, false, "default", abi));
+        require(named_header_program.records.size() == 2 && named_header_program.enumerations.size() == 2);
+        require(named_header_program.records[0].nominal_key() != named_header_program.records[1].nominal_key());
+        require(named_header_program.enumerations[0].nominal_key() != named_header_program.enumerations[1].nominal_key());
+        require(named_header_program.functions.size() == 5);
+        const auto named_header_module = hir::build(named_header_program, options, *target, diagnostics);
+        require(diagnostics.errors() == 0 && named_header_module.records.size() == 2);
+
+        const auto* list_source = sources.add("shared_header_nominal_identity.x", R"(
+            typedef u8 T;
+            global struct Shared { T value; } *first<T>(), *plain(), *second<T>(), *plain_again();
+            global struct Counted { u8 bytes[N]; } *first_count<u32 N>(), *second_count<u32 N>();
+        )");
+        Parser list_parser(Lexer(*list_source, diagnostics).lex(), diagnostics, {}, model->address_bits);
+        auto list_program = list_parser.parse();
+        require(diagnostics.errors() == 0 && list_program.records.size() == 5 &&
+                list_program.functions.size() == 6);
+        const auto& first_result = list_program.functions[0]->return_type->pointee;
+        const auto& plain_result = list_program.functions[1]->return_type->pointee;
+        const auto& second_result = list_program.functions[2]->return_type->pointee;
+        require(first_result->nominal_identity && second_result->nominal_identity &&
+                first_result->nominal_identity != second_result->nominal_identity);
+        require(first_result->nominal_identity->generic_owner == list_program.functions[0]->generic_tag_owner &&
+                second_result->nominal_identity->generic_owner == list_program.functions[2]->generic_tag_owner);
+        require(!plain_result->nominal_identity &&
+                plain_result->nominal_key() == list_program.functions[3]->return_type->pointee->nominal_key());
+        for (std::size_t index = 0; index < 3; ++index) {
+            const auto& record = list_program.records[index];
+            const auto& member = record.members.front().type;
+            if (!record.nominal_identity) {
+                require(member->kind == Type::Kind::Builtin && member->builtin == BuiltinType::U8);
+                continue;
+            }
+            const auto& owner = record.nominal_identity->generic_owner == list_program.functions[0]->generic_tag_owner
+                ? list_program.functions[0] : list_program.functions[2];
+            require(member->kind == Type::Kind::Generic && !member->generic_header_view &&
+                    generic_type_key(*member) == name_key(owner->generic_parameters.front()));
+        }
+        for (std::size_t index = 0; index < 2; ++index) {
+            const auto& bound = list_program.records[index + 3].members.front().type->array_bound;
+            require(bound && bound->name_context &&
+                    bound->name_context->value_binding == list_program.functions[index + 4]->generic_parameters[0].binding);
+        }
     }
 }

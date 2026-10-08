@@ -48,13 +48,36 @@ if(DEFINED EXTRA_FLAGS AND NOT "${EXTRA_FLAGS}" STREQUAL "")
 else()
     set(extra_flags "")
 endif()
-run_checked(cross-functions "${CC}" -c -O2 -mprofile=${n64_arch}-n64 ${extra_flags}
-            "${SOURCE}" -o "${functions}")
+# Hand-written startups call the compiled entry points as n64 functions, so
+# the compilation selects n64 unless MIPS64_ABI names another ABI; "default"
+# keeps the profile's own default.
+if(NOT DEFINED MIPS64_ABI OR "${MIPS64_ABI}" STREQUAL "")
+    set(abi_flags -mabi=n64)
+elseif(MIPS64_ABI STREQUAL "default")
+    set(abi_flags "")
+else()
+    set(abi_flags "-mabi=${MIPS64_ABI}")
+endif()
+run_checked(cross-functions "${CC}" -c -O2 -mprofile=${n64_arch}-n64 ${abi_flags}
+            ${extra_flags} "${SOURCE}" -o "${functions}")
+set(objects "${functions}")
+# An optional second unit, compiled by its own cc invocation.
+if(DEFINED CALLEE_SOURCE AND NOT "${CALLEE_SOURCE}" STREQUAL "")
+    if(DEFINED CALLEE_FLAGS AND NOT "${CALLEE_FLAGS}" STREQUAL "")
+        separate_arguments(callee_flags NATIVE_COMMAND "${CALLEE_FLAGS}")
+    else()
+        set(callee_flags "")
+    endif()
+    set(callee "${OUTPUT}.callee.o")
+    run_checked(cross-callee "${CC}" -c -O2 -mprofile=${n64_arch}-n64 ${abi_flags}
+                ${extra_flags} ${callee_flags} "${CALLEE_SOURCE}" -o "${callee}")
+    list(APPEND objects "${callee}")
+endif()
 run_checked(startup "${LLVM_MC}" --filetype=obj
             --triple=${n64_arch}-unknown-elf --mcpu=mips64
             --mattr=+noabicalls "${STARTUP}" -o "${start}")
 run_checked(link-elf64 "${LLD}" -m ${n64_link_emulation} -T "${LINKER}"
-            "${start}" "${functions}" -o "${image}")
+            "${start}" ${objects} -o "${image}")
 
 execute_process(
     COMMAND "${QEMU}" -M malta -cpu MIPS64R2-generic -m 64M -bios none

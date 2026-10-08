@@ -14,12 +14,16 @@ static i32x4 vector_sysv(in i32x4 value) {
 }
 
 [[abi("ms_abi"), noinline]]
-static i32x4 vector_ms(in i32x4 value) {
-    return value + 2;
+static i32 [[ext_vector_type(4)]] vector_ms(in i32 [[vector_size(16)]] value) {
+    return (i32 [[ext_vector_type(4)]])(value + 2);
 }
 
 global i32 vector_entry() {
-    i32x4 left = 3;
+    register i32x4 fixed_lanes = 4;
+    fixed_lanes[1] += 3;
+    if (fixed_lanes[1]++ != 7 || --fixed_lanes[1] != 7 || fixed_lanes[0] != 4)
+        return 0;
+    [[ext_vector_type(4)]] i32 left = 3;
     i32x4 right = 2;
     i32x4 sum = left + right;
     i32x4 product = sum * right;

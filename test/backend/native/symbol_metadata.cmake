@@ -197,23 +197,24 @@ if(HOST_GCC)
     endif()
 endif()
 
-execute_process(
-    COMMAND "${CC}" -S "${ERRORS}" -o "${OUTPUT}-errors.s"
-    RESULT_VARIABLE error_status OUTPUT_VARIABLE error_stdout
-    ERROR_VARIABLE error_stderr)
-if(error_status EQUAL 0)
-    message(FATAL_ERROR "invalid symbol metadata compiled")
-endif()
+set(error_case 0)
 foreach(pattern
         "weak does not take arguments"
         "weak requires an external definition"
         "weak requires global linkage"
         "visibility requires one visibility-kind string"
+        "visibility requires one visibility-kind string"
         "visibility must be default, hidden, protected, or internal"
         "visibility requires global linkage"
         "conflicting visibility attributes")
-    if(NOT error_stderr MATCHES "${pattern}")
+    execute_process(
+        COMMAND "${CC}" -S "-DSYMBOL_METADATA_ERROR=${error_case}" "${ERRORS}"
+                -o "${OUTPUT}-errors-${error_case}.s"
+        RESULT_VARIABLE error_status OUTPUT_VARIABLE error_stdout ERROR_VARIABLE error_stderr)
+    if(NOT error_status EQUAL 1 OR NOT error_stderr MATCHES "${pattern}" OR
+       NOT error_stderr MATCHES "symbol_metadata_errors[.]x:[0-9]+:[0-9]+: error:")
         message(FATAL_ERROR
             "symbol metadata diagnostic lacks '${pattern}'\n${error_stderr}")
     endif()
+    math(EXPR error_case "${error_case} + 1")
 endforeach()

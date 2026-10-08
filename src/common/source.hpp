@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "common/owner_release.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -19,6 +22,8 @@ struct SyntaxNode;
 struct NominalTypeIdentity;
 struct TagBinding;
 struct AliasBinding;
+struct FunctionScopeIdentity;
+struct FragmentNamespaceLookup;
 
 struct SourceLocation {
     const SourceFile* file{};
@@ -57,19 +62,117 @@ struct TokenIdentity {
     bool operator==(const TokenIdentity&) const = default;
 };
 
+struct TokenIdentityHash {
+    std::size_t operator()(const TokenIdentity& identity) const noexcept {
+        auto hash = std::hash<const SourceFile*>{}(identity.source_unit);
+        const auto mix = [&](std::size_t value) {
+            hash ^= value + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+        };
+        mix(std::hash<std::size_t>{}(identity.offset));
+        mix(std::hash<std::uint64_t>{}(identity.expansion.value));
+        mix(std::hash<std::size_t>{}(identity.output_position));
+        return hash;
+    }
+};
+
+struct TokenRegion {
+    TokenIdentity first;
+    TokenIdentity end;
+};
+
 // Private name-resolution provenance, not a public meta-tree property. Unknown
 // means the token has not been interpreted as a value name. Nonlocal records
 // the absence of a visible local, so relocating a parsed use cannot capture a
 // subsequently introduced local. Local names retain the declaring token's
 // identity and syntax mark independently of the use token's own identity.
+struct ValueBinding;
+struct ValuePlacementIdentity {
+    ValuePlacementIdentity() = default;
+    ValuePlacementIdentity(const ValuePlacementIdentity&) = default;
+    ValuePlacementIdentity(ValuePlacementIdentity&&) = default;
+    ValuePlacementIdentity& operator=(const ValuePlacementIdentity&) = default;
+    ValuePlacementIdentity& operator=(ValuePlacementIdentity&&) = default;
+    ~ValuePlacementIdentity();
+    enum class Kind { Object, Function } kind{Kind::Object};
+    // A local spelling or namespace-qualified source symbol name (never a
+    // target link name). Pointer identity distinguishes declaration placements.
+    std::string name;
+    // Grammar classification travels with an exact function binding, including
+    // through a body splice that restores its original lookup environment.
+    // These are source parameter kinds, never ABI transport information.
+    enum class GenericParameterKind { Type, Value };
+    std::vector<GenericParameterKind> generic_parameters;
+    // Only a copied declaring token contributes ancestry. This lets a header
+    // parsed independently of its body reconnect the body's earlier binding,
+    // without treating sibling copies of the same token as one declaration.
+    std::shared_ptr<const ValueBinding> source_binding;
+    std::uint64_t source_storage{};
+private:
+    friend class detail::OwnerRelease;
+    mutable detail::OwnerReleaseLink teardown_;
+};
+
+struct ValueDeclarationSource;
+
 struct ValueBinding {
-    enum class Kind { Unknown, Local, Nonlocal, Enumerator } kind{Kind::Unknown};
+    enum class Kind { Unknown, Local, Nonlocal, Enumerator, Object, Function } kind{Kind::Unknown};
+    ValueBinding() = default;
+    ValueBinding(const ValueBinding&) = default;
+    ValueBinding(ValueBinding&&) = default;
+    ValueBinding& operator=(const ValueBinding&) = default;
+    ValueBinding& operator=(ValueBinding&&) = default;
+    ValueBinding(Kind kind, TokenIdentity declaration, ExpansionId mark,
+                 std::shared_ptr<const NominalTypeIdentity> enumeration = {},
+                 std::shared_ptr<const ValuePlacementIdentity> placement = {},
+                 std::shared_ptr<const ValueDeclarationSource> source = {})
+        : kind(kind), declaration(declaration), mark(mark),
+          enumeration(std::move(enumeration)), placement(std::move(placement)),
+          declaration_source(std::move(source)) {}
+    ~ValueBinding();
     TokenIdentity declaration;
     ExpansionId mark;
-    // Local enumerators belong to a particular placement of their enum, not
-    // just the declaring token (which is shared by copied public subtrees).
+    // Enumerators belong to a particular placement of their enum, not just
+    // the declaring token (which is shared by copied public subtrees). This
+    // owner is independent of whether lookup also exposes a namespace name.
+    // A Nonlocal binding may retain a namespace-enumerator candidate here for
+    // declaration-copy remapping; ordinary namespace lookup remains authoritative
+    // until that declaration is actually reintroduced in a new placement.
     std::shared_ptr<const NominalTypeIdentity> enumeration{};
-    bool operator==(const ValueBinding&) const = default;
+    std::shared_ptr<const ValuePlacementIdentity> placement{};
+    // Enumerator declaration-copy ancestry, excluded from binding equality.
+    std::shared_ptr<const ValueDeclarationSource> declaration_source{};
+    bool operator==(const ValueBinding& other) const {
+        if (kind != other.kind) return false;
+        // Redeclarations retain their own declaring-token anchors but share
+        // the source entity's placement. Local placements are always fresh.
+        if (placement || other.placement) return placement == other.placement;
+        return declaration == other.declaration && mark == other.mark && enumeration == other.enumeration;
+    }
+};
+
+struct ValueDeclarationSource {
+    ValueDeclarationSource() = default;
+    ValueDeclarationSource(const ValueDeclarationSource&) = default;
+    ValueDeclarationSource(ValueDeclarationSource&&) = default;
+    ValueDeclarationSource& operator=(const ValueDeclarationSource&) = default;
+    ValueDeclarationSource& operator=(ValueDeclarationSource&&) = default;
+    ValueDeclarationSource(ValueBinding binding, std::uint64_t storage)
+        : binding(std::move(binding)), storage(storage) {}
+    ValueBinding binding;
+    std::uint64_t storage{};
+private:
+    friend class detail::OwnerRelease;
+    mutable detail::OwnerReleaseLink teardown_;
+};
+
+// Labels use a function-wide namespace independent of ordinary values. A
+// parsed reference retains its source scope even before a forward declaration
+// is known; completed parsed units additionally retain the declaring token.
+struct LabelBinding {
+    enum class Kind { Unknown, Definition, Reference } kind{Kind::Unknown};
+    TokenIdentity declaration;
+    std::shared_ptr<const FunctionScopeIdentity> scope;
+    bool operator==(const LabelBinding&) const = default;
 };
 
 struct SyntaxContext {
@@ -79,6 +182,9 @@ struct SyntaxContext {
     SourceLocation invocation;
     std::string name_space;
     std::vector<std::string> imports;
+    // Exact declarations already reflected in imports. A later provenance
+    // refinement must not promote an old outer import above a saved inner one.
+    std::vector<TokenIdentity> import_declarations;
     struct EntityId {
         std::uint32_t value{};
         bool operator==(const EntityId&) const = default;
@@ -112,16 +218,46 @@ struct EmbedIdentity {
 };
 
 struct TokenOrigin {
+    enum class LookupMode { Lexical, Invocation };
     SourceLocation span;
     TokenIdentity identity;
     std::shared_ptr<const SyntaxContext> context;
+    // call_site fixes this identifier's import lookup to the invocation.
+    // Its unchanged token identity must not re-admit generated block imports.
+    LookupMode lookup_mode{LookupMode::Lexical};
     std::shared_ptr<const EmbedIdentity> embed;
     unsigned embed_piece{};
     ValueBinding value_binding;
+    // Explicit-context parsing resets identifier lookup, but a copied
+    // declaring token still has declaration ancestry if used as a binder.
+    // Expression lookup never reads this separate declaration-only channel.
+    std::shared_ptr<const ValueBinding> declaration_source;
+    // Complete parsed value-name spelling. Editing a qualified name must not
+    // reuse the first component's old binding for a different complete name.
+    std::shared_ptr<const std::string> value_spelling;
+    // A first-parse use may await completion of its original generated
+    // namespace. Projection preserves this lookup, never a destination scope.
+    std::shared_ptr<const FragmentNamespaceLookup> fragment_lookup;
     std::shared_ptr<const FreshIdentifier> fresh;
     // Opaque frontend tag-name provenance, retained by token projection.
     std::shared_ptr<const TagBinding> tag_binding;
+    // Explicit-context parsing resets uses, not copied tag-binder ancestry.
+    std::shared_ptr<const TagBinding> tag_declaration_source;
     std::shared_ptr<const AliasBinding> alias_binding;
+    LabelBinding label_binding;
+    // A token projected from a parsed/deferred public unit retains negative
+    // local lookup too. Raw primitive captures and fresh constructors remain
+    // composable until interpreted in a source grammar position.
+    bool value_context_captured{};
+    // A wholly deferred declaration/header has not bound its parameters yet.
+    // Only declarations from this original header region may complete them.
+    std::shared_ptr<const TokenRegion> deferred_parameter_region;
+    // Constructors may supply a whole retained span. An absent final anchor
+    // denotes the same point as span; this metadata never participates in
+    // lexical identity or name lookup.
+    SourceLocation span_end;
+
+    SourceLocation last_span() const { return span_end.valid() ? span_end : span; }
 
     TokenOrigin() = default;
     TokenOrigin(SourceLocation span, TokenIdentity identity,

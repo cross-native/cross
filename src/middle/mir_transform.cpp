@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <limits>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1328,17 +1330,117 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
     return true;
 }
 
-bool eliminate_one_forwarding_block(ManagedFunction& function) {
-    const UseLists uses(function);
-    for (const auto& forwarding : function.blocks) {
+// Removes legal forwarding blocks in the order of a cleanup that compacts and
+// restarts its scan after each removal: always the lowest-numbered legal block
+// next. Removals are applied in place and compacted once by the caller. A
+// removal can change the legality only of the removed block's predecessors, its
+// destination, and the definitions of values its own values used, so only those
+// blocks are examined again; every other rejected block stays rejected.
+class ForwardingSweep {
+public:
+    explicit ForwardingSweep(ManagedFunction& function)
+        : function_(function), labeled_(function.blocks.size()),
+          removed_(function.blocks.size()),
+          definitions_(function.values.size()),
+          other_uses_(function.values.size()),
+          phi_users_(function.values.size()) {
+        for (const auto& label : function.labels)
+            if (label.block.value < labeled_.size())
+                labeled_[label.block.value] = true;
+        // The same uses as UseLists: values listed in blocks and terminators.
+        for (const auto& block : function.blocks) {
+            pending_.insert(block.id.value);
+            for (const auto id : block.values) {
+                if (id.value >= function.values.size())
+                    continue;
+                definitions_[id.value] = block.id;
+                const auto& value = function.values[id.value];
+                for (const auto operand : value.operands)
+                    count_use(operand, true);
+                for (const auto& argument : value.call_arguments)
+                    if (argument.value)
+                        count_use(*argument.value, true);
+                for (const auto& incoming : value.incoming)
+                    if (incoming.value.value < phi_users_.size())
+                        phi_users_[incoming.value.value].push_back(id);
+            }
+            if (block.terminator.value)
+                count_use(*block.terminator.value, true);
+        }
+    }
+
+    // Removes up to `limit` blocks and returns how many were removed.
+    std::size_t run(std::size_t limit) {
+        std::size_t count = 0;
+        while (count < limit && !pending_.empty()) {
+            const BlockId id{*pending_.begin()};
+            pending_.erase(pending_.begin());
+            if (removed_[id.value])
+                continue;
+            Translation translated;
+            if (!legal(function_.blocks[id.value], translated))
+                continue;
+            remove(id, translated);
+            ++count;
+        }
+        return count;
+    }
+
+private:
+    using Translation =
+        std::unordered_map<std::uint32_t,
+                           std::unordered_map<std::uint32_t, ValueId>>;
+
+    void count_use(ValueId id, bool add) {
+        if (id.value >= other_uses_.size())
+            return;
+        if (add)
+            ++other_uses_[id.value];
+        else
+            --other_uses_[id.value];
+    }
+
+    void revisit(ValueId id) {
+        if (id.value < definitions_.size() && definitions_[id.value])
+            pending_.insert(definitions_[id.value]->value);
+    }
+
+    // Every use of `id` is an incoming value of a `target` phi on the edge
+    // from `forwarding`. Users in removed blocks no longer exist; a listed
+    // user that no longer names `id` is stale.
+    bool only_forwarded(ValueId id, BlockId forwarding,
+                        const ManagedBlock& target) const {
+        if (other_uses_[id.value] != 0)
+            return false;
+        for (const auto user : phi_users_[id.value]) {
+            const auto owner = definitions_[user.value];
+            if (owner && removed_[owner->value])
+                continue;
+            const auto& phi = function_.values[user.value];
+            bool member = false;
+            for (const auto& edge : phi.incoming) {
+                if (edge.value != id)
+                    continue;
+                if (!member) {
+                    if (phi.kind != ValueKind::Phi ||
+                        std::find(target.values.begin(), target.values.end(),
+                                  user) == target.values.end())
+                        return false;
+                    member = true;
+                }
+                if (edge.predecessor != forwarding)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    bool legal(const ManagedBlock& forwarding, Translation& translated) const {
+        const auto& function = function_;
         if (forwarding.id == function.entry ||
             forwarding.terminator.kind != TerminatorKind::Branch ||
             forwarding.terminator.successors.size() != 1 ||
-            forwarding.predecessors.empty() ||
-            std::any_of(function.labels.begin(), function.labels.end(),
-                        [&](const ManagedLabel& label) {
-                            return label.block == forwarding.id;
-                        }) ||
+            forwarding.predecessors.empty() || labeled_[forwarding.id.value] ||
             !std::all_of(forwarding.values.begin(), forwarding.values.end(),
                          [&](ValueId id) {
                              const auto kind = function.values[id.value].kind;
@@ -1346,13 +1448,13 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
                                     kind == ValueKind::LifetimeStart ||
                                     kind == ValueKind::LifetimeEnd;
                          })) {
-            continue;
+            return false;
         }
 
         const auto destination = forwarding.terminator.successors.front();
         if (destination == forwarding.id ||
             destination.value >= function.blocks.size()) {
-            continue;
+            return false;
         }
         const auto& target = function.blocks[destination.value];
         if (std::find(target.predecessors.begin(), target.predecessors.end(),
@@ -1364,16 +1466,12 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
                                      target.predecessors.end(),
                                      predecessor) != target.predecessors.end();
                 })) {
-            continue;
+            return false;
         }
 
         // Translate values crossing the forwarding block before changing the
         // CFG. A phi may be discarded only when every use is a destination
         // phi on the edge being replaced.
-        std::unordered_map<std::uint32_t,
-                           std::unordered_map<std::uint32_t, ValueId>>
-            translated;
-        bool valid = true;
         for (const auto id : forwarding.values) {
             const auto& value = function.values[id.value];
             if (value.kind != ValueKind::Phi)
@@ -1381,72 +1479,49 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
             auto& incoming = translated[id.value];
             for (const auto& edge : value.incoming) {
                 if (!incoming.emplace(edge.predecessor.value, edge.value)
-                         .second) {
-                    valid = false;
-                    break;
-                }
+                         .second)
+                    return false;
             }
-            if (!valid || incoming.size() != forwarding.predecessors.size() ||
+            if (incoming.size() != forwarding.predecessors.size() ||
                 std::any_of(forwarding.predecessors.begin(),
                             forwarding.predecessors.end(),
                             [&](BlockId predecessor) {
                                 return !incoming.contains(predecessor.value);
-                            })) {
-                valid = false;
-                break;
-            }
-            for (const auto& use : uses.uses(id)) {
-                if (use.kind != UseKind::PhiIncoming || !use.user ||
-                    std::find(target.values.begin(), target.values.end(),
-                              *use.user) == target.values.end()) {
-                    valid = false;
-                    break;
-                }
-                const auto& phi = function.values[use.user->value];
-                if (phi.kind != ValueKind::Phi ||
-                    use.index >= phi.incoming.size() ||
-                    phi.incoming[use.index].predecessor != forwarding.id ||
-                    phi.incoming[use.index].value != id) {
-                    valid = false;
-                    break;
-                }
-            }
-            if (!valid)
-                break;
+                            }) ||
+                !only_forwarded(id, forwarding.id, target))
+                return false;
         }
-        if (!valid)
-            continue;
 
         const auto target_effect_id = target.effect;
         if (target_effect_id.value >= function.effects.size())
-            continue;
+            return false;
         const auto& target_effect = function.effects[target_effect_id.value];
         if (std::count_if(target_effect.incoming.begin(),
                           target_effect.incoming.end(),
                           [&](const EffectIncoming& incoming) {
                               return incoming.predecessor == forwarding.id;
                           }) != 1) {
-            continue;
+            return false;
         }
 
-        const auto forwarding_id = forwarding.id;
-        const auto old_predecessors = forwarding.predecessors;
-        for (const auto predecessor : old_predecessors) {
-            if (predecessor.value >= function.blocks.size()) {
-                valid = false;
-                break;
-            }
+        for (const auto predecessor : forwarding.predecessors) {
+            if (predecessor.value >= function.blocks.size())
+                return false;
             const auto& owner = function.blocks[predecessor.value];
             if (std::count(owner.terminator.successors.begin(),
                            owner.terminator.successors.end(),
-                           forwarding_id) != 1) {
-                valid = false;
-                break;
-            }
+                           forwarding.id) != 1)
+                return false;
         }
-        if (!valid)
-            continue;
+        return true;
+    }
 
+    void remove(BlockId forwarding_id, const Translation& translated) {
+        auto& function = function_;
+        const auto destination =
+            function.blocks[forwarding_id.value].terminator.successors.front();
+        const auto old_predecessors =
+            function.blocks[forwarding_id.value].predecessors;
         for (const auto predecessor : old_predecessors) {
             auto& successors =
                 function.blocks[predecessor.value].terminator.successors;
@@ -1466,7 +1541,7 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
                 static_cast<std::ptrdiff_t>(predecessor_offset),
             old_predecessors.begin(), old_predecessors.end());
 
-        auto& mutable_effect = function.effects[target_effect_id.value];
+        auto& mutable_effect = function.effects[mutable_target.effect.value];
         const auto effect_position = std::find_if(
             mutable_effect.incoming.begin(), mutable_effect.incoming.end(),
             [&](const EffectIncoming& incoming) {
@@ -1511,6 +1586,8 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
                     value = found->second.at(predecessor.value);
                 }
                 replacements.push_back({predecessor, value});
+                if (value.value < phi_users_.size())
+                    phi_users_[value.value].push_back(id);
             }
             phi.incoming.insert(
                 phi.incoming.begin() +
@@ -1518,14 +1595,43 @@ bool eliminate_one_forwarding_block(ManagedFunction& function) {
                 replacements.begin(), replacements.end());
         }
 
-        // The forwarding block is now unreachable. Reuse the central
-        // compactor so block, value, effect, and label identities remain
-        // dense for every serializer and target backend.
-        prune_unreachable_blocks(function);
-        return true;
+        // The forwarding block is now unreachable and its values are gone.
+        removed_[forwarding_id.value] = true;
+        const auto& forwarding = function.blocks[forwarding_id.value];
+        for (const auto id : forwarding.values) {
+            const auto& value = function.values[id.value];
+            for (const auto operand : value.operands) {
+                count_use(operand, false);
+                revisit(operand);
+            }
+            for (const auto& argument : value.call_arguments) {
+                if (!argument.value)
+                    continue;
+                count_use(*argument.value, false);
+                revisit(*argument.value);
+            }
+            for (const auto& incoming : value.incoming)
+                revisit(incoming.value);
+        }
+        if (forwarding.terminator.value) {
+            count_use(*forwarding.terminator.value, false);
+            revisit(*forwarding.terminator.value);
+        }
+        for (const auto predecessor : old_predecessors)
+            pending_.insert(predecessor.value);
+        pending_.insert(destination.value);
     }
-    return false;
-}
+
+    ManagedFunction& function_;
+    std::vector<bool> labeled_;
+    std::vector<bool> removed_;
+    std::vector<std::optional<BlockId>> definitions_;
+    // Operand, call-argument, and terminator uses by values still present.
+    std::vector<std::uint32_t> other_uses_;
+    // Values naming each value as a phi input, possibly stale or repeated.
+    std::vector<std::vector<ValueId>> phi_users_;
+    std::set<std::uint32_t> pending_;
+};
 
 } // namespace
 
@@ -1549,6 +1655,39 @@ bool narrow_bitwise_values(ManagedFunction& function,
 bool factor_zero_extended_bitwise_chains(
     ManagedFunction& function, const hir::Module& hir_module) {
     return factor_zero_extended_bitwise_chains_impl(function, hir_module);
+}
+
+void ValueReplacements::add(ValueId from, ValueId to) {
+    to = resolve(to);
+    if (to != from) targets_[from.value] = to;
+}
+
+ValueId ValueReplacements::resolve(ValueId id) {
+    auto target = id;
+    for (auto found = targets_.find(target.value); found != targets_.end();
+         found = targets_.find(target.value))
+        target = found->second;
+    for (auto found = targets_.find(id.value); found != targets_.end();
+         found = targets_.find(id.value)) {
+        id = found->second;
+        found->second = target;
+    }
+    return target;
+}
+
+void ValueReplacements::rewrite(ManagedValue& value) {
+    if (targets_.empty()) return;
+    for (auto& operand : value.operands) operand = resolve(operand);
+    for (auto& argument : value.call_arguments)
+        if (argument.value) argument.value = resolve(*argument.value);
+    for (auto& incoming : value.incoming) incoming.value = resolve(incoming.value);
+}
+
+void ValueReplacements::apply(ManagedFunction& function) {
+    if (targets_.empty()) return;
+    for (auto& value : function.values) rewrite(value);
+    for (auto& block : function.blocks)
+        if (block.terminator.value) block.terminator.value = resolve(*block.terminator.value);
 }
 
 void compact_managed_values(ManagedFunction& function) {
@@ -1638,10 +1777,16 @@ bool rotate_guarded_loops(ManagedFunction& function) {
 }
 
 bool eliminate_forwarding_blocks(ManagedFunction& function) {
-    bool changed = false;
-    while (eliminate_one_forwarding_block(function))
-        changed = true;
-    return changed;
+    // The first removal sees the function as given, unreachable blocks
+    // included, and compaction then drops every unreachable block. After
+    // that a removal detaches only its own block, so the rest share one
+    // compaction.
+    if (ForwardingSweep(function).run(1) == 0)
+        return false;
+    prune_unreachable_blocks(function);
+    if (ForwardingSweep(function).run(std::numeric_limits<std::size_t>::max()) != 0)
+        prune_unreachable_blocks(function);
+    return true;
 }
 
 } // namespace cross::mir

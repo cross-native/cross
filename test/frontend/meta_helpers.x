@@ -5,6 +5,44 @@ namespace MetaHelpers {
     typedef u32 Choice;
     [[noinline]] static u32 marker() { return 11u32; }
     static u32 ordinary(in u32 value) { return value + 1u32; }
+    static void label_owner() { point: ; }
+    static label label_value() { return label_owner::point; }
+    static uptr label_layout(in $::meta::tokens input) {
+        return sizeof(point) + $::alignof((point));
+        point: ;
+    }
+    static $::meta::tokens label_helper() {
+        if (label_layout($::quote {}) != sizeof(label) + $::alignof(label))
+            return $::quote { 0u32 };
+        label value = label_value();
+        value = (label)value;
+        label values[2] = {value, label_value()};
+        $::meta::buffer storage = $::meta::alloc(2uptr * sizeof(label));
+        label *stored = (label *)$::meta::data(storage);
+        *stored = values[0];
+        stored[1] = values[1];
+        label numeric[2] = {};
+        if (numeric[1] != (label)0uptr) return $::quote { 0u32 };
+        numeric[1] = (label)0x3131uptr;
+        $::meta::buffer numeric_storage = $::meta::alloc(sizeof(label));
+        *((label *)$::meta::data(numeric_storage)) = numeric[1];
+        if ((uptr)*((label *)$::meta::data(numeric_storage)) != 0x3131uptr)
+            return $::quote { 0u32 };
+        $::meta::bytes numeric_bytes = $::meta::freeze(numeric_storage, sizeof(label));
+        u32 sum = 0u32;
+        for (uptr index = 0uptr; index < sizeof(label); ++index) {
+            sum += $::meta::at(numeric_bytes, index);
+#if $::target::byte_order == $::target::order_little
+            u8 expected = index < 2uptr ? 49u8 : 0u8;
+#else
+            u8 expected = index + 2uptr >= sizeof(label) ? 49u8 : 0u8;
+#endif
+            if ($::meta::at(numeric_bytes, index) != expected) return $::quote { 0u32 };
+        }
+        if (sum != 98u32) return $::quote { 0u32 };
+        if (*stored == label_value() && stored[1] == value) return $::quote { 53u32 };
+        return $::quote { 0u32 };
+    }
     static $::meta::tokens literal() { return $::quote { marker() }; }
     static $::meta::tokens parsed() { return $::meta::parse("marker()"); }
     static $::meta::tokens alias() { return $::quote { sizeof(Choice) }; }
@@ -59,6 +97,23 @@ namespace MetaHelpers {
         } };
     }
 }
+namespace MetaHelperBridge {
+    typedef u64 Choice;
+    [[noinline]] static u32 marker() { return 19u32; }
+    static $::meta::tokens nested(in $::meta::tokens input) {
+        $::meta::tokens before = $::quote { marker() };
+        $::meta::tokens inner_literal = MetaHelpers::literal();
+        $::meta::tokens after = $::meta::parse("marker()");
+        $::meta::tokens inner_parse = MetaHelpers::parsed();
+        $::meta::tokens caller = MetaHelpers::at_caller();
+        $::meta::tokens inner_alias = MetaHelpers::alias();
+        // Returning from a helper restores this helper's definition context.
+        // Copied input and explicit call_site still use the original invocation.
+        return $::quote { ($::unquote(before) + $::unquote(inner_literal) +
+            $::unquote(after) + $::unquote(inner_parse) + $::unquote(caller) +
+            (u32)$::unquote(inner_alias) + (u32)sizeof(Choice) + $::unquote(input)) };
+    }
+}
 namespace MetaHelperOwners {
     typedef u8 Choice;
     static u32 marker() { return 13u32; }
@@ -70,8 +125,15 @@ namespace MetaHelperOwners {
     [[macro]] static $::meta::tokens parsed(in $::meta::tokens input) { return MetaHelpers::parsed(); }
     [[macro]] static $::meta::tokens alias(in $::meta::tokens input) { return MetaHelpers::alias(); }
     [[macro]] static $::meta::tokens byte_helper(in $::meta::tokens input) { return MetaHelpers::byte_helper(); }
+    [[macro]] static $::meta::tokens label_helper(in $::meta::tokens input) { return MetaHelpers::label_helper(); }
     [[macro]] static $::meta::tokens at_caller(in $::meta::tokens input) { return MetaHelpers::at_caller(); }
     [[macro]] static $::meta::tokens token_helper(in $::meta::tokens input) { return MetaHelpers::token_helper(input); }
+    [[macro]] static $::meta::tokens nested(in $::meta::tokens input) { return MetaHelperBridge::nested(input); }
+}
+namespace MetaHelperOtherCaller {
+    typedef u8 Choice;
+    [[noinline]] static u32 marker() { return 29u32; }
+    [[noinline]] static u32 run() { return MetaHelperOwners::nested!(marker()); }
 }
 namespace MetaHelperCaller {
     typedef u16 Choice;
@@ -84,6 +146,9 @@ namespace MetaHelperCaller {
             MetaHelperOwners::parsed!() != 11u32 ||
             MetaHelperOwners::alias!() != 4uptr ||
             MetaHelperOwners::byte_helper!() != 51u32 ||
+            MetaHelperOwners::label_helper!() != 53u32 ||
+            MetaHelperOwners::nested!(marker()) != 106u32 ||
+            MetaHelperOtherCaller::run() != 130u32 ||
             MetaHelperOwners::at_caller!() != 17u32 || token_result() != 23u32) return 0u32;
         return 61u32;
     }

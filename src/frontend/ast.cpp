@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frontend/ast.hpp"
+#include "frontend/vector_constraints.hpp"
 
 #include "model/model.hpp"
 
@@ -11,6 +12,106 @@
 #include <unordered_set>
 
 namespace cross {
+
+namespace detail {
+class AstRelease {
+public:
+    template<class Node>
+    static void release(Node& node) noexcept {
+        OwnerRelease::run([&](OwnerRelease& release) { detach(node, release); });
+    }
+private:
+    static void detach(Type& node, OwnerRelease& release) noexcept {
+        release.take(node.pointee);
+        release.take(node.element);
+        release.take(node.array_bound);
+        release.take(node.vector_bound);
+        // Shared callable metadata is not edited speculatively. Its own
+        // destructor forwards its edges only when the last owner releases it.
+        node.function.reset();
+    }
+    static void detach(FunctionType& node, OwnerRelease& release) noexcept {
+        release.take(node.result);
+        for (auto& parameter : node.parameters) {
+            release.take(parameter.type);
+            release.take(parameter.declared_array_type);
+        }
+    }
+    static void detach(Expr& node, OwnerRelease& release) noexcept {
+        release.take(node.left);
+        release.take(node.right);
+        release.take(node.third);
+        release.take(node.type);
+        release.take(node.deferred_generic_signature);
+        for (auto& argument : node.arguments) release.take(argument);
+        for (auto& argument : node.generic_arguments) {
+            release.take(argument.type);
+            release.take(argument.value);
+        }
+        for (auto& relocation : node.object_relocations) release.take(relocation.type);
+        for (auto& entry : node.initializer_entries) {
+            for (auto& designator : entry.designators) release.take(designator.index);
+            release.take(entry.value);
+        }
+    }
+};
+} // namespace detail
+
+Type::~Type() { detail::AstRelease::release(*this); }
+FunctionType::~FunctionType() { detail::AstRelease::release(*this); }
+Expr::~Expr() { detail::AstRelease::release(*this); }
+
+TagBinding::~TagBinding() {
+    detail::OwnerRelease::run([&](detail::OwnerRelease& release) {
+        release.take(declaration_source);
+    });
+}
+
+Statement::~Statement() {
+    Statement* pending{};
+    const auto detach = [&](Statement& node) {
+        const auto take = [&](std::unique_ptr<Statement>& owner) {
+            if (auto* child = owner.release()) {
+                child->teardown_next_ = pending;
+                pending = child;
+            }
+        };
+        for (auto& child : node.statements) take(child);
+        take(node.first);
+        take(node.second);
+    };
+    detach(*this);
+    while (pending) {
+        auto* node = pending;
+        pending = node->teardown_next_;
+        node->teardown_next_ = nullptr;
+        detach(*node);
+        // Statement edges are empty before delete, so nested teardown is a
+        // leaf. Payload Expr and shared metadata keep their normal owners.
+        delete node;
+    }
+}
+
+MemberName member_name(const Expr& expression) {
+    return {expression.text, token_origin(expression.location).fresh};
+}
+
+std::optional<BuiltinType> builtin_kind(std::string_view spelling) {
+    static constexpr std::pair<std::string_view, BuiltinType> types[] = {
+        {"void", BuiltinType::Void}, {"bool", BuiltinType::Bool},
+        {"i8", BuiltinType::I8}, {"u8", BuiltinType::U8},
+        {"i16", BuiltinType::I16}, {"u16", BuiltinType::U16},
+        {"i32", BuiltinType::I32}, {"u32", BuiltinType::U32},
+        {"i64", BuiltinType::I64}, {"u64", BuiltinType::U64},
+        {"i128", BuiltinType::I128}, {"u128", BuiltinType::U128},
+        {"iptr", BuiltinType::Iptr}, {"uptr", BuiltinType::Uptr},
+        {"f32", BuiltinType::F32}, {"f64", BuiltinType::F64},
+        {"f80", BuiltinType::F80}, {"f128", BuiltinType::F128},
+        {"fptr", BuiltinType::Fptr}, {"label", BuiltinType::Label},
+    };
+    for (const auto& [name, kind] : types) if (spelling == name) return kind;
+    return std::nullopt;
+}
 
 bool is_meta_type(const TypePtr& type) {
     if (!type) return false;
@@ -79,26 +180,57 @@ TypePtr copy_type(const TypePtr& type) {
         if (source->function) {
             destination->function = std::make_shared<FunctionType>(*source->function);
             destination->function->result = copy(source->function->result);
-            for (auto& parameter : destination->function->parameters)
+            for (auto& parameter : destination->function->parameters) {
                 parameter.type = copy(parameter.type);
+                parameter.declared_array_type = copy(parameter.declared_array_type);
+            }
         }
     }
     return result;
 }
 
-bool has_pending_array_bound(const TypePtr& type) {
+bool has_pending_type_bound(const TypePtr& type) {
     std::unordered_set<const Type*> seen;
     std::vector<TypePtr> pending{type};
     while (!pending.empty()) {
         auto next = std::move(pending.back());
         pending.pop_back();
         if (!next || !seen.insert(next.get()).second) continue;
-        if (next->array_bound && next->lanes == 0) return true;
+        if (((next->array_bound || next->vector_bound) && next->lanes == 0) ||
+            (next->kind == Type::Kind::Array && !next->lanes &&
+             next->array_extent_dependency == Type::ArrayExtentDependency::ExpansionContext) ||
+            deferred_vector_extent(next) ||
+            next->kind == Type::Kind::Generic) return true;
         pending.push_back(next->element);
         pending.push_back(next->pointee);
         if (next->function) {
             pending.push_back(next->function->result);
-            for (const auto& parameter : next->function->parameters) pending.push_back(parameter.type);
+            for (const auto& parameter : next->function->parameters) {
+                pending.push_back(parameter.type);
+                pending.push_back(parameter.declared_array_type);
+            }
+        }
+    }
+    return false;
+}
+
+bool has_context_dependent_type_bound(const TypePtr& type) {
+    std::unordered_set<const Type*> seen;
+    std::vector<TypePtr> pending{type};
+    while (!pending.empty()) {
+        auto next = std::move(pending.back());
+        pending.pop_back();
+        if (!next || !seen.insert(next.get()).second) continue;
+        if (deferred_vector_extent(next) || (next->kind == Type::Kind::Array && !next->lanes &&
+            next->array_extent_dependency == Type::ArrayExtentDependency::ExpansionContext)) return true;
+        pending.push_back(next->element);
+        pending.push_back(next->pointee);
+        if (next->function) {
+            pending.push_back(next->function->result);
+            for (const auto& parameter : next->function->parameters) {
+                pending.push_back(parameter.type);
+                pending.push_back(parameter.declared_array_type);
+            }
         }
     }
     return false;
@@ -228,6 +360,7 @@ TypePtr record_type(const RecordDecl& declaration) {
 TypePtr enum_type(const EnumDecl& declaration) {
     auto type = enum_type(declaration.name, declaration.underlying);
     type->nominal_identity = declaration.nominal_identity;
+    type->captured_tag_errors = declaration.captured_type_errors;
     return type;
 }
 
@@ -393,14 +526,20 @@ std::string canonical_type_name(const TypePtr& type) {
     return result;
 }
 
-bool same_type(const TypePtr& left, const TypePtr& right) {
+enum class TypeComparisonMode { Exact, Source, Generic };
+
+static bool same_type_impl(const TypePtr& left, const TypePtr& right,
+                          TypeComparisonMode mode, bool& pending_extent) {
+    const auto same = [&](const TypePtr& a, const TypePtr& b) {
+        return same_type_impl(a, b, mode, pending_extent);
+    };
     if (!left || !right || left->kind != right->kind || left->is_const != right->is_const ||
         left->is_volatile != right->is_volatile ||
         left->is_restrict != right->is_restrict ||
         left->is_atomic != right->is_atomic) return false;
     if (left->kind == Type::Kind::Pointer)
         return left->address_space == right->address_space &&
-               same_type(left->pointee, right->pointee);
+               same(left->pointee, right->pointee);
     if (left->kind == Type::Kind::Function) {
         if (!left->function || !right->function) return false;
         const auto& a = *left->function;
@@ -416,13 +555,13 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
                 b.stack_cleanup.value_or("caller") ||
             a_clobbers != b_clobbers ||
             a.parameters.size() != b.parameters.size() ||
-            !same_type(a.result, b.result))
+            !same(a.result, b.result))
             return false;
         for (std::size_t index = 0; index < a.parameters.size(); ++index) {
             if (a.parameters[index].mode != b.parameters[index].mode ||
                 a.parameters[index].location_name.value_or("auto") !=
                     b.parameters[index].location_name.value_or("auto") ||
-                !same_type(callable_parameter_type(a.parameters[index].type,
+                !same(callable_parameter_type(a.parameters[index].type,
                                                    a.parameters[index].mode),
                            callable_parameter_type(b.parameters[index].type,
                                                    b.parameters[index].mode)))
@@ -430,16 +569,36 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
         }
         return true;
     }
-    if (left->kind == Type::Kind::Generic) return left->generic_name == right->generic_name;
+    if (left->kind == Type::Kind::Generic) return generic_type_key(*left) == generic_type_key(*right);
     if (left->kind == Type::Kind::Vector) {
+        if (left->scalable != right->scalable) return false;
+        const auto pending = [mode](const TypePtr& type) {
+            return deferred_vector_extent(type) ||
+                (mode == TypeComparisonMode::Generic && !type->lanes && type->vector_bound);
+        };
+        if (mode != TypeComparisonMode::Exact && (pending(left) || pending(right))) {
+            if ((!pending(left) && !left->lanes) ||
+                (!pending(right) && !right->lanes)) return false;
+            pending_extent = true;
+            return same(left->element, right->element);
+        }
         return left->lanes == right->lanes &&
-               left->scalable == right->scalable &&
-               same_type(left->element, right->element);
+               (left->lanes != 0 || left->vector_bound == right->vector_bound) &&
+               same(left->element, right->element);
     }
     if (left->kind == Type::Kind::Array) {
+        const auto pending = [mode](const TypePtr& type) {
+            return !type->lanes && (type->array_extent_dependency == Type::ArrayExtentDependency::ExpansionContext ||
+                (mode == TypeComparisonMode::Generic && type->array_bound));
+        };
+        if (mode != TypeComparisonMode::Exact && (pending(left) || pending(right))) {
+            if ((!pending(left) && !left->lanes) || (!pending(right) && !right->lanes)) return false;
+            pending_extent = true;
+            return same(left->element, right->element);
+        }
         return left->lanes == right->lanes &&
                (left->lanes != 0 || left->array_bound == right->array_bound) &&
-               same_type(left->element, right->element);
+               same(left->element, right->element);
     }
     if (left->kind == Type::Kind::Record) {
         return left->is_union == right->is_union &&
@@ -453,6 +612,35 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
            left->nominal_key() == right->nominal_key();
 }
 
+bool same_type(const TypePtr& left, const TypePtr& right) {
+    bool unused{};
+    return same_type_impl(left, right, TypeComparisonMode::Exact, unused);
+}
+
+std::shared_ptr<const RecordDecl> Program::record_definition(const NominalTypeKey& key) const {
+    if (evaluation_record_definition) {
+        // A nested layout query may replace the scoped provider while running.
+        const auto query = evaluation_record_definition;
+        if (auto view = query(key)) return view;
+    }
+    for (const auto& record : records)
+        if (record.complete && record.nominal_key() == key)
+            return std::shared_ptr<const RecordDecl>{std::shared_ptr<const RecordDecl>{}, &record};
+    return {};
+}
+
+TypeComparison compare_source_types(const TypePtr& left, const TypePtr& right) {
+    bool pending{};
+    if (!same_type_impl(left, right, TypeComparisonMode::Source, pending)) return TypeComparison::Different;
+    return pending ? TypeComparison::DeferredBound : TypeComparison::Same;
+}
+
+TypeComparison compare_generic_types(const TypePtr& left, const TypePtr& right) {
+    bool pending{};
+    if (!same_type_impl(left, right, TypeComparisonMode::Generic, pending)) return TypeComparison::Different;
+    return pending ? TypeComparison::DeferredBound : TypeComparison::Same;
+}
+
 TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode) {
     if (!type || mode != ParameterMode::In || !type->is_const) return type;
     auto normalized = std::make_shared<Type>(*type);
@@ -460,35 +648,146 @@ TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode) {
     return normalized;
 }
 
-bool compatible_pointee(const TypePtr& source, const TypePtr& destination,
-                        unsigned depth, bool nested_qualification) {
-    if (!source || !destination || depth >= 32) return false;
-    if ((source->is_const && !destination->is_const) ||
-        (source->is_volatile && !destination->is_volatile) ||
-        source->is_atomic != destination->is_atomic) return false;
-    if (!nested_qualification &&
-        ((!source->is_const && destination->is_const) ||
-         (!source->is_volatile && destination->is_volatile))) return false;
+PointeeCompatibility compare_pointee(const TypePtr& source, const TypePtr& destination,
+                                     unsigned depth, bool nested_qualification) {
+    using Result = PointeeCompatibility;
+    auto from = source, to = destination;
+    bool immediate = depth == 0;
+    bool pending{};
     const auto is_void = [](const TypePtr& type) {
         return type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
     };
-    if (depth == 0 && (is_void(source) || is_void(destination)))
-        return source->kind != Type::Kind::Function && destination->kind != Type::Kind::Function;
-    if (source->kind != destination->kind) return false;
-    if (source->kind == Type::Kind::Pointer)
-        return source->address_space == destination->address_space &&
-            compatible_pointee(source->pointee, destination->pointee, depth + 1,
-                               nested_qualification && destination->is_const);
-    if (source->kind == Type::Kind::Array || source->kind == Type::Kind::Vector)
-        return source->lanes == destination->lanes && source->scalable == destination->scalable &&
-            compatible_pointee(source->element, destination->element, depth + 1,
-                               nested_qualification);
-    auto from = std::make_shared<Type>(*source);
-    auto to = std::make_shared<Type>(*destination);
-    from->is_const = to->is_const = false;
-    from->is_volatile = to->is_volatile = false;
-    from->is_restrict = to->is_restrict = false;
-    return same_type(from, to);
+    while (from && to) {
+        if ((from->is_const && !to->is_const) ||
+            (from->is_volatile && !to->is_volatile) ||
+            from->is_atomic != to->is_atomic) return Result::Incompatible;
+        if (!nested_qualification &&
+            ((!from->is_const && to->is_const) ||
+             (!from->is_volatile && to->is_volatile))) return Result::Incompatible;
+        if (immediate && (is_void(from) || is_void(to)))
+            return from->kind != Type::Kind::Function && to->kind != Type::Kind::Function
+                ? Result::Compatible : Result::Incompatible;
+        if (from->kind != to->kind) return Result::Incompatible;
+        immediate = false;
+        if (from->kind == Type::Kind::Pointer) {
+            if (from->address_space != to->address_space) return Result::Incompatible;
+            nested_qualification = nested_qualification && to->is_const;
+            from = from->pointee;
+            to = to->pointee;
+            continue;
+        }
+        if (from->kind == Type::Kind::Array || from->kind == Type::Kind::Vector) {
+            const auto deferred = [](const TypePtr& type) {
+                return (type->kind == Type::Kind::Array && !type->lanes &&
+                    type->array_extent_dependency == Type::ArrayExtentDependency::ExpansionContext) ||
+                    deferred_vector_extent(type);
+            };
+            const bool pending_extent = deferred(from) || deferred(to);
+            if (pending_extent && ((!deferred(from) && !from->lanes) ||
+                (!deferred(to) && !to->lanes))) return Result::Incompatible;
+            if ((!pending_extent && from->lanes != to->lanes) || from->scalable != to->scalable)
+                return Result::Incompatible;
+            pending = pending || pending_extent;
+            from = from->element;
+            to = to->element;
+            continue;
+        }
+        auto unqualified_from = std::make_shared<Type>(*from);
+        auto unqualified_to = std::make_shared<Type>(*to);
+        unqualified_from->is_const = unqualified_to->is_const = false;
+        unqualified_from->is_volatile = unqualified_to->is_volatile = false;
+        unqualified_from->is_restrict = unqualified_to->is_restrict = false;
+        switch (compare_source_types(unqualified_from, unqualified_to)) {
+        case TypeComparison::Same: return pending ? Result::DeferredExtent : Result::Compatible;
+        case TypeComparison::DeferredBound: return Result::DeferredExtent;
+        case TypeComparison::Different: return Result::Incompatible;
+        }
+    }
+    return Result::Incompatible;
+}
+
+bool compatible_pointee(const TypePtr& source, const TypePtr& destination,
+                        unsigned depth, bool nested_qualification) {
+    return compare_pointee(source, destination, depth, nested_qualification) == PointeeCompatibility::Compatible;
+}
+
+PointerJoinResult<TypePtr> common_pointer_type(const TypePtr& left, const TypePtr& right,
+                                              const AddressSpaceJoin& spaces) {
+    if (!left || !right) return {};
+    struct Traits {
+        using Type = TypePtr;
+        PointerJoinNode<Type> describe(const Type& type) const {
+            PointerJoinNode<Type> node;
+            switch (type->kind) {
+            case cross::Type::Kind::Pointer:
+                node.kind = PointerJoinKind::Pointer;
+                if (type->pointee) node.child = type->pointee;
+                break;
+            case cross::Type::Kind::Array:
+                node.kind = PointerJoinKind::Array;
+                if (type->element) node.child = type->element;
+                break;
+            case cross::Type::Kind::Vector:
+                node.kind = PointerJoinKind::Vector;
+                if (type->element) node.child = type->element;
+                break;
+            case cross::Type::Kind::Function: node.kind = PointerJoinKind::Function; break;
+            case cross::Type::Kind::Builtin:
+                if (type->builtin == BuiltinType::Void) node.kind = PointerJoinKind::Void;
+                break;
+            default: break;
+            }
+            node.is_const = type->is_const;
+            node.is_volatile = type->is_volatile;
+            node.is_atomic = type->is_atomic;
+            node.is_restrict = type->is_restrict;
+            node.address_space = type->address_space;
+            node.extent = type->lanes;
+            node.scalable = type->scalable;
+            node.deferred_extent = !type->lanes &&
+                ((type->kind == cross::Type::Kind::Array &&
+                  type->array_extent_dependency == cross::Type::ArrayExtentDependency::ExpansionContext) ||
+                 deferred_vector_extent(type));
+            return node;
+        }
+        PointerJoinEquality equal_leaf(const Type& left, const Type& right) const {
+            auto a = std::make_shared<cross::Type>(*left), b = std::make_shared<cross::Type>(*right);
+            a->is_const = b->is_const = a->is_volatile = b->is_volatile = false;
+            a->is_restrict = b->is_restrict = false;
+            switch (compare_source_types(a, b)) {
+            case TypeComparison::Same: return PointerJoinEquality::Same;
+            case TypeComparison::DeferredBound: return PointerJoinEquality::Deferred;
+            case TypeComparison::Different: return PointerJoinEquality::Different;
+            }
+            return PointerJoinEquality::Different;
+        }
+        Type rebuild(const Type& base, const PointerJoinNode<Type>& node) const {
+            auto result = std::make_shared<cross::Type>(*base);
+            result->is_const = node.is_const;
+            result->is_volatile = node.is_volatile;
+            result->is_atomic = node.is_atomic;
+            result->is_restrict = node.is_restrict;
+            result->address_space = node.address_space;
+            if (node.kind == PointerJoinKind::Pointer) result->pointee = *node.child;
+            else if (node.kind == PointerJoinKind::Array || node.kind == PointerJoinKind::Vector)
+                result->element = *node.child;
+            return result;
+        }
+    } traits;
+    return join_pointer_types(traits, left, right, spaces);
+}
+
+TypePtr qualified_element_type(const TypePtr& container) {
+    if (!container || !container->element ||
+        (container->kind != Type::Kind::Array && container->kind != Type::Kind::Vector))
+        return {};
+    if ((!container->is_const || container->element->is_const) &&
+        (!container->is_volatile || container->element->is_volatile))
+        return container->element;
+    auto result = std::make_shared<Type>(*container->element);
+    result->is_const = result->is_const || container->is_const;
+    result->is_volatile = result->is_volatile || container->is_volatile;
+    return result;
 }
 
 bool is_integer(const TypePtr& type) {

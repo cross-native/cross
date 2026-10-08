@@ -3,6 +3,8 @@
 #pragma once
 
 #include "common/options.hpp"
+#include "common/code_address.hpp"
+#include "common/patch_address.hpp"
 
 #include <optional>
 #include <cstdint>
@@ -173,6 +175,11 @@ struct AbiEntry {
     std::string gcc_calling_attribute;
     bool compilation_selectable{true};
     bool function_selectable{true};
+    // Target-interpreted object tag; empty keeps the object writer's default.
+    std::string elf_abi_tag;
+    // Nonzero marks a private-call convention candidate for subtargets whose
+    // native integer registers have this width.
+    unsigned private_carrier_bits{};
     std::vector<AbiRegisterBank> banks;
     std::vector<AbiRule> rules;
     std::vector<std::string> call_clobbers;
@@ -220,9 +227,15 @@ struct RegisterEntry {
     // to ABI and instruction registries while remaining unavailable to the
     // managed allocator and user hard bindings.
     bool compiler_owned{};
+    // Instruction source constraints differ from managed hard-binding policy
+    // (for example an ordered floating register can be instruction-only).
+    std::vector<ScalarMode> instruction_scalar_modes{};
+    bool instruction_vector_values{};
+    bool instruction_writable{true};
 };
 
 enum class InstructionOperandRole { Input, Output, InOut };
+enum class InstructionLabelScope { AnyVisible, SameFunction };
 
 struct InstructionOperandEntry {
     InstructionOperandRole role{InstructionOperandRole::Input};
@@ -252,6 +265,14 @@ struct InstructionOperandEntry {
     // Optional exact physical storage constraint. Register class and width
     // alone cannot describe accumulator or ordered-register-stack forms.
     std::string_view register_storage{};
+    // Exact scalar source types accepted by this patch field. This is distinct
+    // from the range accepted for an ordinary (non-patch) immediate operand.
+    std::vector<std::string_view> patch_types{};
+    PatchAddressRepresentation patch_address{PatchAddressRepresentation::Unavailable};
+    bool patch_supports_symbol_relocation{};
+    // A direct label field can impose an owner constraint independently of
+    // its spelling or the source function's ABI.
+    InstructionLabelScope label_scope{InstructionLabelScope::AnyVisible};
 };
 
 enum class InstructionControlEffect {
@@ -319,9 +340,12 @@ struct PatchValueMaterializerEntry {
     std::string_view type_name;
     unsigned bits{};
     std::string_view feature;
-    bool supports_address_sink{};
+    PatchAddressRepresentation patch_address{PatchAddressRepresentation::Unavailable};
     // The contiguous encoded field accepts a link-time symbol plus addend.
     bool supports_symbol_relocation{};
+    // Repeated lexical uses can read one immutable cell without duplicating
+    // its physical field. The target owns the read/encoding sequence.
+    bool supports_shared_cell{};
 };
 
 struct AtomicWidthEntry {
@@ -373,6 +397,7 @@ struct TargetDataLayout {
     BitFieldUnitSharing bit_field_unit_sharing{
         BitFieldUnitSharing::SameUnqualifiedBase};
     BitFieldPlacement bit_field_placement{BitFieldPlacement::AlignedUnits};
+    CodeAddressRepresentation code_addresses{CodeAddressRepresentation::Opaque};
 };
 
 // Target-independent optimizations describe the value they need priced;
@@ -394,6 +419,26 @@ struct TargetCostModel {
     IntegerConstantMaterializationCost integer_constant_materialization{};
 };
 
+// Direct typed instruction-memory addressing. These are encoding constraints,
+// independent of ABI result/argument transport and managed address legalization.
+struct InstructionAddressMode {
+    unsigned pointer_bits{};
+    unsigned register_bits{};
+    std::string_view register_class;
+    std::vector<std::uint32_t> address_spaces;
+    std::vector<unsigned> index_scales;
+    std::vector<std::string_view> forbidden_index_storage;
+    unsigned displacement_bits{};
+    std::string_view feature;
+};
+
+// An optional `$::feature::NAME` the target implements. A nonempty `option`
+// gates it on that resolved boolean target option.
+struct LanguageFeatureEntry {
+    std::string_view name;
+    std::string_view option;
+};
+
 struct TargetInfo {
     std::string_view architecture;
     std::vector<std::string_view> triple_prefixes;
@@ -410,6 +455,8 @@ struct TargetInfo {
     const SubtargetTable* subtargets{};
     TargetCostModel cost_model;
     std::vector<AddressSpaceEntry> address_spaces;
+    std::vector<InstructionAddressMode> instruction_address_modes{};
+    std::vector<LanguageFeatureEntry> language_features{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;
@@ -417,12 +464,17 @@ struct TargetInfo {
 
 const std::vector<const TargetInfo*>& all_targets();
 const TargetInfo* target_for_triple(std::string_view triple);
+// Language feature names (without `$::feature::`) available for the resolved
+// target and options; target instruction-set extensions are listed separately.
+std::vector<std::string_view> language_features(const CompilerOptions& options);
 const AbiEntry* find_abi(const TargetInfo& target, std::string_view name,
                          std::string_view triple);
 const AbiEntry* find_abi(const TargetInfo& target, AbiId id);
 const RegisterEntry* find_register(const TargetInfo& target, std::string_view name);
 const PatchValueMaterializerEntry* find_patch_value_materializer(
     const TargetInfo& target, std::string_view type_name);
+bool patch_operand_accepts_type(const InstructionOperandEntry& operand, std::string_view type_name,
+                               unsigned source_bits);
 const InstructionEntry* find_instruction(const TargetInfo& target, std::string_view name);
 // A source mnemonic can expose several typed forms.  `find_instruction` is
 // retained for callers that need only an existence check or a canonical form;
@@ -432,5 +484,9 @@ std::vector<const InstructionEntry*> find_instruction_forms(
 bool target_has_instruction(const TargetInfo& target, std::string_view name);
 const AddressSpaceEntry* find_address_space(const TargetInfo& target,
                                             std::uint32_t number);
+// Source pointer types require an explicitly registered native representation.
+// Shared by ordinary HIR validation and pre-erasure expansion validation.
+std::optional<std::string> address_space_type_error(const TargetInfo& target,
+                                                   std::uint32_t number);
 
 } // namespace cross

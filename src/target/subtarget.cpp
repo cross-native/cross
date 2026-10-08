@@ -87,6 +87,10 @@ bool Subtarget::has_feature(std::string_view name) const {
     return feature && has_feature(*feature);
 }
 
+bool Subtarget::supports_registry_feature(std::string_view name) const {
+    return name.empty() || name == "base" || name == target_->architecture || has_feature(name);
+}
+
 const SubtargetTable* subtarget_table_for(const TargetInfo& target) {
     return target.subtargets;
 }

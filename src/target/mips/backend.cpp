@@ -5,6 +5,7 @@
 
 #include "common/options.hpp"
 #include "middle/machine_ir.hpp"
+#include "model/model.hpp"
 #include "target/backend.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/machine_description.hpp"
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <unordered_set>
 
 namespace cross::mips {
 namespace {
@@ -84,11 +86,12 @@ public:
         return "mips1";
     }
 
-    // n64 and n32 are defined on a 64-bit FPU: the 32 floating registers are
-    // independently addressable doublewords, so neither the FPXX transport
-    // rules nor the even-register restriction applies.
+    // A 64-bit address model produces ELF64 objects of the n64 class, which
+    // is defined on a 64-bit FPU: the 32 floating registers are independently
+    // addressable doublewords, so neither the FPXX transport rules nor the
+    // even-register restriction applies.
     static bool wide_register_abi(const Subtarget& subtarget) {
-        return subtarget.abi() == "n64" || subtarget.abi() == "n32";
+        return subtarget.abi_info().address_bits > 32;
     }
 
     std::vector<std::string> object_writer_features(
@@ -126,7 +129,8 @@ public:
     bool finalize_object(const std::filesystem::path& path,
                          const Subtarget& subtarget,
                          Diagnostics& diagnostics) const override {
-        const bool needs_eabi32 = subtarget.abi() == "eabi32";
+        const bool needs_eabi32 =
+            elf_abi_tag(subtarget.abi_info()) == ElfAbiTag::Eabi32;
         const bool needs_single_float =
             subtarget.has_feature(Feature::SingleFloat);
         if (!needs_eabi32 && !needs_single_float) return true;
@@ -271,7 +275,24 @@ public:
             diagnostics.command_error(
                 "the MIPS '" + std::string(subtarget.abi()) +
                 "' ABI has 32-bit addresses and cannot be selected for a "
-                "mips64 target triple; use -mabi=n64 or a mips/mipsel triple");
+                "mips64 target triple; use -mabi=cross, -mabi=n64, or a "
+                "mips/mipsel triple");
+        }
+        // Object tags are model data; this writer implements EABI32 only.
+        for (const auto& abi : model_registry().abis()) {
+            if (abi.architecture != subtarget.target().architecture) continue;
+            const auto tag = elf_abi_tag(abi);
+            if (!tag) {
+                diagnostics.command_error(
+                    "ABI model '" + abi.canonical_name +
+                    "' requests the unsupported MIPS ELF ABI tag '" +
+                    abi.elf_abi_tag + "'; only 'eabi32' is implemented");
+            } else if (*tag == ElfAbiTag::Eabi32 && abi.address_bits != 32) {
+                diagnostics.command_error(
+                    "ABI model '" + abi.canonical_name +
+                    "' requests the ELF32 'eabi32' tag but has " +
+                    std::to_string(abi.address_bits) + "-bit addresses");
+            }
         }
         if (wide_abi && !subtarget.has_feature(Feature::Mips3)) {
             diagnostics.command_error(
@@ -392,10 +413,11 @@ public:
         mir::AssemblyBundle result;
         // The shared data emitter owns sink objects through this bundle,
         // including when the patch value itself is managed Machine IR.
+        std::unordered_set<std::uint32_t> collected;
         for (const auto& function : managed.functions) {
             for (const auto& value : function.values) {
                 if (value.kind != mir::ValueKind::PatchValue ||
-                    !value.patch_sink) continue;
+                    !value.patch_sink || !collected.insert(value.patch_id).second) continue;
                 const auto bits = type_bits(hir_module, value.type);
                 if (bits != 8 && bits != 16 && bits != 32 && bits != 64) {
                     diagnostics.error(value.location,

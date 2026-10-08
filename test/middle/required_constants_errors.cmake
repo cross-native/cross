@@ -28,11 +28,12 @@ reject(argument "static i32 helper(in i32 x) { return x; } global i32 value = 1 
     "incompatible argument type")
 reject(pointer_argument "static i32 helper(in const u32 *x) { return 7; } global i32 value = 1 || helper(\"bad\");"
     "incompatible argument type")
-reject(dereference "global i32 value = 0 && *1;" "unsupported unary operand")
+reject(dereference "global i32 value = 0 && *1;" "dereference requires a pointer operand")
 reject(operand "global i32 value = 0 && (\"bad\" + 1);" "unsupported type|non-integer operation|unsupported operation")
-reject(conditional "global i32 value = 1 ? 7 : \"bad\";" "unsupported type")
+reject(conditional "global i32 value = 1 ? 7 : \"bad\";"
+    "conditional pointer/integer operands require an integer constant zero")
 reject(runtime "global i32 value = $::runtime(7);" "runtime is invalid")
-reject(runtime_short "global i32 value = 1 || $::runtime(7);" "runtime is invalid")
+reject(runtime_short "global i32 value = 0 || $::runtime(7);" "runtime is invalid")
 reject(runtime_only "[[runtime_only]] static i32 seed() { return 1; } global i32 value = seed();"
     "runtime-only function")
 reject(runtime_chain "[[runtime_only]] static i32 seed() { return 1; } static i32 helper() { return seed(); } global i32 value = helper();"

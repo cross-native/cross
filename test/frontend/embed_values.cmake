@@ -156,9 +156,11 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         vector_effective_type vector_const_write vector_out_of_view
         vector_lane_out_of_view record_value_unassigned record_value_alias
         record_value_invalid_bool record_value_nominal record_value_nominal_write
+        nested_value_unassigned nested_value_alias nested_value_invalid_bool
         record_value_padding_freeze record_value_scalar_alias
         bit_field_alias bit_field_alias_write compound_unassigned
-        compound_invalid_operand pointer_increment_overflow bit_field_foreign_unit)
+        compound_invalid_operand pointer_increment_overflow bit_field_foreign_unit
+        deep_scalar_alias deep_tag_alias)
     if(case STREQUAL unassigned_read)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(1u32);\n"
@@ -179,7 +181,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const u8 *pointer = $::meta::data(value);\n"
             "pointer[0u32] = 7u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable supported storage")
+        set(expected "cannot write a const subobject")
     elseif(case STREQUAL view_overread)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -371,7 +373,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const struct eval_bits *record = (const struct eval_bits *)$::meta::data(value);\n"
             "record->value = 5u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable supported storage")
+        set(expected "cannot write a const subobject")
     elseif(case STREQUAL record_array_overread)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_collection));\n"
@@ -390,7 +392,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const struct eval_outer *outer = (const struct eval_outer *)$::meta::data(value);\n"
             "outer->inner.value = 7uptr;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable supported storage")
+        set(expected "cannot write a const subobject")
     elseif(case STREQUAL union_unassigned)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(union eval_union));\n"
@@ -460,7 +462,7 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "const u32x4 *vectors = (const u32x4 *)$::meta::data(value);\n"
             "vectors[0u32][0u32] = 1u32;\n"
             "return 0u32;")
-        set(expected "meta pointer write requires mutable supported storage")
+        set(expected "cannot write a const subobject")
     elseif(case STREQUAL vector_out_of_view)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(15u32);\n"
@@ -495,6 +497,29 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::data(value)[0u32] = 2u8;\n"
             "struct eval_bool_record snapshot = *((struct eval_bool_record *)$::meta::data(value));\n"
             "return snapshot.flag;")
+        set(expected "invalid bool representation")
+    elseif(case STREQUAL nested_value_unassigned)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_nested_scalar));\n"
+            "((u32 *)$::meta::data(value))[0uptr] = 3u32;\n"
+            "struct eval_nested_scalar snapshot = *((struct eval_nested_scalar *)$::meta::data(value));\n"
+            "return snapshot.cells[0uptr].value;")
+        set(expected "read of unassigned buffer byte")
+    elseif(case STREQUAL nested_value_alias)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_nested_scalar));\n"
+            "((f32 *)$::meta::data(value))[0uptr] = 1.5f32;\n"
+            "((f32 *)$::meta::data(value))[1uptr] = 2.5f32;\n"
+            "struct eval_nested_scalar snapshot = *((struct eval_nested_scalar *)$::meta::data(value));\n"
+            "return snapshot.cells[0uptr].value;")
+        set(expected "meta pointer read violates effective type")
+    elseif(case STREQUAL nested_value_invalid_bool)
+        string(CONCAT body
+            "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_nested_bool));\n"
+            "for (uptr i = 0uptr; i < $::meta::cap(value); ++i) $::meta::data(value)[i] = 0u8;\n"
+            "$::meta::data(value)[sizeof(bool)] = 2u8;\n"
+            "struct eval_nested_bool snapshot = *((struct eval_nested_bool *)$::meta::data(value));\n"
+            "return snapshot.cells[0uptr].flag;")
         set(expected "invalid bool representation")
     elseif(case STREQUAL record_value_nominal OR case STREQUAL record_value_nominal_write)
         string(CONCAT body
@@ -565,6 +590,25 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "struct eval_bit_units *record = (struct eval_bit_units *)$::meta::data(value);\n"
             "record->first = 5u32; return 0u32;")
         set(expected "meta pointer write violates aggregate effective type")
+    elseif(case STREQUAL deep_scalar_alias OR case STREQUAL deep_tag_alias)
+        set(body "")
+        foreach(index RANGE 0 47)
+            math(EXPR next "${index} + 1")
+            string(APPEND body "struct deep_${index} { struct deep_${next} child[1]; };\n")
+        endforeach()
+        string(APPEND body "struct deep_48 { uptr value; };\n")
+        if(case STREQUAL deep_scalar_alias)
+            string(APPEND body "struct deep_0 object = {}; return (uptr)*((f32 *)&object);")
+            set(expected "meta pointer read violates aggregate effective type")
+        else()
+            string(APPEND body
+                "struct deep_tagged { struct deep_0 child; u32 bits : 3; };\n"
+                "$::meta::buffer raw = $::meta::alloc(sizeof(struct deep_tagged));\n"
+                "for (uptr index = 0uptr; index < $::meta::cap(raw); ++index) $::meta::data(raw)[index] = 0u8;\n"
+                "struct deep_tagged *root = (struct deep_tagged *)$::meta::data(raw);\n"
+                "*((f32 *)&root->child) = 1.5f32; root->bits = 5u32; return 0uptr;")
+            set(expected "meta pointer write violates aggregate effective type")
+        endif()
     elseif(case STREQUAL integer_cast)
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
@@ -586,6 +630,8 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         "struct eval_other { u8 tag; uptr value; };\n"
         "struct eval_scalar { u32 value; };\n"
         "struct eval_bool_record { bool flag; };\n"
+        "struct eval_nested_bool { struct eval_bool_record cells[2]; };\n"
+        "struct eval_nested_scalar { struct eval_scalar cells[2]; };\n"
         "struct eval_packed [[packed]] { u8 tag; uptr value; };\n"
         "struct eval_bits { u32 value : 3; };\n"
         "struct eval_bit_units { u32 first : 3; u32 second : 32; };\n"

@@ -91,7 +91,7 @@ foreach(case bad_at bad_slice bad_concat)
         set(expected "slice length is outside the token sequence")
     else()
         set(operation "$::meta::concat(input, 3u32)")
-        set(expected "concat requires token values")
+        set(expected "incompatible argument type for translation-only operation")
     endif()
     set(input "${OUTPUT}-${case}.x")
     file(WRITE "${input}"

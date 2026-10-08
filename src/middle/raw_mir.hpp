@@ -63,6 +63,7 @@ struct RawBlock {
     BlockId id;
     SourceLocation location;
     std::string source_label;
+    std::optional<hir::LabelId> source_label_id;
     std::vector<Instruction> instructions;
     std::vector<BlockId> predecessors;
     std::vector<BlockId> successors;

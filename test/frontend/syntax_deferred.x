@@ -200,13 +200,305 @@ definition [[noinline]] static u32 deferred_definition(in u32 value) {
     }
     return total;
 }
+namespace GeneratedDeferredOrder {
+    [[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+        return $::quote { ; };
+    }
+    syntax Inner : statement { prefix "generated_inner"; match value:expr ";"; expand discard; }
+    static $::meta::syntax find_inner(in $::meta::syntax value) {
+        if ($::meta::is_extension(value, "GeneratedDeferredOrder::Inner")) return value;
+        for (uptr at = 0uptr; at < $::meta::child_count(value); ++at) {
+            $::meta::syntax found = find_inner($::meta::child(value, at));
+            if ($::meta::is_extension(found, "GeneratedDeferredOrder::Inner")) return found;
+        }
+        return value;
+    }
+    [[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        $::meta::syntax block = $::meta::child($::meta::child(body, 0uptr), 0uptr);
+        $::meta::syntax value = $::syntax::node($::meta::extension_match(find_inner(body)), "value");
+        $::static_assert($::meta::is_kind(value, "deferred"), "generated expression was classified early");
+        return $::quote {
+            {
+                $::unquote($::meta::tokens($::meta::child(block, 0uptr)))
+                $::unquote($::meta::child(block, 1uptr))
+                $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))
+                { typedef u8 $::unquote($::syntax::capture(input, "name"));
+                  $::static_assert(sizeof($::unquote(value)) == sizeof(uptr), "original generated alias");
+                  return $::unquote(value) + 7uptr; }
+            }
+        };
+    }
+    syntax Move : statement { prefix "generated_move"; match name:ident body:stmt; expand move; }
+    syntax Inner, Move;
+    [[macro]] static $::meta::tokens generate(in $::meta::tokens name) {
+        return $::quote {
+            [[noinline]] static uptr $::unquote(name)(in uptr seed) {
+                generated_move Later { introduce_type!(Later); generated_inner (Later)seed; }
+                return 0uptr;
+            }
+        };
+    }
+    generate!(first)
+    generate!(second)
+}
+
+namespace DeferredBoundaries {
+    [[syntax_expander]] static $::meta::tokens keep(in $::meta::syntax_match input) {
+        return $::quote { $::unquote($::syntax::node(input, "body")) };
+    }
+    syntax Inner : statement { prefix "boundary_inner"; match body:stmt; expand keep; }
+    static u32 count_deferred(in $::meta::syntax value) {
+        if ($::meta::is_extension(value, "DeferredBoundaries::Inner")) {
+            $::static_assert($::meta::is_kind(
+                $::syntax::node($::meta::extension_match(value), "body"), "deferred"),
+                "name-dependent statement was classified before its owner");
+            return 1u32;
+        }
+        u32 count = 0u32;
+        for (uptr at = 0uptr; at < $::meta::child_count(value); ++at)
+            count += count_deferred($::meta::child(value, at));
+        return count;
+    }
+    [[syntax_expander]] static $::meta::tokens inspect(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        $::static_assert(count_deferred(body) == 1u32, "deferred statement boundary was lost");
+        return $::quote { $::unquote(body) };
+    }
+    syntax Inspect : statement { prefix "boundary_inspect"; match body:stmt; expand inspect; }
+    syntax Inner, Inspect;
+
+    [[syntax_expander]] static $::meta::tokens compose(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        return $::quote {
+            boundary_inspect {
+                introduce_type!(LateWord);
+                boundary_inner if ((LateWord)1u32) $::unquote(body)
+                    else $::unquote($::syntax::capture(input, "result")) += 97u32;
+            }
+        };
+    }
+    syntax Compose : statement { prefix "boundary_compose"; match result:ident body:stmt; expand compose; }
+
+    [[noinline]] global u32 labeled(in u32 selector) {
+        u32 result = 0u32;
+        boundary_inspect {
+            introduce_type!(LateWord);
+            boundary_inner global label exported:
+                if ((LateWord)selector) result += 7u32; else result += 11u32;
+        }
+        return result;
+    }
+    [[noinline]] static u32 spliced() {
+        syntax Compose;
+        u32 result = 13u32;
+        // The outer else cannot attach to the if inside the retained subtree.
+        boundary_compose result if (0u32) result += 99u32;
+        return result;
+    }
+}
+
+namespace CopiedDeferredBlocks {
+    [[macro]] static $::meta::tokens declare_local(in $::meta::tokens input) {
+        return $::quote { uptr $::unquote($::meta::call_site($::quote { local })) = 3uptr; };
+    }
+    [[macro]] static $::meta::tokens declare_static(in $::meta::tokens input) {
+        return $::quote { static uptr $::unquote($::meta::call_site($::quote { local })) = 3uptr; };
+    }
+    [[macro]] static $::meta::tokens binder(in $::meta::tokens input) {
+        return $::quote { $::unquote($::meta::call_site($::quote { local })) };
+    }
+    [[macro]] static $::meta::tokens statement_head(in $::meta::tokens input) {
+        return $::quote { uptr $::unquote($::meta::call_site($::quote { local })) };
+    }
+    [[macro]] static $::meta::tokens return_head(in $::meta::tokens input) {
+        return $::quote { return };
+    }
+    [[syntax_expander]] static $::meta::tokens repeat(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        return $::quote { { $::unquote(body) $::unquote(body) } };
+    }
+    syntax Repeat : statement { prefix "repeat_deferred"; match body:stmt; expand repeat; }
+    [[syntax_expander]] static $::meta::tokens once(in $::meta::syntax_match input) {
+        return $::quote { $::unquote($::syntax::node(input, "body")) };
+    }
+    syntax Once : statement { prefix "once_deferred"; match body:stmt; expand once; }
+
+    [[noinline]] static uptr automatic(in uptr seed) {
+        syntax Repeat;
+        uptr total = 0uptr;
+        uptr local = seed;
+        repeat_deferred { declare_local!(); local += seed; total += local; }
+        return total + local;
+    }
+    [[noinline]] static uptr persistent() {
+        syntax Repeat;
+        uptr total = 0uptr;
+        repeat_deferred { declare_static!(); local += 1uptr; total += local; }
+        return total;
+    }
+    [[noinline]] static uptr declaration_list(in uptr seed) {
+        syntax Repeat;
+        uptr total = 0uptr;
+        repeat_deferred { uptr binder!() = seed, next = local + 3uptr; total += next; }
+        return total;
+    }
+    [[noinline]] static uptr statement_list(in uptr seed) {
+        syntax Repeat;
+        uptr total = 0uptr;
+        repeat_deferred { statement_head!() = seed, next = local + 5uptr; total += next; }
+        return total;
+    }
+    [[noinline]] static uptr returned(in uptr seed) {
+        syntax Repeat;
+        repeat_deferred return_head!() + seed;
+    }
+    [[noinline]] static uptr direct_declaration(in uptr seed) {
+        syntax Once;
+        once_deferred statement_head!() = seed, next = local + 7uptr;
+        return next;
+    }
+}
+
+namespace CopiedDeferredBindings {
+    [[macro]] static $::meta::tokens declare(in $::meta::tokens name) {
+        return $::quote {
+            struct $::unquote(name) { uptr field; };
+            typedef struct $::unquote(name) $::unquote(name);
+            uptr $::unquote($::meta::call_site($::quote { local })) =
+                ++$::unquote($::meta::call_site($::quote { seed }));
+        };
+    }
+    [[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+        return $::quote { ; };
+    }
+    syntax Use : statement {
+        prefix "use_bindings"; match alias:type "," tag:type "," value:expr ";"; expand discard;
+    }
+    [[syntax_expander]] static $::meta::tokens repeat(in $::meta::syntax_match input) {
+        $::meta::syntax body = $::syntax::node(input, "body");
+        $::meta::syntax block = $::meta::child($::meta::child(body, 0uptr), 0uptr);
+        $::meta::syntax inner = body;
+        for (uptr at = 0uptr; at < $::meta::child_count(block); ++at) {
+            $::meta::syntax child = $::meta::child(block, at);
+            while ($::meta::is_kind(child, "core") && $::meta::child_count(child) == 1uptr)
+                child = $::meta::child(child, 0uptr);
+            if ($::meta::is_extension(child, "CopiedDeferredBindings::Use")) inner = child;
+        }
+        $::meta::syntax_match captured = $::meta::extension_match(inner);
+        $::meta::syntax alias = $::syntax::node(captured, "alias");
+        $::meta::syntax tag = $::syntax::node(captured, "tag");
+        $::meta::syntax value = $::syntax::node(captured, "value");
+        $::static_assert($::meta::is_kind(alias, "deferred") &&
+            $::meta::is_kind(tag, "deferred") && $::meta::is_kind(value, "deferred"),
+            "copies must replay the original deferred nodes, not newly matched captures");
+        $::meta::tokens alias_tokens = $::quote { $::unquote(alias) };
+        $::meta::tokens tag_tokens = $::quote { $::unquote(tag) };
+        $::meta::tokens value_tokens = $::quote { $::unquote(value) };
+        if ($::syntax::is_variant($::syntax::at(input, "mode", 0uptr), "text")) {
+            alias_tokens = $::meta::tokens(alias);
+            tag_tokens = $::meta::tokens(tag);
+            value_tokens = $::meta::tokens(value);
+        }
+        $::meta::tokens one = $::quote {
+            $::unquote($::meta::tokens($::meta::child(block, 0uptr)))
+            $::unquote($::meta::tokens($::meta::child(block, 1uptr)))
+            $::unquote(alias_tokens) object = { $::unquote(value_tokens) };
+            $::unquote(tag_tokens) *pointer = &object;
+            $::unquote($::syntax::capture(input, "total")) += pointer->field;
+            $::unquote($::meta::tokens($::meta::child(block, $::meta::child_count(block) - 1uptr)))
+        };
+        return $::quote { { $::unquote(one) $::unquote(one) } };
+    }
+    syntax Repeat : statement {
+        prefix "repeat_bindings";
+        match mode:choice(tree:("tree") | text:("text")) total:ident body:stmt;
+        expand repeat;
+    }
+    [[noinline]] static uptr structured(in uptr initial) {
+        syntax Use, Repeat;
+        uptr seed = initial;
+        uptr total = 0uptr;
+        repeat_bindings tree total {
+            declare!(Record); use_bindings Record, struct Record, ((Record *)0 ? 0uptr : local);
+        }
+        return total;
+    }
+    [[noinline]] static uptr projected(in uptr initial) {
+        syntax Use, Repeat;
+        uptr seed = initial;
+        uptr total = 0uptr;
+        repeat_bindings text total {
+            declare!(Record); use_bindings Record, struct Record, ((Record *)0 ? 0uptr : local);
+        }
+        return total;
+    }
+}
+
+#include "syntax_exited_scope.x"
+#define ExitedDeferredCopies ProjectedExitedDeferredCopies
+#define TEST_PROJECT_EXITED_ALL
+#include "syntax_exited_scope.x"
+#undef TEST_PROJECT_EXITED_ALL
+#undef ExitedDeferredCopies
+#include "syntax_implicit_tags.x"
+#define ImplicitTagCopies ProjectedImplicitTagCopies
+#define TEST_PROJECT_IMPLICIT
+#include "syntax_implicit_tags.x"
+#undef TEST_PROJECT_IMPLICIT
+#undef ImplicitTagCopies
+#define TEST_GENERATE_IMPLICIT
+#define ImplicitTagCopies GeneratedImplicitTagCopies
+#include "syntax_implicit_tags.x"
+#undef ImplicitTagCopies
+#define ImplicitTagCopies GeneratedProjectedImplicitTagCopies
+#define TEST_PROJECT_IMPLICIT
+#include "syntax_implicit_tags.x"
+#undef TEST_PROJECT_IMPLICIT
+#undef ImplicitTagCopies
+#undef TEST_GENERATE_IMPLICIT
+#include "syntax_ambiguous_scopes.x"
+
 #ifdef CUSTOM_SYNTAX_ABI
 [[abi(HOST_ABI)]]
 #endif
 // Share the explicit platform-ABI MIPS startup with syntax_raw.x.
 global u32 syntax_raw_entry() {
     if (deferred_statements(5u32) != 14u32 || deferred_definition(7u32) != 9u32 ||
-        deferred_expression_splice() != 1u32)
+        deferred_expression_splice() != 1u32 || DeferredBoundaries::labeled(0u32) != 11u32 ||
+        DeferredBoundaries::labeled(1u32) != 7u32 || DeferredBoundaries::spliced() != 13u32 ||
+        GeneratedDeferredOrder::first(300uptr) != 307uptr ||
+        GeneratedDeferredOrder::second(600uptr) != 607uptr ||
+        CopiedDeferredBlocks::automatic(300uptr) != 906uptr ||
+        CopiedDeferredBlocks::automatic(600uptr) != 1806uptr ||
+        CopiedDeferredBlocks::persistent() != 8uptr ||
+        CopiedDeferredBlocks::persistent() != 10uptr ||
+        CopiedDeferredBlocks::declaration_list(300uptr) != 606uptr ||
+        CopiedDeferredBlocks::declaration_list(600uptr) != 1206uptr ||
+        CopiedDeferredBlocks::statement_list(300uptr) != 610uptr ||
+        CopiedDeferredBlocks::returned(600uptr) != 600uptr ||
+        CopiedDeferredBlocks::direct_declaration(900uptr) != 907uptr ||
+        CopiedDeferredBindings::structured(300uptr) != 603uptr ||
+        CopiedDeferredBindings::projected(600uptr) != 1203uptr ||
+        AmbiguousDeferredCopies::run() != 7uptr ||
+        ExitedDeferredCopies::plain() != 14uptr ||
+        ExitedDeferredCopies::instances() != 16uptr ||
+        ExitedDeferredCopies::instances() != 18uptr ||
+        ProjectedExitedDeferredCopies::plain() != 14uptr ||
+        ProjectedExitedDeferredCopies::instances() != 16uptr ||
+        ProjectedExitedDeferredCopies::instances() != 18uptr ||
+        ImplicitTagCopies::plain() != 2uptr ||
+        ImplicitTagCopies::instances() != 2uptr ||
+        ImplicitTagCopies::instances() != 4uptr ||
+        ProjectedImplicitTagCopies::plain() != 2uptr ||
+        ProjectedImplicitTagCopies::instances() != 2uptr ||
+        ProjectedImplicitTagCopies::instances() != 4uptr ||
+        GeneratedImplicitTagCopies::plain() != 2uptr ||
+        GeneratedImplicitTagCopies::instances() != 2uptr ||
+        GeneratedImplicitTagCopies::instances() != 4uptr ||
+        GeneratedProjectedImplicitTagCopies::plain() != 2uptr ||
+        GeneratedProjectedImplicitTagCopies::instances() != 2uptr ||
+        GeneratedProjectedImplicitTagCopies::instances() != 4uptr)
         return 0u32;
     return 61u32;
 }

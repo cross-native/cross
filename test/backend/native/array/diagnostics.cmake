@@ -32,7 +32,7 @@ expect_array_error(omitted_bound
 expect_array_error(initializer
     "aggregate initializer requires a brace list")
 expect_array_error(vla_inner_bound
-    "only the outermost array bound may be a runtime value")
+    "runtime local or parameter is not a translation-time value")
 expect_array_error(vla_wide_bound
     "variable-length array bound cannot exceed pointer width")
 expect_array_error(vla_goto

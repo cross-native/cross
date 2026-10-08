@@ -88,6 +88,7 @@ compile_variant(cisc -mrisc-cisc-balance=100)
 compile_variant(fix4300 -mfix4300)
 compile_variant(fix4300_no_schedule -mfix4300 -fno-schedule-insns)
 compile_variant(r4000 -march=r4000 -mtune=r4000)
+compile_variant(r3000 -march=r3000 -mtune=r3000)
 compile_variant(no_cprop -fno-cprop-registers)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_variant(no_if_conversion -fno-if-conversion)
@@ -745,4 +746,30 @@ if(affine_exit MATCHES "[\t ]sltu[\t ]" OR
         "MIR affine-exit induction selection did not replace the loop counter "
         "or honor -fno-ivopts\n"
         "selected:\n${affine_exit}\nordinary:\n${counted_exit}")
+endif()
+
+# A quotient and remainder of the same operands share one division; scalar
+# code before MIPS III keeps leaf values in caller-saved registers; and only
+# the output pointers of an out-parameter function need frame homes.
+function_body("${OUTPUT}.enabled.s" mips_paired_division paired_division)
+function_body("${OUTPUT}.no_machine_combine.s" mips_paired_division separate_division)
+function_body("${OUTPUT}.r3000.s" mips_paired_division mips1_division)
+function_body("${OUTPUT}.enabled.s" mips_output_division output_division)
+string(REGEX MATCHALL "[\t ]divu[\t ]" paired_divides "${paired_division}")
+string(REGEX MATCHALL "[\t ]divu[\t ]" separate_divides "${separate_division}")
+string(REGEX MATCHALL "[\t ]divu[\t ]" output_divides "${output_division}")
+list(LENGTH paired_divides paired_count)
+list(LENGTH separate_divides separate_count)
+list(LENGTH output_divides output_count)
+if(NOT paired_count EQUAL 1 OR NOT separate_count EQUAL 2 OR
+   NOT output_count EQUAL 1 OR
+   NOT paired_division MATCHES "[\t ]mflo[\t ]" OR
+   NOT paired_division MATCHES "[\t ]mfhi[\t ]" OR
+   mips1_division MATCHES "[\t ]s[wd][\t ]+\\$s[0-7]," OR
+   output_division MATCHES "[\t ]s[wd][\t ]+\\$a[01],")
+    message(FATAL_ERROR
+        "MIPS division pairing, MIPS I leaf allocation, or output-parameter "
+        "entry captures regressed\n"
+        "paired:\n${paired_division}\nseparate:\n${separate_division}\n"
+        "MIPS I:\n${mips1_division}\noutput:\n${output_division}")
 endif()

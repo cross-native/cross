@@ -7,6 +7,12 @@ struct generic_memory_pair { u64 low; u64 high; };
 typedef struct generic_memory_pair (*memory_callback)(in u32 value)
     [[abi("memory_result_abi")]];
 typedef i32 (*default_callback)(in i32 value);
+typedef i32 (*canonical_callback)(in i32 value) [[abi("test_sysv")]];
+typedef i32 (*alias_callback)(in i32 value) [[abi("test_abi")]];
+
+[[abi("test_abi"), noinline]] static i32 alias_add_four(in i32 value) {
+    return value + 4i32;
+}
 
 static T copy<T>(in T value) {
     return value;
@@ -82,6 +88,10 @@ $::static_assert(assertion_memory(22u32).low == 22u64,
     struct generic_memory_pair copied_pair = copy_trailing(late_pair);
     default_callback selected_default = add_nine;
     default_callback default_inferred = copy(selected_default);
+    canonical_callback canonical = copy(alias_add_four);
+    alias_callback alias = canonical;
+    // Equal model identities must not introduce a fresh adapter address.
+    if (canonical != alias_add_four || alias != &alias_add_four) return 3i32;
     return inferred(34i32) == 41i32 &&
            explicit_type(35i32) == 42i32 &&
            inferred_stack(30i32) == 41i32 &&
@@ -90,5 +100,5 @@ $::static_assert(assertion_memory(22u32).low == 22u64,
            pair.low == 22u64 && pair.high == 28u64 &&
            inferred_pair.low == 24u64 && inferred_pair.high == 30u64 &&
            copied_pair.low == 26u64 && copied_pair.high == 32u64 &&
-           default_inferred(36i32) == 45i32 ? 1i32 : 2i32;
+           default_inferred(36i32) == 45i32 && alias(37i32) == 41i32 ? 1i32 : 2i32;
 }

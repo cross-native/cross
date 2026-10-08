@@ -7,18 +7,21 @@ foreach(required CC SOURCE CONFLICT_SOURCE GENERIC_SOURCE INLINE_SOURCE OUTPUT)
     endif()
 endforeach()
 
-execute_process(
-    COMMAND "${CC}" -emit-llvm "${SOURCE}" -o "${OUTPUT}.ll"
-    RESULT_VARIABLE status
-    OUTPUT_VARIABLE stdout
-    ERROR_VARIABLE stderr
-)
-if(status EQUAL 0)
-    message(FATAL_ERROR "invalid patch values unexpectedly compiled")
-endif()
-foreach(pattern
-        "initial value must be a translation-time integer or"
-        "no contiguous $::patch materializer for u128")
+foreach(case RANGE 0 1)
+    execute_process(
+        COMMAND "${CC}" -DCASE=${case} -emit-llvm "${SOURCE}" -o "${OUTPUT}-${case}.ll"
+        RESULT_VARIABLE status
+        OUTPUT_VARIABLE stdout
+        ERROR_VARIABLE stderr
+    )
+    if(status EQUAL 0)
+        message(FATAL_ERROR "invalid patch value ${case} unexpectedly compiled")
+    endif()
+    if(case EQUAL 0)
+        set(pattern "runtime local or parameter is not a translation-time value")
+    else()
+        set(pattern "no contiguous $::patch materializer for u128")
+    endif()
     string(FIND "${stderr}" "${pattern}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "patch diagnostics are missing '${pattern}'\n${stderr}")

@@ -82,22 +82,24 @@ run_cc(mips-structured-big -c -target mips-unknown-elf
 run_cc(mips-structured-little -c -target mipsel-unknown-elf
        "${MIPS_SOURCE}" -o "${OUTPUT}-mipsel.o")
 
-execute_process(
-    COMMAND "${CC}" -S "${ERROR_SOURCE}" -o "${OUTPUT}-errors.s"
-    RESULT_VARIABLE error_status
-    OUTPUT_VARIABLE error_stdout
-    ERROR_VARIABLE error_stderr)
-if(error_status EQUAL 0)
-    message(FATAL_ERROR "invalid structured patch sinks compiled")
-endif()
-foreach(pattern
-        "must designate an uninitialized static-duration subobject"
-        "must be a static object followed only by direct member or constant array selections"
-        "address sink is used by more than one site")
+foreach(case RANGE 1 4)
+    if(case EQUAL 1)
+        set(pattern "must designate an uninitialized static-duration subobject")
+    elseif(case EQUAL 4)
+        set(pattern "address sink is used by more than one site")
+    else()
+        set(pattern "must be a static object followed only by direct member or constant array selections")
+    endif()
+    # A source-phase failure must not hide a separate lowering-phase case.
+    execute_process(
+        COMMAND "${CC}" -S "-DPATCH_ERROR_CASE=${case}" "${ERROR_SOURCE}" -o "${OUTPUT}-error-${case}.s"
+        RESULT_VARIABLE error_status
+        OUTPUT_VARIABLE error_stdout
+        ERROR_VARIABLE error_stderr)
     string(FIND "${error_stderr}" "${pattern}" position)
-    if(position EQUAL -1)
+    if(NOT error_status EQUAL 1 OR position EQUAL -1 OR NOT error_stderr MATCHES ":[0-9]+:[0-9]+: error:")
         message(FATAL_ERROR
-            "structured patch diagnostics lack '${pattern}'\n${error_stderr}")
+            "structured patch case ${case} lacks '${pattern}'\n${error_stderr}")
     endif()
 endforeach()
 
@@ -106,8 +108,9 @@ execute_process(
     RESULT_VARIABLE index_status
     OUTPUT_VARIABLE index_stdout
     ERROR_VARIABLE index_stderr)
-if(index_status EQUAL 0 OR NOT index_stderr MATCHES
-   "expression is not a translation-time value")
+if(NOT index_status EQUAL 1 OR NOT index_stderr MATCHES
+   "runtime local or parameter is not a translation-time value" OR
+   NOT index_stderr MATCHES ":[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR
         "runtime patch-sink index was not diagnosed\n"
         "${index_stdout}\n${index_stderr}")

@@ -1,15 +1,53 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frontend/syntax.hpp"
+#include "frontend/token_tree.hpp"
 
 #include <algorithm>
 #include <array>
 #include <iterator>
 #include <limits>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace cross {
+
+namespace detail {
+class SyntaxRelease {
+public:
+    template<class Value>
+    static void release(Value& value) noexcept {
+        OwnerRelease::run([&](OwnerRelease& release) { detach(value, release); });
+    }
+private:
+    static void detach(TokenSequence& tokens, OwnerRelease& release) noexcept {
+        for (auto& token : tokens) release.take(token.splice);
+        // Drop provenance while the drain is active too: a retained context's
+        // private type/AST metadata can itself own public node handles.
+        tokens.clear();
+    }
+    static void detach(SyntaxNode& node, OwnerRelease& release) noexcept {
+        for (auto& child : node.children) release.take(child);
+        release.take(node.match);
+        detach(node.tokens, release);
+        node.context.reset();
+    }
+    static void detach(SyntaxMatchValue& match, OwnerRelease& release) noexcept {
+        detach(match.input, release);
+        for (auto& field : match.fields) {
+            release.take(field.node);
+            for (auto& record : field.records) release.take(record);
+            detach(field.tokens, release);
+        }
+        match.context.reset();
+    }
+};
+} // namespace detail
+
+SyntaxNode::~SyntaxNode() { detail::SyntaxRelease::release(*this); }
+SyntaxMatchValue::~SyntaxMatchValue() { detail::SyntaxRelease::release(*this); }
 
 std::optional<SyntaxParseCategory> syntax_parse_category(std::string_view name) {
     using C = SyntaxParseCategory;
@@ -26,6 +64,7 @@ std::optional<SyntaxParseCategory> syntax_parse_category(std::string_view name) 
 std::uint64_t syntax_context_storage(const SyntaxContext& context) {
     std::uint64_t size = 128 + context.name_space.size();
     for (const auto& entry : context.imports) size += 32 + entry.size();
+    size += 40 * context.import_declarations.size();
     for (const auto& binding : context.syntax_bindings) size += 48 + binding.prefix.size();
     if (context.parse_environment) size += syntax_environment_storage(*context.parse_environment);
     return size;
@@ -53,7 +92,8 @@ std::string_view syntax_production_name(SyntaxProduction production) {
         "relational_expression", "shift_expression", "additive_expression",
         "multiplicative_expression", "cast_expression", "unary_expression",
         "postfix_expression", "primary_expression", "argument_list", "generic_arguments", "generic_argument",
-        "builtin_name", "literal", "embed_expression", "quote_expression"};
+        "builtin_name", "literal", "embed_expression", "quote_expression",
+        "global_label_declaration", "qualified_label_name", "qualified_function_name"};
     static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Count));
     const auto index = static_cast<std::size_t>(production);
     return index < std::size(names) ? names[index] : std::string_view{};
@@ -66,12 +106,24 @@ bool syntax_expression_node(const SyntaxNode& node) {
         node.kind != SyntaxNode::Kind::Extension &&
         node.kind != SyntaxNode::Kind::Macro &&
         node.kind != SyntaxNode::Kind::Deferred) return false;
-    return (production >= SyntaxProduction::Expression &&
-            production <= SyntaxProduction::PrimaryExpression) ||
-        production == SyntaxProduction::BuiltinName ||
-        production == SyntaxProduction::Literal ||
-        production == SyntaxProduction::EmbedExpression ||
-        production == SyntaxProduction::QuoteExpression;
+    // Category compatibility follows complete expression productions, not
+    // enum ordering: assignment_operator lives among expression productions
+    // but is not itself an expression. Conversely, qualified_name is a valid
+    // primary-expression alternative despite being shared with declarations.
+    using P = SyntaxProduction;
+    switch (production) {
+    case P::Expression: case P::ConstantExpression: case P::AssignmentExpression:
+    case P::ConditionalExpression: case P::LogicalOrExpression: case P::LogicalAndExpression:
+    case P::InclusiveOrExpression: case P::ExclusiveOrExpression: case P::AndExpression:
+    case P::EqualityExpression: case P::RelationalExpression: case P::ShiftExpression:
+    case P::AdditiveExpression: case P::MultiplicativeExpression: case P::CastExpression:
+    case P::UnaryExpression: case P::PostfixExpression: case P::PrimaryExpression:
+    case P::QualifiedName: case P::BuiltinName: case P::Literal:
+    case P::EmbedExpression: case P::QuoteExpression:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool syntax_statement_node(const SyntaxNode& node) {
@@ -95,7 +147,10 @@ bool syntax_compound_node(const SyntaxNode& node) {
 
 bool syntax_declaration_node(const SyntaxNode& node) {
     return (node.kind == SyntaxNode::Kind::Core &&
-            node.production == SyntaxProduction::Declaration) ||
+            (node.production == SyntaxProduction::Declaration ||
+             node.production == SyntaxProduction::UsingDeclaration ||
+             node.production == SyntaxProduction::GlobalLabelDeclaration ||
+             node.production == SyntaxProduction::StaticAssertDeclaration)) ||
         (node.kind == SyntaxNode::Kind::Deferred &&
          node.slot_production == SyntaxProduction::Declaration &&
          (node.deferred_category == SyntaxParseCategory::Declaration ||
@@ -193,13 +248,14 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node) {
     struct Part {
         const SyntaxNode* node;
         std::shared_ptr<const SyntaxNode> owner;
+        bool splice{};
     };
     std::vector<Part> pending{{&node, {}}};
     while (!pending.empty()) {
-        auto [next, owner] = std::move(pending.back());
+        auto [next, owner, splice] = std::move(pending.back());
         pending.pop_back();
         std::shared_ptr<const SyntaxNode> fragment;
-        if (next != &node && (next->kind == SyntaxNode::Kind::Deferred ||
+        if (next != &node && (splice || next->kind == SyntaxNode::Kind::Deferred ||
                              syntax_function_header_node(*next)))
             fragment = std::move(owner);
         if (next->kind == SyntaxNode::Kind::Core && next->structured_splice &&
@@ -224,8 +280,9 @@ TokenSequence syntax_node_fragments(const SyntaxNode& node) {
                    next->kind == SyntaxNode::Kind::Deferred) {
             for (const auto& token : next->tokens) append(token);
         } else {
-            for (auto at = next->children.rbegin(); at != next->children.rend(); ++at)
-                pending.push_back({at->get(), *at});
+            for (std::size_t at = next->children.size(); at-- > 0;)
+                pending.push_back({next->children[at].get(), next->children[at],
+                    std::binary_search(next->splice_children.begin(), next->splice_children.end(), at)});
         }
     }
     return result;
@@ -251,6 +308,8 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
     };
     std::unordered_set<const SyntaxContext*> contexts;
     std::unordered_set<const SyntaxParseEnvironment*> environments;
+    std::vector<const SyntaxNode*> nodes{&node};
+    std::vector<const SyntaxMatchValue*> matches;
     const auto context = [&](const std::shared_ptr<const SyntaxContext>& value) {
         if (!value || !contexts.insert(value.get()).second) return;
         auto amount = syntax_context_storage(*value);
@@ -265,15 +324,18 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
             add(origin_binding_storage(token.origin));
             context(token.origin.context);
             if (token.split_source) { add(32); add(token.split_source->spelling.size()); }
+            // Opaque to grammar inspection does not mean free storage. A
+            // deferred/raw token can retain another complete public tree.
+            // Follow that ownership edge on the same iterative worklist.
+            if (token.splice) nodes.push_back(token.splice.get());
         }
     };
-    std::vector<const SyntaxNode*> nodes{&node};
-    std::vector<const SyntaxMatchValue*> matches;
     while ((!nodes.empty() || !matches.empty()) && size <= stop_after) {
         if (!nodes.empty()) {
             const auto* next = nodes.back();
             nodes.pop_back();
             add(128);
+            add(8 * next->splice_children.size());
             context(next->context);
             tokens(next->tokens);
             for (const auto& child : next->children) {
@@ -304,6 +366,120 @@ std::uint64_t syntax_node_storage(const SyntaxNode& node, std::uint64_t stop_aft
         }
     }
     return size;
+}
+
+std::shared_ptr<const SyntaxMatchValue> syntax_attach_context(
+    std::shared_ptr<const SyntaxMatchValue> match, std::shared_ptr<const SyntaxContext> context) {
+    if (!match) return {};
+    struct NodeFrame {
+        std::shared_ptr<const SyntaxNode> source;
+        std::shared_ptr<SyntaxNode> copy{};
+        std::size_t child{};
+        bool entered{};
+        bool match_done{};
+        SyntaxNode& change() {
+            if (!copy) copy = std::make_shared<SyntaxNode>(*source);
+            return *copy;
+        }
+    };
+    struct MatchFrame {
+        std::shared_ptr<const SyntaxMatchValue> source;
+        std::shared_ptr<SyntaxMatchValue> copy{};
+        std::size_t field{};
+        std::size_t record{};
+        bool entered{};
+        bool field_entered{};
+        bool node_done{};
+        SyntaxMatchValue& change() {
+            if (!copy) copy = std::make_shared<SyntaxMatchValue>(*source);
+            return *copy;
+        }
+    };
+    const auto needs_context = [](const TokenSequence& tokens) {
+        return std::any_of(tokens.begin(), tokens.end(), [](const MetaToken& token) {
+            return !token.origin.context;
+        });
+    };
+    const auto attach = [&](TokenSequence& tokens) {
+        for (auto& token : tokens) if (!token.origin.context) token.origin.context = context;
+    };
+    std::unordered_map<const SyntaxNode*, std::shared_ptr<const SyntaxNode>> nodes;
+    std::unordered_map<const SyntaxMatchValue*, std::shared_ptr<const SyntaxMatchValue>> matches;
+    std::vector<std::variant<NodeFrame, MatchFrame>> pending{MatchFrame{match}};
+    while (!pending.empty()) {
+        if (auto* frame = std::get_if<NodeFrame>(&pending.back())) {
+            const auto& source = *frame->source;
+            if (!frame->entered) {
+                if (!source.context) frame->change().context = context;
+                if (needs_context(source.tokens)) attach(frame->change().tokens);
+                frame->entered = true;
+            }
+            if (frame->child < source.children.size()) {
+                const auto& child = source.children[frame->child];
+                const auto found = nodes.find(child.get());
+                if (found == nodes.end()) {
+                    pending.emplace_back(NodeFrame{child});
+                    continue;
+                }
+                if (found->second != child) frame->change().children[frame->child] = found->second;
+                ++frame->child;
+                continue;
+            }
+            if (source.match && !frame->match_done) {
+                const auto found = matches.find(source.match.get());
+                if (found == matches.end()) {
+                    pending.emplace_back(MatchFrame{source.match});
+                    continue;
+                }
+                if (found->second != source.match) frame->change().match = found->second;
+                frame->match_done = true;
+            }
+            nodes.emplace(frame->source.get(), frame->copy ? std::move(frame->copy) : frame->source);
+            pending.pop_back();
+            continue;
+        }
+        auto& frame = std::get<MatchFrame>(pending.back());
+        const auto& source = *frame.source;
+        if (!frame.entered) {
+            if (!source.context) frame.change().context = context;
+            if (needs_context(source.input)) attach(frame.change().input);
+            frame.entered = true;
+        }
+        if (frame.field == source.fields.size()) {
+            matches.emplace(frame.source.get(), frame.copy ? std::move(frame.copy) : frame.source);
+            pending.pop_back();
+            continue;
+        }
+        const auto& field = source.fields[frame.field];
+        if (!frame.field_entered) {
+            if (needs_context(field.tokens)) attach(frame.change().fields[frame.field].tokens);
+            frame.field_entered = true;
+        }
+        if (field.node && !frame.node_done) {
+            const auto found = nodes.find(field.node.get());
+            if (found == nodes.end()) {
+                pending.emplace_back(NodeFrame{field.node});
+                continue;
+            }
+            if (found->second != field.node) frame.change().fields[frame.field].node = found->second;
+            frame.node_done = true;
+        }
+        if (frame.record < field.records.size()) {
+            const auto& record = field.records[frame.record];
+            const auto found = matches.find(record.get());
+            if (found == matches.end()) {
+                pending.emplace_back(MatchFrame{record});
+                continue;
+            }
+            if (found->second != record) frame.change().fields[frame.field].records[frame.record] = found->second;
+            ++frame.record;
+            continue;
+        }
+        ++frame.field;
+        frame.record = 0;
+        frame.field_entered = frame.node_done = false;
+    }
+    return matches.at(match.get());
 }
 
 namespace {
@@ -456,6 +632,10 @@ const auto& public_tree_rules() {
         set(P::CompoundStatement, sequence({terminal("{"), repeated(choice({reference(P::Statement),
             reference(P::UsingDeclaration)})), terminal("}")}));
         set(P::UsingDeclaration, sequence({terminal("using"), reference(P::NamespaceName), terminal(";")}));
+        set(P::GlobalLabelDeclaration, sequence({attrs, terminal("global"), terminal("label"),
+            reference(P::QualifiedLabelName), attrs, terminal(";")}));
+        set(P::QualifiedLabelName, sequence({reference(P::QualifiedFunctionName), terminal("::"), id}));
+        set(P::QualifiedFunctionName, reference(P::QualifiedName));
         set(P::LabeledStatement, choice({sequence({id, terminal(":"), reference(P::Statement)}),
             sequence({terminal("label"), id, terminal(":"), reference(P::Statement)}),
             sequence({terminal("global"), terminal("label"), id, terminal(":"), reference(P::Statement)}),
@@ -507,7 +687,8 @@ const auto& public_tree_rules() {
         set(P::CastExpression, choice({reference(P::UnaryExpression), sequence({terminal("("),
             reference(P::TypeName), terminal(")"), reference(P::CastExpression)})}));
         set(P::UnaryExpression, choice({reference(P::PostfixExpression), sequence({
-                terminals({"++", "--", "&", "*", "+", "-", "~", "!", "sizeof"}), reference(P::UnaryExpression)}),
+                terminals({"++", "--", "sizeof"}), reference(P::UnaryExpression)}),
+            sequence({terminals({"&", "*", "+", "-", "~", "!"}), reference(P::CastExpression)}),
             sequence({terminal("sizeof"), terminal("("), reference(P::TypeName), terminal(")")})}));
         set(P::PostfixExpression, sequence({reference(P::PrimaryExpression), repeated(choice({
             sequence({terminal("["), reference(P::Expression), terminal("]")}),
@@ -517,6 +698,8 @@ const auto& public_tree_rules() {
             sequence({terminal("("), reference(P::Expression), terminal(")")}),
             sequence({terminal("$::alignof"), terminal("("),
                 choice({reference(P::TypeName), reference(P::Expression)}), terminal(")")}),
+            sequence({terminal("$::atomic_is_lock_free"), terminal("("),
+                choice({reference(P::TypeName), reference(P::ArgumentList)}), terminal(")")}),
             reference(P::EmbedExpression), reference(P::QuoteExpression), opaque(P::PrimaryExpression)}));
         set(P::ArgumentList, optional(sequence({reference(P::AssignmentExpression),
             repeated(sequence({terminal(","), reference(P::AssignmentExpression)}))})));
@@ -636,6 +819,28 @@ struct TreeValidator {
                 error = "public syntax tree exceeds validation depth budget";
                 return false;
             }
+            std::optional<std::size_t> previous_splice;
+            for (const auto index : node->splice_children) {
+                if (!step()) break;
+                if (index >= node->children.size() || !node->children[index] ||
+                    (previous_splice && index <= *previous_splice)) {
+                    error = "invalid structured child boundary";
+                    return false;
+                }
+                const auto& child = *node->children[index];
+                if (node->kind == SyntaxNode::Kind::Group) {
+                    if (index == 0 || index + 1 == node->children.size()) {
+                        error = "raw group delimiters cannot be structured splice boundaries";
+                        return false;
+                    }
+                } else if (!syntax_statement_node(child) && !syntax_declaration_node(child) &&
+                    !syntax_function_definition_node(child)) {
+                    error = "structured child boundary requires a statement or declaration fragment";
+                    return false;
+                }
+                previous_splice = index;
+            }
+            if (exhausted) break;
             if (node->kind == SyntaxNode::Kind::Token || opaque_kind(node->kind)) {
                 if (node->structured_splice) {
                     error = "structured splice must be a core expression or type specifier";
@@ -648,32 +853,28 @@ struct TreeValidator {
                         error = "deferred syntax node requires a compatible category/grammar slot, context, and bounded input";
                         return false;
                     }
-                    std::vector<std::string_view> closers;
-                    for (const auto& token : node->tokens) {
-                        if (!step()) break;
-                        const auto text = std::string_view(token.text);
-                        if (token.kind == TokenKind::Invalid || token.kind == TokenKind::End) {
-                            error = "deferred syntax input contains an invalid or boundary token";
-                            return false;
-                        }
-                        if (text == "(" || text == "[" || text == "[[" || text == "{") {
-                            if (closers.size() >= limits.depth) {
-                                failure = SyntaxTreeValidationError::DepthLimit;
-                                error = "deferred syntax input exceeds delimiter depth budget";
+                    const auto scanned = scan_token_trees(node->tokens, limits.depth,
+                        TokenTreeBalance::Required, {[&](std::size_t index) {
+                            if (!step()) return false;
+                            const auto kind = node->tokens[index].kind;
+                            if (kind == TokenKind::Invalid || kind == TokenKind::End) {
+                                error = "deferred syntax input contains an invalid or boundary token";
                                 return false;
                             }
-                            closers.push_back(text == "(" ? ")" : text == "[" ? "]" :
-                                              text == "[[" ? "]]" : "}");
-                        } else if (text == ")" || text == "]" || text == "]]" || text == "}") {
-                            if (closers.empty() || closers.back() != text) {
-                                error = "deferred syntax input has an unmatched delimiter";
-                                return false;
-                            }
-                            closers.pop_back();
-                        }
-                    }
+                            return true;
+                        }, {}, {}});
                     if (exhausted) break;
-                    if (!closers.empty()) {
+                    if (scanned == TokenTreeScanError::Cancelled) return false;
+                    if (scanned == TokenTreeScanError::DepthLimit) {
+                        failure = SyntaxTreeValidationError::DepthLimit;
+                        error = "deferred syntax input exceeds delimiter depth budget";
+                        return false;
+                    }
+                    if (scanned == TokenTreeScanError::UnmatchedDelimiter) {
+                        error = "deferred syntax input has an unmatched delimiter";
+                        return false;
+                    }
+                    if (scanned == TokenTreeScanError::UnterminatedGroup) {
                         error = "deferred syntax input has an unterminated delimiter group";
                         return false;
                     }
@@ -686,8 +887,8 @@ struct TreeValidator {
                 }
                 continue;
             }
-            TreeRule group_rule;
             const TreeRule* rule{};
+            bool group_shape{};
             if (node->kind == SyntaxNode::Kind::Core) {
                 const auto index = static_cast<std::size_t>(node->production);
                 if (index >= public_tree_rules().size()) {
@@ -696,16 +897,31 @@ struct TreeValidator {
                 }
                 rule = &public_tree_rules()[index];
             } else if (node->kind == SyntaxNode::Kind::Group) {
-                const auto raw = TreeRule(TreeRule::Kind::RawToken);
-                const auto group = TreeRule(TreeRule::Kind::Group);
-                group_rule = choice({
-                    sequence({terminal("("), repeated(choice({raw, group})), terminal(")")}),
-                    sequence({terminal("["), repeated(choice({raw, group})), terminal("]")}),
-                    sequence({terminal("[["), repeated(choice({raw, group})), terminal("]]")}),
-                    sequence({terminal("{"), repeated(choice({raw, group})), terminal("}")})});
-                rule = &group_rule;
+                const auto lexical = [](const std::shared_ptr<const SyntaxNode>& child) -> const MetaToken* {
+                    return child && child->kind == SyntaxNode::Kind::Token && child->tokens.size() == 1 &&
+                        !child->tokens.front().splice && child->tokens.front().kind != TokenKind::StructuredSplice
+                        ? &child->tokens.front() : nullptr;
+                };
+                if (node->children.size() >= 2) {
+                    const auto* first = lexical(node->children.front());
+                    const auto* last = lexical(node->children.back());
+                    group_shape = first && last && first->kind == TokenKind::Punctuator &&
+                        last->kind == TokenKind::Punctuator &&
+                        ((first->text == "(" && last->text == ")") ||
+                         (first->text == "[" && last->text == "]") ||
+                         (first->text == "[[" && last->text == "]]") ||
+                         (first->text == "{" && last->text == "}"));
+                    for (std::size_t index = 1; group_shape && index + 1 < node->children.size(); ++index) {
+                        if (!step()) break;
+                        const auto& child = node->children[index];
+                        if (std::binary_search(node->splice_children.begin(), node->splice_children.end(), index)) continue;
+                        const auto* token = lexical(child);
+                        group_shape = child && (child->kind == SyntaxNode::Kind::Group ||
+                            (token && !delimiter(token->text)));
+                    }
+                }
             }
-            if (!rule || !node->tokens.empty()) {
+            if ((!rule && node->kind != SyntaxNode::Kind::Group) || !node->tokens.empty()) {
                 error = "invalid public syntax tree node representation";
                 return false;
             }
@@ -723,7 +939,9 @@ struct TreeValidator {
                 error = "structured splice requires one category-compatible child";
                 return false;
             }
-            const auto positions = expression_splice_shape || type_splice_shape
+            const auto positions = node->kind == SyntaxNode::Kind::Group
+                ? (group_shape ? Positions{node->children.size()} : Positions{})
+                : expression_splice_shape || type_splice_shape
                 ? Positions{node->children.size()}
                 : match(*rule, node->children, 0);
             if (exhausted) break;
@@ -773,6 +991,24 @@ std::shared_ptr<const SyntaxNode> syntax_replace_child(
         return {};
     }
     auto result = std::make_shared<SyntaxNode>(parent);
+    const auto edge = std::lower_bound(result->splice_children.begin(), result->splice_children.end(), index);
+    const bool was_bounded = edge != result->splice_children.end() && *edge == index;
+    const bool bounded = parent.kind == SyntaxNode::Kind::Group
+        ? was_bounded || (replacement->kind != SyntaxNode::Kind::Token && replacement->kind != SyntaxNode::Kind::Group)
+        : syntax_statement_node(*replacement) || syntax_declaration_node(*replacement) ||
+            syntax_function_definition_node(*replacement);
+    // Tree editing inserts a subtree, even when the old child was written
+    // directly rather than supplied by an unquote. Otherwise a new inner if
+    // can steal its parent's else when this edited tree is materialized.
+    if (bounded) {
+        if (edge == result->splice_children.end() || *edge != index)
+            result->splice_children.insert(edge, index);
+    } else if (edge != result->splice_children.end() && *edge == index) {
+        // Grammar alternatives can change, e.g. an unattributed statement's
+        // declaration becomes a jump production. Its containing statement
+        // supplies the boundary; this child is no longer a splice category.
+        result->splice_children.erase(edge);
+    }
     result->children[index] = std::move(replacement);
     if (!syntax_validate_node(*result, error, limits, work)) return {};
     return result;

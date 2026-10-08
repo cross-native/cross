@@ -18,7 +18,3 @@ global void hard_overlap() {
     register i32 second "r12d" = 2;
 }
 
-global void hard_address() {
-    register i32 value "r12d" = 1;
-    i32 *pointer = &value;
-}

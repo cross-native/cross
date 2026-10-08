@@ -25,6 +25,7 @@ struct TokenMacro {
     FunctionDecl function;
     SourceLocation location;
     bool syntax_expander{};
+    Program declarations;
 };
 
 struct Replacement {
@@ -61,11 +62,8 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
     if (index >= tokens.size()) return std::nullopt;
     const auto location = tokens[index].location;
     auto cursor = index;
-    bool static_storage = false;
-    bool global_storage = false;
     bool malformed = false;
     std::optional<ExpansionFunctionHead> head;
-    std::optional<std::pair<std::string, SourceLocation>> other_attribute;
     const auto set_error = [&](std::string message, SourceLocation at) {
         if (head && head->error.empty()) {
             head->error = std::move(message);
@@ -106,9 +104,6 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
                 }
                 if (arguments) set_error("'" + name + "' takes no arguments",
                                          attribute_location);
-            } else if (name != "eval_only" || arguments) {
-                if (!other_attribute)
-                    other_attribute = std::pair{name, attribute_location};
             }
             if (cursor < tokens.size() && tokens[cursor].is(",")) {
                 ++cursor;
@@ -123,60 +118,24 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
         if (!closed) malformed = true;
         return true;
     };
-    const auto consume_specifier_prefix = [&]() {
-        while (cursor < tokens.size()) {
-            if (tokens[cursor].is("static") || tokens[cursor].is("global") ||
-                tokens[cursor].is("inline")) {
-                static_storage |= tokens[cursor].is("static");
-                global_storage |= tokens[cursor].is("global");
-                ++cursor;
-            } else if (!consume_attribute_list() || malformed) break;
+    // Discover only the declaration role. Do not assume a particular return
+    // type spelling or parameter grammar, and never inspect nested groups.
+    while (cursor < tokens.size() && tokens[cursor].kind != TokenKind::End &&
+           !tokens[cursor].is("{") && !tokens[cursor].is("}") &&
+           !tokens[cursor].is(";") && !tokens[cursor].is("=")) {
+        if (consume_attribute_list()) {
+            if (malformed) break;
+            continue;
         }
-    };
-    consume_specifier_prefix();
-    const auto return_type_index = cursor;
-    std::size_t name_index = 0;
-    std::size_t body_index = 0;
-    bool result_location = false;
-    if (!malformed && cursor < tokens.size() &&
-        tokens[cursor].is("$::meta::tokens")) {
+        if (tokens[cursor].is("(") || tokens[cursor].is("[")) {
+            const auto close = matching_group(tokens, cursor);
+            if (!close) break;
+            cursor = *close;
+        }
         ++cursor;
-        consume_specifier_prefix();
-        name_index = cursor;
-        if (!malformed && cursor < tokens.size() &&
-            tokens[cursor].kind == TokenKind::Identifier) {
-            ++cursor;
-            while (cursor + 1 < tokens.size() && tokens[cursor].is("::") &&
-                   tokens[cursor + 1].kind == TokenKind::Identifier)
-                cursor += 2;
-            if (cursor < tokens.size() && tokens[cursor].is("(")) {
-                const auto close = matching_group(tokens, cursor);
-                if (close) {
-                    cursor = *close + 1;
-                    if (cursor + 1 < tokens.size() && tokens[cursor].is("->") &&
-                        tokens[cursor + 1].kind == TokenKind::String) {
-                        result_location = true;
-                        cursor += 2;
-                    }
-                    while (consume_attribute_list() && !malformed) {}
-                    body_index = cursor;
-                }
-            }
-        }
     }
     if (!head) return std::nullopt;
-    head->after_specifiers = return_type_index;
-    head->name_index = name_index;
-    head->body_index = body_index;
-    head->static_storage = static_storage;
-    head->global_storage = global_storage;
-    head->result_location = result_location;
     if (malformed) set_error("malformed expansion function attribute list", location);
-    if (other_attribute) {
-        set_error("attribute '" + other_attribute->first +
-                  "' on an expansion function is not implemented",
-                  other_attribute->second);
-    }
     return head;
 }
 
@@ -308,7 +267,7 @@ std::vector<std::string> active_imports(const std::vector<Token>& tokens,
     return result;
 }
 
-std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
+ContinuationTask<std::vector<TokenMacro>> collect_macros_async(const std::vector<Token>& tokens,
                                        std::vector<Replacement>& removals,
                                        Diagnostics& diagnostics,
                                        unsigned address_bits,
@@ -321,81 +280,23 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
         if (!head || (head->syntax_expander && !syntax_expanders)) continue;
         const bool syntax_expander = head->syntax_expander;
         const auto role = syntax_expander ? "syntax_expander" : "macro";
-        const auto input_type = syntax_expander ? "$::meta::syntax_match" : "$::meta::tokens";
         const auto declaration_begin = tokens[index].location.offset;
-        auto cursor = head->after_specifiers;
+        auto cursor = index;
         if (!head->error.empty()) {
             diagnostics.error(head->error_location, head->error);
-            if (cursor > index) index = cursor - 1;
             continue;
         }
-        if (!head->static_storage || head->global_storage) {
-            diagnostics.error(
-                tokens[index].location,
-                "'" + std::string(role) + "' functions must be static and cannot be global");
-            if (cursor > index) index = cursor - 1;
-            continue;
+        // Bound the declaration without interpreting its signature. Attribute
+        // arguments and parameter groups may themselves contain braces.
+        for (; cursor < tokens.size() && !tokens[cursor].is("{") &&
+               !tokens[cursor].is(";") && tokens[cursor].kind != TokenKind::End; ++cursor) {
+            if (tokens[cursor].is("(") || tokens[cursor].is("[") || tokens[cursor].is("[[")) {
+                const auto close = matching_group(tokens, cursor);
+                if (!close) break;
+                cursor = *close;
+            }
         }
-        if (cursor >= tokens.size() ||
-            tokens[cursor].text != "$::meta::tokens") {
-            diagnostics.error(tokens[index].location,
-                              "'" + std::string(role) + "' functions must return $::meta::tokens");
-            continue;
-        }
-        ++cursor;
-        if (head->name_index) cursor = head->name_index;
-        auto name = qualified_name(tokens, cursor, tokens.size());
-        if (name.empty() || cursor >= tokens.size() ||
-            tokens[cursor].text != "(") {
-            diagnostics.error(tokens[index].location,
-                              "malformed '" + std::string(role) + "' declaration");
-            continue;
-        }
-        const auto current_namespace = namespace_at(regions, index);
-        if (!current_namespace.empty()) {
-            name = current_namespace + "::" + name;
-        }
-        const auto parameter_end = matching_group(tokens, cursor);
-        if (!parameter_end) {
-            diagnostics.error(tokens[cursor].location,
-                              "unterminated '" + std::string(role) + "' parameter list");
-            continue;
-        }
-        const bool valid_length =
-            *parameter_end == cursor + 4 ||
-            *parameter_end == cursor + 5;
-        if (!valid_length) {
-            diagnostics.error(
-                tokens[cursor].location,
-                "'" + std::string(role) + "' requires exactly one 'in [const] " +
-                std::string(input_type) + " name' parameter");
-            continue;
-        }
-        const bool local_const =
-            *parameter_end == cursor + 5 &&
-            tokens[cursor + 2].text == "const";
-        const auto type_index = cursor + (local_const ? 3 : 2);
-        const auto name_index = type_index + 1;
-        if ((*parameter_end != cursor + 4 && !local_const) ||
-            tokens[cursor + 1].text != "in" ||
-            tokens[type_index].text != input_type ||
-            tokens[name_index].kind != TokenKind::Identifier) {
-            diagnostics.error(
-                tokens[cursor].location,
-                "expansion function requires exactly one 'in [const] " +
-                    std::string(input_type) + " name' parameter");
-            continue;
-        }
-        std::string parameter(tokens[name_index].text);
-        cursor = *parameter_end + 1;
-        if (head->result_location) {
-            diagnostics.error(tokens[index].location,
-                              "expansion functions cannot specify a result location");
-            continue;
-        }
-        if (head->body_index) cursor = head->body_index;
-        if (parameter.empty() || cursor >= tokens.size() ||
-            tokens[cursor].text != "{") {
+        if (cursor >= tokens.size() || !tokens[cursor].is("{")) {
             diagnostics.error(tokens[index].location,
                               "'" + std::string(role) + "' requires one named parameter and a body");
             continue;
@@ -406,25 +307,25 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                               "unterminated '" + std::string(role) + "' body");
             continue;
         }
-        FunctionDecl function;
-        function.name = name;
-        function.location = tokens[index].location;
-        function.return_type = tokens_type();
-        function.source_namespace = definition_context ? definition_context->name_space : current_namespace;
-        function.imports = definition_context ? definition_context->imports : active_imports(tokens, index);
-        if (function.location.file)
-            function.source_unit = function.location.file->source_unit_at(function.location.line);
-        function.linkage = Linkage::Static;
-        auto parameter_type = syntax_expander ? syntax_match_type() : tokens_type();
-        parameter_type->is_const = local_const;
-        function.parameters.push_back({tokens[*parameter_end - 1].location,
-            std::move(parameter), std::move(parameter_type), ParameterMode::In, true, {}});
-        std::vector<Token> body_tokens(tokens.begin() + static_cast<std::ptrdiff_t>(cursor),
+        auto context = definition_context;
+        if (!context) {
+            auto lexical = std::make_shared<SyntaxContext>();
+            lexical->kind = SyntaxContext::Kind::DefinitionSite;
+            lexical->name_space = namespace_at(regions, index);
+            lexical->imports = active_imports(tokens, index);
+            context = std::move(lexical);
+        }
+        std::vector<Token> declaration_tokens(tokens.begin() + static_cast<std::ptrdiff_t>(index),
             tokens.begin() + static_cast<std::ptrdiff_t>(*body_end + 1));
-        body_tokens.push_back({TokenKind::End, {}, tokens[*body_end].location});
-        Parser parser(std::move(body_tokens), diagnostics, {}, address_bits);
-        auto body = parser.parse_procedural_body(function, definition_context);
-        if (!body) continue;
+        declaration_tokens.push_back({TokenKind::End, {}, tokens[*body_end].location});
+        Parser parser(std::move(declaration_tokens), diagnostics, {}, address_bits);
+        Program declarations;
+        auto function = co_await parser.parse_expansion_declaration_async(context, declarations);
+        if (!function || !validate_expansion_function_declaration(*function, syntax_expander, diagnostics)) {
+            index = *body_end;
+            continue;
+        }
+        auto name = function->name;
         const auto declaration_end =
             tokens[*body_end].location.offset + tokens[*body_end].text.size();
         removals.push_back(
@@ -438,14 +339,23 @@ std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
                                   "' is defined more than once");
             continue;
         }
-        function.body = std::move(body);
-        macros.push_back({std::move(name), std::move(function), tokens[index].location,
-                          syntax_expander});
+        macros.push_back({std::move(name), std::move(*function), tokens[index].location,
+                          syntax_expander, std::move(declarations)});
         index = *body_end;
     }
-    return macros;
+    co_return macros;
 }
 
+
+std::vector<TokenMacro> collect_macros(const std::vector<Token>& tokens,
+                                       std::vector<Replacement>& removals,
+                                       Diagnostics& diagnostics,
+                                       unsigned address_bits,
+                                       bool syntax_expanders = false,
+                                       std::shared_ptr<const SyntaxContext> definition_context = {}) {
+    return collect_macros_async(tokens, removals, diagnostics, address_bits,
+        syntax_expanders, std::move(definition_context)).run();
+}
 std::vector<SourceTokenOrigin> remap_token_origins(
     const std::vector<SourceTokenOrigin>& source, const Replacement& replacement) {
     std::vector<SourceTokenOrigin> result;
@@ -653,15 +563,27 @@ std::vector<SourceExpansion> remap_expansions(
 std::optional<ExpansionFunctionSource> parse_expansion_function(
     const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
     unsigned address_bits, std::shared_ptr<const SyntaxContext> definition_context) {
+    return parse_expansion_function_async(tokens, index, diagnostics, address_bits,
+        std::move(definition_context)).run();
+}
+
+ContinuationTask<std::optional<ExpansionFunctionSource>> parse_expansion_function_async(
+    const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
+    unsigned address_bits, std::shared_ptr<const SyntaxContext> definition_context) {
     const auto begin = index;
     auto end = index;
-    for (auto at = index + 3; at < tokens.size() && tokens[at].kind != TokenKind::End; ++at) {
+    for (auto at = index; at < tokens.size() && tokens[at].kind != TokenKind::End; ++at) {
         if (tokens[at].is("{")) {
             const auto close = matching_group(tokens, at);
             end = close ? *close + 1 : tokens.size() - 1;
             break;
         }
         if (tokens[at].is(";")) { end = at + 1; break; }
+        if (tokens[at].is("(") || tokens[at].is("[") || tokens[at].is("[[")) {
+            const auto close = matching_group(tokens, at);
+            if (!close) break;
+            at = *close;
+        }
     }
     if (end == begin) end = tokens.size() - 1;
     std::vector<Token> bounded(tokens.begin() + static_cast<std::ptrdiff_t>(begin),
@@ -670,10 +592,11 @@ std::optional<ExpansionFunctionSource> parse_expansion_function(
     index = end;
     std::vector<Replacement> removals;
     const auto errors_before = diagnostics.errors();
-    auto functions = collect_macros(bounded, removals, diagnostics,
+    auto functions = co_await collect_macros_async(bounded, removals, diagnostics,
                                     address_bits, true, std::move(definition_context));
-    if (functions.size() != 1 || diagnostics.errors() != errors_before) return {};
-    return ExpansionFunctionSource{std::move(functions.front().function), functions.front().syntax_expander};
+    if (functions.size() != 1 || diagnostics.errors() != errors_before) co_return {};
+    co_return ExpansionFunctionSource{std::move(functions.front().function), functions.front().syntax_expander,
+        std::move(functions.front().declarations)};
 }
 
 const SourceFile* expand_procedural_macros(SourceManager& sources,

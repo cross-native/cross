@@ -7,6 +7,7 @@
 #include "frontend/parser.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -61,39 +62,75 @@ bool closing(std::string_view token) {
     return token == ")" || token == "]" || token == "]]" || token == "}";
 }
 
-std::optional<std::size_t> group_end(const std::vector<Token>& tokens, std::size_t index,
-                                   SyntaxExecution& execution) {
-    if (index >= tokens.size() || closer(tokens[index].text).empty()) return {};
+// Classify a retained raw group by its lexical boundary, never by the
+// structured marker's display spelling. Full tree validation stays budgeted
+// at capture time; FIRST-set queries need only this constant-time boundary.
+std::string_view group_opening(const SyntaxNode& node) {
+    if (node.kind != SyntaxNode::Kind::Group || node.children.size() < 2) return {};
+    const auto& first = node.children.front();
+    const auto& last = node.children.back();
+    const auto lexical = [](const std::shared_ptr<const SyntaxNode>& child) {
+        return child && child->kind == SyntaxNode::Kind::Token && child->tokens.size() == 1 &&
+            child->tokens.front().kind == TokenKind::Punctuator && !child->tokens.front().splice;
+    };
+    if (!lexical(first) || !lexical(last)) return {};
+    const auto opening = std::string_view(first->tokens.front().text);
+    if (closer(opening).empty() || closer(opening) != last->tokens.front().text) return {};
+    return opening;
+}
+
+struct GroupScanResult {
+    enum class Status { NotGroup, Complete, Unbalanced, ResourceFailure } status;
+    std::size_t last{};
+};
+
+GroupScanResult group_end(const std::vector<Token>& tokens, std::size_t index,
+                         SyntaxExecution& execution) {
+    using Status = GroupScanResult::Status;
+    if (index >= tokens.size() || tokens[index].kind != TokenKind::Punctuator ||
+        closer(tokens[index].text).empty()) return {Status::NotGroup};
     std::vector<std::string_view> stack;
     for (auto at = index; at < tokens.size() && tokens[at].kind != TokenKind::End; ++at) {
-        if (!execution.work(tokens[at].location)) return {};
+        if (!execution.work(tokens[at].location)) return {Status::ResourceFailure};
+        if (tokens[at].kind != TokenKind::Punctuator) continue;
         if (const auto close = closer(tokens[at].text); !close.empty()) {
-            if (stack.size() >= execution.limits().depth) return {};
+            if (stack.size() >= execution.limits().depth) {
+                execution.resource_error(tokens[at].location, "syntax raw-group nesting depth exceeded");
+                return {Status::ResourceFailure};
+            }
             stack.push_back(close);
         }
         else if (closing(tokens[at].text)) {
-            if (stack.empty() || stack.back() != tokens[at].text) return {};
+            if (stack.empty() || stack.back() != tokens[at].text) return {Status::Unbalanced};
             stack.pop_back();
-            if (stack.empty()) return at;
+            if (stack.empty()) return {Status::Complete, at};
         }
     }
-    return {};
+    return {Status::Unbalanced};
 }
 
 using Pattern = std::vector<SyntaxPatternElement>;
 using RulePattern = std::function<const Pattern*(SyntaxEntityId)>;
 
 struct FirstSet {
+    enum class Splice {
+        Expression, Type, Statement, Declaration, UsingDeclaration,
+        GlobalLabelDeclaration, StaticAssertDeclaration, FunctionHeader,
+        FunctionDefinition, ParenGroup, BracketGroup, AttributeGroup, BlockGroup, Count,
+    };
     struct Terminal {
         TokenKind kind;
         std::string text;
         bool operator==(const Terminal&) const = default;
     };
     std::vector<Terminal> exact;
+    std::bitset<static_cast<std::size_t>(Splice::Count)> splices;
     bool identifier{};
     bool literal{};
     bool builtin{};
     bool raw{};
+
+    void add(Splice kind) { splices.set(static_cast<std::size_t>(kind)); }
 };
 
 bool merge_first(FirstSet& into, const FirstSet& from) {
@@ -103,8 +140,10 @@ bool merge_first(FirstSet& into, const FirstSet& from) {
             into.exact.push_back(token);
             changed = true;
         }
-    changed |= (!into.identifier && from.identifier) || (!into.literal && from.literal) ||
+    changed |= (from.splices & ~into.splices).any() ||
+               (!into.identifier && from.identifier) || (!into.literal && from.literal) ||
                (!into.builtin && from.builtin) || (!into.raw && from.raw);
+    into.splices |= from.splices;
     into.identifier |= from.identifier;
     into.literal |= from.literal;
     into.builtin |= from.builtin;
@@ -113,7 +152,8 @@ bool merge_first(FirstSet& into, const FirstSet& from) {
 }
 
 bool first_accepts(const FirstSet& set, TokenKind kind, std::string_view text) {
-    if (set.raw && kind != TokenKind::End && text != ";" && !closing(text)) return true;
+    if (set.raw && kind != TokenKind::End &&
+        (kind != TokenKind::Punctuator || (text != ";" && !closing(text)))) return true;
     if (set.identifier && kind == TokenKind::Identifier && !is_reserved_identifier(text)) return true;
     if (set.literal && (kind == TokenKind::Integer || kind == TokenKind::Floating ||
                         kind == TokenKind::String || kind == TokenKind::Character)) return true;
@@ -123,18 +163,49 @@ bool first_accepts(const FirstSet& set, TokenKind kind, std::string_view text) {
     });
 }
 
+bool first_accepts(const FirstSet& set, const Token& token) {
+    if (first_accepts(set, token.kind, token.text)) return true;
+    if (token.kind != TokenKind::StructuredSplice || !token.splice) return false;
+    const auto& node = *token.splice;
+    using S = FirstSet::Splice;
+    std::optional<S> kind;
+    if (const auto opening = group_opening(node); !opening.empty()) {
+        if (opening == "(") kind = S::ParenGroup;
+        else if (opening == "[") kind = S::BracketGroup;
+        else if (opening == "[[") kind = S::AttributeGroup;
+        else kind = S::BlockGroup;
+    } else if (syntax_expression_node(node)) kind = S::Expression;
+    else if (syntax_type_node(node)) kind = S::Type;
+    else if (syntax_statement_node(node)) kind = S::Statement;
+    else if (syntax_declaration_node(node)) {
+        kind = S::Declaration;
+        if (node.kind == SyntaxNode::Kind::Core) {
+            if (node.production == SyntaxProduction::UsingDeclaration) kind = S::UsingDeclaration;
+            else if (node.production == SyntaxProduction::GlobalLabelDeclaration) kind = S::GlobalLabelDeclaration;
+            else if (node.production == SyntaxProduction::StaticAssertDeclaration) kind = S::StaticAssertDeclaration;
+        }
+    } else if (syntax_function_header_node(node)) kind = S::FunctionHeader;
+    else if (syntax_function_definition_node(node)) kind = S::FunctionDefinition;
+    return kind && set.splices.test(static_cast<std::size_t>(*kind));
+}
+
 bool first_overlap(const FirstSet& left, const FirstSet& right) {
     const auto ordinary = [](const FirstSet& set) {
-        return set.raw || set.identifier || set.literal || set.builtin;
+        return set.raw || set.identifier || set.literal || set.builtin || set.splices.any();
     };
     if ((left.raw && ordinary(right)) || (right.raw && ordinary(left)) ||
         (left.identifier && right.identifier) || (left.literal && right.literal) ||
-        (left.builtin && right.builtin)) return true;
+        (left.builtin && right.builtin) || (left.splices & right.splices).any()) return true;
     for (const auto& token : left.exact) if (first_accepts(right, token.kind, token.text)) return true;
     for (const auto& token : right.exact) if (first_accepts(left, token.kind, token.text)) return true;
     return false;
 }
 
+enum class PatternAnalysisPhase { Declaration, BoundGraph };
+
+// Declaration analysis treats every rule reference as opaque, even if a
+// same-spelled rule is already visible. Its first/nullable facts are only
+// locally proven facts; activation resolves the graph and checks it in full.
 // Left-recursive cycles have been rejected before bound rules reach this
 // analysis. Summarize only nullable prefixes, memoizing shared rule bodies:
 // productive recursion stops at its first consuming element. Exact terminals
@@ -146,11 +217,14 @@ public:
         bool nullable{};
     };
 
-    PatternAnalysis(SyntaxExecution& execution, Diagnostics& diagnostics, RulePattern rule)
-        : execution_(execution), diagnostics_(diagnostics), rule_(std::move(rule)) {}
+    PatternAnalysis(SyntaxExecution& execution, Diagnostics& diagnostics,
+                    PatternAnalysisPhase phase, RulePattern rule = {})
+        : execution_(execution), diagnostics_(diagnostics), phase_(phase), rule_(std::move(rule)) {}
 
     bool good() const { return !failed_; }
-    const Pattern* rule(SyntaxEntityId id) const { return rule_(id); }
+    const Pattern* rule(SyntaxEntityId id) const {
+        return phase_ == PatternAnalysisPhase::BoundGraph && rule_ ? rule_(id) : nullptr;
+    }
     bool work(SourceLocation location, std::uint64_t amount = 1) {
         if (!failed_ && !execution_.work(location, amount)) failed_ = true;
         return !failed_;
@@ -169,7 +243,7 @@ public:
         if (!work(location)) return empty_;
         if (active_.size() >= execution_.limits().depth ||
             std::find(active_.begin(), active_.end(), &pattern) != active_.end()) {
-            diagnostics_.error(location, "syntax pattern analysis depth exceeded");
+            execution_.resource_error(location, "syntax pattern analysis depth exceeded");
             failed_ = true;
             return empty_;
         }
@@ -189,16 +263,19 @@ public:
         if (const auto found = elements_.find(&part); found != elements_.end()) return found->second;
         if (!work(part.location)) return empty_;
         using K = SyntaxPatternElement::Kind;
+        using S = FirstSet::Splice;
         Summary result;
         auto& current = result.first;
         const auto expression_starts = [&] {
             current.identifier = current.literal = current.builtin = true;
+            current.add(S::Expression);
             for (const auto spelling : {"(", "++", "--", "&", "*", "+", "-", "~", "!", "sizeof"})
                 current.exact.push_back({spelling == std::string_view("sizeof")
                     ? TokenKind::Identifier : TokenKind::Punctuator, spelling});
         };
         const auto type_starts = [&] {
             current.identifier = current.builtin = true;
+            current.add(S::Type);
             for (const auto spelling : {"void", "bool", "i8", "i16", "i32", "i64", "i128", "iptr",
                                        "u8", "u16", "u32", "u64", "u128", "uptr", "f32", "f64",
                                        "f80", "f128", "fptr", "label", "const", "volatile", "restrict",
@@ -217,13 +294,30 @@ public:
         case K::Literal: current.literal = true; break;
         case K::Expr: expression_starts(); break;
         case K::Type: type_starts(); break;
-        case K::Declaration: case K::FunctionHeader:
+        case K::Declaration:
+            declaration_starts();
+            // Ordinary using is a declaration/block item, not a standalone
+            // statement or a function header. Keep their start sets distinct.
+            current.exact.push_back({TokenKind::Identifier, "using"});
+            current.add(S::Declaration);
+            current.add(S::UsingDeclaration);
+            current.add(S::GlobalLabelDeclaration);
+            current.add(S::StaticAssertDeclaration);
+            current.add(S::FunctionHeader);
+            break;
+        case K::FunctionHeader:
         case K::FunctionDeclaration: case K::FunctionDefinition: case K::FunctionRaw:
             declaration_starts();
+            current.add(S::FunctionHeader);
+            if (part.kind == K::FunctionDeclaration) current.add(S::Declaration);
+            if (part.kind == K::FunctionDefinition) current.add(S::FunctionDefinition);
             break;
         case K::Statement:
             expression_starts();
             declaration_starts();
+            current.add(S::Statement);
+            current.add(S::Declaration);
+            current.add(S::StaticAssertDeclaration);
             for (const auto spelling : {"case", "default", "if", "switch", "while", "do", "for",
                                        "goto", "break", "continue", "return", "syntax"})
                 current.exact.push_back({TokenKind::Identifier, spelling});
@@ -241,11 +335,21 @@ public:
                     token.kind = TokenKind::Punctuator;
                     token.text = opener;
                     current.exact.push_back(std::move(token));
+                    if (opener == std::string_view("(")) current.add(S::ParenGroup);
+                    else if (opener == std::string_view("[")) current.add(S::BracketGroup);
+                    else if (opener == std::string_view("[[")) current.add(S::AttributeGroup);
+                    else current.add(S::BlockGroup);
                 }
             break;
         case K::Rule:
-            if (part.resolved_rule)
-                if (const auto* body = rule_(*part.resolved_rule)) result = sequence(*body);
+            if (phase_ == PatternAnalysisPhase::BoundGraph) {
+                const auto* body = part.resolved_rule ? rule(*part.resolved_rule) : nullptr;
+                if (body) result = sequence(*body);
+                else {
+                    diagnostics_.error(part.location, "syntax rule is not bound for graph analysis");
+                    failed_ = true;
+                }
+            }
             break;
         case K::Optional: case K::Repeat0: case K::Repeat1: case K::Separated0: case K::Separated1:
             result = sequence(part.pattern);
@@ -266,6 +370,7 @@ public:
 private:
     SyntaxExecution& execution_;
     Diagnostics& diagnostics_;
+    PatternAnalysisPhase phase_;
     RulePattern rule_;
     bool failed_{};
     Summary empty_;
@@ -309,6 +414,7 @@ bool validate_pattern_progress(const Pattern& root, PatternAnalysis& analysis,
                 // token must fence the capture; a record boundary alone does
                 // not bound an expression or inject new operator precedence.
                 if (continuation.raw || continuation.identifier || continuation.literal || continuation.builtin ||
+                    continuation.splices.any() ||
                     std::any_of(continuation.exact.begin(), continuation.exact.end(), [](const auto& fence) {
                         return fence.kind != TokenKind::Punctuator ||
                             (fence.text != ";" && fence.text != "," && !closing(fence.text));
@@ -343,13 +449,11 @@ bool validate_pattern_progress(const Pattern& root, PatternAnalysis& analysis,
             enqueue(element.pattern, child_continuation);
             if (element.kind == K::Rule && element.resolved_rule)
                 if (const auto* body = analysis.rule(*element.resolved_rule)) enqueue(*body, continuation);
-            for (const auto& alternative : element.alternatives) {
-                if (analysis.sequence(alternative.pattern).nullable) {
-                    diagnostics.error(element.location, "syntax choice alternative must consume input");
-                    return false;
-                }
+            // Choice itself neither repeats nor requires a selected body to
+            // advance. Nullable alternatives remain real tagged derivations;
+            // enclosing progress checks and complete-match ambiguity still apply.
+            for (const auto& alternative : element.alternatives)
                 enqueue(alternative.pattern, continuation);
-            }
             const auto& start = analysis.element(element);
             if (!start.nullable) continuation = start.first;
             else analysis.merge(continuation, start.first, element.location);
@@ -403,28 +507,52 @@ void SyntaxExecution::publish_declarations(const Program& program,
     for (const auto& enumeration : pending_enumerations) publish_enumeration(enumeration);
 }
 
-bool SyntaxExecution::define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
+const FunctionDecl* SyntaxExecution::define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
     const std::vector<std::string>& imports, const std::vector<SyntaxBinding>& bindings,
+    std::shared_ptr<const SyntaxParseEnvironment> environment) {
+    return define_function_async(tokens, index, std::string(name_space), imports, bindings,
+        std::move(environment)).run();
+}
+
+ContinuationTask<const FunctionDecl*> SyntaxExecution::define_function_async(const std::vector<Token>& tokens, std::size_t& index, std::string name_space,
+    std::vector<std::string> imports, std::vector<SyntaxBinding> bindings,
     std::shared_ptr<const SyntaxParseEnvironment> environment) {
     auto context = std::make_shared<SyntaxContext>();
     context->kind = SyntaxContext::Kind::DefinitionSite;
     context->name_space = name_space;
     context->imports = imports;
+    if (environment) context->import_declarations = environment->import_declarations;
     context->syntax_bindings = bindings;
     context->parse_environment = environment;
-    auto function = parse_expansion_function(tokens, index, diagnostics_, address_bits_, std::move(context));
-    if (!function) return false;
+    auto function = co_await parse_expansion_function_async(tokens, index, diagnostics_, address_bits_, std::move(context));
+    if (!function) co_return nullptr;
     auto& declaration = function->function;
-    declaration.name = join(name_space, declaration.name);
+    // The ordinary declaration parser has already qualified the name in the
+    // retained definition namespace.
     declaration.source_namespace = name_space;
     declaration.imports = imports;
     for (const auto& previous : functions_) {
         if (previous.declaration.name != declaration.name) continue;
         diagnostics_.error(declaration.location, "expansion function is defined more than once: '" + declaration.name + "'");
-        return false;
+        co_return nullptr;
     }
+    publish_declarations(function->declarations);
+    declarations_.expansion_definitions.push_back(copy_evaluation_declaration(declaration));
     functions_.push_back({std::move(declaration), function->syntax_expander, bindings, std::move(environment)});
-    return true;
+    co_return &functions_.back().declaration;
+}
+
+bool SyntaxExecution::validate_functions() {
+    return validate_functions_async().run();
+}
+
+ContinuationTask<bool> SyntaxExecution::validate_functions_async() {
+    // Registration keeps role bodies out of runtime IR, not out of ordinary
+    // source validation. Validate even uncalled definitions after the primary
+    // unit has published its declarations, without executing their effects.
+    for (const auto& function : functions_)
+        if (!(co_await semantics_->validate_source_async(function.declaration))) co_return false;
+    co_return true;
 }
 
 std::optional<SyntaxExecution::FunctionId> SyntaxExecution::find_function(
@@ -446,7 +574,7 @@ std::optional<SyntaxExecution::FunctionId> SyntaxExecution::find_function(
 
 bool SyntaxExecution::work(SourceLocation location, std::uint64_t amount) {
     if (amount > limits_.steps - std::min(work_, limits_.steps)) {
-        diagnostics_.error(location, "syntax matching work budget exceeded");
+        resource_error(location, "syntax matching work budget exceeded");
         return false;
     }
     work_ += amount;
@@ -454,6 +582,9 @@ bool SyntaxExecution::work(SourceLocation location, std::uint64_t amount) {
 }
 
 bool SyntaxExecution::begin_replacement(SourceLocation location) {
+    // Flat, independent invocations consume the configurable work budget;
+    // their count is not recursion and has no separate fixed ceiling.
+    if (!work(location)) return false;
     // Textual macro output is parsed by the caller's token cursor, so its
     // generating expansion may no longer occupy the C++ call stack. Retain
     // the same nesting limit through typed source ancestry, excluding public
@@ -468,24 +599,24 @@ bool SyntaxExecution::begin_replacement(SourceLocation location) {
         if (ancestry >= limits_.depth) break;
         at = expansion->invocation;
     }
-    if (std::max(depth_, ancestry) >= limits_.depth || expansions_ >= 128) {
-        diagnostics_.error(location, "syntax/procedural expansion depth or invocation budget exceeded");
+    if (std::max(depth_, ancestry) >= limits_.depth) {
+        resource_error(location, "syntax/procedural expansion depth exceeded");
         return false;
     }
     ++depth_;
-    ++expansions_;
     active_expansions_.emplace_back();
     return true;
 }
 
 void SyntaxExecution::end_replacement() {
+    if (active_expansions_.back()) expansion_signature_storage_ -= active_expansions_.back()->storage;
     active_expansions_.pop_back();
     --depth_;
 }
 
 bool SyntaxExecution::begin_fragment(SourceLocation location, std::size_t copied_tokens) {
     if (fragment_depth_ >= limits_.depth) {
-        diagnostics_.error(location, "public syntax fragment nesting depth exceeded");
+        resource_error(location, "public syntax fragment nesting depth exceeded");
         return false;
     }
     if (!work(location, copied_tokens + 1)) return false;
@@ -496,20 +627,81 @@ bool SyntaxExecution::begin_fragment(SourceLocation location, std::size_t copied
 void SyntaxExecution::end_fragment() { --fragment_depth_; }
 
 void SyntaxExecution::tree_limit_error(SourceLocation location) {
-    diagnostics_.error(location, "public syntax tree depth, work, or storage budget exceeded");
+    resource_error(location, "public syntax tree depth, work, or storage budget exceeded");
+}
+
+void SyntaxExecution::resource_error(SourceLocation location, std::string_view message) {
+    // Speculative parsers own quiet ordinary diagnostics, but exhausting a
+    // shared limit is not an alternative mismatch. Retain it independently of
+    // whichever diagnostic sink the current matcher happens to use.
+    ++declarations_.evaluation_resource_errors;
+    diagnostics_.error(location, message);
+}
+
+void SyntaxExecution::resource_note(SourceLocation location, std::string_view message) {
+    diagnostics_.note(location, message);
 }
 
 std::shared_ptr<const SyntaxContext> SyntaxExecution::call_context(SourceLocation location,
     std::string_view name_space, const std::vector<std::string>& imports,
     const std::vector<SyntaxBinding>& bindings,
-    std::shared_ptr<const SyntaxParseEnvironment> environment) const {
+    std::shared_ptr<const SyntaxParseEnvironment> environment,
+    const std::vector<TokenIdentity>& import_declarations) const {
     auto context = std::make_shared<SyntaxContext>();
     context->invocation = location;
     context->name_space = name_space;
     context->imports = imports;
+    context->import_declarations = import_declarations;
     context->syntax_bindings = bindings;
     context->parse_environment = std::move(environment);
     return context;
+}
+
+bool SyntaxExecution::ExpansionInputToken::operator==(const ExpansionInputToken& other) const {
+    const auto& left = token;
+    const auto& right = other.token;
+    if (left.kind != right.kind || left.text != right.text || left.splice != right.splice ||
+        left.split_source != right.split_source || left.split_offset != right.split_offset) return false;
+    const auto& a = left.origin;
+    const auto& b = right.origin;
+    // Original lexical positions remain significant. Constructed tokens keep
+    // their source anchor and output position, while the fresh serialization
+    // frame alone is not progress (private names/binders are compared below).
+    if (a.identity.source_unit != b.identity.source_unit || a.identity.offset != b.identity.offset ||
+        a.identity.output_position != b.identity.output_position ||
+        (!a.identity.expansion.value != !b.identity.expansion.value)) return false;
+    if (a.lookup_mode != b.lookup_mode || a.embed != b.embed || a.embed_piece != b.embed_piece ||
+        a.value_binding != b.value_binding || a.declaration_source != b.declaration_source ||
+        a.value_spelling != b.value_spelling || a.fragment_lookup != b.fragment_lookup ||
+        a.fresh != b.fresh || a.tag_binding != b.tag_binding ||
+        a.tag_declaration_source != b.tag_declaration_source || a.alias_binding != b.alias_binding ||
+        a.label_binding != b.label_binding || a.value_context_captured != b.value_context_captured ||
+        a.deferred_parameter_region != b.deferred_parameter_region) return false;
+    if (a.span.file != b.span.file || a.span.offset != b.span.offset ||
+        a.last_span().file != b.last_span().file || a.last_span().offset != b.last_span().offset) return false;
+    if (a.context == b.context) return true;
+    if (!a.context || !b.context) return false;
+    // Quoting a fixed definition produces a new invocation wrapper each time.
+    // Compare its retained lookup state, not that wrapper's allocation address.
+    // Never structurally merge distinct parser snapshots or private binders.
+    const auto& x = *a.context;
+    const auto& y = *b.context;
+    return x.kind == y.kind && x.definition.file == y.definition.file &&
+        x.definition.offset == y.definition.offset && x.name_space == y.name_space &&
+        x.imports == y.imports && x.import_declarations == y.import_declarations &&
+        x.syntax_bindings == y.syntax_bindings &&
+        (x.parse_environment == y.parse_environment ||
+         (x.parse_environment && y.parse_environment &&
+          syntax_environment_same_lookup(*x.parse_environment, *y.parse_environment)));
+}
+
+bool SyntaxExecution::ExpansionSignature::operator==(const ExpansionSignature& other) const {
+    return function == other.function && name_space == other.name_space && imports == other.imports &&
+        bindings == other.bindings && import_declarations == other.import_declarations &&
+        published_functions == other.published_functions && published_objects == other.published_objects &&
+        published_records == other.published_records && published_enumerations == other.published_enumerations &&
+        (environment == other.environment || (environment && other.environment &&
+            syntax_environment_same_lookup(*environment, *other.environment))) && input == other.input;
 }
 
 std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
@@ -517,57 +709,76 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     std::string_view name_space, const std::vector<std::string>& imports,
     const std::vector<SyntaxBinding>& bindings,
     std::shared_ptr<const SyntaxParseEnvironment> environment,
-    const SyntaxDefinition* owner) {
-    if (id.value >= functions_.size()) return {};
+    const SyntaxDefinition* owner, const std::vector<TokenIdentity>& import_declarations) {
+    return expand_async(id, std::move(input), std::move(match), invocation, std::string(name_space),
+        imports, bindings, std::move(environment), owner, import_declarations).run();
+}
+
+ContinuationTask<std::optional<SyntaxExecution::Output>> SyntaxExecution::expand_async(FunctionId id,
+    TokenSequence input, std::shared_ptr<const SyntaxMatchValue> match, SourceLocation invocation,
+    std::string name_space, std::vector<std::string> imports,
+    std::vector<SyntaxBinding> bindings,
+    std::shared_ptr<const SyntaxParseEnvironment> environment,
+    const SyntaxDefinition* owner, std::vector<TokenIdentity> import_declarations) {
+    if (id.value >= functions_.size()) co_return {};
     if (!active_expansions_.empty()) {
         ExpansionSignature signature;
         signature.function = id.value;
         signature.name_space = name_space;
         signature.imports = imports;
         signature.bindings = bindings;
+        signature.import_declarations = import_declarations;
+        signature.environment = environment;
+        signature.published_functions = declarations_.functions.size();
+        signature.published_objects = declarations_.objects.size();
+        signature.published_records = declarations_.records.size();
+        signature.published_enumerations = declarations_.enumerations.size();
         const auto& matched = match ? match->input : input;
+        if (!work(invocation, matched.size() + 1)) co_return {};
+        const auto add_storage = [&](std::uint64_t amount) {
+            if (amount > limits_.bytes - std::min(signature.storage, limits_.bytes) ||
+                amount > limits_.memory - std::min(expansion_signature_storage_ + signature.storage, limits_.memory)) {
+                resource_error(invocation, "syntax expansion byte or memory budget exceeded");
+                return false;
+            }
+            signature.storage += amount;
+            return true;
+        };
+        if (!add_storage(192 + signature.name_space.size())) co_return {};
+        for (const auto& imported : signature.imports)
+            if (!add_storage(32 + imported.size())) co_return {};
+        for (const auto& binding : signature.bindings)
+            if (!add_storage(64 + binding.prefix.size())) co_return {};
+        for (const auto& declaration : signature.import_declarations) {
+            (void)declaration;
+            if (!add_storage(40)) co_return {};
+        }
         signature.input.reserve(matched.size());
-        for (const auto& token : matched)
-            signature.input.push_back({token.kind, token.text, token.splice.get()});
+        for (const auto& token : matched) {
+            if (!add_storage(meta_token_storage_bytes + token.text.size())) co_return {};
+            signature.input.push_back({token});
+        }
         unsigned repeats{};
-        for (std::size_t at = 0; at + 1 < active_expansions_.size(); ++at)
+        for (std::size_t at = 0; at + 1 < active_expansions_.size(); ++at) {
+            if (!work(invocation, 1 + (active_expansions_[at] ? active_expansions_[at]->input.size() : 0))) co_return {};
             if (active_expansions_[at] && *active_expansions_[at] == signature) ++repeats;
+        }
         if (repeats >= 2) {
             diagnostics_.error(invocation,
-                "syntax/procedural expansion depth or invocation budget exceeded (recursive cycle)");
+                "syntax/procedural expansion depth exceeded (recursive cycle)");
             if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
-            return {};
+            co_return {};
         }
+        expansion_signature_storage_ += signature.storage;
         active_expansions_.back() = std::move(signature);
     }
     const auto& function = functions_[id.value];
-    const auto call = call_context(invocation, name_space, imports, bindings, std::move(environment));
+    const auto call = call_context(invocation, name_space, imports, bindings, std::move(environment), import_declarations);
     const auto attach = [&](TokenSequence& tokens) {
         for (auto& token : tokens) if (!token.origin.context) token.origin.context = call;
     };
     attach(input);
-    std::function<std::shared_ptr<const SyntaxNode>(const SyntaxNode&)> contextualize_node;
-    std::function<std::shared_ptr<const SyntaxMatchValue>(const SyntaxMatchValue&)> contextualize_match;
-    contextualize_node = [&](const SyntaxNode& source) -> std::shared_ptr<const SyntaxNode> {
-        auto node = std::make_shared<SyntaxNode>(source);
-        if (!node->context) node->context = call;
-        attach(node->tokens);
-        for (auto& child : node->children) child = contextualize_node(*child);
-        if (node->match) node->match = contextualize_match(*node->match);
-        return node;
-    };
-    contextualize_match = [&](const SyntaxMatchValue& source) -> std::shared_ptr<const SyntaxMatchValue> {
-        auto value = std::make_shared<SyntaxMatchValue>(source);
-        if (!value->context) value->context = call;
-        attach(value->input);
-        for (auto& field : value->fields) {
-            attach(field.tokens);
-            if (field.node) field.node = contextualize_node(*field.node);
-            for (auto& record : field.records) record = contextualize_match(*record);
-        }
-        return value;
-    };
-    if (match) match = contextualize_match(*match);
+    if (match) match = syntax_attach_context(std::move(match), call);
     const auto expansion = sources_.next_expansion();
     auto definition = std::make_shared<SyntaxContext>();
     definition->kind = SyntaxContext::Kind::DefinitionSite;
@@ -576,30 +787,37 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     definition->invocation = invocation;
     definition->name_space = function.declaration.source_namespace;
     definition->imports = function.declaration.imports;
+    if (function.environment) definition->import_declarations = function.environment->import_declarations;
     definition->syntax_bindings = function.bindings;
     definition->parse_environment = function.environment;
     const SyntaxParseCallback parse = [&](SyntaxParseCategory category, const TokenSequence& tokens,
         std::shared_ptr<const SyntaxContext> context, SourceLocation location) {
-        return parse_tokens(category, tokens, std::move(context), location);
+        return parse_tokens_async(category, tokens, std::move(context), location);
     };
-    auto prepared = semantics_->prepare(function.declaration);
+    auto prepared = co_await semantics_->prepare_async(function.declaration);
     if (!prepared) {
+        diagnostics_.note(function.declaration.location, "expansion function is defined here");
+        if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
         diagnostics_.note(invocation, "while preparing expansion '" + function.declaration.name + "'");
-        return {};
+        co_return {};
     }
     const auto& size_of = declarations_.evaluation_size_of ? declarations_.evaluation_size_of : size_of_;
     const auto& align_of = declarations_.evaluation_align_of ? declarations_.evaluation_align_of : align_of_;
-    auto output = function.syntax_expander
-        ? evaluate_syntax_body(*prepared, std::move(match), address_bits_, size_of, align_of,
-                               definition, diagnostics_, limits_, layout_, parse, call, &declarations_)
-        : evaluate_procedural_body(*prepared, input, address_bits_, size_of, align_of,
-                                   definition, diagnostics_, limits_, layout_, parse, call, &declarations_);
-    if (output && !semantics_->validate_assertions()) output.reset();
+    std::optional<TokenSequence> output;
+    if (function.syntax_expander)
+        output = co_await evaluate_syntax_body_async(*prepared, std::move(match), address_bits_, size_of, align_of,
+            definition, diagnostics_, limits_, layout_, parse, call, &declarations_);
+    else
+        output = co_await evaluate_procedural_body_async(*prepared, std::move(input), address_bits_, size_of, align_of,
+            definition, diagnostics_, limits_, layout_, parse, call, &declarations_);
+    if (output) {
+        if (!(co_await semantics_->validate_assertions_async())) output.reset();
+    }
     if (!output) {
         diagnostics_.note(function.declaration.location, "expansion function is defined here");
         if (owner) diagnostics_.note(owner->location, "syntax '" + owner->name + "' defined here");
         diagnostics_.note(invocation, "while expanding '" + function.declaration.name + "'");
-        return {};
+        co_return {};
     }
     std::string text;
     std::vector<SourceTokenOrigin> origins;
@@ -616,36 +834,58 @@ std::optional<SyntaxExecution::Output> SyntaxExecution::expand(FunctionId id,
     const auto end = text.size();
     const auto unit = invocation.file ? invocation.file->source_unit_at(invocation.line) : std::string{};
     std::vector<std::string> units(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) + 1, unit);
-    const auto* source = sources_.add(invocation.file ? invocation.file->path : std::filesystem::path("<syntax>"),
+    const auto& name = owner ? owner->name : function.declaration.name;
+    const auto* source = sources_.add("<expansion of '" + name + "'>",
         std::move(text), {SourceExpansion{0, end,
-            owner ? owner->name : function.declaration.name,
+            name,
             invocation, owner ? owner->location : function.declaration.location,
             owner ? SourceExpansion::Kind::SyntaxExtension : SourceExpansion::Kind::ProceduralMacro,
             owner ? function.declaration.location : SourceLocation{}}},
         std::move(origins), {}, std::move(units));
-    if (!validate_embeds(*source, diagnostics_)) return {};
+    if (!validate_embeds(*source, diagnostics_)) co_return {};
     auto tokens = Lexer(*source, diagnostics_).lex();
     // Empty item replacements still need an ancestry-bearing source location.
-    return Output{std::move(tokens), {source, 0, 1, 1}};
+    co_return Output{std::move(tokens), {source, 0, 1, 1}};
 }
 
 std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCategory category,
     const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
     SourceLocation location) {
-    if (!context || !context->parse_environment) return {};
+    return parse_tokens_async(category, input, std::move(context), location).run();
+}
+
+ContinuationTask<std::shared_ptr<const SyntaxNode>> SyntaxExecution::parse_tokens_async(SyntaxParseCategory category,
+    const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
+    SourceLocation location) {
+    if (!context || !context->parse_environment) co_return {};
     std::string text;
     std::vector<SourceTokenOrigin> origins;
     for (const auto& token : input) {
-        if (!work(location)) return {};
+        if (!work(location)) co_return {};
         if (token.kind == TokenKind::End || token.kind == TokenKind::Invalid ||
             token.text.empty() || token.text.find('\0') != std::string::npos ||
-            token.text.size() + 1 > limits_.bytes - std::min<std::uint64_t>(text.size(), limits_.bytes)) return {};
+            token.text.size() + 1 > limits_.bytes - std::min<std::uint64_t>(text.size(), limits_.bytes)) co_return {};
         const auto begin = text.size();
         text += token.text;
         auto origin = token.origin;
         // Explicit-context parsing changes lookup, not identity or source span.
         origin.context = context;
+        if ((origin.value_binding.kind == ValueBinding::Kind::Local ||
+             origin.value_binding.kind == ValueBinding::Kind::Object ||
+             origin.value_binding.kind == ValueBinding::Kind::Function ||
+             origin.value_binding.kind == ValueBinding::Kind::Enumerator) &&
+            origin.value_binding.declaration == origin.identity)
+            origin.declaration_source = std::make_shared<const ValueBinding>(origin.value_binding);
         origin.value_binding = {};
+        origin.value_spelling.reset();
+        origin.fragment_lookup.reset();
+        origin.value_context_captured = false;
+        origin.lookup_mode = TokenOrigin::LookupMode::Lexical;
+        origin.deferred_parameter_region.reset();
+        origin.label_binding = {};
+        if (origin.tag_binding)
+            origin.tag_declaration_source = origin.tag_binding->role == TagBinding::Role::Declaration
+                ? origin.tag_binding : nullptr;
         origin.tag_binding.reset();
         origin.alias_binding.reset();
         origins.push_back({begin, text.size(), std::move(origin), token.splice});
@@ -656,14 +896,14 @@ std::shared_ptr<const SyntaxNode> SyntaxExecution::parse_tokens(SyntaxParseCateg
         {{0, size, "$::meta::parse", location, context->definition,
           SourceExpansion::Kind::FragmentParse}}, std::move(origins));
     auto tokens = Lexer(*source, diagnostics_).lex();
-    if (tokens.size() != input.size() + 1) return {};
+    if (tokens.size() != input.size() + 1) co_return {};
     for (std::size_t at = 0; at < input.size(); ++at) {
-        if (tokens[at].kind != input[at].kind || tokens[at].text != input[at].text) return {};
-        if (tokens[at].splice != input[at].splice) return {};
+        if (tokens[at].kind != input[at].kind || tokens[at].text != input[at].text) co_return {};
+        if (tokens[at].splice != input[at].splice) co_return {};
         tokens[at].split_source = input[at].split_source;
         tokens[at].split_offset = input[at].split_offset;
     }
-    return Parser::parse_syntax_tokens(category, std::move(tokens), std::move(context), diagnostics_);
+    co_return co_await Parser::parse_syntax_tokens_async(category, std::move(tokens), std::move(context), diagnostics_);
 }
 
 std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(
@@ -970,8 +1210,15 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
                                 error("separated pattern requires a quoted one-token separator"); return {};
                             }
                             auto separator = execution_->terminal(tokens[index].text, tokens[index].location);
-                            ++index;
                             if (!separator) return {};
+                            // Each list body is independently balanced. A single
+                            // group delimiter between bodies cannot preserve that
+                            // balance, even if a later terminal fixes the endpoint.
+                            if (!closer(separator->text).empty() || closing(separator->text)) {
+                                error("syntax separator cannot be a group delimiter");
+                                return {};
+                            }
+                            ++index;
                             element.terminal = std::move(*separator);
                         }
                         if (!take(")")) { error("expected ')' after syntax pattern combinator"); return {}; }
@@ -1014,8 +1261,7 @@ bool SyntaxState::declare(const std::vector<Token>& tokens, std::size_t& index,
         if (!pattern) return false;
         if (!take(";")) return error("expected ';' after syntax match");
         definition.pattern = std::move(*pattern);
-        PatternAnalysis analysis(*execution_, diagnostics,
-            [](SyntaxEntityId) -> const Pattern* { return nullptr; });
+        PatternAnalysis analysis(*execution_, diagnostics, PatternAnalysisPhase::Declaration);
         if (!validate_pattern_progress(definition.pattern, analysis, diagnostics)) return false;
         if (*selected != SyntaxKind::Rule) {
             if (!take("expand")) return error("syntax definition requires an expand clause after match");
@@ -1043,6 +1289,11 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
     std::vector<PendingRules> pending_rules;
     std::vector<std::pair<SyntaxEntityId, SyntaxFunctionId>> pending_expanders;
     std::vector<SyntaxEntityId> resolving_rules;
+    struct ActivationFrame {
+        const SyntaxActivation* entry;
+        SyntaxEntityId definition;
+    };
+    std::vector<ActivationFrame> activation_frames;
     struct BindingNote {
         Diagnostics& diagnostics;
         const SyntaxDefinition& definition;
@@ -1111,6 +1362,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
         const auto& definition = (*definitions_)[id->value];
         ActivationNote note{diagnostics, entry, definition};
         if (!execution_->work(entry.location)) return false;
+        activation_frames.push_back({&entry, *id});
         if (definition.kind == SyntaxKind::Rule) {
             diagnostics.error(entry.location, "a syntax rule cannot be activated");
             return false;
@@ -1158,6 +1410,29 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
         return true;
     };
     for (const auto& entry : entries) if (!flatten(flatten, entry, name_space, imports_)) return false;
+    // Flattening can succeed before graph-dependent checks fail. Keep the
+    // complete atomic directive's request trail alive through that second
+    // phase, including bundle-use locations, not just the failing rule's site.
+    struct GraphActivationNote {
+        Diagnostics& diagnostics;
+        const std::vector<ActivationFrame>& frames;
+        const std::vector<SyntaxDefinition>& definitions;
+        unsigned previous_errors;
+        bool complete{};
+        ~GraphActivationNote() {
+            if (complete || diagnostics.errors() == previous_errors) return;
+            std::vector<bool> noted(definitions.size());
+            for (auto at = frames.rbegin(); at != frames.rend(); ++at) {
+                diagnostics.note(at->entry->location,
+                    "requested by syntax activation '" + at->entry->name + "'");
+                if (noted[at->definition.value]) continue;
+                noted[at->definition.value] = true;
+                const auto& definition = definitions[at->definition.value];
+                diagnostics.note(definition.location,
+                    "syntax '" + definition.name + "' defined here");
+            }
+        }
+    } graph_note{diagnostics, activation_frames, *definitions_, diagnostics.errors()};
     const RulePattern bound_pattern = [&](SyntaxEntityId id) -> const Pattern* {
         for (const auto& pending : pending_rules)
             if (pending.definition == id) return &pending.pattern;
@@ -1263,7 +1538,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
     };
     for (const auto& pending : pending_rules)
         if (visited[pending.definition.value] == 0 && !check_leading(check_leading, pending.definition)) return false;
-    PatternAnalysis progress(*execution_, diagnostics, bound_pattern);
+    PatternAnalysis progress(*execution_, diagnostics, PatternAnalysisPhase::BoundGraph, bound_pattern);
     for (const auto& pending : pending_rules)
         if (!validate_pattern_progress(pending.pattern, progress, diagnostics)) {
             const auto& definition = (*definitions_)[pending.definition.value];
@@ -1282,6 +1557,7 @@ bool SyntaxState::activate(std::span<const SyntaxActivation> entries, std::strin
     for (auto& binding : proposed)
         if (std::find(inherited.begin(), inherited.end(), binding) == inherited.end())
             scopes_.back().push_back(std::move(binding));
+    graph_note.complete = true;
     return true;
 }
 
@@ -1297,18 +1573,55 @@ const SyntaxDefinition* SyntaxState::selected(const Token& token, bool item) con
 
 std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& definition,
     const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
-    const std::function<std::optional<SyntaxParsedFragment>(
-        SyntaxPatternElement::Kind, std::size_t)>& parse_fragment) const {
+    const ParseFragment& parse_fragment,
+    const std::function<std::shared_ptr<const SyntaxContext>(SourceLocation)>& capture_context,
+    MatchMode mode) const {
+    return match_async(definition, tokens, begin, diagnostics, parse_fragment, capture_context, mode).run();
+}
+
+ContinuationTask<std::optional<SyntaxState::Match>> SyntaxState::match_async(const SyntaxDefinition& definition,
+    const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
+    ParseFragment parse_fragment,
+    std::function<std::shared_ptr<const SyntaxContext>(SourceLocation)> capture_context,
+    MatchMode mode) const {
     const auto previous_errors = diagnostics.errors();
-    PatternAnalysis analysis(*execution_, diagnostics, [&](SyntaxEntityId id) -> const Pattern* {
+    const auto previous_resources = execution_->resource_errors();
+    const auto resource_failed = [&] { return execution_->resource_errors() != previous_resources; };
+    const auto note = [&](SourceLocation location, std::string_view message) {
+        if (resource_failed()) execution_->resource_note(location, message);
+        else diagnostics.note(location, message);
+    };
+    PatternAnalysis analysis(*execution_, diagnostics, PatternAnalysisPhase::BoundGraph,
+        [&](SyntaxEntityId id) -> const Pattern* {
         return id.value < definitions_->size() ? &(*definitions_)[id.value].pattern : nullptr;
     });
     std::uint64_t storage{};
     bool failed{};
+    std::shared_ptr<const SyntaxContext> source_context;
+    const auto context_at = [&](SourceLocation location) {
+        if (failed || resource_failed()) return std::shared_ptr<const SyntaxContext>{};
+        // Unmarked source tokens in this bounded match share its unchanged
+        // caller environment. Do not create one full snapshot per raw leaf.
+        if (capture_context && !token_origin(location).context) {
+            if (!source_context) source_context = capture_context(tokens[begin].location);
+            if (!source_context) failed = true;
+            return source_context;
+        }
+        auto context = capture_context ? capture_context(location) : token_origin(location).context;
+        if (capture_context && !context) failed = true;
+        return context;
+    };
+    const auto scan_group = [&](std::size_t at) -> std::optional<std::size_t> {
+        const auto result = group_end(tokens, at, *execution_);
+        if (result.status == GroupScanResult::Status::ResourceFailure) failed = true;
+        if (result.status == GroupScanResult::Status::Complete) return result.last;
+        return {};
+    };
     const auto charge = [&](std::uint64_t amount) {
+        if (failed || resource_failed()) return false;
         const auto limit = std::min(execution_->limits().bytes, execution_->limits().memory);
         if (amount > limit - std::min(storage, limit)) {
-            diagnostics.error(tokens[begin].location, "syntax match record byte or memory budget exceeded");
+            execution_->resource_error(tokens[begin].location, "syntax match record byte or memory budget exceeded");
             return false;
         }
         storage += amount;
@@ -1331,27 +1644,45 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         for (auto at = first; at < last; ++at) {
             if (!execution_->work(tokens[at].location)) { failed = true; return {}; }
             const auto origin = token_origin(tokens[at].location);
-            if (!closer(tokens[at].text).empty()) {
+            if (tokens[at].kind == TokenKind::StructuredSplice) {
+                // A captured splice is already a public node, not a lexical
+                // leaf with a printable marker spelling. Retain its exact
+                // identity and an edge boundary for nontextual reconstruction.
+                if (groups.empty() || !tokens[at].splice || !charge(16 + 8) ||
+                    !charge(syntax_node_storage(*tokens[at].splice,
+                        std::min(execution_->limits().bytes, execution_->limits().memory)))) {
+                    failed = true;
+                    return {};
+                }
+                auto& group = *groups.back();
+                group.splice_children.push_back(group.children.size());
+                group.children.push_back(tokens[at].splice);
+                continue;
+            }
+            if (tokens[at].kind == TokenKind::Punctuator && !closer(tokens[at].text).empty()) {
                 if (!execution_->work(tokens[at].location) || !charge(128) ||
                     (!groups.empty() && !charge(16))) { failed = true; return {}; }
                 auto group = std::make_shared<SyntaxNode>();
                 group->kind = SyntaxNode::Kind::Group;
-                group->span = {origin.span, origin.span};
-                group->context = origin.context;
+                group->span = {origin.span, origin.last_span()};
+                group->context = context_at(tokens[at].location);
+                if (failed || resource_failed()) return {};
                 if (groups.empty()) root = group;
                 else groups.back()->children.push_back(group);
                 groups.push_back(std::move(group));
             }
             // group_end has already validated balance and depth. Build only
-            // public token/group nodes, never parsing or expanding contents.
+            // public token/group nodes around retained splice children, never
+            // parsing or expanding contents.
             if (groups.empty() || !charge(128 + 16)) { failed = true; return {}; }
             auto leaf = std::make_shared<SyntaxNode>();
-            leaf->span = {origin.span, origin.span};
-            leaf->context = origin.context;
+            leaf->span = {origin.span, origin.last_span()};
+            leaf->context = context_at(tokens[at].location);
+            if (failed || resource_failed()) return {};
             if (!copy_tokens(leaf->tokens, at, at + 1)) { failed = true; return {}; }
             groups.back()->children.push_back(std::move(leaf));
-            if (closing(tokens[at].text)) {
-                groups.back()->span.last = origin.span;
+            if (tokens[at].kind == TokenKind::Punctuator && closing(tokens[at].text)) {
+                groups.back()->span.last = origin.last_span();
                 groups.pop_back();
             }
         }
@@ -1360,7 +1691,7 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     using FieldKind = SyntaxMatchValue::Field::Kind;
     const auto span = [&](std::size_t first, std::size_t last) {
         return SyntaxSpan{token_origin(tokens[first].location).span,
-            token_origin(tokens[last == first ? first : last - 1].location).span};
+            token_origin(tokens[last == first ? first : last - 1].location).last_span()};
     };
     struct RuleFrame {
         SyntaxEntityId id;
@@ -1380,7 +1711,12 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
     };
     using K = SyntaxPatternElement::Kind;
     std::vector<RuleFrame> active_rules;
-    std::vector<RuleFrame> failure_rules;
+    struct FailureTrace {
+        std::size_t at{};
+        std::vector<RuleFrame> rules;
+    };
+    FailureTrace farthest_failure;
+    auto* failure_trace = &farthest_failure;
     std::optional<std::vector<RuleFrame>> hard_failure_rules;
     struct CommittedFailure {
         std::size_t at;
@@ -1388,19 +1724,22 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
         std::vector<RuleFrame> rules;
     };
     std::optional<CommittedFailure> committed_failure;
-    const auto remember_commit = [&](std::size_t at, bool separator) {
+    const auto remember_commit = [&](std::size_t at, bool separator, const FailureTrace& item) {
         if (!committed_failure || at > committed_failure->at ||
-            (at == committed_failure->at && active_rules.size() > committed_failure->rules.size())) {
-            if (!charge(64 + 32 * active_rules.size())) { failed = true; return; }
-            committed_failure = CommittedFailure{at, separator, active_rules};
+            (at == committed_failure->at && item.rules.size() > committed_failure->rules.size())) {
+            if (!charge(64 + 32 * item.rules.size())) { failed = true; return; }
+            committed_failure = CommittedFailure{at, separator, item.rules};
         }
     };
-    std::size_t farthest_failure{};
-    const auto consider_failure = [&](std::size_t at) {
-        if (at > farthest_failure || (at == farthest_failure && active_rules.size() > failure_rules.size())) {
-            farthest_failure = at;
-            failure_rules = active_rules;
+    const auto record_failure = [&](FailureTrace& trace, std::size_t at, const std::vector<RuleFrame>& rules) {
+        if (at > trace.at || (at == trace.at && rules.size() > trace.rules.size())) {
+            if (!charge(32 * rules.size())) { failed = true; return; }
+            trace.at = at;
+            trace.rules = rules;
         }
+    };
+    const auto consider_failure = [&](std::size_t at) {
+        record_failure(*failure_trace, at, active_rules);
     };
     std::vector<bool> noted_rules(definitions_->size());
     const auto note_rules = [&](const std::vector<RuleFrame>& rules) {
@@ -1409,29 +1748,36 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             if (id.value >= definitions_->size() || noted_rules[id.value]) continue;
             noted_rules[id.value] = true;
             const auto& rule = (*definitions_)[id.value];
-            diagnostics.note(frame.reference, "while matching syntax rule '" + rule.name + "'");
-            diagnostics.note(rule.location, "syntax rule '" + rule.name + "' defined here");
+            note(frame.reference, "while matching syntax rule '" + rule.name + "'");
+            note(rule.location, "syntax rule '" + rule.name + "' defined here");
         }
     };
-    std::function<std::vector<Candidate>(const Pattern&, std::size_t, unsigned)> run;
-    std::function<std::vector<Piece>(const SyntaxPatternElement&, std::size_t, unsigned)> pieces;
-    run = [&](const Pattern& pattern, std::size_t first, unsigned depth) -> std::vector<Candidate> {
-        if (failed) return {};
+    std::function<ContinuationTask<std::vector<Candidate>>(const Pattern&, std::size_t, unsigned)> run;
+    std::function<ContinuationTask<std::vector<Piece>>(const SyntaxPatternElement&, std::size_t, unsigned)> pieces;
+    run = [&](const Pattern& pattern, std::size_t first, unsigned depth) -> ContinuationTask<std::vector<Candidate>> {
+        if (failed) co_return {};
         consider_failure(first);
+        if (failed) co_return {};
         if (depth >= execution_->limits().depth) {
-            diagnostics.error(tokens[begin].location, "syntax pattern matching depth exceeded");
+            execution_->resource_error(tokens[begin].location, "syntax pattern matching depth exceeded");
             failed = true;
-            return {};
+            co_return {};
         }
-        if (!charge(syntax_match_storage_bytes)) { failed = true; return {}; }
+        if (!charge(syntax_match_storage_bytes)) { failed = true; co_return {}; }
         std::vector<Candidate> active{{first, std::make_shared<SyntaxMatchValue>(), {}}};
         for (const auto& element : pattern) {
             std::vector<Candidate> next;
             for (const auto& candidate : active) {
                 if (candidate.end >= tokens.size() || failed) continue;
                 consider_failure(candidate.end);
+                if (failed) break;
                 if (!execution_->work(tokens[candidate.end].location)) { failed = true; break; }
-                for (auto part : pieces(element, candidate.end, depth + 1)) {
+                auto matched_pieces = co_await pieces(element, candidate.end, depth + 1);
+                // Ordinary speculative parser errors stay in its private
+                // diagnostic sink. A shared diagnostic (notably a resource
+                // limit) is fatal to the owner, not a failed alternative.
+                if (diagnostics.errors() != previous_errors || resource_failed()) failed = true;
+                for (auto part : matched_pieces) {
                     if (failed || !charge(syntax_match_storage_bytes +
                         syntax_field_storage_bytes * candidate.value->fields.size() +
                         32 * (candidate.rules.size() + part.rules.size()))) { failed = true; break; }
@@ -1440,8 +1786,27 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                         SyntaxMatchValue::Field field{element.field, {}, std::move(part.node),
                             std::move(part.records), part.kind, span(candidate.end, part.end)};
                         if (!charge(syntax_field_storage_bytes + field.name.size())) { failed = true; break; }
-                        if ((part.kind == FieldKind::Primitive || part.kind == FieldKind::RawGroup) &&
-                            !copy_tokens(field.tokens, candidate.end, part.end)) {
+                        if (part.kind == FieldKind::RawGroup &&
+                            tokens[candidate.end].kind == TokenKind::StructuredSplice) {
+                            // Opening this raw capture is structural, not the
+                            // explicit textual projection: nested splice edges
+                            // remain intact, and the field still owns the same node.
+                            field.span = field.node->span;
+                            if (!execution_->work(tokens[candidate.end].location,
+                                    syntax_node_count(*field.node))) { failed = true; break; }
+                            field.tokens = syntax_node_fragments(*field.node);
+                            for (const auto& token : field.tokens) {
+                                if (!execution_->work(tokens[candidate.end].location) ||
+                                    !charge(meta_token_storage_bytes + token.text.size()) ||
+                                    !charge(origin_binding_storage(token.origin)) ||
+                                    (token.split_source &&
+                                     !charge(32 + token.split_source->spelling.size()))) {
+                                    failed = true; break;
+                                }
+                            }
+                            if (failed) break;
+                        } else if ((part.kind == FieldKind::Primitive || part.kind == FieldKind::RawGroup) &&
+                                   !copy_tokens(field.tokens, candidate.end, part.end)) {
                             failed = true; break;
                         }
                         value->fields.push_back(std::move(field));
@@ -1451,32 +1816,42 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                     next.push_back({part.end, std::move(value), std::move(rules)});
                 }
             }
-            if (failed) return {};
+            if (failed) co_return {};
             active = std::move(next);
-            if (active.empty()) return {};
+            if (active.empty()) co_return {};
         }
         for (auto& candidate : active) {
             auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
             value->span = span(first, candidate.end);
-            value->context = token_origin(tokens[first].location).context;
-            if (!copy_tokens(value->input, first, candidate.end)) { failed = true; return {}; }
+            value->context = context_at(tokens[first].location);
+            if (!copy_tokens(value->input, first, candidate.end)) { failed = true; co_return {}; }
             candidate.value = std::move(value);
         }
-        return active;
+        co_return active;
     };
-    pieces = [&](const SyntaxPatternElement& element, std::size_t start, unsigned depth) -> std::vector<Piece> {
-        if (failed || start >= tokens.size()) return {};
+    pieces = [&](const SyntaxPatternElement& element, std::size_t start, unsigned depth) -> ContinuationTask<std::vector<Piece>> {
+        if (failed || start >= tokens.size()) co_return {};
         consider_failure(start);
-        if (tokens[start].kind == TokenKind::End && element.kind != K::Optional &&
-            element.kind != K::Repeat0 && element.kind != K::Separated0) return {};
-        const auto nested = [&](const Pattern& pattern, std::size_t from) {
-            return run(pattern, from, depth);
+        if (failed) co_return {};
+        const auto nested = [&](const Pattern& pattern, std::size_t from, FailureTrace* trace = nullptr) -> ContinuationTask<std::vector<Candidate>> {
+            if (trace && !charge(64)) { failed = true; co_return std::vector<Candidate>{}; }
+            auto* enclosing_trace = failure_trace;
+            struct RestoreTrace {
+                FailureTrace*& slot;
+                FailureTrace* enclosing;
+                ~RestoreTrace() { slot = enclosing; }
+            } restore{failure_trace, enclosing_trace};
+            if (trace) failure_trace = trace;
+            auto result = co_await run(pattern, from, depth);
+            failure_trace = enclosing_trace;
+            if (trace && !failed) record_failure(*enclosing_trace, trace->at, trace->rules);
+            co_return result;
         };
         if (element.kind == K::Rule) {
-            if (!element.resolved_rule) return {};
+            if (!element.resolved_rule) co_return {};
             std::vector<Piece> output;
             active_rules.push_back({*element.resolved_rule, element.location});
-            auto candidates = nested((*definitions_)[element.resolved_rule->value].pattern, start);
+            auto candidates = co_await nested((*definitions_)[element.resolved_rule->value].pattern, start);
             if (failed && !hard_failure_rules) hard_failure_rules = active_rules;
             active_rules.pop_back();
             for (auto& candidate : candidates) {
@@ -1484,30 +1859,30 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 rules.insert(rules.begin(), {*element.resolved_rule, element.location});
                 output.push_back({candidate.end, {candidate.value}, FieldKind::Nested, {}, std::move(rules)});
             }
-            return output;
+            co_return output;
         }
         if (element.kind == K::Choice) {
             std::vector<Piece> output;
             for (const auto& alternative : element.alternatives)
-                for (auto& candidate : nested(alternative.pattern, start)) {
-                    if (!charge(syntax_match_storage_bytes + alternative.label.size())) { failed = true; return {}; }
+                for (auto& candidate : co_await nested(alternative.pattern, start)) {
+                    if (!charge(syntax_match_storage_bytes + alternative.label.size())) { failed = true; co_return {}; }
                     auto value = std::make_shared<SyntaxMatchValue>(*candidate.value);
                     value->variant = alternative.label;
                     for (const auto& possible : element.alternatives) {
-                        if (!charge(32 + possible.label.size())) { failed = true; return {}; }
+                        if (!charge(32 + possible.label.size())) { failed = true; co_return {}; }
                         value->variant_labels.push_back(possible.label);
                     }
                     output.push_back({candidate.end, {std::move(value)}, FieldKind::Nested, {},
                                       std::move(candidate.rules)});
                 }
-            return output;
+            co_return output;
         }
         if (element.kind == K::Optional) {
             std::vector<Piece> output{{start, {}, FieldKind::Nested, {}, {}}};
-            for (auto& candidate : nested(element.pattern, start))
+            for (auto& candidate : co_await nested(element.pattern, start))
                 if (candidate.end > start) output.push_back({candidate.end, {candidate.value}, FieldKind::Nested,
                                                                {}, std::move(candidate.rules)});
-            return output;
+            co_return output;
         }
         if (element.kind == K::Repeat0 || element.kind == K::Repeat1 ||
             element.kind == K::Separated0 || element.kind == K::Separated1) {
@@ -1516,12 +1891,12 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
             const bool require_one = element.kind == K::Repeat1 || element.kind == K::Separated1;
             const auto extend = [&](const auto& self, std::size_t at,
                                     std::vector<std::shared_ptr<const SyntaxMatchValue>>& records,
-                                    std::vector<RuleFrame>& rules) -> bool {
-                if (failed) return false;
+                                    std::vector<RuleFrame>& rules) -> ContinuationTask<bool> {
+                if (failed) co_return false;
                 if (records.size() >= execution_->limits().depth) {
-                    diagnostics.error(tokens[begin].location, "syntax repetition depth exceeded");
+                    execution_->resource_error(tokens[begin].location, "syntax repetition depth exceeded");
                     failed = true;
-                    return false;
+                    co_return false;
                 }
                 const auto finish = [&] {
                     if (require_one && records.empty()) return false;
@@ -1532,154 +1907,206 @@ std::optional<SyntaxState::Match> SyntaxState::match(const SyntaxDefinition& def
                 std::size_t body = at;
                 if (separated && !records.empty()) {
                     if (at >= tokens.size() || tokens[at].kind != element.terminal.kind ||
-                        tokens[at].text != element.terminal.text) return finish();
+                        tokens[at].text != element.terminal.text) co_return finish();
                     body = at + 1;
                 }
-                auto candidates = nested(element.pattern, body);
-                if (failed) return false;
+                // Retain this item's own failure path before its rule frames
+                // unwind. The owner's farther failure may belong to an
+                // unrelated choice arm and must not supply commitment notes.
+                FailureTrace item_failure;
+                auto candidates = co_await nested(element.pattern, body, &item_failure);
+                if (failed) co_return false;
                 if (candidates.empty() && body < tokens.size()) {
                     const auto& first = analysis.sequence(element.pattern).first;
-                    if (!analysis.good()) { failed = true; return false; }
+                    if (!analysis.good()) { failed = true; co_return false; }
                     if ((separated && !records.empty()) ||
                         (tokens[body].kind != TokenKind::End &&
-                         first_accepts(first, tokens[body].kind, tokens[body].text))) {
+                         first_accepts(first, tokens[body]))) {
                         // This derivation cannot stop before malformed input,
                         // but a sibling choice/optional derivation can still
                         // match. Keep the diagnostic only if the entire owner
                         // has no successful derivation. Resource failures use
                         // the separate, global `failed` state.
-                        remember_commit(body, separated && !records.empty());
-                        return false;
+                        remember_commit(body, separated && !records.empty(), item_failure);
+                        co_return false;
                     }
                 }
-                if (candidates.empty()) return finish();
+                if (candidates.empty()) co_return finish();
                 bool viable = false;
                 for (auto& candidate : candidates) {
                     if (candidate.end <= body) {
                         diagnostics.error(tokens[begin].location, "syntax repetition body must consume input");
                         failed = true;
-                        return false;
+                        co_return false;
                     }
                     records.push_back(candidate.value);
                     const auto previous = rules.size();
                     rules.insert(rules.end(), candidate.rules.begin(), candidate.rules.end());
-                    viable |= self(self, candidate.end, records, rules);
+                    viable |= co_await self(self, candidate.end, records, rules);
                     rules.resize(previous);
                     records.pop_back();
-                    if (failed) return false;
+                    if (failed) co_return false;
                 }
                 // Retain shorter complete lengths only along a viable chain.
                 // Otherwise a later malformed item would be silently treated
                 // as the end of this same repetition.
                 if (viable) (void)finish();
-                return viable;
+                co_return viable;
             };
             std::vector<std::shared_ptr<const SyntaxMatchValue>> records;
             std::vector<RuleFrame> rules;
-            extend(extend, start, records, rules);
-            return output;
+            co_await extend(extend, start, records, rules);
+            co_return output;
         }
+        // Traverse rules and combinators at EOF before rejecting a primitive.
+        // Nullable derivations still construct their empty records, and a
+        // required leaf failure retains the complete rule-reference ancestry.
+        // The same depth/work/storage limits govern this traversal.
+        if (tokens[start].kind == TokenKind::End) co_return {};
         std::size_t position = start;
         if (element.kind == K::Terminal) {
-            if (tokens[position].kind != element.terminal.kind || tokens[position].text != element.terminal.text) return {};
+            if (tokens[position].kind != element.terminal.kind || tokens[position].text != element.terminal.text) co_return {};
             ++position;
         } else if (element.kind == K::Ident) {
-            if (!user_identifier(tokens[position])) return {};
+            if (!user_identifier(tokens[position])) co_return {};
             ++position;
         } else if (element.kind == K::Name) {
-            if (name_at(tokens, position).empty()) return {};
+            if (name_at(tokens, position).empty()) co_return {};
         } else if (element.kind == K::Literal) {
             const auto kind = tokens[position].kind;
             if (kind != TokenKind::Integer && kind != TokenKind::Floating &&
-                kind != TokenKind::String && kind != TokenKind::Character) return {};
+                kind != TokenKind::String && kind != TokenKind::Character) co_return {};
             ++position;
         } else if (element.kind == K::TokensUntil) {
-            while (position < tokens.size() && tokens[position].kind != TokenKind::End && !tokens[position].is(";")) {
-                if (!execution_->work(tokens[position].location)) { failed = true; return {}; }
-                if (closing(tokens[position].text)) return {};
-                if (const auto close = group_end(tokens, position, *execution_)) position = *close + 1;
-                else if (!closer(tokens[position].text).empty()) return {};
+            const auto punctuation = [&](std::string_view text) {
+                return tokens[position].kind == TokenKind::Punctuator && tokens[position].is(text);
+            };
+            while (position < tokens.size() && tokens[position].kind != TokenKind::End && !punctuation(";")) {
+                if (!execution_->work(tokens[position].location)) { failed = true; co_return {}; }
+                if (tokens[position].kind == TokenKind::Punctuator && closing(tokens[position].text)) co_return {};
+                if (const auto close = scan_group(position)) position = *close + 1;
+                else if (tokens[position].kind == TokenKind::Punctuator && !closer(tokens[position].text).empty()) co_return {};
                 else ++position;
             }
-            if (position == start || position >= tokens.size() || !tokens[position].is(";")) return {};
+            if (position == start || position >= tokens.size() || !punctuation(";")) co_return {};
         } else if (element.kind == K::FunctionRaw) {
             // Let the core declarator grammar locate the header boundary.
             // The first written brace may instead belong to an inline tag,
             // and parentheses may belong to a function-pointer object. The
             // shared recognizer never parses or expands the following body.
-            if (!parse_fragment) return {};
-            const auto header = parse_fragment(K::FunctionHeader, start);
+            if (!parse_fragment) co_return {};
+            const auto header = co_await parse_fragment.async(K::FunctionHeader, start);
             if (!header || !header->node || header->end <= start ||
-                header->end >= tokens.size() || !tokens[header->end].is("{")) return {};
+                header->end >= tokens.size() || !tokens[header->end].is("{")) co_return {};
             position = header->end;
-            const auto close = group_end(tokens, position, *execution_);
-            if (!close) return {};
+            const auto close = scan_group(position);
+            if (!close) co_return {};
             position = *close + 1;
         } else if (element.kind == K::Expr || element.kind == K::Statement ||
                    element.kind == K::Type || element.kind == K::Declaration ||
                    element.kind == K::FunctionHeader ||
                    element.kind == K::FunctionDeclaration ||
                    element.kind == K::FunctionDefinition) {
-            if (!parse_fragment) return {};
-            auto parsed = parse_fragment(element.kind, start);
+            if (!parse_fragment) co_return {};
+            auto parsed = co_await parse_fragment.async(element.kind, start);
             if (!parsed || !parsed->node || parsed->end <= start ||
-                parsed->end > tokens.size()) return {};
+                parsed->end > tokens.size()) co_return {};
             if (!execution_->work(tokens[start].location, parsed->end - start)) {
                 failed = true;
-                return {};
+                co_return {};
             }
             if (!charge(syntax_node_storage(*parsed->node,
                 std::min(execution_->limits().bytes, execution_->limits().memory)))) {
                 failed = true;
-                return {};
+                co_return {};
             }
-            return {{parsed->end, {}, FieldKind::Parsed, std::move(parsed->node), {}}};
+            co_return {{parsed->end, {}, FieldKind::Parsed, std::move(parsed->node), {}}};
         } else {
-            const auto opening = tokens[position].text;
+            const auto retained = tokens[position].kind == TokenKind::StructuredSplice
+                ? tokens[position].splice : nullptr;
+            const auto opening = retained ? group_opening(*retained)
+                : tokens[position].kind == TokenKind::Punctuator ? tokens[position].text : std::string_view{};
             if ((element.kind == K::Paren && opening != "(") ||
                 (element.kind == K::Bracket && opening != "[") ||
-                (element.kind == K::Block && opening != "{") || closer(opening).empty()) return {};
-            const auto close = group_end(tokens, position, *execution_);
-            if (!close) return {};
+                (element.kind == K::Block && opening != "{") || closer(opening).empty()) co_return {};
+            if (retained) {
+                std::string shape_error;
+                std::uint64_t validation_work{};
+                SyntaxTreeValidationError failure{};
+                const auto valid = syntax_validate_node(*retained, shape_error,
+                    execution_->limits(), &validation_work, &failure);
+                if (!execution_->work(tokens[start].location, validation_work)) {
+                    failed = true; co_return {};
+                }
+                if (!valid) {
+                    if (failure == SyntaxTreeValidationError::DepthLimit ||
+                        failure == SyntaxTreeValidationError::WorkLimit) {
+                        execution_->tree_limit_error(tokens[start].location);
+                        failed = true;
+                    }
+                    co_return {};
+                }
+                if (!charge(syntax_node_storage(*retained,
+                    std::min(execution_->limits().bytes, execution_->limits().memory)))) {
+                    failed = true; co_return {};
+                }
+                co_return {{position + 1, {}, FieldKind::RawGroup, retained, {}}};
+            }
+            const auto close = scan_group(position);
+            if (!close) co_return {};
             position = *close + 1;
             auto node = raw_group(start, position);
-            if (!node) return {};
-            return {{position, {}, FieldKind::RawGroup, std::move(node), {}}};
+            if (!node) co_return {};
+            co_return {{position, {}, FieldKind::RawGroup, std::move(node), {}}};
         }
-        if (!execution_->work(tokens[start].location, position - start)) { failed = true; return {}; }
-        return {{position, {}, FieldKind::Primitive, {}, {}}};
+        if (!execution_->work(tokens[start].location, position - start)) { failed = true; co_return {}; }
+        co_return {{position, {}, FieldKind::Primitive, {}, {}}};
     };
-    auto matches = run(definition.pattern, begin + 1, 0);
+    auto matches = co_await run(definition.pattern, begin + 1, 0);
+    failed = failed || resource_failed();
     if (matches.empty() || failed) {
+        // A lexical boundary probe may find that this identifier is not an
+        // invocation at all (for example, a same-spelled declarator name).
+        // Only ordinary mismatch is quiet; ambiguity and resource failures
+        // remain errors and must never select another interpretation.
+        if (mode == MatchMode::Probe && !failed && diagnostics.errors() == previous_errors) co_return {};
         if (!failed && committed_failure && diagnostics.errors() == previous_errors)
             diagnostics.error(tokens[committed_failure->at].location, committed_failure->separator
                 ? "malformed syntax item after committed separator"
                 : "malformed syntax repetition after committed start");
-        if (diagnostics.errors() == previous_errors) diagnostics.error(tokens[begin].location,
+        if (diagnostics.errors() == previous_errors && !resource_failed()) diagnostics.error(tokens[begin].location,
             "syntax-match error for active prefix '" + std::string(tokens[begin].text) + "'");
-        diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        note(definition.location, "syntax '" + definition.name + "' defined here");
         if (hard_failure_rules) note_rules(*hard_failure_rules);
         else if (!failed && committed_failure) note_rules(committed_failure->rules);
-        else if (!failed) note_rules(failure_rules);
-        return {};
+        else if (!failed) note_rules(farthest_failure.rules);
+        co_return {};
     }
     if (matches.size() != 1) {
         diagnostics.error(tokens[begin].location, "ambiguous syntax invocation has multiple complete derivations");
-        diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        note(definition.location, "syntax '" + definition.name + "' defined here");
         for (const auto& match : matches) note_rules(match.rules);
-        return {};
+        co_return {};
     }
     auto root = std::make_shared<SyntaxMatchValue>(*matches.front().value);
     if (!charge(meta_token_storage_bytes + tokens[begin].text.size()) ||
         !charge(token_binding_storage(tokens[begin]))) {
-        diagnostics.note(definition.location, "syntax '" + definition.name + "' defined here");
+        note(definition.location, "syntax '" + definition.name + "' defined here");
         note_rules(matches.front().rules);
-        return {};
+        co_return {};
     }
     root->input.insert(root->input.begin(), MetaToken(tokens[begin]));
     root->span = span(begin, matches.front().end);
-    if (!definition.bound_expander) return {};
-    return Match{std::move(root), matches.front().end, *definition.bound_expander};
+    // The root owns the invocation including its prefix, not just the first
+    // pattern field. Quoted/copied fields keep their own retained contexts.
+    root->context = context_at(tokens[begin].location);
+    if (failed || resource_failed()) {
+        note(definition.location, "syntax '" + definition.name + "' defined here");
+        note_rules(matches.front().rules);
+        co_return {};
+    }
+    if (!definition.bound_expander) co_return {};
+    co_return Match{std::move(root), matches.front().end, *definition.bound_expander};
 }
 
 } // namespace cross

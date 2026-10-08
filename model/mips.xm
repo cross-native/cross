@@ -1,6 +1,7 @@
 # MIPS family ABI and profile definitions. ISA legality, byte order, and CPU
 # scheduling are selected by the compiled target registry; this model owns
-# external data-transport policy only.
+# external data-transport policy, object ABI tags (elf_abi_tag), and the
+# private-call conventions (private_carrier_bits).
 
 abi "cross32" {
     architecture = "mips";
@@ -10,6 +11,7 @@ abi "cross32" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    private_carrier_bits = 32;
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "packed";
@@ -164,6 +166,7 @@ abi "cross64" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    private_carrier_bits = 64;
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "packed";
@@ -299,6 +302,186 @@ abi "cross64" {
         unit_bits = 64;
         merge_banks = ["integer", "floating"];
         require_natural_alignment = true;
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-result-memory" {
+        match = ["pair", "aggregate", "array"];
+        action = "indirect";
+        bank = "integer";
+        applies_to = ["results"];
+        requires_features = ["mips3"];
+    }
+
+    rule "argument-memory" {
+        match = ["any"];
+        action = "stack";
+        applies_to = ["arguments"];
+        requires_features = ["mips3"];
+    }
+}
+
+# The Cross ABI of the 64-bit address model, whose objects are ELF64.  It
+# shares the names cross and cross_abi with cross32; a name shared by address
+# models resolves to the entry of the target triple's address model.  Like
+# cross64, each scalar through 64 bits consumes one GPR, volatile channels
+# come first, and s0-s7 stay preserved; pointers and hidden result channels
+# are 64 bits wide.
+abi "cross-n64" {
+    architecture = "mips";
+    address_bits = 64;
+    aliases = ["cross", "cross_abi"];
+    llvm_calling_convention = "";
+    gcc_calling_attribute = "";
+    compilation_selectable = true;
+    function_selectable = true;
+    private_carrier_bits = 64;
+    argument_register_failure = "partial";
+    result_register_failure = "error";
+    stack_layout = "packed";
+    argument_stack_base = 0;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    return_address_bytes = 0;
+    stack_order = ["arguments"];
+    variadic_supported = true;
+    variadic_save_banks = ["integer", "floating"];
+    variadic_save_alignment = 8;
+    variadic_va_list_bytes = 24;
+    variadic_va_list_alignment = 8;
+    call_clobbers = [
+        "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "t8", "t9", "gp", "ra", "hi", "lo",
+        "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+        "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
+        "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23",
+        "f24", "f25", "f26", "f27", "f28", "f29", "f30", "f31",
+        "memory"
+    ];
+
+    bank "integer" {
+        class = "integer";
+        cursor = "integer";
+        register_bits = 64;
+        arguments = [
+            "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "t8", "t9",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"
+        ];
+        results = ["v0", "v1", "a0", "a1"];
+    }
+
+    bank "floating" {
+        class = "floating";
+        cursor = "floating";
+        register_bits = 64;
+        arguments = [
+            "f12", "f14", "f16", "f18", "f4", "f6", "f8", "f10"
+        ];
+        results = ["f0", "f2", "f4", "f6"];
+    }
+
+    variadic_state "overflow_arg_area" {
+        type = "void*";
+        kind = "stack_address";
+    }
+
+    variadic_state "gp_arg_area" {
+        type = "u64*";
+        kind = "register_save_address";
+        cursor = "integer";
+        stride = 8;
+    }
+
+    variadic_state "fp_arg_area" {
+        type = "f64*";
+        kind = "register_save_address";
+        cursor = "floating";
+        stride = 8;
+    }
+
+    rule "zero" {
+        match = ["zero"];
+        action = "ignore";
+        requires_features = ["mips3"];
+    }
+
+    rule "integer-small" {
+        match = ["integer", "pointer"];
+        action = "direct";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "integer-wide" {
+        match = ["integer"];
+        action = "split";
+        bank = "integer";
+        min_bits = 65;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "floating32" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 32;
+        max_bits = 32;
+        requires_features = ["mips3", "hard-float"];
+    }
+
+    rule "floating64" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating";
+        min_bits = 64;
+        max_bits = 64;
+        requires_features = ["mips3", "hard-float"];
+        forbids_features = ["single-float"];
+    }
+
+    rule "floating-soft" {
+        match = ["floating"];
+        action = "split";
+        bank = "integer";
+        min_bits = 32;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-argument-registers" {
+        match = ["pair", "aggregate", "array"];
+        action = "flatten";
+        min_bits = 1;
+        max_bits = 512;
+        unit_bits = 64;
+        merge_banks = ["integer", "floating"];
+        require_natural_alignment = true;
+        applies_to = ["arguments"];
+        requires_features = ["mips3"];
+    }
+
+    # At most four 64-bit pieces, which always fit the result registers of
+    # either bank; larger records return through a hidden pointer.
+    rule "aggregate-result-registers" {
+        match = ["pair", "aggregate", "array"];
+        action = "flatten";
+        min_bits = 1;
+        max_bits = 256;
+        unit_bits = 64;
+        merge_banks = ["integer", "floating"];
+        require_natural_alignment = true;
+        applies_to = ["results"];
         requires_features = ["mips3"];
     }
 
@@ -713,6 +896,7 @@ abi "eabi32" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    elf_abi_tag = "eabi32";
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "packed";
@@ -928,13 +1112,15 @@ profile "mipsel-elf" {
     f.if-conversion-memory-limit = 12;
 }
 
-# MIPS64 ELF targets default to the n64 data model.  The 64-bit generic CPU
-# keeps the object writer honest about the ISA; -march may narrow it to any
-# MIPS III or later CPU.
+# MIPS64 ELF targets default to the n64 data model with the Cross ABI; C
+# interfaces select n64 explicitly.  The canonical ABI name keeps the default
+# unambiguous: it fixes the address model in which the shared name cross
+# resolves.  The 64-bit generic CPU keeps the object writer honest about the
+# ISA; -march may narrow it to any MIPS III or later CPU.
 profile "mips64-n64" {
     default_for = ["mips64", "mips64-*"];
     target = "mips64-unknown-elf";
-    abi = "n64";
+    abi = "cross-n64";
     mangling = "cross";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
@@ -945,7 +1131,7 @@ profile "mips64-n64" {
 profile "mips64el-n64" {
     default_for = ["mips64el", "mips64el-*"];
     target = "mips64el-unknown-elf";
-    abi = "n64";
+    abi = "cross-n64";
     mangling = "cross";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;

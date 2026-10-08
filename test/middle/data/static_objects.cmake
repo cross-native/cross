@@ -106,7 +106,7 @@ if(LLVM_TEXT)
             "global fp128 0xLBFFF8000000000000000000000000000"
             "global ptr @\"addressed_object\""
             "global ptr @\"addressed_function\""
-            "blockaddress(@\"dispatch\", %cross.label.target)"
+            "blockaddress(@\"dispatch\", %cross.label."
             "section \".cross.data\", align 32"
             "global i64 undef, section \".noinit\", align 64"
             "@llvm.compiler.used = appending global [1 x ptr]"

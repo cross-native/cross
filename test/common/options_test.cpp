@@ -301,6 +301,24 @@ int main() {
          ok;
 
     const auto& x86_target = cross::x86_64_target();
+    using PatchAddress = cross::PatchAddressRepresentation;
+    ok = expect(cross::InstructionOperandEntry{}.patch_address == PatchAddress::Unavailable &&
+                    cross::PatchValueMaterializerEntry{}.patch_address == PatchAddress::Unavailable &&
+                    cross::patch_address_storage_bytes(PatchAddress::Unavailable, 64) == 0 &&
+                    cross::patch_address_storage_bytes(PatchAddress::FlatUptr, 32) == 4 &&
+                    cross::patch_address_storage_bytes(PatchAddress::FlatUptr, 64) == 8 &&
+                    cross::patch_address_storage_bytes(PatchAddress::FlatUptr, 128) == 0,
+                "patch addresses must be explicit and preserve the resolved width") && ok;
+    const auto* patch_instruction = cross::find_instruction(x86_target, "$::_movabs");
+    ok = expect(patch_instruction && patch_instruction->operands.size() == 2 &&
+                    patch_instruction->operands[1].patch_address == PatchAddress::FlatUptr &&
+                    cross::patch_operand_accepts_type(patch_instruction->operands[1], "u64", 64) &&
+                    cross::patch_operand_accepts_type(patch_instruction->operands[1], "i64", 64) &&
+                    cross::patch_operand_accepts_type(patch_instruction->operands[1], "uptr", 64) &&
+                    !cross::patch_operand_accepts_type(patch_instruction->operands[1], "uptr", 32) &&
+                    !cross::patch_operand_accepts_type(patch_instruction->operands[1], "f64", 64) &&
+                    !cross::patch_operand_accepts_type(patch_instruction->operands[0], "u64", 64),
+                "patch-field types ignored exact type, operand, or model width") && ok;
     const auto* feature_table = cross::subtarget_table_for(x86_target);
     bool feature_ids_match = feature_table &&
         feature_table->features.size() == static_cast<std::size_t>(
@@ -339,6 +357,12 @@ int main() {
                         {64, 0x100000000ULL, 0, false}) == 2,
                 "typed target feature/cost queries did not match resolution") &&
          ok;
+    ok = expect(selected && selected->supports_registry_feature("") &&
+                    selected->supports_registry_feature("base") &&
+                    selected->supports_registry_feature(x86_target.architecture) &&
+                    selected->supports_registry_feature("avx2") &&
+                    !selected->supports_registry_feature("not-a-registered-feature"),
+                "registry baseline and selected-feature requirements diverged") && ok;
 
     const auto architecture_level = parse({"cc", "-march=x86-64-v4"});
     ok = expect(architecture_level &&
@@ -362,6 +386,14 @@ int main() {
                     cross::resolved_bool(*disabled_baseline, "m.bmi2"),
                 "disabling a prerequisite did not disable CPU dependents") &&
          ok;
+    const auto disabled_selected = disabled_baseline
+        ? cross::resolve_subtarget(x86_target, *disabled_baseline, subtarget_diagnostics)
+        : std::nullopt;
+    ok = expect(disabled_selected &&
+                    disabled_selected->supports_registry_feature(x86_target.architecture) &&
+                    !disabled_selected->supports_registry_feature("avx") &&
+                    !disabled_selected->supports_registry_feature("avx2"),
+                "registry requirements ignored explicit feature disablement") && ok;
 
     const auto disabled_transitive_baseline =
         parse({"cc", "-march=haswell", "-mno-sse4.2"});
@@ -458,5 +490,26 @@ int main() {
                         std::string::npos,
                 "runtime compatibility option lacks a standalone diagnostic") &&
          ok;
+
+    std::string freestanding_error;
+    const auto freestanding = parse({"cc", "-ffreestanding"}, &freestanding_error);
+    ok = expect(!freestanding &&
+                    freestanding_error.find("always freestanding") !=
+                        std::string::npos,
+                "-ffreestanding lacks a standalone diagnostic") &&
+         ok;
+
+    for (const char* linker_option : {"-e", "-Lpath", "-lname", "-nostdlib",
+                                      "-nostartfiles", "-nodefaultlibs"}) {
+        std::string link_error;
+        const auto link = parse({"cc", "-S", linker_option, "start", "a.x"},
+                                &link_error);
+        ok = expect(!link && link_error.find("cc does not link") !=
+                                 std::string::npos,
+                    (std::string(linker_option) +
+                     " lacks a linker-option diagnostic")
+                        .c_str()) &&
+             ok;
+    }
     return ok ? 0 : 1;
 }

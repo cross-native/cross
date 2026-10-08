@@ -43,6 +43,7 @@ struct AddressConstant {
     std::optional<hir::FunctionId> function;
     std::optional<hir::LabelId> label;
     std::int64_t addend{};
+    bool operator==(const AddressConstant&) const = default;
 };
 
 struct AddressScope {
@@ -63,6 +64,10 @@ bool normalize_generic_pointer(Program& program, std::unique_ptr<Expr>& expressi
                                const CompilerOptions& options,
                                const Subtarget& subtarget,
                                Diagnostics& diagnostics);
+ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::unique_ptr<Expr>& expression,
+                               const TypePtr& destination, const FunctionDecl* caller,
+                               std::span<const NameKey> locals, const CompilerOptions& options,
+                               const Subtarget& subtarget, Diagnostics& diagnostics);
 
 struct Relocation {
     unsigned offset{};

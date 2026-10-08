@@ -38,15 +38,16 @@ execute_process(
     COMMAND "${CC}" -S "${BAD_SOURCE}" -o "${OUTPUT}-shadow.s"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(status EQUAL 0 OR NOT err MATCHES
-   "initial value must be a translation-time integer or relocatable address")
+   "cannot depend on an automatic local or parameter")
     message(FATAL_ERROR "shadowed runtime cell became a patch relocation\n${out}\n${err}")
 endif()
 
 execute_process(
     COMMAND "${CC}" -S "${TLS_SOURCE}" -o "${OUTPUT}-tls.s"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(status EQUAL 0 OR NOT err MATCHES
-   "cannot use an ordinary relocation to thread-local storage")
+if(NOT status EQUAL 1 OR NOT err MATCHES
+   "a thread-local address is not an ordinary static relocation" OR
+   NOT err MATCHES "patch_relocatable_tls.x:[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR "TLS address became an ordinary patch relocation\n${out}\n${err}")
 endif()
 

@@ -75,10 +75,13 @@ struct ResolvedOption {
     std::string source{"default"};
 };
 
+// Triple chosen when the toolchain was configured (CROSS_DEFAULT_TARGET).
+std::string_view default_target();
+
 struct CompilerOptions {
     EmitKind emit{EmitKind::Link};
     std::string optimization{"O0"};
-    std::string target{"x86_64-w64-windows-gnu"};
+    std::string target{default_target()};
     std::string cpu{"generic"};
     std::string tune{"generic"};
     std::string abi{"default"};
@@ -91,6 +94,8 @@ struct CompilerOptions {
     std::optional<std::filesystem::path> output;
     std::vector<std::filesystem::path> include_paths;
     std::vector<std::filesystem::path> system_include_paths;
+    std::vector<std::filesystem::path> forced_includes;
+    std::vector<std::filesystem::path> macro_includes;
     DependencyMode dependency_mode{DependencyMode::None};
     std::optional<std::filesystem::path> dependency_file;
     std::vector<DependencyTarget> dependency_targets;

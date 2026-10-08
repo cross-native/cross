@@ -5,6 +5,7 @@
 #include "middle/machine_ir.hpp"
 
 #include <functional>
+#include <optional>
 
 namespace cross::native {
 
@@ -49,5 +50,18 @@ eliminate_redundant_loads(machine::Function& function,
 // target can keep that early, simple construction without paying frame cost.
 [[nodiscard]] bool
 elide_unused_virtual_spill_slots(machine::Function& function);
+
+// A quotient and a remainder of the same SSA operands in one block become one
+// combined instruction at the first position, defining {quotient, remainder}.
+struct DivisionKind {
+    bool quotient{};
+    bool is_signed{};
+};
+using DivisionClassifier =
+    std::function<std::optional<DivisionKind>(const machine::Instruction&)>;
+[[nodiscard]] bool fuse_division_results(
+    machine::Function& function, const DivisionClassifier& classify,
+    machine::TargetOpcodeId signed_combined,
+    machine::TargetOpcodeId unsigned_combined);
 
 } // namespace cross::native

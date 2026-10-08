@@ -7,16 +7,146 @@
 #include "middle/hir.hpp"
 
 #include <cstdlib>
+#include <iostream>
+#include <source_location>
 #include <sstream>
 
 int main() {
     using namespace cross;
-    const auto require = [](bool condition) {
-        if (!condition) std::abort();
+    const auto require = [](bool condition, const std::source_location at = std::source_location::current()) {
+        if (!condition) {
+            std::cerr << at.file_name() << ':' << at.line() << ": callable type check failed\n";
+            std::abort();
+        }
     };
+    const auto scalar_element = builtin_type(BuiltinType::U32);
+    const auto qualified_vector = vector_type(scalar_element, 4, false, true, true);
+    const auto vector_element = qualified_element_type(qualified_vector);
+    require(vector_element->is_const && vector_element->is_volatile);
+    require(!scalar_element->is_const && !scalar_element->is_volatile);
+    const auto qualified_array = array_type(array_type(scalar_element, 2), 3, true, true);
+    const auto row = qualified_element_type(qualified_array);
+    const auto array_element = qualified_element_type(row);
+    require(row->is_const && row->is_volatile);
+    require(array_element->is_const && array_element->is_volatile);
+    require(!qualified_array->element->is_const && !scalar_element->is_const);
+    require(!qualified_element_type(pointer_type(scalar_element, true)));
     SourceManager sources;
     std::ostringstream output;
     Diagnostics diagnostics(output);
+    {
+        const auto* source = sources.add("prototype-parameter-identity.x", R"(
+            typedef u8 input;
+            global u8 (*result<T>(in T input, in u8 (*values)[sizeof(input)]))[sizeof(input)];
+            global u32 outer(in u32 input, in u32 (*callback)(in u16 input,
+                in u8 (*values)[sizeof(input)]), in u8 (*values)[sizeof(input)]);
+        )");
+        Parser parser(Lexer(*source, diagnostics).lex(), diagnostics);
+        const auto program = parser.parse();
+        require(diagnostics.errors() == 0 && program.functions.size() == 2);
+        const auto& result = *program.functions[0];
+        const auto parameter_bound = result.parameters[1].type->pointee->array_bound;
+        const auto result_bound = result.return_type->pointee->array_bound;
+        const auto bound_name = [&](const std::shared_ptr<const Expr>& bound) {
+            auto* operand = bound->left.get();
+            while (operand && operand->kind == Expr::Kind::Parenthesized) operand = operand->left.get();
+            require(operand && operand->kind == Expr::Kind::Name);
+            return name_key(*operand);
+        };
+        require(parameter_bound && result_bound && parameter_bound->left && result_bound->left);
+        require(bound_name(parameter_bound) == name_key(result.parameters[0]));
+        require(bound_name(result_bound) == name_key(result.parameters[0]));
+        const auto& outer = *program.functions[1];
+        const auto& callback = *outer.parameters[1].type->pointee->function;
+        const auto callback_bound = callback.parameters[1].type->pointee->array_bound;
+        const auto outer_bound = outer.parameters[2].type->pointee->array_bound;
+        require(callback_bound && callback_bound->left && outer_bound && outer_bound->left);
+        require(bound_name(callback_bound) == name_key(callback.parameters[0]));
+        require(bound_name(outer_bound) == name_key(outer.parameters[0]));
+        require(bound_name(callback_bound) != name_key(outer.parameters[0]));
+        const auto copied = copy_type(outer.parameters[1].type);
+        const auto& copied_callback = *copied->pointee->function;
+        require(bound_name(copied_callback.parameters[1].type->pointee->array_bound) ==
+            name_key(copied_callback.parameters[0]));
+    }
+    {
+        const auto* source = sources.add("generic-bound-identity.x",
+            "global u32 first<T>(in u8 (*value)[sizeof(T)]); "
+            "global u32 second<T>(in u8 (*value)[sizeof(T)]);");
+        Parser parser(Lexer(*source, diagnostics).lex(), diagnostics);
+        const auto program = parser.parse();
+        require(diagnostics.errors() == 0 && program.functions.size() == 2);
+        const auto first = program.functions[0]->parameters[0].type;
+        const auto second = program.functions[1]->parameters[0].type;
+        require(!same_type(first, second));
+        require(compare_source_types(first, second) == TypeComparison::Different);
+        require(compare_generic_types(first, second) == TypeComparison::DeferredBound);
+        require(compare_generic_types(first, pointer_type(array_type(builtin_type(BuiltinType::U8), 4))) ==
+                TypeComparison::DeferredBound);
+        require(compare_generic_types(first, pointer_type(array_type(builtin_type(BuiltinType::U8), 0))) ==
+                TypeComparison::Different);
+        require(compare_generic_types(first, pointer_type(array_type(builtin_type(BuiltinType::U16), 4))) ==
+                TypeComparison::Different);
+        auto qualified = copy_type(second);
+        qualified->pointee->element->is_const = true;
+        require(compare_generic_types(first, qualified) == TypeComparison::Different);
+        auto callable = function_type(builtin_type(BuiltinType::U32), program.functions[0]->parameters);
+        auto changed = copy_type(callable);
+        changed->function->parameters[0].type = second;
+        require(compare_generic_types(callable, changed) == TypeComparison::DeferredBound);
+        changed->function->result_location = "private-result-bank";
+        require(compare_generic_types(callable, changed) == TypeComparison::Different);
+    }
+    {
+        const auto* generic_source = sources.add("generic-identity.x",
+            "static T first<T>(in T value); static T second<T>(in T value);");
+        Parser generic_parser(Lexer(*generic_source, diagnostics).lex(), diagnostics);
+        auto generics = generic_parser.parse();
+        require(diagnostics.errors() == 0 && generics.functions.size() == 2);
+        const auto& first = *generics.functions[0];
+        const auto& second = *generics.functions[1];
+        require(generic_type_key(*first.return_type) == name_key(first.generic_parameters[0]));
+        require(same_type(first.return_type, first.parameters[0].type));
+        require(!same_type(first.return_type, second.return_type));
+        const auto copied_generic = copy_type(first.return_type);
+        require(copied_generic != first.return_type && same_type(copied_generic, first.return_type));
+        // Internal alpha-normalization placeholders remain comparable by their
+        // placeholder name; parsed source parameters always carry a binder.
+        require(same_type(generic_type("placeholder"), generic_type("placeholder")));
+    }
+    {
+        const auto* source = sources.add("grouped-function-suffix-attributes.x", R"(
+            typedef u8 T;
+            static u32 (*factory(in u32 value) -> "factory.result"
+                [[noinline, abi("factory_abi"), clobber("factory-resource"),
+                  stack_cleanup("callee")]])(in u32 argument) -> "callback.result"
+                [[abi("callback_abi"), clobber("callback-resource"), stack_cleanup("caller")]];
+            static T (*generic(in T value) [[generic(T), noinline]])(in T argument);
+            static T (*plain(in T value))(in T argument);
+        )");
+        Parser parser(Lexer(*source, diagnostics).lex(), diagnostics);
+        const auto program = parser.parse();
+        require(diagnostics.errors() == 0 && program.functions.size() == 3);
+        const auto& factory = *program.functions[0];
+        require(factory.attribute("noinline") && factory.attribute("abi") &&
+                factory.attribute("abi")->arguments == std::vector<std::string>{"\"factory_abi\""});
+        require(factory.result_location == "factory.result" &&
+                factory.attribute("clobber")->arguments == std::vector<std::string>{"\"factory-resource\""} &&
+                factory.attribute("stack_cleanup")->arguments == std::vector<std::string>{"\"callee\""});
+        const auto& callback = *factory.return_type->pointee->function;
+        require(callback.abi == "callback_abi" && callback.result_location == "callback.result" &&
+                callback.clobbers == std::vector<std::string>{"callback-resource"} &&
+                callback.stack_cleanup == "caller");
+        const auto& generic = *program.functions[1];
+        require(generic.attribute("noinline") && generic.generic_parameters.size() == 1 &&
+                generic.parameters[0].type->kind == Type::Kind::Generic);
+        const auto& generic_callback = *generic.return_type->pointee->function;
+        require(same_type(generic.parameters[0].type, generic_callback.result) &&
+                same_type(generic_callback.result, generic_callback.parameters[0].type));
+        const auto& plain = *program.functions[2];
+        require(plain.generic_parameters.empty() && plain.parameters[0].type->builtin == BuiltinType::U8 &&
+                plain.return_type->pointee->function->result->builtin == BuiltinType::U8);
+    }
     const auto* source = sources.add(
         "callable_type.x",
         R"(typedef i32 (*callback)(in i32 value "rdi") -> "rax"
@@ -59,6 +189,70 @@ int main() {
         value.stack_cleanup = "callee";
     });
     require(module.intern_type(original) == original_id);
+
+    // A missing expansion-dependent extent delays only that comparison; all
+    // independent type and ABI fields still have to agree. Physical endpoint
+    // spellings are opaque here, including custom register/memory locations.
+    const auto deferred_array = [](TypePtr element) {
+        auto result = array_type(std::move(element), 0);
+        result->array_extent_dependency = Type::ArrayExtentDependency::ExpansionContext;
+        return result;
+    };
+    auto deferred = deferred_array(copy_type(original));
+    require(has_pending_type_bound(deferred));
+    auto concrete = array_type(copy_type(original), 2);
+    require(compare_source_types(deferred, concrete) == TypeComparison::DeferredBound);
+    require(compare_source_types(concrete, deferred) == TypeComparison::DeferredBound);
+    require(!same_type(deferred, concrete));
+    require(compare_source_types(deferred, array_type(copy_type(original), 0)) == TypeComparison::Different);
+    require(compare_source_types(deferred, array_type(builtin_type(BuiltinType::U8), 2)) == TypeComparison::Different);
+    const auto independent_difference = [&](auto change) {
+        auto changed = copy_type(concrete);
+        change(changed->element);
+        require(compare_source_types(deferred, changed) == TypeComparison::Different);
+    };
+    independent_difference([](TypePtr& value) { value->is_const = true; });
+    independent_difference([](TypePtr& value) { value->address_space = 17; });
+    independent_difference([](TypePtr& value) { value->pointee->function->abi = "custom_abi"; });
+    independent_difference([](TypePtr& value) { value->pointee->function->result_location = "custom.memory"; });
+    independent_difference([](TypePtr& value) { value->pointee->function->parameters[0].location_name = "stack+32"; });
+    independent_difference([](TypePtr& value) { value->pointee->function->parameters[0].mode = ParameterMode::Out; });
+    independent_difference([](TypePtr& value) { value->pointee->function->clobbers.clear(); });
+    independent_difference([](TypePtr& value) { value->pointee->function->stack_cleanup = "callee"; });
+    deferred->lanes = 2;
+    deferred->array_extent_dependency = Type::ArrayExtentDependency::None;
+    require(compare_source_types(deferred, concrete) == TypeComparison::Same && same_type(deferred, concrete));
+    concrete->lanes = 3;
+    require(compare_source_types(deferred, concrete) == TypeComparison::Different);
+
+    auto deferred_vector = vector_type(builtin_type(BuiltinType::U32), 0);
+    deferred_vector->vector_extent_dependency = Type::VectorExtentDependency::ExpansionContext;
+    require(has_pending_type_bound(deferred_vector));
+    auto concrete_vector = vector_type(builtin_type(BuiltinType::U32), 4);
+    require(compare_source_types(deferred_vector, concrete_vector) == TypeComparison::DeferredBound);
+    require(compare_pointee(deferred_vector, concrete_vector) == PointeeCompatibility::DeferredExtent);
+    require(!same_type(deferred_vector, concrete_vector));
+    require(copy_type(deferred_vector)->vector_extent_dependency == Type::VectorExtentDependency::ExpansionContext);
+    require(compare_source_types(deferred_vector, vector_type(builtin_type(BuiltinType::U16), 4)) == TypeComparison::Different);
+    require(compare_source_types(deferred_vector, vector_type(builtin_type(BuiltinType::U32), 4, true)) == TypeComparison::Different);
+    require(compare_source_types(deferred_vector, vector_type(builtin_type(BuiltinType::U32), 0)) == TypeComparison::Different);
+    auto deferred_callback = copy_type(original);
+    auto concrete_callback = copy_type(original);
+    deferred_callback->pointee->function->parameters[0].type = deferred_vector;
+    concrete_callback->pointee->function->parameters[0].type = concrete_vector;
+    require(compare_source_types(deferred_callback, concrete_callback) == TypeComparison::DeferredBound);
+    require(compare_pointee(deferred_callback->pointee, concrete_callback->pointee) == PointeeCompatibility::DeferredExtent);
+    require(!compatible_pointee(deferred_callback->pointee, concrete_callback->pointee));
+    for (const auto endpoint : {"custom.result", "stack+32", "*custom.address"}) {
+        auto changed = copy_type(concrete_callback);
+        changed->pointee->function->result_location = endpoint;
+        require(compare_source_types(deferred_callback, changed) == TypeComparison::Different);
+        require(compare_pointee(deferred_callback->pointee, changed->pointee) == PointeeCompatibility::Incompatible);
+    }
+    deferred_vector->lanes = 4;
+    deferred_vector->vector_extent_dependency = Type::VectorExtentDependency::None;
+    require(!has_pending_type_bound(deferred_vector));
+    require(same_type(deferred_callback, concrete_callback));
 
     auto copied = copy_type(original);
     require(copied != original && copied->pointee != original->pointee);
@@ -179,7 +373,7 @@ int main() {
             }
         }
         Word global_value;
-        typedef u32 Scalar [[aligned(8)]], Vector [[ext_vector_type(4)]];
+        typedef u32 Scalar, Vector [[ext_vector_type(4)]];
         Scalar scalar;
         Vector vector;
     )");
@@ -234,24 +428,96 @@ int main() {
             interleaved.records[0].members[0].attributes.size() == 1 &&
             interleaved.records[0].members[0].attributes[0].name == "aligned");
 
+    const auto* vector_specifier_source = sources.add("vector-specifiers.x", R"(
+        [[ext_vector_type(4)]] const u32 leading, *pointer, array[2];
+        u32 [[vector_size(16), aligned(32)]] object;
+        typedef const volatile u32 Qualified [[ext_vector_type(4)]];
+        Qualified qualified;
+        struct Fields { u32 [[ext_vector_type(4)]] values; };
+        static u32 [[ext_vector_type(4)]] transform(in u32 [[vector_size(16)]] value);
+    )");
+    Parser vector_specifier_parser(Lexer(*vector_specifier_source, diagnostics).lex(), diagnostics);
+    auto vectors = vector_specifier_parser.parse();
+    require(diagnostics.errors() == 0 && vectors.objects.size() == 5 &&
+            vectors.records.size() == 1 && vectors.functions.size() == 1);
+    require(vectors.objects[0]->type->kind == Type::Kind::Vector && vectors.objects[0]->type->is_const);
+    require(vectors.objects[1]->type->kind == Type::Kind::Pointer &&
+            vectors.objects[1]->type->pointee->kind == Type::Kind::Vector &&
+            vectors.objects[1]->type->pointee->is_const);
+    require(vectors.objects[2]->type->kind == Type::Kind::Array &&
+            vectors.objects[2]->type->element->kind == Type::Kind::Vector);
+    require(vectors.objects[3]->type->kind == Type::Kind::Vector &&
+            vectors.objects[3]->attributes.size() == 1 &&
+            vectors.objects[3]->attributes[0].name == "aligned");
+    require(vectors.objects[4]->type->kind == Type::Kind::Vector &&
+            vectors.objects[4]->type->is_const && vectors.objects[4]->type->is_volatile &&
+            !vectors.objects[4]->type->element->is_const && !vectors.objects[4]->type->element->is_volatile);
+    require(vectors.records[0].members[0].type->kind == Type::Kind::Vector);
+    require(same_type(vectors.functions[0]->return_type, vectors.functions[0]->parameters[0].type));
+    require(vectors.functions[0]->return_type->kind == Type::Kind::Vector &&
+            vectors.functions[0]->return_type->lanes == 4);
+
     const auto* target_vector_source = sources.add("target-vector-size.x", R"(
         typedef uptr WidthVector [[vector_size(16)]];
         typedef iptr SignedWidthVector [[vector_size(16)]];
         WidthVector value;
         SignedWidthVector signed_value;
+        uptr [[vector_size(16)]] direct;
     )");
     for (const auto [address_bits, expected_lanes] :
          std::vector<std::pair<unsigned, std::uint32_t>>{{32, 4}, {64, 2}}) {
         Parser width_parser(Lexer(*target_vector_source, diagnostics).lex(),
                             diagnostics, {}, address_bits);
         auto width_program = width_parser.parse();
-        require(diagnostics.errors() == 0 && width_program.objects.size() == 2);
+        require(diagnostics.errors() == 0 && width_program.objects.size() == 3);
         for (const auto& object : width_program.objects) {
             require(object->type->kind == Type::Kind::Vector);
             require(object->type->lanes == expected_lanes);
         }
     }
+    const auto* array_source = sources.add("array-parameters.x", R"(
+        static uptr width() { return 4uptr; }
+        void direct(in u8 values[width()], in u8 (*row)[width()]);
+        typedef void (*Callback)(in u8 values[width()], in u8 (*row)[width()]);
+        Callback callback;
+    )");
+    Parser array_parser(Lexer(*array_source, diagnostics).lex(), diagnostics);
+    auto arrays = array_parser.parse();
+    require(diagnostics.errors() == 0 && arrays.functions.size() == 2 && arrays.objects.size() == 1);
+    const auto check_parameters = [&](const std::vector<ParameterDecl>& parameters) {
+        require(parameters.size() == 2);
+        require(parameters[0].type->kind == Type::Kind::Pointer &&
+                parameters[0].type->pointee->kind == Type::Kind::Builtin);
+        require(parameters[0].declared_array_type && parameters[0].declared_array_type->array_bound);
+        require(parameters[1].type->kind == Type::Kind::Pointer &&
+                parameters[1].type->pointee->kind == Type::Kind::Array &&
+                parameters[1].type->pointee->array_bound);
+        require(!parameters[1].declared_array_type);
+    };
+    check_parameters(arrays.functions[1]->parameters);
+    const auto callback_source = arrays.objects[0]->type;
+    check_parameters(callback_source->pointee->function->parameters);
+    auto callback_copy = copy_type(callback_source);
+    check_parameters(callback_copy->pointee->function->parameters);
+    callback_copy->pointee->function->parameters[0].declared_array_type->lanes = 5;
+    require(callback_source->pointee->function->parameters[0].declared_array_type->lanes == 0);
+
     std::ostringstream unresolved_output;
+    const auto* bound_vector_source = sources.add("vector-bounds.x", R"(
+        typedef u32 Unused [[ext_vector_type(2uptr + 2uptr)]];
+        static T make<T, uptr N>(in T value) {
+            typedef T Local [[ext_vector_type(N)]];
+            return value;
+        }
+    )");
+    Parser bound_vector_parser(Lexer(*bound_vector_source, diagnostics).lex(), diagnostics, {}, 32);
+    auto bound_vectors = bound_vector_parser.parse();
+    require(diagnostics.errors() == 0 && bound_vectors.required_types.size() == 1);
+    require(bound_vectors.required_types[0].type->vector_bound &&
+            bound_vectors.required_types[0].type->lanes == 0);
+    require(bound_vectors.functions.size() == 1 && bound_vectors.functions[0]->required_types.size() == 1);
+    require(bound_vectors.functions[0]->required_types[0].type->vector_bound &&
+            bound_vectors.functions[0]->required_types[0].type->element->kind == Type::Kind::Generic);
     Diagnostics unresolved_diagnostics(unresolved_output);
     Parser unresolved_parser(Lexer(*target_vector_source, unresolved_diagnostics).lex(),
                              unresolved_diagnostics);

@@ -1,53 +1,78 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
-
-foreach(required CC SOURCE_DIR OUTPUT_DIR)
+foreach(required CC SOURCE_DIR OUTPUT_DIR MODE LEVEL MODEL)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
-        message(FATAL_ERROR "${required} must name a path")
+        message(FATAL_ERROR "${required} must name a path or selection")
     endif()
 endforeach()
 file(MAKE_DIRECTORY "${OUTPUT_DIR}")
+set(flags -${LEVEL} -fno-eval-calls)
+if(MODE STREQUAL custom)
+    list(APPEND flags "--model=${MODEL}" -mabi=odd_abi)
+elseif(MODE STREQUAL mips OR MODE STREQUAL mipsel)
+    list(APPEND flags -target "${MODE}-unknown-elf" -mprofile=r3000-o32)
+elseif(MODE STREQUAL mips64 OR MODE STREQUAL mips64el)
+    list(APPEND flags -target "${MODE}-unknown-elf" -mabi=n64)
+elseif(NOT MODE STREQUAL native)
+    message(FATAL_ERROR "unknown mode ${MODE}")
+endif()
+if(NOT LEVEL STREQUAL O0 AND NOT LEVEL STREQUAL O2)
+    message(FATAL_ERROR "unsupported level ${LEVEL}")
+endif()
 
-foreach(target IN ITEMS x86 mipsel)
-    set(target_flags)
-    if(target STREQUAL mipsel)
-        set(target_flags -target mipsel-unknown-elf -march=r3000 -mabi=o32)
+function(accept input stem)
+    execute_process(COMMAND "${CC}" ${flags} -S "${input}" -o "${OUTPUT_DIR}/${stem}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 30)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "valid out-cell flow rejected (${MODE}/${LEVEL}/${stem})\n${out}\n${err}")
     endif()
-    foreach(level IN ITEMS O0 O2)
-        execute_process(
-            COMMAND "${CC}" ${target_flags} -${level} -S
-                "${SOURCE_DIR}/out_valid.x"
-                -o "${OUTPUT_DIR}/out-valid-${target}-${level}.s"
-            RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-        if(NOT status EQUAL 0)
-            message(FATAL_ERROR "valid out-cell flow rejected (${target}/${level})\n${out}\n${err}")
-        endif()
-        foreach(name IN ITEMS out_read_before out_partial_branch
-                              out_compound_before out_loop_gap out_goto_gap
-                              out_pointer_read out_partial_member
-                              out_member_read_before out_partial_bitfield)
-            execute_process(
-                COMMAND "${CC}" ${target_flags} -${level} -S
-                    "${SOURCE_DIR}/${name}.x"
-                    -o "${OUTPUT_DIR}/${name}-${target}-${level}.s"
-                RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-            if(status EQUAL 0)
-                message(FATAL_ERROR "invalid out-cell flow accepted: ${name} (${target}/${level})")
-            endif()
-            if(name STREQUAL out_read_before OR
-               name STREQUAL out_compound_before OR
-               name STREQUAL out_pointer_read OR
-               name STREQUAL out_member_read_before)
-                set(expected "read of 'out' parameter")
-            else()
-                set(expected "normal return leaves 'out' parameter")
-            endif()
-            if(NOT err MATCHES "${expected}")
-                message(FATAL_ERROR "missing ${name} diagnostic (${target}/${level})\n${err}")
-            endif()
-            if(NOT err MATCHES "${name}\\.x:[0-9]+:[0-9]+")
-                message(FATAL_ERROR "diagnostic for ${name} lacks a source location\n${err}")
-            endif()
-        endforeach()
-    endforeach()
+endfunction()
+function(reject input stem expected)
+    execute_process(COMMAND "${CC}" ${flags} -S "${input}" -o "${OUTPUT_DIR}/${stem}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 30)
+    if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}" OR
+       NOT err MATCHES "${stem}\\.x:[0-9]+:[0-9]+")
+        message(FATAL_ERROR "invalid out-cell flow not diagnosed (${MODE}/${LEVEL}/${stem})\n${out}\n${err}")
+    endif()
+endfunction()
+accept("${SOURCE_DIR}/out_valid.x" out_valid)
+foreach(name out_read_before out_partial_branch out_compound_before out_loop_gap
+             out_goto_gap out_pointer_read out_partial_member out_member_read_before out_partial_bitfield)
+    if(name MATCHES "^(out_read_before|out_compound_before|out_pointer_read|out_member_read_before)$")
+        set(expected "read of 'out' parameter")
+    else()
+        set(expected "normal return leaves 'out' parameter")
+    endif()
+    reject("${SOURCE_DIR}/${name}.x" "${name}" "${expected}")
 endforeach()
+
+# Arrays below are subobjects, not array-spelled parameters (which adjust to
+# pointer cells). The leaf has target-width padding that need not be initialized.
+set(source "struct Leaf { u8 tag; uptr value; };\nstruct Layer0 { struct Leaf child[1]; };\n")
+set(access "value.child[0]")
+foreach(index RANGE 1 40)
+    math(EXPR previous "${index} - 1")
+    string(APPEND source "struct Layer${index} { struct Layer${previous} child[1]; };\n")
+    string(APPEND access ".child[0]")
+endforeach()
+set(complete "${access}.tag = 7u8; ${access}.value = 54uptr;")
+file(WRITE "${OUTPUT_DIR}/deep_complete.x" "${source}global uptr complete(out struct Layer40 value) { ${complete} return ${access}.value + (uptr)${access}.tag; }\n")
+accept("${OUTPUT_DIR}/deep_complete.x" deep_complete)
+foreach(kind partial read_before branch)
+    set(body "${access}.tag = 7u8;")
+    set(expected "normal return leaves 'out' parameter")
+    set(extra "")
+    if(kind STREQUAL read_before)
+        string(APPEND body " uptr observed = ${access}.value; ${access}.value = observed;")
+        set(expected "read of 'out' parameter")
+    elseif(kind STREQUAL branch)
+        string(APPEND body " if (choose) ${access}.value = 54uptr;")
+        set(extra ", in bool choose")
+    endif()
+    set(name "deep_${kind}")
+    file(WRITE "${OUTPUT_DIR}/${name}.x" "${source}global void invalid(out struct Layer40 value${extra}) { ${body} }\n")
+    reject("${OUTPUT_DIR}/${name}.x" "${name}" "${expected}")
+endforeach()
+string(REPLACE "value.child" "value.selected.child" union_access "${access}")
+file(WRITE "${OUTPUT_DIR}/deep_union_partial.x" "${source}union Choice { struct Layer40 selected; uptr alternate; };\nglobal void invalid(out union Choice value) { ${union_access}.tag = 7u8; }\n")
+reject("${OUTPUT_DIR}/deep_union_partial.x" deep_union_partial "normal return leaves 'out' parameter")

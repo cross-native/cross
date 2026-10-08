@@ -136,13 +136,9 @@ if(HOST_GCC)
     endif()
 endif()
 
-execute_process(
-    COMMAND "${CC}" -S "${ERRORS}" -o "${OUTPUT}-errors.s"
-    RESULT_VARIABLE error_status OUTPUT_VARIABLE error_stdout
-    ERROR_VARIABLE error_stderr)
-if(error_status EQUAL 0)
-    message(FATAL_ERROR "invalid function metadata compiled")
-endif()
+# Compile independently: source attribute errors may precede HIR metadata
+# checks, and one early error must not suppress coverage of the other cases.
+set(error_case 0)
 foreach(pattern
         "a function cannot be both hot and cold"
         "used requires a function definition"
@@ -150,8 +146,16 @@ foreach(pattern
         "hot does not take arguments"
         "no_stack_protector does not take arguments"
         "no_sanitize requires one instrumentation-name string"
-        "no_sanitize requires one nonempty instrumentation-name string")
-    if(NOT error_stderr MATCHES "${pattern}")
+        "no_sanitize requires one nonempty instrumentation-name string"
+        "no_sanitize requires one nonempty instrumentation-name string"
+        "no_sanitize requires one instrumentation-name string")
+    execute_process(
+        COMMAND "${CC}" -S "-DFUNCTION_METADATA_ERROR=${error_case}" "${ERRORS}"
+                -o "${OUTPUT}-errors-${error_case}.s"
+        RESULT_VARIABLE error_status OUTPUT_VARIABLE error_stdout ERROR_VARIABLE error_stderr)
+    if(NOT error_status EQUAL 1 OR NOT error_stderr MATCHES "${pattern}" OR
+       NOT error_stderr MATCHES "function_metadata_errors[.]x:[0-9]+:[0-9]+: error:")
         message(FATAL_ERROR "function metadata diagnostic lacks '${pattern}'\n${error_stderr}")
     endif()
+    math(EXPR error_case "${error_case} + 1")
 endforeach()

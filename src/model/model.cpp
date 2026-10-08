@@ -1327,6 +1327,7 @@ private:
                 {"architecture", "address_bits", "aliases",
                  "llvm_calling_convention", "gcc_calling_attribute",
                  "compilation_selectable", "function_selectable",
+                 "elf_abi_tag", "private_carrier_bits",
                  "call_clobbers", "argument_register_failure",
                  "result_register_failure", "stack_layout",
                  "argument_stack_base", "stack_alignment",
@@ -1383,6 +1384,21 @@ private:
         if (const auto value =
                 bool_property(properties, "function_selectable")) {
             result.function_selectable = *value;
+        }
+        if (const auto value = text_property(properties, "elf_abi_tag")) {
+            if (value->empty()) {
+                fail(line, "ABI elf_abi_tag must not be empty");
+                return std::nullopt;
+            }
+            result.elf_abi_tag = *value;
+        }
+        if (const auto value =
+                unsigned_property(properties, "private_carrier_bits")) {
+            if (*value == 0) {
+                fail(line, "ABI private_carrier_bits must be nonzero");
+                return std::nullopt;
+            }
+            result.private_carrier_bits = *value;
         }
         if (const auto value = list_property(properties, "call_clobbers")) {
             result.call_clobbers = *value;
@@ -2417,35 +2433,54 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
         return false;
     }
 
+    // Names and private-call candidates are unique per architecture and
+    // address width; find_abi resolves a name shared by address models.
+    const auto abi_key = [](const AbiEntry& entry, std::string_view item) {
+        return entry.architecture + '\n' +
+               std::to_string(entry.address_bits) + '\n' + std::string(item);
+    };
     std::unordered_set<std::string> abi_names;
+    std::unordered_set<std::string> private_conventions;
     for (const auto& entry : abis_) {
-        abi_names.insert(entry.architecture + '\n' + entry.canonical_name);
+        abi_names.insert(abi_key(entry, entry.canonical_name));
         for (const auto& alias : entry.aliases) {
-            abi_names.insert(entry.architecture + '\n' + alias);
+            abi_names.insert(abi_key(entry, alias));
+        }
+        if (entry.private_carrier_bits != 0) {
+            private_conventions.insert(abi_key(
+                entry, std::to_string(entry.private_carrier_bits)));
         }
     }
     for (const auto& entry : document->abis) {
+        const auto model = " for " + entry.architecture + " with " +
+                           std::to_string(entry.address_bits) +
+                           "-bit addresses";
         const auto add_name = [&](std::string_view name) {
-            return abi_names.insert(entry.architecture + '\n' +
-                                    std::string(name)).second;
-        };
-        if (!add_name(entry.canonical_name)) {
+            if (abi_names.insert(abi_key(entry, name)).second) return true;
             if (diagnostics) {
                 diagnostics->command_error(
                     origin + ": duplicate ABI model name or alias '" +
-                    entry.canonical_name + "' for " + entry.architecture);
+                    std::string(name) + "'" + model);
             }
             return false;
-        }
+        };
+        if (!add_name(entry.canonical_name)) return false;
         for (const auto& alias : entry.aliases) {
-            if (!add_name(alias)) {
-                if (diagnostics) {
-                    diagnostics->command_error(
-                        origin + ": duplicate ABI model name or alias '" +
-                        alias + "' for " + entry.architecture);
-                }
-                return false;
+            if (!add_name(alias)) return false;
+        }
+        if (entry.private_carrier_bits != 0 &&
+            !private_conventions
+                 .insert(abi_key(entry,
+                                 std::to_string(entry.private_carrier_bits)))
+                 .second) {
+            if (diagnostics) {
+                diagnostics->command_error(
+                    origin + ": ABI model '" + entry.canonical_name +
+                    "' duplicates the private convention for " +
+                    std::to_string(entry.private_carrier_bits) +
+                    "-bit carriers" + model);
             }
+            return false;
         }
     }
 
@@ -2591,14 +2626,31 @@ const AbiEntry* ModelRegistry::find_abi(
     if (name.empty() || name == "default") {
         name = default_abi(architecture, triple);
     }
-    for (const auto& entry : abis_) {
-        if (entry.architecture != architecture) continue;
-        if (entry.canonical_name == name) return &entry;
-        for (const auto& alias : entry.aliases) {
-            if (alias == name) return &entry;
+    // Zero address bits accept any address model; a shared name is then
+    // ambiguous and yields null.
+    const auto unique = [&](std::string_view sought,
+                            unsigned address_bits) -> const AbiEntry* {
+        const AbiEntry* found{};
+        for (const auto& entry : abis_) {
+            if (entry.architecture != architecture ||
+                (address_bits != 0 && entry.address_bits != address_bits) ||
+                (entry.canonical_name != sought &&
+                 std::find(entry.aliases.begin(), entry.aliases.end(),
+                           sought) == entry.aliases.end())) {
+                continue;
+            }
+            if (found) return nullptr;
+            found = &entry;
         }
-    }
-    return nullptr;
+        return found;
+    };
+    if (const auto* entry = unique(name, 0)) return entry;
+    // A name shared by several address models, such as each MIPS model's
+    // `cross`, follows the address model of the triple's default ABI.
+    const auto* profile = default_profile(triple);
+    const auto* model =
+        profile && profile->abi ? unique(*profile->abi, 0) : nullptr;
+    return model ? unique(name, model->address_bits) : nullptr;
 }
 
 const AbiEntry* ModelRegistry::find_abi(AbiId id) const {

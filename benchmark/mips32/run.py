@@ -2124,16 +2124,11 @@ async def discover_libgcc(gcc: Path, llvm_nm: Path) -> tuple[Path, frozenset[str
     return libgcc, symbols
 
 
-def default_gcc(source_dir: Path) -> str:
-    suffix = ".exe" if sys.platform == "win32" else ""
-    return f"mips64-elf-gcc{suffix}"
-
-
 def default_cross_cc(source_dir: Path) -> str:
-    """Return the conventional in-workspace Cross compiler path."""
+    """Return the compiler of the repository's documented `build` tree."""
 
     suffix = ".exe" if sys.platform == "win32" else ""
-    return str(source_dir.parents[2] / "build" / f"cc{suffix}")
+    return str(source_dir.parents[1] / "build" / "bin" / f"cc{suffix}")
 
 
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
@@ -2142,7 +2137,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     source_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cross-cc", default=default_cross_cc(source_dir))
-    parser.add_argument("--gcc", default=default_gcc(source_dir))
+    parser.add_argument("--gcc", default="mips64-elf-gcc")
     parser.add_argument("--clang", default="clang")
     parser.add_argument("--opt", default="opt")
     parser.add_argument("--llc", default="llc")
@@ -2202,7 +2197,7 @@ async def configuration_from_arguments(
     else:
         run_name = arguments.run_name or time.strftime("%Y%m%d-%H%M%S")
         output_dir = (
-            source_dir.parents[2]
+            source_dir.parents[1]
             / "build"
             / "benchmark"
             / "mips32"

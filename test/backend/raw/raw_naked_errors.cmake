@@ -3,13 +3,13 @@
 
 function(expect_failure source output)
     execute_process(
-        COMMAND "${CC}" -emit-llvm "${source}" -o "${output}"
+        COMMAND "${CC}" -emit-llvm ${ARGN} "${source}" -o "${output}"
         RESULT_VARIABLE status
         OUTPUT_VARIABLE stdout
         ERROR_VARIABLE stderr
     )
-    if(status EQUAL 0)
-        message(FATAL_ERROR "invalid raw source unexpectedly compiled: ${source}")
+    if(NOT status EQUAL 1)
+        message(FATAL_ERROR "expected diagnostic exit 1 for ${source}, received ${status}\n${stdout}\n${stderr}")
     endif()
     set(LAST_STDERR "${stderr}" PARENT_SCOPE)
 endfunction()
@@ -29,14 +29,18 @@ foreach(pattern
     endif()
 endforeach()
 
-expect_failure("${INTERFACE_SOURCE}" "${OUTPUT}-interface.ll")
+set(error_case 0)
 foreach(pattern
         "non-void result requires an explicit result location"
         "parameter 'value' has an automatic endpoint"
         "naked does not take arguments")
-    if(NOT LAST_STDERR MATCHES "${pattern}")
+    expect_failure("${INTERFACE_SOURCE}" "${OUTPUT}-interface-${error_case}.ll"
+        "-DRAW_INTERFACE_ERROR=${error_case}")
+    if(NOT LAST_STDERR MATCHES "${pattern}" OR
+       NOT LAST_STDERR MATCHES "raw_naked_interface_errors[.]x:[0-9]+:[0-9]+: error:")
         message(FATAL_ERROR "missing raw HIR diagnostic: ${pattern}\n${LAST_STDERR}")
     endif()
+    math(EXPR error_case "${error_case} + 1")
 endforeach()
 
 expect_failure("${CONTEXT_SOURCE}" "${OUTPUT}-context.ll")

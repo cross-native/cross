@@ -3,8 +3,11 @@
 #include "target/x86_64/raw_backend.hpp"
 
 #include "common/floating_semantics.hpp"
+#include "middle/data_ir.hpp"
 #include "middle/patch_sink.hpp"
 #include "target/assembly_format.hpp"
+#include "target/instruction_constraints.hpp"
+#include "frontend/semantic.hpp"
 
 #include "target/x86_64/features.hpp"
 #include "target/x86_64/manual_endpoint.hpp"
@@ -83,28 +86,9 @@ std::optional<std::uint64_t> integer_literal(const Expr& expression) {
     return value;
 }
 
-bool fits_immediate(std::uint64_t value, unsigned bits, bool is_signed) {
-    if (bits == 0 || bits >= 64) return true;
-    if (!is_signed) return value < (std::uint64_t{1} << bits);
-    const auto positive_max = (std::uint64_t{1} << (bits - 1)) - 1;
-    const auto negative_min = std::uint64_t{0} -
-                              (std::uint64_t{1} << (bits - 1));
-    return value <= positive_max || value >= negative_min;
-}
-
 bool fits_instruction_immediate(
     std::uint64_t value, const InstructionOperandEntry& specification) {
-    if (fits_immediate(value, specification.immediate_bits,
-                       specification.immediate_signed)) {
-        return true;
-    }
-    // An immediate that occupies the complete integer destination width has
-    // modulo-width semantics.  Accept both its signed spelling and its
-    // unsigned bit-pattern spelling.  Sign-extended short immediates (for
-    // example addq imm32) intentionally remain signed-only.
-    return specification.immediate_signed && specification.allow_register &&
-           specification.register_bits == specification.immediate_bits &&
-           fits_immediate(value, specification.immediate_bits, false);
+    return instruction_immediate_fits(value, specification);
 }
 
 bool signed_integer_type(const hir::Type& type) {
@@ -153,9 +137,7 @@ public:
 
 private:
     bool feature_enabled(std::string_view feature) const {
-        return feature.empty() || feature == "base" ||
-               feature == target_.architecture ||
-               subtarget_.has_feature(feature);
+        return subtarget_.supports_registry_feature(feature);
     }
 
     std::optional<std::string_view> missing_feature(
@@ -192,40 +174,55 @@ private:
         };
         const auto& source = unparenthesized(expression);
         const Expr* pointer = nullptr;
-        std::int64_t element_index{};
+        EvaluationInstructionOperand::Memory memory;
+        using Shape = EvaluationInstructionOperand::Memory::Shape;
         const RegisterEntry* index_register = nullptr;
-        unsigned index_scale = 1;
+        const auto register_fact = [&](const Expr& expression) {
+            EvaluationInstructionOperand::Memory::Register result;
+            if (expression.kind != Expr::Kind::Name) return result;
+            const auto binding = bindings_.find(name_key(expression));
+            const auto type = binding_types_.find(name_key(expression));
+            if (binding == bindings_.end() || type == binding_types_.end()) return result;
+            result.object = true;
+            result.type = type->second;
+            result.fixed = binding->second->name;
+            result.integer = is_integer(result.type);
+            result.bits = result.type->kind == Type::Kind::Pointer ? hir_.address_bits
+                : result.type->kind == Type::Kind::Builtin &&
+                  (result.type->builtin == BuiltinType::Iptr || result.type->builtin == BuiltinType::Uptr)
+                    ? hir_.address_bits : type_bits(result.type);
+            return result;
+        };
         if (source.kind == Expr::Kind::Unary && source.text == "*" &&
             source.left) {
+            memory.shape = Shape::Dereference;
             pointer = &unparenthesized(*source.left);
         } else if (source.kind == Expr::Kind::Binary &&
                    source.text == "index" && source.left && source.right) {
+            memory.shape = Shape::Index;
             pointer = &unparenthesized(*source.left);
-            const auto index = integer_literal(*source.right);
-            if (!index) {
-                const auto& index_expression = unparenthesized(*source.right);
-                if (index_expression.kind != Expr::Kind::Name) {
-                    return fail(source.right->location,
-                                "raw memory index must be an integer constant or one hard-bound 64-bit register");
+            const auto& index = unparenthesized(*source.right);
+            memory.index = register_fact(index);
+            if (memory.index.object) index_register = find_register(target_, memory.index.fixed);
+            else {
+                memory.constant_index = source.right->evaluated_integer;
+                if (!memory.constant_index) {
+                    // Raw-compatible inlining can construct an operand after
+                    // source checking. Reuse required integer semantics, with
+                    // no runtime cells or foreign source declarations.
+                    Program constants;
+                    constants.address_bits = hir_.address_bits;
+                    std::ostringstream output;
+                    Diagnostics quiet(output);
+                    const LayoutQuery size_of = [&](const TypePtr& type) { return hir::layout_size(hir_, type, target_); };
+                    memory.constant_index = evaluate_target_integer_constant(constants, *source.right, quiet, size_of, {});
                 }
-                const auto binding = bindings_.find(name_key(index_expression));
-                const auto type = binding_types_.find(name_key(index_expression));
-                if (binding == bindings_.end() || type == binding_types_.end() ||
-                    !type->second || !is_integer(type->second) ||
-                    binding->second->register_class != "integer" ||
-                    binding->second->bits != 64 ||
-                    !binding->second->address_capable) {
-                    return fail(index_expression.location,
-                                "raw memory index requires a hard-bound 64-bit integer register");
+                if (memory.constant_index) {
+                    const auto builtin = memory.constant_index->type;
+                    memory.constant_bits = builtin == BuiltinType::Iptr || builtin == BuiltinType::Uptr
+                        ? hir_.address_bits : type_bits(builtin_type(builtin));
+                    memory.constant_signed = signed_integer_type(builtin_type(builtin));
                 }
-                if (binding->second->storage == "rsp" ||
-                    binding->second->storage == "r12") {
-                    return fail(index_expression.location,
-                                "x86-64 rsp/r12 storage cannot encode an address index");
-                }
-                index_register = binding->second;
-            } else {
-                element_index = static_cast<std::int64_t>(*index);
             }
         } else {
             return fail(source.location,
@@ -243,48 +240,34 @@ private:
             return fail(pointer->location,
                         "raw memory base is not a typed hard-bound pointer");
         }
-        if (!binding->second->address_capable ||
-            binding->second->register_class != "integer") {
-            return fail(pointer->location,
-                        "raw memory base requires an address-capable integer register");
-        }
-        auto bytes = type_bits(type->second->pointee) / 8;
-        if (type->second->pointee->kind == Type::Kind::Builtin &&
-            type->second->pointee->builtin == BuiltinType::F80) {
-            bytes = target_.data_layout.f80_storage_bytes;
-        }
-        if (bytes == 0) {
-            return fail(source.location,
-                        "raw memory operand requires a complete byte-sized pointee type");
-        }
-        if (index_register) {
-            if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) {
-                return fail(source.right->location,
-                            "x86-64 scaled register index requires a 1-, 2-, 4-, or 8-byte pointee");
-            }
-            index_scale = static_cast<unsigned>(bytes);
-        }
-        if (element_index > std::numeric_limits<std::int32_t>::max() /
-                                static_cast<std::int64_t>(bytes) ||
-            element_index < std::numeric_limits<std::int32_t>::min() /
-                                static_cast<std::int64_t>(bytes)) {
-            return fail(source.location,
-                        "raw memory displacement does not fit x86-64 disp32 addressing");
-        }
+        memory.base = register_fact(*pointer);
+        memory.element_bytes = hir::layout_size(hir_, type->second->pointee, target_);
+        const auto selected = select_instruction_address(target_, subtarget_, memory);
+        if (!selected.error.empty()) return fail(source.location, selected.error);
+        const auto displacement = relocation_addend_i64(selected.displacement);
+        if (selected.deferred || !displacement)
+            return fail(source.location, "raw memory address has no concrete representable displacement");
         return RawMemoryAddress{
-            binding->second, index_register, index_scale, type->second->pointee,
-            element_index * static_cast<std::int64_t>(bytes)};
+            binding->second, index_register, selected.scale, type->second->pointee, *displacement};
     }
 
-    bool operand_matches(const Expr& expression,
+    bool operand_matches(const Expr& original_expression,
                          const InstructionOperandEntry& specification) const {
+        const auto& expression = unparenthesized(original_expression);
         const Expr* source = &expression;
         if (expression.kind == Expr::Kind::Call && expression.left &&
             expression.left->kind == Expr::Kind::Name &&
             expression.left->text == "$::patch") {
             if (!specification.patchable || expression.arguments.empty() ||
                 expression.arguments.size() > 2) return false;
+            if (expression.arguments.size() == 2 &&
+                specification.patch_address == PatchAddressRepresentation::Unavailable) return false;
             source = expression.arguments.front().get();
+            const auto& initial = source->evaluated_integer;
+            return initial && patch_operand_accepts_type(specification, type_name(builtin_type(initial->type)),
+                    initial->type == BuiltinType::Iptr || initial->type == BuiltinType::Uptr
+                        ? hir_.address_bits : type_bits(builtin_type(initial->type))) &&
+                initial->value.high == 0 && fits_instruction_immediate(initial->value.low, specification);
         }
         if (specification.allow_memory) {
             const auto address = memory_address(*source, false);
@@ -301,7 +284,7 @@ private:
         }
         if (specification.allow_label) {
             return current_function_ && source->kind == Expr::Kind::Name &&
-                   hir_.label(current_function_->id, source->text);
+                   find_same_function_label(*source);
         }
         if (source->kind == Expr::Kind::Name && specification.allow_register) {
             const auto found = bindings_.find(name_key(*source));
@@ -430,12 +413,14 @@ private:
         return nullptr;
     }
 
-    mir::BlockId new_block(SourceLocation location, std::string source_label = {}) {
+    mir::BlockId new_block(SourceLocation location, std::string source_label = {},
+                          std::optional<hir::LabelId> source_label_id = {}) {
         const mir::BlockId id{static_cast<std::uint32_t>(current_.blocks.size())};
         mir::RawBlock candidate;
         candidate.id = id;
         candidate.location = location;
         candidate.source_label = std::move(source_label);
+        candidate.source_label_id = source_label_id;
         current_.blocks.push_back(std::move(candidate));
         return id;
     }
@@ -637,6 +622,7 @@ private:
 
     void lower_function(const hir::Function& function) {
         current_function_ = &function;
+        current_patch_origins_.clear();
         bindings_.clear();
         binding_types_.clear();
         binding_signed_.clear();
@@ -662,7 +648,7 @@ private:
         for (const auto label_id : function.labels) {
             const auto& label = hir_.labels.at(label_id.value);
             label_blocks_.emplace(label_id.value,
-                                  new_block(label.location, label.source_name));
+                                  new_block(label.location, label.source_name, label.id));
         }
         bind_parameters(function);
         initialize_raw_inline_resources(function);
@@ -694,6 +680,19 @@ private:
         return false;
     }
 
+    const hir::Label* find_same_function_label(const Expr& expression) const {
+        if (!current_function_ || expression.kind != Expr::Kind::Name) return nullptr;
+        if (expression.text.find("::") == std::string::npos)
+            return hir_.label(current_function_->id, expression);
+        const auto address = data::relocatable_address(hir_,
+            {current_function_->source_name, current_function_->source_unit},
+            expression, subtarget_, false);
+        if (!address || address->kind != data::AddressKind::Label || !address->label)
+            return nullptr;
+        const auto& label = hir_.labels.at(address->label->value);
+        return label.owner == current_function_->id ? &label : nullptr;
+    }
+
     const hir::Label* resolve_label(const Expr& expression) {
         if (!current_function_) return nullptr;
         if (expression.kind == Expr::Kind::Parenthesized) {
@@ -709,7 +708,7 @@ private:
                                "raw branch target must be a same-function label address");
             return nullptr;
         }
-        if (const auto* label = hir_.label(current_function_->id, expression.text)) return label;
+        if (const auto* label = find_same_function_label(expression)) return label;
         diagnostics_.error(expression.location,
                            "unknown same-function raw label '" + expression.text + "'");
         return nullptr;
@@ -838,7 +837,7 @@ private:
 
     void activate_label(const Statement& statement) {
         if (!current_function_) return;
-        const auto* label = hir_.label(current_function_->id, statement.label_name);
+        const auto* label = hir_.label(current_function_->id, statement);
         if (!label) return;
         const auto target = label_blocks_.at(label->id.value);
         if (current_block_) {
@@ -915,6 +914,9 @@ private:
             return;
         case Statement::Kind::Empty:
             return;
+        case Statement::Kind::StaticAssert:
+            diagnostics_.error(statement.location, "block assertion reached raw lowering unprepared");
+            return;
         case Statement::Kind::Return:
             if (!inline_frames_.empty()) {
                 lower_inline_return(statement);
@@ -984,10 +986,11 @@ private:
                 "raw goto target must be a same-function label or hard-bound label value");
             return;
         }
-        if (const auto* target_label =
-                current_function_
-                    ? hir_.label(current_function_->id, destination.text)
-                    : nullptr) {
+        const auto binding = bindings_.find(name_key(destination));
+        const bool object_expression = statement.expression->kind != Expr::Kind::Name &&
+            binding != bindings_.end();
+        if (const auto* target_label = object_expression
+                ? nullptr : find_same_function_label(destination)) {
             const auto* form = find_instruction(target_, "$::_jmp");
             if (!form) return;
             mir::Instruction instruction{statement.location, form, {}};
@@ -996,7 +999,12 @@ private:
             append_instruction(std::move(instruction));
             return;
         }
-        const auto binding = bindings_.find(name_key(destination));
+        if (statement.expression->kind == Expr::Kind::Name &&
+            resolved_label_binding(destination).kind == LabelBinding::Kind::Reference) {
+            diagnostics_.error(destination.location,
+                "raw goto target does not name a visible label in its retained source binding");
+            return;
+        }
         if (binding == bindings_.end() ||
             !label_bindings_.contains(name_key(destination))) {
             diagnostics_.error(destination.location,
@@ -1130,7 +1138,7 @@ private:
     }
 
     std::optional<mir::PatchSink> resolve_patch_sink(
-        const Expr& expression) {
+        const Expr& expression, PatchAddressRepresentation representation) {
         if (!current_function_) return std::nullopt;
         auto resolve = [&](NameUse name) -> const hir::Object* {
             const auto* source = current_function_->definition;
@@ -1153,7 +1161,7 @@ private:
             return nullptr;
         };
         auto sink = mir::resolve_patch_sink_designator(
-            expression, hir_, target_, resolve, diagnostics_);
+            expression, hir_, target_, representation, resolve, diagnostics_);
         if (!sink) return std::nullopt;
         const auto key = std::pair{sink->object.value, sink->offset};
         if (!patch_sinks_.insert(key).second) {
@@ -1165,8 +1173,9 @@ private:
         return sink;
     }
 
-    std::optional<mir::Operand> lower_operand(const Expr& expression,
+    std::optional<mir::Operand> lower_operand(const Expr& original_expression,
                                              const InstructionOperandEntry& specification) {
+        const auto& expression = unparenthesized(original_expression);
         const Expr* source = &expression;
         std::optional<mir::PatchSink> patch_sink;
         bool patch = false;
@@ -1186,8 +1195,34 @@ private:
                 return std::nullopt;
             }
             source = expression.arguments.front().get();
+            if (!source->evaluated_integer || !patch_operand_accepts_type(specification,
+                    type_name(builtin_type(source->evaluated_integer->type)),
+                    source->evaluated_integer->type == BuiltinType::Iptr || source->evaluated_integer->type == BuiltinType::Uptr
+                        ? hir_.address_bits : type_bits(builtin_type(source->evaluated_integer->type)))) {
+                diagnostics_.error(source->location,
+                    "raw patch initial requires a constant of exactly a registered patch-field type");
+                return std::nullopt;
+            }
+            const auto origin = token_origin(expression.left->location).identity;
+            if (origin.source_unit) {
+                const auto [first, inserted] = current_patch_origins_.emplace(origin, expression.location);
+                if (!inserted) {
+                    // A direct raw operand promises the selected instruction's
+                    // exact immediate field. Replacing it with a load would
+                    // silently change the explicitly requested instruction.
+                    diagnostics_.error(expression.location,
+                        "selected raw instruction cannot share one $::patch cell across copied operands");
+                    diagnostics_.note(first->second, "first use of this patch expression is here");
+                    return std::nullopt;
+                }
+            }
             if (expression.arguments.size() == 2) {
-                patch_sink = resolve_patch_sink(*expression.arguments[1]);
+                if (specification.patch_address == PatchAddressRepresentation::Unavailable) {
+                    diagnostics_.error(expression.arguments[1]->location,
+                        "selected target instruction patch field does not support an address sink");
+                    return std::nullopt;
+                }
+                patch_sink = resolve_patch_sink(*expression.arguments[1], specification.patch_address);
                 if (!patch_sink) return std::nullopt;
             }
         }
@@ -1267,7 +1302,10 @@ private:
             return register_operand(*entry, source->location);
         }
         if (specification.allow_immediate) {
-            const auto value = integer_literal(*source);
+            const auto value = patch
+                ? source->evaluated_integer && source->evaluated_integer->value.high == 0
+                    ? std::optional<std::uint64_t>{source->evaluated_integer->value.low} : std::nullopt
+                : integer_literal(*source);
             if (value) {
                 if (!fits_instruction_immediate(*value, specification)) {
                     diagnostics_.error(source->location,
@@ -3854,6 +3892,7 @@ private:
     std::vector<LoopContext> loops_;
     std::vector<mir::BlockId> break_targets_;
     std::set<std::pair<std::uint32_t, std::uint64_t>> patch_sinks_;
+    std::unordered_map<TokenIdentity, SourceLocation, TokenIdentityHash> current_patch_origins_;
     std::uint32_t next_patch_id_{};
     unsigned entry_ordered_depth_{};
     unsigned return_ordered_depth_{};
@@ -3958,10 +3997,11 @@ private:
     }
 
     void collect_managed_patch_sinks() {
+        std::unordered_set<std::uint32_t> collected;
         for (const auto& function : managed_.functions) {
             for (const auto& value : function.values) {
                 if (value.kind != mir::ValueKind::PatchValue ||
-                    !value.patch_sink) {
+                    !value.patch_sink || !collected.insert(value.patch_id).second) {
                     continue;
                 }
                 const auto& object = hir_.object(value.patch_sink->object);
@@ -4083,25 +4123,20 @@ private:
             const auto id = function.layout[layout_index];
             if (id != function.entry) output_ << block_symbol(function, id) << ":\n";
             const auto& candidate = function.blocks[id.value];
-            if (!candidate.source_label.empty()) {
-                const auto* label =
-                    hir_.label(function.source, candidate.source_label);
-                if (label) {
-                    output_ << ".Lcross.label." << function.source.value
-                            << '.' << label->id.value << ":\n";
-                    if (label->is_global) {
-                        const auto label_symbol =
-                            assembly_symbol(label->link_symbol);
-                        output_ << ".globl " << label_symbol << "\n";
-                        if (format_ == ObjectFormat::Elf) {
-                            output_ << ".type " << label_symbol
-                                    << ",@function\n";
-                        } else if (format_ == ObjectFormat::Coff) {
-                            output_ << ".def " << label_symbol
-                                    << "; .scl 2; .type 32; .endef\n";
-                        }
-                        output_ << label_symbol << ":\n";
+            if (candidate.source_label_id) {
+                const auto& label = hir_.labels.at(candidate.source_label_id->value);
+                output_ << ".Lcross.label." << function.source.value
+                        << '.' << label.id.value << ":\n";
+                if (label.is_global) {
+                    const auto label_symbol = assembly_symbol(label.link_symbol);
+                    output_ << ".globl " << label_symbol << "\n";
+                    if (format_ == ObjectFormat::Elf) {
+                        output_ << ".type " << label_symbol << ",@function\n";
+                    } else if (format_ == ObjectFormat::Coff) {
+                        output_ << ".def " << label_symbol
+                                << "; .scl 2; .type 32; .endef\n";
                     }
+                    output_ << label_symbol << ":\n";
                 }
             }
             for (const auto& instruction : candidate.instructions) {

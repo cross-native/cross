@@ -72,6 +72,8 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             type.kind == hir::Type::Kind::Builtin &&
             type.builtin >= BuiltinType::F32 &&
             type.builtin <= BuiltinType::Fptr;
+        const bool numeric_label = type.kind == hir::Type::Kind::Builtin &&
+            type.builtin == BuiltinType::Label;
         const bool address =
             type.kind == hir::Type::Kind::Pointer ||
             (type.kind == hir::Type::Kind::Builtin &&
@@ -89,7 +91,7 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             object.initializer == data::InitializerKind::Declaration;
         if (declaration != (entity.definition == nullptr) ||
             (object.initializer == data::InitializerKind::Integer &&
-             !integer && type.kind != hir::Type::Kind::Pointer) ||
+             !integer && !numeric_label && type.kind != hir::Type::Kind::Pointer) ||
             (object.initializer == data::InitializerKind::Floating &&
              !floating) ||
             (object.initializer == data::InitializerKind::Address &&

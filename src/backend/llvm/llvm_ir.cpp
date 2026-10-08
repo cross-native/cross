@@ -48,22 +48,6 @@ std::string llvm_visibility(hir::SymbolVisibility visibility) {
     return {};
 }
 
-std::string sanitize_identifier(std::string_view text) {
-    std::string result;
-    result.reserve(text.size());
-    for (const char ch : text) {
-        const bool valid = (ch >= 'A' && ch <= 'Z') ||
-                           (ch >= 'a' && ch <= 'z') ||
-                           (ch >= '0' && ch <= '9');
-        result.push_back(valid ? ch : '_');
-    }
-    return result;
-}
-
-std::string label_name(std::string_view source_name) {
-    return "cross.label." + sanitize_identifier(source_name);
-}
-
 std::string hexadecimal(std::uint64_t value, unsigned width) {
     std::ostringstream out;
     out << std::uppercase << std::hex << std::setfill('0')
@@ -310,7 +294,7 @@ private:
             const auto& function = hir_.function(*address.function);
             const auto& label = hir_.labels.at(address.label->value);
             target = "blockaddress(" + symbol_name(function.link_symbol) +
-                     ", %" + label_name(label.source_name) + ')';
+                     ", %" + llvm_label_name(label.id) + ')';
         } else {
             diagnostics_.error(object.location,
                                "data IR address constant has no target");
@@ -327,11 +311,14 @@ private:
         case data::InitializerKind::Declaration: return {};
         case data::InitializerKind::Zero: return "zeroinitializer";
         case data::InitializerKind::Uninitialized: return "undef";
-        case data::InitializerKind::Integer:
-            if (hir_.type(object.type).kind == hir::Type::Kind::Pointer)
+        case data::InitializerKind::Integer: {
+            const auto& type = hir_.type(object.type);
+            if (type.kind == hir::Type::Kind::Pointer ||
+                (type.kind == hir::Type::Kind::Builtin && type.builtin == BuiltinType::Label))
                 return "inttoptr (i" + std::to_string(object.size * 8) + ' ' +
                        to_decimal(object.bits) + " to " + ir_type(object.type) + ')';
             return to_decimal(object.bits);
+        }
         case data::InitializerKind::Floating:
             return floating_initializer(object);
         case data::InitializerKind::Address: {

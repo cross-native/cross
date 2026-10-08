@@ -38,3 +38,16 @@ endforeach()
 if(NOT stderr MATCHES "procedural_origin_errors\\.x:34:17: note: token supplied from here")
     message(FATAL_ERROR "copied token lost its original input span\n${stdout}\n${stderr}")
 endif()
+
+# Locations inside generated code name the expansion, not a position in the
+# invoking file.
+foreach(expected
+        "<expansion of 'inner'>:[0-9]+:[0-9]+: error: expected expression"
+        "<expansion of 'outer'>:[0-9]+:[0-9]+: note: in expansion of procedural macro 'inner'")
+    if(NOT stderr MATCHES "${expected}")
+        message(FATAL_ERROR "missing expansion label '${expected}'\n${stdout}\n${stderr}")
+    endif()
+endforeach()
+if(stderr MATCHES "procedural_origin_errors\.x:1:[0-9]+:")
+    message(FATAL_ERROR "generated code was reported as line 1 of the input\n${stdout}\n${stderr}")
+endif()

@@ -4,6 +4,8 @@
 
 #include "middle/data_ir.hpp"
 #include "middle/hir.hpp"
+#include "common/memory_order.hpp"
+#include "common/patch_address.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -71,6 +73,8 @@ enum class ValueKind {
     Call,
     PatchValue,
     Intrinsic,
+    // A completed, effect-free void expression; never a machine register.
+    VoidValue,
 };
 enum class IntrinsicOperation {
     Expect,
@@ -88,7 +92,7 @@ enum class AtomicOperation {
     FetchUpdate,
     ThreadFence, SignalFence,
 };
-enum class MemoryOrder { Relaxed, Acquire, Release, AcqRel, SeqCst };
+using cross::MemoryOrder;
 enum class UnaryOperation { Negate, BitNot, IsZero };
 enum class BinaryOperation {
     Add, Subtract, Multiply, SignedDivide, UnsignedDivide,
@@ -122,6 +126,8 @@ struct CallArgument {
 struct PatchSink {
     hir::ObjectId object;
     std::uint64_t offset{};
+    PatchAddressRepresentation representation{PatchAddressRepresentation::Unavailable};
+    unsigned storage_bytes{};
 
     friend bool operator==(const PatchSink&, const PatchSink&) = default;
 };
@@ -163,6 +169,8 @@ struct ManagedValue {
     std::optional<hir::ObjectId> object;
     std::optional<PatchSink> patch_sink;
     std::optional<data::AddressConstant> patch_initial_address;
+    // One physical cell per source identity/concrete owner; copied uses can
+    // have separate SSA values/control paths but must agree on cell metadata.
     std::uint32_t patch_id{};
     bool is_volatile_access{};
     // A source [[musttail]] return owns this call. Optimizers and targets must

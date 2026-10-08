@@ -8,6 +8,18 @@
 
 namespace cross {
 
+ValueBinding::~ValueBinding() {
+    detail::OwnerRelease::run([&](detail::OwnerRelease& release) {
+        release.take(placement);
+        release.take(declaration_source);
+        enumeration.reset();
+    });
+}
+
+ValuePlacementIdentity::~ValuePlacementIdentity() {
+    detail::OwnerRelease::run([&](detail::OwnerRelease&) { source_binding.reset(); });
+}
+
 namespace {
 std::string hex_unit(std::string_view unit) {
     static constexpr char digits[] = "0123456789abcdef";

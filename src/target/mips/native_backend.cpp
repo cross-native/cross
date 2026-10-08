@@ -5,6 +5,7 @@
 
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
+#include "common/control_flow.hpp"
 #include "model/model.hpp"
 #include "middle/mir_analysis.hpp"
 #include "target/abi_lowering.hpp"
@@ -57,6 +58,7 @@ enum class LoweringPass : std::uint16_t {
     FoldPointerOffsets,
     EliminateRedundantExpressions,
     EliminateRedundantLoads,
+    FuseDivisionResults,
     FuseCompareBranches,
     EliminateDeadValues,
     ScheduleBlockLayout,
@@ -364,25 +366,27 @@ const AbiEntry* managed_abi_model(const hir::Module& module,
                                   const CompilerOptions& options) {
     if (options.private_abi &&
         function.abi_contract == hir::AbiContract::Dynamic) {
-        // Both Cross private MIPS conventions declare 32-bit addresses, and
-        // the shared ABI interpreter sizes pointer and by-reference channels
-        // from that width. Under a 64-bit address model they would truncate
-        // every pointer argument, so the compilation ABI stays the private
-        // contract until a 64-bit-address private convention exists.
-        if (subtarget.abi_info().address_bits <= 32) {
-            const auto name = subtarget.has_feature(Feature::Mips3)
-                ? std::string_view{"cross64"}
-                : std::string_view{"cross32"};
-            if (const auto* abi = model_registry().find_abi(
-                    "mips", name, options.target)) {
-                // Private transport is an optimization, not permission to
-                // reject a signature supported by its resolved source ABI.
-                // Classify the complete interface (including hidden result
-                // channels) before committing, using the same model and
-                // resolved ISA facts at caller and callee.
-                if (classify_managed_interface(module, function, subtarget, *abi))
-                    return abi;
+        // The model marks one candidate per address model and carrier width.
+        // Its address width must match because the shared ABI interpreter
+        // sizes pointer and by-reference channels from it; carriers follow
+        // the native GPR width.
+        const unsigned carrier_bits =
+            subtarget.has_feature(Feature::Mips3) ? 64U : 32U;
+        const auto& compilation = subtarget.abi_info();
+        for (const auto& abi : model_registry().abis()) {
+            if (abi.architecture != compilation.architecture ||
+                abi.address_bits != compilation.address_bits ||
+                abi.private_carrier_bits != carrier_bits) {
+                continue;
             }
+            // Private transport is an optimization, not permission to
+            // reject a signature supported by its resolved source ABI.
+            // Classify the complete interface (including hidden result
+            // channels) before committing, using the same model and
+            // resolved ISA facts at caller and callee.
+            if (classify_managed_interface(module, function, subtarget, abi))
+                return &abi;
+            break;
         }
     }
     return abi_model(function.abi);
@@ -1029,14 +1033,17 @@ private:
             const auto* entity = value.label
                 ? &hir_.labels.at(value.label->value)
                 : nullptr;
+            const bool symbolic = entity &&
+                (entity->is_global || entity->owner != source_->source);
             auto result = target_instruction(
-                entity && entity->is_global ? Opcode::GlobalAddress
-                                            : Opcode::LabelAddress,
+                symbolic ? Opcode::GlobalAddress : Opcode::LabelAddress,
                 value.location);
-            if (entity && entity->is_global) {
+            if (symbolic) {
+                const auto symbol = entity->is_global ? entity->link_symbol
+                    : ".Lcross.label." + std::to_string(entity->owner.value) +
+                      '.' + std::to_string(entity->id.value);
                 result.operands.push_back(machine::SymbolOperand{
-                    entity->link_symbol, 0, true, std::nullopt,
-                    entity->owner});
+                    symbol, 0, true, std::nullopt, entity->owner, entity->id});
                 result.defs.push_back(reg(value.id));
                 return result;
             }
@@ -1628,6 +1635,7 @@ private:
             }
             for (const auto value : block.values) {
                 const auto& managed_value = source.values[value.value];
+                if (managed_value.kind == mir::ValueKind::VoidValue) continue;
                 if (!target.instructions.empty() &&
                     target.instructions.back().kind ==
                         machine::InstructionKind::Call &&
@@ -2086,54 +2094,14 @@ private:
         std::vector<LiveSet> interference(count);
         std::vector<LiveSet> affinity(count);
         std::vector<LiveSet> backedge_affinity(count);
-        std::vector<LiveSet> dominators;
-        if (options_.cprop_registers) {
-            LiveSet all_blocks;
-            for (const auto& block : function.blocks) {
-                if (block.id.value < block_count) {
-                    all_blocks.insert(block.id.value);
-                }
-            }
-            dominators.assign(block_count, all_blocks);
-            if (function.entry.value < block_count) {
-                dominators[function.entry.value] = {function.entry.value};
-            }
-            bool dominators_changed = true;
-            while (dominators_changed) {
-                dominators_changed = false;
-                for (const auto& block : function.blocks) {
-                    if (block.id == function.entry ||
-                        block.id.value >= block_count ||
-                        std::any_of(
-                            block.predecessors.begin(),
-                            block.predecessors.end(),
-                            [&](machine::BlockId predecessor) {
-                                return predecessor.value >= block_count;
-                            })) {
-                        continue;
-                    }
-                    LiveSet next;
-                    if (!block.predecessors.empty()) {
-                        next = dominators[
-                            block.predecessors.front().value];
-                        for (std::size_t index = 1;
-                             index < block.predecessors.size(); ++index) {
-                            const auto& other = dominators[
-                                block.predecessors[index].value];
-                            std::erase_if(
-                                next, [&](std::uint32_t candidate) {
-                                    return !other.contains(candidate);
-                                });
-                        }
-                    }
-                    next.insert(block.id.value);
-                    if (next != dominators[block.id.value]) {
-                        dominators[block.id.value] = std::move(next);
-                        dominators_changed = true;
-                    }
-                }
-            }
-        }
+        const Dominance dominance(
+            function.blocks.size(), function.entry.value,
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return function.blocks[block].successors;
+            },
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return function.blocks[block].predecessors;
+            });
         for (const auto& block : function.blocks) {
             if (block.id.value >= block_count) continue;
             auto live = live_out[block.id.value];
@@ -2205,8 +2173,8 @@ private:
                     affinity[*source].insert(*target);
                     if (options_.cprop_registers && predecessor &&
                         predecessor->target.value < block_count &&
-                        dominators[predecessor->target.value].contains(
-                            block.id.value)) {
+                        dominance.dominates(block.id.value,
+                                            predecessor->target.value)) {
                         // Reserve a common color for a genuine loop-carried
                         // edge before unrelated ranges consume it. This is
                         // especially important for rotated loops, where a
@@ -2219,10 +2187,31 @@ private:
             }
         }
         std::vector<machine::PhysicalRegisterId> integer_colors;
-        if (subtarget_.has_feature(Feature::Mips3)) {
+        // Before MIPS III, 64-bit integers are legalized to word pairs whose
+        // expansions use these registers as fixed scratches.
+        const bool pair_scratch = !subtarget_.has_feature(Feature::Mips3) &&
+            std::any_of(function.blocks.begin(), function.blocks.end(),
+                [&](const machine::Block& block) {
+                    return std::any_of(
+                        block.instructions.begin(), block.instructions.end(),
+                        [&](const machine::Instruction& instruction) {
+                            const auto wide = [&](const machine::Register& value) {
+                                return value.mode.bits > 32 && value.mode.bits <= 64 &&
+                                    (value.kind != machine::RegisterKind::Virtual ||
+                                     value.id >= count ||
+                                     function.virtual_register_classes[value.id] ==
+                                         machine::VirtualRegisterClass::Integer);
+                            };
+                            return std::any_of(instruction.uses.begin(),
+                                               instruction.uses.end(), wide) ||
+                                   std::any_of(instruction.defs.begin(),
+                                               instruction.defs.end(), wide);
+                        });
+                });
+        if (!pair_scratch) {
             // These registers are never implicit emitter scratches on the
-            // MIPS-III scalar path. They are preferred because they require
-            // no prologue save under o32/EABI.
+            // native-width scalar path. They are preferred because they
+            // require no prologue save under o32/EABI.
             for (const auto id : {2U, 3U, 4U, 5U, 6U, 7U,
                                   14U, 15U, 24U, 25U}) {
                 integer_colors.push_back({id});
@@ -2539,8 +2528,9 @@ private:
             }
             const auto integer_name = gpr_name(physical);
             const auto floating_name = fpr_name(physical);
-            const bool preserved_integer =
-                physical.value >= 16 && physical.value <= 23 &&
+            // Any GPR the function's ABI preserves, including gp when a
+            // callee's contract clobbers it.
+            const bool preserved_integer = !integer_name.empty() &&
                 !function_clobbers(integer_name);
             const bool preserved_floating = !floating_name.empty() &&
                 !function_clobbers(floating_name);
@@ -3162,7 +3152,9 @@ private:
         case Opcode::Sdiv:
         case Opcode::Udiv:
         case Opcode::Srem:
-        case Opcode::Urem: return 36U;
+        case Opcode::Urem:
+        case Opcode::Sdivrem:
+        case Opcode::Udivrem: return 36U;
         case Opcode::Fdiv:
             return instruction.defs.empty() ||
                            instruction.defs.front().mode.bits <= 32
@@ -3224,7 +3216,8 @@ private:
         const auto opcode = decode_opcode(instruction.opcode);
         return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
             opcode == Opcode::Udiv || opcode == Opcode::Srem ||
-            opcode == Opcode::Urem || opcode == Opcode::StackAllocate ||
+            opcode == Opcode::Urem || opcode == Opcode::Sdivrem ||
+            opcode == Opcode::Udivrem || opcode == Opcode::StackAllocate ||
             indexed_operation_writes_hilo(instruction);
     }
 
@@ -4112,6 +4105,28 @@ private:
                     });
             });
         passes.add(
+            {{LoweringPass::FuseDivisionResults},
+              Stage::InstructionCombining, "fuse-division-results"},
+            [this](machine::Function& function) {
+                if (!options_.machine_combine) return false;
+                const unsigned native_bits =
+                    subtarget_.has_feature(Feature::Mips3) ? 64U : 32U;
+                return native::fuse_division_results(function,
+                    [&](const machine::Instruction& instruction)
+                        -> std::optional<native::DivisionKind> {
+                        const auto opcode = decode_opcode(instruction.opcode);
+                        if (instruction.uses.empty() ||
+                            instruction.uses.front().mode.bits > native_bits ||
+                            (opcode != Opcode::Sdiv && opcode != Opcode::Udiv &&
+                             opcode != Opcode::Srem && opcode != Opcode::Urem))
+                            return std::nullopt;
+                        return native::DivisionKind{
+                            opcode == Opcode::Sdiv || opcode == Opcode::Udiv,
+                            opcode == Opcode::Sdiv || opcode == Opcode::Srem};
+                    },
+                    Opcode::Sdivrem, Opcode::Udivrem);
+            });
+        passes.add(
             {{LoweringPass::FuseCompareBranches},
               Stage::InstructionCombining, "fuse-compare-branches"},
             [this](machine::Function& function) {
@@ -4352,11 +4367,11 @@ public:
                     Diagnostics& diagnostics)
         : module_(module), hir_(hir_module), subtarget_(subtarget), options_(options),
           diagnostics_(diagnostics), format_(subtarget.object_format()),
-          // n64 and n32 rename $t0-$t3 to the architectural registers 12-15
-          // and spell 8-11 as $a4-$a7.  Numeric GPR operands are the one
-          // spelling every MIPS ABI reads identically; FPR names are shared.
-          numeric_gprs_(subtarget.abi() == "n64" ||
-                        subtarget.abi() == "n32"),
+          // A 64-bit address model produces ELF64 objects, which assemblers
+          // read with the n64 register names: $t0-$t3 denote registers 12-15
+          // and 8-11 are $a4-$a7.  Numeric GPR operands read identically
+          // under every naming convention; FPR names are shared.
+          numeric_gprs_(hir_module.address_bits > 32),
           wide_addresses_(hir_module.address_bits > 32) {}
 
     void prepare_frames() {
@@ -4383,7 +4398,7 @@ public:
                 "native MIPS assembly currently requires an ELF target");
             return {};
         }
-        if (subtarget_.abi() == "eabi32") {
+        if (elf_abi_tag(subtarget_.abi_info()) == ElfAbiTag::Eabi32) {
             // GNU MIPS linkers use this conventional empty marker in addition
             // to EF_MIPS_ABI_EABI32.  LLVM MC accepts the section even though
             // it cannot infer EABI32 from the PSP triple by itself.
@@ -5260,16 +5275,33 @@ private:
             (subtarget_.has_feature(Feature::Mips3) && bits <= 64);
     }
 
+    // Captures are emitted in parameter order. Direct captures never write
+    // another parameter's incoming register, and fallback captures write
+    // only the t0/t1 assembly scratches, so every incoming register survives
+    // until its own capture unless an argument arrives in t0 or t1.
+    bool incoming_registers_survive() const {
+        return active_signature_ && std::none_of(
+            active_signature_->layout.call.arguments.begin(),
+            active_signature_->layout.call.arguments.end(),
+            [](const auto& assignment) {
+                return std::any_of(
+                    assignment.pieces.begin(), assignment.pieces.end(),
+                    [](const ValuePiece& piece) {
+                        return piece.location.kind == LocationKind::Register &&
+                            (piece.location.reg == "t0" || piece.location.reg == "t1");
+                    });
+            });
+    }
+
     bool direct_parameter_capture(const machine::Function& function,
                                   std::size_t index) const {
         if (!individually_direct_parameter_capture(function, index) ||
             !active_signature_) {
             return false;
         }
-        // A fallback capture uses t0/t1 assembly scratches. If any incoming
-        // register still needs that fallback, preserve every incoming
-        // register first; otherwise all register captures are non-destructive
-        // direct moves and stack parameters may be read afterward.
+        if (incoming_registers_survive()) return true;
+        // Otherwise one fallback capture requires every incoming register to
+        // be preserved in its home first.
         for (std::size_t other = 0;
              other < active_signature_->layout.call.arguments.size();
              ++other) {
@@ -5286,6 +5318,22 @@ private:
             }
         }
         return true;
+    }
+
+    // An output pointer arriving in one register is read from it directly
+    // when incoming registers survive, so it needs no home.
+    bool output_pointer_in_register(const machine::Function& function,
+                                    std::size_t index) const {
+        const auto& entity = hir_.function(function.source);
+        if (!active_signature_ || !incoming_registers_survive() ||
+            index >= entity.parameters.size() ||
+            entity.parameters[index].mode == ParameterMode::In ||
+            index >= active_signature_->layout.call.arguments.size()) {
+            return false;
+        }
+        const auto& pieces = active_signature_->layout.call.arguments[index].pieces;
+        return pieces.size() == 1 &&
+            pieces.front().location.kind == LocationKind::Register;
     }
 
     void prepare_parameter_homes(machine::Function& function) {
@@ -5309,7 +5357,8 @@ private:
         for (std::size_t index = 0;
              index < active_signature_->layout.call.arguments.size();
              ++index) {
-            if (direct_parameter_capture(function, index)) continue;
+            if (direct_parameter_capture(function, index) ||
+                output_pointer_in_register(function, index)) continue;
             const auto& assignment =
                 active_signature_->layout.call.arguments[index];
             for (const auto& piece : assignment.pieces) {
@@ -5364,7 +5413,8 @@ private:
         for (std::size_t index = 0;
              index < active_signature_->layout.call.arguments.size();
              ++index) {
-            if (direct_parameter_capture(function, index)) continue;
+            if (direct_parameter_capture(function, index) ||
+                output_pointer_in_register(function, index)) continue;
             const auto& assignment =
                 active_signature_->layout.call.arguments[index];
             for (const auto& piece : assignment.pieces) {
@@ -6260,7 +6310,8 @@ private:
                     return;
                 }
                 load_abi_piece(function, assignment.pieces.front(),
-                               *active_signature_->abi, "t0", true);
+                               *active_signature_->abi, "t0",
+                               !output_pointer_in_register(function, index));
                 normalize_integer("t0", hir_.address_bits, true);
                 instruction(address_store(),
                             "$t0," + memory(*pointer->frame_offset));
@@ -6459,7 +6510,8 @@ private:
                 return;
             }
             load_abi_piece(function, assignment.pieces.front(),
-                           *active_signature_->abi, "t0", true);
+                           *active_signature_->abi, "t0",
+                           !output_pointer_in_register(function, index));
             // A 32-bit ABI address carried by a MIPS-III 64-bit GPR must be
             // canonical before it is dereferenced.  Indexed address
             // formation used to provide this sign extension accidentally;
@@ -6467,16 +6519,8 @@ private:
             normalize_integer("t0", hir_.address_bits, true);
             instruction(address_store(),
                         "$t0," + memory(*pointer->frame_offset));
-            if (parameter.mode == ParameterMode::Out) {
-                if (legalizes_to_pair(target)) {
-                    store_vreg_pair(function, target, "zero", "zero",
-                                    value.location);
-                } else {
-                    instruction("move", "$t1,$zero");
-                    store_vreg(function, target, "t1", value.location);
-                }
-                return;
-            }
+            // An `out` cell starts unassigned; its initial value is never read.
+            if (parameter.mode == ParameterMode::Out) return;
             if (is_floating(hir_, parameter.type)) {
                 instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
                             "$f0,0($t0)");
@@ -8129,6 +8173,7 @@ private:
     bool numeric_gprs_{};
     bool wide_addresses_{};
     std::ostringstream output_;
+    std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::optional<ActiveSignature> active_signature_;
     std::uint32_t frame_size_{};
     std::uint32_t saved_fp_offset_{};
@@ -8588,6 +8633,19 @@ void AssemblyEmitter::emit_integer_binary(
         instruction(value.opcode == Opcode::Urem ? "mfhi" : "mflo",
                     reg_name(target_gpr));
         break;
+    case Opcode::Sdivrem:
+    case Opcode::Udivrem: {
+        instruction(opcode == Opcode::Sdivrem ? (wide ? "ddiv" : "div")
+                                              : (wide ? "ddivu" : "divu"),
+                    "$zero," + reg_name(left_gpr) + "," +
+                        reg_name(right_gpr));
+        const auto remainder = value.defs[1];
+        const auto remainder_gpr = output_gpr(function, remainder, "t3");
+        instruction("mflo", reg_name(target_gpr));
+        instruction("mfhi", reg_name(remainder_gpr));
+        commit_gpr(function, remainder, remainder_gpr, value.location);
+        break;
+    }
     case Opcode::And:
         instruction(immediate ? "andi" : "and",
                     immediate ? immediate_operands() : binary_operands());
@@ -9002,19 +9060,41 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
             "the first MIPS LL/SC lowering supports 32-bit atomic objects only");
         return;
     }
+    const auto floating = [&](machine::Register reg) {
+        return reg.kind == machine::RegisterKind::Virtual &&
+               reg.id < function.virtual_register_classes.size() &&
+               function.virtual_register_classes[reg.id] ==
+                   machine::VirtualRegisterClass::Floating;
+    };
+    const auto load_bits = [&](machine::Register reg, std::string_view gpr) {
+        if (floating(reg)) {
+            load_fvreg(function, reg, "f0", value.location);
+            move_fpr_to_gpr("f0", gpr, bits);
+        } else {
+            load_vreg(function, reg, gpr, value.location);
+        }
+    };
+    const auto store_bits = [&](machine::Register reg, std::string_view gpr) {
+        if (floating(reg)) {
+            move_gpr_to_fpr(gpr, "f0", bits);
+            store_fvreg(function, reg, "f0", value.location);
+        } else {
+            store_vreg(function, reg, gpr, value.location);
+        }
+    };
     load_vreg(function, value.uses.front(), "t0", value.location);
     if (opcode == Opcode::AtomicLoad) {
         instruction("sync");
         instruction("lw", "$t1,0($t0)");
         instruction("sync");
         if (!value.defs.empty()) {
-            store_vreg(function, value.defs.front(), "t1", value.location);
+            store_bits(value.defs.front(), "t1");
         }
         return;
     }
     if (opcode == Opcode::AtomicStore) {
         if (value.uses.size() < 2) return;
-        load_vreg(function, value.uses[1], "t1", value.location);
+        load_bits(value.uses[1], "t1");
         instruction("sync");
         instruction("sw", "$t1,0($t0)");
         instruction("sync");
@@ -9024,7 +9104,7 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
         if (value.uses.size() < 3 || value.defs.empty()) return;
         load_vreg(function, value.uses[1], "t3", value.location);
         instruction("lw", "$t4,0($t3)");
-        load_vreg(function, value.uses[2], "t5", value.location);
+        load_bits(value.uses[2], "t5");
         const auto retry = local_label(function);
         const auto failed = local_label(function);
         const auto done = local_label(function);
@@ -9048,7 +9128,7 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
         return;
     }
     if (value.uses.size() < 2 || value.defs.empty()) return;
-    load_vreg(function, value.uses[1], "t3", value.location);
+    load_bits(value.uses[1], "t3");
     const auto retry = local_label(function);
     instruction("sync");
     output_ << retry << ":\n";
@@ -9109,7 +9189,7 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
     instruction("beq", "$t2,$zero," + retry);
     instruction("nop");
     instruction("sync");
-    store_vreg(function, value.defs.front(), "t1", value.location);
+    store_bits(value.defs.front(), "t1");
 }
 
 void AssemblyEmitter::emit_phi_edge_copies(
@@ -9414,20 +9494,22 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 return;
             }
             const auto bytes = std::max(1U, (target.mode.bits + 7U) / 8U);
-            const auto after = local_label(function);
             const auto end = ".Lcross.patch.value." +
                              std::to_string(value.patch->identity) + ".end";
-            instruction("b", after);
-            instruction("nop");
-            output_ << ".p2align " << std::countr_zero(std::bit_ceil(bytes))
-                    << '\n';
-            if (bytes == 1) output_ << "\t.byte " << immediate.value << '\n';
-            else if (bytes == 2) output_ << "\t.short " << immediate.value << '\n';
-            else if (bytes == 4) output_ << "\t.word " << immediate.value << '\n';
-            else output_ << "\t.dword " << immediate.value << '\n';
-            // Keep end at the exact cell boundary, but branch only to an
-            // instruction-aligned continuation after subword cells.
-            output_ << end << ":\n.p2align 2\n" << after << ":\n";
+            if (emitted_patch_cells_.insert(value.patch->identity).second) {
+                const auto after = local_label(function);
+                instruction("b", after);
+                instruction("nop");
+                output_ << ".p2align " << std::countr_zero(std::bit_ceil(bytes))
+                        << '\n';
+                if (bytes == 1) output_ << "\t.byte " << immediate.value << '\n';
+                else if (bytes == 2) output_ << "\t.short " << immediate.value << '\n';
+                else if (bytes == 4) output_ << "\t.word " << immediate.value << '\n';
+                else output_ << "\t.dword " << immediate.value << '\n';
+                // Keep end at the exact cell boundary, but branch only to an
+                // instruction-aligned continuation after subword cells.
+                output_ << end << ":\n.p2align 2\n" << after << ":\n";
+            }
             const auto field = end + "-" + std::to_string(bytes);
             materialize_symbol_address("t0", field);
             if (legalizes_to_pair(target)) {
@@ -10774,6 +10856,12 @@ std::string emit_managed_machine_assembly(
     (void)managed;
     return AssemblyEmitter(module, hir_module, subtarget, options,
                            diagnostics).run();
+}
+
+std::optional<ElfAbiTag> elf_abi_tag(const AbiEntry& abi) {
+    if (abi.elf_abi_tag.empty()) return ElfAbiTag::Default;
+    if (abi.elf_abi_tag == "eabi32") return ElfAbiTag::Eabi32;
+    return std::nullopt;
 }
 
 } // namespace cross::mips

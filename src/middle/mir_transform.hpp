@@ -5,6 +5,7 @@
 #include "middle/mir_analysis.hpp"
 
 #include <span>
+#include <unordered_map>
 
 namespace cross::mir {
 
@@ -36,6 +37,22 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 // SSA and deliberately rejects secondary exits, multiple latches, compact
 // self-latches, and addressable blocks rather than weakening those invariants.
 [[nodiscard]] bool rotate_guarded_loops(ManagedFunction& function);
+
+// Value replacements collected by one sweep and applied to every use at once,
+// instead of rescanning the function per replaced value. Chains resolve to
+// their final value. A sweep that inspects operands rewrites each value with
+// `rewrite` before inspecting it, which sees every replacement made so far.
+class ValueReplacements {
+public:
+    void add(ValueId from, ValueId to);
+    [[nodiscard]] bool empty() const { return targets_.empty(); }
+    [[nodiscard]] ValueId resolve(ValueId id);
+    void rewrite(ManagedValue& value);
+    void apply(ManagedFunction& function);
+
+private:
+    std::unordered_map<std::uint32_t, ValueId> targets_;
+};
 
 // Keep canonical dense value IDs after a transformation removes definitions.
 // The helper rewrites every value-bearing MIR edge, including effect owners,

@@ -3,6 +3,7 @@
 #include "frontend/preprocessor.hpp"
 
 #include "frontend/ast.hpp"
+#include "frontend/builtin_registry.hpp"
 #include "frontend/preprocessor_expression.hpp"
 #include "frontend/semantic.hpp"
 #include "model/model.hpp"
@@ -442,8 +443,7 @@ std::string Preprocessor::evaluate_query(
             if (!instruction_enabled(*instruction) ||
                 operand_index >= instruction->operands.size()) continue;
             const auto& operand = instruction->operands[operand_index];
-            if (operand.patchable && operand.allow_immediate &&
-                operand.immediate_bits == bits) return "1";
+            if (patch_operand_accepts_type(operand, type, bits)) return "1";
         }
         return "0";
     }
@@ -462,31 +462,9 @@ std::string Preprocessor::evaluate_query(
         return find_include(including, *written, quoted).empty() ? "0" : "1";
     }
     auto argument = normalized_argument(0);
-    const auto one_of = [&](std::initializer_list<std::string_view> entries) {
-        return std::any_of(entries.begin(), entries.end(),
-                           [&](std::string_view entry) { return argument == entry; });
-    };
     if (name == "$::has_intrinsic") {
-        return one_of({"$::expect", "$::assume", "$::unreachable", "$::trap",
-                       "$::alignof", "$::static_assert", "$::patch",
-                       "$::eval", "$::runtime", "$::quote", "$::unquote",
-                       "$::meta::parse", "$::meta::concat", "$::meta::tokens",
-                       "$::meta::call_site", "$::meta::gensym",
-                       "$::meta::child_count", "$::meta::child", "$::meta::replace_child",
-                       "$::meta::is_kind", "$::meta::is_production", "$::meta::is_extension",
-                       "$::meta::extension_match",
-                       "$::syntax::input", "$::syntax::capture", "$::syntax::count", "$::syntax::at",
-                       "$::syntax::is_variant", "$::syntax::node",
-                       "$::syntax::context",
-                       "$::syntax::span", "$::syntax::capture_span", "$::meta::node_span",
-                       "$::syntax::error", "$::syntax::warning", "$::syntax::note",
-                       "$::atomic_load", "$::atomic_store",
-                       "$::atomic_exchange", "$::atomic_compare_exchange",
-                       "$::atomic_fetch_add", "$::atomic_fetch_sub",
-                       "$::atomic_fetch_and", "$::atomic_fetch_xor",
-                       "$::atomic_fetch_or", "$::atomic_thread_fence",
-                       "$::atomic_signal_fence",
-                       "$::atomic_is_lock_free"}) ? "1" : "0";
+        const auto* entry = find_core_expression_builtin(argument);
+        return entry && entry->kind == CoreBuiltinKind::Intrinsic ? "1" : "0";
     }
     if (name == "$::has_instruction") {
         if (!target) return "0";
@@ -496,28 +474,7 @@ std::string Preprocessor::evaluate_query(
         }) ? "1" : "0";
     }
     if (name == "$::has_builtin") {
-        return one_of({"$::expect", "$::assume", "$::unreachable", "$::trap",
-                       "$::alignof", "$::static_assert", "$::patch",
-                       "$::eval", "$::runtime", "$::quote", "$::unquote",
-                       "$::meta::parse", "$::meta::concat", "$::meta::tokens",
-                       "$::meta::call_site", "$::meta::gensym",
-                       "$::meta::child_count", "$::meta::child", "$::meta::replace_child",
-                       "$::meta::is_kind", "$::meta::is_production", "$::meta::is_extension",
-                       "$::meta::extension_match",
-                       "$::syntax::input", "$::syntax::capture", "$::syntax::count", "$::syntax::at",
-                       "$::syntax::is_variant", "$::syntax::node",
-                       "$::syntax::context",
-                       "$::syntax::span", "$::syntax::capture_span", "$::meta::node_span",
-                       "$::syntax::error", "$::syntax::warning", "$::syntax::note",
-                       "$::atomic_load", "$::atomic_store",
-                       "$::atomic_exchange", "$::atomic_compare_exchange",
-                       "$::atomic_fetch_add", "$::atomic_fetch_sub",
-                       "$::atomic_fetch_and", "$::atomic_fetch_xor",
-                       "$::atomic_fetch_or", "$::atomic_thread_fence",
-                       "$::atomic_signal_fence", "$::atomic_is_lock_free",
-                       "$::memory::relaxed", "$::memory::acquire",
-                       "$::memory::release", "$::memory::acq_rel",
-                       "$::memory::seq_cst"}) ||
+        return find_core_expression_builtin(argument) ||
                        ([&] {
                             if (!target) return false;
                             const auto forms =
@@ -533,46 +490,13 @@ std::string Preprocessor::evaluate_query(
         return is_known_attribute(argument) ? "1" : "0";
     }
     if (name == "$::has_feature") {
-        if (argument == "$::feature::address_spaces") {
-            return target && std::any_of(
-                       target->address_spaces.begin(),
-                       target->address_spaces.end(),
-                       [](const AddressSpaceEntry& entry) {
-                           return entry.number != 0 && entry.native_lowering;
-                       })
-                       ? "1" : "0";
-        }
-        if (one_of({"$::feature::runtime_free_intrinsics",
-                    "$::feature::control_intrinsics",
-                    "$::feature::evaluation",
-                    "$::feature::automatic_evaluation",
-                    "$::feature::generics",
-                    "$::feature::procedural_macros",
-                    "$::feature::patchable_values",
-                    "$::feature::patchable_operands",
-                    "$::feature::raw_inline",
-                    "$::feature::contextual_attributes",
-                    "$::feature::external_models",
-                    "$::feature::operator_binding"})) return "1";
-        if (target && target->architecture == "x86-64" &&
-            one_of({"$::feature::integer128",
-                    "$::feature::binary128_storage",
-                    "$::feature::binary128_arithmetic",
-                    "$::feature::fixed_vectors",
-                    "$::feature::atomics",
-                    "$::feature::variadics",
-                    "$::feature::thread_local"})) {
-            return "1";
-        }
-        if (target && target->architecture == "mips" &&
-            argument == "$::feature::atomics") {
-            return resolved_bool(options_, "m.llsc") ? "1" : "0";
-        }
         constexpr std::string_view prefix = "$::feature::";
-        if (argument.starts_with(prefix)) {
-            return feature_enabled(argument.substr(prefix.size())) ? "1" : "0";
-        }
-        return "0";
+        if (!argument.starts_with(prefix)) return "0";
+        const auto feature = std::string_view(argument).substr(prefix.size());
+        const auto features = language_features(options_);
+        return std::find(features.begin(), features.end(), feature) != features.end() ||
+                       feature_enabled(feature)
+                   ? "1" : "0";
     }
     if (name == "$::has_abi") {
         return target && find_abi(*target, argument, options_.target) ? "1" : "0";
@@ -882,7 +806,23 @@ std::string Preprocessor::process(const std::filesystem::path& input) {
     dependencies_.clear();
     dependency_identities_.clear();
     std::vector<std::filesystem::path> stack;
-    auto included = expand_includes(input, stack);
+    const auto forced = [&](const std::filesystem::path& name) {
+        const auto path = find_include({}, name.string(), true);
+        if (path.empty()) {
+            diagnostics_.command_error("forced include file not found: " + name.string());
+            return std::string{};
+        }
+        return expand_includes(path, stack);
+    };
+    for (const auto& name : options_.macro_includes) {
+        line_locations_.clear();
+        expand_macros(forced(name), nullptr);
+        output_line_locations_.clear();
+    }
+    line_locations_.clear();
+    std::string included;
+    for (const auto& name : options_.forced_includes) included += forced(name);
+    included += expand_includes(input, stack);
     if (diagnostics_.errors() != 0) return {};
     // Namespace canonicalization is represented structurally by the parser in
     // this first implementation stage; macro expansion still observes the

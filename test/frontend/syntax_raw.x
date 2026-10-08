@@ -186,6 +186,21 @@ namespace flow {
         match "(" branch:choice(left:("left" number:literal) | right:("right" number:literal)) ")";
         expand selected;
     }
+    syntax MaybeEmpty : rule { match part:optional("unused"); }
+    [[syntax_expander]] static $::meta::tokens nullable_selected(in $::meta::syntax_match input) {
+        if ($::syntax::count(input, "branch") != 1uptr) return $::quote { 0u32 };
+        $::meta::syntax_match branch = $::syntax::at(input, "branch", 0uptr);
+        if ($::syntax::is_variant(branch, "value")) return $::syntax::capture(branch, "number");
+        if (!$::syntax::is_variant(branch, "empty")) return $::quote { 0u32 };
+        $::meta::syntax_match child = $::syntax::at(branch, "child", 0uptr);
+        if ($::syntax::count(child, "part") == 0uptr) return $::quote { 17u32 };
+        return $::quote { 18u32 };
+    }
+    syntax NullableSelect : expression {
+        prefix "nullable_select";
+        match "(" branch:choice(empty:(child:rule(MaybeEmpty)) | value:(number:literal)) ")";
+        expand nullable_selected;
+    }
     syntax Tree : rule {
         match branch:choice(leaf:(value:literal) |
                             pair:("(" left:rule(Tree) "+" right:rule(Tree) ")"));
@@ -615,6 +630,9 @@ namespace frozen {
 }
 [[noinline]] static u32 combinators() {
     syntax flow::Maybe, flow::List, flow::ListOne, flow::Repeat, flow::RepeatZero, flow::Select;
+    syntax flow::NullableSelect;
+    if (nullable_select () != 17u32 || nullable_select (unused) != 18u32 ||
+        nullable_select (23u32) != 23u32) return 0u32;
     return maybe () + maybe (3u32) + list () + list (4u32) +
            list (2u32, 5u32) + list_one (8u32) + repeat (a a) +
            repeat_zero () + repeat_zero (a a) +
@@ -729,6 +747,89 @@ typedef u32 ShadowName;
 }
 syntax flow::Width;
 global uptr syntax_width = width ();
+
+namespace raw_splice {
+    [[syntax_expander]] static $::meta::tokens inspect(in $::meta::syntax_match input) {
+        $::meta::syntax group = $::syntax::node(input, "body");
+        $::meta::syntax value = $::meta::child(group, 1uptr);
+        $::static_assert($::meta::is_production(value, "assignment_expression"), "raw splice root");
+        $::static_assert($::meta::child_count(group) == 5uptr, "raw splice child count");
+        $::meta::tokens captured = $::meta::children($::syntax::capture(input, "body"));
+        $::static_assert($::meta::is_kind($::meta::slice(captured, 0uptr, 1uptr), "splice"), "primitive capture boundary");
+        $::meta::syntax replacement = $::meta::parse("expr", $::quote { 11u32 + 2u32 }, $::syntax::context(value));
+        $::meta::syntax edited = $::meta::replace_child(group, 1uptr, replacement);
+        $::meta::tokens flat = $::meta::children($::meta::tokens(group));
+        return $::quote {
+            $::unquote(value) * 3u32 + ($::unquote(flat)) +
+            $::unquote($::meta::child(edited, 1uptr)) * 2u32
+        };
+    }
+    syntax Inspect : expression { prefix "inspect_group"; match body:block; expand inspect; }
+    syntax Inspect;
+    [[syntax_expander]] static $::meta::tokens relay(in $::meta::syntax_match input) {
+        return $::quote { inspect_group $::unquote($::syntax::node(input, "body")) };
+    }
+    syntax Relay : expression { prefix "relay_group"; match body:block; expand relay; }
+    syntax Relay;
+    [[syntax_expander]] static $::meta::tokens forward(in $::meta::syntax_match input) {
+        return $::quote { relay_group { $::unquote($::syntax::node(input, "value")) * 3u32 } };
+    }
+    syntax Forward : expression { prefix "through_group"; match "(" value:expr ")"; expand forward; }
+    [[syntax_expander]] static $::meta::tokens discard(in $::meta::syntax_match input) {
+        $::meta::syntax group = $::syntax::node(input, "body");
+        $::static_assert(!$::meta::is_kind($::meta::child(group, 1uptr), "token"), "opaque splice became a marker");
+        return $::quote { 1u32 };
+    }
+    syntax Discard : expression { prefix "discard_group"; match body:block; expand discard; }
+    syntax Discard;
+    [[syntax_expander]] static $::meta::tokens relay_discard(in $::meta::syntax_match input) {
+        return $::quote { discard_group $::unquote($::syntax::node(input, "body")) };
+    }
+    syntax RelayDiscard : expression { prefix "relay_discard"; match body:block; expand relay_discard; }
+    syntax RelayDiscard;
+    [[syntax_expander]] static $::meta::tokens hold(in $::meta::syntax_match input) {
+        return $::quote { relay_discard { $::unquote($::syntax::node(input, "value")) } };
+    }
+    syntax Hold : expression { prefix "hold_group"; match "(" value:expr ")"; expand hold; }
+    [[syntax_expander]] static $::meta::tokens sum_groups(in $::meta::syntax_match input) {
+        return $::quote {
+            ($::unquote($::meta::children($::syntax::capture(input, "round")))) +
+            ($::unquote($::meta::children($::syntax::capture(input, "square")))) +
+            ($::unquote($::meta::children($::syntax::capture(input, "braces")))) +
+            ($::unquote($::meta::children($::syntax::capture(input, "attributes"))))
+        };
+    }
+    syntax SumGroups : expression {
+        prefix "sum_groups";
+        match round:paren square:bracket braces:block attributes:group;
+        expand sum_groups;
+    }
+    syntax SumGroups;
+    [[syntax_expander]] static $::meta::tokens relay_all(in $::meta::syntax_match input) {
+        return $::quote {
+            sum_groups $::unquote($::syntax::node(input, "round"))
+                $::unquote($::syntax::node(input, "square"))
+                $::unquote($::syntax::node(input, "braces"))
+                $::unquote($::syntax::node(input, "attributes"))
+        };
+    }
+    syntax RelayAll : expression {
+        prefix "relay_all";
+        match round:paren square:bracket braces:block attributes:group;
+        expand relay_all;
+    }
+}
+[[noinline]] static u32 raw_splice_value(in u32 value) {
+    syntax raw_splice::Forward, raw_splice::Hold, raw_splice::RelayAll;
+    if (hold_group(unknown_discarded_macro! { not source; }) != 1u32) return 0u32;
+    if (hold_group(unknown_discarded_macro! { not source; } + 1u32) != 1u32) return 0u32;
+    if (relay_all (value) [2u32] {3u32} [[4u32]] != value + 9u32) return 0u32;
+    return through_group(value + 1u32);
+}
+
+#include "syntax_cycles.x"
+
+[[noinline]] static uptr eof_value(in uptr value);
 #ifdef CUSTOM_SYNTAX_ABI
 [[abi(HOST_ABI)]]
 #endif
@@ -751,6 +852,8 @@ global u32 syntax_raw_entry() {
     if (primitives() != 26u32) return 0u32;
     if (macro_statements() != 10u32) return 0u32;
     if (raw_groups() != 14u32) return 0u32;
+    if (raw_splice_value(4u32) != 48u32) return 0u32;
+    if (ContextCycleProgress::run(5u32) != 47u32) return 0u32;
     if (angle_boundary() != 9u32) return 0u32;
     if (combinators() != 50u32) return 0u32;
     if (recursive_rules() != 27u32) return 0u32;
@@ -778,7 +881,27 @@ global u32 syntax_raw_entry() {
         parsed_array[0] != 5u32 || parsed_array[1] != 0u32 || parsed_array[2] != 7u32 ||
         header_function(4u32) != 6u32 || parsed_statements(0u32) != 12u32 ||
         parsed_statements(1u32) != 10u32) return 0u32;
-    if (syntax_width != sizeof(uptr)) return 0u32;
+    if (syntax_width != sizeof(uptr) || eof_value(3uptr) != sizeof(uptr) + 3uptr) return 0u32;
 #endif
     return 61u32;
 }
+
+[[syntax_expander]] static $::meta::tokens emit_at_eof(in $::meta::syntax_match input) {
+    $::meta::syntax_match branch = $::syntax::at(input, "branch", 0uptr);
+    if (!$::syntax::is_variant(branch, "empty"))
+        return $::quote { $::static_assert(0u32, "EOF choice lost its empty variant"); };
+    $::meta::syntax_match child = $::syntax::at(branch, "child", 0uptr);
+    if ($::syntax::count(child, "part") != 0uptr)
+        return $::quote { $::static_assert(0u32, "EOF rule was not empty"); };
+    return $::quote {
+        [[noinline]] static uptr eof_value(in uptr value) { return value + sizeof(uptr); }
+    };
+}
+syntax EmptyAtEnd : rule { match part:optional("unused"); }
+syntax EmitAtEnd : item {
+    prefix "emit_at_end";
+    match branch:choice(empty:(child:rule(EmptyAtEnd)) | required:(value:literal));
+    expand emit_at_eof;
+}
+syntax EmitAtEnd;
+emit_at_end

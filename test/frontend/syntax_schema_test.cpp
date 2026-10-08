@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frontend/parser.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -19,14 +20,72 @@ struct SyntaxParseEnvironmentTestAccess {
         environment.aliases.emplace(std::move(name),
             std::make_shared<const AliasDefinition>(type, 224));
     }
+    static void function(SyntaxParseEnvironment& environment, std::string name) {
+        auto table = environment.ordinary_values
+            ? std::make_shared<decltype(environment.ordinary_values)::element_type>(*environment.ordinary_values)
+            : std::make_shared<decltype(environment.ordinary_values)::element_type>();
+        table->storage += 128 + name.size();
+        using Entry = decltype(table->entries)::mapped_type;
+        table->entries.emplace(std::move(name), Entry{decltype(Entry::kind)::Function, {}});
+        environment.ordinary_values = std::move(table);
+    }
+    static void generic(SyntaxParseEnvironment& environment, bool value, ValueBinding binding = {}) {
+        environment.functions["generic"] = {{value ? ValuePlacementIdentity::GenericParameterKind::Value
+            : ValuePlacementIdentity::GenericParameterKind::Type}, std::move(binding)};
+    }
+    static void record(SyntaxParseEnvironment& environment, bool complete) {
+        environment.records["Record"] = {false, complete};
+    }
+    static void enumeration(SyntaxParseEnvironment& environment, BuiltinType underlying) {
+        environment.enumerations["Enum"] = {underlying, {}};
+    }
+    static void fragment(SyntaxParseEnvironment& environment, std::shared_ptr<const FragmentNamespaceLookup> lookup) {
+        environment.fragment_context = std::move(lookup);
+    }
 };
 } // namespace cross
 
 namespace {
 using namespace cross;
 using Node = std::shared_ptr<const SyntaxNode>;
+std::array<bool, static_cast<std::size_t>(SyntaxProduction::Count)> observed_productions{};
+std::size_t replacement_round_trips{};
 void require(bool condition, const char* message) {
     if (!condition) { std::cerr << message << '\n'; std::abort(); }
+}
+void observe_tree(const Node& root) {
+    std::vector<Node> pending{root};
+    while (!pending.empty()) {
+        auto node = std::move(pending.back());
+        pending.pop_back();
+        if (node->kind == SyntaxNode::Kind::Core)
+            observed_productions[static_cast<std::size_t>(node->production)] = true;
+        for (std::size_t index = 0; index < node->children.size(); ++index) {
+            std::string error;
+            auto copied = syntax_replace_child(*node, index, node->children[index], error);
+            if (!copied) {
+                std::cerr << "identity replacement failed for "
+                          << syntax_production_name(node->production) << " child " << index
+                          << ": " << error << '\n';
+                std::abort();
+            }
+            require(copied.get() != node.get() && copied->children == node->children &&
+                    copied->kind == node->kind && copied->production == node->production &&
+                    copied->context == node->context,
+                    "identity replacement changed public children, production or context");
+            const auto before = syntax_node_tokens(*node);
+            const auto after = syntax_node_tokens(*copied);
+            require(before.size() == after.size(), "identity replacement changed token count");
+            for (std::size_t at = 0; at < before.size(); ++at)
+                require(before[at].kind == after[at].kind && before[at].text == after[at].text &&
+                        before[at].origin.identity == after[at].origin.identity &&
+                        before[at].origin.span.file == after[at].origin.span.file &&
+                        before[at].origin.span.offset == after[at].origin.span.offset,
+                        "identity replacement changed token spelling, kind, identity or span");
+            ++replacement_round_trips;
+            pending.push_back(node->children[index]);
+        }
+    }
 }
 Node production(Node node, SyntaxProduction expected, std::size_t children) {
     if (!node || node->kind != SyntaxNode::Kind::Core || node->production != expected) {
@@ -39,6 +98,7 @@ Node production(Node node, SyntaxProduction expected, std::size_t children) {
                   << " children, found " << node->children.size() << '\n';
         std::abort();
     }
+    observe_tree(node);
     return node;
 }
 void token(Node node, std::string_view spelling) {
@@ -66,6 +126,53 @@ Node descendant(Node node, SyntaxProduction expected) {
 }
 
 int main() {
+    {
+        SyntaxParseEnvironment original, independent;
+        auto same = original;
+        require(syntax_environment_same_lookup(original, same), "identical namespace refinement changed lexical identity");
+        require(!syntax_environment_same_lookup(original, independent), "independent empty snapshots were merged");
+        auto alias = original;
+        SyntaxParseEnvironmentTestAccess::alias(alias, "T", builtin_type(BuiltinType::U32));
+        require(!syntax_environment_same_lookup(original, alias), "new alias did not change lookup state");
+        auto different_alias = original;
+        SyntaxParseEnvironmentTestAccess::alias(different_alias, "T", builtin_type(BuiltinType::U32));
+        require(!syntax_environment_same_lookup(alias, different_alias), "same-layout private alias bindings were merged");
+        auto ordinary = original;
+        SyntaxParseEnvironmentTestAccess::function(ordinary, "owner");
+        require(!syntax_environment_same_lookup(original, ordinary), "ordinary namespace classifier change was ignored");
+        auto generic = original;
+        SyntaxParseEnvironmentTestAccess::generic(generic, false);
+        auto value_generic = generic;
+        SyntaxParseEnvironmentTestAccess::generic(value_generic, true);
+        require(!syntax_environment_same_lookup(generic, value_generic), "generic parameter kinds were merged");
+        auto private_generic = generic;
+        ValueBinding binding;
+        binding.kind = ValueBinding::Kind::Function;
+        binding.placement = std::make_shared<ValuePlacementIdentity>();
+        SyntaxParseEnvironmentTestAccess::generic(private_generic, false, binding);
+        require(!syntax_environment_same_lookup(generic, private_generic), "private function placements were merged");
+        auto record = original;
+        SyntaxParseEnvironmentTestAccess::record(record, false);
+        auto complete = record;
+        SyntaxParseEnvironmentTestAccess::record(complete, true);
+        require(!syntax_environment_same_lookup(record, complete), "record completeness change was ignored");
+        auto enumeration = original;
+        SyntaxParseEnvironmentTestAccess::enumeration(enumeration, BuiltinType::U32);
+        auto narrow = enumeration;
+        SyntaxParseEnvironmentTestAccess::enumeration(narrow, BuiltinType::U16);
+        require(!syntax_environment_same_lookup(enumeration, narrow), "enum underlying types were merged");
+        auto lookup = std::make_shared<FragmentNamespaceLookup>();
+        lookup->scopes.push_back({std::make_shared<FragmentNamespaceTable>(),
+            std::make_shared<FragmentNamespaceIdentity>(), {}, {}, "ns"});
+        auto fragment = original;
+        SyntaxParseEnvironmentTestAccess::fragment(fragment, lookup);
+        auto copied = fragment;
+        auto copied_lookup = std::make_shared<FragmentNamespaceLookup>(*lookup);
+        SyntaxParseEnvironmentTestAccess::fragment(copied, copied_lookup);
+        require(syntax_environment_same_lookup(fragment, copied), "equivalent fragment views were merged by allocation only");
+        copied_lookup->scopes.front().mark = ExpansionId{1};
+        require(!syntax_environment_same_lookup(fragment, copied), "fragment expansion provenance was ignored");
+    }
     SourceManager sources;
     std::ostringstream messages;
     Diagnostics diagnostics(messages);
@@ -87,16 +194,170 @@ int main() {
         auto projected = syntax_node_tokens(*fragment->node);
         require(projected.size() == fragment->end, "projection omitted source terminals");
         for (std::size_t at = 0; at < projected.size(); ++at) {
+            require(projected[at].origin.value_context_captured,
+                    "public projection lost negative local-lookup provenance");
             require(projected[at].kind == input[at].kind && projected[at].text == input[at].text,
                     "projection changed source terminals");
             require(projected[at].origin.span.line == input[at].location.line &&
                     projected[at].origin.span.column == input[at].location.column,
                     "projection changed source spans");
         }
+        observe_tree(fragment->node);
         return fragment->node;
     };
     using P = SyntaxProduction;
     using K = SyntaxPatternElement::Kind;
+    const auto parse_complete = [&](std::string_view text, K kind) -> Node {
+        auto result = parse(text, kind);
+        const auto* source = sources.add("complete-schema.x", std::string(text));
+        const auto input = Lexer(*source, diagnostics).lex();
+        require(syntax_node_tokens(*result).size() + 1 == input.size(),
+                "schema matrix left source tokens outside its bounded root");
+        return result;
+    };
+    {
+        for (const auto operation : {"&", "*", "+", "-", "~", "!"}) {
+            const auto expression = parse_complete(std::string(operation) + "(u32)value", K::Expr);
+            const auto unary = production(descendant(expression, P::UnaryExpression), P::UnaryExpression, 2);
+            token(unary->children[0], operation);
+            const auto cast = child(unary, 1, P::CastExpression, 4);
+            token(cast->children[0], "(");
+            token(cast->children[2], ")");
+        }
+        const auto plus = descendant(parse_complete("+value", K::Expr), P::UnaryExpression);
+        const auto operand = child(plus, 1, P::CastExpression, 1);
+        std::string error;
+        require(!syntax_replace_child(*plus, 1, operand->children[0], error),
+                "unary operator accepted an unwrapped unary-expression operand");
+        for (const auto operation : {"++", "--", "sizeof "}) {
+            const auto expression = parse_complete(std::string(operation) + "value", K::Expr);
+            const auto unary = production(descendant(expression, P::UnaryExpression), P::UnaryExpression, 2);
+            require(unary->children[1]->production == P::UnaryExpression,
+                    "prefix update/sizeof lost its unary-expression operand");
+            error.clear();
+            require(!syntax_replace_child(*unary, 1, operand, error),
+                    "prefix update/sizeof accepted a cast-expression child");
+        }
+    }
+    {
+        const auto call = parse_complete("((callee))(1u32)", K::Expr);
+        const auto postfix = descendant(call, P::PostfixExpression);
+        const auto grouped = child(postfix, 0, P::PrimaryExpression, 3);
+        token(grouped->children.front(), "(");
+        token(grouped->children.back(), ")");
+        require(descendant(grouped->children[1], P::PrimaryExpression)->children.size() == 3,
+            "callee normalization removed a public parenthesis layer");
+        (void)parse_complete("(callee::<u16, 2u32>)(3u16)", K::Expr);
+    }
+    {
+        auto imported = production(parse_complete("using ns::inner;", K::Declaration), P::UsingDeclaration, 3);
+        token(imported->children[0], "using");
+        child(imported, 1, P::NamespaceName, 3);
+        token(imported->children[2], ";");
+        auto assertion = production(parse_complete("$::static_assert(0u32, \"not executed\");", K::Declaration),
+                                    P::StaticAssertDeclaration, 7);
+        child(assertion, 2, P::ConstantExpression, 1);
+        const auto parse_label = [&](std::string_view text) {
+            auto context = std::make_shared<SyntaxContext>(*assertion->context);
+            auto environment = std::make_shared<SyntaxParseEnvironment>(*context->parse_environment);
+            SyntaxParseEnvironmentTestAccess::function(*environment, "ns::owner");
+            SyntaxParseEnvironmentTestAccess::function(*environment, "owner");
+            context->parse_environment = environment;
+            const auto* source = sources.add("label-schema.x", std::string(text));
+            auto input = Lexer(*source, diagnostics).lex();
+            auto node = Parser::parse_syntax_tokens(SyntaxParseCategory::Declaration, input, context, diagnostics);
+            std::string error;
+            require(node && syntax_validate_node(*node, error), "declared label owner did not produce a valid public tree");
+            require(syntax_node_tokens(*node).size() + 1 == input.size(), "global-label root lost source tokens");
+            return node;
+        };
+        auto label = production(parse_label("global label ns::owner::resume;"),
+                                P::GlobalLabelDeclaration, 4);
+        token(label->children[0], "global");
+        token(label->children[1], "label");
+        auto name = child(label, 2, P::QualifiedLabelName, 3);
+        child(child(name, 0, P::QualifiedFunctionName, 1), 0, P::QualifiedName, 3);
+        token(name->children[1], "::");
+        token(name->children[2], "resume");
+        (void)parse_label("[[link_name(\"start\")]] global label owner::resume [[used]];");
+        require(parse_complete("global label unknown_owner::slot;", K::Declaration)->production == P::Declaration,
+                "unknown function owner was misclassified as a code-label declaration");
+        require(syntax_declaration_node(*imported) && syntax_declaration_node(*assertion) &&
+                syntax_declaration_node(*label), "special declaration roots lost their splice category");
+    }
+
+    {
+        const auto original = parse("identifier", K::Expr);
+        auto input = syntax_node_tokens(*original);
+        require(input.size() == 1, "identifier projection changed token count");
+        input.front().origin.lookup_mode = TokenOrigin::LookupMode::Invocation;
+        SyntaxExecution explicit_parse(sources, diagnostics, 64, {}, {}, {}, {});
+        const auto parsed = explicit_parse.parse_tokens(SyntaxParseCategory::Expression,
+            input, original->context, original->span.first);
+        require(parsed != nullptr, "explicit-context identifier parse failed");
+        const auto output = syntax_node_tokens(*parsed);
+        require(output.size() == 1 &&
+                output.front().origin.lookup_mode == TokenOrigin::LookupMode::Lexical &&
+                output.front().origin.identity == input.front().origin.identity &&
+                output.front().origin.span.file == input.front().origin.span.file &&
+                output.front().origin.span.offset == input.front().origin.span.offset,
+                "explicit-context parse did not reset lookup while preserving token identity/span");
+    }
+
+    {
+        FunctionDecl owner, other_owner;
+        Statement first, second;
+        LabelAddressConstant address{&owner, &first, {}, 1};
+        auto same = address;
+        same.ordinal = 7;
+        require(address == same, "serialization ordinal became private label identity");
+        same.definition = &second;
+        require(!(address == same), "same-spelled private label declarations merged");
+        same = address;
+        same.owner = &other_owner;
+        require(!(address == same), "label constants lost source owner identity");
+    }
+
+    {
+        const auto node = parse("void source() { goto point; point: ; }", K::FunctionDefinition);
+        std::shared_ptr<const FunctionScopeIdentity> scope;
+        TokenIdentity declaration;
+        for (const auto& item : syntax_node_tokens(*node)) {
+            if (item.origin.label_binding.kind != LabelBinding::Kind::Definition) continue;
+            scope = item.origin.label_binding.scope;
+            declaration = item.origin.label_binding.declaration;
+        }
+        require(scope && scope->labels() && scope->labels()->declarations.size() == 1,
+                "completed function did not retain its own label namespace");
+        const auto jump = descendant(node, P::JumpStatement);
+        const auto tokens = syntax_node_tokens(*jump);
+        require(tokens.size() == 3, "unexpected goto token projection");
+        LabelBinding pending;
+        pending.scope = scope;
+        const auto resolved = resolved_label_binding(pending, NameKey("point", tokens[1].origin.span));
+        require(resolved.kind == LabelBinding::Kind::Reference && resolved.declaration == declaration,
+                "forward label dependency did not resolve its original declaration");
+        NameLookupContext context;
+        context.label_binding = pending;
+        context.last_component_location = tokens[1].origin.span;
+        NameUse qualified("destination::point");
+        qualified.context = &context;
+        const auto qualified_binding = resolved_label_binding(qualified);
+        require(qualified_binding == resolved,
+                "qualification discarded a final component's forward label dependency");
+        context.label_binding.kind = LabelBinding::Kind::Definition;
+        context.label_binding.declaration = declaration;
+        require(resolved_label_binding(qualified).kind == LabelBinding::Kind::Definition,
+                "lookup changed a declaration query into an exact use and hid duplicate labels");
+        const auto* fragment = sources.add("label-probe.x", "invented: ;");
+        auto probe = Parser::parse_syntax_tokens(SyntaxParseCategory::Statement,
+            Lexer(*fragment, diagnostics).lex(), jump->context, diagnostics);
+        require(probe && scope->labels()->declarations.size() == 1 &&
+                !scope->labels()->declarations.contains(NameKey("invented")),
+                "statement probe changed a completed function label namespace");
+        require(origin_binding_storage(tokens[1].origin) >= scope->labels()->storage,
+                "retained label namespace escaped token storage accounting");
+    }
 
     {
         const auto node = parse("{ typedef u32 (*Alias)(in u16 *value); Alias object; }", K::Statement);
@@ -131,6 +392,41 @@ int main() {
                 "public-tree storage did not account for a retained typedef type graph");
         require(use->definition->storage() > 128,
                 "retained typedef graph storage omitted its callable and pointer children");
+    }
+
+    {
+        const auto* source = sources.add("deferred-header.x",
+            "static u32 source(parameters!()) { return hold!(value); }");
+        auto region_execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 64,
+            LayoutQuery{}, LayoutQuery{},
+            EvaluationLimits{}, EvaluationLayout{});
+        Parser parser(Lexer(*source, diagnostics).lex(), diagnostics, region_execution, 64);
+        const auto fragment = parser.parse_syntax_fragment(K::FunctionDefinition, 0);
+        require(fragment.has_value(), "deferred header region fixture was not recognized");
+        const auto node = fragment->node;
+        require(node->kind == SyntaxNode::Kind::Deferred,
+                "opaque parameter list did not defer its containing function");
+        const auto projected = syntax_node_tokens(*node);
+        const auto region = projected.front().origin.deferred_parameter_region;
+        require(region && region->first == projected.front().origin.identity,
+                "deferred function lost its source header start");
+        bool found_body = false;
+        for (const auto& item : projected) {
+            require(item.origin.deferred_parameter_region == region,
+                    "deferred function tokens lost their shared header dependency");
+            if (item.text == "{") {
+                found_body = item.origin.identity == region->end;
+                break;
+            }
+        }
+        require(found_body, "deferred header region includes its body");
+        SyntaxNode leaf;
+        leaf.kind = SyntaxNode::Kind::Token;
+        leaf.tokens.push_back(projected.back());
+        const auto retained_storage = syntax_node_storage(leaf);
+        leaf.tokens.front().origin.deferred_parameter_region.reset();
+        require(retained_storage - syntax_node_storage(leaf) == 80,
+                "deferred header region escaped token storage accounting");
     }
 
     {
@@ -289,8 +585,74 @@ int main() {
              "u32 * [[atomic]] const * volatile [[address_space(23)]]",
              "u32 (* const [[address_space(17)]] [3u32])(in u16)",
              "[[address_space(17)]] u32 (* volatile)[3u32]",
+             "[[vector_size(16)]] const u32", "const [[vector_size(16)]] u32",
+             "const u32 [[ext_vector_type(4)]]", "u32 [[vector_size(16)]] const *",
+             "u32 [[ext_vector_type(4)]] (*)[3u32]",
+             "u32 [[ext_vector_type(4)]] (*)(in u32 [[vector_size(16)]])",
+             "[[scalable_vector(4)]] const u32",
+             "[[ext_vector_type(2uptr + 2uptr)]] const u32",
+             "u16 [[vector_size(sizeof(u16) * 8uptr)]] *",
+             "u32 [[scalable_vector(1uptr << 2uptr)]]",
              "$::meta::bytes", "const $::meta::buffer"})
         (void)parse(text, K::Type);
+    auto vector_type_node = production(parse("const u32 [[vector_size(16)]] *", K::Type),
+                                       P::TypeName, 2);
+    // Attribute meaning is not part of lossless syntax recognition. These
+    // balanced forms may be inspected/transformed before ordinary validation.
+    for (const auto text : {
+             "[[vendor::annotation({ [first] })]] const u32 *",
+             "const [[vendor::annotation]] u32 volatile *",
+             "u32 * [[vendor::annotation]] const",
+             "u32 [[atomic(1)]]", "u32 [[atomic, atomic]]",
+             "u32 [[address_space()]] *", "u32 [[address_space(-1)]] *",
+             "u32 [[address_space(7)]]", "restrict u32",
+             "u32 [[ext_vector_type(0)]]", "u32 [[vector_size(3)]]",
+             "bool [[ext_vector_type(4)]]", "u32 [[ext_vector_type(+)]]",
+             "u32 [[ext_vector_type({ [bad] })]]",
+             "u32 [[ext_vector_type(4), ext_vector_type(8)]]",
+             "u32 (*)(in u16) [[vendor::annotation]]",
+             "u32 (*)(in u16) [[abi(1), clobber(), stack_cleanup(7)]]",
+             "struct Declared [[vendor::annotation]] *",
+             "enum E [[underlying(f64)]] { value = 0 }",
+             "enum E [[underlying(u32), underlying(u64)]] { value = 0 }"})
+        (void)parse_complete(text, K::Type);
+    (void)parse_complete("typedef u32 Value [[vendor::annotation]];", K::Declaration);
+    auto vector_specifiers = child(vector_type_node, 0, P::DeclarationSpecifiers, 3);
+    auto vector_attribute = child(child(vector_specifiers, 2, P::DeclarationSpecifier, 1),
+                                  0, P::AttributeSpecifier, 3);
+    auto attribute = child(vector_attribute, 1, P::Attribute, 4);
+    token(child(attribute, 0, P::AttributeName, 1)->children[0], "vector_size");
+    child(attribute, 2, P::BalancedTokenSequence, 1);
+    // Callable layout and attribute spellings are preserved structurally. Tree
+    // inspection does not assume host registers or a shipped ABI name.
+    for (const auto text : {
+             "u32 ()", "u32 (in u16)", "u32 (*)(in u16)",
+             "u32 (*[2u32])(in u16)", "u32 (*(*)(in u8))(in u16)",
+             "u32 (*)(in u16 (*)(in u8), in u32 (*)[3u32])",
+             "u32 (*)(in u16 input \"input.channel\") -> \"result.channel\" [[abi(\"custom\")]]",
+             "u32 (* const [[address_space(17)]] [2u32])(in u16) [[abi(\"custom\")]]",
+             "u32 (*)(in u32 [[atomic]] *, in u16 [[ext_vector_type(4)]], ...)",
+             "struct { u32 (*callback)(in u16) [[abi(\"custom\")]]; u8 bytes[3u32]; } *"})
+        (void)parse_complete(text, K::Type);
+    for (const auto text : {
+             "typedef u32 (*Callback)(in u16 input \"input.channel\") -> \"result.channel\" [[abi(\"custom\"), clobber(\"scratch.channel\")]];",
+             "[[vendor::annotate({ [1u32] (2u32) [[nested]] })]] global u32 value;",
+             "global u32 (*callbacks[2u32])(in u16) [[abi(\"custom\")]];",
+             "global u32 (*factory(in u8))(in u16) [[abi(\"custom\")]];"})
+        (void)parse_complete(text, K::Declaration);
+    for (const auto text : {
+             "global u32 run(in u32 (*)(in u16), in u32 (*)[2u32], ...);",
+             "[[vendor::before(1u32)]] global u32 run(in u16) -> \"result.channel\" [[abi(\"custom\"), vendor::after({ [2u32] })]];",
+             "global u32 (*factory(in u8))(in u16) [[abi(\"custom\")]];"})
+        (void)parse_complete(text, K::FunctionDeclaration);
+    {
+        auto alternate = descendant(parse("u32 [[ext_vector_type(8)]]", K::Type), P::AttributeSpecifier);
+        std::string error;
+        auto owner = vector_specifiers->children[2];
+        auto replaced = syntax_replace_child(*owner, 0, alternate, error);
+        require(replaced && replaced->children[0] == alternate,
+                "vector type attribute replacement lost its exact child");
+    }
     auto leading_qualified = production(parse("[[atomic]] const u32 volatile", K::Type),
                                          P::TypeName, 1);
     auto trailing_qualified = production(parse("const u32 volatile [[atomic]]", K::Type),
@@ -327,6 +689,18 @@ int main() {
         std::string error;
         require(!syntax_replace_child(*primary, 2, primary->children[0], error),
                 "alignof accepted an unstructured operand token");
+    }
+
+    for (const auto operand : {"u32", "struct Tag *", "value", "(value + other)", ""}) {
+        const auto tree = parse(std::string("$::atomic_is_lock_free(") + operand + ")", K::Expr);
+        const auto primary = production(descendant(tree, P::PrimaryExpression), P::PrimaryExpression, 4);
+        token(primary->children[0], "$::atomic_is_lock_free");
+        token(primary->children[1], "(");
+        token(primary->children[3], ")");
+        const auto type_operand = std::string_view(operand) == "u32" ||
+                                  std::string_view(operand) == "struct Tag *";
+        require(primary->children[2]->production == (type_operand ? P::TypeName : P::ArgumentList),
+                "atomic query operand lost its type/expression shape");
     }
 
     for (const auto tag : {"struct", "union"}) {
@@ -566,6 +940,55 @@ int main() {
                 "function definition was accepted in a header-child slot");
         require(diagnostics.errors() == 0, "decorated header diagnostics escaped");
     }
+    // A pending fragment in each sibling completes that sibling's own header
+    // dependency, including expression captures reparsed after generic discovery.
+    // Inspect exact binding identity: equal display names cannot prove hygiene.
+    for (const auto bits : {32u, 64u}) for (const std::string projection : {"", "keep", "project"}) {
+        auto sibling_execution = std::make_shared<SyntaxExecution>(sources, diagnostics, bits,
+            LayoutQuery{}, LayoutQuery{}, EvaluationLimits{}, EvaluationLayout{});
+        const auto* source = sources.add("deferred-sibling-headers.x", std::string(R"cross(
+            typedef u8 T;
+            [[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
+            [[syntax_expander]] static $::meta::tokens capture(in $::meta::syntax_match input) {
+                $::meta::syntax value = $::syntax::node(input, "value");
+                $::static_assert($::meta::is_kind(value, "deferred"), "pending sibling was classified");
+                return $::quote { $::unquote(value) };
+            }
+            syntax Capture : expression { prefix "capture"; match "(" value:expr ")"; expand capture; }
+            syntax Capture;
+            [[syntax_expander]] static $::meta::tokens keep(in $::meta::syntax_match input) {
+                return $::quote { $::unquote($::syntax::node(input, "declaration")) };
+            }
+            [[syntax_expander]] static $::meta::tokens project(in $::meta::syntax_match input) {
+                return $::meta::tokens($::syntax::node(input, "declaration"));
+            }
+            syntax Keep : item { prefix "keep"; match declaration:declaration; expand keep; }
+            syntax Project : item { prefix "project"; match declaration:declaration; expand project; }
+            syntax Keep;
+            syntax Project;
+        )cross") + projection + R"cross( global T first<params!(T)>(in T value),
+                second(in u8 data[1uptr][capture(sizeof(T))]) [[generic(params!(T))]],
+                third(in u8 data[1uptr][capture(sizeof(T))]) [[generic(params!(T))]];
+        )cross");
+        Parser parser(Lexer(*source, diagnostics).lex(), diagnostics, sibling_execution, bits);
+        const auto program = parser.parse();
+        require(diagnostics.errors() == 0 && program.functions.size() == 3,
+                "deferred sibling headers did not parse");
+        for (std::size_t at = 1; at < program.functions.size(); ++at) {
+            const auto& function = *program.functions[at];
+            const auto& array = function.parameters.front().type->pointee;
+            require(array && array->kind == Type::Kind::Array && array->array_bound,
+                    "deferred sibling lost its array bound");
+            const auto* bound = array->array_bound.get();
+            while (bound->kind == Expr::Kind::Parenthesized && bound->left) bound = bound->left.get();
+            require(bound->type && bound->type->kind == Type::Kind::Generic,
+                    "deferred sibling bound did not retain its generic type");
+            require(generic_type_key(*bound->type) == name_key(function.generic_parameters.front()),
+                    "deferred sibling bound borrowed another header's generic binding");
+            require(generic_type_key(*function.return_type) == name_key(function.generic_parameters.front()),
+                    ("prepared sibling shared result borrowed another header's generic binding: " + projection).c_str());
+        }
+    }
     child(definition, 1, P::Declarator, 1);
     child(definition, 3, P::CompoundStatement, 3);
     declaration = production(parse("global u32 fn(in u16 value) -> \"stack.result\" "
@@ -672,12 +1095,101 @@ int main() {
     auto execution = std::make_shared<SyntaxExecution>(sources, diagnostics, 32,
         no_layout, no_layout, EvaluationLimits{}, EvaluationLayout{});
     for (const auto text : {
+             "u32 unknown!{first} = { 1u32 }, second = 2u32;",
+             "struct Record { u32 member; } unknown!(first) = { 1u32 }, second = { 2u32 };",
+             "typedef union Variant [[aligned(8)]] { u32 member; } unknown![First], *Second;",
+             "enum Code [[underlying(u16)]] { unknown!(A = 1u16) } value;",
+             "struct Record { unknown!(u32 member;) };",
+             "u32 (*unknown!(callback))(in u32), other;"}) {
+        const auto* source = sources.add("declaration-boundary-schema.x", std::string(text) + " u32 sentinel;");
+        const auto input = Lexer(*source, diagnostics).lex();
+        const auto end = static_cast<std::size_t>(std::find_if(input.begin(), input.end(),
+            [&](const Token& token) { return token.location.offset >= std::string_view(text).size(); }) - input.begin());
+        Parser parser(input, diagnostics, execution, 32);
+        const auto fragment = parser.parse_syntax_fragment(K::Declaration, 0);
+        require(fragment && fragment->end == end && fragment->node->kind == SyntaxNode::Kind::Deferred,
+                "deferred declaration boundary lost a tag, initializer, macro input or following item");
+        const auto projected = syntax_node_tokens(*fragment->node);
+        require(projected.size() == end, "deferred declaration projection changed its boundary");
+        for (std::size_t at = 0; at < end; ++at)
+            require(projected[at].origin.identity == token_origin(input[at].location).identity,
+                    "deferred declaration boundary changed a token identity");
+        require(diagnostics.errors() == 0, "declaration boundary recognition executed a macro");
+    }
+    for (const auto kind : {K::Declaration, K::Statement}) {
+        for (const auto text : {
+                 "u32 function(unknown!()) { unknown!(); };",
+                 "u32 function(unknown!()) { unknown!(); } u32 sentinel;",
+                 "u32 name!() { unknown!(); } struct Sentinel { u32 member; };",
+                 "unknown!() (*ignored())(in u32) { unknown!(); } u32 sentinel;",
+                 "unknown!() (condition) { unknown!(); };",
+                 "unknown!() + value { unknown!(); } u32 sentinel;"}) {
+            const auto* source = sources.add("invalid-declaration-boundary-schema.x", text);
+            const auto input = Lexer(*source, diagnostics).lex();
+            Parser parser(input, diagnostics, execution, 32);
+            require(!parser.parse_syntax_fragment(kind, 0),
+                    "a deferred declaration/statement swallowed a function body and adjacent source");
+            require(diagnostics.errors() == 0, "failed boundary recognition emitted speculative diagnostics");
+        }
+    }
+    for (const auto text : {
+             "unknown!() + another!{ ignored!(); };",
+             "unknown!() + $::quote { ignored!(); };",
+             "unknown!() [2u32] = { 1u32, 2u32 };",
+             "unknown!() *pointer = $::quote { ignored!(); };"}) {
+        const auto* source = sources.add("opaque-statement-boundary-schema.x", std::string(text) + " u32 sentinel;");
+        const auto input = Lexer(*source, diagnostics).lex();
+        const auto end = static_cast<std::size_t>(std::find_if(input.begin(), input.end(),
+            [&](const Token& token) { return token.location.offset >= std::string_view(text).size(); }) - input.begin());
+        Parser parser(input, diagnostics, execution, 32);
+        const auto fragment = parser.parse_syntax_fragment(K::Statement, 0);
+        require(fragment && fragment->end == end && fragment->node->kind == SyntaxNode::Kind::Deferred,
+                "opaque-led statement lost a macro, quotation or initializer group");
+        const auto projected = syntax_node_tokens(*fragment->node);
+        require(projected.size() == end, "opaque-led statement projection changed its boundary");
+        for (std::size_t at = 0; at < end; ++at)
+            require(projected[at].origin.identity == token_origin(input[at].location).identity,
+                    "opaque-led statement boundary changed a token identity");
+        require(diagnostics.errors() == 0, "opaque-led statement recognition executed nested code");
+    }
+    for (const auto text : {
+             "static T prototype(in T value) [[generic(unknown!(T))]];",
+             "static T ((prototype<unknown!(T)>))(in T value);",
+             "static T (*prototype(in T value))(unknown!()) [[generic(unknown!(T))]];"}) {
+        const auto* source = sources.add("prototype-schema.x", std::string(text) + " global u32 sentinel;");
+        const auto input = Lexer(*source, diagnostics).lex();
+        const auto end = static_cast<std::size_t>(std::find_if(input.begin(), input.end(),
+            [](const Token& token) { return token.is(";"); }) - input.begin()) + 1;
+        for (const auto kind : {K::Declaration, K::FunctionDeclaration}) {
+            Parser parser(input, diagnostics, execution, 32);
+            const auto fragment = parser.parse_syntax_fragment(kind, 0);
+            require(fragment && fragment->end == end,
+                    "deferred prototype classification consumed the next declaration");
+            require(fragment->node->kind == SyntaxNode::Kind::Deferred &&
+                    fragment->node->deferred_category == SyntaxParseCategory::FunctionDeclaration &&
+                    fragment->node->slot_production == P::Declaration && fragment->node->children.empty(),
+                    "deferred prototype lost its direct-function proof or public root");
+            const auto projected = syntax_node_tokens(*fragment->node);
+            require(projected.size() == end, "deferred prototype lost its semicolon");
+            for (std::size_t at = 0; at < end; ++at)
+                require(projected[at].kind == input[at].kind && projected[at].text == input[at].text &&
+                        projected[at].origin.identity == token_origin(input[at].location).identity,
+                        "prototype classification changed source tokens or identity");
+            std::string error;
+            require(syntax_validate_node(*fragment->node, error), "invalid deferred prototype tree");
+            require(diagnostics.errors() == 0, "prototype recognition executed opaque input");
+        }
+    }
+    for (const auto text : {
              "{ future!{}; NewType item = 3u32; }",
              "{ future!{}; return (NewType)3u32; }",
              "{ future!{}; return introduced<u32>(3u32); }",
              "{ future!{}; for (NewType item = 0u32; ; ) {} }",
              "{ future!{}; struct Introduced value; }",
              "{ future!{}; enum Introduced value; }",
+             "{ future!{} = 3u32, second = local + 1u32; total += second; }",
+             "{ future!{} + 3u32; }",
+             "{ future!{} [2u32] = { 1u32, 2u32 }; }",
              "{ old::<nested::<3u32>>; future!{}; NewType item; }"}) {
         const auto* source = sources.add("deferred-schema.x", text);
         auto input = Lexer(*source, diagnostics).lex();
@@ -710,7 +1222,27 @@ int main() {
         require(!syntax_validate_node(*replacement, error), "incompatible deferred category was accepted");
         replacement->deferred_category = SyntaxParseCategory::Statement;
         replacement->tokens.pop_back();
-        require(!syntax_validate_node(*replacement, error), "unbounded deferred input was accepted");
+        require(!syntax_validate_node(*replacement, error) &&
+                error == "deferred syntax input has an unterminated delimiter group",
+                "unbounded deferred input lost its delimiter diagnostic");
+        replacement = std::make_shared<SyntaxNode>(*deferred);
+        replacement->tokens.back().text = "]";
+        require(!syntax_validate_node(*replacement, error) &&
+                error == "deferred syntax input has an unmatched delimiter",
+                "mismatched deferred input lost its delimiter diagnostic");
+        replacement->tokens.back().kind = TokenKind::End;
+        require(!syntax_validate_node(*replacement, error) &&
+                error == "deferred syntax input contains an invalid or boundary token",
+                "deferred input admitted a boundary token");
+        replacement = std::make_shared<SyntaxNode>(*deferred);
+        replacement->tokens.resize(1);
+        replacement->tokens.front().kind = TokenKind::StructuredSplice;
+        replacement->tokens.front().text = "(";
+        const auto retained = parse(";", K::Statement);
+        replacement->tokens.front().splice = retained;
+        require(syntax_validate_node(*replacement, error) &&
+                replacement->tokens.front().splice == retained,
+                "deferred validation reparsed an opaque splice's display text");
         EvaluationLimits validation_limits;
         validation_limits.steps = 2;
         SyntaxTreeValidationError failure;
@@ -720,6 +1252,37 @@ int main() {
         validation_limits.depth = 1;
         require(!syntax_validate_node(*deferred, error, validation_limits, nullptr, &failure) &&
                 failure == SyntaxTreeValidationError::DepthLimit, "deferred payload escaped depth accounting");
+    }
+    for (const auto text : {
+             "future!{} = 3u32, second = local + 1u32;",
+             "future!{} + 3u32;", "future!{} (3u32);",
+             "future!{} [2u32] = { 1u32, 2u32 };", "future!{} *item;",
+             "future!{} .field += 1u32;", "future!{} ->field;", "future!{} ++;",
+             "if (1u32) future!{} + 3u32; else ;",
+             "while (1u32) future!{} += 3u32;",
+             "do future!{} (3u32); while (0u32);",
+             "for (; 0u32; ) future!{} [0u32] = 1u32;",
+             "global label exported: future!{} + 3u32;"}) {
+        const auto* source = sources.add("deferred-statement-head.x", text);
+        auto input = Lexer(*source, diagnostics).lex();
+        Parser deferred_parser(input, diagnostics, execution, 32);
+        const auto fragment = deferred_parser.parse_syntax_fragment(K::Statement, 0);
+        require(fragment && fragment->end == input.size() - 1,
+                "statement-leading macro continuation lost its complete boundary");
+        const auto& node = fragment->node;
+        require(node->kind == SyntaxNode::Kind::Deferred && node->children.empty() &&
+                node->deferred_category == SyntaxParseCategory::Statement &&
+                node->slot_production == P::Statement && node->context,
+                "statement-leading macro continuation was classified prematurely");
+        const auto projected = syntax_node_tokens(*node);
+        require(projected.size() == input.size() - 1,
+                "deferred statement continuation lost source tokens");
+        for (std::size_t at = 0; at < projected.size(); ++at)
+            require(projected[at].kind == input[at].kind && projected[at].text == input[at].text &&
+                    projected[at].origin.identity == token_origin(input[at].location).identity,
+                    "deferred statement continuation changed lexical identity");
+        std::string error;
+        require(syntax_validate_node(*node, error), "deferred statement continuation has invalid shape");
     }
     for (const auto text : {
              "{ future!{}; return 3u32; }",
@@ -771,11 +1334,23 @@ int main() {
             "syntax Type, Expr, Stmt;");
         auto input = Lexer(*source, diagnostics).lex();
         std::vector<std::pair<std::size_t, SyntaxParseCategory>> cases;
-        const auto add_case = [&](std::string_view text, SyntaxParseCategory category) {
+        const auto add_case = [&](std::string_view text, SyntaxParseCategory category, Node splice = {}) {
             const auto* capture = sources.add("nested-capture-schema.x", std::string(text));
             auto tokens = Lexer(*capture, diagnostics).lex();
+            if (splice) for (auto& token : tokens) if (token.is("retained")) {
+                token.kind = TokenKind::StructuredSplice;
+                token.splice = splice;
+            }
             cases.emplace_back(input.size(), category);
             input.insert(input.end(), tokens.begin(), tokens.end());
+        };
+        const auto retained = [&](std::string_view text, K category) {
+            const auto* retained_source = sources.add("retained-deferred-boundary.x", std::string(text));
+            auto tokens = Lexer(*retained_source, diagnostics).lex();
+            Parser parser(tokens, diagnostics, execution, 32);
+            const auto fragment = parser.parse_syntax_fragment(category, 0);
+            require(fragment && fragment->end + 1 == tokens.size(), "retained boundary fixture failed to parse");
+            return fragment->node;
         };
         using C = SyntaxParseCategory;
         add_case("{ future!{}; with_type NewType *; }", C::Type);
@@ -789,7 +1364,35 @@ int main() {
         add_case("{ future!{}; with_stmt while ((NewType)1u32) NewType item; }", C::Statement);
         add_case("{ future!{}; with_stmt do NewType item; while ((NewType)1u32); }", C::Statement);
         add_case("{ future!{}; with_stmt label tagged: NewType item; }", C::Statement);
+        add_case("{ future!{}; with_stmt global label tagged: if ((NewType)1u32) ; else ; }", C::Statement);
+        add_case("{ future!{}; with_stmt global label tagged: while ((NewType)1u32) ; }", C::Statement);
+        add_case("{ future!{}; with_stmt [[vendor::hint]] global label tagged: return (NewType)1u32; }", C::Statement);
+        add_case("{ future!{}; with_stmt default: if ((NewType)1u32) ; else ; }", C::Statement);
+        add_case("{ future!{}; with_stmt case (NewType)1u32: do ; while (0u32); }", C::Statement);
         add_case("{ future!{}; with_stmt switch ((NewType)1u32) {} }", C::Statement);
+        const auto retained_statement = retained("if (inner) ;", K::Statement);
+        for (const auto text : {
+                 "{ future!{}; with_stmt if ((NewType)1u32) retained else ; }",
+                 "{ future!{}; with_stmt while ((NewType)1u32) retained }",
+                 "{ future!{}; with_stmt do if ((NewType)1u32) ; else retained while (0u32); }",
+                 "{ future!{}; with_stmt for (NewType i = 0u32; ; ) retained }",
+                 "{ future!{}; with_stmt global label tagged: if ((NewType)1u32) retained else ; }",
+                 "{ future!{}; with_stmt case (NewType)1u32: retained }"})
+            add_case(text, C::Statement, retained_statement);
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained else ; }", C::Statement,
+                 retained("u32 local;", K::Declaration));
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained else ; }", C::Statement,
+                 retained("u32 local suffix!();", K::Declaration));
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained; else ; }", C::Statement,
+                 retained("1u32", K::Expr));
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained else ; }", C::None,
+                 retained("1u32", K::Expr));
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained else ; }", C::None,
+                 retained("global u32 object;", K::Declaration));
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained else ; }", C::None,
+                 retained("using Imported;", K::Declaration));
+        add_case("{ future!{}; with_stmt if ((NewType)1u32) retained else ; }", C::None,
+                 retained("u32 function()", K::FunctionHeader));
         add_case("{ future!{}; with_expr introduced<NewType, u32>(3u32); }", C::None);
         add_case("{ future!{}; with_stmt if (1u32) NewType item else second; }", C::None);
         Parser nested_parser(input, diagnostics, execution, 32);
@@ -819,10 +1422,21 @@ int main() {
             std::string error;
             require(syntax_validate_node(*value, error), "nested deferred node failed validation");
             const auto projected = syntax_node_tokens(*fragment->node);
-            require(projected.size() == fragment->end - first, "nested deferred projection changed its boundary");
+            TokenSequence expected;
+            for (auto at = first; at < fragment->end; ++at) {
+                if (input[at].splice) {
+                    require(std::any_of(value->tokens.begin(), value->tokens.end(), [&](const MetaToken& token) {
+                        return token.splice == input[at].splice;
+                    }), "deferred statement lost a retained splice identity");
+                    const auto flattened = syntax_node_tokens(*input[at].splice);
+                    expected.insert(expected.end(), flattened.begin(), flattened.end());
+                } else expected.emplace_back(input[at]);
+            }
+            require(projected.size() == expected.size(), "nested deferred projection changed its boundary");
             for (std::size_t at = 0; at < projected.size(); ++at)
-                require(projected[at].kind == input[first + at].kind &&
-                        projected[at].text == input[first + at].text, "nested deferred projection changed a token");
+                require(projected[at].kind == expected[at].kind && projected[at].text == expected[at].text &&
+                        projected[at].origin.identity == expected[at].origin.identity,
+                        "nested deferred projection changed a token or its identity");
         }
     }
     for (unsigned depth = 1; depth <= 4; ++depth) {
@@ -899,11 +1513,39 @@ int main() {
         };
         production(complete("identity<Word>(3u32)", "expr"), P::AssignmentExpression, 1);
         production(complete("{ Word value = 3u32; }", "stmt"), P::Statement, 1);
+        for (const auto statement_text : {"case 1u32: ;", "default: ;",
+                 "switch (0u32) { default: ; default: ; }",
+                 "{ case 1u32: ; default: ; }"})
+            production(complete(statement_text, "stmt"), P::Statement, 1);
+        for (const auto statement_text : {"u8 bytes[];", "static u8 bytes[];",
+                 "u32 values[] = 1u32;", "u8 bytes[] = unknown!();",
+                 "for (u8 bytes[]; ; ) ;"})
+            production(complete(statement_text, "stmt"), P::Statement, 1);
+        production(complete("static u8 bytes[];", "declaration"), P::Declaration, 3);
+        for (const auto statement_text : {
+                 "[[unknown_local_attribute]] u32 value;",
+                 "[[library::annotation(must_not_execute!())]] u32 value;",
+                 "[[used]] u32 value;",
+                 "[[unknown_return_attribute]] return;",
+                 "[[musttail(1u32), musttail]] return unknown();",
+                 "[[cold]] if (0u32) ;"})
+            production(complete(statement_text, "stmt"), P::Statement, 2);
         production(complete("Word (*)(in Word value) -> \"arbitrary.result\" [[abi(\"custom\")]]", "type"),
                    P::TypeName, 2);
         production(complete("Word value = 3u32;", "declaration"), P::Declaration, 3);
         production(complete("static Word fn(in Word value) -> \"stack.result\"", "function_header"),
                    P::FunctionHeader, 2);
+        const auto callable_header = production(complete(
+            "static Word (*factory(in Word value) [[noinline, abi(\"factory\")]])"
+            "(in Word argument) [[abi(\"callback\")]]", "function_header"), P::FunctionHeader, 2);
+        const auto factory_suffix = descendant(callable_header, P::FunctionSuffix);
+        const auto factory_attributes = descendant(factory_suffix, P::AttributeSpecifier);
+        const auto factory_attribute_tokens = syntax_node_tokens(*factory_attributes);
+        require(factory_attribute_tokens.size() == 8 && factory_attribute_tokens[1].text == "noinline" &&
+                factory_attribute_tokens[5].text == "\"factory\"",
+                "grouped callable attributes did not stay under their written suffix");
+        production(complete("static T (*factory(in T value) [[generic(T)]])(in T argument)",
+                            "function_header"), P::FunctionHeader, 2);
         production(complete("static Word fn(in Word value) -> \"memory.result\";", "function_decl"),
                    P::Declaration, 3);
         production(complete("static Word fn(in Word value) { return value; }", "function_def"),
@@ -929,6 +1571,45 @@ int main() {
                 "public nodes did not preserve their lexical alias scopes");
         require(syntax_node_storage(*scoped) > syntax_node_count(*scoped) * 128,
                 "public tree storage omitted context snapshots");
+        const auto retained_parse = [&](const Node& node, SyntaxParseCategory category,
+                                         const std::shared_ptr<const SyntaxContext>& context,
+                                         bool compound = false) {
+            const auto* source = sources.add("retained-declaration-context.x", compound ? "{ marker }" : "marker");
+            auto tokens = Lexer(*source, diagnostics).lex();
+            auto& marker = tokens[compound ? 1 : 0];
+            marker.kind = TokenKind::StructuredSplice;
+            marker.splice = node;
+            return Parser::parse_syntax_tokens(category, std::move(tokens), context, diagnostics);
+        };
+        for (const auto storage : {"register", "stack"}) {
+            const auto declaration_text = std::string(storage) + " Local local;";
+            const auto local = saved_parse(declaration_text, SyntaxParseCategory::Declaration, outer_context);
+            require(local && !saved_parse(declaration_text, SyntaxParseCategory::Declaration, saved_context),
+                    "block-only raw declaration ignored its context");
+            require(retained_parse(local, SyntaxParseCategory::Declaration, outer_context) == local,
+                    "same-block reparse changed a retained declaration's identity");
+            require(!retained_parse(local, SyntaxParseCategory::Declaration, saved_context),
+                    "retained block-only declaration was accepted at file scope");
+        }
+        for (const auto declaration_text : {"global Word value;", "inline Word function();"}) {
+            const auto external = saved_parse(declaration_text, SyntaxParseCategory::Declaration, saved_context);
+            require(external && !saved_parse(declaration_text, SyntaxParseCategory::Declaration, outer_context),
+                    "file-only raw declaration ignored its context");
+            require(retained_parse(external, SyntaxParseCategory::Declaration, saved_context) == external,
+                    "same-file reparse changed a retained declaration's identity");
+            require(!retained_parse(external, SyntaxParseCategory::Declaration, outer_context) &&
+                    !retained_parse(external, SyntaxParseCategory::Statement, outer_context) &&
+                    !retained_parse(external, SyntaxParseCategory::Statement, saved_context, true),
+                    "retained file-only declaration bypassed block grammar");
+        }
+        for (const auto declaration_text : {"Local value;", "static Local value;", "typedef Local Copied;",
+                                  "Local value = trap ();"}) {
+            const auto local = saved_parse(declaration_text, SyntaxParseCategory::Declaration, outer_context);
+            require(local && retained_parse(local, SyntaxParseCategory::Declaration, saved_context) == local,
+                    "declaration placement replaced captured alias lookup or executed a nested expansion");
+        }
+        require(!saved_parse("Copied", SyntaxParseCategory::Type, saved_context),
+                "retained declaration inspection published a destination alias");
         auto early_trap = saved_parse("trap ()", SyntaxParseCategory::Expression, early_context);
         auto saved_trap = saved_parse("trap ()", SyntaxParseCategory::Expression, saved_context);
         const auto has_extension = [](Node node) {
@@ -946,6 +1627,7 @@ int main() {
                  {"", "expr"}, {"1u32, 2u32", "expr"}, {"1u32;", "expr"},
                  {"Word;", "type"}, {"Word value", "type"}, {"Temporary", "type"},
                  {"; ;", "stmt"}, {"if (1u32) ; else ; ;", "stmt"},
+                 {"case : ;", "stmt"}, {"default ;", "stmt"},
                  {"syntax Trap;", "stmt"}, {"namespace ns {}", "declaration"},
                  {"Word first; Word second;", "declaration"}, {"Word fn();", "function_header"},
                  {"Word fn() {}", "function_header"}, {"Word fn() {}", "function_decl"},
@@ -956,6 +1638,57 @@ int main() {
                 "rejected registration damaged existing syntax activation");
         require(!owner.parse_syntax_tokens(SyntaxParseCategory::None, input),
                 "empty parse category was accepted");
+        {
+            const auto inner = complete("if (inner) ;", "stmt");
+            const auto* boundary_source = sources.add("nested-statement-boundary.x", "if (outer) marker else ;");
+            auto tokens = Lexer(*boundary_source, diagnostics).lex();
+            tokens[4].kind = TokenKind::StructuredSplice;
+            tokens[4].splice = inner;
+            const auto nested = Parser::parse_syntax_tokens(SyntaxParseCategory::Statement,
+                tokens, saved_context, diagnostics);
+            require(nested != nullptr, "nested statement splice was not recognized");
+            const auto selection = descendant(nested, P::SelectionStatement);
+            require(selection->children[4] == inner && selection->splice_children == std::vector<std::size_t>{4},
+                    "nested statement boundary changed the public child identity");
+            const auto fragments = syntax_node_fragments(*nested);
+            require(fragments.size() == 7 && fragments[4].kind == TokenKind::StructuredSplice &&
+                    fragments[4].splice == inner && fragments[5].text == "else",
+                    "ordinary materialization flattened a retained statement child");
+            require(syntax_node_tokens(*nested).size() == 11,
+                    "explicit statement projection did not flatten the child");
+            std::string error;
+            const auto replacement = complete("if (other) ;", "stmt");
+            const auto changed = syntax_replace_child(*selection, 4, replacement, error);
+            require(changed && changed->splice_children == selection->splice_children &&
+                    syntax_node_fragments(*changed)[4].splice == replacement && selection->children[4] == inner,
+                    "replacing a structured child lost its boundary or mutated the parent");
+            auto invalid = *selection;
+            invalid.splice_children = {4, 4};
+            require(!syntax_validate_node(invalid, error), "duplicate private child boundaries were accepted");
+            invalid.splice_children = {selection->children.size()};
+            require(!syntax_validate_node(invalid, error), "out-of-range private child boundary was accepted");
+            invalid.splice_children = {0};
+            require(!syntax_validate_node(invalid, error), "terminal was accepted as a structured statement boundary");
+            invalid.splice_children.clear();
+            require(syntax_node_storage(*selection) == syntax_node_storage(invalid) + 8,
+                    "structured child boundary was not charged to logical storage");
+            const auto ordinary = complete("if (outer) ; else ;", "stmt");
+            const auto ordinary_selection = descendant(ordinary, P::SelectionStatement);
+            require(ordinary_selection->splice_children.empty(), "written statement unexpectedly has a splice edge");
+            const auto newly_bounded = syntax_replace_child(*ordinary_selection, 4, inner, error);
+            require(newly_bounded && newly_bounded->splice_children == std::vector<std::size_t>{4} &&
+                    syntax_node_fragments(*newly_bounded)[4].splice == inner,
+                    "replacing a written statement failed to introduce its structured boundary");
+            const auto jump = complete("return;", "stmt")->children[0];
+            const auto declaration_statement = complete("u32 local;", "stmt")->children[0];
+            const auto declaration_variant = syntax_replace_child(*jump, 0, declaration_statement->children[0], error);
+            require(declaration_variant && declaration_variant->splice_children == std::vector<std::size_t>{0},
+                    "declaration alternative replacement did not retain its structured child");
+            const auto restored_jump = syntax_replace_child(*declaration_variant, 0, jump->children[0], error);
+            require(restored_jump && restored_jump->splice_children.empty() &&
+                    syntax_node_fragments(*restored_jump).size() == 2,
+                    "stale declaration boundary rejected a valid non-splice grammar alternative");
+        }
         auto missing_end = Lexer(*source, diagnostics).lex();
         missing_end.pop_back();
         require(!owner.parse_syntax_tokens(SyntaxParseCategory::Statement, missing_end),
@@ -1014,6 +1747,28 @@ int main() {
     auto right_expression = production(parse("7u32 * 4u32", K::Expr),
                                        P::AssignmentExpression, 1);
     std::string replacement_error;
+    {
+        const auto assignment = parse("left = right", K::Expr);
+        const auto operation = descendant(assignment, P::AssignmentOperator);
+        const auto name = descendant(parse("source::value", K::Expr), P::QualifiedName);
+        require(!syntax_expression_node(*operation),
+                "assignment operator was classified as a complete expression");
+        require(syntax_expression_node(*name),
+                "qualified name was not classified as a complete expression");
+        SyntaxNode wrapper;
+        wrapper.kind = SyntaxNode::Kind::Core;
+        wrapper.production = P::PrimaryExpression;
+        wrapper.structured_splice = true;
+        wrapper.children = {left_expression};
+        wrapper.span = left_expression->span;
+        wrapper.context = left_expression->context;
+        require(!syntax_replace_child(wrapper, 0, operation, replacement_error) &&
+                replacement_error.find("category-compatible") != std::string::npos,
+                "operator-only structural expression replacement was accepted");
+        const auto name_splice = syntax_replace_child(wrapper, 0, name, replacement_error);
+        require(name_splice && name_splice->children.front() == name,
+                "qualified-name expression replacement lost its original child");
+    }
     auto replaced = syntax_replace_child(*left_expression, 0,
         right_expression->children[0], replacement_error);
     require(replaced && replacement_error.empty(), "compatible syntax child replacement failed");
@@ -1026,6 +1781,70 @@ int main() {
     require(syntax_node_storage(*replaced, 127) > 127 &&
             syntax_node_storage(*replaced, 127) < syntax_node_storage(*replaced),
             "syntax storage traversal did not stop at its exceeded limit");
+    {
+        auto payload = std::make_shared<SyntaxNode>();
+        payload->kind = SyntaxNode::Kind::Token;
+        MetaToken value;
+        value.kind = TokenKind::Identifier;
+        value.text.assign(4096, 'x');
+        payload->tokens.push_back(value);
+        SyntaxNode retained;
+        retained.kind = SyntaxNode::Kind::Deferred;
+        MetaToken marker;
+        marker.kind = TokenKind::StructuredSplice;
+        marker.text = "__cross_syntax_splice";
+        retained.tokens.push_back(marker);
+        const auto wrapper_storage = syntax_node_storage(retained);
+        retained.tokens.front().splice = payload;
+        require(syntax_node_storage(retained) == wrapper_storage + syntax_node_storage(*payload),
+                "public-tree storage omitted a token's retained structured splice");
+        const auto payload_storage = syntax_node_storage(*payload);
+        require(syntax_node_storage(retained, wrapper_storage) > wrapper_storage,
+                "retained structured splice bypassed bounded storage traversal");
+        auto context = std::make_shared<SyntaxContext>();
+        retained.context = payload->context = context;
+        retained.tokens.front().origin.context = context;
+        require(syntax_node_storage(retained) == wrapper_storage + payload_storage +
+                syntax_context_storage(*context),
+                "retained splice counted its shared context more than once");
+        retained.context.reset();
+        retained.tokens.front().origin.context.reset();
+        payload->context.reset();
+
+        auto match = std::make_shared<SyntaxMatchValue>();
+        SyntaxNode extension;
+        extension.kind = SyntaxNode::Kind::Extension;
+        extension.match = match;
+        match->input = {marker};
+        const auto match_storage = syntax_node_storage(extension);
+        match->input.front().splice = payload;
+        require(syntax_node_storage(extension) == match_storage + payload_storage,
+                "match input storage omitted a retained structured splice");
+        match->input.clear();
+        match->fields.emplace_back();
+        match->fields.back().tokens = {marker};
+        const auto field_storage = syntax_node_storage(extension);
+        match->fields.back().tokens.front().splice = payload;
+        require(syntax_node_storage(extension) == field_storage + payload_storage,
+                "match field storage omitted a retained structured splice");
+
+        // Retained splice edges do not recurse through the host stack. Keep
+        // independent owners so test destruction is iterative as well.
+        std::vector<std::shared_ptr<SyntaxNode>> chain{payload};
+        for (unsigned depth = 0; depth < 4096; ++depth) {
+            auto parent = std::make_shared<SyntaxNode>();
+            parent->kind = SyntaxNode::Kind::Deferred;
+            parent->tokens = {marker};
+            parent->tokens.front().splice = chain.back();
+            chain.push_back(std::move(parent));
+        }
+        require(syntax_node_storage(*chain.back()) == 4096 * wrapper_storage + payload_storage,
+                "nested retained splices lost iterative storage accounting");
+        require(syntax_node_storage(*chain.back(), 512) > 512 &&
+                syntax_node_storage(*chain.back(), 512) < 4096 * wrapper_storage,
+                "nested retained splices ignored the early storage cutoff");
+        while (chain.size() > 1) chain.pop_back();
+    }
     require(!syntax_replace_child(*left_expression, 0, right_expression,
                                   replacement_error) &&
             replacement_error.find("grammar production") != std::string::npos,
@@ -1105,6 +1924,59 @@ int main() {
     token(contents->children[3], "$::unquote");
     child(contents, 4, P::BalancedTokenTree, 3);
     token(quote->children[3], "}");
+    {
+        auto source = parse_complete("$::quote { [[custom({ [first] })]] }", K::Expr);
+        auto destination = parse_complete("$::quote { [[other($::unquote(never!()))]] }", K::Expr);
+        const auto source_quote = descendant(source, P::QuoteExpression);
+        const auto destination_quote = descendant(destination, P::QuoteExpression);
+        const auto source_contents = child(source_quote, 2, P::BalancedTokens, 1);
+        const auto destination_contents = child(destination_quote, 2, P::BalancedTokens, 1);
+        const auto group = child(source_contents, 0, P::BalancedTokenTree, 3);
+        const auto replacement = child(destination_contents, 0, P::BalancedTokenTree, 3);
+        token(group->children[0], "[[");
+        token(group->children[2], "]]");
+        const auto content = child(group, 1, P::BalancedTokens, 2);
+        token(content->children[0], "custom");
+        child(content, 1, P::BalancedTokenTree, 3);
+        std::string error;
+        auto changed = syntax_replace_child(*source_contents, 0, replacement, error);
+        require(changed && changed->children[0] == replacement,
+                "attribute token-tree replacement lost the original child");
+        require(!syntax_replace_child(*group, 2, group->children[0], error),
+                "attribute token-tree replacement accepted a mismatched delimiter");
+        const auto projected = syntax_node_tokens(*changed);
+        require(projected.front().text == "[[" && projected.back().text == "]]" &&
+                projected.front().origin.span.file == replacement->span.first.file &&
+                projected.front().origin.span.offset == replacement->span.first.offset,
+                "attribute token-tree projection changed its delimiter span");
+    }
+    for (const auto text : {"$::quote { [[first] }", "$::quote { [[first)} }",
+                            "$::quote { [[first }", "$::quote { ]] }"}) {
+        const auto* source = sources.add("mismatched-attributes.x", text);
+        const auto input = Lexer(*source, diagnostics).lex();
+        Parser parser(input, diagnostics);
+        require(!parser.parse_syntax_fragment(K::Expr, 0),
+                "mismatched quoted attribute delimiters produced a public tree");
+    }
+    {
+        SourceManager limit_sources;
+        std::ostringstream limit_messages;
+        Diagnostics limit_diagnostics(limit_messages);
+        std::string text = "$::quote { ";
+        for (unsigned i = 0; i < 40; ++i) text += "[[ ";
+        text += "nested ";
+        for (unsigned i = 0; i < 40; ++i) text += "]] ";
+        text += "}";
+        const auto* source = limit_sources.add("attribute-depth.x", text);
+        auto input = Lexer(*source, limit_diagnostics).lex();
+        EvaluationLimits limits;
+        limits.depth = 32;
+        auto executor = std::make_shared<SyntaxExecution>(limit_sources, limit_diagnostics, 32,
+            no_layout, no_layout, limits, EvaluationLayout{});
+        Parser parser(input, limit_diagnostics, executor, 32);
+        require(!parser.parse_syntax_fragment(K::Expr, 0) && limit_diagnostics.errors() != 0,
+                "nested attribute groups bypassed public-tree depth limits");
+    }
     expression = parse("$::quote {}", K::Expr);
     quote = production(descendant(expression, P::QuoteExpression), P::QuoteExpression, 4);
     contents = child(quote, 2, P::BalancedTokens, 0);
@@ -1112,4 +1984,14 @@ int main() {
             contents->span.last.offset == contents->span.first.offset,
             "empty quote content has the wrong boundary span");
     require(diagnostics.errors() == 0, "schema diagnostics escaped");
+    bool complete_coverage = true;
+    for (std::size_t index = 1; index < observed_productions.size(); ++index) {
+        if (observed_productions[index]) continue;
+        std::cerr << "public production has no schema/identity-replacement coverage: "
+                  << syntax_production_name(static_cast<P>(index)) << '\n';
+        complete_coverage = false;
+    }
+    require(complete_coverage, "public production coverage is incomplete");
+    std::cout << observed_productions.size() - 1 << " public productions covered; "
+              << replacement_round_trips << " identity replacements checked\n";
 }

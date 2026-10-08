@@ -1406,7 +1406,7 @@ def default_output_directory(
             f"{samples}samples-{compile_runs}compiles"
         )
     return (
-        source_dir.parents[2]
+        source_dir.parents[1]
         / "build"
         / "benchmark"
         / "x86_64"
@@ -1442,10 +1442,10 @@ def benchmark_corpus_sha256(source_dir: Path) -> str:
 
 
 def default_cross_cc(source_dir: Path) -> str:
-    """Return the repository's conventional built compiler path."""
+    """Return the compiler of the repository's documented `build` tree."""
 
     suffix = ".exe" if sys.platform == "win32" else ""
-    return str(source_dir.parents[2] / "build" / f"cc{suffix}")
+    return str(source_dir.parents[1] / "build" / "bin" / f"cc{suffix}")
 
 
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:

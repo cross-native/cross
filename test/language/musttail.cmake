@@ -147,23 +147,30 @@ foreach(pattern
     endif()
 endforeach()
 
-execute_process(
-    COMMAND "${CC}" -S "${LOWERING_ERRORS}"
-            -o "${OUTPUT}-lowering-errors.s"
-    RESULT_VARIABLE lowering_status
-    OUTPUT_VARIABLE lowering_stdout
-    ERROR_VARIABLE lowering_stderr
-)
-if(lowering_status EQUAL 0)
-    message(FATAL_ERROR "invalid musttail returns unexpectedly compiled")
-endif()
-foreach(pattern
-        "musttail requires returning a call expression directly"
-        "musttail output-parameter forwarding is not implemented"
-        "musttail cannot restore variable-length array storage"
-        "musttail requires the returned value to be the direct result of the call")
+# Source-type checks can diagnose an invalid return before target lowering.
+# Isolate the cases so an early failure cannot hide any later tail constraint.
+foreach(case NONCALL EMPTY OUTPUT VLA CONVERSION)
+    if(case STREQUAL "NONCALL" OR case STREQUAL "EMPTY")
+        set(pattern "musttail requires returning a call expression directly")
+    elseif(case STREQUAL "OUTPUT")
+        set(pattern "musttail output-parameter forwarding is not implemented")
+    elseif(case STREQUAL "VLA")
+        set(pattern "musttail cannot restore variable-length array storage")
+    else()
+        set(pattern "musttail requires the returned value to be the direct result of the call")
+    endif()
+    execute_process(
+        COMMAND "${CC}" -S "-DBAD_${case}" "${LOWERING_ERRORS}"
+                -o "${OUTPUT}-lowering-errors-${case}.s"
+        RESULT_VARIABLE lowering_status
+        OUTPUT_VARIABLE lowering_stdout
+        ERROR_VARIABLE lowering_stderr
+    )
+    if(lowering_status EQUAL 0)
+        message(FATAL_ERROR "invalid musttail return ${case} unexpectedly compiled")
+    endif()
     string(FIND "${lowering_stderr}" "${pattern}" position)
-    if(position EQUAL -1)
+    if(position EQUAL -1 OR NOT lowering_stderr MATCHES "musttail_lowering_errors.x:[0-9]+:[0-9]+: error:")
         message(FATAL_ERROR
             "musttail lowering diagnostics lack '${pattern}'\n${lowering_stderr}")
     endif()

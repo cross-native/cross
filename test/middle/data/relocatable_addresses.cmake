@@ -43,9 +43,9 @@ endforeach()
 execute_process(
     COMMAND "${CC}" -S "${BAD_SOURCE}" -o "${OUTPUT}-bad.s"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(status EQUAL 0 OR NOT err MATCHES "not an address constant" OR
+if(NOT status EQUAL 1 OR NOT err MATCHES "runtime/static storage cannot be read during translation-time evaluation" OR
    NOT err MATCHES "relocatable_addresses_bad\\.x:[0-9]+:[0-9]+")
-    message(FATAL_ERROR "invalid scalar-as-address initializer was accepted\n${out}\n${err}")
+    message(FATAL_ERROR "missing runtime-scalar address-initializer rejection (${status})\n${out}\n${err}")
 endif()
 
 execute_process(

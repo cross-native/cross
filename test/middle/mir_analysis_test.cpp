@@ -876,6 +876,51 @@ int main() {
         std::cerr << diagnostics_text.str();
     }
 
+    auto labeled_forwarding = forwarding_function();
+    ManagedBlock isolated_label;
+    isolated_label.id = {5};
+    isolated_label.effect = {5};
+    isolated_label.terminator = {TerminatorKind::Branch, {}, std::nullopt, {{6}}, {5}};
+    ManagedBlock isolated_tail;
+    isolated_tail.id = {6};
+    isolated_tail.effect = {6};
+    isolated_tail.predecessors = {{5}};
+    isolated_tail.values = {{5}};
+    isolated_tail.terminator = {TerminatorKind::Return, {}, ValueId{5}, {}, {6}};
+    ManagedValue isolated_result;
+    isolated_result.id = {5};
+    isolated_result.type = {1};
+    isolated_result.kind = ValueKind::ConstantInteger;
+    isolated_result.integer = 42;
+    labeled_forwarding.values.push_back(isolated_result);
+    labeled_forwarding.blocks.push_back(isolated_label);
+    labeled_forwarding.blocks.push_back(isolated_tail);
+    labeled_forwarding.effects.push_back(
+        {EffectId{5}, {}, EffectKind::Phi, std::nullopt, std::nullopt, {}});
+    labeled_forwarding.effects.push_back(
+        {EffectId{6}, {}, EffectKind::Phi, std::nullopt, std::nullopt, {{{5}, {5}}}});
+    labeled_forwarding.labels.push_back({{0}, {5}});
+    auto label_hir = hir;
+    cross::hir::Label isolated_entity;
+    isolated_entity.id = {0};
+    isolated_entity.owner = {0};
+    label_hir.labels.push_back(isolated_entity);
+    label_hir.functions[0].labels.push_back({0});
+    ok &= expect(eliminate_forwarding_blocks(labeled_forwarding) &&
+                     labeled_forwarding.blocks.size() == 6 &&
+                     labeled_forwarding.labels.front().block == BlockId{4} &&
+                     labeled_forwarding.blocks[4].terminator.successors ==
+                         std::vector<BlockId>{{5}},
+                 "forwarding cleanup must preserve an isolated label and its continuation");
+    ManagedModule labeled_module;
+    labeled_module.functions.push_back(labeled_forwarding);
+    labeled_module.definitions.insert(0);
+    std::ostringstream labeled_diagnostics_text;
+    cross::Diagnostics labeled_diagnostics(labeled_diagnostics_text);
+    ok &= expect(verify(labeled_module, label_hir, labeled_diagnostics),
+                 "isolated labels must not prevent forwarding CFG/value/effect repair");
+    if (!labeled_diagnostics_text.str().empty()) std::cerr << labeled_diagnostics_text.str();
+
     auto guarded = guarded_loop_function();
     ok &= expect(rotate_guarded_loops(guarded),
                  "guarded loop should rotate to a bottom test");

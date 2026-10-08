@@ -18,9 +18,10 @@ function(accept_splice case source)
     endif()
 endfunction()
 function(reject_splice case expected source)
-    set(anchor_kind "error")
+    # An error in generated code is anchored to the case by a note.
+    set(anchor "(error|note):")
     if(ARGC GREATER 3)
-        set(anchor_kind "${ARGV3}")
+        set(anchor "${ARGV3}:")
     endif()
     set(input "${OUTPUT}/${case}.x")
     file(WRITE "${input}" "${source}")
@@ -28,10 +29,42 @@ function(reject_splice case expected source)
         RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(NOT status EQUAL 1 OR NOT err MATCHES "${expected}" OR
        NOT err MATCHES ":[0-9]+:[0-9]+: error:" OR
-       NOT err MATCHES "${case}.x:[0-9]+:[0-9]+: ${anchor_kind}:")
+       NOT err MATCHES "${case}.x:[0-9]+:[0-9]+: ${anchor}")
         message(FATAL_ERROR "${case} was not diagnosed correctly\n${out}\n${err}")
     endif()
 endfunction()
+
+reject_splice(unary_cast_address "address-of requires an object or function lvalue" [=[
+    global void entry() { u32 value = 1u32; u32 *invalid = &(u32)value; }
+]=])
+reject_splice(unary_cast_dereference "dereference requires a pointer operand" [=[
+    global void entry() { u32 value = 1u32; *(u32)value; }
+]=])
+
+reject_splice(operator_expression_parse "could not recognize complete bounded input" [=[
+    [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {
+        $::meta::syntax assignment = $::meta::parse("expr", $::quote { value = 1u32 }, $::syntax::context(input));
+        $::meta::syntax operation = $::meta::child(assignment, 1uptr);
+        $::meta::syntax invalid = $::meta::parse("expr", $::quote { $::unquote(operation) }, $::syntax::context(input));
+        return $::quote { 7u32 };
+    }
+    syntax Check : expression { prefix "check"; match body:paren; expand expand; }
+    syntax Check;
+    global u32 entry() { return check (); }
+]=])
+reject_splice(operator_expression_replace "structured splice requires one category-compatible child" [=[
+    [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {
+        $::meta::syntax assignment = $::meta::parse("expr", $::quote { value = 1u32 }, $::syntax::context(input));
+        $::meta::syntax operation = $::meta::child(assignment, 1uptr);
+        $::meta::syntax wrapper = $::meta::parse("expr", $::quote { $::unquote(assignment) }, $::syntax::context(input));
+        while (!$::meta::is_production(wrapper, "primary_expression")) wrapper = $::meta::child(wrapper, 0uptr);
+        $::meta::syntax invalid = $::meta::replace_child(wrapper, 0uptr, operation);
+        return $::quote { 7u32 };
+    }
+    syntax Check : expression { prefix "check"; match body:paren; expand expand; }
+    syntax Check;
+    global u32 entry() { return check (); }
+]=])
 
 file(READ "${CMAKE_CURRENT_LIST_DIR}/tag_lookup.x" tag_lookup_source)
 file(READ "${CMAKE_CURRENT_LIST_DIR}/local_tag_scope.x" local_tag_scope_source)
@@ -93,10 +126,12 @@ reject_splice(member_bound_overflow "fixed array bound must be a positive intege
     static uptr bad<u64 N>() { struct Local { u8 data[N]; }; return sizeof(struct Local); }
     global uptr entry() { return bad<4294967296u64>(); }
 ]=])
-reject_splice(member_bound_cycle "record contains itself by value through a member cycle" [=[
+# The required bound is now checked before final record layout; its cyclic
+# sizeof has no complete fixed-size type at that point.
+reject_splice(member_bound_cycle "sizeof requires a complete object type with fixed size" [=[
     struct Local { u8 data[sizeof(struct Local)]; };
 ]=])
-reject_splice(member_bound_runtime "required constant expression" [=[
+reject_splice(member_bound_runtime "runtime local or parameter is not a translation-time value" [=[
     global uptr bad(in u32 count) { struct Local { u8 data[count]; }; return sizeof(struct Local); }
 ]=])
 reject_splice(member_bound_bad_address_space "address space 999 is not registered" [=[
@@ -174,7 +209,7 @@ reject_splice(early_layout_invalid_alignment "sizeof requires a complete object 
     }
     global uptr entry() { return bad<3u32>(); }
 ]=])
-reject_splice(early_layout_later_enum "required constant expression|sizeof requires a complete object type with fixed size" [=[
+reject_splice(early_layout_later_enum "'Count' has no value in this syntax context" [=[
     static u32 next();
     struct Local { u8 data[next()]; };
     enum Size [[underlying(uptr)]] { Bytes = sizeof(struct Local) };
@@ -419,7 +454,7 @@ $::static_assert(identity(7u32) == 7u32, \"private generic identity was lost in 
 [[macro]] static $::meta::tokens discard(in $::meta::tokens input) { return $::quote {}; }
 discard! { [[macro]] invalid declaration; unknown!{ not Cross } }
 global u32 entry() { return 1u32; }")
-    reject_splice(token_macro_cycle_${mode} "expansion depth or invocation budget exceeded"
+    reject_splice(token_macro_cycle_${mode} "expansion depth exceeded"
         "${parameter_prefix}
 [[macro]] static $::meta::tokens recur(in $::meta::tokens input) { return $::quote { recur!() }; }
 global u32 entry() { return recur!(); }")
@@ -461,7 +496,7 @@ foreach(mode macro_only syntax_enabled)
         list(LENGTH failures failure_count)
         if(NOT status EQUAL 1 OR NOT failure_count EQUAL 1 OR
            err MATCHES "procedural macro is not visible" OR
-           NOT err MATCHES "failed-header-${mode}-${position}.x:[0-9]+:[0-9]+: error:")
+           NOT err MATCHES "(failed-header-${mode}-${position}.x|<expansion of '[^']+'>):[0-9]+:[0-9]+: error:")
             message(FATAL_ERROR "${mode}/${position}: failed header macro retried or lost recovery\n${out}\n${err}")
         endif()
     endforeach()
@@ -858,7 +893,7 @@ execute_process(COMMAND "${CC}" -S "${input}" -o "${OUTPUT}/category.s"
     RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT status EQUAL 1 OR
    NOT err MATCHES "structured syntax splice requires an expression node" OR
-   NOT err MATCHES "category.x:[0-9]+:[0-9]+: error:")
+   NOT err MATCHES "(category.x|<expansion of '[^']+'>):[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR "incompatible splice category was not diagnosed\n${out}\n${err}")
 endif()
 
@@ -874,8 +909,8 @@ file(WRITE "${reverse_input}" "${reverse_source}")
 execute_process(COMMAND "${CC}" -S "${reverse_input}" -o "${OUTPUT}/reverse-category.s"
     RESULT_VARIABLE reverse_status OUTPUT_VARIABLE reverse_out ERROR_VARIABLE reverse_err)
 if(NOT reverse_status EQUAL 1 OR
-   NOT reverse_err MATCHES "structured syntax splice requires a statement node" OR
-   NOT reverse_err MATCHES "reverse-category.x:[0-9]+:[0-9]+: error:")
+   NOT reverse_err MATCHES "expected ';'" OR
+   NOT reverse_err MATCHES "(reverse-category.x|<expansion of '[^']+'>):[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR "reverse splice category was not diagnosed\n${reverse_out}\n${reverse_err}")
 endif()
 
@@ -955,7 +990,7 @@ execute_process(COMMAND "${CC}" -S "${collision_input}" -o "${OUTPUT}/destinatio
     RESULT_VARIABLE collision_status OUTPUT_VARIABLE collision_out ERROR_VARIABLE collision_err)
 if(NOT collision_status EQUAL 1 OR
    NOT collision_err MATCHES "spliced local value 'copied' was declared more than once" OR
-   NOT collision_err MATCHES "destination-collision.x:[0-9]+:[0-9]+: error:")
+   NOT collision_err MATCHES "(destination-collision.x|<expansion of '[^']+'>):[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR "destination collision was not diagnosed\n${collision_out}\n${collision_err}")
 endif()
 
@@ -973,7 +1008,7 @@ execute_process(COMMAND "${CC}" -S "${tag_input}" -o "${OUTPUT}/destination-tag-
     RESULT_VARIABLE tag_status OUTPUT_VARIABLE tag_out ERROR_VARIABLE tag_err)
 if(NOT tag_status EQUAL 1 OR
    NOT tag_err MATCHES "spliced record tag 'Tag' duplicates a destination definition" OR
-   NOT tag_err MATCHES "destination-tag-collision.x:[0-9]+:[0-9]+: error:")
+   NOT tag_err MATCHES "(destination-tag-collision.x|<expansion of '[^']+'>):[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR "destination record collision was not diagnosed\n${tag_out}\n${tag_err}")
 endif()
 
@@ -996,7 +1031,7 @@ execute_process(COMMAND "${CC}" -S "${enum_input}" -o "${OUTPUT}/destination-enu
     RESULT_VARIABLE enum_status OUTPUT_VARIABLE enum_out ERROR_VARIABLE enum_err)
 if(NOT enum_status EQUAL 1 OR
    NOT enum_err MATCHES "spliced enumeration 'Tag' conflicts with the destination underlying type" OR
-   NOT enum_err MATCHES "destination-enum-collision.x:[0-9]+:[0-9]+: error:")
+   NOT enum_err MATCHES "(destination-enum-collision.x|<expansion of '[^']+'>):[0-9]+:[0-9]+: error:")
     message(FATAL_ERROR "destination enum collision was not diagnosed\n${enum_out}\n${enum_err}")
 endif()
 

@@ -21,3 +21,6 @@
 #endif
 
 global i32 x86_features_consistent = 1;
+#if !$::has_feature($::feature::embedded_assets)
+#error $::embed is implemented on every target
+#endif

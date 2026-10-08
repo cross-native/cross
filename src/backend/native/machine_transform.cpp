@@ -527,6 +527,51 @@ bool eliminate_dead_definitions(
     return any_changed;
 }
 
+bool fuse_division_results(machine::Function& function,
+                           const DivisionClassifier& classify,
+                           machine::TargetOpcodeId signed_combined,
+                           machine::TargetOpcodeId unsigned_combined) {
+    bool changed = false;
+    for (auto& block : function.blocks) {
+        std::vector<bool> removed(block.instructions.size());
+        // Pending candidates by signedness and operands, in block order.
+        std::vector<std::size_t> pending;
+        for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+            const auto& instruction = block.instructions[index];
+            const auto kind = classify(instruction);
+            if (!kind || instruction.uses.size() != 2 || instruction.defs.size() != 1)
+                continue;
+            const auto partner = std::find_if(pending.begin(), pending.end(),
+                [&](std::size_t first) {
+                    const auto& candidate = block.instructions[first];
+                    const auto other = classify(candidate);
+                    return other->quotient != kind->quotient &&
+                           other->is_signed == kind->is_signed &&
+                           candidate.uses == instruction.uses;
+                });
+            if (partner == pending.end()) {
+                pending.push_back(index);
+                continue;
+            }
+            auto& first = block.instructions[*partner];
+            const auto quotient = kind->quotient ? instruction.defs.front() : first.defs.front();
+            const auto remainder = kind->quotient ? first.defs.front() : instruction.defs.front();
+            first.opcode = kind->is_signed ? signed_combined : unsigned_combined;
+            first.defs = {quotient, remainder};
+            removed[index] = true;
+            pending.erase(partner);
+            changed = true;
+        }
+        if (std::find(removed.begin(), removed.end(), true) == removed.end()) continue;
+        std::vector<machine::Instruction> kept;
+        kept.reserve(block.instructions.size());
+        for (std::size_t index = 0; index < block.instructions.size(); ++index)
+            if (!removed[index]) kept.push_back(std::move(block.instructions[index]));
+        block.instructions = std::move(kept);
+    }
+    return changed;
+}
+
 bool elide_unused_virtual_spill_slots(machine::Function& function) {
     std::vector<bool> referenced(function.virtual_registers.size());
     const auto mark = [&](const machine::Register& value) {

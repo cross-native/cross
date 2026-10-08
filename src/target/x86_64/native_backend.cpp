@@ -5,6 +5,7 @@
 #include "middle/mir_analysis.hpp"
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
+#include "common/control_flow.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
 #include "target/x86_64/features.hpp"
@@ -587,6 +588,56 @@ machine::TargetOpcodeId vector_binary_opcode(
     return Opcode::Invalid;
 }
 
+// Storage that a parallel phi copy reads or writes. Unallocated values with
+// one frame color share a home, so copy ordering must treat them as one
+// location. An unallocated rematerialized immediate reads no storage.
+struct CopyLocation {
+    enum class Kind : std::uint8_t { Temporary, Fixed, Physical, Frame, Value };
+    Kind kind{};
+    std::uint32_t id{};
+    friend bool operator==(const CopyLocation&, const CopyLocation&) = default;
+};
+
+class CopyLocations {
+public:
+    explicit CopyLocations(const machine::Function& function)
+        : function_(function), colors_(function.virtual_registers.size()) {
+        for (const auto& slot : function.stack_slots) {
+            if (slot.spill_for && slot.frame_color &&
+                slot.spill_for->value < colors_.size() &&
+                !colors_[slot.spill_for->value]) {
+                colors_[slot.spill_for->value] = slot.frame_color;
+            }
+        }
+    }
+
+    CopyLocation operator()(machine::Register value,
+                            bool temporary = false) const {
+        using Kind = CopyLocation::Kind;
+        if (temporary) return {Kind::Temporary};
+        if (value.kind != machine::RegisterKind::Virtual) {
+            return {Kind::Fixed, value.id};
+        }
+        const auto id = value.id;
+        if (id < function_.virtual_register_assignments.size() &&
+            function_.virtual_register_assignments[id]) {
+            return {Kind::Physical,
+                    function_.virtual_register_assignments[id]->value};
+        }
+        const bool rematerialized =
+            id < function_.rematerialized_immediates.size() &&
+            function_.rematerialized_immediates[id];
+        if (id < colors_.size() && colors_[id] && !rematerialized) {
+            return {Kind::Frame, *colors_[id]};
+        }
+        return {Kind::Value, id};
+    }
+
+private:
+    const machine::Function& function_;
+    std::vector<std::optional<std::uint32_t>> colors_;
+};
+
 struct ParameterStoragePlan {
     std::unordered_set<std::uint16_t> used;
     std::vector<std::optional<std::uint16_t>> direct;
@@ -766,6 +817,11 @@ private:
         result.kind = machine::InstructionKind::Target;
         result.opcode = opcode;
         result.location = location;
+        // Symbol-address emission always materializes through RAX, including
+        // function/object addresses and nonlocal code labels. This scratch is
+        // independent of the virtual destination and the selected ABI result.
+        if (opcode == Opcode::GlobalAddress)
+            append_fixed_clobber(result, "rax", machine::i64);
         return result;
     }
 
@@ -1247,13 +1303,17 @@ private:
             const auto* label = value.label
                 ? &hir_.labels.at(value.label->value)
                 : nullptr;
+            const bool symbolic = label &&
+                (label->is_global || label->owner != source_->source);
             auto instruction = target_instruction(
-                label && label->is_global ? Opcode::GlobalAddress
-                                          : Opcode::LabelAddress,
+                symbolic ? Opcode::GlobalAddress : Opcode::LabelAddress,
                 value.location);
-            if (label && label->is_global) {
+            if (symbolic) {
+                const auto symbol = label->is_global ? label->link_symbol
+                    : ".Lcross.label." + std::to_string(label->owner.value) +
+                      '.' + std::to_string(label->id.value);
                 instruction.operands.push_back(machine::SymbolOperand{
-                    label->link_symbol, 0, true, std::nullopt, label->owner});
+                    symbol, 0, true, std::nullopt, label->owner, label->id});
                 instruction.defs.push_back(reg(value.id));
                 return instruction;
             }
@@ -1717,6 +1777,10 @@ private:
             instruction.patch =
                 machine::PatchSite{value.patch_id, target.mode.bits,
                                    value.patch_sink};
+            // Both the immediate materializer and a shared-cell read publish
+            // through RAX before storing their virtual result. Loop-carried
+            // values and custom ABI results may otherwise remain live there.
+            append_fixed_clobber(instruction, "rax", machine::i64);
             instruction.has_side_effects = true;
             return instruction;
         }
@@ -2096,6 +2160,7 @@ private:
             }
             for (const auto value : block.values) {
                 const auto& managed_value = source.values[value.value];
+                if (managed_value.kind == mir::ValueKind::VoidValue) continue;
                 if (!target.instructions.empty() &&
                     target.instructions.back().kind ==
                         machine::InstructionKind::Call &&
@@ -3500,69 +3565,17 @@ private:
 
     void fuse_scalar_division_results() {
         if (!options_.machine_combine) return;
-        const auto quotient_kind = [](machine::TargetOpcodeId opcode) {
-            return opcode == Opcode::Sdiv || opcode == Opcode::Udiv;
-        };
-        const auto remainder_kind = [](machine::TargetOpcodeId opcode) {
-            return opcode == Opcode::Srem || opcode == Opcode::Urem;
-        };
-        const auto signed_kind = [](machine::TargetOpcodeId opcode) {
-            return opcode == Opcode::Sdiv || opcode == Opcode::Srem;
-        };
-        for (auto& block : current_.blocks) {
-            std::unordered_set<std::size_t> removed;
-            for (std::size_t first = 0;
-                 first < block.instructions.size(); ++first) {
-                if (removed.contains(first)) continue;
-                const auto& candidate = block.instructions[first];
-                if ((!quotient_kind(candidate.opcode) &&
-                     !remainder_kind(candidate.opcode)) ||
-                    candidate.uses.size() != 2 ||
-                    candidate.defs.size() != 1 ||
-                    candidate.uses.front().mode.bits > 64) {
-                    continue;
-                }
-                for (std::size_t second = first + 1;
-                     second < block.instructions.size(); ++second) {
-                    if (removed.contains(second)) continue;
-                    const auto& partner = block.instructions[second];
-                    if (candidate.uses != partner.uses ||
-                        partner.defs.size() != 1 ||
-                        quotient_kind(candidate.opcode) ==
-                            quotient_kind(partner.opcode) ||
-                        signed_kind(candidate.opcode) !=
-                            signed_kind(partner.opcode) ||
-                        (!quotient_kind(partner.opcode) &&
-                         !remainder_kind(partner.opcode))) {
-                        continue;
-                    }
-                    machine::Instruction combined = target_instruction(
-                        signed_kind(candidate.opcode)
-                            ? Opcode::Sdivrem : Opcode::Udivrem,
-                        candidate.location);
-                    combined.operands = candidate.operands;
-                    combined.uses = candidate.uses;
-                    combined.defs = quotient_kind(candidate.opcode)
-                        ? std::vector<machine::Register>{
-                              candidate.defs.front(), partner.defs.front()}
-                        : std::vector<machine::Register>{
-                              partner.defs.front(), candidate.defs.front()};
-                    block.instructions[first] = std::move(combined);
-                    removed.insert(second);
-                    break;
-                }
-            }
-            if (removed.empty()) continue;
-            std::vector<machine::Instruction> compact;
-            compact.reserve(block.instructions.size() - removed.size());
-            for (std::size_t index = 0;
-                 index < block.instructions.size(); ++index) {
-                if (!removed.contains(index)) {
-                    compact.push_back(std::move(block.instructions[index]));
-                }
-            }
-            block.instructions = std::move(compact);
-        }
+        (void)native::fuse_division_results(current_,
+            [](const machine::Instruction& instruction) -> std::optional<native::DivisionKind> {
+                const auto opcode = instruction.opcode;
+                if (instruction.uses.empty() || instruction.uses.front().mode.bits > 64 ||
+                    (opcode != Opcode::Sdiv && opcode != Opcode::Udiv &&
+                     opcode != Opcode::Srem && opcode != Opcode::Urem))
+                    return std::nullopt;
+                return native::DivisionKind{opcode == Opcode::Sdiv || opcode == Opcode::Udiv,
+                                            opcode == Opcode::Sdiv || opcode == Opcode::Srem};
+            },
+            Opcode::Sdivrem, Opcode::Udivrem);
     }
 
     void fuse_compare_branches() {
@@ -4310,20 +4323,48 @@ private:
             }
         }
         for (auto& block : current_.blocks) {
+            auto& instructions = block.instructions;
+            // Unfused selects per condition and the single-definition sites of
+            // each virtual register, kept current while this block is fused.
+            // Erasure is deferred, so instruction indices stay stable.
+            std::unordered_map<std::uint32_t, unsigned> selectable;
+            std::unordered_map<std::uint32_t, std::vector<std::size_t>> definitions;
+            std::vector<bool> erased(instructions.size());
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                const auto& instruction = instructions[index];
+                if (instruction.opcode == Opcode::Select &&
+                    instruction.condition_predicate.empty() &&
+                    instruction.uses.size() == 3 &&
+                    instruction.uses.front().kind == machine::RegisterKind::Virtual) {
+                    ++selectable[instruction.uses.front().id];
+                }
+                if (instruction.defs.size() == 1 &&
+                    instruction.defs.front().kind == machine::RegisterKind::Virtual) {
+                    definitions[instruction.defs.front().id].push_back(index);
+                }
+            }
+            const auto first_definition = [&](machine::Register reg, std::size_t limit)
+                -> std::optional<std::size_t> {
+                const auto found = definitions.find(reg.id);
+                if (found == definitions.end()) return std::nullopt;
+                for (const auto index : found->second) {
+                    if (index >= limit) break;
+                    if (!erased[index]) return index;
+                }
+                return std::nullopt;
+            };
             for (std::size_t selection_index = 0;
-                 selection_index < block.instructions.size();) {
-                auto selection = block.instructions.begin() +
-                    static_cast<std::ptrdiff_t>(selection_index);
-                if (selection->opcode != Opcode::Select ||
-                    !selection->condition_predicate.empty() ||
-                    selection->uses.size() != 3 ||
-                    selection->uses.front().kind !=
+                 selection_index < instructions.size(); ++selection_index) {
+                auto& selection = instructions[selection_index];
+                if (selection.opcode != Opcode::Select ||
+                    !selection.condition_predicate.empty() ||
+                    selection.uses.size() != 3 ||
+                    selection.uses.front().kind !=
                         machine::RegisterKind::Virtual ||
-                    selection->uses.front().id >= uses.size()) {
-                    ++selection_index;
+                    selection.uses.front().id >= uses.size()) {
                     continue;
                 }
-                const auto condition = selection->uses.front();
+                const auto condition = selection.uses.front();
                 // A flags target can profitably duplicate a pure comparison
                 // into several conditional moves.  Compared with keeping a
                 // materialized boolean, this removes SETcc and every TEST of
@@ -4331,131 +4372,112 @@ private:
                 // replace CMP/SETcc plus N TEST/CMOV pairs.  Require every
                 // use to be a selectable consumer in this block so cloning
                 // never penalizes a remaining ordinary boolean use.
-                const auto selectable_uses =
-                    static_cast<unsigned>(std::count_if(
-                        block.instructions.begin(),
-                        block.instructions.end(),
-                        [&](const machine::Instruction& instruction) {
-                            return instruction.opcode == Opcode::Select &&
-                                   instruction.condition_predicate.empty() &&
-                                   instruction.uses.size() == 3 &&
-                                   instruction.uses.front() == condition;
-                        }));
+                const auto selectable_uses = selectable[condition.id];
                 if (selectable_uses == 0 ||
                     uses[condition.id] != selectable_uses) {
-                    ++selection_index;
                     continue;
                 }
-                const auto definition = std::find_if(
-                    block.instructions.begin(), selection,
-                    [&](const machine::Instruction& instruction) {
-                        return instruction.defs.size() == 1 &&
-                               instruction.defs.front() == condition;
-                    });
-                if (definition == selection ||
-                    definition->kind != machine::InstructionKind::Target ||
-                    definition->uses.empty() ||
-                    definition->uses.front().mode.bits > 64 ||
-                    definition->operands.empty() || definition->patch ||
-                    definition->has_side_effects || definition->may_load ||
-                    definition->may_store) {
-                    ++selection_index;
+                const auto definition_index =
+                    first_definition(condition, selection_index);
+                if (!definition_index) continue;
+                const auto& definition = instructions[*definition_index];
+                if (definition.kind != machine::InstructionKind::Target ||
+                    definition.uses.empty() ||
+                    definition.uses.front().mode.bits > 64 ||
+                    definition.operands.empty() || definition.patch ||
+                    definition.has_side_effects || definition.may_load ||
+                    definition.may_store) {
                     continue;
                 }
-                const auto base = binary_base_opcode(definition->opcode);
+                const auto base = binary_base_opcode(definition.opcode);
                 const bool comparison =
                     has_property(base, OpcodeProperty::Comparison) &&
                     !has_property(base, OpcodeProperty::Floating) &&
                     !has_property(base, OpcodeProperty::Vector);
-                const bool iszero = definition->opcode == Opcode::Iszero;
-                if (!comparison && !iszero) {
-                    ++selection_index;
-                    continue;
-                }
+                const bool iszero = definition.opcode == Opcode::Iszero;
+                if (!comparison && !iszero) continue;
 
-                const auto truth = selection->uses[1];
-                const auto falsity = selection->uses[2];
-                const auto truth_operand = selection->operands[1];
-                const auto falsity_operand = selection->operands[2];
+                const auto truth = selection.uses[1];
+                const auto falsity = selection.uses[2];
+                const auto truth_operand = selection.operands[1];
+                const auto falsity_operand = selection.operands[2];
                 if (uses[condition.id] == 1 &&
                     (base == Opcode::CmpEq || base == Opcode::CmpNe) &&
-                    has_property(definition->opcode,
+                    has_property(definition.opcode,
                                  OpcodeProperty::Immediate) &&
-                    definition->uses.size() == 1 &&
-                    definition->operands.size() >= 2) {
+                    definition.uses.size() == 1 &&
+                    definition.operands.size() >= 2) {
                     const auto* zero =
                         std::get_if<machine::ImmediateOperand>(
-                            &definition->operands.back());
-                    const auto masked = definition->uses.front();
-                    const auto mask_definition = std::find_if(
-                        block.instructions.begin(), definition,
-                        [&](const machine::Instruction& instruction) {
-                            return instruction.defs.size() == 1 &&
-                                   instruction.defs.front() == masked;
-                        });
+                            &definition.operands.back());
+                    const auto masked = definition.uses.front();
+                    const auto mask_index =
+                        masked.kind == machine::RegisterKind::Virtual
+                            ? first_definition(masked, *definition_index)
+                            : std::nullopt;
                     if (zero && zero->value == 0 && zero->high == 0 &&
-                        masked.kind == machine::RegisterKind::Virtual &&
-                        uses[masked.id] == 1 &&
-                        mask_definition != definition &&
-                        mask_definition->opcode == Opcode::AndImm &&
-                        mask_definition->uses.size() == 1 &&
-                        mask_definition->operands.size() >= 2 &&
-                        !mask_definition->patch &&
-                        !mask_definition->has_side_effects) {
-                        selection->condition_predicate =
+                        mask_index && uses[masked.id] == 1 &&
+                        instructions[*mask_index].opcode == Opcode::AndImm &&
+                        instructions[*mask_index].uses.size() == 1 &&
+                        instructions[*mask_index].operands.size() >= 2 &&
+                        !instructions[*mask_index].patch &&
+                        !instructions[*mask_index].has_side_effects) {
+                        const auto& mask_definition = instructions[*mask_index];
+                        selection.condition_predicate =
                             base == Opcode::CmpEq
                                 ? Opcode::TestEqImm
                                 : Opcode::TestNeImm;
-                        selection->uses = mask_definition->uses;
-                        selection->uses.push_back(truth);
-                        selection->uses.push_back(falsity);
-                        selection->operands = {
-                            mask_definition->operands.front(),
-                            mask_definition->operands.back(),
+                        selection.uses = mask_definition.uses;
+                        selection.uses.push_back(truth);
+                        selection.uses.push_back(falsity);
+                        selection.operands = {
+                            mask_definition.operands.front(),
+                            mask_definition.operands.back(),
                             truth_operand, falsity_operand};
-                        block.instructions.erase(definition);
-                        block.instructions.erase(mask_definition);
-                        selection_index = 0;
+                        --selectable[condition.id];
+                        erased[*definition_index] = true;
+                        erased[*mask_index] = true;
                         continue;
                     }
                 }
-                selection->condition_predicate = iszero
+                selection.condition_predicate = iszero
                     ? machine::TargetOpcodeId{Opcode::CmpEqImm}
-                    : definition->opcode;
-                selection->uses = definition->uses;
-                selection->uses.push_back(truth);
-                selection->uses.push_back(falsity);
-                selection->operands = definition->operands;
+                    : definition.opcode;
+                selection.uses = definition.uses;
+                selection.uses.push_back(truth);
+                selection.uses.push_back(falsity);
+                selection.operands = definition.operands;
                 if (iszero) {
-                    selection->operands.push_back(
+                    selection.operands.push_back(
                         machine::ImmediateOperand{
-                            0, 0, definition->uses.front().mode, false});
+                            0, 0, definition.uses.front().mode, false});
                 }
-                selection->operands.push_back(truth_operand);
-                selection->operands.push_back(falsity_operand);
+                selection.operands.push_back(truth_operand);
+                selection.operands.push_back(falsity_operand);
+                --selectable[condition.id];
                 --uses[condition.id];
-                for (const auto use : definition->uses) {
+                for (const auto use : definition.uses) {
                     if (use.kind == machine::RegisterKind::Virtual &&
                         use.id < uses.size()) {
                         ++uses[use.id];
                     }
                 }
                 if (uses[condition.id] == 0) {
-                    for (const auto use : definition->uses) {
+                    for (const auto use : definition.uses) {
                         if (use.kind == machine::RegisterKind::Virtual &&
                             use.id < uses.size()) {
                             --uses[use.id];
                         }
                     }
-                    block.instructions.erase(definition);
-                    // Erasing an earlier definition shifts the select.
-                    // Restart; each completed group strictly reduces this
-                    // block.
-                    selection_index = 0;
-                } else {
-                    ++selection_index;
+                    erased[*definition_index] = true;
                 }
             }
+            if (std::find(erased.begin(), erased.end(), true) == erased.end()) continue;
+            std::vector<machine::Instruction> kept;
+            kept.reserve(instructions.size());
+            for (std::size_t index = 0; index < instructions.size(); ++index)
+                if (!erased[index]) kept.push_back(std::move(instructions[index]));
+            instructions = std::move(kept);
         }
     }
 
@@ -4708,6 +4730,18 @@ private:
                     continue;
                 }
                 consumer.opcode = opcode;
+                // The fused memory operation still materializes spilled
+                // address components through the address emitter's scratch.
+                consumer.clobbers.insert(consumer.clobbers.end(),
+                    address.clobbers.begin(), address.clobbers.end());
+                if (opcode == Opcode::IndexedStore) {
+                    // Integer stores reload a spilled value through R10
+                    // (R10:R11 for i128). These effects also participate in
+                    // preservation under a custom ABI's clobber contract.
+                    append_fixed_clobber(consumer, "r10", machine::i64);
+                    if (transported_mode.bits > 64)
+                        append_fixed_clobber(consumer, "r11", machine::i64);
+                }
                 if (store) {
                     const auto source = consumer.uses[1];
                     consumer.uses = {
@@ -5618,61 +5652,26 @@ private:
         // continuing path. Restricting preferred back paths to blocks
         // dominated by the header distinguishes those two cases.
         const auto block_count = current_.blocks.size();
-        std::vector<std::vector<bool>> dominates(
-            block_count, std::vector<bool>(block_count, true));
-        if (current_.entry.value < block_count) {
-            std::fill(dominates[current_.entry.value].begin(),
-                      dominates[current_.entry.value].end(), false);
-            dominates[current_.entry.value][current_.entry.value] = true;
-        }
-        bool dominance_changed = true;
-        while (dominance_changed) {
-            dominance_changed = false;
-            for (const auto& candidate : current_.blocks) {
-                if (candidate.id == current_.entry) continue;
-                std::vector<bool> next(block_count, true);
-                if (candidate.predecessors.empty()) {
-                    std::fill(next.begin(), next.end(), false);
-                } else {
-                    for (const auto predecessor : candidate.predecessors) {
-                        if (predecessor.value >= block_count) continue;
-                        for (std::size_t index = 0; index < block_count;
-                             ++index) {
-                            next[index] = next[index] &&
-                                dominates[predecessor.value][index];
-                        }
-                    }
-                }
-                next[candidate.id.value] = true;
-                if (next != dominates[candidate.id.value]) {
-                    dominates[candidate.id.value] = std::move(next);
-                    dominance_changed = true;
-                }
-            }
-        }
-        const auto distance_to = [&](machine::BlockId source,
-                                     machine::BlockId target)
-            -> std::optional<std::size_t> {
-            std::vector<std::pair<machine::BlockId, std::size_t>> pending{
-                {source, 0}};
-            std::unordered_set<std::uint32_t> visited;
-            for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-                const auto [item, distance] = pending[cursor];
-                if (item == target) return distance;
-                if (!visited.insert(item.value).second) continue;
-                for (const auto successor :
-                     current_.blocks.at(item.value).successors) {
-                    pending.emplace_back(successor, distance + 1);
-                }
-            }
-            return std::nullopt;
-        };
+        const Dominance dominance(
+            block_count, current_.entry.value,
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return current_.blocks[block].successors;
+            },
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return current_.blocks[block].predecessors;
+            });
+        // A successor leads back to its block exactly when both lie on one
+        // cycle.
+        const auto components = strongly_connected_components(
+            block_count,
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return current_.blocks[block].successors;
+            });
         const auto natural_back_distance =
             [&](machine::BlockId source, machine::BlockId header)
             -> std::optional<std::size_t> {
-            if (source.value >= block_count ||
-                header.value >= block_count ||
-                !dominates[source.value][header.value]) {
+            if (components[source.value] != components[header.value] ||
+                !dominance.dominates(header.value, source.value)) {
                 return std::nullopt;
             }
             std::vector<std::pair<machine::BlockId, std::size_t>> pending{
@@ -5685,8 +5684,7 @@ private:
                 for (const auto successor :
                      current_.blocks.at(item.value).successors) {
                     if (successor == header ||
-                        (successor.value < block_count &&
-                         dominates[successor.value][header.value])) {
+                        dominance.dominates(header.value, successor.value)) {
                         pending.emplace_back(successor, distance + 1);
                     }
                 }
@@ -5739,7 +5737,7 @@ private:
                         for (auto item = owner.successors.rbegin();
                              item != owner.successors.rend(); ++item) {
                             if (!placed.contains(item->value) && ready(*item) &&
-                                !distance_to(*item, current)) {
+                                components[item->value] != components[current.value]) {
                                 successor = *item;
                                 break;
                             }
@@ -5769,26 +5767,27 @@ private:
                     return label.block.value == id.value;
                 });
         };
-        for (const auto& header : current_.blocks) {
-            std::optional<machine::BlockId> latch;
-            std::size_t latch_inputs{};
-            for (const auto& candidate : current_.blocks) {
-                if (candidate.id == current_.entry ||
-                    candidate.predecessors.size() < 2 ||
-                    candidate.successors.size() != 1 ||
-                    candidate.successors.front() != header.id ||
-                    addressable(candidate.id) ||
-                    candidate.id.value >= block_count ||
-                    header.id.value >= block_count ||
-                    !dominates[candidate.id.value][header.id.value]) {
-                    continue;
-                }
-                if (!latch ||
-                    candidate.predecessors.size() > latch_inputs) {
-                    latch = candidate.id;
-                    latch_inputs = candidate.predecessors.size();
-                }
+        // The latch of each header: the dominated single-successor block with
+        // the most predecessors, the earliest one on ties.
+        std::vector<std::optional<machine::BlockId>> latches(block_count);
+        for (const auto& candidate : current_.blocks) {
+            if (candidate.id == current_.entry ||
+                candidate.predecessors.size() < 2 ||
+                candidate.successors.size() != 1 ||
+                addressable(candidate.id)) {
+                continue;
             }
+            const auto header = candidate.successors.front();
+            if (!dominance.dominates(header.value, candidate.id.value)) continue;
+            auto& latch = latches[header.value];
+            if (!latch ||
+                candidate.predecessors.size() >
+                    current_.blocks[latch->value].predecessors.size()) {
+                latch = candidate.id;
+            }
+        }
+        for (const auto& header : current_.blocks) {
+            const auto latch = latches[header.id.value];
             if (!latch) continue;
             auto header_position = std::find(
                 layout.begin(), layout.end(), header.id);
@@ -6539,7 +6538,6 @@ private:
                      opcode == Opcode::Fphi ||
                      opcode == Opcode::FindexedLoad ||
                      opcode == Opcode::FindexedStore ||
-                     opcode == Opcode::IndexedStore ||
                      base == Opcode::Fadd || base == Opcode::Fsub ||
                      base == Opcode::Fmul || base == Opcode::Fdiv) &&
                     scalar_simd()) {
@@ -6624,37 +6622,14 @@ private:
         std::vector<std::unordered_set<std::uint32_t>> affinity(count);
         std::vector<std::unordered_set<std::uint32_t>>
             backedge_affinity(count);
-        std::unordered_set<std::uint32_t> all_blocks;
-        for (const auto& block : current_.blocks) {
-            all_blocks.insert(block.id.value);
-        }
-        std::vector<std::unordered_set<std::uint32_t>> dominators(
-            current_.blocks.size(), all_blocks);
-        dominators[current_.entry.value] = {current_.entry.value};
-        bool dominators_changed = true;
-        while (dominators_changed) {
-            dominators_changed = false;
-            for (const auto& block : current_.blocks) {
-                if (block.id == current_.entry) continue;
-                std::unordered_set<std::uint32_t> next;
-                if (!block.predecessors.empty()) {
-                    next = dominators[block.predecessors.front().value];
-                    for (std::size_t index = 1;
-                         index < block.predecessors.size(); ++index) {
-                        const auto& other =
-                            dominators[block.predecessors[index].value];
-                        std::erase_if(next, [&](std::uint32_t candidate) {
-                            return !other.contains(candidate);
-                        });
-                    }
-                }
-                next.insert(block.id.value);
-                if (next != dominators[block.id.value]) {
-                    dominators[block.id.value] = std::move(next);
-                    dominators_changed = true;
-                }
-            }
-        }
+        const Dominance dominance(
+            current_.blocks.size(), current_.entry.value,
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return current_.blocks[block].successors;
+            },
+            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+                return current_.blocks[block].predecessors;
+            });
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (!is_phi(instruction)) {
@@ -6847,8 +6822,8 @@ private:
                             current_.virtual_register_classes[target.id] !=
                                 current_.virtual_register_classes[
                                     source->value.id] ||
-                            !dominators[predecessor->target.value].contains(
-                                block.id.value)) {
+                            !dominance.dominates(block.id.value,
+                                                 predecessor->target.value)) {
                             continue;
                         }
                         backedge_affinity[target.id].insert(source->value.id);
@@ -6932,6 +6907,9 @@ private:
             }
         }
         std::vector<std::unordered_set<std::uint32_t>> forbidden(count);
+        // Colors a crossed call clobbers. A value may still take one and be
+        // split through its home around that call.
+        std::vector<std::unordered_set<std::uint32_t>> call_forbidden(count);
         for (const auto& block : current_.blocks) {
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
@@ -7120,8 +7098,11 @@ private:
                     if (clobber.kind != machine::RegisterKind::Physical) {
                         continue;
                     }
+                    auto& excluded =
+                        item->kind == machine::InstructionKind::Call
+                            ? call_forbidden : forbidden;
                     for (const auto id : live) {
-                        if (id < count) forbidden[id].insert(clobber.id);
+                        if (id < count) excluded[id].insert(clobber.id);
                     }
                     if (item->kind != machine::InstructionKind::Call) {
                         for (const auto& use : item->uses) {
@@ -7431,6 +7412,7 @@ private:
         }
 
         std::vector<bool> crosses_call(count);
+        std::vector<unsigned> crossed_calls(count);
         for (const auto& block : current_.blocks) {
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
@@ -7443,7 +7425,10 @@ private:
                 }
                 if (item->kind == machine::InstructionKind::Call) {
                     for (const auto id : live) {
-                        if (id < count) crosses_call[id] = true;
+                        if (id < count) {
+                            crosses_call[id] = true;
+                            ++crossed_calls[id];
+                        }
                     }
                 }
                 if (!phi) {
@@ -7465,6 +7450,21 @@ private:
                     machine::VirtualRegisterClass::Vector) {
                 eligible[id] = false;
             }
+        }
+        // A scalar crossing calls may take a volatile color that a crossed
+        // call clobbers; the emitter then stores and reloads it around that
+        // call. Prefer this over a memory-resident value when its uses and
+        // definition would cost at least as much home traffic.
+        std::vector<bool> split_allowed(count);
+        for (std::size_t id = 0; id < count; ++id) {
+            split_allowed[id] = crosses_call[id] && eligible[id] &&
+                !current_.rematerialized_immediates[id] &&
+                current_.virtual_registers[id].bits <= 64 &&
+                (current_.virtual_register_classes[id] ==
+                     machine::VirtualRegisterClass::Integer ||
+                 current_.virtual_register_classes[id] ==
+                     machine::VirtualRegisterClass::Floating) &&
+                register_use_counts[id] + 1 >= 2 * crossed_calls[id];
         }
 
         const bool dynamic_stack_frame = std::any_of(
@@ -8022,8 +8022,7 @@ private:
             current_.blocks.size());
         for (const auto& latch : current_.blocks) {
             for (const auto successor : latch.successors) {
-                if (!dominators[latch.id.value].contains(
-                        successor.value)) {
+                if (!dominance.dominates(successor.value, latch.id.value)) {
                     continue;
                 }
                 auto& members = natural_loop_blocks[successor.value];
@@ -8147,12 +8146,20 @@ private:
                 // Leave it unassigned so each use reconstructs it instead.
                 colors.clear();
             } else if (crosses_call[id]) {
-                // Exact per-call clobbers are already physical constraints on
-                // this value. Prefer an untouched volatile register before
-                // paying a function-wide callee-save; ordinary external ABIs
-                // forbid their volatile set and naturally fall through.
+                // Prefer a volatile register no crossed call clobbers, then a
+                // function-wide callee-save, then a clobbered volatile
+                // register split through the home around each crossed call.
+                std::vector<machine::PhysicalRegisterId> split;
+                std::erase_if(colors, [&](machine::PhysicalRegisterId color) {
+                    if (!call_forbidden[id].contains(color.value)) return false;
+                    split.push_back(color);
+                    return true;
+                });
                 colors.insert(colors.end(), preserved_colors.begin(),
                               preserved_colors.end());
+                if (split_allowed[id]) {
+                    colors.insert(colors.end(), split.begin(), split.end());
+                }
             } else if (!rematerializable) {
                 // A one-time callee-save is preferable to a spill inside a
                 // hot region. Volatile colors remain first for ordinary
@@ -8214,9 +8221,24 @@ private:
                 }
             }
             preferred.insert(preferred.end(), colors.begin(), colors.end());
+            if (crosses_call[id] && !preserved_colors.empty()) {
+                // An affinity or endpoint color a crossed call clobbers ranks
+                // below every preserved color: one callee-save beats a store
+                // and reload at each call.
+                std::stable_partition(
+                    preferred.begin(), preferred.end(),
+                    [&](machine::PhysicalRegisterId color) {
+                        return !call_forbidden[id].contains(color.value);
+                    });
+            }
+            // Affinity propagation hands a neighbor a color a crossed call
+            // clobbers only when its class has no preserved color at all;
+            // otherwise the neighbor's own selection prefers the one-time
+            // callee-save over a store and reload at every crossed call.
             const auto color_available =
                 [&](std::uint32_t value,
-                    machine::PhysicalRegisterId color) {
+                    machine::PhysicalRegisterId color,
+                    bool propagating = false) {
                     if (value >= count || !eligible[value] ||
                         current_.virtual_register_assignments[value]) {
                         return false;
@@ -8229,6 +8251,19 @@ private:
                         return false;
                     }
                     if (forbidden[value].contains(color.value)) return false;
+                    if (call_forbidden[value].contains(color.value)) {
+                        if (!split_allowed[value]) return false;
+                        const bool simd_value =
+                            current_.virtual_register_classes[value] ==
+                                machine::VirtualRegisterClass::Floating ||
+                            current_.virtual_register_classes[value] ==
+                                machine::VirtualRegisterClass::Vector;
+                        if (propagating &&
+                            !(simd_value ? preserved_floating_colors
+                                         : preserved_integer_colors).empty()) {
+                            return false;
+                        }
+                    }
                     return std::none_of(
                         interference[value].begin(),
                         interference[value].end(),
@@ -8257,7 +8292,7 @@ private:
                         [&](std::uint32_t neighbor) {
                             return neighbor < count && eligible[neighbor] &&
                                 !interference[id].contains(neighbor) &&
-                                color_available(neighbor, color);
+                                color_available(neighbor, color, true);
                         })) {
                     selected = color;
                     break;
@@ -8304,7 +8339,7 @@ private:
                             return;
                         }
                         if (neighbor >= count ||
-                            !color_available(neighbor, *selected)) {
+                            !color_available(neighbor, *selected, true)) {
                             return;
                         }
                         current_.virtual_register_assignments[neighbor] =
@@ -8350,7 +8385,8 @@ private:
                                              *parameter_endpoints[link] !=
                                                  *selected) ||
                                             !color_available(link,
-                                                             *selected)) {
+                                                             *selected,
+                                                             true)) {
                                             return;
                                         }
                                         ++result;
@@ -8393,33 +8429,121 @@ private:
             for (const auto neighbor : backedge_affinity[id]) {
                 if (neighbor >= count ||
                     interference[id].contains(neighbor) ||
-                    !color_available(neighbor, *selected)) {
+                    !color_available(neighbor, *selected, true)) {
                     continue;
                 }
                 current_.virtual_register_assignments[neighbor] = *selected;
             }
         }
 
+        // The audited leaf path assumes every SIMD operand is resident. If
+        // pressure still leaves one in a fallback home, withdraw XMM0/XMM1
+        // assignments so the emitter may use those conventional scratches
+        // without aliasing a live allocated value.
+        if (extra_simd_colors_safe) {
+            bool unassigned_simd = false;
+            for (std::uint32_t id = 0; id < count; ++id) {
+                const auto value_class =
+                    current_.virtual_register_classes[id];
+                if ((value_class ==
+                         machine::VirtualRegisterClass::Floating ||
+                     value_class ==
+                         machine::VirtualRegisterClass::Vector) &&
+                    eligible[id] &&
+                    !current_.rematerialized_immediates[id] &&
+                    !current_.virtual_register_assignments[id]) {
+                    unassigned_simd = true;
+                    break;
+                }
+            }
+            if (unassigned_simd) {
+                const auto* xmm0 = find_register_view("xmm0");
+                const auto* xmm1 = find_register_view("xmm1");
+                for (auto& assignment :
+                     current_.virtual_register_assignments) {
+                    if (!assignment) continue;
+                    if ((xmm0 && assignment->value == xmm0->storage_id) ||
+                        (xmm1 && assignment->value == xmm1->storage_id)) {
+                        assignment.reset();
+                    }
+                }
+            }
+        }
+        {
+            // Fixed call/result endpoint affinity can assign RAX/RCX even
+            // when the opcode-set audit did not admit them as general colors.
+            // Any scalar fallback home still needs those emitter scratches;
+            // audit all assignments, not only the extra-color path.
+            bool unassigned_integer = false;
+            for (std::uint32_t id = 0; id < count; ++id) {
+                if (current_.virtual_register_classes[id] ==
+                        machine::VirtualRegisterClass::Integer &&
+                    eligible[id] &&
+                    !current_.rematerialized_immediates[id] &&
+                    !current_.virtual_register_assignments[id]) {
+                    unassigned_integer = true;
+                    break;
+                }
+            }
+            if (unassigned_integer) {
+                for (auto& assignment :
+                     current_.virtual_register_assignments) {
+                    if (!assignment) continue;
+                    if ((rax && assignment->value == rax->storage_id) ||
+                        (rcx && assignment->value == rcx->storage_id)) {
+                        assignment.reset();
+                    }
+                }
+            }
+        }
+
+        // Color fallback homes independently from physical registers.  A
+        // value allocated to a register may still need its home at a call, so
+        // all SSA values participate; finalize_frame later elides colors whose
+        // members need no materialized home.
+        std::vector<std::uint32_t> spill_order(count);
+        for (std::uint32_t id = 0; id < count; ++id) spill_order[id] = id;
+        std::sort(spill_order.begin(), spill_order.end(),
+                  [&](std::uint32_t left, std::uint32_t right) {
+                      if (interference[left].size() != interference[right].size()) {
+                          return interference[left].size() >
+                                 interference[right].size();
+                      }
+                      return current_.virtual_registers[left].bits >
+                             current_.virtual_registers[right].bits;
+                  });
+        std::vector<std::optional<std::uint32_t>> spill_colors(count);
+        for (const auto id : spill_order) {
+            std::unordered_set<std::uint32_t> occupied;
+            for (const auto neighbor : interference[id]) {
+                if (neighbor < count && spill_colors[neighbor]) {
+                    occupied.insert(*spill_colors[neighbor]);
+                }
+            }
+            std::uint32_t color{};
+            while (occupied.contains(color)) ++color;
+            spill_colors[id] = color;
+        }
+        for (auto& slot : current_.stack_slots) {
+            if (slot.spill_for &&
+                slot.spill_for->value < spill_colors.size() &&
+                current_.virtual_register_classes[slot.spill_for->value] !=
+                    machine::VirtualRegisterClass::Memory) {
+                slot.frame_color = spill_colors[slot.spill_for->value];
+            }
+        }
+
         // A parallel phi-copy cycle uses XMM2 as its scalar bit bucket. The
         // literal was colored last and has a reconstruction recipe, so simply
         // withdraw its cache assignment if any edge needs that cycle breaker.
-        // This cannot invalidate another color chosen earlier.
+        // This cannot invalidate another color chosen earlier. Frame colors
+        // and the final assignments decide which copies form a cycle.
         if (literal_xmm2_color) {
-            const auto location_key = [&](machine::Register value) {
-                if (value.kind == machine::RegisterKind::Virtual &&
-                    value.id < current_.virtual_register_assignments.size() &&
-                    current_.virtual_register_assignments[value.id]) {
-                    return std::string("physical:") + std::to_string(
-                        current_.virtual_register_assignments[value.id]
-                            ->value);
-                }
-                return std::string("virtual:") +
-                       std::to_string(value.id);
-            };
+            const CopyLocations location_key(current_);
             bool copy_cycle = false;
             for (const auto& block : current_.blocks) {
                 for (const auto predecessor : block.predecessors) {
-                    std::vector<std::pair<std::string, std::string>> copies;
+                    std::vector<std::pair<CopyLocation, CopyLocation>> copies;
                     for (const auto& instruction : block.instructions) {
                         if ((instruction.opcode != Opcode::Phi &&
                              instruction.opcode != Opcode::Fphi &&
@@ -8482,63 +8606,6 @@ private:
             }
         }
 
-        // The audited leaf path assumes every SIMD operand is resident. If
-        // pressure still leaves one in a fallback home, withdraw XMM0/XMM1
-        // assignments so the emitter may use those conventional scratches
-        // without aliasing a live allocated value.
-        if (extra_simd_colors_safe) {
-            bool unassigned_simd = false;
-            for (std::uint32_t id = 0; id < count; ++id) {
-                const auto value_class =
-                    current_.virtual_register_classes[id];
-                if ((value_class ==
-                         machine::VirtualRegisterClass::Floating ||
-                     value_class ==
-                         machine::VirtualRegisterClass::Vector) &&
-                    eligible[id] &&
-                    !current_.rematerialized_immediates[id] &&
-                    !current_.virtual_register_assignments[id]) {
-                    unassigned_simd = true;
-                    break;
-                }
-            }
-            if (unassigned_simd) {
-                const auto* xmm0 = find_register_view("xmm0");
-                const auto* xmm1 = find_register_view("xmm1");
-                for (auto& assignment :
-                     current_.virtual_register_assignments) {
-                    if (!assignment) continue;
-                    if ((xmm0 && assignment->value == xmm0->storage_id) ||
-                        (xmm1 && assignment->value == xmm1->storage_id)) {
-                        assignment.reset();
-                    }
-                }
-            }
-        }
-        if (extra_integer_colors_safe) {
-            bool unassigned_integer = false;
-            for (std::uint32_t id = 0; id < count; ++id) {
-                if (current_.virtual_register_classes[id] ==
-                        machine::VirtualRegisterClass::Integer &&
-                    eligible[id] &&
-                    !current_.rematerialized_immediates[id] &&
-                    !current_.virtual_register_assignments[id]) {
-                    unassigned_integer = true;
-                    break;
-                }
-            }
-            if (unassigned_integer) {
-                for (auto& assignment :
-                     current_.virtual_register_assignments) {
-                    if (!assignment) continue;
-                    if ((rax && assignment->value == rax->storage_id) ||
-                        (rcx && assignment->value == rcx->storage_id)) {
-                        assignment.reset();
-                    }
-                }
-            }
-        }
-
         std::unordered_set<std::uint32_t> preserved_assignments;
         const auto collect_preserved_assignment =
             [&](const std::optional<machine::PhysicalRegisterId>& assignment,
@@ -8567,42 +8634,6 @@ private:
         std::sort(ordered_preserved.begin(), ordered_preserved.end());
         for (const auto storage : ordered_preserved) {
             add_preserved_storage(storage);
-        }
-
-        // Color fallback homes independently from physical registers.  A
-        // value allocated to a register may still need its home at a call, so
-        // all SSA values participate; finalize_frame later elides colors whose
-        // members need no materialized home.
-        std::vector<std::uint32_t> spill_order(count);
-        for (std::uint32_t id = 0; id < count; ++id) spill_order[id] = id;
-        std::sort(spill_order.begin(), spill_order.end(),
-                  [&](std::uint32_t left, std::uint32_t right) {
-                      if (interference[left].size() != interference[right].size()) {
-                          return interference[left].size() >
-                                 interference[right].size();
-                      }
-                      return current_.virtual_registers[left].bits >
-                             current_.virtual_registers[right].bits;
-                  });
-        std::vector<std::optional<std::uint32_t>> spill_colors(count);
-        for (const auto id : spill_order) {
-            std::unordered_set<std::uint32_t> occupied;
-            for (const auto neighbor : interference[id]) {
-                if (neighbor < count && spill_colors[neighbor]) {
-                    occupied.insert(*spill_colors[neighbor]);
-                }
-            }
-            std::uint32_t color{};
-            while (occupied.contains(color)) ++color;
-            spill_colors[id] = color;
-        }
-        for (auto& slot : current_.stack_slots) {
-            if (slot.spill_for &&
-                slot.spill_for->value < spill_colors.size() &&
-                current_.virtual_register_classes[slot.spill_for->value] !=
-                    machine::VirtualRegisterClass::Memory) {
-                slot.frame_color = spill_colors[slot.spill_for->value];
-            }
         }
 
         // Record the exact volatile assignments that cross each call. The
@@ -8902,20 +8933,7 @@ private:
     }
 
     void create_wide_phi_temporary_if_needed() {
-        const auto location_key = [&](machine::Register reg,
-                                      bool temporary = false) {
-            if (temporary) return std::string("temporary");
-            if (reg.kind == machine::RegisterKind::Virtual &&
-                reg.id < current_.virtual_register_assignments.size() &&
-                current_.virtual_register_assignments[reg.id]) {
-                return std::string("physical:") +
-                    std::to_string(
-                        current_.virtual_register_assignments[reg.id]->value);
-            }
-            return std::string(reg.kind == machine::RegisterKind::Virtual
-                                   ? "virtual:" : "fixed:") +
-                std::to_string(reg.id);
-        };
+        const CopyLocations location_key(current_);
         struct Copy {
             machine::Register source;
             machine::Register target;
@@ -10004,6 +10022,7 @@ private:
     bool global_requires_got(
         const machine::SymbolOperand& source) const {
         if (!options_.position_independent) return false;
+        if (source.label && !hir_.labels.at(source.label->value).is_global) return false;
         if (source.function) {
             return externally_preemptible(hir_.function(*source.function));
         }
@@ -10752,13 +10771,11 @@ private:
 
     std::int32_t vreg_offset(const machine::Function& function,
                              machine::Register value) const {
-        const auto name = "$v" + std::to_string(value.id);
-        const auto found = std::find_if(
-            function.stack_slots.begin(), function.stack_slots.end(),
-            [&](const machine::StackSlot& slot) {
-                return slot.name == name;
-            });
-        if (found == function.stack_slots.end() || !found->frame_offset) {
+        const auto* found = value.id < spill_homes_.size() &&
+                                    spill_homes_[value.id] < function.stack_slots.size()
+            ? &function.stack_slots[spill_homes_[value.id]]
+            : nullptr;
+        if (!found || !found->frame_offset) {
             std::string allocation;
             if (value.id < function.virtual_register_classes.size()) {
                 const auto kind = function.virtual_register_classes[value.id];
@@ -17421,6 +17438,39 @@ private:
         }
     }
 
+    void capture_automatic_output_registers(const machine::Function& function,
+                                           const hir::Function& entity) {
+        if (manual_plans_.find(function.source)) return;
+        const auto* abi = abi_model(function.abi);
+        if (!abi) return;
+        std::vector<AutomaticAbiValue> parameters;
+        for (const auto& parameter : entity.parameters)
+            parameters.push_back(automatic_value(hir_, parameter.type, *abi,
+                                                 parameter.mode != ParameterMode::In));
+        std::optional<AutomaticAbiValue> result;
+        if (!is_void(hir_, entity.result_type))
+            result = automatic_value(hir_, entity.result_type, *abi);
+        const auto stable = classify_scalar_signature(parameters, result, function.abi,
+                                                      std::nullopt, subtarget_.enabled_features());
+        const auto* dynamic = dynamic_plans_.find(function.source);
+        const auto locations = dynamic ? dynamic_argument_locations(*dynamic) : stable.arguments;
+        // Snapshot every register-carried output pointer without a scratch
+        // register, before any parameter's copy-in can consume R10/RAX/XMM0.
+        // The model/dynamic plan, not a default register list, owns endpoints.
+        for (std::size_t index = 0; index < entity.parameters.size() && index < locations.size(); ++index) {
+            if (entity.parameters[index].mode == ParameterMode::In ||
+                locations[index].pieces.empty() || !locations[index].pieces.front().in_register) continue;
+            const auto home = named_slot_offset(function, "$paramptr." + std::to_string(index));
+            if (!home) {
+                diagnostics_.error(entity.parameters[index].location,
+                                   "output parameter has no native pointer home");
+                continue;
+            }
+            instruction("movq", register_name(locations[index].pieces.front().reg, 64) +
+                                    ", " + memory(*home));
+        }
+    }
+
     void emit_parameter(const machine::Function& function,
                         const machine::Instruction& value) {
         const auto index = static_cast<std::size_t>(
@@ -17435,7 +17485,7 @@ private:
             return;
         }
         const auto target = value.defs.front();
-        if (target.mode.bits == 80) {
+        if (target.mode.bits == 80 && entity.parameters[index].mode == ParameterMode::In) {
             std::vector<AutomaticAbiValue> values;
             values.reserve(entity.parameters.size());
             for (const auto& parameter : entity.parameters) {
@@ -17521,14 +17571,14 @@ private:
             }
             const auto& source = location.pieces.front();
             if (source.in_register) {
-                instruction("movq", register_name(source.reg, 64) +
-                                        ", %r10");
+                instruction("movq", memory(*pointer_slot) + ", %r10");
             } else {
                 instruction(
                     "movq", incoming_memory(source.stack_offset) +
                                 ", %r10");
             }
-            instruction("movq", "%r10, " + memory(*pointer_slot));
+            if (!source.in_register)
+                instruction("movq", "%r10, " + memory(*pointer_slot));
             if (parameter.mode == ParameterMode::Out) return;
             if (is_aggregate(hir_, parameter.type)) {
                 copy_pointer_to_frame(
@@ -17538,6 +17588,9 @@ private:
                 copy_pointer_to_frame(
                     "r10", vreg_offset(function, target),
                     storage_size(hir_, parameter.type));
+            } else if (target.mode.bits == 80) {
+                instruction("fldt", "0(%r10)");
+                store_x87(function, target);
             } else if (target.mode.bits == 128) {
                 instruction("movq", "0(%r10), %rax");
                 instruction("movq", "8(%r10), %rdx");
@@ -17683,6 +17736,16 @@ private:
             return;
         }
         const auto bits = target.mode.bits;
+        const auto end = ".Lcross.patch.value." + std::to_string(value.patch->identity) + ".end";
+        if (!emitted_patch_cells_.insert(value.patch->identity).second) {
+            // The target's immutable patch protocol permits each copied use
+            // to read the original immediate field, even on another CFG path.
+            instruction("mov" + std::string(1, suffix(bits)),
+                        end + "-" + std::to_string(bits / 8U) + "(%rip), " +
+                            register_name("rax", bits));
+            store(function, target, "rax");
+            return;
+        }
         const auto opcode = bits == 64 ? "movabsq" :
                             "mov" + std::string(1, suffix(bits));
         std::string immediate;
@@ -17701,8 +17764,7 @@ private:
         }
         instruction(opcode, "$" + immediate + ", " +
                             register_name("rax", bits));
-        output_ << ".Lcross.patch.value." << value.patch->identity
-                << ".end:\n";
+        output_ << end << ":\n";
         store(function, target, "rax");
     }
 
@@ -17927,7 +17989,8 @@ private:
                        machine::Register right,
                        machine::Register target) {
         load(function, left, "rax", "rdx");
-        load(function, right, "rcx");
+        // A 128-bit count's high half is irrelevant and must not replace %rdx.
+        load(function, right, "rcx", "r11");
         const auto large = private_label(function, "shift128.large");
         const auto done = private_label(function, "shift128.done");
         instruction("testb", "$64, %cl");
@@ -21234,6 +21297,7 @@ private:
             bool vector{};
             bool source_temporary{};
         };
+        const CopyLocations location_key(function);
         std::vector<Copy> copies;
         for (const auto& value : destination.instructions) {
             if (value.kind != machine::InstructionKind::Target ||
@@ -21250,8 +21314,7 @@ private:
                     std::get<machine::RegisterOperand>(
                         value.operands[index + 1]).value;
                 if (source == value.defs.front() ||
-                    same_physical_assignment(
-                        function, source, value.defs.front())) {
+                    location_key(source) == location_key(value.defs.front())) {
                     break;
                 }
                 copies.push_back({source, value.defs.front(),
@@ -21262,18 +21325,6 @@ private:
         }
         if (copies.empty()) return;
         const auto temporaries = edge_offsets(function);
-        const auto location_key = [&](machine::Register reg,
-                                      bool temporary) {
-            if (temporary) return std::string("temporary");
-            if (reg.kind == machine::RegisterKind::Virtual &&
-                reg.id < function.virtual_register_assignments.size() &&
-                function.virtual_register_assignments[reg.id]) {
-                return std::string("physical:") +
-                    std::to_string(
-                        function.virtual_register_assignments[reg.id]->value);
-            }
-            return std::string("virtual:") + std::to_string(reg.id);
-        };
         const auto require_wide_temporary = [&]() -> std::optional<std::int32_t> {
             if (!temporaries.empty()) return temporaries.front();
             diagnostics_.error(destination.location,
@@ -22842,6 +22893,14 @@ private:
 
     void emit_function(machine::Function& function) {
         active_function_ = &function;
+        spill_homes_.assign(function.virtual_registers.size(),
+                            std::numeric_limits<std::size_t>::max());
+        for (std::size_t index = 0; index < function.stack_slots.size(); ++index) {
+            const auto& owner = function.stack_slots[index].spill_for;
+            if (owner && owner->value < spill_homes_.size() &&
+                spill_homes_[owner->value] == std::numeric_limits<std::size_t>::max())
+                spill_homes_[owner->value] = index;
+        }
         const auto& entity = hir_.function(function.source);
         uses_wide_vectors_ = false;
         for (std::size_t id = 0;
@@ -23190,6 +23249,7 @@ private:
             capture_manual_x87_inputs(function, *manual);
             capture_manual_register_inputs(function, *manual);
         }
+        capture_automatic_output_registers(function, entity);
         std::optional<ReturnAssignment> managed_result;
         if (!manual_plans_.find(function.source)) {
             if (const auto* dynamic = dynamic_plans_.find(function.source);
@@ -23286,6 +23346,7 @@ private:
     Diagnostics& diagnostics_;
     ObjectFormat format_;
     std::ostringstream output_;
+    std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::vector<FloatLiteral> float_literals_;
     std::vector<JumpTable> jump_tables_;
     std::vector<DeferredEdgeStub> deferred_edge_stubs_;
@@ -23308,6 +23369,8 @@ private:
     std::string dynamic_frame_anchor_register_;
     std::string current_operation_;
     const machine::Function* active_function_{};
+    // Index of each virtual register's first spill home in the active function.
+    std::vector<std::size_t> spill_homes_;
     std::unordered_map<const machine::Instruction*,
                        const machine::Instruction*> fused_adds_;
     std::unordered_set<const machine::Instruction*>

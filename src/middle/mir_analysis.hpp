@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "common/control_flow.hpp"
 #include "middle/mir.hpp"
 
 #include <cstddef>
@@ -84,14 +85,10 @@ public:
     [[nodiscard]] std::optional<BlockId> immediate_dominator(
         BlockId block) const;
     [[nodiscard]] const std::vector<BlockId>& children(BlockId block) const;
-    [[nodiscard]] std::size_t block_count() const { return reachable_.size(); }
+    [[nodiscard]] std::size_t block_count() const { return children_.size(); }
 
 private:
-    [[nodiscard]] bool bit(BlockId block, BlockId candidate) const;
-
-    std::vector<bool> reachable_;
-    std::vector<std::vector<std::uint64_t>> dominators_;
-    std::vector<std::optional<BlockId>> immediate_dominators_;
+    Dominance dominance_;
     std::vector<std::vector<BlockId>> children_;
 };
 

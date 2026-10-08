@@ -877,7 +877,8 @@ private:
                  << ";\n";
             return;
         }
-        if (value.kind == ValueKind::ConstantInteger ||
+        if (value.kind == ValueKind::VoidValue ||
+            value.kind == ValueKind::ConstantInteger ||
             value.kind == ValueKind::LabelAddress ||
             value.kind == ValueKind::SlotAddress ||
             value.kind == ValueKind::GlobalAddress ||

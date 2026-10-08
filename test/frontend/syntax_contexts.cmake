@@ -16,6 +16,36 @@ function(compile case source)
     set(err "${out}${err}" PARENT_SCOPE)
 endfunction()
 
+# Namespace refinement must not copy unrelated current classifier maps into a
+# definition-site context. Its own generated alias is visible, but a later
+# alias in the macro's original namespace remains outside that saved context.
+foreach(level O0 O2)
+    compile(namespace_fragment_free_alias_${level} [=[
+[[syntax_expander]] static $::meta::tokens inspect(in $::meta::syntax_match input) {
+    $::meta::context context = $::syntax::context(input);
+    $::meta::syntax own = $::meta::parse("type", $::meta::parse("Own"), context);
+    $::syntax::note($::meta::node_span(own), "verified fragment alias");
+    $::meta::syntax late = $::meta::parse("type", $::meta::parse("Late"), context);
+    return $::quote { 1u32 };
+}
+syntax Inspect : expression { prefix "inspect"; match body:paren; expand inspect; }
+syntax Inspect;
+namespace Definition {
+    [[macro]] static $::meta::tokens make(in $::meta::tokens input) {
+        return $::quote { namespace Made { typedef u16 Own; static u32 read() { return inspect (); } } };
+    }
+    typedef u64 Late;
+}
+Definition::make!()
+global u32 entry() { return Made::read(); }
+]=] -${level} -fno-eval-calls)
+    if(NOT result EQUAL 1 OR NOT err MATCHES "verified fragment alias" OR
+       NOT err MATCHES "could not recognize complete bounded input for 'type'" OR
+       NOT err MATCHES "namespace_fragment_free_alias_${level}.x:[0-9]+:[0-9]+: error:")
+        message(FATAL_ERROR "generated namespace context leaked an unrelated later alias\n${err}")
+    endif()
+endforeach()
+
 set(template [=[
 [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {
     @body@
@@ -35,45 +65,45 @@ function(reject case expected body)
     endif()
 endfunction()
 
-reject(context_operand "context requires a syntax match or node"
+reject(context_operand "incompatible argument type for translation-only operation"
     "$::meta::context saved = $::syntax::context(1u32);")
-reject(context_count "unsupported syntax operation or invalid argument count"
+reject(context_count "invalid argument count for translation-only operation"
     "$::meta::context saved = $::syntax::context(input, input);")
-reject(context_size "layout query requires a runtime object type"
+reject(context_size "meta values have no runtime size or alignment"
     "uptr width = sizeof($::meta::context);")
-reject(context_value_size "layout query requires a runtime object type"
+reject(context_value_size "meta values have no runtime size or alignment"
     "uptr width = sizeof($::syntax::context(input));")
-reject(context_alignment "layout query requires a runtime object type"
+reject(context_alignment "meta values have no runtime size or alignment"
     "uptr width = $::alignof($::meta::context);")
-reject(context_address "unsupported unary operand"
+reject(context_address "opaque meta values do not support unary operators or addresses"
     "$::meta::context saved = $::syntax::context(input); &saved;")
 reject(context_const "cannot write a const cell"
     "const $::meta::context saved = $::syntax::context(input); saved = $::syntax::context(input);")
-reject(context_volatile "without runtime storage qualifiers"
+reject(context_volatile "meta cells require automatic translation-only storage without runtime qualifiers"
     "volatile $::meta::context saved = $::syntax::context(input);")
-reject(context_scalar_cast "unsupported conversion"
+reject(context_scalar_cast "incompatible meta value in cast"
     "uptr value = (uptr)$::syntax::context(input);")
-reject(context_pointer_cast "unsupported conversion"
+reject(context_pointer_cast "incompatible meta value in cast"
     "u8 *value = (u8 *)$::syntax::context(input);")
-reject(context_reverse_cast "unsupported conversion"
+reject(context_reverse_cast "incompatible meta value in cast"
     "$::meta::context saved = ($::meta::context)1uptr;")
-reject(context_mixed_conditional "unsupported type in required constant expression"
+reject(context_mixed_conditional "conditional meta operands must have the same type"
     "$::meta::context saved = 1u32 ? $::syntax::context(input) : $::syntax::span(input);")
-reject(context_equality "unsupported operation"
+reject(context_equality "opaque meta values do not support binary operators"
     "$::syntax::context(input) == $::syntax::context(input);")
-reject(context_not "unsupported unary operand" "!$::syntax::context(input);")
+reject(context_not "opaque meta values do not support unary operators or addresses" "!$::syntax::context(input);")
 reject(context_condition "condition must be scalar"
     "if ($::syntax::context(input)) return $::quote { 0u32 };")
-reject(context_tokens "requires.*meta::syntax"
+reject(context_tokens "incompatible argument type for translation-only operation"
     "$::meta::tokens projected = $::meta::tokens($::syntax::context(input));")
 reject(context_uninitialized "read of uninitialized value"
     "$::meta::context saved; $::meta::context copied = saved;")
 reject(context_emit "unquote requires a token value"
     "return $::quote { $::unquote($::syntax::context(input)) };")
 
-reject(call_site_count "call_site requires one token value"
+reject(call_site_count "invalid argument count for translation-only operation"
     "$::meta::tokens selected = $::meta::call_site($::quote { name }, $::quote { value });")
-reject(call_site_type "call_site requires one identifier token value"
+reject(call_site_type "incompatible argument type for translation-only operation"
     "$::meta::tokens selected = $::meta::call_site(7u32);")
 reject(call_site_empty "call_site requires exactly one identifier token"
     "$::meta::tokens selected = $::meta::call_site($::quote { });")
@@ -81,16 +111,39 @@ reject(call_site_multiple "call_site requires exactly one identifier token"
     "$::meta::tokens selected = $::meta::call_site($::quote { name value });")
 reject(call_site_nonidentifier "call_site requires exactly one identifier token"
     "$::meta::tokens selected = $::meta::call_site($::quote { 7u32 });")
-reject(gensym_count "gensym requires one string prefix"
+reject(gensym_count "invalid argument count for translation-only operation"
     "$::meta::tokens selected = $::meta::gensym(\"name\", \"other\");")
-reject(gensym_type "gensym requires a translation-time string prefix"
+reject(gensym_type "incompatible argument type for translation-only operation"
     "$::meta::tokens selected = $::meta::gensym(7u32);")
-reject(gensym_empty "gensym prefix must be a nonreserved identifier"
-    "$::meta::tokens selected = $::meta::gensym(\"\");")
-reject(gensym_reserved "gensym prefix must be a nonreserved identifier"
-    "$::meta::tokens selected = $::meta::gensym(\"return\");")
-reject(gensym_punctuation "gensym prefix must be a nonreserved identifier"
-    "$::meta::tokens selected = $::meta::gensym(\"two words\");")
+
+# Any gensym prefix is accepted and spelled as a valid identifier.
+compile(gensym_spelling [=[
+static bool spelled(in $::meta::tokens name, in const u8 *expected) {
+    const $::meta::bytes actual = $::meta::spelling(name);
+    uptr index = 0uptr;
+    while (index < $::meta::len(actual)) {
+        if (expected[index] != $::meta::at(actual, index)) return (bool)0u8;
+        index += 1uptr;
+    }
+    return expected[index] == 0u8;
+}
+[[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {
+    if (!spelled($::meta::gensym(""), "_") ||
+        !spelled($::meta::gensym("return"), "_return") ||
+        !spelled($::meta::gensym("two words"), "two_words") ||
+        !spelled($::meta::gensym("9lives"), "_9lives") ||
+        !spelled($::meta::gensym("temp-value"), "temp_value") ||
+        !spelled($::meta::gensym("caf\xC3\xA9"), "caf_"))
+        $::meta::error($::syntax::span(input), "unexpected gensym spelling");
+    return $::quote { 1u32 };
+}
+syntax Inspect : expression { prefix "inspect"; match body:paren; expand expand; }
+syntax Inspect;
+global u32 entry() { return inspect (); }
+]=])
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "gensym prefixes were not sanitized\n${err}")
+endif()
 
 set(body [=[
     const $::meta::context original = $::syntax::context(input);
@@ -217,11 +270,11 @@ endforeach()
 
 reject(parse_category "invalid public syntax parse category"
     "$::meta::syntax node = $::meta::parse(\"expression\", $::quote { 1u32 }, $::syntax::context(input));")
-reject(parse_count "requires a string or category, tokens, and context"
+reject(parse_count "invalid argument count for translation-only operation"
     "$::meta::parse(\"expr\", $::quote { 1u32 });")
-reject(parse_tokens_type "requires a string or category string, tokens, and context"
+reject(parse_tokens_type "incompatible argument type for translation-only operation"
     "$::meta::parse(\"expr\", 1u32, $::syntax::context(input));")
-reject(parse_context_type "requires a string or category string, tokens, and context"
+reject(parse_context_type "incompatible argument type for translation-only operation"
     "$::meta::parse(\"expr\", $::quote { 1u32 }, $::syntax::span(input));")
 reject(parse_trailing "could not recognize complete bounded input"
     "$::meta::parse(\"expr\", $::quote { 1u32; }, $::syntax::context(input));")
@@ -237,6 +290,8 @@ reject(parse_outside_else "could not recognize complete bounded input"
 # Speculative aliases do not leak from one parse into the saved context.
 reject(parse_no_alias_leak "could not recognize complete bounded input"
     "$::meta::context context = $::syntax::context(input); $::meta::syntax first = $::meta::parse(\"declaration\", $::quote { typedef u32 Temporary; }, context); $::meta::parse(\"type\", $::quote { Temporary }, context);")
+
+# Retained-splice storage budgets are separately registered by model/target.
 
 set(source [=[
 [[syntax_expander]] static $::meta::tokens expand(in $::meta::syntax_match input) {

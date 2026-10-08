@@ -3,7 +3,10 @@
 #include "middle/hir.hpp"
 
 #include "frontend/semantic.hpp"
+#include "frontend/record_constraints.hpp"
+#include "middle/initializer.hpp"
 #include "model/model.hpp"
+#include "target/subtarget.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -54,12 +57,23 @@ std::string_view parameter_mode_name(ParameterMode mode) {
     return {};
 }
 
+std::string model_entity_name(std::string_view qualified_name, const FreshIdentifier* fresh) {
+    if (!fresh) return std::string(qualified_name);
+    // A private identifier is reusable in distinct lexical namespaces. Its
+    // opaque leaf identity must not erase the enclosing entity placement from
+    // the name passed to the selected model (or private-symbol serializer).
+    const auto separator = qualified_name.rfind("::");
+    auto result = separator == std::string_view::npos ? std::string{}
+        : std::string(qualified_name.substr(0, separator + 2));
+    result += fresh_identifier_link_stem(*fresh);
+    return result;
+}
+
 std::string resolved_link_name(const FunctionDecl& function,
                                const CompilerOptions& options) {
     if (const auto exact = decode_attribute_string(function.attribute("link_name"));
         !exact.empty()) return exact;
-    const auto model_name = function.fresh
-        ? fresh_identifier_link_stem(*function.fresh) : function.name;
+    const auto model_name = model_entity_name(function.name, function.fresh.get());
     if (function.linkage == Linkage::Global ||
         (function.linkage != Linkage::Static && !function.definition())) {
         std::vector<ManglingParameter> parameters;
@@ -96,8 +110,7 @@ std::string resolved_link_name(const ObjectDecl& object,
                                const CompilerOptions& options) {
     if (const auto exact = decode_attribute_string(object_attribute(object, "link_name"));
         !exact.empty()) return exact;
-    const auto model_name = object.fresh
-        ? fresh_identifier_link_stem(*object.fresh) : object.name;
+    const auto model_name = model_entity_name(object.name, object.fresh.get());
     if (object.linkage == Linkage::Global ||
         (object.linkage != Linkage::Static && !object.initializer)) {
         return encode_model_link_name(
@@ -133,38 +146,11 @@ TypePtr variadic_state_type(std::string_view spelling) {
         ++pointers;
         spelling.remove_suffix(1);
     }
-    static constexpr std::pair<std::string_view, BuiltinType> builtins[] = {
-        {"void", BuiltinType::Void}, {"bool", BuiltinType::Bool},
-        {"i8", BuiltinType::I8}, {"u8", BuiltinType::U8},
-        {"i16", BuiltinType::I16}, {"u16", BuiltinType::U16},
-        {"i32", BuiltinType::I32}, {"u32", BuiltinType::U32},
-        {"i64", BuiltinType::I64}, {"u64", BuiltinType::U64},
-        {"i128", BuiltinType::I128}, {"u128", BuiltinType::U128},
-        {"iptr", BuiltinType::Iptr}, {"uptr", BuiltinType::Uptr},
-        {"f32", BuiltinType::F32}, {"f64", BuiltinType::F64},
-        {"f80", BuiltinType::F80}, {"f128", BuiltinType::F128},
-        {"fptr", BuiltinType::Fptr}, {"label", BuiltinType::Label},
-    };
-    const auto found = std::find_if(
-        std::begin(builtins), std::end(builtins),
-        [&](const auto& item) { return item.first == spelling; });
-    if (found == std::end(builtins)) return {};
-    auto result = builtin_type(found->second);
+    const auto kind = builtin_kind(spelling);
+    if (!kind) return {};
+    auto result = builtin_type(*kind);
     while (pointers-- != 0) result = pointer_type(result);
     return result;
-}
-
-bool source_identifier(std::string_view spelling) {
-    if (spelling.empty()) return false;
-    const auto initial = [](unsigned char ch) {
-        return (ch >= 'A' && ch <= 'Z') ||
-               (ch >= 'a' && ch <= 'z') || ch == '_';
-    };
-    const auto continuation = [&](unsigned char ch) {
-        return initial(ch) || (ch >= '0' && ch <= '9');
-    };
-    return initial(static_cast<unsigned char>(spelling.front())) &&
-           std::all_of(spelling.begin() + 1, spelling.end(), continuation);
 }
 
 std::string source_namespace(std::string_view name) {
@@ -174,18 +160,73 @@ std::string source_namespace(std::string_view name) {
                : std::string(name.substr(0, separator));
 }
 
+// Program::record_definition with indexed published positions.
+std::shared_ptr<const RecordDecl> record_definition(const Program& program,
+    const NominalTypeKey& key, RecordSourceIndex& index) {
+    if (program.evaluation_record_definition) {
+        // A nested layout query may replace the scoped provider while running.
+        const auto query = program.evaluation_record_definition;
+        if (auto view = query(key)) return view;
+    }
+    return {std::shared_ptr<const RecordDecl>{}, index.definition(program, key)};
+}
+
+enum class LayoutViewCoverage { PendingAllowed, Complete };
+
+// Resolves each by-value record of the graph once per call, so a changed
+// provider, owner or completeness is always observed.
+bool layout_view_matches_records(const Module& module, const Program& program,
+                                 const TypePtr& source, LayoutViewCoverage coverage) {
+    if (module.address_bits != program.address_bits) return false;
+    // Holding each definition keeps the member types on the work list alive.
+    std::vector<std::shared_ptr<const RecordDecl>> definitions;
+    std::vector<const cross::Type*> work{source.get()};
+    std::vector<bool> visited(module.records.size());
+    std::unordered_set<NominalTypeKey, NominalTypeKeyHash> uncached;
+    while (!work.empty()) {
+        const auto* type = work.back();
+        work.pop_back();
+        if (!type) continue;
+        if (type->kind == cross::Type::Kind::Array || type->kind == cross::Type::Kind::Vector) {
+            work.push_back(type->element.get());
+        } else if (type->kind == cross::Type::Kind::Record) {
+            const auto key = type->nominal_key();
+            if (key.identity && key.identity->function_scope &&
+                (!module.evaluation_layout_scope ||
+                 module.evaluation_layout_scope != program.evaluation_layout_scope)) return false;
+            const auto* cached = module.record(key);
+            if (cached ? visited[cached->id.value] : !uncached.insert(key).second) continue;
+            if (cached) visited[cached->id.value] = true;
+            auto definition = record_definition(program, key, module.source_records);
+            if (!definition) return false;
+            if (coverage == LayoutViewCoverage::Complete && (!cached || !cached->complete)) return false;
+            if (cached && cached->complete && cached->definition != definition.get()) return false;
+            for (const auto& member : definition->members) work.push_back(member.type.get());
+            definitions.push_back(std::move(definition));
+        }
+        // The layout of a pointer does not depend on its pointee's shape.
+    }
+    return true;
+}
+
 class Builder {
 public:
     Builder(Program& program, const CompilerOptions& options,
             const TargetInfo& target, Diagnostics& diagnostics)
         : program_(program), options_(options), target_(target), diagnostics_(diagnostics) {
+        module_.evaluation_layout_scope = program_.evaluation_layout_scope;
         const auto* abi = find_abi(target_, options_.abi, options_.target);
         if (abi) module_.default_abi = abi->id;
+        // Resolve through the registry: a name shared by several address
+        // models denotes the entry of this target triple.
+        const auto add_abi_name = [&](const std::string& name) {
+            if (const auto* entry = find_abi(target_, name, options_.target))
+                module_.abi_names.emplace(name, entry->id);
+        };
         for (const auto& entry : model_registry().abis()) {
             if (entry.architecture != target_.architecture) continue;
-            module_.abi_names.emplace(entry.canonical_name, entry.id);
-            for (const auto& alias : entry.aliases)
-                module_.abi_names.emplace(alias, entry.id);
+            add_abi_name(entry.canonical_name);
+            for (const auto& alias : entry.aliases) add_abi_name(alias);
         }
         module_.abi_names["default"] = module_.default_abi;
         module_.address_bits = abi && abi->address_bits != 0
@@ -198,42 +239,61 @@ public:
         }
     }
 
-    Module run() {
+    ContinuationTask<Module> run_async() {
         validate_address_spaces();
         collect_record_shells();
-        finish_records();
+        co_await finish_records_async();
+        if (resource_failed()) co_return std::move(module_);
         collect_functions();
+        if (resource_failed()) co_return std::move(module_);
         collect_objects();
-        finish_functions();
+        if (resource_failed()) co_return std::move(module_);
+        co_await finish_functions_async();
+        if (resource_failed()) co_return std::move(module_);
         finish_global_labels();
-        finish_objects();
+        co_await finish_objects_async();
+        if (resource_failed()) co_return std::move(module_);
         finish_symbol_indirections();
-        finish_patch_sink_indices();
+        co_await finish_patch_sink_indices_async();
+        if (resource_failed()) co_return std::move(module_);
         diagnose_symbol_collisions();
-        return std::move(module_);
+        co_return std::move(module_);
     }
 
-    Module constant_context() {
+    ContinuationTask<Module> constant_context_async() {
         collect_record_shells();
-        finish_records();
+        co_await finish_records_async();
+        if (resource_failed()) co_return std::move(module_);
         collect_functions(true);
-        collect_objects();
-        finish_functions();
-        finish_objects();
-        return std::move(module_);
+        if (resource_failed()) co_return std::move(module_);
+        collect_objects(true);
+        if (resource_failed()) co_return std::move(module_);
+        co_await finish_functions_async();
+        if (resource_failed()) co_return std::move(module_);
+        co_await finish_objects_async();
+        co_return std::move(module_);
     }
 
-    Module record_layout_context() {
+    ContinuationTask<Module> record_layout_context_async() {
         collect_record_shells();
-        finish_records();
-        return std::move(module_);
+        co_await finish_records_async();
+        co_return std::move(module_);
     }
 
-    Module required_layout_context(const TypePtr& type) {
+    ContinuationTask<Module> required_layout_context_async(TypePtr type, EvaluationLayoutKind kind) {
+        required_layout_query_ = true;
         collect_record_shells();
-        if (resolve_member_bounds(type, {}))
-            (void)storage_layout(intern_type(type), {});
-        return std::move(module_);
+        // Nested source probes replace the dynamically scoped callback. Keep
+        // this callable alive until its continuation has fully returned.
+        const auto prepare = program_.evaluation_prepare_layout;
+        if (prepare && !(co_await prepare.async(type, kind)))
+            co_return std::move(module_);
+        if (resource_failed()) co_return std::move(module_);
+        if (kind == EvaluationLayoutKind::Alignment)
+            (void)co_await required_alignment_async(type, {});
+        else if (co_await resolve_member_bounds_async(type, {}, true))
+            (void)co_await storage_layout_async(intern_type(type), {});
+        co_return std::move(module_);
     }
 
     void validate_address_spaces() {
@@ -244,14 +304,13 @@ public:
                               SourceLocation fallback) -> void {
             if (!source || !visited.insert(source.get()).second) return;
             if (source->array_bound) retained_bounds.push_back(source->array_bound.get());
+            if (source->vector_bound) retained_bounds.push_back(source->vector_bound.get());
             if (source->pending_address_space) {
                 diagnostics_.error(source->pending_address_space->second,
                                    "address_space requires a pointer declarator");
             }
             if (source->kind == cross::Type::Kind::Pointer) {
-                const auto* entry =
-                    find_address_space(target_, source->address_space);
-                if (!entry || !entry->native_lowering) {
+                if (const auto issue = address_space_type_error(target_, source->address_space)) {
                     const auto location =
                         source->address_space_location.valid()
                             ? source->address_space_location
@@ -262,13 +321,7 @@ public:
                         std::to_string(location.offset) + ':' +
                         std::to_string(source->address_space);
                     if (reported.insert(key).second) {
-                        diagnostics_.error(
-                            location,
-                            "address space " +
-                                std::to_string(source->address_space) +
-                                (entry ? " has no native lowering on target '"
-                                       : " is not registered for target '") +
-                                std::string(target_.architecture) + "'");
+                        diagnostics_.error(location, *issue);
                     }
                 }
                 self(self, source->pointee, fallback);
@@ -278,8 +331,10 @@ public:
             } else if (source->kind == cross::Type::Kind::Function &&
                        source->function) {
                 self(self, source->function->result, fallback);
-                for (const auto& parameter : source->function->parameters)
+                for (const auto& parameter : source->function->parameters) {
                     self(self, parameter.type, parameter.location);
+                    self(self, parameter.declared_array_type, parameter.location);
+                }
             }
         };
         const auto expression = [&](const auto& self,
@@ -302,9 +357,12 @@ public:
             }
         };
         const auto attributes = [&](const std::vector<Attribute>& values) {
-            for (const auto& attribute : values)
+            for (const auto& attribute : values) {
                 expression(expression,
                            attribute.expression_argument.get());
+                for (const auto& binding : attribute.variadic_bindings)
+                    type(type, binding.type, attribute.location);
+            }
         };
         const auto statement = [&](const auto& self,
                                    const Statement* source) -> void {
@@ -346,8 +404,14 @@ public:
             attributes(label.attributes);
         for (const auto& function : program_.functions) {
             type(type, function->return_type, function->location);
-            for (const auto& parameter : function->parameters)
+            for (const auto& requirement : function->required_types) {
+                type(type, requirement.type, requirement.location);
+                type(type, requirement.compatible_with, requirement.location);
+            }
+            for (const auto& parameter : function->parameters) {
                 type(type, parameter.type, parameter.location);
+                type(type, parameter.declared_array_type, parameter.location);
+            }
             for (const auto& parameter : function->generic_parameters)
                 type(type, parameter.value_type, function->location);
             attributes(function->attributes);
@@ -358,6 +422,10 @@ public:
             attributes(object->attributes);
             expression(expression, object->initializer.get());
         }
+        for (const auto& requirement : program_.required_types) {
+            type(type, requirement.type, requirement.location);
+            type(type, requirement.compatible_with, requirement.location);
+        }
         while (!retained_bounds.empty()) {
             const auto* bound = retained_bounds.back();
             retained_bounds.pop_back();
@@ -366,6 +434,85 @@ public:
     }
 
 private:
+    // Object-producing required values must not rebuild the same record graph
+    // through member/initializer services independently of their sizeof view.
+    // A nominal key alone does not identify invocation-private prepared layout.
+    bool share_layout_type(const TypePtr& source) const {
+        return layout_view_matches_records(module_, program_, source, LayoutViewCoverage::PendingAllowed);
+    }
+
+    struct LayoutServiceScope {
+        Program& program;
+        decltype(Program::evaluation_member_layout) member_layout;
+        decltype(Program::evaluation_initializer_plan) initializer_plan;
+        decltype(Program::evaluation_initializer_types) initializer_types;
+
+        LayoutServiceScope(Builder& builder, SourceLocation location)
+            : program(builder.program_), member_layout(std::move(program.evaluation_member_layout)),
+              initializer_plan(std::move(program.evaluation_initializer_plan)),
+              initializer_types(std::move(program.evaluation_initializer_types)) {
+            program.evaluation_member_layout = [&builder, previous = member_layout, location](
+                const TypePtr& owner, const MemberName& name)
+                -> ContinuationTask<std::optional<EvaluationMemberLayout>> {
+                if (builder.resource_failed()) co_return {};
+                if (!builder.share_layout_type(owner)) {
+                    if (previous) co_return co_await previous.async(owner, name);
+                    co_return {};
+                }
+                const auto id = builder.intern_type(owner);
+                if (!(co_await builder.storage_layout_async(id, location)).first) co_return {};
+                if (!builder.share_layout_type(owner)) {
+                    if (previous) co_return co_await previous.async(owner, name);
+                    co_return {};
+                }
+                const auto& type = builder.module_.type(id);
+                if (!type.record) co_return {};
+                const auto* selected = builder.module_.member(*type.record, name);
+                if (!selected) co_return {};
+                co_return EvaluationMemberLayout{selected->offset, selected->alignment,
+                    selected->bit_width, selected->bit_offset};
+            };
+            program.evaluation_initializer_plan = [&builder, previous = initializer_plan, location](
+                const Expr& expression, const TypePtr& destination)
+                -> ContinuationTask<EvaluationInitializerPlan> {
+                if (!builder.resource_failed()) {
+                    if (!builder.share_layout_type(destination)) {
+                        if (previous) co_return co_await previous.async(expression, destination);
+                    } else {
+                        const bool dynamic = destination && destination->kind == cross::Type::Kind::Array &&
+                            !destination->lanes;
+                        const auto& layout_type = dynamic ? destination->element : destination;
+                        const auto id = builder.intern_type(layout_type);
+                        const auto extent = co_await builder.storage_layout_async(id, location);
+                        if (extent.first && builder.share_layout_type(destination))
+                            co_return initializer::build_for_evaluation(expression, destination,
+                                builder.program_, builder.module_, builder.target_);
+                        if (!builder.resource_failed() && previous)
+                            co_return co_await previous.async(expression, destination);
+                    }
+                }
+                co_return EvaluationInitializerPlan{.items = {}, .valid = false,
+                    .error_location = expression.location,
+                    .error_message = "target layout is unavailable for this initializer"};
+            };
+            program.evaluation_initializer_types = [&builder](const Expr& expression,
+                const TypePtr& destination, std::span<const Expr* const> deferred)
+                -> ContinuationTask<EvaluationInitializerTypePlan> {
+                // Type selection copies the registry and uses current source
+                // shapes; it neither requires nor mutates physical layout.
+                co_return initializer::types_for_evaluation(expression, destination,
+                    builder.program_, builder.module_, builder.target_, deferred);
+            };
+        }
+        ~LayoutServiceScope() {
+            program.evaluation_member_layout = std::move(member_layout);
+            program.evaluation_initializer_plan = std::move(initializer_plan);
+            program.evaluation_initializer_types = std::move(initializer_types);
+        }
+        LayoutServiceScope(const LayoutServiceScope&) = delete;
+        LayoutServiceScope& operator=(const LayoutServiceScope&) = delete;
+    };
+
     TypeId intern_type(const TypePtr& source) {
         return module_.intern_type(source);
     }
@@ -384,177 +531,141 @@ private:
         return (value + mask) & ~mask;
     }
 
-    void finish_patch_sink_designator(Expr& expression,
+    ContinuationTask<void> finish_patch_sink_designator_async(Expr& expression,
                                       std::string_view source_namespace) {
-        if (expression.kind == Expr::Kind::Parenthesized &&
-            expression.left) {
-            finish_patch_sink_designator(*expression.left,
-                                         source_namespace);
-            return;
-        }
-        if (expression.kind != Expr::Kind::Binary || !expression.left) {
-            return;
-        }
-        finish_patch_sink_designator(*expression.left, source_namespace);
-        if (expression.text != "index" || !expression.right ||
-            expression.right->evaluated_integer) {
-            return;
-        }
-        const auto layout = [&](const TypePtr& source)
-            -> std::optional<std::pair<std::uint64_t, unsigned>> {
-            const auto id = intern_type(source);
-            const auto& type = module_.type(id);
-            if (type.kind == Type::Kind::Record &&
-                (!type.record ||
-                 !layout_record(*type.record, expression.location))) {
-                return std::nullopt;
+        std::vector<Expr*> indices;
+        auto* selected = &expression;
+        while (!resource_failed()) {
+            if (selected->kind == Expr::Kind::Parenthesized && selected->left) {
+                selected = selected->left.get();
+                continue;
             }
-            const auto result = storage_layout(id, expression.location);
-            return result.first == 0 ? std::nullopt
-                                     : std::optional(result);
-        };
-        const LayoutQuery size_of = [&](const TypePtr& source)
-            -> std::optional<std::uint64_t> {
-            const auto result = layout(source);
-            return result ? std::optional(result->first) : std::nullopt;
-        };
-        const LayoutQuery align_of = [&](const TypePtr& source)
-            -> std::optional<std::uint64_t> {
-            const auto result = layout(source);
-            return result ? std::optional<std::uint64_t>(result->second)
-                          : std::nullopt;
-        };
-        expression.right->evaluated_integer =
-            evaluate_target_integer_constant(
-                program_, *expression.right, diagnostics_, size_of, align_of,
-                source_namespace);
+            if (selected->kind != Expr::Kind::Binary || !selected->left) break;
+            if (selected->text == "index" && selected->right &&
+                !selected->right->evaluated_integer) indices.push_back(selected);
+            selected = selected->left.get();
+        }
+        // The innermost selection is proved first. Do not start an outer proof
+        // after a new resource failure in an inner index/layout dependency.
+        for (auto index = indices.rbegin(); index != indices.rend(); ++index) {
+            if (resource_failed()) co_return;
+            auto& selection = **index;
+            selection.right->evaluated_integer = co_await with_record_layout_async(
+                selection.location, [&](const LayoutQuery& size_of, const LayoutQuery& align_of)
+                    -> ContinuationTask<std::optional<Expr::IntegerConstant>> {
+                    co_return co_await evaluate_target_integer_constant_async(
+                        program_, *selection.right, diagnostics_, size_of, align_of,
+                        source_namespace);
+                });
+        }
     }
 
-    void finish_patch_sink_expression(Expr& expression,
-                                      std::string_view source_namespace) {
+    ContinuationTask<void> finish_patch_sink_expression_async(Expr& expression,
+                                     std::string_view source_namespace) {
+        if (resource_failed()) co_return;
         if (expression.kind == Expr::Kind::Call && expression.left &&
             expression.left->kind == Expr::Kind::Name &&
             expression.left->text == "$::patch" &&
             expression.arguments.size() == 2) {
-            finish_patch_sink_designator(*expression.arguments[1],
+            co_await finish_patch_sink_designator_async(*expression.arguments[1],
                                          source_namespace);
         }
         if (expression.left) {
-            finish_patch_sink_expression(*expression.left,
+            co_await finish_patch_sink_expression_async(*expression.left,
                                          source_namespace);
         }
         if (expression.right) {
-            finish_patch_sink_expression(*expression.right,
+            co_await finish_patch_sink_expression_async(*expression.right,
                                          source_namespace);
         }
         if (expression.third) {
-            finish_patch_sink_expression(*expression.third,
+            co_await finish_patch_sink_expression_async(*expression.third,
                                          source_namespace);
         }
         for (auto& argument : expression.arguments) {
-            finish_patch_sink_expression(*argument, source_namespace);
+            co_await finish_patch_sink_expression_async(*argument, source_namespace);
         }
         for (auto& argument : expression.generic_arguments) {
             if (argument.value) {
-                finish_patch_sink_expression(*argument.value,
+                co_await finish_patch_sink_expression_async(*argument.value,
                                              source_namespace);
             }
         }
         for (auto& entry : expression.initializer_entries) {
             for (auto& designator : entry.designators) {
                 if (designator.index) {
-                    finish_patch_sink_expression(*designator.index,
+                    co_await finish_patch_sink_expression_async(*designator.index,
                                                  source_namespace);
                 }
             }
             if (entry.value) {
-                finish_patch_sink_expression(*entry.value,
+                co_await finish_patch_sink_expression_async(*entry.value,
                                              source_namespace);
             }
         }
     }
 
-    void finish_patch_sink_statement(Statement& statement,
-                                     std::string_view source_namespace) {
+    ContinuationTask<void> finish_patch_sink_statement_async(Statement& statement,
+                                    std::string_view source_namespace) {
+        if (resource_failed()) co_return;
         for (auto& child : statement.statements) {
-            finish_patch_sink_statement(*child, source_namespace);
+            co_await finish_patch_sink_statement_async(*child, source_namespace);
         }
         if (statement.declaration) {
             if (statement.declaration->dynamic_array_bound) {
-                finish_patch_sink_expression(
+                co_await finish_patch_sink_expression_async(
                     *statement.declaration->dynamic_array_bound,
                     source_namespace);
             }
             if (statement.declaration->initializer) {
-                finish_patch_sink_expression(
+                co_await finish_patch_sink_expression_async(
                     *statement.declaration->initializer, source_namespace);
             }
         }
         if (statement.expression) {
-            finish_patch_sink_expression(*statement.expression,
+            co_await finish_patch_sink_expression_async(*statement.expression,
                                          source_namespace);
         }
         if (statement.condition) {
-            finish_patch_sink_expression(*statement.condition,
+            co_await finish_patch_sink_expression_async(*statement.condition,
                                          source_namespace);
         }
         if (statement.increment) {
-            finish_patch_sink_expression(*statement.increment,
+            co_await finish_patch_sink_expression_async(*statement.increment,
                                          source_namespace);
         }
         if (statement.first) {
-            finish_patch_sink_statement(*statement.first, source_namespace);
+            co_await finish_patch_sink_statement_async(*statement.first, source_namespace);
         }
         if (statement.second) {
-            finish_patch_sink_statement(*statement.second, source_namespace);
+            co_await finish_patch_sink_statement_async(*statement.second, source_namespace);
         }
     }
 
-    void finish_patch_sink_indices() {
-        for (auto& function : program_.functions) {
+    ContinuationTask<void> finish_patch_sink_indices_async() {
+        for (std::size_t index = 0; index < program_.functions.size(); ++index) {
+            if (resource_failed()) co_return;
+            const auto* function = program_.functions[index].get();
+            const auto name_space = function->source_namespace;
             if (function->body) {
-                finish_patch_sink_statement(*function->body,
-                                            function->source_namespace);
+                co_await finish_patch_sink_statement_async(*function->body, name_space);
             }
         }
     }
 
-    unsigned parse_alignment(const std::vector<Attribute>& attributes,
-                             std::string_view subject,
-                             std::string_view source_namespace) {
+    ContinuationTask<unsigned> parse_alignment_async(const std::vector<Attribute>& attributes,
+                             std::string_view subject, std::string_view source_namespace) {
         unsigned result = 1;
         for (const auto& attribute : attributes) {
+            if (resource_failed()) co_return result;
             if (attribute.name != "aligned") continue;
-            const auto layout = [&](const TypePtr& source)
-                -> std::optional<std::pair<std::uint64_t, unsigned>> {
-                const auto id = intern_type(source);
-                const auto& type = module_.type(id);
-                if (type.kind == Type::Kind::Record &&
-                    (!type.record ||
-                     !layout_record(*type.record, attribute.location))) {
-                    return std::nullopt;
-                }
-                const auto resolved = storage_layout(id, attribute.location);
-                return resolved.first == 0 ? std::nullopt
-                                           : std::optional(resolved);
-            };
-            const LayoutQuery size_of = [&](const TypePtr& source)
-                -> std::optional<std::uint64_t> {
-                const auto resolved = layout(source);
-                return resolved ? std::optional(resolved->first) : std::nullopt;
-            };
-            const LayoutQuery align_of = [&](const TypePtr& source)
-                -> std::optional<std::uint64_t> {
-                const auto resolved = layout(source);
-                return resolved ? std::optional<std::uint64_t>(resolved->second)
-                                : std::nullopt;
-            };
-            const auto value = evaluate_alignment_attribute(
-                program_, attribute, diagnostics_, size_of, align_of,
-                subject, source_namespace);
+            const auto [size_of, align_of] = record_layout_queries(attribute.location);
+            LayoutServiceScope services(*this, attribute.location);
+            const auto value = co_await evaluate_alignment_attribute_async(
+                program_, attribute, diagnostics_, size_of, align_of, subject, source_namespace);
             if (value) result = std::max(result, *value);
         }
-        return result;
+        co_return result;
     }
 
     void parse_symbol_attributes(
@@ -725,57 +836,60 @@ private:
         }
     }
 
-    std::pair<std::uint64_t, unsigned> storage_layout(TypeId id,
+    ContinuationTask<std::pair<std::uint64_t, unsigned>> storage_layout_async(TypeId id,
                                                        SourceLocation location) {
+        if (resource_failed()) co_return {0, 1};
         const auto type = module_.type(id);
         if (type.kind == Type::Kind::Pointer) {
-            return {address_bytes_, std::max(
+            co_return {address_bytes_, std::max(
                                        1U, std::min(address_bytes_,
                                                     target_.data_layout
                                                         .natural_alignment_limit))};
         }
         if (type.kind == Type::Kind::Record) {
-            if (!type.record || !layout_record(*type.record, location)) {
-                return {0, 1};
+            if (!type.record || !(co_await layout_record_async(*type.record, location))) {
+                co_return {0, 1};
             }
             const auto& record = module_.record(*type.record);
-            return {record.size, record.alignment};
+            co_return {record.size, record.alignment};
         }
         if (type.kind == Type::Kind::Array) {
             if (!type.element || type.lanes == 0) {
                 diagnostics_.error(location,
                                    "record member cannot have variable-length or incomplete array type");
-                return {0, 1};
+                co_return {0, 1};
             }
             const auto [element_size, element_alignment] =
-                storage_layout(*type.element, location);
+                (co_await storage_layout_async(*type.element, location));
+            if (resource_failed()) co_return {0, element_alignment};
             if (element_size == 0 ||
                 type.lanes > std::numeric_limits<std::uint64_t>::max() /
                                  element_size) {
                 diagnostics_.error(location,
                                    "record member array size overflows target storage");
-                return {0, element_alignment};
+                co_return {0, element_alignment};
             }
-            return {element_size * type.lanes, element_alignment};
+            co_return {element_size * type.lanes, element_alignment};
         }
         if (type.kind == Type::Kind::Vector) {
             if (type.scalable || !type.element || type.lanes == 0) {
                 diagnostics_.error(location,
                                    "record member cannot have scalable or incomplete vector type");
-                return {0, 1};
+                co_return {0, 1};
             }
             const auto [element_size, unused] =
-                storage_layout(*type.element, location);
+                (co_await storage_layout_async(*type.element, location));
+            if (resource_failed()) co_return {0, 1};
             (void)unused;
             if (element_size == 0 ||
                 type.lanes > std::numeric_limits<std::uint64_t>::max() /
                                  element_size) {
                 diagnostics_.error(location,
                                    "record member vector size overflows target storage");
-                return {0, 1};
+                co_return {0, 1};
             }
             const auto size = element_size * type.lanes;
-            return {size, std::max(
+            co_return {size, std::max(
                               1U, std::min(
                                       static_cast<unsigned>(std::min<
                                           std::uint64_t>(
@@ -788,7 +902,7 @@ private:
             type.builtin == BuiltinType::Void) {
             diagnostics_.error(location,
                                "record member has an incomplete or non-object type");
-            return {0, 1};
+            co_return {0, 1};
         }
         std::uint64_t size{};
         switch (type.builtin) {
@@ -822,136 +936,179 @@ private:
                                                  static_cast<unsigned>(size),
                                                  target_.data_layout
                                                      .natural_alignment_limit));
-        return {size, alignment};
+        co_return {size, alignment};
     }
 
-    bool set_bit_field_width(RecordMember& member,
+    ContinuationTask<std::optional<unsigned>> required_alignment_async(TypePtr source, SourceLocation location) {
+        if (resource_failed()) co_return std::nullopt;
+        if (!source) co_return {};
+        const auto prepare_type = program_.evaluation_prepare_type;
+        if (prepare_type &&
+            !(co_await prepare_type.async(source, EvaluationLayoutKind::Alignment))) co_return {};
+        // Array counts and pointee layouts do not determine alignment.
+        if (source->kind == cross::Type::Kind::Array)
+            co_return (co_await required_alignment_async(source->element, location));
+        const auto id = intern_type(source);
+        if (source->kind != cross::Type::Kind::Record) {
+            if (source->kind == cross::Type::Kind::Vector && !(co_await resolve_member_bounds_async(source, {}))) co_return {};
+            const auto value = layout_alignment(module_, intern_type(source), target_);
+            co_return value ? std::optional<unsigned>{static_cast<unsigned>(*value)} : std::nullopt;
+        }
+        const auto record_id = *module_.type(id).record;
+        if (module_.record(record_id).alignment_complete) co_return module_.record(record_id).alignment;
+        const auto key = source->nominal_key();
+        if (!alignment_active_.insert(key).second) {
+            diagnostics_.error(location, "record alignment depends on itself");
+            co_return {};
+        }
+        struct Pop {
+            std::unordered_set<NominalTypeKey, NominalTypeKeyHash>& active;
+            NominalTypeKey key;
+            ~Pop() { active.erase(key); }
+        } pop{alignment_active_, key};
+        const auto definition = record_definition(program_, key, module_.source_records);
+        if (!definition) {
+            diagnostics_.error(location, "incomplete record type cannot provide alignment");
+            co_return {};
+        }
+        if (const auto error = record_source_error(*definition, program_, module_.source_records,
+                &record_source_proofs_)) {
+            diagnostics_.error(error->location, error->message);
+            co_return {};
+        }
+        const auto errors = diagnostics_.errors();
+        const bool packed = parse_packed(definition->attributes, "a record definition");
+        const auto name_space = source_namespace(definition->name);
+        unsigned alignment = (co_await parse_alignment_async(definition->attributes, "a record definition", name_space));
+        for (const auto& member : definition->members) {
+            if (resource_failed()) co_return std::nullopt;
+            const bool member_packed = parse_packed(member.attributes, "a record member");
+            const auto requested = (co_await parse_alignment_async(member.attributes, "a record member", name_space));
+            const auto natural = (co_await required_alignment_async(member.type, member.location));
+            if (!natural) co_return {};
+            // This is the same placement-alignment rule as full layout. Width,
+            // including a zero-width field, does not change that rule.
+            alignment = std::max(alignment, std::max(requested, packed || member_packed ? 1U : *natural));
+        }
+        if (resource_failed() || diagnostics_.errors() != errors) co_return {};
+        auto& record = module_.record(record_id);
+        record.definition = definition.get();
+        record.retained_definition = definition;
+        record.alignment = alignment;
+        record.alignment_complete = true;
+        co_return alignment;
+    }
+
+    ContinuationTask<bool> set_bit_field_width_async(RecordMember& member,
                              const Expr::IntegerConstant& width,
                              SourceLocation location) {
-        const auto width_type = width.type;
-        const bool signed_width =
-            width_type == BuiltinType::I8 ||
-            width_type == BuiltinType::I16 ||
-            width_type == BuiltinType::I32 ||
-            width_type == BuiltinType::I64 ||
-            width_type == BuiltinType::I128 ||
-            width_type == BuiltinType::Iptr;
-        auto width_bits = type_bits(builtin_type(width_type));
-        if (width_type == BuiltinType::Iptr ||
-            width_type == BuiltinType::Uptr) {
-            width_bits = module_.address_bits;
-        }
-        const bool negative =
-            signed_width && width_bits != 0 &&
-            (shift_right(width.value, width_bits - 1).low & 1U) != 0;
-        const auto storage_bits = static_cast<unsigned>(
-            storage_layout(member.type, location).first * 8U);
-        if (negative || width.value.high != 0) {
-            diagnostics_.error(location,
-                               "bit-field width must be nonnegative");
-            return false;
-        }
-        if (width.value.low > storage_bits) {
-            diagnostics_.error(location,
-                               "bit-field width exceeds its base type");
-            return false;
+        const auto storage_bits = (co_await storage_layout_async(member.type, location)).first * 8U;
+        if (resource_failed()) co_return false;
+        if (const auto* error = bit_field_width_error(width, module_.address_bits,
+                                                     storage_bits, !member.name.empty())) {
+            diagnostics_.error(location, error);
+            co_return false;
         }
         member.bit_width = static_cast<unsigned>(width.value.low);
-        if (*member.bit_width == 0 && !member.name.empty()) {
-            diagnostics_.error(location,
-                               "a zero-width bit-field must be unnamed");
-            return false;
-        }
-        return true;
+        co_return true;
+    }
+
+    std::pair<LayoutQuery, LayoutQuery> record_layout_queries(SourceLocation location) {
+        LayoutQuery size_of = [this, location](const TypePtr& source)
+            -> ContinuationTask<std::optional<std::uint64_t>> {
+            const auto result = co_await storage_layout_async(intern_type(source), location);
+            if (!result.first) co_return std::nullopt;
+            co_return result.first;
+        };
+        LayoutQuery align_of = [this, location](const TypePtr& source)
+            -> ContinuationTask<std::optional<std::uint64_t>> {
+            const auto result = co_await required_alignment_async(source, location);
+            if (!result) co_return std::nullopt;
+            co_return *result;
+        };
+        return {std::move(size_of), std::move(align_of)};
     }
 
     template<class Evaluate>
-    auto with_record_layout(SourceLocation location, Evaluate&& evaluate) {
-        const auto layout = [&](const TypePtr& source)
-            -> std::optional<std::pair<std::uint64_t, unsigned>> {
-            const auto id = intern_type(source);
-            const auto& type = module_.type(id);
-            if (type.kind == Type::Kind::Record &&
-                (!type.record ||
-                 !layout_record(*type.record, location))) {
-                return std::nullopt;
-            }
-            const auto result = storage_layout(id, location);
-            return result.first == 0 ? std::nullopt
-                                     : std::optional(result);
-        };
-        const LayoutQuery size_of = [&](const TypePtr& source)
-            -> std::optional<std::uint64_t> {
-            const auto result = layout(source);
-            return result ? std::optional(result->first) : std::nullopt;
-        };
-        const LayoutQuery align_of = [&](const TypePtr& source)
-            -> std::optional<std::uint64_t> {
-            const auto result = layout(source);
-            return result ? std::optional<std::uint64_t>(result->second)
-                          : std::nullopt;
-        };
-        return evaluate(size_of, align_of);
+    auto with_record_layout_async(SourceLocation location, Evaluate evaluate)
+        -> std::invoke_result_t<Evaluate, const LayoutQuery&, const LayoutQuery&> {
+        const auto [size_of, align_of] = record_layout_queries(location);
+        LayoutServiceScope services(*this, location);
+        co_return co_await evaluate(size_of, align_of);
     }
 
-    bool resolve_bit_field_width(RecordMember& member,
+    ContinuationTask<bool> resolve_bit_field_width_async(RecordMember& member,
                                  std::string_view source_namespace) {
-        if (!member.pending_bit_width) return member.bit_width.has_value();
+        if (resource_failed()) co_return false;
+        if (!member.pending_bit_width) co_return member.bit_width.has_value();
         const auto* expression = member.pending_bit_width;
         member.pending_bit_width = nullptr;
-        const auto evaluated = with_record_layout(expression->location,
-            [&](const LayoutQuery& size_of, const LayoutQuery& align_of) {
-                return evaluate_target_integer_constant(program_, *expression, diagnostics_,
+        const auto evaluated = co_await with_record_layout_async(expression->location,
+            [&](const LayoutQuery& size_of, const LayoutQuery& align_of) -> ContinuationTask<std::optional<Expr::IntegerConstant>> {
+                co_return co_await evaluate_target_integer_constant_async(program_, *expression, diagnostics_,
                     size_of, align_of, source_namespace);
             });
-        return evaluated &&
-               set_bit_field_width(member, *evaluated, member.location);
+        co_return evaluated &&
+               (co_await set_bit_field_width_async(member, *evaluated, member.location));
     }
 
-    bool resolve_member_bounds(const TypePtr& type, std::string_view name_space) {
-        if (!type) return true;
-        bool valid = resolve_member_bounds(type->element, name_space);
-        valid = resolve_member_bounds(type->pointee, name_space) && valid;
+    ContinuationTask<bool> resolve_member_bounds_async(TypePtr type, std::string_view name_space, bool layout_only = false) {
+        if (resource_failed()) co_return false;
+        if (!type) co_return true;
+        if (layout_only && (type->kind == cross::Type::Kind::Pointer || type->kind == cross::Type::Kind::Function)) co_return true;
+        bool valid = (co_await resolve_member_bounds_async(type->element, name_space, layout_only));
+        valid = (co_await resolve_member_bounds_async(type->pointee, name_space, layout_only)) && valid;
         if (type->function) {
-            valid = resolve_member_bounds(type->function->result, name_space) && valid;
-            for (const auto& parameter : type->function->parameters)
-                valid = resolve_member_bounds(parameter.type, name_space) && valid;
+            valid = (co_await resolve_member_bounds_async(type->function->result, name_space)) && valid;
+            for (const auto& parameter : type->function->parameters) {
+                valid = (co_await resolve_member_bounds_async(parameter.type, name_space)) && valid;
+                valid = (co_await resolve_member_bounds_async(parameter.declared_array_type, name_space)) && valid;
+            }
         }
         if (type->array_bound && type->lanes == 0) {
             const auto expression = type->array_bound;
-            const auto bound = with_record_layout(expression->location,
-                [&](const LayoutQuery& size_of, const LayoutQuery& align_of) {
-                    return evaluate_fixed_array_bound(program_, *expression, diagnostics_,
+            const auto bound = co_await with_record_layout_async(expression->location,
+                [&](const LayoutQuery& size_of, const LayoutQuery& align_of) -> ContinuationTask<std::optional<std::uint32_t>> {
+                    co_return co_await evaluate_fixed_array_bound_async(program_, *expression, diagnostics_,
                         size_of, align_of, name_space);
                 });
-            if (!bound) return false;
+            if (!bound) co_return false;
             type->lanes = *bound;
         }
-        return valid;
+        if (type->vector_bound && type->lanes == 0) {
+            const auto expression = type->vector_bound;
+            valid = (co_await with_record_layout_async(expression->location,
+                [&](const LayoutQuery& size_of, const LayoutQuery& align_of) -> ContinuationTask<bool> {
+                    co_return co_await resolve_vector_bound_async(program_, type, diagnostics_, size_of, align_of, name_space);
+                })) && valid;
+        }
+        co_return valid;
     }
 
-    bool layout_record(RecordId id, SourceLocation use_location) {
+    ContinuationTask<bool> layout_record_async(RecordId id, SourceLocation use_location) {
+        if (resource_failed()) co_return false;
         if (id.value >= layout_state_.size()) {
             layout_state_.resize(module_.records.size());
         }
-        if (layout_state_[id.value] == 2) return true;
-        if (layout_state_[id.value] == 3) return false;
+        if (layout_state_[id.value] == 2) co_return true;
+        if (layout_state_[id.value] == 3) co_return false;
         if (layout_state_[id.value] == 1) {
             diagnostics_.error(
                 use_location,
                 "record contains itself by value through a member cycle");
-            return false;
+            co_return false;
         }
         const auto key = module_.record(id).source_key;
         auto type = record_type(key.name, module_.record(id).is_union);
         type->nominal_identity = key.identity;
-        if (program_.evaluation_prepare_type && !program_.evaluation_prepare_type(type)) return false;
+        const auto prepare_type = program_.evaluation_prepare_type;
+        if (prepare_type &&
+            !(co_await prepare_type.async(type, EvaluationLayoutKind::Complete))) co_return false;
         // Preparation can publish generic definitions and relocate the source
         // vector. Refresh this pointer from its typed nominal key, not spelling.
-        const RecordDecl* definition = nullptr;
-        for (const auto& source : program_.records)
-            if (source.complete && source.nominal_key() == key) { definition = &source; break; }
-        module_.record(id).definition = definition;
+        auto definition = record_definition(program_, key, module_.source_records);
+        module_.record(id).definition = definition.get();
+        module_.record(id).retained_definition = std::move(definition);
         // A required layout expression may intern an implicit pointer tag and
         // grow the record table. Work on a detached record, then publish by ID;
         // neither the record nor its member references may dangle across queries.
@@ -961,11 +1118,18 @@ private:
                 use_location,
                 "incomplete record type '" + record.source_name +
                     "' cannot be used as an object or member");
-            return false;
+            co_return false;
+        }
+        if (const auto error = record_source_error(*record.definition, program_, module_.source_records,
+                &record_source_proofs_)) {
+            diagnostics_.error(error->location, error->message);
+            layout_state_[id.value] = 3;
+            co_return false;
         }
         layout_state_[id.value] = 1;
         const auto errors = diagnostics_.errors();
-        prepare_record(record);
+        co_await prepare_record_async(record);
+        if (resource_failed()) { layout_state_[id.value] = 3; co_return false; }
         std::uint64_t extent{};
         unsigned record_alignment = 1;
         bool valid = diagnostics_.errors() == errors;
@@ -985,8 +1149,9 @@ private:
         std::uint64_t next_bit{};
         const auto current_namespace = source_namespace(record.source_name);
         for (auto& member : record.members) {
+            if (resource_failed()) { layout_state_[id.value] = 3; co_return false; }
             if (member.pending_source_type) {
-                if (!resolve_member_bounds(member.pending_source_type, current_namespace)) {
+                if (!(co_await resolve_member_bounds_async(member.pending_source_type, current_namespace, required_layout_query_))) {
                     valid = false;
                     member.pending_source_type.reset();
                     continue;
@@ -996,11 +1161,12 @@ private:
                 validate_atomic_type(member.type, member.location);
             }
             if (member.pending_bit_width &&
-                !resolve_bit_field_width(member, current_namespace)) {
+                !(co_await resolve_bit_field_width_async(member, current_namespace))) {
                 valid = false;
             }
             const auto [size, natural_alignment] =
-                storage_layout(member.type, member.location);
+                (co_await storage_layout_async(member.type, member.location));
+            if (resource_failed()) { layout_state_[id.value] = 3; co_return false; }
             if (size == 0) valid = false;
             const auto requested_alignment = member.alignment;
             const auto placement_alignment =
@@ -1211,10 +1377,11 @@ private:
         record.size = rounded.value_or(0);
         module_.record(id) = std::move(record);
         layout_state_[id.value] = valid ? 2 : 3;
-        return valid;
+        co_return valid;
     }
 
-    void prepare_record(Record& record) {
+    ContinuationTask<void> prepare_record_async(Record& record) {
+        if (resource_failed()) co_return;
         const auto* definition = record.definition;
         const auto attributes = definition->attributes;
         // Member buffers and expression allocations survive RecordDecl vector
@@ -1226,44 +1393,19 @@ private:
         record.packed = parse_packed(attributes,
                                      "a record definition");
         record.explicit_alignment =
-            parse_alignment(attributes,
+            co_await parse_alignment_async(attributes,
                             "a record definition",
                             source_namespace(record.source_name));
-        if (members.empty()) {
-            diagnostics_.error(record.location,
-                               "a complete record requires at least one member");
-        }
-        std::unordered_set<std::string> names;
         for (const auto* descriptor : members) {
+            if (resource_failed()) co_return;
             const auto& source = *descriptor;
-            if (!source.name.empty() &&
-                !names.insert(source.name).second) {
-                diagnostics_.error(
-                    source.location,
-                    "duplicate record member '" + source.name + "'");
-                continue;
-            }
             RecordMember member;
             member.location = source.location;
             member.name = source.name;
+            member.fresh = source.fresh;
             member.type = intern_type(source.type);
             member.pending_source_type = source.type;
             if (source.bit_width) {
-                const auto& type = module_.type(member.type);
-                bool valid_base = true;
-                if (type.kind != Type::Kind::Builtin ||
-                    type.builtin < BuiltinType::Bool ||
-                    type.builtin > BuiltinType::Uptr) {
-                    diagnostics_.error(
-                        source.location,
-                        "bit-field base type must be bool, an integer, or an enumeration");
-                    valid_base = false;
-                } else if (type.is_atomic) {
-                    diagnostics_.error(
-                        source.location,
-                        "a bit-field cannot have atomic type");
-                    valid_base = false;
-                }
                 const auto* width = source.bit_width.get();
                 while (width &&
                        width->kind == Expr::Kind::Parenthesized &&
@@ -1274,34 +1416,41 @@ private:
                     diagnostics_.error(
                         source.location,
                         "bit-field width must be a nonnegative integer constant expression");
-                } else if (valid_base && width->evaluated_integer) {
-                    (void)set_bit_field_width(
+                } else if (width->evaluated_integer) {
+                    (void)co_await set_bit_field_width_async(
                         member, *width->evaluated_integer,
                         source.location);
-                } else if (valid_base) {
+                } else {
                     member.pending_bit_width = width;
                 }
             }
             member.packed = parse_packed(source.attributes,
                                          "a record member");
-            member.alignment = parse_alignment(source.attributes,
+            member.alignment = co_await parse_alignment_async(source.attributes,
                                                "a record member",
                                                source_namespace(record.source_name));
             record.members.push_back(std::move(member));
         }
+        co_return;
     }
 
-    void finish_records() {
+    ContinuationTask<void> finish_records_async() {
         for (std::size_t index = 0; index < module_.records.size(); ++index) {
+            if (resource_failed()) co_return;
+            const auto& key = module_.records[index].source_key;
+            if (key.identity && std::find(program_.translation_only_record_scopes.begin(),
+                    program_.translation_only_record_scopes.end(), key.identity->function_scope) !=
+                    program_.translation_only_record_scopes.end()) continue;
             if (module_.records[index].definition) {
-                (void)layout_record(
+                (void)co_await layout_record_async(
                     RecordId{static_cast<std::uint32_t>(index)},
                     module_.records[index].location);
             }
         }
     }
 
-    void validate_atomic_type(TypeId id, SourceLocation location) {
+    void validate_atomic_type(TypeId id, SourceLocation location,
+                              bool pending_outer_bound = false) {
         const auto& type = module_.type(id);
         if (type.kind == Type::Kind::Function) {
             if (!type.function || !type.function->abi.valid()) {
@@ -1352,7 +1501,7 @@ private:
             return;
         }
         if (type.kind == Type::Kind::Array) {
-            if (!type.element || type.lanes == 0) {
+            if (!type.element || (type.lanes == 0 && !pending_outer_bound && !required_layout_query_)) {
                 diagnostics_.error(location,
                                    "array type requires a positive fixed bound");
             } else {
@@ -1460,7 +1609,7 @@ private:
         return true;
     }
 
-    Function make_function(const FunctionDecl& declaration) {
+    Function make_function(const FunctionDecl& declaration, bool validate_layout = true) {
         Function function;
         function.id = {static_cast<std::uint32_t>(module_.functions.size())};
         function.location = declaration.location;
@@ -1468,7 +1617,7 @@ private:
         function.source_unit = declaration.source_unit;
         function.linkage = declaration.linkage;
         function.result_type = intern_type(declaration.return_type);
-        validate_atomic_type(function.result_type, declaration.location);
+        if (validate_layout) validate_atomic_type(function.result_type, declaration.location);
         if (module_.type(function.result_type).is_atomic) {
             diagnostics_.error(declaration.location,
                                "a function result cannot be atomic-qualified");
@@ -1477,16 +1626,17 @@ private:
         function.variadic = declaration.variadic;
         for (const auto& parameter : declaration.parameters) {
             const auto type = intern_type(parameter.type);
-            validate_atomic_type(type, parameter.location);
+            if (validate_layout) validate_atomic_type(type, parameter.location);
             function.parameters.push_back({parameter.location, parameter.name,
                                            type, parameter.mode,
-                                           parameter.location_name});
+                                           parameter.location_name, parameter.binding});
         }
         return function;
     }
 
     void collect_functions(bool skip_templates = false) {
         for (const auto& source : program_.functions) {
+            if (resource_failed()) return;
             if (skip_templates && !source->generic_parameters.empty()) continue;
             const auto key = entity_key(source->linkage, source->source_unit, source->name);
             const auto found = function_keys_.find(key);
@@ -1494,7 +1644,12 @@ private:
             if (found == function_keys_.end()) {
                 id = {static_cast<std::uint32_t>(module_.functions.size())};
                 function_keys_.emplace(key, id);
-                module_.functions.push_back(make_function(*source));
+                // A constant-address context retains helper names/signatures
+                // for source lookup, not runtime layout or transport. Its
+                // translation-only extents may still require an invocation;
+                // the source validator checks their constraints before erasure.
+                const bool translation_only = source->attribute("eval_only") || source->has_meta_signature();
+                module_.functions.push_back(make_function(*source, !skip_templates || !translation_only));
             } else {
                 id = found->second;
                 auto& canonical = module_.function(id);
@@ -1518,8 +1673,9 @@ private:
         }
     }
 
-    void finish_functions() {
+    ContinuationTask<void> finish_functions_async() {
         for (auto& function : module_.functions) {
+            if (resource_failed()) co_return;
             for (const auto* declaration : function.declarations) {
                 if (declaration->definition()) continue;
                 for (const auto& attribute : declaration->attributes) {
@@ -1548,7 +1704,7 @@ private:
             for (const auto& parameter : representative->parameters) {
                 function.parameters.push_back({parameter.location, parameter.name,
                                                intern_type(parameter.type), parameter.mode,
-                                               parameter.location_name});
+                                               parameter.location_name, parameter.binding});
             }
 
             const auto abi_text = decode_attribute_string(representative->attribute("abi"));
@@ -1624,64 +1780,39 @@ private:
                 if (variadic_attributes != 0 && selected_abi &&
                     variadic_attribute) {
                     const auto* attribute = variadic_attribute;
-                    std::unordered_set<std::string> names;
+                    NameSet names;
                     std::unordered_set<std::string> states;
-                    for (std::size_t argument_index = 0;
-                         argument_index < attribute->arguments.size(); ++argument_index) {
-                        const auto& argument = attribute->arguments[argument_index];
-                        const auto quote = argument.find('"');
-                        const auto decoded = quote == std::string::npos
-                            ? std::optional<std::string>{}
-                            : decode_string_literal(
-                                  std::string_view(argument).substr(quote));
-                        if (!decoded) {
-                            diagnostics_.error(
-                                attribute->location,
-                                "variadic binding must end in a state-name string");
-                            continue;
-                        }
+                    for (const auto& declaration : attribute->variadic_bindings) {
                         const auto state = std::find_if(
                             selected_abi->variadic_states.begin(),
                             selected_abi->variadic_states.end(),
                             [&](const AbiVariadicState& candidate) {
-                                return candidate.canonical_name == *decoded;
+                                return candidate.canonical_name == declaration.state;
                             });
                         if (state == selected_abi->variadic_states.end()) {
                             diagnostics_.error(
-                                attribute->location,
-                                "unknown variadic ABI state '" + *decoded + "'");
+                                declaration.location,
+                                "unknown variadic ABI state '" + declaration.state + "'");
                             continue;
                         }
-                        const auto prefix = std::string_view(argument).substr(0, quote);
-                        if (!prefix.starts_with(state->type)) {
+                        const auto type = variadic_state_type(state->type);
+                        if (!type || !same_type(type, declaration.type)) {
                             diagnostics_.error(
-                                attribute->location,
-                                "variadic state '" + *decoded +
+                                declaration.location,
+                                "variadic state '" + declaration.state +
                                     "' requires binding type '" + state->type + "'");
                             continue;
                         }
-                        const auto name = prefix.substr(state->type.size());
-                        const auto type = variadic_state_type(state->type);
-                        if (!type || !source_identifier(name)) {
+                        VariadicBinding binding{declaration.location, declaration.name,
+                            intern_type(declaration.type), state->id, declaration.binding};
+                        if (!names.insert(name_key(binding)).second ||
+                            !states.insert(declaration.state).second) {
                             diagnostics_.error(
-                                attribute->location,
-                                "invalid variadic state binding declaration");
-                            continue;
-                        }
-                        if (!names.insert(std::string(name)).second ||
-                            !states.insert(*decoded).second) {
-                            diagnostics_.error(
-                                attribute->location,
+                                declaration.location,
                                 "duplicate variadic state binding");
                             continue;
                         }
-                        const auto name_location = argument_index < attribute->variadic_names.size() &&
-                                attribute->variadic_names[argument_index].name == name
-                            ? attribute->variadic_names[argument_index].location
-                            : attribute->location;
-                        function.variadic_bindings.push_back(
-                            {name_location, std::string(name),
-                             intern_type(type), state->id});
+                        function.variadic_bindings.push_back(std::move(binding));
                     }
                 }
             } else if (variadic_attributes != 0) {
@@ -1694,7 +1825,7 @@ private:
                 function.section = section;
             }
             if (function.definition) {
-                function.minimum_alignment = parse_alignment(
+                function.minimum_alignment = co_await parse_alignment_async(
                     function.definition->attributes, "function definition",
                     function.definition->source_namespace);
             }
@@ -1829,7 +1960,19 @@ private:
 
     void collect_labels(Function& function, const Statement& statement) {
         if (statement.kind == Statement::Kind::Label) {
-            if (module_.label(function.id, statement.label_name)) {
+            const auto label_location = statement.label_location.valid()
+                ? statement.label_location : statement.location;
+            NameLookupContext context;
+            context.label_binding = statement.label_binding;
+            NameUse name(statement.label_name, label_location);
+            name.context = &context;
+            const bool public_collision = std::any_of(function.labels.begin(), function.labels.end(),
+                [&](LabelId id) {
+                    const auto& existing = module_.labels.at(id.value);
+                    return (statement.global_label || existing.is_global) &&
+                           existing.source_name == statement.label_name;
+                });
+            if (public_collision || module_.label(function.id, name)) {
                 diagnostics_.error(statement.location,
                                    "duplicate label '" + statement.label_name + "'");
             } else {
@@ -1862,7 +2005,8 @@ private:
                 module_.labels.push_back(
                     {id, function.id, statement.location,
                      statement.label_name, qualified, std::move(symbol), {},
-                     &statement, statement.global_label});
+                     &statement, statement.global_label,
+                     NameKey{statement.label_name, label_location}, statement.label_binding});
                 function.labels.push_back(id);
             }
         }
@@ -1906,9 +2050,7 @@ private:
             if (owner_fresh || label_fresh) {
                 const auto split = qualified_name.rfind("::");
                 if (split != std::string_view::npos) {
-                    model_name = owner_fresh
-                        ? fresh_identifier_link_stem(*owner_fresh)
-                        : std::string(qualified_name.substr(0, split));
+                    model_name = model_entity_name(qualified_name.substr(0, split), owner_fresh);
                     model_name += "::";
                     model_name += label_fresh
                         ? fresh_identifier_link_stem(*label_fresh)
@@ -2006,7 +2148,7 @@ private:
                 {id, function->id, declaration.location,
                  declaration.qualified_name.substr(split + 2),
                  declaration.qualified_name, symbol, {&declaration}, nullptr,
-                 true});
+                 true, NameKey{declaration.qualified_name.substr(split + 2)}, {}});
         }
     }
 
@@ -2031,7 +2173,7 @@ private:
         }
     }
 
-    Object make_object(const ObjectDecl& declaration) {
+    Object make_object(const ObjectDecl& declaration, bool allow_inferred_bounds) {
         Object object;
         object.id = {static_cast<std::uint32_t>(module_.objects.size())};
         object.location = declaration.location;
@@ -2039,20 +2181,28 @@ private:
         object.source_unit = declaration.source_unit;
         object.linkage = declaration.linkage;
         object.type = intern_type(declaration.type);
-        validate_atomic_type(object.type, declaration.location);
+        // A symbolic-address query may precede byte/brace initializer
+        // materialization elsewhere in the input. Keep that array's identity
+        // and element type without inventing an extent. Layout queries still
+        // return unavailable, and final HIR requires the completed bound.
+        const bool pending_bound = allow_inferred_bounds && declaration.initializer &&
+            declaration.type && declaration.type->kind == cross::Type::Kind::Array &&
+            declaration.type->lanes == 0 && !declaration.type->array_bound;
+        validate_atomic_type(object.type, declaration.location, pending_bound);
         (void)complete_object_type(object.type, declaration.location);
         return object;
     }
 
-    void collect_objects() {
+    void collect_objects(bool allow_inferred_bounds = false) {
         for (const auto& source : program_.objects) {
+            if (resource_failed()) return;
             const auto key = entity_key(source->linkage, source->source_unit, source->name);
             const auto found = object_keys_.find(key);
             ObjectId id;
             if (found == object_keys_.end()) {
                 id = {static_cast<std::uint32_t>(module_.objects.size())};
                 object_keys_.emplace(key, id);
-                module_.objects.push_back(make_object(*source));
+                module_.objects.push_back(make_object(*source, allow_inferred_bounds));
             } else {
                 id = found->second;
                 if (module_.objects[id.value].type != intern_type(source->type)) {
@@ -2078,8 +2228,9 @@ private:
         }
     }
 
-    void finish_objects() {
+    ContinuationTask<void> finish_objects_async() {
         for (auto& object : module_.objects) {
+            if (resource_failed()) co_return;
             const auto* representative = object.definition
                                              ? object.definition
                                              : object.declarations.back();
@@ -2098,7 +2249,7 @@ private:
                 !section.empty()) {
                 object.section = section;
             }
-            object.minimum_alignment = parse_alignment(
+            object.minimum_alignment = co_await parse_alignment_async(
                 representative->attributes, "an object definition",
                 source_namespace(object.source_name));
             std::vector<const Attribute*> symbol_attributes;
@@ -2335,13 +2486,24 @@ private:
         }
     }
 
+    bool resource_failed() const {
+        return program_.evaluation_resource_errors != resource_epoch_;
+    }
+
     Program& program_;
+    // A fresh builder ignores older independent failures; an affected traversal
+    // stops after a new evaluator failure without parsing diagnostic wording.
+    const std::uint64_t resource_epoch_{program_.evaluation_resource_errors};
     const CompilerOptions& options_;
     const TargetInfo& target_;
     Diagnostics& diagnostics_;
     Module module_;
+    // Spares nested layout the closure its enclosing layout just validated.
+    RecordSourceProofs record_source_proofs_;
     unsigned address_bytes_{8};
     std::vector<unsigned char> layout_state_;
+    bool required_layout_query_{};
+    std::unordered_set<NominalTypeKey, NominalTypeKeyHash> alignment_active_;
     std::unordered_map<std::string, FunctionId> function_keys_;
     std::unordered_map<std::string, ObjectId> object_keys_;
 };
@@ -2403,7 +2565,7 @@ TypeId Module::intern_type(const TypePtr& source) {
                     {parameter.location, parameter.name,
                      intern_type(callable_parameter_type(parameter.type,
                                                          parameter.mode)), parameter.mode,
-                     parameter.location_name});
+                     parameter.location_name, parameter.binding});
             }
             candidate.function = std::move(signature);
         } else if (source->kind == cross::Type::Kind::Vector ||
@@ -2467,6 +2629,65 @@ TypeId Module::function_type(FunctionSignature signature) {
     const TypeId id{static_cast<std::uint32_t>(types.size())};
     types.push_back(std::move(type));
     return id;
+}
+
+std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, const AddressSpaceJoin& spaces) {
+    struct Traits {
+        using Type = TypeId;
+        Module& module;
+        static bool same(const hir::Type& a, const hir::Type& b) {
+            return a.kind == b.kind && a.builtin == b.builtin && a.pointee == b.pointee &&
+                a.element == b.element && a.record == b.record && a.function == b.function &&
+                a.lanes == b.lanes && a.scalable == b.scalable && a.nominal_key() == b.nominal_key() &&
+                a.is_const == b.is_const && a.is_volatile == b.is_volatile &&
+                a.is_atomic == b.is_atomic && a.is_restrict == b.is_restrict && a.address_space == b.address_space;
+        }
+        PointerJoinNode<Type> describe(Type id) const {
+            const auto& type = module.type(id);
+            PointerJoinNode<Type> node;
+            switch (type.kind) {
+            case hir::Type::Kind::Pointer: node.kind = PointerJoinKind::Pointer; node.child = type.pointee; break;
+            case hir::Type::Kind::Array: node.kind = PointerJoinKind::Array; node.child = type.element; break;
+            case hir::Type::Kind::Vector: node.kind = PointerJoinKind::Vector; node.child = type.element; break;
+            case hir::Type::Kind::Function: node.kind = PointerJoinKind::Function; break;
+            case hir::Type::Kind::Builtin:
+                if (type.builtin == BuiltinType::Void) node.kind = PointerJoinKind::Void;
+                break;
+            default: break;
+            }
+            node.is_const = type.is_const;
+            node.is_volatile = type.is_volatile;
+            node.is_atomic = type.is_atomic;
+            node.is_restrict = type.is_restrict;
+            node.address_space = type.address_space;
+            node.extent = type.lanes;
+            node.scalable = type.scalable;
+            return node;
+        }
+        PointerJoinEquality equal_leaf(Type left, Type right) const {
+            auto a = module.type(left), b = module.type(right);
+            a.is_const = b.is_const = a.is_volatile = b.is_volatile = false;
+            a.is_restrict = b.is_restrict = false;
+            return same(a, b) ? PointerJoinEquality::Same : PointerJoinEquality::Different;
+        }
+        Type rebuild(Type base, const PointerJoinNode<Type>& node) {
+            auto result = module.type(base);
+            result.is_const = node.is_const;
+            result.is_volatile = node.is_volatile;
+            result.is_atomic = node.is_atomic;
+            result.is_restrict = node.is_restrict;
+            result.address_space = node.address_space;
+            if (node.kind == PointerJoinKind::Pointer) result.pointee = node.child;
+            else if (node.kind == PointerJoinKind::Array || node.kind == PointerJoinKind::Vector)
+                result.element = node.child;
+            for (std::uint32_t index = 0; index < module.types.size(); ++index)
+                if (same(module.types[index], result)) return {index};
+            const Type id{static_cast<std::uint32_t>(module.types.size())};
+            module.types.push_back(std::move(result));
+            return id;
+        }
+    } traits{*this};
+    return join_pointer_types(traits, left, right, spaces).type;
 }
 
 TypeId Module::pointer_to(TypeId pointee) {
@@ -2629,11 +2850,11 @@ const Record* Module::record(const NominalTypeKey& key) const {
 }
 
 const RecordMember* Module::member(RecordId id,
-                                   std::string_view name) const {
+                                   const MemberName& name) const {
     const auto& source = record(id);
     const auto found = std::find_if(
         source.members.begin(), source.members.end(),
-        [&](const RecordMember& candidate) { return candidate.name == name; });
+        [&](const RecordMember& candidate) { return candidate.member_name() == name; });
     return found == source.members.end() ? nullptr : &*found;
 }
 
@@ -2642,21 +2863,55 @@ const Object* Module::object(const ObjectDecl& declaration) const {
     return found == object_ids.end() ? nullptr : &objects[found->second.value];
 }
 
-const Label* Module::label(FunctionId function, std::string_view name) const {
+const Label* Module::label(FunctionId function, NameUse name) const {
+    if (name.context && name.context->label_address) return label(*name.context->label_address);
+    const auto split = name.spelling.rfind("::");
+    const auto component = split == std::string_view::npos
+        ? name.spelling : name.spelling.substr(split + 2);
+    const auto location = name.context && name.context->last_component_location.valid()
+        ? name.context->last_component_location : name.location;
+    const NameKey key(component, location);
+    const auto binding = resolved_label_binding(name);
+    const auto binding_matches = [&](const Label& candidate) {
+        if (binding.scope && binding.scope != candidate.binding.scope) return false;
+        return binding.kind != LabelBinding::Kind::Reference ||
+               binding.declaration == candidate.binding.declaration;
+    };
+    const Label* qualified_fallback = nullptr;
     for (const auto id : functions.at(function.value).labels) {
         const auto& candidate = labels.at(id.value);
-        if (candidate.source_name == name || candidate.qualified_name == name) {
-            return &candidate;
-        }
+        if (candidate.source_name != name.spelling && candidate.qualified_name != name.spelling) continue;
+        if (!binding_matches(candidate)) continue;
+        if (candidate.is_global || candidate.lookup_key == key) return &candidate;
+        // Explicit qualification can name an ordinary label through its
+        // visible function, but cannot select an unrelated private expansion.
+        if (split != std::string_view::npos && !candidate.lookup_key.context.value &&
+            candidate.lookup_key.fresh == key.fresh) qualified_fallback = &candidate;
     }
+    if (qualified_fallback) return qualified_fallback;
     for (const auto& candidate : labels) {
-        if (candidate.owner == function && candidate.is_global &&
-            (candidate.source_name == name ||
-             candidate.qualified_name == name)) {
+        if (candidate.owner == function && candidate.is_global && binding_matches(candidate) &&
+            (candidate.source_name == name.spelling ||
+             candidate.qualified_name == name.spelling)) {
             return &candidate;
         }
     }
     return nullptr;
+}
+
+const Label* Module::label(FunctionId function, const Statement& definition) const {
+    for (const auto id : functions.at(function.value).labels)
+        if (labels.at(id.value).definition == &definition) return &labels.at(id.value);
+    return nullptr;
+}
+
+const Label* Module::label(const LabelAddressConstant& address) const {
+    if (!address.owner) return nullptr;
+    const auto* owner = function(*address.owner);
+    if (!owner) return nullptr;
+    if (address.definition) return label(owner->id, *address.definition);
+    const auto* selected = global_label(address.global_name);
+    return selected && selected->owner == owner->id ? selected : nullptr;
 }
 
 const Label* Module::global_label(std::string_view qualified_name) const {
@@ -2677,23 +2932,52 @@ bool Module::raw_owned(const FunctionDecl& declaration) const {
 
 Module build(Program& program, const CompilerOptions& options,
              const TargetInfo& target, Diagnostics& diagnostics) {
-    return Builder(program, options, target, diagnostics).run();
+    return build_async(program, options, target, diagnostics).run();
+}
+
+ContinuationTask<Module> build_async(Program& program, const CompilerOptions& options,
+             const TargetInfo& target, Diagnostics& diagnostics) {
+    Builder builder(program, options, target, diagnostics);
+    co_return co_await builder.run_async();
 }
 
 Module build_constant_context(Program& program, const CompilerOptions& options,
                               const TargetInfo& target, Diagnostics& diagnostics) {
-    return Builder(program, options, target, diagnostics).constant_context();
+    return build_constant_context_async(program, options, target, diagnostics).run();
+}
+
+ContinuationTask<Module> build_constant_context_async(Program& program, const CompilerOptions& options,
+                              const TargetInfo& target, Diagnostics& diagnostics) {
+    Builder builder(program, options, target, diagnostics);
+    co_return co_await builder.constant_context_async();
 }
 
 Module build_record_layout_context(Program& program, const CompilerOptions& options,
                                    const TargetInfo& target, Diagnostics& diagnostics) {
-    return Builder(program, options, target, diagnostics).record_layout_context();
+    return build_record_layout_context_async(program, options, target, diagnostics).run();
+}
+
+ContinuationTask<Module> build_record_layout_context_async(Program& program, const CompilerOptions& options,
+                                   const TargetInfo& target, Diagnostics& diagnostics) {
+    Builder builder(program, options, target, diagnostics);
+    co_return co_await builder.record_layout_context_async();
+}
+
+bool layout_view_covers(const Module& module, const Program& program, const TypePtr& type) {
+    return layout_view_matches_records(module, program, type, LayoutViewCoverage::Complete);
 }
 
 Module build_required_layout_context(Program& program, const CompilerOptions& options,
                                      const TargetInfo& target, Diagnostics& diagnostics,
-                                     const TypePtr& type) {
-    return Builder(program, options, target, diagnostics).required_layout_context(type);
+                                     const TypePtr& type, EvaluationLayoutKind kind) {
+    return build_required_layout_context_async(program, options, target, diagnostics, type, kind).run();
+}
+
+ContinuationTask<Module> build_required_layout_context_async(Program& program, const CompilerOptions& options,
+                                     const TargetInfo& target, Diagnostics& diagnostics,
+                                     TypePtr type, EvaluationLayoutKind kind) {
+    Builder builder(program, options, target, diagnostics);
+    co_return co_await builder.required_layout_context_async(std::move(type), kind);
 }
 
 bool validate_source_address_spaces(Program& program,
@@ -2720,6 +3004,22 @@ bool stabilize_function_address(Module& module, FunctionId id,
                       "clobbers are not implemented yet");
         return false;
     }
+    function.abi_contract = AbiContract::Registered;
+    return true;
+}
+
+bool stabilize_label_address(Module& module, LabelId id,
+                             SourceLocation location, Diagnostics& diagnostics) {
+    const auto& label = module.labels.at(id.value);
+    auto& function = module.function(label.owner);
+    if (function.definition && function.definition->attribute("always_inline")) {
+        diagnostics.error(location,
+            "taking a label address conflicts with always_inline on its owner");
+        return false;
+    }
+    // Freezing private transport does not erase explicit endpoints or clobbers.
+    // Unlike a callable function pointer, no registered-interface adapter is
+    // needed to represent an interior code address.
     function.abi_contract = AbiContract::Registered;
     return true;
 }
@@ -2809,6 +3109,40 @@ std::string type_name(const Module& module, TypeId id) {
     return prefix + std::string(names[static_cast<unsigned>(type.builtin)]);
 }
 
+static std::optional<std::uint64_t> builtin_storage_size(BuiltinType type, unsigned address_bits,
+                                                        const TargetInfo& target) {
+    if (type == BuiltinType::Void) return {};
+    if (type == BuiltinType::F80) return target.data_layout.f80_storage_bytes;
+    const auto bits = type == BuiltinType::Bool || type == BuiltinType::I8 || type == BuiltinType::U8 ? 8U
+        : type == BuiltinType::I16 || type == BuiltinType::U16 ? 16U
+        : type == BuiltinType::I32 || type == BuiltinType::U32 || type == BuiltinType::F32 ? 32U
+        : type == BuiltinType::I64 || type == BuiltinType::U64 || type == BuiltinType::F64 ? 64U
+        : type == BuiltinType::Iptr || type == BuiltinType::Uptr || type == BuiltinType::Fptr ||
+          type == BuiltinType::Label ? address_bits : 128U;
+    return (bits + 7U) / 8U;
+}
+
+std::optional<std::uint64_t> layout_size(const Module& module, const TypePtr& type,
+                                      const TargetInfo& target) {
+    if (!type) return {};
+    switch (type->kind) {
+    case cross::Type::Kind::Builtin: return builtin_storage_size(type->builtin, module.address_bits, target);
+    case cross::Type::Kind::Pointer: return (module.address_bits + 7U) / 8U;
+    case cross::Type::Kind::Record: {
+        const auto* record = module.record(type->nominal_key());
+        return record && record->complete && record->size ? std::optional{record->size} : std::nullopt;
+    }
+    case cross::Type::Kind::Array:
+    case cross::Type::Kind::Vector: {
+        if (!type->lanes || type->scalable) return {};
+        const auto element = layout_size(module, type->element, target);
+        if (!element || !*element || type->lanes > UINT64_MAX / *element) return {};
+        return *element * type->lanes;
+    }
+    default: return {};
+    }
+}
+
 std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,
                                          const TargetInfo& target) {
     const auto& type = module.type(id);
@@ -2848,38 +3182,15 @@ std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,
         type.builtin == BuiltinType::Void) {
         return std::nullopt;
     }
-    if (type.builtin == BuiltinType::F80) {
-        return target.data_layout.f80_storage_bytes;
-    }
-    const auto bits = type.builtin == BuiltinType::Bool ||
-                              type.builtin == BuiltinType::I8 ||
-                              type.builtin == BuiltinType::U8
-                          ? 8U
-                      : type.builtin == BuiltinType::I16 ||
-                                type.builtin == BuiltinType::U16
-                          ? 16U
-                      : type.builtin == BuiltinType::I32 ||
-                                type.builtin == BuiltinType::U32 ||
-                                type.builtin == BuiltinType::F32
-                          ? 32U
-                      : type.builtin == BuiltinType::I64 ||
-                                type.builtin == BuiltinType::U64 ||
-                                type.builtin == BuiltinType::F64
-                          ? 64U
-                      : type.builtin == BuiltinType::Iptr ||
-                                type.builtin == BuiltinType::Uptr ||
-                                type.builtin == BuiltinType::Fptr ||
-                                type.builtin == BuiltinType::Label
-                          ? module.address_bits
-                          : 128U;
-    return (bits + 7U) / 8U;
+    return builtin_storage_size(type.builtin, module.address_bits, target);
 }
 
 std::optional<std::uint64_t> layout_alignment(
     const Module& module, TypeId id, const TargetInfo& target) {
     const auto& type = module.type(id);
     if (type.kind == Type::Kind::Record) {
-        if (!type.record || !module.record(*type.record).complete) {
+        if (!type.record || (!module.record(*type.record).complete &&
+                             !module.record(*type.record).alignment_complete)) {
             return std::nullopt;
         }
         return module.record(*type.record).alignment;
@@ -2896,6 +3207,25 @@ std::optional<std::uint64_t> layout_alignment(
     return std::max<std::uint64_t>(
         1, std::min<std::uint64_t>(
                *size, target.data_layout.natural_alignment_limit));
+}
+
+bool lock_free_atomic_type(const Module& module, TypeId id,
+                           const TargetInfo& target, const Subtarget& subtarget) {
+    const auto& type = module.type(id);
+    if (type.kind != Type::Kind::Builtin && type.kind != Type::Kind::Pointer) return false;
+    if (type.kind == Type::Kind::Builtin &&
+        (type.builtin == BuiltinType::Void || type.builtin == BuiltinType::Label)) return false;
+    const auto size = layout_size(module, id, target);
+    if (!size) return false;
+    // Extended floating storage may include target padding; capability entries
+    // describe the scalar representation width, as they do in MIR selection.
+    const auto bits = type.kind == Type::Kind::Builtin && type.builtin == BuiltinType::F80
+        ? 80U : *size * 8U;
+    return std::any_of(target.lock_free_atomic_widths.begin(), target.lock_free_atomic_widths.end(),
+        [&](const AtomicWidthEntry& entry) {
+            return entry.bits == bits && (entry.feature.empty() || entry.feature == "base" ||
+                entry.feature == target.architecture || subtarget.has_feature(entry.feature));
+        });
 }
 
 } // namespace cross::hir

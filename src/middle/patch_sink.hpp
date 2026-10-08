@@ -24,7 +24,8 @@ using PatchSinkObjectResolver =
 // constant array selections.
 [[nodiscard]] std::optional<PatchSink> resolve_patch_sink_designator(
     const Expr& expression, const hir::Module& module,
-    const TargetInfo& target, const PatchSinkObjectResolver& resolve_object,
+    const TargetInfo& target, PatchAddressRepresentation representation,
+    const PatchSinkObjectResolver& resolve_object,
     Diagnostics& diagnostics);
 
 } // namespace mir

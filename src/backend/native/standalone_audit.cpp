@@ -22,13 +22,21 @@ bool audit_standalone(const machine::Module& machine_module,
                     const auto* symbol =
                         std::get_if<machine::SymbolOperand>(&operand);
                     if (!symbol) continue;
+                    if (symbol->label && symbol->label->value < hir_module.labels.size()) {
+                        const auto& label = hir_module.labels.at(symbol->label->value);
+                        const auto expected = label.is_global ? label.link_symbol
+                            : ".Lcross.label." + std::to_string(label.owner.value) +
+                              '.' + std::to_string(label.id.value);
+                        if (symbol->is_function && symbol->function == label.owner &&
+                            symbol->name == expected && (label.definition || label.is_global)) continue;
+                    }
                     const bool declared_label = std::any_of(
                         hir_module.labels.begin(), hir_module.labels.end(),
                         [&](const hir::Label& candidate) {
                             return candidate.is_global &&
                                    candidate.link_symbol == symbol->name;
                         });
-                    const bool declared = declared_label || (symbol->is_function
+                    const bool declared = !symbol->label && (declared_label || (symbol->is_function
                         ? std::any_of(
                               hir_module.functions.begin(),
                               hir_module.functions.end(),
@@ -40,7 +48,7 @@ bool audit_standalone(const machine::Module& machine_module,
                               hir_module.objects.end(),
                               [&](const hir::Object& candidate) {
                                   return candidate.link_symbol == symbol->name;
-                              }));
+                              })));
                     if (declared) continue;
                     diagnostics.error(
                         instruction.location,

@@ -99,13 +99,22 @@ bool validate_shipped_abis() {
         model_registry().find_abi("mips", "eabi32", {});
     const auto* mips_cross32 =
         model_registry().find_abi("mips", "cross32", {});
-    const auto* mips_cross_alias =
-        model_registry().find_abi("mips", "cross", {});
     const auto* mips_cross64 =
         model_registry().find_abi("mips", "cross64", {});
+    const auto* mips_cross_n64 =
+        model_registry().find_abi("mips", "cross-n64", {});
+    // Both MIPS address models name their Cross ABI `cross`; the triple's
+    // default ABI selects the address model, and no triple is ambiguous.
+    const auto* mips_cross_alias =
+        model_registry().find_abi("mips", "cross", "mips-unknown-elf");
+    const auto* mips64_cross_alias =
+        model_registry().find_abi("mips", "cross", "mips64el-unknown-elf");
     if (!cross_abi || !sysv || !microsoft || !o32 || !eabi32 ||
         !mips_cross32 || mips_cross_alias != mips_cross32 ||
-        !mips_cross64) {
+        !mips_cross64 || !mips_cross_n64 ||
+        mips64_cross_alias != mips_cross_n64 ||
+        model_registry().find_abi("mips", "cross", {})) {
+        std::cerr << "shipped ABI name resolution mismatch\n";
         return false;
     }
     if (!cross_abi->gcc_calling_attribute.empty() ||
@@ -317,6 +326,33 @@ bool validate_shipped_abis() {
         !register_is(mips_cross64_arguments.layout.arguments[4], 0, "t0") ||
         mips_cross64_result.pieces.size() != 1 ||
         !register_is(mips_cross64_result, 0, "v0")) {
+        return false;
+    }
+
+    // cross-n64 keeps the cross64 channels with 64-bit pointers: integer and
+    // floating cursors are independent, and a record result wider than the
+    // four result registers returns through a hidden pointer.
+    const auto n64_pointer = scalar(ScalarMode::pointer(64));
+    const auto mips_cross_n64_arguments = classify_call_arguments(
+        *mips_cross_n64, std::array{n64_pointer, f64, i64},
+        mips3_cross_features);
+    const auto mips_cross_n64_quad = classify_return(
+        *mips_cross_n64, aggregate(256, {i64, i64, i64, i64}),
+        mips3_cross_features);
+    const auto mips_cross_n64_large = classify_return(
+        *mips_cross_n64, aggregate(320, {i64, i64, i64, i64, i64}),
+        mips3_cross_features);
+    if (!mips_cross_n64_arguments ||
+        mips_cross_n64_arguments.layout.arguments[0].pieces.size() != 1 ||
+        !register_is(mips_cross_n64_arguments.layout.arguments[0], 0, "a0") ||
+        !register_is(mips_cross_n64_arguments.layout.arguments[1], 0, "f12") ||
+        !register_is(mips_cross_n64_arguments.layout.arguments[2], 0, "a1") ||
+        !mips_cross_n64_quad || mips_cross_n64_quad.indirect ||
+        !register_is(mips_cross_n64_quad, 0, "v0") ||
+        !register_is(mips_cross_n64_quad, 3, "a1") ||
+        !mips_cross_n64_large || !mips_cross_n64_large.indirect ||
+        !register_is(mips_cross_n64_large, 0, "a0")) {
+        std::cerr << "cross-n64 classification mismatch\n";
         return false;
     }
 

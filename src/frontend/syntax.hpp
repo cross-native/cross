@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace cross {
@@ -21,6 +22,12 @@ namespace cross {
 using SyntaxEntityId = SyntaxContext::EntityId;
 using SyntaxBinding = SyntaxContext::Binding;
 struct SyntaxMatchValue;
+struct SyntaxNode;
+
+namespace detail {
+class SyntaxRelease;
+using SyntaxReleaseLink = OwnerReleaseLink;
+} // namespace detail
 
 struct SyntaxSpan {
     SourceLocation first;
@@ -54,7 +61,8 @@ enum class SyntaxProduction {
     RelationalExpression, ShiftExpression, AdditiveExpression,
     MultiplicativeExpression, CastExpression, UnaryExpression,
     PostfixExpression, PrimaryExpression, ArgumentList, GenericArguments, GenericArgument,
-    BuiltinName, Literal, EmbedExpression, QuoteExpression, Count,
+    BuiltinName, Literal, EmbedExpression, QuoteExpression,
+    GlobalLabelDeclaration, QualifiedLabelName, QualifiedFunctionName, Count,
 };
 std::string_view syntax_production_name(SyntaxProduction production);
 
@@ -64,11 +72,18 @@ enum class SyntaxParseCategory {
 };
 std::optional<SyntaxParseCategory> syntax_parse_category(std::string_view name);
 std::uint64_t syntax_environment_storage(const SyntaxParseEnvironment& environment);
+bool syntax_environment_same_lookup(const SyntaxParseEnvironment& left, const SyntaxParseEnvironment& right);
 std::uint64_t syntax_context_storage(const SyntaxContext& context);
 
 // The public, versioned tree is independent of typed AST/HIR. Every node
 // owns its lexical identity and remains immutable after construction.
 struct SyntaxNode {
+    SyntaxNode() = default;
+    SyntaxNode(const SyntaxNode&) = default;
+    SyntaxNode(SyntaxNode&&) = default;
+    SyntaxNode& operator=(const SyntaxNode&) = default;
+    SyntaxNode& operator=(SyntaxNode&&) = default;
+    ~SyntaxNode();
     enum class Kind { Token, Group, Core, Extension, Macro, Deferred } kind{Kind::Token};
     SyntaxProduction production{SyntaxProduction::None};
     // Internal category-aware splice alternative of primary_expression.
@@ -80,10 +95,19 @@ struct SyntaxNode {
     SyntaxParseCategory deferred_category{SyntaxParseCategory::None};
     TokenSequence tokens;
     std::vector<std::shared_ptr<const SyntaxNode>> children;
+    // Sorted child indices supplied as complete structured fragments. These
+    // private edge boundaries preserve the original public child/root identity
+    // without wrapping or mutating the retained node. Textual projection ignores
+    // them; ordinary materialization must not flatten them into adjacent source.
+    std::vector<std::size_t> splice_children;
     SyntaxSpan span;
     std::shared_ptr<const SyntaxContext> context;
     std::optional<SyntaxEntityId> definition;
     std::shared_ptr<const SyntaxMatchValue> match;
+private:
+    friend class detail::SyntaxRelease;
+    friend class detail::OwnerRelease;
+    mutable detail::SyntaxReleaseLink teardown_;
 };
 
 TokenSequence syntax_node_tokens(const SyntaxNode& node);
@@ -114,6 +138,12 @@ std::shared_ptr<const SyntaxNode> syntax_replace_child(
 
 // Public match records are translation-only, not runtime records or typed HIR.
 struct SyntaxMatchValue {
+    SyntaxMatchValue() = default;
+    SyntaxMatchValue(const SyntaxMatchValue&) = default;
+    SyntaxMatchValue(SyntaxMatchValue&&) = default;
+    SyntaxMatchValue& operator=(const SyntaxMatchValue&) = default;
+    SyntaxMatchValue& operator=(SyntaxMatchValue&&) = default;
+    ~SyntaxMatchValue();
     struct Field {
         enum class Kind { Primitive, RawGroup, Parsed, Nested };
         std::string name;
@@ -129,9 +159,18 @@ struct SyntaxMatchValue {
     std::vector<std::string> variant_labels;
     SyntaxSpan span;
     std::shared_ptr<const SyntaxContext> context;
+private:
+    friend class detail::SyntaxRelease;
+    friend class detail::OwnerRelease;
+    mutable detail::SyntaxReleaseLink teardown_;
 };
 
 struct SyntaxFunctionId { std::uint32_t value{}; };
+// Invocation-local context attachment copies only changed immutable paths,
+// preserving sharing and all existing lookup contexts.
+std::shared_ptr<const SyntaxMatchValue> syntax_attach_context(
+    std::shared_ptr<const SyntaxMatchValue> match,
+    std::shared_ptr<const SyntaxContext> context);
 enum class SyntaxKind { Item, Statement, Expression, Rule, Bundle };
 struct SyntaxActivation {
     std::string name;
@@ -186,13 +225,19 @@ public:
                     EvaluationLayoutInstaller install_evaluation = {},
                     std::string mangling = {}, GenericAbiCanonicalizer canonical_abi = {});
     std::vector<Token> prepare(const SourceFile& source);
+    bool validate_functions();
+    ContinuationTask<bool> validate_functions_async();
     void publish_declarations(const Program& program,
         std::span<const RecordDecl> pending_records = {},
         std::span<const EnumDecl> pending_enumerations = {});
-    bool define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
+    const FunctionDecl* define_function(const std::vector<Token>& tokens, std::size_t& index, std::string_view name_space,
                           const std::vector<std::string>& imports,
                           const std::vector<SyntaxBinding>& bindings,
                           std::shared_ptr<const SyntaxParseEnvironment> environment = {});
+    ContinuationTask<const FunctionDecl*> define_function_async(
+        const std::vector<Token>& tokens, std::size_t& index, std::string name_space,
+        std::vector<std::string> imports, std::vector<SyntaxBinding> bindings,
+        std::shared_ptr<const SyntaxParseEnvironment> environment = {});
     std::optional<FunctionId> find_function(std::string_view name, std::string_view name_space,
                                           const std::vector<std::vector<std::string>>& imports,
                                           bool syntax_expander) const;
@@ -205,18 +250,33 @@ public:
         std::string_view name_space, const std::vector<std::string>& imports,
         const std::vector<SyntaxBinding>& bindings,
         std::shared_ptr<const SyntaxParseEnvironment> environment = {},
-        const SyntaxDefinition* owner = nullptr);
+        const SyntaxDefinition* owner = nullptr,
+        const std::vector<TokenIdentity>& import_declarations = {});
+    ContinuationTask<std::optional<Output>> expand_async(FunctionId function, TokenSequence input,
+        std::shared_ptr<const SyntaxMatchValue> match, SourceLocation invocation,
+        std::string name_space, std::vector<std::string> imports,
+        std::vector<SyntaxBinding> bindings,
+        std::shared_ptr<const SyntaxParseEnvironment> environment = {},
+        const SyntaxDefinition* owner = nullptr,
+        std::vector<TokenIdentity> import_declarations = {});
     bool begin_replacement(SourceLocation location);
     void end_replacement();
     bool begin_fragment(SourceLocation location, std::size_t copied_tokens);
     void end_fragment();
     void tree_limit_error(SourceLocation location);
+    void resource_error(SourceLocation location, std::string_view message);
+    void resource_note(SourceLocation location, std::string_view message);
+    std::uint64_t resource_errors() const { return declarations_.evaluation_resource_errors; }
     bool work(SourceLocation location, std::uint64_t amount = 1);
     std::shared_ptr<const SyntaxContext> call_context(SourceLocation location,
         std::string_view name_space, const std::vector<std::string>& imports,
         const std::vector<SyntaxBinding>& bindings,
-        std::shared_ptr<const SyntaxParseEnvironment> environment = {}) const;
+        std::shared_ptr<const SyntaxParseEnvironment> environment = {},
+        const std::vector<TokenIdentity>& import_declarations = {}) const;
     std::shared_ptr<const SyntaxNode> parse_tokens(SyntaxParseCategory category,
+        const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
+        SourceLocation location);
+    ContinuationTask<std::shared_ptr<const SyntaxNode>> parse_tokens_async(SyntaxParseCategory category,
         const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
         SourceLocation location);
     std::optional<Output> materialize_node(const SyntaxNode& node, SourceLocation location,
@@ -225,18 +285,20 @@ public:
     std::optional<MetaToken> terminal(std::string_view quoted, SourceLocation location);
 private:
     struct ExpansionInputToken {
-        TokenKind kind{TokenKind::Invalid};
-        std::string text;
-        const SyntaxNode* splice{};
-        bool operator==(const ExpansionInputToken&) const = default;
+        MetaToken token;
+        bool operator==(const ExpansionInputToken&) const;
     };
     struct ExpansionSignature {
         std::uint32_t function{};
         std::string name_space;
         std::vector<std::string> imports;
         std::vector<SyntaxBinding> bindings;
+        std::vector<TokenIdentity> import_declarations;
+        std::shared_ptr<const SyntaxParseEnvironment> environment;
+        std::size_t published_functions{}, published_objects{}, published_records{}, published_enumerations{};
+        std::uint64_t storage{};
         std::vector<ExpansionInputToken> input;
-        bool operator==(const ExpansionSignature&) const = default;
+        bool operator==(const ExpansionSignature&) const;
     };
     struct Function {
         FunctionDecl declaration;
@@ -258,9 +320,9 @@ private:
     std::unordered_map<NominalTypeKey, bool, NominalTypeKeyHash> published_records_;
     std::unordered_set<NominalTypeKey, NominalTypeKeyHash> published_enumerations_;
     std::uint64_t work_{};
+    std::uint64_t expansion_signature_storage_{};
     unsigned depth_{};
     unsigned fragment_depth_{};
-    unsigned expansions_{};
     std::vector<std::optional<ExpansionSignature>> active_expansions_;
 };
 
@@ -288,10 +350,19 @@ public:
         std::size_t end{};
         SyntaxExecution::FunctionId expander;
     };
+    enum class MatchMode { Required, Probe };
+    using ParseFragment = ContinuationQuery<std::optional<SyntaxParsedFragment>(
+        SyntaxPatternElement::Kind, std::size_t)>;
     std::optional<Match> match(const SyntaxDefinition& definition,
         const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
-        const std::function<std::optional<SyntaxParsedFragment>(
-            SyntaxPatternElement::Kind, std::size_t)>& parse_fragment = {}) const;
+        const ParseFragment& parse_fragment = {},
+        const std::function<std::shared_ptr<const SyntaxContext>(SourceLocation)>& capture_context = {},
+        MatchMode mode = MatchMode::Required) const;
+    ContinuationTask<std::optional<Match>> match_async(const SyntaxDefinition& definition,
+        const std::vector<Token>& tokens, std::size_t begin, Diagnostics& diagnostics,
+        ParseFragment parse_fragment = {},
+        std::function<std::shared_ptr<const SyntaxContext>(SourceLocation)> capture_context = {},
+        MatchMode mode = MatchMode::Required) const;
     std::shared_ptr<SyntaxExecution> execution() const { return execution_; }
 private:
     std::optional<SyntaxEntityId> lookup(std::string_view name, std::string_view name_space,

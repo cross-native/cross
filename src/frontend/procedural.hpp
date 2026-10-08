@@ -12,16 +12,11 @@ namespace cross {
 struct ExpansionFunctionSource {
     FunctionDecl function;
     bool syntax_expander{};
+    Program declarations;
 };
 struct ExpansionFunctionHead {
-    std::size_t after_specifiers{};
-    std::size_t name_index{};
-    std::size_t body_index{};
     SourceLocation location;
     bool syntax_expander{};
-    bool static_storage{};
-    bool global_storage{};
-    bool result_location{};
     std::string error;
     SourceLocation error_location;
 };
@@ -32,6 +27,9 @@ std::optional<ExpansionFunctionHead> expansion_function_head(
 // Parse one original declaration selected by the item parser, never scan raw
 // captured inputs for declarations. Advances index past the bounded source.
 std::optional<ExpansionFunctionSource> parse_expansion_function(
+    const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
+    unsigned address_bits, std::shared_ptr<const SyntaxContext> definition_context = {});
+ContinuationTask<std::optional<ExpansionFunctionSource>> parse_expansion_function_async(
     const std::vector<Token>& tokens, std::size_t& index, Diagnostics& diagnostics,
     unsigned address_bits, std::shared_ptr<const SyntaxContext> definition_context = {});
 

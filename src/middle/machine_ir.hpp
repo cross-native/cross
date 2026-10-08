@@ -159,6 +159,7 @@ struct SymbolOperand {
     bool is_function{};
     std::optional<hir::ObjectId> object;
     std::optional<hir::FunctionId> function{};
+    std::optional<hir::LabelId> label{};
     friend bool operator==(const SymbolOperand&,
                            const SymbolOperand&) = default;
 };

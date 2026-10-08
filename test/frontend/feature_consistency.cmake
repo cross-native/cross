@@ -43,3 +43,6 @@ if(NOT status EQUAL 0 OR
     message(FATAL_ERROR
         "x86-64 --print-features omits thread_local\n${features}\n${stderr}")
 endif()
+if(NOT features MATCHES "[$]::feature::embedded_assets([\r\n]|$)")
+    message(FATAL_ERROR "--print-features omits embedded_assets\n${features}")
+endif()

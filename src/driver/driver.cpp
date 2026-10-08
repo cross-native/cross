@@ -11,8 +11,10 @@
 #include "backend/native/assembler.hpp"
 #include "backend/native/data_emitter.hpp"
 #include "common/options.hpp"
+#include "common/relocation_addend.hpp"
 #include "common/source.hpp"
 #include "frontend/lexer.hpp"
+#include "frontend/builtin_registry.hpp"
 #include "frontend/embed.hpp"
 #include "frontend/parser.hpp"
 #include "frontend/preprocessor.hpp"
@@ -27,6 +29,7 @@
 #include "model/model.hpp"
 #include "target/backend.hpp"
 #include "target/target.hpp"
+#include "target/instruction_constraints.hpp"
 #include "target/subtarget.hpp"
 
 #include <algorithm>
@@ -45,93 +48,160 @@
 namespace cross {
 namespace {
 
+TypePtr patch_address_type(PatchAddressRepresentation representation, unsigned address_bits) {
+    if (!patch_address_storage_bytes(representation, address_bits)) return {};
+    switch (representation) {
+    case PatchAddressRepresentation::Unavailable: return {};
+    case PatchAddressRepresentation::FlatUptr: return builtin_type(BuiltinType::Uptr);
+    }
+    return {};
+}
+
 template <typename LayoutFor>
-void install_evaluation_layout_queries(Program& current, const TargetInfo* target, LayoutFor layout_for) {
+void install_evaluation_layout_queries(Program& current, const TargetInfo* target,
+                                       const Subtarget& subtarget, LayoutFor layout_for) {
     current.evaluation_size_of = [layout_for, target](const TypePtr& type)
-        -> std::optional<std::uint64_t> {
-        const auto layout = layout_for(type);
-        if (!layout) return {};
-        return hir::layout_size(*layout, layout->intern_type(type), *target);
+        -> ContinuationTask<std::optional<std::uint64_t>> {
+        const auto layout = co_await layout_for(type);
+        if (!layout) co_return std::nullopt;
+        co_return hir::layout_size(*layout, layout->intern_type(type), *target);
     };
     current.evaluation_align_of = [layout_for, target](const TypePtr& type)
-        -> std::optional<std::uint64_t> {
-        const auto layout = layout_for(type);
-        if (!layout) return {};
-        return hir::layout_alignment(*layout, layout->intern_type(type), *target);
+        -> ContinuationTask<std::optional<std::uint64_t>> {
+        const auto layout = co_await layout_for(type, EvaluationLayoutKind::Alignment);
+        if (!layout) co_return std::nullopt;
+        co_return hir::layout_alignment(*layout, layout->intern_type(type), *target);
+    };
+    current.evaluation_atomic_is_lock_free = [layout_for, target, &subtarget](const TypePtr& type)
+        -> ContinuationTask<std::optional<bool>> {
+        const auto layout = co_await layout_for(type);
+        if (!layout) co_return {};
+        co_return hir::lock_free_atomic_type(*layout, layout->intern_type(type), *target, subtarget);
+    };
+    current.evaluation_relocation_addend = [](const RelocationAddend& value) {
+        // Both source-entity and Data IR relocation records currently carry
+        // signed 64-bit displacements, independently of the selected ABI width.
+        return relocation_addend_i64(value).has_value();
+    };
+    current.evaluation_address_space_type_error = [target](std::uint32_t number) {
+        return address_space_type_error(*target, number);
+    };
+    current.evaluation_patch_value_capabilities = [target, &subtarget, &current](const TypePtr& type)
+        -> std::optional<EvaluationPatchValueCapabilities> {
+        // Enums use their underlying scalar materializer. Top-level source
+        // qualifiers do not create a different machine representation.
+        const auto* entry = type && type->kind == Type::Kind::Builtin
+            ? find_patch_value_materializer(*target, type_name(builtin_type(type->builtin))) : nullptr;
+        if (!entry || !subtarget.supports_registry_feature(entry->feature)) return {};
+        return EvaluationPatchValueCapabilities{patch_address_type(entry->patch_address, current.address_bits),
+                                                entry->supports_symbol_relocation};
+    };
+    current.evaluation_patch_operand_capabilities = [target, &subtarget, &current](std::string_view instruction,
+        std::size_t index, std::size_t count, const TypePtr& type) {
+        std::vector<EvaluationPatchValueCapabilities> candidates;
+        if (!type || type->kind != Type::Kind::Builtin || type->nominal_key() != NominalTypeKey{})
+            return candidates;
+        const auto name = type_name(builtin_type(type->builtin));
+        const auto bits = type->builtin == BuiltinType::Iptr || type->builtin == BuiltinType::Uptr
+            ? current.address_bits : type_bits(type);
+        for (const auto* form : find_instruction_forms(*target, instruction)) {
+            if (form->operands.size() != count || index >= count ||
+                !subtarget.supports_registry_feature(form->feature) ||
+                !std::all_of(form->required_features.begin(), form->required_features.end(),
+                    [&](std::string_view feature) { return subtarget.supports_registry_feature(feature); })) continue;
+            const auto& operand = form->operands[index];
+            if (patch_operand_accepts_type(operand, name, bits)) candidates.push_back({
+                patch_address_type(operand.patch_address, current.address_bits), operand.patch_supports_symbol_relocation,
+                EvaluationInstructionFormId{static_cast<std::size_t>(form - target->instructions.data())}});
+        }
+        return candidates;
+    };
+    current.evaluation_instruction_source = [target, &subtarget](std::string_view name,
+        std::span<const EvaluationInstructionOperand> operands) {
+        return instruction_source_error(*target, subtarget, name, operands);
     };
     current.evaluation_member_layout = [layout_for](
-        const TypePtr& owner, std::string_view name)
-        -> std::optional<EvaluationMemberLayout> {
-        const auto layout = layout_for(owner);
-        if (!layout) return {};
+        const TypePtr& owner, const MemberName& name)
+        -> ContinuationTask<std::optional<EvaluationMemberLayout>> {
+        const auto layout = co_await layout_for(owner);
+        if (!layout) co_return {};
         const auto id = layout->intern_type(owner);
         const auto& type = layout->type(id);
-        if (!type.record) return std::nullopt;
+        if (!type.record) co_return std::nullopt;
         const auto* member = layout->member(*type.record, name);
-        if (!member) return std::nullopt;
-        return EvaluationMemberLayout{
+        if (!member) co_return std::nullopt;
+        co_return EvaluationMemberLayout{
             member->offset, member->alignment,
             member->bit_width, member->bit_offset};
     };
     current.evaluation_initializer_plan = [layout_for, target, &current](
-        const Expr& expression, const TypePtr& destination) {
-        const auto layout = layout_for(destination);
-        if (!layout) return EvaluationInitializerPlan{.items = {}, .valid = false,
+        const Expr& expression, const TypePtr& destination) -> ContinuationTask<EvaluationInitializerPlan> {
+        const bool dynamic_array = destination && destination->kind == Type::Kind::Array &&
+            destination->lanes == 0;
+        const auto layout = co_await layout_for(dynamic_array ? destination->element : destination);
+        if (!layout) co_return EvaluationInitializerPlan{.items = {}, .valid = false,
             .error_location = expression.location,
             .error_message = "target layout is unavailable for this initializer"};
-        // The shared planner owns selection, duplicate checking, and
-        // physical placement; the evaluator consumes source types only.
-        const auto type_hash = [](hir::TypeId id) { return std::hash<std::uint32_t>{}(id.value); };
-        std::unordered_map<hir::TypeId, TypePtr, decltype(type_hash)> source_types(0, type_hash);
-        const auto visit = [&](const auto& self, const TypePtr& type) -> void {
-            if (!type) return;
-            const auto id = layout->intern_type(type);
-            if (!source_types.emplace(id, type).second) return;
-            self(self, type->element);
-            if (type->kind != Type::Kind::Record) return;
-            for (const auto& record : current.records) {
-                if (record.nominal_key() != type->nominal_key() || !record.complete) continue;
-                for (const auto& member : record.members) self(self, member.type);
-                break;
-            }
-        };
-        visit(visit, destination);
-        std::ostringstream output;
-        Diagnostics quiet(output);
-        const auto plan = initializer::build(expression,
-            layout->intern_type(destination), *layout, *target, quiet);
-        EvaluationInitializerPlan result;
-        result.valid = plan.valid;
-        result.error_location = plan.error_location;
-        result.error_message = plan.error_message;
-        for (const auto& item : plan.items) {
-            const auto found = source_types.find(item.type);
-            if (found == source_types.end()) { result.valid = false; break; }
-            result.items.push_back({item.expression, found->second,
-                {item.offset, item.alignment, item.bit_width, item.bit_offset}});
-        }
-        return result;
+        co_return initializer::build_for_evaluation(expression, destination, current, *layout, *target);
+    };
+    current.evaluation_initializer_types = [layout_for, target, &current](
+        const Expr& expression, const TypePtr& destination, std::span<const Expr* const> deferred)
+        -> ContinuationTask<EvaluationInitializerTypePlan> {
+        // Type selection must not demand physical record layout. Keep the
+        // resolved type/ABI registry, but acquire no destination byte offsets.
+        const auto layout = co_await layout_for(builtin_type(BuiltinType::U8));
+        if (!layout) co_return EvaluationInitializerTypePlan{.items = {}, .valid = false,
+            .error_location = expression.location,
+            .error_message = "target layout is unavailable for this initializer"};
+        co_return initializer::types_for_evaluation(expression, destination, current, *layout, *target, deferred);
     };
 }
 
-void install_early_evaluation_layout(Program& program, const CompilerOptions& options, const TargetInfo* target) {
-    // Generic publication changes the source tables. Build an isolated lazy
-    // view per early query; do not cache pointers into growing declaration
-    // vectors or force unrelated templates/required expressions.
-    auto active_layout_queries = std::make_shared<std::vector<TypePtr>>();
-    install_evaluation_layout_queries(program, target, [&, target, active_layout_queries](const TypePtr& type) -> std::shared_ptr<hir::Module> {
+struct CompletedEvaluationLayoutView {
+    std::shared_ptr<hir::Module> layout;
+    const RecordDecl* records{};
+    std::size_t count{};
+
+    std::shared_ptr<hir::Module> find(const Program& program, const TypePtr& type) {
+        if (records != program.records.data() || count != program.records.size()) layout.reset();
+        return layout && hir::layout_view_covers(*layout, program, type) ? layout : nullptr;
+    }
+
+    void retain(const Program& program, const TypePtr& type, const std::shared_ptr<hir::Module>& view) {
+        if (!hir::layout_view_covers(*view, program, type)) return;
+        layout = view;
+        records = program.records.data();
+        count = program.records.size();
+    }
+};
+
+void install_early_evaluation_layout(Program& program, const CompilerOptions& options,
+                                     const TargetInfo* target, const Subtarget& subtarget) {
+    // Source publication and exact private graph ownership bound view reuse.
+    // Preparation and cycle/resource checks still precede each query.
+    using Query = std::pair<TypePtr, EvaluationLayoutKind>;
+    auto active_layout_queries = std::make_shared<std::vector<Query>>();
+    auto completed = std::make_shared<CompletedEvaluationLayoutView>();
+    install_evaluation_layout_queries(program, target, subtarget, [&, target, active_layout_queries, completed](
+        TypePtr type, EvaluationLayoutKind kind = EvaluationLayoutKind::Complete) -> ContinuationTask<std::shared_ptr<hir::Module>> {
         if (active_layout_queries->size() >= program.evaluation_limits.depth ||
             std::any_of(active_layout_queries->begin(), active_layout_queries->end(),
-                [&](const auto& active) { return same_type(active, type); })) return {};
-        active_layout_queries->push_back(type);
-        struct Pop { std::vector<TypePtr>& values; ~Pop() { values.pop_back(); } }
+                [&](const auto& active) { return active.second == kind && same_type(active.first, type); })) co_return nullptr;
+        active_layout_queries->emplace_back(type, kind);
+        struct Pop { std::vector<Query>& values; ~Pop() { values.pop_back(); } }
             pop{*active_layout_queries};
-        if (program.evaluation_prepare_type && !program.evaluation_prepare_type(type)) return {};
+        const auto prepare_type = program.evaluation_prepare_type;
+        if (prepare_type && !(co_await prepare_type.async(type, kind))) co_return nullptr;
+        const auto prepare = program.evaluation_prepare_layout;
+        if (prepare && !(co_await prepare.async(type, kind))) co_return nullptr;
+        if (const auto cached = completed->find(program, type)) co_return cached;
         std::ostringstream output;
         Diagnostics quiet(output);
         auto layout = std::make_shared<hir::Module>(
-            hir::build_required_layout_context(program, options, *target, quiet, type));
-        return quiet.errors() == 0 ? std::move(layout) : nullptr;
+            co_await hir::build_required_layout_context_async(program, options, *target, quiet, type, kind));
+        if (quiet.errors() != 0) co_return nullptr;
+        completed->retain(program, type, layout);
+        co_return layout;
     });
 }
 
@@ -302,47 +372,9 @@ void print_target_instructions(const TargetInfo& target) {
 }
 
 void print_builtins(const CompilerOptions& options) {
-    std::cout << "$::expect intrinsic\n$::assume intrinsic\n"
-                 "$::unreachable intrinsic\n$::trap intrinsic\n"
-                 "$::alignof intrinsic\n$::static_assert intrinsic\n"
-                 "$::patch code-generation intrinsic\n"
-                 "$::eval translation-time requirement\n"
-                 "$::runtime staged-evaluation barrier\n"
-                 "$::quote procedural quotation\n"
-                 "$::unquote procedural interpolation\n"
-                 "$::meta::parse translation intrinsic\n"
-                 "$::meta::concat translation intrinsic\n"
-                 "$::meta::call_site identifier-context intrinsic\n"
-                 "$::meta::gensym fresh-identifier intrinsic\n"
-                 "$::meta::tokens syntax-tree token projection\n"
-                 "$::meta::child_count translation intrinsic\n"
-                 "$::meta::child translation intrinsic\n"
-                 "$::meta::is_kind translation intrinsic\n"
-                 "$::meta::is_production translation intrinsic\n"
-                 "$::syntax::input translation intrinsic\n"
-                 "$::syntax::capture translation intrinsic\n"
-                 "$::syntax::node translation intrinsic\n"
-                 "$::syntax::count translation intrinsic\n"
-                 "$::syntax::at translation intrinsic\n"
-                 "$::syntax::is_variant translation intrinsic\n"
-                 "$::atomic_load atomic intrinsic\n"
-                 "$::atomic_store atomic intrinsic\n"
-                 "$::atomic_exchange atomic intrinsic\n"
-                 "$::atomic_compare_exchange atomic intrinsic\n"
-                 "$::atomic_fetch_add atomic intrinsic\n"
-                 "$::atomic_fetch_sub atomic intrinsic\n"
-                 "$::atomic_fetch_and atomic intrinsic\n"
-                 "$::atomic_fetch_xor atomic intrinsic\n"
-                 "$::atomic_fetch_or atomic intrinsic\n"
-                 "$::atomic_thread_fence atomic intrinsic\n"
-                 "$::atomic_signal_fence atomic intrinsic\n"
-                 "$::atomic_is_lock_free atomic query\n"
-                 "$::memory::relaxed atomic-order constant\n"
-                 "$::memory::acquire atomic-order constant\n"
-                 "$::memory::release atomic-order constant\n"
-                 "$::memory::acq_rel atomic-order constant\n"
-                 "$::memory::seq_cst atomic-order constant\n"
-                 "$::has_builtin query\n"
+    for (const auto& entry : core_expression_builtins())
+        std::cout << entry.name << ' ' << entry.description << '\n';
+    std::cout << "$::has_builtin query\n"
                  "$::has_intrinsic query\n"
                  "$::has_instruction query\n"
                  "$::has_patch_value query\n"
@@ -380,38 +412,9 @@ void print_instructions(const CompilerOptions& options) {
 }
 
 void print_features(const CompilerOptions& options) {
-    std::cout << "$::feature::runtime_free_intrinsics\n"
-                 "$::feature::control_intrinsics\n"
-                  "$::feature::evaluation\n"
-                 "$::feature::automatic_evaluation\n"
-                 "$::feature::generics\n"
-                 "$::feature::procedural_macros\n"
-                 "$::feature::patchable_values\n"
-                 "$::feature::patchable_operands\n"
-                 "$::feature::raw_inline\n";
-    std::cout << "$::feature::contextual_attributes\n"
-                 "$::feature::external_models\n"
-                 "$::feature::operator_binding\n";
+    for (const auto feature : language_features(options))
+        std::cout << "$::feature::" << feature << '\n';
     if (const auto* target = target_for_triple(options.target)) {
-        if (std::any_of(target->address_spaces.begin(),
-                        target->address_spaces.end(),
-                        [](const AddressSpaceEntry& entry) {
-                            return entry.number != 0 && entry.native_lowering;
-                        })) {
-            std::cout << "$::feature::address_spaces\n";
-        }
-        if (target->architecture == "x86-64") {
-            std::cout << "$::feature::integer128\n"
-                         "$::feature::binary128_storage\n"
-                         "$::feature::binary128_arithmetic\n"
-                         "$::feature::fixed_vectors\n"
-                         "$::feature::atomics\n"
-                         "$::feature::variadics\n"
-                         "$::feature::thread_local\n";
-        } else if (target->architecture == "mips" &&
-                   resolved_bool(options, "m.llsc")) {
-            std::cout << "$::feature::atomics\n";
-        }
         if (const auto* table = subtarget_table_for(*target)) {
             for (const auto& feature : table->features) {
                 if (!feature.selectable) continue;
@@ -854,13 +857,14 @@ int cc_main(int argc, char** argv) {
         return 1;
     }
     if (!target_for_triple(options.target)) {
-        diagnostics.command_error("target '" + options.target +
-                                  "' is not implemented; use --print-targets to list compiled-in targets");
+        diagnostics.command_error(
+            (options.target_explicit || options.profile_explicit ? "target '" : "default target '") +
+            options.target + "' is not implemented; use --print-targets to list compiled-in targets");
         return 1;
     }
     if (options.emit == EmitKind::Link &&
         options.dependency_mode != DependencyMode::Only) {
-        diagnostics.command_error("link mode is not implemented yet; use -c or -S");
+        diagnostics.command_error("cc does not link; use -S, -c, or -E");
         return 1;
     }
 
@@ -893,15 +897,16 @@ int cc_main(int argc, char** argv) {
                        : std::nullopt;
         };
     const EvaluationLayoutInstaller install_expansion_evaluation = [&](Program& current) {
-        install_early_evaluation_layout(current, options, target);
+        install_early_evaluation_layout(current, options, target, *subtarget);
         current.evaluation_pointer_resolver = [&current, &options, &subtarget, &diagnostics](
             std::unique_ptr<Expr>& expression, const TypePtr& destination,
             const FunctionDecl* caller, std::span<const NameKey> locals) {
-            return data::normalize_generic_pointer(current, expression, destination,
+            return data::normalize_generic_pointer_async(current, expression, destination,
                 caller, locals, options, *subtarget, diagnostics);
         };
     };
     Program program;
+    program.canonical_callable_abi = canonical_abi;
     program.address_bits = subtarget->abi_info().address_bits;
     program.evaluation_limits = {
         options.eval_byte_limit, options.eval_memory_limit,
@@ -911,7 +916,8 @@ int cc_main(int argc, char** argv) {
             ? EvaluationByteOrder::Big : EvaluationByteOrder::Little,
         target->data_layout.natural_alignment_limit,
         target->data_layout.f80_storage_bytes,
-        target->data_layout.f80_alignment};
+        target->data_layout.f80_alignment,
+        target->data_layout.code_addresses};
     // Macro execution precedes source declarations. Scalar layout queries
     // nevertheless use the same target-owned context as later required folds.
     auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);
@@ -960,6 +966,7 @@ int cc_main(int argc, char** argv) {
         for (auto& assertion : unit.static_assertions) {
             program.static_assertions.push_back(std::move(assertion));
         }
+        for (auto& type : unit.required_types) program.required_types.push_back(std::move(type));
         for (auto& label : unit.global_labels) {
             program.global_labels.push_back(std::move(label));
         }
@@ -973,23 +980,39 @@ int cc_main(int argc, char** argv) {
     const GenericPointerResolver pointer_resolver =
         [&](std::unique_ptr<Expr>& expression, const TypePtr& destination,
             const FunctionDecl* caller, std::span<const NameKey> locals) {
-            return data::normalize_generic_pointer(program, expression, destination,
+            return data::normalize_generic_pointer_async(program, expression, destination,
                 caller, locals, options, *subtarget, diagnostics);
         };
     program.evaluation_pointer_resolver = [&](std::unique_ptr<Expr>& expression,
-        const TypePtr& destination, const FunctionDecl* caller, std::span<const NameKey> locals) {
+        const TypePtr& destination, const FunctionDecl* caller, std::span<const NameKey> locals) -> ContinuationTask<bool> {
         // An automatic attempt may defer to runtime without speculative diagnostics.
         std::ostringstream output;
         Diagnostics quiet(output);
-        return data::normalize_generic_pointer(program, expression, destination,
+        co_return co_await data::normalize_generic_pointer_async(program, expression, destination,
             caller, locals, options, *subtarget, quiet);
     };
-    install_early_evaluation_layout(program, options, target);
+    install_early_evaluation_layout(program, options, target, *subtarget);
     const EvaluationLayoutInstaller install_layout = [&](Program& current) {
         auto layout = std::make_shared<hir::Module>(
             hir::build_record_layout_context(current, options, *target, diagnostics));
         if (diagnostics.errors() != 0) return;
-        install_evaluation_layout_queries(current, target, [layout](const TypePtr&) { return layout; });
+        auto completed = std::make_shared<CompletedEvaluationLayoutView>();
+        install_evaluation_layout_queries(current, target, *subtarget, [&, layout, completed](
+            TypePtr type, EvaluationLayoutKind kind = EvaluationLayoutKind::Complete) -> ContinuationTask<std::shared_ptr<hir::Module>> {
+            const auto prepare = current.evaluation_prepare_layout;
+            if (prepare && !(co_await prepare.async(type, kind))) co_return nullptr;
+            // Published records use the settled view. A separate completed
+            // demand-driven view is reusable only in its exact private scope.
+            if (hir::layout_view_covers(*layout, current, type)) co_return layout;
+            if (const auto cached = completed->find(current, type)) co_return cached;
+            std::ostringstream output;
+            Diagnostics quiet(output);
+            auto required = std::make_shared<hir::Module>(
+                co_await hir::build_required_layout_context_async(current, options, *target, quiet, type, kind));
+            if (quiet.errors()) co_return nullptr;
+            completed->retain(current, type, required);
+            co_return required;
+        });
     };
     if (!expand_semantics(program, diagnostics, options.evaluate_calls,
                           options.mangling, options.abi, pointer_resolver,
