@@ -27,16 +27,17 @@ gate also has to survive removing any one category. Code size is built as six
 separate scalar, call, linear-memory, indirect-memory, control, and floating
 units and is checked again after removing any one unit.
 
-Run from the repository root after building `build/cc`:
+Build Cross into `build/` as described in [doc/install.md](../../doc/install.md)
+(or pass another compiler with `--cross-cc`), then run from the repository root:
 
 ```text
-python trunk/benchmark/x86_64/run.py
+python benchmark/x86_64/run.py
 ```
 
 For a quick validation:
 
 ```text
-python trunk/benchmark/x86_64/run.py --levels O2 --target-ms 1 --samples 1 --compile-runs 1
+python benchmark/x86_64/run.py --levels O2 --target-ms 1 --samples 1 --compile-runs 1
 ```
 
 By default, results are grouped by source revision and run configuration:

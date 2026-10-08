@@ -42,16 +42,19 @@ runner/startup footprint. Linker padding and extracted runtime support remain
 charged to the candidate. The intended objectives are `O3` for speed and `Oz`
 for minimum size.
 
-After building `build/cc`, run from the repository root:
+The runner needs a `mips64-elf` GCC, found on `PATH` as `mips64-elf-gcc` or
+given with `--gcc`. Build Cross into `build/` as described in
+[doc/install.md](../../doc/install.md) (or pass another compiler with
+`--cross-cc`), then run from the repository root:
 
 ```text
-python trunk/benchmark/mips32/run.py
+python benchmark/mips32/run.py
 ```
 
 For a shorter validation run:
 
 ```text
-python trunk/benchmark/mips32/run.py --levels O3 --samples 3 --run-name quick
+python benchmark/mips32/run.py --levels O3 --samples 3 --run-name quick
 ```
 
 Restrict runtime, pipeline, and per-function reporting to selected kernels.
@@ -59,7 +62,7 @@ Each source unit containing one of them is still compiled as a whole, so linked
 image totals include companion functions from those units:
 
 ```text
-python trunk/benchmark/mips32/run.py --kernels narrow,branch,pointer_chase,pointer_chase_pair \
+python benchmark/mips32/run.py --kernels narrow,branch,pointer_chase,pointer_chase_pair \
   --levels O3 --samples 3 --pipeline-timing --run-name narrow-branch-pointer
 ```
 
@@ -71,7 +74,7 @@ pipeline. This is useful for controlled pass ablations without changing a
 model, for example:
 
 ```text
-python trunk/benchmark/mips32/run.py --levels O3 --samples 3 \
+python benchmark/mips32/run.py --levels O3 --samples 3 \
   --cross-flag=-fno-tree-loop-rotate --run-name no-rotation
 ```
 
@@ -79,7 +82,7 @@ To add the path-weighted LLVM-MCA estimate (the driver auto-discovers QEMU's
 contributed hotblocks plugin beside the emulator when installed):
 
 ```text
-python trunk/benchmark/mips32/run.py --levels O3 --samples 3 \
+python benchmark/mips32/run.py --levels O3 --samples 3 \
   --pipeline-timing --run-name pipeline
 ```
 

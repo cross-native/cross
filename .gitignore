@@ -1,5 +1,25 @@
+# Only the compiler, tests, documentation, benchmarks, models, and license
+# belong in this repository. Add any new top-level entry here explicitly.
+/*
+!/.gitignore
+!/CMakeLists.txt
+!/LICENSE
+!/README.md
+!/benchmark/
+!/doc/
+!/model/
+!/src/
+!/test/
+
+# Generated files.
 __pycache__/
+*.py[cod]
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
-*.py[cod]
+*.exe
+*.log
+*.o
+*.obj
+.DS_Store
+Thumbs.db
