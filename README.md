@@ -70,7 +70,7 @@ their invaluable contributions:
 ## Support
 
 Developing Cross with language models costs a lot of tokens. If Cross is
-useful to you, consider supporting its development.
+useful to you, you can support its development at <https://ko-fi.com/xcmp0>.
 
 ## License
 
