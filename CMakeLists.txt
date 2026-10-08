@@ -155,6 +155,7 @@ add_library(cross_middle
     src/middle/mir_analysis.cpp
     src/middle/mir_pass.cpp
     src/middle/mir_transform.cpp
+    src/middle/shrink_wrap.cpp
 )
 target_link_libraries(cross_middle PUBLIC cross_frontend cross_targets)
 cross_component(cross_middle)
@@ -1368,6 +1369,48 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/backend/noreturn/mips_noreturn.cmake")
     set_tests_properties(cross_noreturn_mips PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.frame")
+    foreach(level O1 O2 O3 Os)
+        add_test(NAME cross_shrink_wrap_runtime_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DLEVEL=${level}
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/shrink-wrap-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/backend/native/shrink_wrap/runtime.cmake")
+        set_tests_properties(cross_shrink_wrap_runtime_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.frame;opt.${level}")
+    endforeach()
+    foreach(arch x86_64 mips)
+        add_test(NAME cross_shrink_wrap_assembly_${arch} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DARCH=${arch}
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/shrink-wrap-assembly-${arch}
+            -P "${CMAKE_SOURCE_DIR}/test/backend/native/shrink_wrap/assembly.cmake")
+        set_tests_properties(cross_shrink_wrap_assembly_${arch} PROPERTIES
+            LABELS "check.compile;arch.${arch};backend.native;feature.frame;opt.O2")
+    endforeach()
+    # Each MIPS registration owns one CPU, byte order, and flag setting.
+    foreach(cpu vr4300 r3000)
+        foreach(endian big little)
+            string(SUBSTRING ${endian} 0 1 endian_letter)
+            foreach(mode shrink_wrap no_shrink_wrap shrink_wrap_frame_pointer)
+                if(mode STREQUAL shrink_wrap_frame_pointer)
+                    set(flags -fshrink-wrap -fno-omit-frame-pointer)
+                else()
+                    string(REPLACE "_" "-" flags -f${mode})
+                endif()
+                set(name cross_shrink_wrap_mips_${cpu}_${endian_letter}_${mode})
+                add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/shrink_wrap/mips.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/shrink_wrap/mips_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/shrink-wrap-mips-${cpu}-${endian_letter}-${mode}
+                    -DMIPS_CPUS=${cpu} -DMIPS_ENDIANS=${endian_letter}
+                    -DMIPS_SINGLE_CASE=ON -DEXPECTED=P "-DCC_FLAGS=${flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+                set_tests_properties(${name} PROPERTIES
+                    LABELS "check.runtime;arch.mips;backend.native;feature.frame;profile.o32;opt.O2;isa.${cpu};endian.${endian}"
+                    SKIP_REGULAR_EXPRESSION "skipping MIPS")
+            endforeach()
+        endforeach()
+    endforeach()
 
     add_executable(cross_mir_verifier_test test/middle/mir_verifier_test.cpp)
     target_link_libraries(cross_mir_verifier_test PRIVATE cross_middle)
@@ -1400,6 +1443,14 @@ if(BUILD_TESTING)
     cross_component(cross_frame_ir_test)
     add_test(NAME cross_frame_ir COMMAND $<TARGET_FILE:cross_frame_ir_test>)
     set_tests_properties(cross_frame_ir PROPERTIES
+        LABELS "check.unit;arch.independent;feature.frame;feature.ir")
+
+    add_executable(cross_shrink_wrap_test test/middle/shrink_wrap_test.cpp)
+    target_link_libraries(cross_shrink_wrap_test PRIVATE cross_middle)
+    cross_component(cross_shrink_wrap_test)
+    add_test(NAME cross_shrink_wrap_placement
+             COMMAND $<TARGET_FILE:cross_shrink_wrap_test>)
+    set_tests_properties(cross_shrink_wrap_placement PROPERTIES
         LABELS "check.unit;arch.independent;feature.frame;feature.ir")
 
     add_executable(cross_machine_transform_test

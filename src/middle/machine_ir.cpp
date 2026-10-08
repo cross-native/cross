@@ -3,6 +3,8 @@
 
 #include "middle/machine_ir.hpp"
 
+#include "middle/shrink_wrap.hpp"
+
 #include <algorithm>
 #include <bit>
 #include <string>
@@ -374,6 +376,13 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
     if (!is_power_of_two(function.frame.outgoing_argument_alignment)) {
         ok = fail(diagnostics, function.location,
                   "machine outgoing-argument alignment must be a power of two");
+    }
+    if (function.frame.prologue_block &&
+        (function.frame.elide_incoming_saves ||
+         !valid_prologue_block(function, *function.frame.prologue_block))) {
+        ok = fail(diagnostics, function.location,
+                  "shrink-wrapped prologue block must lie on no cycle and "
+                  "dominate every block it reaches");
     }
     std::vector<bool> referenced_virtuals(function.virtual_registers.size());
     const auto mark_virtual = [&](const Register& value) {

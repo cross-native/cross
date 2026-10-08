@@ -126,6 +126,7 @@ struct CompilerOptions {
     bool unwind_tables{};
     bool asynchronous_unwind_tables{};
     bool elide_noreturn_saves{};
+    bool shrink_wrap{};
     UnwindModel unwind_model{UnwindModel::None};
     CodeModel code_model{CodeModel::Small};
     bool fast_math{};

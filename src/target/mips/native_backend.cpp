@@ -8,6 +8,7 @@
 #include "common/control_flow.hpp"
 #include "model/model.hpp"
 #include "middle/mir_analysis.hpp"
+#include "middle/shrink_wrap.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
 #include "target/mips/features.hpp"
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <iomanip>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -63,6 +65,7 @@ enum class LoweringPass : std::uint16_t {
     EliminateDeadValues,
     ScheduleBlockLayout,
     ScheduleInstructions,
+    SplitEntryParameters,
     AllocateRegisters,
     ElideUnusedSpillSlots,
 };
@@ -169,6 +172,42 @@ bool has_dynamic_stack(const machine::Function& function) {
         }
     }
     return false;
+}
+
+bool phi_instruction(const machine::Instruction& instruction) {
+    return instruction.opcode == Opcode::Phi;
+}
+
+bool returns_twice_or_interrupt(const hir::Function& entity) {
+    const auto special = [](const cross::FunctionDecl* declaration) {
+        return declaration && (declaration->attribute("returns_twice") ||
+                               declaration->attribute("interrupt"));
+    };
+    return special(entity.definition) ||
+           std::any_of(entity.declarations.begin(), entity.declarations.end(),
+                       special);
+}
+
+// Every argument and result piece travels in a register, so the interface
+// uses no frame-relative incoming or result storage.
+bool register_interface(const SignatureLayout& layout) {
+    const auto in_register = [](const ValuePiece& piece) {
+        return piece.location.kind == LocationKind::Register;
+    };
+    return std::all_of(layout.call.arguments.begin(),
+                       layout.call.arguments.end(),
+                       [&](const auto& assignment) {
+                           return std::all_of(assignment.pieces.begin(),
+                                              assignment.pieces.end(),
+                                              in_register);
+                       }) &&
+           std::all_of(layout.results.begin(), layout.results.end(),
+                       [&](const auto& result) {
+                           return !result.indirect &&
+                                  std::all_of(result.pieces.begin(),
+                                              result.pieces.end(),
+                                              in_register);
+                       });
 }
 
 unsigned type_bits(const hir::Module& module, hir::TypeId id) {
@@ -889,19 +928,7 @@ private:
         if (!options_.elide_noreturn_saves ||
             options_.unwind_model != UnwindModel::None ||
             options_.unwind_tables || options_.asynchronous_unwind_tables ||
-            entity.naked) {
-            return false;
-        }
-        if (entity.definition && (entity.definition->attribute("returns_twice") ||
-                                  entity.definition->attribute("interrupt"))) {
-            return false;
-        }
-        if (std::any_of(entity.declarations.begin(), entity.declarations.end(),
-                        [](const cross::FunctionDecl* declaration) {
-                            return declaration &&
-                                   (declaration->attribute("returns_twice") ||
-                                    declaration->attribute("interrupt"));
-                        })) {
+            entity.naked || returns_twice_or_interrupt(entity)) {
             return false;
         }
         return source_ && !mir::has_reachable_return(*source_);
@@ -4188,6 +4215,12 @@ private:
                 return schedule_instructions(function);
             });
         passes.add(
+            {{LoweringPass::SplitEntryParameters}, Stage::RegisterAllocation,
+              "split-entry-parameters"},
+            [this](machine::Function& function) {
+                return split_entry_parameters(function);
+            });
+        passes.add(
             {{LoweringPass::AllocateRegisters}, Stage::RegisterAllocation,
               "allocate-registers"},
             [this](machine::Function& function) {
@@ -4200,6 +4233,72 @@ private:
                 return native::elide_unused_virtual_spill_slots(function);
             });
         (void)passes.run(current_);
+    }
+
+    // A parameter that crosses calls only below one branch of the entry
+    // block is copied there, so the entry block can leave it in a volatile
+    // register and stay outside a shrink-wrapped frame. Only values the
+    // allocator can color are split.
+    bool split_entry_parameters(machine::Function& function) const {
+        const auto& entity = hir_.function(function.source);
+        if (!options_.shrink_wrap || !options_.register_allocation ||
+            options_.unwind_model != UnwindModel::None ||
+            options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            function.frame.elide_incoming_saves ||
+            std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                        [](const hir::Parameter& parameter) {
+                            return parameter.mode != ParameterMode::In;
+                        })) {
+            return false;
+        }
+        // Incoming stack pieces keep the prologue at entry anyway.
+        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
+        const auto layout =
+            abi ? classify_function_interface(entity, *abi) : std::nullopt;
+        if (!layout || !register_interface(*layout)) return false;
+        // Without a preserved register of its class, a parameter crossing a
+        // call never makes the entry block need the frame; a copy only costs.
+        const auto preserves =
+            [&](std::initializer_list<std::string_view> names) {
+                return std::any_of(
+                    names.begin(), names.end(), [&](std::string_view name) {
+                        const auto clobbers =
+                            [&](const std::vector<std::string>& list) {
+                                return std::find(list.begin(), list.end(),
+                                                 name) != list.end();
+                            };
+                        return !(abi && clobbers(abi->call_clobbers)) &&
+                               !clobbers(entity.clobbers);
+                    });
+            };
+        const bool integer_preserved =
+            preserves({"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"});
+        const bool floating_preserved =
+            preserves({"f20", "f22", "f24", "f26", "f28", "f30"});
+        return machine::split_entry_parameters(
+            function,
+            [&](const machine::Instruction& instruction) {
+                const auto opcode = decode_opcode(instruction.opcode);
+                if ((opcode != Opcode::Parameter &&
+                     opcode != Opcode::Fparameter) ||
+                    instruction.defs.size() != 1 ||
+                    instruction.defs.front().kind !=
+                        machine::RegisterKind::Virtual) {
+                    return false;
+                }
+                const auto value = instruction.defs.front();
+                const auto kind = function.virtual_register_classes[value.id];
+                return (integer_preserved &&
+                        kind == machine::VirtualRegisterClass::Integer &&
+                        (value.mode.bits <= 32 ||
+                         subtarget_.has_feature(Feature::Mips3))) ||
+                       (floating_preserved &&
+                        kind == machine::VirtualRegisterClass::Floating &&
+                        value.mode.bits <= 64 &&
+                        subtarget_.has_feature(Feature::Mips3) &&
+                        subtarget_.has_feature(Feature::HardFloat));
+            },
+            phi_instruction);
     }
 
     void record_private_clobbers(const machine::Function& function) {
@@ -4387,6 +4486,10 @@ public:
             prepare_parameter_homes(function);
             if (!finalize_frame(function)) continue;
             prepare_fixed_frame(function);
+            if (can_shrink_wrap(function)) {
+                function.frame.prologue_block = machine::place_prologue(
+                    function, machine::frame_blocks(function, phi_instruction));
+            }
         }
         active_signature_.reset();
     }
@@ -4867,11 +4970,26 @@ private:
         return (hir_.address_bits + 7U) / 8U;
     }
 
+    // Shrink-wrap placement keeps frame storage inside the framed region.
+    void require_frame() const {
+        if (!frame_active_) {
+            diagnostics_.error(
+                function_location_,
+                "MIPS code outside a shrink-wrapped frame uses frame storage");
+        }
+    }
+
+    // Returns before a shrink-wrapped prologue, or from a frameless
+    // function, jump back directly instead of through the epilogue.
+    bool direct_return() const { return frame_size_ == 0 || !frame_active_; }
+
     std::string memory(std::int64_t offset) const {
+        require_frame();
         return memory(offset, frame_pointer_active_ ? "fp" : "sp");
     }
 
     std::string_view frame_base() const {
+        require_frame();
         return frame_pointer_active_ ? std::string_view{"fp"}
                                      : std::string_view{"sp"};
     }
@@ -5582,6 +5700,36 @@ private:
         function.frame.program = std::move(program);
     }
 
+    // Shrink-wrapping moves only the fixed frame program. Entry work that
+    // uses the frame (incoming homes and stack pieces, output pointers,
+    // indirect or stack results) keeps it at function entry, as do externally
+    // visible labels.
+    bool can_shrink_wrap(const machine::Function& function) const {
+        const auto& entity = hir_.function(function.source);
+        if (!options_.shrink_wrap || !active_signature_ ||
+            function.frame.elide_incoming_saves ||
+            function.frame.program->prologue.empty() ||
+            returns_twice_or_interrupt(entity) ||
+            std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                        [](const hir::Parameter& parameter) {
+                            return parameter.mode != ParameterMode::In;
+                        }) ||
+            std::any_of(function.labels.begin(), function.labels.end(),
+                        [&](const machine::Function::LocalLabel& label) {
+                            return hir_.labels.at(label.label.value).is_global;
+                        }) ||
+            std::any_of(function.stack_slots.begin(),
+                        function.stack_slots.end(),
+                        [](const machine::StackSlot& slot) {
+                            return !slot.elided &&
+                                   slot.kind ==
+                                       machine::StackSlotKind::IncomingArgument;
+                        })) {
+            return false;
+        }
+        return register_interface(active_signature_->layout);
+    }
+
     void emit_frame_instruction(const machine::Instruction& value) {
         const auto& effect = *value.frame_effect;
         const auto base = reg_name(gpr_name({effect.base.id}));
@@ -5887,6 +6035,20 @@ private:
             instruction("lbu", "$at," + memory(source + index, source_base));
             instruction("sb",
                         "$at," + memory(destination + index, destination_base));
+        }
+    }
+
+    void emit_copy(const machine::Function& function,
+                   const machine::Instruction& value) {
+        const auto target = value.defs.front();
+        const auto source = value.uses.front();
+        if (same_physical_assignment(function, target, source)) return;
+        if (const auto assigned = assigned_gpr(function, target)) {
+            load_vreg(function, source, *assigned, value.location);
+        } else if (const auto floating = assigned_fpr(function, target)) {
+            load_fvreg(function, source, *floating, value.location);
+        } else {
+            copy_vreg(function, target, source, value.location);
         }
     }
 
@@ -6806,7 +6968,7 @@ private:
                 return false;
             }
             place_high();
-            if (frame_size_ == 0) instruction("jr", "$ra");
+            if (direct_return()) instruction("jr", "$ra");
             else instruction("b", epilogue_label_);
             place_low();
             return true;
@@ -7062,6 +7224,7 @@ private:
 
     bool needs_shared_epilogue(const machine::Function& function) {
         for (const auto& block : function.blocks) {
+            if (!framed_[block.id.value]) continue;
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
                 const auto& instruction = block.instructions[index];
@@ -7453,7 +7616,7 @@ private:
             if (delay_opcode == "nop") instruction("nop");
             else instruction(delay_opcode, delay_operands);
         };
-        if (frame_size_ == 0) {
+        if (direct_return()) {
             instruction("jr", "$ra");
             emit_delay();
         } else if (!fallthrough_epilogue) {
@@ -7577,7 +7740,7 @@ private:
                                                 std::to_string(mask));
                                     }
                                 };
-                                if (frame_size_ == 0) {
+                                if (direct_return()) {
                                     instruction("jr", "$ra");
                                     place_low();
                                 } else if (!fallthrough_epilogue) {
@@ -7605,7 +7768,7 @@ private:
                         place_split_integer_registers(
                             function, source, result.pieces,
                             type_bits(hir_, entity.result_type),
-                            frame_size_ == 0 || !fallthrough_epilogue)) {
+                            direct_return() || !fallthrough_epilogue)) {
                         return;
                     } else {
                         for (const auto& piece : result.pieces) {
@@ -7645,7 +7808,7 @@ private:
                 }
             }
         }
-        if (frame_size_ == 0) {
+        if (direct_return()) {
             instruction("jr", "$ra");
             instruction("nop");
         } else if (!fallthrough_epilogue) {
@@ -7985,7 +8148,9 @@ private:
                                    machine::BlockId target,
                                    bool allow_fused_compare,
                                    bool prior_branch_clears_hilo = false) {
+            // A successor's first operation cannot run before its prologue.
             if (target == source.id ||
+                function.frame.prologue_block == target ||
                 layout_successor(function, source.id) == target ||
                 edge_has_phi_copies(function, source.id, target)) {
                 return;
@@ -8178,6 +8343,11 @@ private:
     std::uint32_t frame_size_{};
     std::uint32_t saved_fp_offset_{};
     std::uint32_t saved_ra_offset_{};
+    // Blocks of the active function that run with its frame, and whether the
+    // code being emitted does.
+    std::vector<bool> framed_;
+    bool frame_active_{true};
+    SourceLocation function_location_;
     bool frame_pointer_active_{};
     bool saves_fp_{};
     bool saves_ra_{};
@@ -10103,7 +10273,7 @@ void AssemblyEmitter::emit_terminator(
         else instruction("nop");
     };
     if (value.kind == machine::InstructionKind::Return) {
-        const bool fallthrough_epilogue = frame_size_ != 0 &&
+        const bool fallthrough_epilogue = frame_size_ != 0 && frame_active_ &&
             !function.layout.empty() &&
             function.layout.back() == predecessor;
         place_return(function, value, fallthrough_epilogue);
@@ -10558,6 +10728,7 @@ void AssemblyEmitter::emit_terminator(
 
 void AssemblyEmitter::emit_function(machine::Function& function) {
     const auto& entity = hir_.function(function.source);
+    frame_active_ = true;
     active_signature_ = classify_entity(entity, function.location);
     if (!active_signature_) return;
     hilo_write_barrier_ = 0;
@@ -10575,6 +10746,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         prepare_parameter_homes(function);
         if (!finalize_frame(function)) return;
     }
+    framed_ = machine::framed_blocks(function);
+    function_location_ = function.location;
     const bool shared_epilogue =
         frame_size_ != 0 && needs_shared_epilogue(function);
     frame_pointer_active_ = function.frame.has_frame_pointer;
@@ -10660,8 +10833,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                      assembly_uses_dwarf_cfi(format_);
     if (cfi) output_ << ".cfi_startproc\n";
     if (function.frame.program) {
-        for (const auto& instruction : function.frame.program->prologue) {
-            emit_frame_instruction(instruction);
+        if (!function.frame.prologue_block) {
+            for (const auto& instruction : function.frame.program->prologue) {
+                emit_frame_instruction(instruction);
+            }
         }
     } else if (frame_size_ != 0) {
         instruction(address_add_immediate(),
@@ -10695,6 +10870,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         }
         emit_callee_saves(function, cfi);
     }
+    // Entry homes run before a shrink-wrapped prologue.
+    frame_active_ = !function.frame.prologue_block;
     emit_parameter_homes(function);
     epilogue_label_ = ".Lcross.mips." +
                       std::to_string(function.source.value) + ".return";
@@ -10718,6 +10895,12 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 output_ << ".globl " << label_symbol << '\n'
                         << ".type " << label_symbol << ",@function\n"
                         << label_symbol << ":\n";
+            }
+        }
+        frame_active_ = framed_[found->id.value];
+        if (function.frame.prologue_block == found->id) {
+            for (const auto& instruction : function.frame.program->prologue) {
+                emit_frame_instruction(instruction);
             }
         }
         const auto delay_plan = delay_slot_plan(function, *found);
@@ -10785,6 +10968,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 } else {
                     emit_call(function, value);
                 }
+            } else if (value.kind == machine::InstructionKind::Copy) {
+                emit_copy(function, value);
             } else {
                 const machine::Instruction* delay = nullptr;
                 if (delay_plan && index == delay_plan->second) {
@@ -10805,6 +10990,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         }
     }
 
+    frame_active_ = true;
     if (shared_epilogue) {
         output_ << epilogue_label_ << ":\n";
         if (function.frame.program) {

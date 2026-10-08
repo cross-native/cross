@@ -342,6 +342,9 @@ struct FrameInfo {
     // when the function's ABI does not preserve that register.
     std::optional<PhysicalRegisterId> cfa_anchor_register;
     std::optional<FrameProgram> program;
+    // Shrink-wrapped frames run the prologue on entry to this block instead
+    // of at function entry; only exits reachable from it run the epilogue.
+    std::optional<BlockId> prologue_block;
     bool has_frame_pointer{};
     bool elide_incoming_saves{};
     bool finalized{};

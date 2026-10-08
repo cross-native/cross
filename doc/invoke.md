@@ -75,6 +75,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-ffast-math` | Relax floating-point rules: finite math only, no signed zeros, `-ffp-contract=fast`. |
 | `-funwind-tables` | Emit unwind tables (CFI or SEH). No unwinder is linked. |
 | `-fno-inline-functions` | Disable discretionary inlining; `[[always_inline]]` still applies. |
+| `-fno-shrink-wrap` | Set up the stack frame and save preserved registers at function entry, not only on the paths that need them (the default from `-O1`). |
 | `-fno-eval-calls` | Stop evaluating ordinary calls during compilation; required evaluation still happens. |
 | `-feval-step-limit=N`, `-feval-depth-limit=N`, `-feval-memory-limit=N`, `-feval-byte-limit=N` | Limits for compile-time evaluation and macro expansion. |
 

@@ -537,6 +537,9 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.elide-noreturn-saves", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "omit unobservable incoming register saves in non-returning functions"},
+        {"f.shrink-wrap", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Implemented,
+         "set up the frame and callee saves only on paths that need them"},
         {"f.unwind-model", {}, OptionValueKind::Enumeration, std::string("none"),
          {"none", "platform"}, 0, 0, OptionCategory::Semantic, false,
          OptionImplementation::Implemented, "select whether frame unwinding is observable"},
@@ -840,6 +843,7 @@ bool resolve_registered_options(
     options.asynchronous_unwind_tables =
         resolved_bool(options, "f.asynchronous-unwind-tables");
     options.elide_noreturn_saves = resolved_bool(options, "f.elide-noreturn-saves");
+    options.shrink_wrap = resolved_bool(options, "f.shrink-wrap");
     options.unwind_model = resolved_text(options, "f.unwind-model") == "platform"
         ? UnwindModel::Platform : UnwindModel::None;
     const auto code_model = resolved_text(options, "m.cmodel", "small");

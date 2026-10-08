@@ -3,6 +3,7 @@
 
 #include "target/x86_64/native_backend.hpp"
 #include "middle/mir_analysis.hpp"
+#include "middle/shrink_wrap.hpp"
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
 #include "common/control_flow.hpp"
@@ -17,6 +18,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -76,6 +78,7 @@ enum class LoweringPass : std::uint16_t {
     ScheduleAcrossBlocks,
     ScheduleBlocks,
     ClusterSharedCompareSelects,
+    SplitEntryParameters,
     SelectRematerialization,
     AllocateRegisters,
     PreserveBoundaryContract,
@@ -743,6 +746,22 @@ bool packed_integer_operation_supported(const Subtarget& subtarget,
             subtarget.has_feature(Feature::Avx2));
 }
 
+bool phi_instruction(const machine::Instruction& instruction) {
+    return instruction.opcode == Opcode::Phi ||
+           instruction.opcode == Opcode::Fphi ||
+           instruction.opcode == Opcode::Vphi;
+}
+
+bool returns_twice_or_interrupt(const hir::Function& entity) {
+    const auto special = [](const cross::FunctionDecl* declaration) {
+        return declaration && (declaration->attribute("returns_twice") ||
+                               declaration->attribute("interrupt"));
+    };
+    return special(entity.definition) ||
+           std::any_of(entity.declarations.begin(), entity.declarations.end(),
+                       special);
+}
+
 class MachineLowerer {
 public:
     MachineLowerer(const mir::ManagedModule& managed,
@@ -867,19 +886,8 @@ private:
         if (!options_.elide_noreturn_saves ||
             options_.unwind_model != UnwindModel::None ||
             options_.unwind_tables || options_.asynchronous_unwind_tables ||
-            entity.naked || manual_plans_.find(entity.id)) {
-            return false;
-        }
-        if (entity.definition && (entity.definition->attribute("returns_twice") ||
-                                  entity.definition->attribute("interrupt"))) {
-            return false;
-        }
-        if (std::any_of(entity.declarations.begin(), entity.declarations.end(),
-                        [](const cross::FunctionDecl* declaration) {
-                            return declaration &&
-                                   (declaration->attribute("returns_twice") ||
-                                    declaration->attribute("interrupt"));
-                        })) {
+            entity.naked || manual_plans_.find(entity.id) ||
+            returns_twice_or_interrupt(entity)) {
             return false;
         }
         return source_ && !mir::has_reachable_return(*source_);
@@ -2235,6 +2243,78 @@ private:
             entry->instructions.begin(),
             std::make_move_iterator(captures.begin()),
             std::make_move_iterator(captures.end()));
+    }
+
+    // A parameter that crosses calls only below one branch of the entry
+    // block is copied there, so the entry block can leave it in its argument
+    // register and stay outside a shrink-wrapped frame.
+    void split_entry_parameters() {
+        const auto& entity = hir_.function(current_.source);
+        if (!options_.shrink_wrap || !options_.register_allocation ||
+            options_.unwind_model != UnwindModel::None ||
+            options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            current_.frame.elide_incoming_saves || entity.variadic ||
+            manual_plans_.find(current_.source) ||
+            std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                        [](const hir::Parameter& parameter) {
+                            return parameter.mode != ParameterMode::In;
+                        }) ||
+            std::any_of(current_.stack_slots.begin(),
+                        current_.stack_slots.end(),
+                        [](const machine::StackSlot& slot) {
+                            return slot.hard_register.has_value();
+                        })) {
+            return;
+        }
+        // Without a preserved register of its class, a parameter crossing a
+        // call never makes the entry block need the frame; a copy only costs.
+        // RBP does not count; allocation often reserves it as frame pointer.
+        const auto preserves =
+            [&](std::initializer_list<std::string_view> names) {
+                return std::any_of(
+                    names.begin(), names.end(), [&](std::string_view name) {
+                        const auto* view = find_register_view(name);
+                        return view && !current_function_may_clobber(*view);
+                    });
+            };
+        const bool integer_preserved = preserves(
+            {"rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"});
+        const bool floating_preserved = preserves(
+            {"xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+             "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"});
+        if (!machine::split_entry_parameters(
+                current_,
+                [&](const machine::Instruction& instruction) {
+                    if ((instruction.opcode != Opcode::Parameter &&
+                         instruction.opcode != Opcode::Fparameter) ||
+                        instruction.defs.size() != 1 ||
+                        instruction.defs.front().kind !=
+                            machine::RegisterKind::Virtual ||
+                        instruction.defs.front().mode.bits > 64) {
+                        return false;
+                    }
+                    const auto kind = current_.virtual_register_classes
+                        [instruction.defs.front().id];
+                    return (integer_preserved &&
+                            kind == machine::VirtualRegisterClass::Integer) ||
+                           (floating_preserved &&
+                            kind == machine::VirtualRegisterClass::Floating);
+                },
+                phi_instruction)) {
+            return;
+        }
+        // A copy to or from a frame home goes through the emitter's scratch.
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (instruction.kind != machine::InstructionKind::Copy) continue;
+                const bool floating =
+                    current_.virtual_register_classes
+                        [instruction.defs.front().id] ==
+                    machine::VirtualRegisterClass::Floating;
+                append_fixed_clobber(instruction, floating ? "xmm0" : "rax",
+                                     floating ? machine::i128 : machine::i64);
+            }
+        }
     }
 
     void propagate_machine_copies() {
@@ -9180,6 +9260,9 @@ private:
         add(LoweringPass::ClusterSharedCompareSelects, Stage::Scheduling,
             "cluster-shared-compare-selects",
             &MachineLowerer::cluster_shared_compare_selects);
+        add(LoweringPass::SplitEntryParameters, Stage::RegisterAllocation,
+            "split-entry-parameters",
+            &MachineLowerer::split_entry_parameters);
         add(LoweringPass::SelectRematerialization,
             Stage::RegisterAllocation, "select-rematerialization",
             &MachineLowerer::select_rematerialization);
@@ -9579,6 +9662,10 @@ public:
             const bool compact = can_push_allocated_preserved_registers(function, entity);
             if (!compact && use_red_zone(function, entity, function.frame.local_size)) continue;
             prepare_fixed_frame(function, compact);
+            if (can_shrink_wrap(function, entity)) {
+                function.frame.prologue_block =
+                    machine::place_prologue(function, frame_uses(function));
+            }
         }
     }
 
@@ -9697,6 +9784,59 @@ private:
             if (fp_slot) program.epilogue.push_back(transfer(function.stack_slots[fp_slot->value], true, true));
         }
         function.frame.program = std::move(program);
+    }
+
+    // Shrink-wrapping moves only the fixed frame program. Entry work that
+    // uses the frame (incoming stack pieces, output pointers, indirect
+    // results) keeps it at function entry, as do externally visible labels.
+    bool can_shrink_wrap(const machine::Function& function,
+                         const hir::Function& entity) const {
+        if (!options_.shrink_wrap || function.frame.elide_incoming_saves ||
+            function.frame.program->prologue.empty() ||
+            returns_twice_or_interrupt(entity) ||
+            automatic_interface_uses_stack(function, entity) ||
+            std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                        [](const hir::Parameter& parameter) {
+                            return parameter.mode != ParameterMode::In;
+                        }) ||
+            std::any_of(function.labels.begin(), function.labels.end(),
+                        [&](const machine::Function::LocalLabel& label) {
+                            return hir_.labels.at(label.label.value).is_global;
+                        })) {
+            return false;
+        }
+        std::optional<ReturnAssignment> result;
+        if (const auto* dynamic = dynamic_plans_.find(function.source);
+            dynamic && dynamic->result) {
+            result = *dynamic->result;
+        } else {
+            result = classify_function_result(hir_, entity, subtarget_);
+        }
+        return !(result && *result && result->indirect);
+    }
+
+    // Blocks needing the frame, including PHI copies of values that the
+    // emitter cycles through the frame's wide temporary.
+    std::vector<bool> frame_uses(const machine::Function& function) const {
+        auto result = machine::frame_blocks(function, phi_instruction);
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (!phi_instruction(instruction) ||
+                    (instruction.opcode != Opcode::Vphi &&
+                     instruction.defs.front().mode.bits <= 64)) {
+                    continue;
+                }
+                for (const auto& operand : instruction.operands) {
+                    if (const auto* predecessor =
+                            std::get_if<machine::BlockOperand>(&operand);
+                        predecessor &&
+                        predecessor->target.value < result.size()) {
+                        result[predecessor->target.value] = true;
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     void emit_frame_instruction(const machine::Instruction& value) {
@@ -10166,7 +10306,17 @@ private:
         return symbol_with_addend(source) + "(%rip)";
     }
 
+    // Shrink-wrap placement keeps frame storage inside the framed region.
+    void require_frame() const {
+        if (!frame_active_) {
+            diagnostics_.error(
+                active_function_ ? active_function_->location : SourceLocation{},
+                "x86-64 code outside a shrink-wrapped frame uses frame storage");
+        }
+    }
+
     std::string memory(std::int32_t offset) const {
+        require_frame();
         if (realigned_dynamic_frame_) {
             return std::to_string(offset) + "(%rbp)";
         }
@@ -10185,12 +10335,14 @@ private:
     }
 
     std::string outgoing_memory(std::size_t offset) const {
+        require_frame();
         return std::to_string(offset) + "(%rsp)";
     }
 
     std::string indexed_frame_memory(std::int32_t offset,
                                      std::string_view index,
                                      unsigned scale) const {
+        require_frame();
         std::int64_t relative = offset;
         std::string_view base = "rsp";
         if (realigned_dynamic_frame_) {
@@ -10207,6 +10359,7 @@ private:
     }
 
     std::string incoming_memory(std::size_t caller_offset) const {
+        require_frame();
         // ABI offsets precede CALL's return-address word and any saved RBP.
         if (realigned_dynamic_frame_) {
             return std::to_string(caller_offset + 24U) + "(%" +
@@ -20731,8 +20884,7 @@ private:
         }
         if (tail) {
             if (uses_wide_vectors_) instruction("vzeroupper");
-            restore_allocated_preserved_registers(function);
-            emit_frame_teardown(function);
+            emit_frame_exit(function);
             emit_tail_call_transfer(*entity, *symbol);
             if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
                 output_ << ".cfi_restore_state\n";
@@ -21726,6 +21878,13 @@ private:
         }
     }
 
+    // A shrink-wrapped exit that runs before the prologue has no frame.
+    void emit_frame_exit(const machine::Function& function) {
+        if (!frame_active_) return;
+        restore_allocated_preserved_registers(function);
+        emit_frame_teardown(function);
+    }
+
     void emit_frame_teardown(const machine::Function& function) {
         if (function.frame.program) {
             for (const auto& instruction : function.frame.program->epilogue) {
@@ -21837,8 +21996,7 @@ private:
         }
         publish_manual_x87_outputs(function, *plan, value);
         if (uses_wide_vectors_) instruction("vzeroupper");
-        restore_allocated_preserved_registers(function);
-        emit_frame_teardown(function);
+        emit_frame_exit(function);
         if (plan->callee_cleanup &&
             plan->stack.outgoing_area_size != 0) {
             instruction(
@@ -22152,8 +22310,7 @@ private:
             }
         }
         if (uses_wide_vectors_) instruction("vzeroupper");
-        restore_allocated_preserved_registers(function);
-        emit_frame_teardown(function);
+        emit_frame_exit(function);
         instruction("retq");
         if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
             // The return block may precede cold blocks in layout. Restore the
@@ -22742,6 +22899,31 @@ private:
         }
     }
 
+    // Copies of scalar integer and floating values; a frame-resident side
+    // goes through the RAX or XMM0 scratch.
+    void emit_copy(const machine::Function& function,
+                   const machine::Instruction& value) {
+        const auto source = value.uses.front();
+        const auto target = value.defs.front();
+        if (same_physical_assignment(function, source, target)) return;
+        if (function.virtual_register_classes[target.id] ==
+            machine::VirtualRegisterClass::Floating) {
+            if (const auto* assigned = assigned_simd_register(function, target)) {
+                load_float(function, source, assigned->name);
+            } else {
+                load_float(function, source, "xmm0");
+                store_float(function, target, "xmm0");
+            }
+            return;
+        }
+        if (const auto* assigned = assigned_integer_register(function, target)) {
+            load(function, source, assigned->storage_name);
+        } else {
+            load(function, source, "rax");
+            store(function, target, "rax");
+        }
+    }
+
     void emit_block(const machine::Function& function,
                     const machine::Block& value,
                     std::optional<machine::BlockId> next_block) {
@@ -22766,6 +22948,12 @@ private:
                             << "; .scl 2; .type 32; .endef\n";
                 }
                 output_ << symbol << ":\n";
+            }
+        }
+        frame_active_ = framed_[value.id.value];
+        if (function.frame.prologue_block == value.id) {
+            for (const auto& instruction : function.frame.program->prologue) {
+                emit_frame_instruction(instruction);
             }
         }
         early_select_tests_.clear();
@@ -22882,9 +23070,7 @@ private:
                                 next_block);
                 break;
             case machine::InstructionKind::Copy:
-                diagnostics_.error(instruction_value.location,
-                                   "unresolved machine copy reached x86 "
-                                   "assembly emission");
+                emit_copy(function, instruction_value);
                 break;
             }
         }
@@ -22892,6 +23078,7 @@ private:
 
     void emit_function(machine::Function& function) {
         active_function_ = &function;
+        frame_active_ = true;
         spill_homes_.assign(function.virtual_registers.size(),
                             std::numeric_limits<std::size_t>::max());
         for (std::size_t index = 0; index < function.stack_slots.size(); ++index) {
@@ -23075,10 +23262,13 @@ private:
             realigned_stack_
                 ? fixed_cfa_save_size(function)
                 : 0U;
+        framed_ = machine::framed_blocks(function);
         if (function.frame.program) {
             frame_size_ = function.frame.program->stack_size - frame_pointer_save_size_;
-            for (const auto &instruction : function.frame.program->prologue) {
-                emit_frame_instruction(instruction);
+            if (!function.frame.prologue_block) {
+                for (const auto &instruction : function.frame.program->prologue) {
+                    emit_frame_instruction(instruction);
+                }
             }
         } else {
             if (compact_gpr_saves_) {
@@ -23244,6 +23434,8 @@ private:
         // immediately before call. At callee entry only the return-address
         // word precedes them.
         incoming_stack_base_ = 8;
+        // Entry captures run before a shrink-wrapped prologue.
+        frame_active_ = !function.frame.prologue_block;
         if (const auto* manual = manual_plans_.find(function.source)) {
             capture_manual_x87_inputs(function, *manual);
             capture_manual_register_inputs(function, *manual);
@@ -23318,6 +23510,7 @@ private:
             emit_block(function, block(function, function.layout[index]), next);
         }
         for (const auto& stub : deferred_edge_stubs_) {
+            frame_active_ = framed_[stub.predecessor.value];
             output_ << stub.label << ":\n";
             emit_edge_copies(function, stub.predecessor, stub.successor);
             instruction("jmp", block_label(function, stub.successor));
@@ -23365,6 +23558,10 @@ private:
     bool compact_gpr_saves_{};
     bool compact_gpr_call_pad_{};
     bool uses_wide_vectors_{};
+    // Blocks of the active function that run with its frame, and whether the
+    // code being emitted does.
+    std::vector<bool> framed_;
+    bool frame_active_{true};
     std::string dynamic_frame_anchor_register_;
     std::string current_operation_;
     const machine::Function* active_function_{};
