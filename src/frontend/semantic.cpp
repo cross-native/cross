@@ -8963,20 +8963,22 @@ private:
                     co_return (co_await resolve_pointer_async(clone_expr(argument), to)).has_value();
                 co_return compare_pointee(from->pointee, to->pointee) != PointeeCompatibility::Incompatible;
             };
-            const bool compatible = from && to &&
+            bool compatible = from && to &&
                 (((is_integer(from) || is_floating(from)) &&
                   (is_integer(to) || is_floating(to))) ||
                  (is_meta_type(from) && from->kind == to->kind) ||
                  (from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Builtin &&
                   to->builtin == BuiltinType::Bool) ||
                  compare_source_types(callable_parameter_type(from, parameter.mode),
-                           callable_parameter_type(to, parameter.mode)) != TypeComparison::Different ||
-                 (co_await pointer_compatible()) ||
-                 (is_integer(from) && to->kind == Type::Kind::Pointer && (co_await null_integer_async(argument))) ||
-                 (is_vector(to) && !to->scalable &&
-                  ((is_vector(from) && !from->scalable && compatible_vector_shape(from, to) &&
-                    (is_integer(from->element) || is_floating(from->element))) ||
-                   is_integer(from) || is_floating(from))));
+                           callable_parameter_type(to, parameter.mode)) != TypeComparison::Different);
+            if (!compatible && from && to) compatible = co_await pointer_compatible();
+            if (!compatible && from && to && is_integer(from) && to->kind == Type::Kind::Pointer)
+                compatible = (co_await null_integer_async(argument)).has_value();
+            if (!compatible && from && to)
+                compatible = is_vector(to) && !to->scalable &&
+                    ((is_vector(from) && !from->scalable && compatible_vector_shape(from, to) &&
+                      (is_integer(from->element) || is_floating(from->element))) ||
+                     is_integer(from) || is_floating(from));
             if (resource_exhausted_ || context_unavailable_) co_return false;
             // An out actual supplies no input value. Its source expression
             // still has to be valid; a modifiable lvalue also receives copy-out.
@@ -11497,8 +11499,9 @@ private:
         std::optional<EvalValue> base;
         if (expression.text == "member") base = co_await meta_designator_pointer_async(*expression.left);
         else base = co_await this->expression_async(*expression.left);
-        if (!base || !base->meta_pointer || !(co_await sized_meta_pointer_async(*base, expression.location)) ||
-            base->type->pointee->kind != Type::Kind::Record) {
+        bool sized = base && base->meta_pointer;
+        if (sized) sized = co_await sized_meta_pointer_async(*base, expression.location);
+        if (!sized || base->type->pointee->kind != Type::Kind::Record) {
             fail(expression.location,
                  "meta record member access requires a supported structure pointer");
             co_return std::nullopt;
@@ -11748,10 +11751,12 @@ private:
         }
         if (!(co_await sized_meta_pointer_async(left, location)) ||
             !(co_await sized_meta_pointer_async(right, location))) co_return std::nullopt;
-        if (!same_backing || a.view_offset != b.view_offset ||
-            a.view_length != b.view_length ||
-            (co_await meta_object_size_async(left.type->pointee)) !=
-                (co_await meta_object_size_async(right.type->pointee)) ||
+        bool one_view = same_backing && a.view_offset == b.view_offset &&
+            a.view_length == b.view_length;
+        if (one_view)
+            one_view = (co_await meta_object_size_async(left.type->pointee)) ==
+                (co_await meta_object_size_async(right.type->pointee));
+        if (!one_view ||
             (!compatible_pointee(left.type->pointee, right.type->pointee) &&
              !compatible_pointee(right.type->pointee, left.type->pointee)) ||
             left.type->address_space != right.type->address_space) {
@@ -11930,9 +11935,9 @@ private:
                     co_return std::nullopt;
                 }
                 const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
-                if (required != 0 && !pointer.union_member_view &&
-                    (!pointer.bit_field || !(co_await meta_bit_field_record_view_async(pointer))) &&
-                    !byte_meta_type(access_type) && tag != 0 &&
+                bool typed = required != 0 && !pointer.union_member_view;
+                if (typed && pointer.bit_field) typed = !(co_await meta_bit_field_record_view_async(pointer));
+                if (typed && !byte_meta_type(access_type) && tag != 0 &&
                     !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
                                           access_type)) {
                     fail(location, "meta pointer read violates effective type");
@@ -12279,8 +12284,9 @@ private:
     EvaluationTask<std::optional<EvalValue>> store_meta_pointer_async(std::optional<EvalValue> pointer,
                                                 std::optional<EvalValue> source,
                                                 SourceLocation location) {
-        if (!pointer || !source || !(co_await sized_meta_pointer_async(*pointer, location)) ||
-            !pointer->meta_pointer->mutable_buffer || pointer->type->pointee->is_const) {
+        bool sized = pointer && source;
+        if (sized) sized = co_await sized_meta_pointer_async(*pointer, location);
+        if (!sized || !pointer->meta_pointer->mutable_buffer || pointer->type->pointee->is_const) {
             fail(location, "meta pointer write requires mutable supported storage");
             co_return std::nullopt;
         }

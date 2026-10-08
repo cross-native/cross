@@ -943,8 +943,10 @@ int cc_main(int argc, char** argv) {
             const bool invocation = at + 2 < tokens.size() &&
                 tokens[at].kind == TokenKind::Identifier && tokens[at + 1].is("!") &&
                 (tokens[at + 2].is("(") || tokens[at + 2].is("[") || tokens[at + 2].is("{"));
+            // A role attribute list begins with "[["; starting the head scan
+            // at every token would be quadratic in a long statement.
             if (!tokens[at].is("syntax") && !invocation &&
-                !expansion_function_head(tokens, at)) continue;
+                !(tokens[at].is("[[") && expansion_function_head(tokens, at))) continue;
             // Ordinary units need no expansion environment or meta budget.
             // This scan only enables the engine; it registers nothing.
             execution = std::make_shared<SyntaxExecution>(sources, diagnostics,

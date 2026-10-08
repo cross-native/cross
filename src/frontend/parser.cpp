@@ -441,7 +441,9 @@ EvaluationTask<bool> Parser::parse_syntax_registration_async(Program* program) {
             import_region.end = token_origin(tokens_[*end - 1].location).identity;
         if ((co_await expect_async("{", "after syntax region"))) {
             import_regions_.push_back(import_region);
-            while (!(co_await current_async()).is("}") && (co_await current_async()).kind != TokenKind::End) {
+            for (;;) {
+                const auto next_token = co_await current_async();
+                if (next_token.is("}") || next_token.kind == TokenKind::End) break;
                 const auto before = index_;
                 co_await parse_external_async(*program, region_namespace);
                 if (before == index_) ++index_;
@@ -725,9 +727,9 @@ std::vector<Token> Parser::specifier_input_tokens(std::size_t first, std::size_t
 }
 
 EvaluationTask<void> Parser::prepare_header_async(const std::vector<Token>* shared_specifiers) {
-    if (!syntax_ || preparing_header_ || parsing_public_fragment_ ||
-        (co_await current_async()).is("namespace") || (co_await current_async()).is("using") ||
-        (co_await current_async()).is("$::static_assert")) co_return;
+    if (!syntax_ || preparing_header_ || parsing_public_fragment_) co_return;
+    const auto next_token = co_await current_async();
+    if (next_token.is("namespace") || next_token.is("using") || next_token.is("$::static_assert")) co_return;
     // Only discovery-visible procedural fragments can change header-wide
     // bindings. An ordinary syntax expression alone must not make otherwise
     // settled captures opaque. This probe shares discovery's boundaries and
@@ -1221,6 +1223,11 @@ EvaluationTask<std::optional<SyntaxParsedFragment>> Parser::parse_syntax_fragmen
     try {
         const auto header_position = child->function_header_splice_position();
         const bool header_splice = header_position.has_value();
+        const auto core_declaration_splice = [&]() -> EvaluationTask<bool> {
+            const auto item = co_await child->current_async();
+            co_return item.kind == TokenKind::StructuredSplice && !header_splice &&
+                (!item.splice || !syntax_type_node(*item.splice));
+        };
         if (kind == K::FunctionHeader && header_position == child->index_ &&
             !(co_await child->current_async(1)).is("[[")) {
             ProductionScope header(*child, SyntaxProduction::FunctionHeader);
@@ -1229,9 +1236,7 @@ EvaluationTask<std::optional<SyntaxParsedFragment>> Parser::parse_syntax_fragmen
             if (header.event < child->production_events_.size())
                 child->production_events_[header.event].opaque = item.splice;
         } else if ((kind == K::Declaration || kind == K::FunctionDeclaration ||
-             kind == K::FunctionDefinition) &&
-            (co_await child->current_async()).kind == TokenKind::StructuredSplice && !header_splice &&
-            (!(co_await child->current_async()).splice || !syntax_type_node(*(co_await child->current_async()).splice))) {
+             kind == K::FunctionDefinition) && (co_await core_declaration_splice())) {
             ProductionScope declaration(*child, kind == K::FunctionDefinition
                 ? SyntaxProduction::FunctionDefinition : SyntaxProduction::Declaration);
             const auto item = (co_await child->current_async());
@@ -1258,8 +1263,10 @@ EvaluationTask<std::optional<SyntaxParsedFragment>> Parser::parse_syntax_fragmen
             // output belongs after owner expansion, so retain the bounded
             // type fragment without executing or prematurely classifying it.
             const auto type_first = child->index_;
-            while ((co_await child->current_async()).is("const") || (co_await child->current_async()).is("volatile") ||
-                   (co_await child->current_async()).is("restrict") || (co_await child->current_async()).is("[[")) {
+            for (;;) {
+                const auto next_token = co_await child->current_async();
+                if (!next_token.is("const") && !next_token.is("volatile") &&
+                    !next_token.is("restrict") && !next_token.is("[[")) break;
                 if ((co_await child->current_async()).is("[[")) {
                     const auto group_end = child->bounded_group_end(child->index_);
                     if (!group_end) co_return {};
@@ -1293,8 +1300,8 @@ EvaluationTask<std::optional<SyntaxParsedFragment>> Parser::parse_syntax_fragmen
                    kind == K::FunctionDeclaration || kind == K::FunctionDefinition) {
             // These categories exclude namespaces, registration, and invocations
             // standing in place of the direct declaration/header itself.
-            if ((co_await child->current_async()).is("namespace") ||
-                (co_await child->current_async()).is("syntax") || child->macro_start() ||
+            const auto next_token = co_await child->current_async();
+            if (next_token.is("namespace") || next_token.is("syntax") || child->macro_start() ||
                 child->active_syntax(true)) co_return {};
             if (kind == K::Declaration) {
                 bool pending_header_bindings = false;
@@ -1964,7 +1971,8 @@ EvaluationTask<std::shared_ptr<const SyntaxNode>> Parser::parse_opaque_invocatio
                 closers.pop_back();
             }
             ++index_;
-        } while (!closers.empty() && (co_await current_async()).kind != TokenKind::End);
+            if (closers.empty()) break;
+        } while ((co_await current_async()).kind != TokenKind::End);
         if (!closers.empty()) {
             (co_await error_here_async("unterminated opaque macro token tree"));
             co_return {};
@@ -2354,7 +2362,11 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                     (co_await current_async()).location,
                     "attributes are contextual names; omit the '$::' prefix");
                 ++index_;
-                while (!(co_await current_async()).is("]]" ) && (co_await current_async()).kind != TokenKind::End) ++index_;
+                for (;;) {
+                    const auto next_token = co_await current_async();
+                    if (next_token.is("]]") || next_token.kind == TokenKind::End) break;
+                    ++index_;
+                }
                 break;
             }
             const auto name_event = begin_production(SyntaxProduction::AttributeName);
@@ -2362,7 +2374,11 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
             if (!first) {
                 end_production(name_event);
                 (co_await error_here_async("expected attribute name"));
-                while (!(co_await current_async()).is("]]" ) && (co_await current_async()).kind != TokenKind::End) ++index_;
+                for (;;) {
+                    const auto next_token = co_await current_async();
+                    if (next_token.is("]]") || next_token.kind == TokenKind::End) break;
+                    ++index_;
+                }
                 break;
             }
             std::string name(first->text);
@@ -2383,8 +2399,9 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                 recording_public_tree_ = false;
                 if (mode == AttributeParseMode::Semantic && attribute.name == "generic") {
                     const auto saved_generic_types = active_generic_types_;
-                    while (!(co_await current_async()).is(")") &&
-                           (co_await current_async()).kind != TokenKind::End) {
+                    for (;;) {
+                        const auto next_token = co_await current_async();
+                        if (next_token.is(")") || next_token.kind == TokenKind::End) break;
                         const auto start = index_;
                         auto parameter_location = (co_await current_async()).location;
                         std::optional<std::string> parameter_name;
@@ -2446,7 +2463,9 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                     (co_await expect_async(")", "after generic parameters"));
                     active_generic_types_ = saved_generic_types;
                 } else if (mode == AttributeParseMode::Semantic && attribute.name == "variadic") {
-                    while (!(co_await current_async()).is(")") && (co_await current_async()).kind != TokenKind::End) {
+                    for (;;) {
+                        const auto next_token = co_await current_async();
+                        if (next_token.is(")") || next_token.kind == TokenKind::End) break;
                         const auto start = index_;
                         auto type = co_await parse_type_async();
                         std::optional<std::string> binding_name;
@@ -2471,8 +2490,9 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                     (co_await expect_async(")", "after variadic state bindings"));
                 } else if (mode == AttributeParseMode::Semantic && !parsing_public_fragment_ &&
                            (attribute.name == "aligned" || is_vector_type_attribute(attribute.name))) {
-                    while (!(co_await current_async()).is(")") &&
-                           (co_await current_async()).kind != TokenKind::End) {
+                    for (;;) {
+                        const auto next_token = co_await current_async();
+                        if (next_token.is(")") || next_token.kind == TokenKind::End) break;
                         const auto start = index_;
                         auto expression = co_await parse_expression_async();
                         if (index_ == start) {
@@ -2494,7 +2514,8 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                 } else {
                     unsigned depth = 1;
                     std::string argument;
-                    while (depth != 0 && (co_await current_async()).kind != TokenKind::End) {
+                    while (depth != 0) {
+                        if ((co_await current_async()).kind == TokenKind::End) break;
                         // The public attribute argument is a balanced-token
                         // sequence. Its core shape does not depend on macro
                         // output; retain it without deferring the entire owner.
@@ -2744,7 +2765,9 @@ EvaluationTask<std::optional<std::string>> Parser::parse_qualified_name_async(Sy
     const auto first = (co_await consume_kind_async(TokenKind::Identifier));
     if (!first) co_return std::nullopt;
     std::string name = identifier_binding_name(*first);
-    while ((co_await current_async()).is("::") && (co_await current_async(1)).kind == TokenKind::Identifier) {
+    for (;;) {
+        if (!(co_await current_async()).is("::")) break;
+        if ((co_await current_async(1)).kind != TokenKind::Identifier) break;
         (co_await consume_async("::"));
         const auto component = (co_await consume_kind_async(TokenKind::Identifier));
         if (!component) {
@@ -3338,13 +3361,17 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
         }
     };
     const auto storage_start_async = [&]() -> EvaluationTask<bool> {
-        co_return storage_specifier &&
-            ((co_await current_async()).is("typedef") || (co_await current_async()).is("static") ||
-             (co_await current_async()).is("global") || (co_await current_async()).is("register") ||
-             (co_await current_async()).is("stack") || (co_await current_async()).is("inline"));
+        if (!storage_specifier) co_return false;
+        const auto next_token = co_await current_async();
+        co_return next_token.is("typedef") || next_token.is("static") || next_token.is("global") ||
+            next_token.is("register") || next_token.is("stack") || next_token.is("inline");
     };
-    while ((co_await current_async()).is("const") || (co_await current_async()).is("volatile") ||
-           (co_await current_async()).is("restrict") || (co_await current_async()).is("[[") || (co_await storage_start_async())) {
+    for (;;) {
+        const auto next_token = co_await current_async();
+        bool specifier_start = next_token.is("const") || next_token.is("volatile") ||
+            next_token.is("restrict") || next_token.is("[[");
+        if (!specifier_start) specifier_start = co_await storage_start_async();
+        if (!specifier_start) break;
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         if ((co_await storage_start_async())) {
             if (!(co_await storage_specifier())) break;
@@ -3749,8 +3776,12 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
     (co_await validate_captured_type_async(type));
     for (const auto& attribute : deferred_type_attributes)
         apply_type_attribute(type, attribute, &pending_address_space);
-    while ((co_await current_async()).is("const") || (co_await current_async()).is("volatile") ||
-           (co_await current_async()).is("restrict") || (co_await current_async()).is("[[") || (co_await storage_start_async())) {
+    for (;;) {
+        const auto next_token = co_await current_async();
+        bool specifier_start = next_token.is("const") || next_token.is("volatile") ||
+            next_token.is("restrict") || next_token.is("[[");
+        if (!specifier_start) specifier_start = co_await storage_start_async();
+        if (!specifier_start) break;
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         if ((co_await storage_start_async())) {
             if (!(co_await storage_specifier())) break;
@@ -4326,8 +4357,9 @@ EvaluationTask<TypePtr> Parser::parse_declarator_async(TypePtr base, std::option
     const bool parameter = context == DeclaratorContext::Parameter;
     const bool abstract_only = context == DeclaratorContext::TypePrefix;
     (co_await expand_inline_macro_fragments_async());
-    const bool written = (co_await current_async()).is("*") || (co_await current_async()).is("(") || (co_await current_async()).is("[") ||
-                         (!abstract_only && (co_await current_async()).kind == TokenKind::Identifier);
+    const auto next_token = co_await current_async();
+    const bool written = next_token.is("*") || next_token.is("(") || next_token.is("[") ||
+                         (!abstract_only && next_token.kind == TokenKind::Identifier);
     ProductionScope declarator(*this,
                                written ? SyntaxProduction::Declarator : SyntaxProduction::None);
     auto pending_address_space = base ? base->pending_address_space
@@ -4379,8 +4411,9 @@ EvaluationTask<TypePtr> Parser::parse_declarator_async(TypePtr base, std::option
         // an expression owner's input. Public recognition still throws before
         // expansion so a bounded enclosing capture may defer instead.
         (co_await expand_inline_macro_fragments_async());
-        if ((co_await current_async()).is("*") || (co_await current_async()).is("(") || (co_await current_async()).is("[")) co_return true;
-        if ((co_await current_async()).kind != TokenKind::Identifier || is_reserved_identifier((co_await current_async()).text))
+        const auto grouped = co_await current_async();
+        if (grouped.is("*") || grouped.is("(") || grouped.is("[")) co_return true;
+        if (grouped.kind != TokenKind::Identifier || is_reserved_identifier(grouped.text))
             co_return false;
         // A required declared name can shadow a type. In optional/abstract
         // contexts an established type instead starts an unnamed parameter
@@ -5258,10 +5291,10 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         ~NamespaceRestore() { value = std::move(previous); }
     } restore{active_namespace_, active_namespace_};
     active_namespace_ = name_space;
-    (void)(co_await current_async());
+    const auto first_token = co_await current_async();
     drain_pending_tags(program);
     ProductionScope production(*this, parsing_public_fragment_ &&
-        !(co_await current_async()).is("using") && !(co_await current_async()).is("$::static_assert")
+        !first_token.is("using") && !first_token.is("$::static_assert")
         ? SyntaxProduction::Declaration : SyntaxProduction::None);
     if (const auto header_position = function_header_splice_position()) {
         co_await parse_function_header_splice_async(program, name_space, production.event, *header_position);
@@ -5269,12 +5302,14 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
     }
     const auto expansion_head = macro_start() || active_syntax(true)
         ? std::optional<ExpansionFunctionHead>{} : expansion_function_head(tokens_, index_);
-    if (parsing_public_fragment_ && ((co_await current_async()).is("syntax") ||
-        (co_await current_async()).is("namespace") || macro_start() || active_syntax(true) ||
-        expansion_head)) {
-        (co_await error_here_async("parsed declaration requires a direct core declaration"));
-        ++index_;
-        co_return;
+    if (parsing_public_fragment_) {
+        const auto next_token = co_await current_async();
+        if (next_token.is("syntax") || next_token.is("namespace") || macro_start() ||
+            active_syntax(true) || expansion_head) {
+            (co_await error_here_async("parsed declaration requires a direct core declaration"));
+            ++index_;
+            co_return;
+        }
     }
     // A leading type splice is a declaration specifier, not a complete item.
     // Let the ordinary type path retain its wrapper and compose the declarator.
@@ -5422,7 +5457,9 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         current_scope_imports_ = 0;
         if (syntax_) syntax_->push_scope();
         active_namespace_ = full;
-        while (!(co_await current_async()).is("}") && (co_await current_async()).kind != TokenKind::End) {
+        for (;;) {
+            const auto next_token = co_await current_async();
+            if (next_token.is("}") || next_token.kind == TokenKind::End) break;
             const auto before = index_;
             co_await parse_external_async(program, full);
             if (before == index_) ++index_;
@@ -5459,12 +5496,16 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         if (!(co_await current_async()).is(tag) || (co_await current_async(1)).kind != TokenKind::Identifier)
             co_return false;
         std::size_t at = 2;
-        while ((co_await current_async(at)).is("::") && (co_await current_async(at + 1)).kind == TokenKind::Identifier)
+        for (;;) {
+            if (!(co_await current_async(at)).is("::")) break;
+            if ((co_await current_async(at + 1)).kind != TokenKind::Identifier) break;
             at += 2;
+        }
         while ((co_await current_async(at)).is("[[")) {
             unsigned depth = 1;
             ++at;
-            while (depth && (co_await current_async(at)).kind != TokenKind::End) {
+            while (depth) {
+                if ((co_await current_async(at)).kind == TokenKind::End) break;
                 if ((co_await current_async(at)).is("[[")) ++depth;
                 else if ((co_await current_async(at)).is("]]")) --depth;
                 ++at;
@@ -5474,7 +5515,8 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         if ((co_await current_async(at)).is("{")) {
             unsigned depth = 1;
             ++at;
-            while (depth && (co_await current_async(at)).kind != TokenKind::End) {
+            while (depth) {
+                if ((co_await current_async(at)).kind == TokenKind::End) break;
                 if ((co_await current_async(at)).is("{")) ++depth;
                 else if ((co_await current_async(at)).is("}")) --depth;
                 ++at;
@@ -5522,8 +5564,10 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         co_return true;
     };
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
-    while ((co_await current_async()).is("typedef") || (co_await current_async()).is("global") ||
-           (co_await current_async()).is("static") || (co_await current_async()).is("inline")) {
+    for (;;) {
+        const auto next_token = co_await current_async();
+        if (!next_token.is("typedef") && !next_token.is("global") &&
+            !next_token.is("static") && !next_token.is("inline")) break;
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         (void)(co_await consume_storage_async());
     }
@@ -5754,7 +5798,9 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
             view->retaining_shared_specifiers_ = true;
             auto view_attributes = co_await view->parse_attributes_async();
             const auto storage_async = [&]() -> EvaluationTask<bool> {
-                co_return (co_await view->consume_async("global")) || (co_await view->consume_async("static")) || (co_await view->consume_async("inline"));
+                if ((co_await view->consume_async("global"))) co_return true;
+                if ((co_await view->consume_async("static"))) co_return true;
+                co_return co_await view->consume_async("inline");
             };
             while ((co_await storage_async())) {}
             SpecifierAttributes view_specifiers{view_attributes};
@@ -5802,7 +5848,11 @@ EvaluationTask<std::optional<std::string>> Parser::global_label_owner_async(std:
     const auto separator = name.rfind("::");
     if (separator == std::string::npos) co_return {};
     ++index_;
-    while ((co_await current_async()).is("::") && (co_await current_async(1)).kind == TokenKind::Identifier) index_ += 2;
+    for (;;) {
+        if (!(co_await current_async()).is("::")) break;
+        if ((co_await current_async(1)).kind != TokenKind::Identifier) break;
+        index_ += 2;
+    }
     while ((co_await current_async()).is("[[")) {
         const auto end = bounded_group_end(index_);
         if (!end) co_return {};
@@ -5854,7 +5904,10 @@ EvaluationTask<void> Parser::parse_global_label_declaration_async(
             ProductionScope qualified(*this, SyntaxProduction::QualifiedName);
             if (const auto first = (co_await consume_kind_async(TokenKind::Identifier))) {
                 name = identifier_binding_name(*first);
-                while ((co_await current_async()).is("::") && (co_await current_async(1)).kind == TokenKind::Identifier && (co_await current_async(2)).is("::")) {
+                for (;;) {
+                    if (!(co_await current_async()).is("::")) break;
+                    if ((co_await current_async(1)).kind != TokenKind::Identifier) break;
+                    if (!(co_await current_async(2)).is("::")) break;
                     (co_await consume_async("::"));
                     const auto component = (co_await consume_kind_async(TokenKind::Identifier));
                     *name += "::" + identifier_binding_name(*component);
@@ -5987,15 +6040,18 @@ EvaluationTask<void> Parser::parse_enumerators_async(EnumDecl& declaration, std:
     // changing the namespace-based identity of the enum's public type.
     const auto owner = declaration.nominal_identity
         ? declaration.nominal_identity : new_nominal_identity(declaration.location);
-    while (!(co_await current_async()).is("}") && (co_await current_async()).kind != TokenKind::End) {
+    for (;;) {
+        const auto next_token = co_await current_async();
+        if (next_token.is("}") || next_token.kind == TokenKind::End) break;
         ProductionScope entry(*this, SyntaxProduction::Enumerator);
         (co_await expand_inline_macro_fragments_async());
         const auto enumerator_index = index_;
         const auto token = (co_await consume_kind_async(TokenKind::Identifier));
         if (!token) {
             (co_await error_here_async("expected enumerator name"));
-            while (!(co_await current_async()).is(",") && !(co_await current_async()).is("}") &&
-                   (co_await current_async()).kind != TokenKind::End) {
+            for (;;) {
+                const auto skipped = co_await current_async();
+                if (skipped.is(",") || skipped.is("}") || skipped.kind == TokenKind::End) break;
                 ++index_;
             }
         } else {
@@ -6111,13 +6167,16 @@ void Parser::parse_record_members(RecordDecl& declaration) {
 }
 
 EvaluationTask<void> Parser::parse_record_members_async(RecordDecl& declaration) {
-    while (!(co_await current_async()).is("}") && (co_await current_async()).kind != TokenKind::End) {
+    for (;;) {
+        const auto next_token = co_await current_async();
+        if (next_token.is("}") || next_token.kind == TokenKind::End) break;
         ProductionScope member(*this, SyntaxProduction::MemberDeclaration);
         auto member_attributes = co_await parse_attributes_async();
         if (!(co_await type_start_async())) {
             (co_await error_here_async("expected record member declaration"));
-            while (!(co_await current_async()).is(";") && !(co_await current_async()).is("}") &&
-                   (co_await current_async()).kind != TokenKind::End) {
+            for (;;) {
+                const auto skipped = co_await current_async();
+                if (skipped.is(";") || skipped.is("}") || skipped.kind == TokenKind::End) break;
                 ++index_;
             }
             (co_await consume_async(";"));
@@ -6160,8 +6219,9 @@ EvaluationTask<void> Parser::parse_record_members_async(RecordDecl& declaration)
             parsed_member = true;
         } while ((co_await consume_async(",")));
         if (!parsed_member) {
-            while (!(co_await current_async()).is(";") && !(co_await current_async()).is("}") &&
-                   (co_await current_async()).kind != TokenKind::End) {
+            for (;;) {
+                const auto skipped = co_await current_async();
+                if (skipped.is(";") || skipped.is("}") || skipped.kind == TokenKind::End) break;
                 ++index_;
             }
         }
@@ -6290,7 +6350,8 @@ EvaluationTask<ParameterDecl> Parser::parse_parameter_async(unsigned ordinal) {
     parameter.location = (co_await current_async()).location;
     auto attributes = co_await parse_attributes_async();
     (co_await expand_inline_macro_fragments_async());
-    if ((co_await current_async()).is("in") || (co_await current_async()).is("out") || (co_await current_async()).is("inout")) {
+    const auto mode_token = co_await current_async();
+    if (mode_token.is("in") || mode_token.is("out") || mode_token.is("inout")) {
         ProductionScope mode(*this, SyntaxProduction::ParameterMode);
         if ((co_await consume_async("in"))) parameter.mode = ParameterMode::In;
         else if ((co_await consume_async("out"))) parameter.mode = ParameterMode::Out;
@@ -6613,8 +6674,9 @@ EvaluationTask<std::unique_ptr<ObjectDecl>> Parser::parse_object_async(
 }
 
 EvaluationTask<bool> Parser::local_declaration_start_async() {
-    if ((co_await current_async()).is("register") || (co_await current_async()).is("stack") ||
-        (co_await current_async()).is("static") || (co_await current_async()).is("typedef")) co_return true;
+    const auto next_token = co_await current_async();
+    if (next_token.is("register") || next_token.is("stack") ||
+        next_token.is("static") || next_token.is("typedef")) co_return true;
     co_return co_await type_start_async(TypeProbe::ExpressionAlternative);
 }
 
@@ -6658,8 +6720,9 @@ Parser::parse_local_declaration_async(std::vector<Attribute> attributes,
         co_return true;
     };
     ProductionScope specifiers(*this, SyntaxProduction::DeclarationSpecifiers);
-    if ((co_await current_async()).is("typedef") || (co_await current_async()).is("register") ||
-        (co_await current_async()).is("stack") || (co_await current_async()).is("static")) {
+    const auto storage_token = co_await current_async();
+    if (storage_token.is("typedef") || storage_token.is("register") ||
+        storage_token.is("stack") || storage_token.is("static")) {
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
         (void)(co_await consume_storage_async());
     }
@@ -6791,7 +6854,9 @@ Parser::StatementTask Parser::parse_compound_async() {
     std::optional<std::size_t> end_input;
     std::shared_ptr<const SyntaxContext> context;
     TokenIdentity source_end;
-    if ((parsing_public_fragment_ || token_origin((co_await current_async()).location).context) && !public_tree_failed_)
+    bool bounded_source = parsing_public_fragment_;
+    if (!bounded_source) bounded_source = token_origin((co_await current_async()).location).context != nullptr;
+    if (bounded_source && !public_tree_failed_)
         if (const auto end = bounded_group_end(first); end && *end > first) {
             source_end = token_origin(tokens_[*end - 1].location).identity;
             if (parsing_public_fragment_) end_input = public_input_indices_[*end];
@@ -6856,7 +6921,9 @@ Parser::StatementTask Parser::parse_compound_async() {
     statement->location = (co_await current_async()).location;
     try {
         (co_await expect_async("{"));
-        while (!(co_await current_async()).is("}") && (co_await current_async()).kind != TokenKind::End) {
+        for (;;) {
+            const auto next_token = co_await current_async();
+            if (next_token.is("}") || next_token.kind == TokenKind::End) break;
             const auto before = index_;
             const auto statement_identity = token_origin((co_await current_async()).location).identity;
             const auto prior_imports = current_scope_imports_;
@@ -7203,7 +7270,9 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Empty;
         statement->location = (co_await current_async()).location;
-        (co_await error_here_async(replacement_ || token_origin((co_await current_async()).location).context
+        const bool expansion_output = replacement_ ||
+            token_origin((co_await current_async()).location).context != nullptr;
+        (co_await error_here_async(expansion_output
             ? "expansion output cannot introduce syntax registration"
             : "syntax registration requires an external item or compound block item position"));
         ++index_;
@@ -7257,8 +7326,12 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
         (co_await current_async(2)).kind == TokenKind::Identifier && (co_await current_async(3)).is(":")) {
         co_return co_await parse_global_label_statement_async();
     }
-    if (((co_await current_async()).kind == TokenKind::Identifier && !(co_await current_async()).is("default") && (co_await current_async(1)).is(":")) ||
-        ((co_await current_async()).is("label") && (co_await current_async(1)).kind == TokenKind::Identifier && (co_await current_async(2)).is(":"))) {
+    const auto label_token = co_await current_async();
+    bool labeled = label_token.kind == TokenKind::Identifier && !label_token.is("default") &&
+        (co_await current_async(1)).is(":");
+    if (!labeled && label_token.is("label") && (co_await current_async(1)).kind == TokenKind::Identifier)
+        labeled = (co_await current_async(2)).is(":");
+    if (labeled) {
         ProductionScope labeled_statement(*this, SyntaxProduction::LabeledStatement);
         auto statement = std::make_unique<Statement>();
         statement->kind = Statement::Kind::Label;
@@ -7556,12 +7629,16 @@ Parser::ExpressionTask Parser::parse_initializer_async() {
     result->kind = Expr::Kind::AggregateInitializer;
     result->location = (co_await current_async()).location;
     (co_await consume_async("{"));
-    while (!(co_await current_async()).is("}") && (co_await current_async()).kind != TokenKind::End) {
+    for (;;) {
+        const auto next_token = co_await current_async();
+        if (next_token.is("}") || next_token.kind == TokenKind::End) break;
         {
             ProductionScope initializer_entry(*this, SyntaxProduction::InitializerEntry);
             Expr::InitializerEntry entry;
             entry.location = (co_await current_async()).location;
-            while ((co_await current_async()).is(".") || (co_await current_async()).is("[")) {
+            for (;;) {
+                const auto designator_token = co_await current_async();
+                if (!designator_token.is(".") && !designator_token.is("[")) break;
                 ProductionScope designator_production(*this, SyntaxProduction::Designator);
                 Expr::InitializerDesignator designator;
                 designator.location = (co_await current_async()).location;
@@ -7595,12 +7672,11 @@ Parser::ExpressionTask Parser::parse_initializer_async() {
 Parser::ExpressionTask Parser::parse_assignment_async(std::unique_ptr<Expr> seed) {
     ProductionScope production(*this, SyntaxProduction::AssignmentExpression);
     auto left = co_await parse_conditional_async(std::move(seed));
-    if ((co_await current_async()).is("=") || (co_await current_async()).is("+=") || (co_await current_async()).is("-=") ||
-        (co_await current_async()).is("*=") || (co_await current_async()).is("/=") || (co_await current_async()).is("%=") ||
-        (co_await current_async()).is("<<=") || (co_await current_async()).is(">>=") ||
-        (co_await current_async()).is("&=") || (co_await current_async()).is("^=") ||
-        (co_await current_async()).is("|=")) {
-        const auto operation = (co_await current_async());
+    const auto operation = co_await current_async();
+    if (operation.is("=") || operation.is("+=") || operation.is("-=") ||
+        operation.is("*=") || operation.is("/=") || operation.is("%=") ||
+        operation.is("<<=") || operation.is(">>=") ||
+        operation.is("&=") || operation.is("^=") || operation.is("|=")) {
         {
             ProductionScope assignment_operator(*this, SyntaxProduction::AssignmentOperator);
             ++index_;
@@ -7737,9 +7813,10 @@ Parser::ExpressionTask Parser::parse_unary_async() {
         result->left = co_await parse_unary_async();
         co_return result;
     }
-    if ((co_await current_async()).is("+") || (co_await current_async()).is("-") || (co_await current_async()).is("!") ||
-        (co_await current_async()).is("~") || (co_await current_async()).is("&") || (co_await current_async()).is("*") ||
-        (co_await current_async()).is("++") || (co_await current_async()).is("--")) {
+    const auto unary_token = co_await current_async();
+    if (unary_token.is("+") || unary_token.is("-") || unary_token.is("!") ||
+        unary_token.is("~") || unary_token.is("&") || unary_token.is("*") ||
+        unary_token.is("++") || unary_token.is("--")) {
         const auto operation = (co_await current_async()); ++index_;
         auto result = std::make_unique<Expr>();
         result->kind = Expr::Kind::Unary;
@@ -7968,12 +8045,12 @@ Parser::ExpressionTask Parser::parse_quote_async() {
             if (!(co_await expect_async(")", "after $::unquote expression"))) co_return result;
             continue;
         }
-        if ((co_await current_async()).is("(")) closers.push_back(")");
-        else if ((co_await current_async()).is("[")) closers.push_back("]");
-        else if ((co_await current_async()).is("[[")) closers.push_back("]]");
-        else if ((co_await current_async()).is("{")) closers.push_back("}");
-        else if ((co_await current_async()).is(")") || (co_await current_async()).is("]") ||
-                 (co_await current_async()).is("]]") || (co_await current_async()).is("}")) {
+        const auto quoted = co_await current_async();
+        if (quoted.is("(")) closers.push_back(")");
+        else if (quoted.is("[")) closers.push_back("]");
+        else if (quoted.is("[[")) closers.push_back("]]");
+        else if (quoted.is("{")) closers.push_back("}");
+        else if (quoted.is(")") || quoted.is("]") || quoted.is("]]") || quoted.is("}")) {
             if (closers.empty() || closers.back() != (co_await current_async()).text) {
                 (co_await error_here_async("$::quote requires balanced token groups"));
                 co_return result;

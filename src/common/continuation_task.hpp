@@ -13,12 +13,16 @@ namespace cross {
 // Resumption always goes through the outer pump: neither awaiting a child nor
 // finishing it recursively resumes another native frame. Callers retain their
 // language/resource controls, evaluation order, typed operands and target policy.
-// Keep conditional awaits in explicit if/else statements: the GCC 16.1 Windows
-// host was observed to resume an unselected `condition ? co_await task : value`
-// arm. Likewise, a structured binding whose object needs destruction must not
-// stay in scope across co_await: GCC 16.1 keeps its cleanup guard outside the
-// frame and skips the destructor. These are host implementation constraints,
-// not Cross evaluation rules.
+// Keep a co_await that `&&`, `||`, or `?:` may skip in an explicit if/else
+// statement unless that operator is the whole condition of an if statement or
+// the whole initializer of a declaration, or is itself an operand of such a
+// `&&` or `?:` or the right operand of such a `||`. Elsewhere, such as in a
+// loop condition, a co_return operand, or a call argument, GCC 16.1 runs the
+// skipped task anyway and drops its result and exception. Likewise, a
+// structured binding whose object needs destruction must not stay in scope
+// across co_await: GCC 16.1 keeps its cleanup guard outside the frame and skips
+// the destructor. These are host implementation constraints, not Cross
+// evaluation rules.
 struct ContinuationSchedule {
     std::coroutine_handle<> next;
 };
