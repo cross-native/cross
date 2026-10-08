@@ -34,45 +34,14 @@ inline const char* bit_field_width_error(const Expr::IntegerConstant& width,
     return nullptr;
 }
 
-// Structural record constraints do not request target layout or evaluate a
-// bound, width or attribute. A deferred value must not hide an already-invalid
-// member. Nominal value edges are followed, but pointers do not require a
-// complete pointee; generic leaves remain obligations of their instantiation.
-// Index only published declaration positions, never a private definition or a
-// successful constraint result. Every traversal still selects the current
-// scoped owner and checks its members. Source publication invalidates positions;
-// completeness is checked on lookup rather than cached in the index.
-// RecordSourceProofs below is the only owner of successful results.
-class RecordSourceIndex {
-public:
-    const RecordDecl* definition(const Program& program, const NominalTypeKey& key) {
-        if (program_ != &program || records_ != program.records.data() || count_ != program.records.size()) {
-            definitions_.clear();
-            for (const auto& record : program.records)
-                definitions_[record.nominal_key()].push_back(&record);
-            program_ = &program;
-            records_ = program.records.data();
-            count_ = program.records.size();
-        }
-        const auto found = definitions_.find(key);
-        if (found != definitions_.end())
-            for (const auto* record : found->second)
-                if (record->complete) return record;
-        return nullptr;
-    }
-private:
-    const Program* program_{};
-    const RecordDecl* records_{};
-    std::size_t count_{};
-    std::unordered_map<NominalTypeKey, std::vector<const RecordDecl*>, NominalTypeKeyHash> definitions_;
-};
-
-// Definitions whose whole by-value closure passed record_source_error, for one
-// caller that does not edit declarations in place while it holds them (one HIR
-// layout context). A proof is keyed by the definition object, its member vector
-// and the evaluation layout scope it was made in, so a substituted private view
-// or a replaced declaration is checked again. It retains a private view so the
-// address is not reused, and source publication drops every proof.
+// Definitions whose whole by-value closure passed record_source_error. While it
+// holds them, the owner edits declarations in place only in ways that cannot
+// change that result: it resolves extents and rewrites bound and width
+// expressions and attributes. A proof is keyed by the definition object, its
+// member vector and the evaluation layout scope it was made in, so a
+// substituted private view or a replaced declaration is checked again. It
+// retains a private view so the address is not reused, and source publication
+// drops every proof.
 class RecordSourceProofs {
 public:
     bool contains(const Program& program, const RecordDecl& record) {
@@ -109,6 +78,12 @@ private:
     std::unordered_map<const RecordDecl*, Proof> proofs_;
 };
 
+// Structural record constraints do not request target layout or evaluate a
+// bound, width or attribute. A deferred value must not hide an already-invalid
+// member. Nominal value edges are followed, but pointers do not require a
+// complete pointee; generic leaves remain obligations of their instantiation.
+// Every traversal selects the current scoped owner and checks its members;
+// RecordSourceProofs is the only owner of successful results.
 inline std::optional<RecordSourceError> record_source_error(const RecordDecl& source, const Program& program,
     RecordSourceIndex& index, RecordSourceProofs* proofs = nullptr) {
     if (!source.complete || (proofs && proofs->contains(program, source))) return {};

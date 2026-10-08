@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -709,6 +710,22 @@ using EvaluationGenericValueQuery = ContinuationQuery<EvaluationGenericValueResu
 using EvaluationPointerQuery = ContinuationQuery<bool(std::unique_ptr<Expr>&,
     const TypePtr&, const FunctionDecl*, std::span<const NameKey>)>;
 
+struct Program;
+
+// Positions of published record declarations by nominal key, never a private
+// view or a constraint result. A lookup tests completeness and returns the
+// first complete definition; a change in the table's size or storage rebuilds
+// the index.
+class RecordSourceIndex {
+public:
+    const RecordDecl* definition(const Program& program, const NominalTypeKey& key);
+private:
+    const Program* program_{};
+    const RecordDecl* records_{};
+    std::size_t count_{};
+    std::unordered_map<NominalTypeKey, std::vector<const RecordDecl*>, NominalTypeKeyHash> definitions_;
+};
+
 struct Program {
     using RequiredType = TypeRequirement;
     struct EnumerationPosition {
@@ -784,6 +801,9 @@ struct Program {
     std::shared_ptr<const EvaluationLayoutScopeIdentity> evaluation_layout_scope;
     EvaluationPointerQuery evaluation_pointer_resolver;
     std::vector<RecordDecl> records;
+    // Serves record_definition and structural record checks. Code that removes
+    // records resets it: a later append could restore the size it compares.
+    mutable RecordSourceIndex record_index;
     // These owners undergo source validation before erasure. Their local
     // records are laid out on demand, not forced by the eager runtime pass.
     std::vector<std::shared_ptr<const FunctionScopeIdentity>> translation_only_record_scopes;

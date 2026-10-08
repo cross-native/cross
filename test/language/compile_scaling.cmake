@@ -72,3 +72,27 @@ ${local_records}    struct L360 { uptr value; };\n    struct L0 first = {};\n\
     *((uptr *)&first) = 7uptr;\n    struct L0 second = first;\n\
     return *((uptr *)&second) == 7uptr ? sizeof(second) : 0uptr;\n}\n\
 $::static_assert($::eval(copy_local_chain()) == sizeof(uptr), \"local record chain\");\n")
+
+# Semantic preparation checks the by-value closure of each record in a chain
+# once, not once per record: a file-scope chain behind one layout query and a
+# chain of local records in a runtime function.
+set(chain_records "")
+set(chain_locals "")
+foreach(index RANGE 0 7999)
+    math(EXPR next "${index} + 1")
+    string(APPEND chain_records "struct G${index} { struct G${next} child; };\n")
+    if(index LESS 4000)
+        string(APPEND chain_locals "    struct V${index} { struct V${next} child; };\n")
+    endif()
+endforeach()
+compile(record_validation -O0 "${chain_records}struct G8000 { uptr value; };\n\
+$::static_assert(sizeof(struct G0) == sizeof(uptr), \"record validation\");\n")
+compile(local_record_validation -O0 "global uptr f() {\n${chain_locals}\
+    struct V4000 { uptr value; };\n    return sizeof(struct V0);\n}\n")
+
+# Translation-time evaluation sizes a deeply nested array in one pass over its
+# layers, not once more for every layer.
+string(REPEAT "[1]" 2400 dimensions)
+compile(deep_array_object -O0 "[[eval_only]] static uptr deep_array() {\n\
+    u8 value${dimensions};\n    *((u8 *)&value) = 7u8;\n    return (uptr)*((u8 *)&value);\n}\n\
+$::static_assert($::eval(deep_array()) == 7uptr, \"deep array object\");\n")

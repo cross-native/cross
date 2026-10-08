@@ -617,15 +617,30 @@ bool same_type(const TypePtr& left, const TypePtr& right) {
     return same_type_impl(left, right, TypeComparisonMode::Exact, unused);
 }
 
+const RecordDecl* RecordSourceIndex::definition(const Program& program, const NominalTypeKey& key) {
+    if (program_ != &program || records_ != program.records.data() || count_ != program.records.size()) {
+        definitions_.clear();
+        for (const auto& record : program.records)
+            definitions_[record.nominal_key()].push_back(&record);
+        program_ = &program;
+        records_ = program.records.data();
+        count_ = program.records.size();
+    }
+    const auto found = definitions_.find(key);
+    if (found != definitions_.end())
+        for (const auto* record : found->second)
+            if (record->complete) return record;
+    return nullptr;
+}
+
 std::shared_ptr<const RecordDecl> Program::record_definition(const NominalTypeKey& key) const {
     if (evaluation_record_definition) {
         // A nested layout query may replace the scoped provider while running.
         const auto query = evaluation_record_definition;
         if (auto view = query(key)) return view;
     }
-    for (const auto& record : records)
-        if (record.complete && record.nominal_key() == key)
-            return std::shared_ptr<const RecordDecl>{std::shared_ptr<const RecordDecl>{}, &record};
+    if (const auto* record = record_index.definition(*this, key))
+        return std::shared_ptr<const RecordDecl>{std::shared_ptr<const RecordDecl>{}, record};
     return {};
 }
 

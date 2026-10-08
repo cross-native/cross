@@ -827,6 +827,8 @@ struct GenericExpansionState {
     std::vector<std::pair<NameKey, TypePtr>> local_types;
     std::unordered_map<NominalTypeKey, RecordPreparation, NominalTypeKeyHash> required_records;
     std::unordered_map<NominalTypeKey, RecordPreparation, NominalTypeKeyHash> required_record_alignments;
+    // Shared by every record preparation of this expansion.
+    RecordSourceProofs record_proofs;
     // Resolve nominal operators before a required expression can execute or
     // supply a generic argument. The resulting direct call follows the same
     // demand-driven preparation path as a written helper call.
@@ -1784,11 +1786,10 @@ EvaluationTask<bool> prepare_generic_record_async(NominalTypeKey key, Program& p
         ? state.required_record_alignments : state.required_records;
     if (const auto found = prepared_records.find(key); found != prepared_records.end())
         co_return found->second != GenericExpansionState::RecordPreparation::Failed;
-    std::size_t index = 0;
-    while (index < program.records.size() &&
-           (!program.records[index].complete || program.records[index].nominal_key() != key)) ++index;
-    if (index == program.records.size()) co_return true;
-    if (const auto error = record_source_error(program.records[index], program)) {
+    const auto* definition = program.record_index.definition(program, key);
+    if (!definition) co_return true;
+    const auto index = static_cast<std::size_t>(definition - program.records.data());
+    if (const auto error = record_source_error(*definition, program, program.record_index, &state.record_proofs)) {
         diagnostics.error(error->location, error->message);
         prepared_records[key] = GenericExpansionState::RecordPreparation::Failed;
         co_return false;
@@ -1994,7 +1995,7 @@ EvaluationTask<void> rewrite_generic_function_async(FunctionDecl& function, Prog
         !state.rewritten_functions.insert(&function).second) co_return;
     for (const auto& record : program.records) {
         if (!record.nominal_identity || record.nominal_identity->function_scope != function.function_scope) continue;
-        if (const auto error = record_source_error(record, program)) {
+        if (const auto error = record_source_error(record, program, program.record_index, &state.record_proofs)) {
             diagnostics.error(error->location, error->message);
             co_return;
         }
@@ -2624,6 +2625,7 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
     std::erase_if(program.records, [](const auto& record) {
         return record.nominal_identity && record.nominal_identity->generic_owner;
     });
+    program.record_index = {};
     std::erase_if(program.enumerations, [](const auto& enumeration) {
         return enumeration.nominal_identity && enumeration.nominal_identity->generic_owner;
     });
@@ -7347,11 +7349,10 @@ public:
             if (prepare_type &&
                 !(co_await prepare_type.async(type, EvaluationLayoutKind::Complete)))
                 co_return Preparation::Invalid;
-            const RecordDecl* definition{};
-            for (const auto& record : program_.records)
-                if (record.complete && record.nominal_key() == key) { definition = &record; break; }
+            const auto* definition = program_.record_index.definition(program_, key);
             if (!definition) co_return Preparation::Ready;
-            if (const auto error = record_source_error(*definition, program_, record_source_index_)) {
+            if (const auto error = record_source_error(*definition, program_, program_.record_index,
+                    &record_source_proofs_)) {
                 fail(error->location, error->message);
                 co_return Preparation::Invalid;
             }
@@ -7595,7 +7596,8 @@ public:
                             if (prepare_type &&
                                 !(co_await prepare_type.async(source, EvaluationLayoutKind::Complete))) co_return false;
                             if (const auto definition = program_.record_definition(key)) {
-                                if (const auto issue = record_source_error(*definition, program_, record_source_index_)) {
+                                if (const auto issue = record_source_error(*definition, program_,
+                                        program_.record_index, &record_source_proofs_)) {
                                     fail(issue->location, issue->message);
                                     co_return false;
                                 }
@@ -10847,6 +10849,20 @@ private:
     }
 
     EvaluationTask<std::optional<std::size_t>> meta_object_size_async(TypePtr type) const {
+        // Multiply out nested array layers in one pass rather than revisiting
+        // the rest of the chain at every level.
+        if (type && type->kind == Type::Kind::Array) {
+            std::size_t count = 1;
+            for (; type->kind == Type::Kind::Array; type = type->element) {
+                if (!type->lanes || !type->element ||
+                    count > std::numeric_limits<std::size_t>::max() / type->lanes) co_return std::nullopt;
+                count *= type->lanes;
+            }
+            const auto element = co_await meta_object_size_async(type);
+            if (!element || *element == 0 || count > std::numeric_limits<std::size_t>::max() / *element)
+                co_return std::nullopt;
+            co_return *element * count;
+        }
         if (is_label_type(type)) {
             std::optional<std::uint64_t> size;
             if (size_of_) size = co_await size_of_->async(type);
@@ -10870,16 +10886,9 @@ private:
                 co_return std::nullopt;
             co_return static_cast<std::size_t>(*size);
         }
-        if (type->kind != Type::Kind::Array) {
-            EvalValue value;
-            value.type = pointer_type(type);
-            co_return meta_scalar_size(value);
-        }
-        const auto element = co_await meta_object_size_async(type->element);
-        if (!element || *element == 0 ||
-            type->lanes > std::numeric_limits<std::size_t>::max() / *element)
-            co_return std::nullopt;
-        co_return *element * type->lanes;
+        EvalValue value;
+        value.type = pointer_type(type);
+        co_return meta_scalar_size(value);
     }
 
     EvaluationTask<std::optional<std::size_t>> meta_object_alignment_async(TypePtr type) const {
@@ -13811,7 +13820,7 @@ private:
         previous_record_query_, inherited_record_query_;
     ContinuationQuery<bool(const TypePtr&, EvaluationLayoutKind)> previous_layout_preparation_;
     std::shared_ptr<RecordViews> record_views_{std::make_shared<RecordViews>()};
-    RecordSourceIndex record_source_index_;
+    RecordSourceProofs record_source_proofs_;
     std::shared_ptr<const EvaluationLayoutScopeIdentity> layout_scope_{
         std::make_shared<EvaluationLayoutScopeIdentity>()}, previous_layout_scope_;
     std::unordered_set<const Type*> preparing_type_bounds_;
@@ -16380,6 +16389,7 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
         carried_owners.push_back(record.nominal_identity->function_scope);
         return !defined.insert(record.nominal_key()).second;
     });
+    program.record_index = {};
     std::erase_if(program.enumerations, [&](const EnumDecl& enumeration) {
         return enumeration.carried && !defined.insert(enumeration.nominal_key()).second;
     });
