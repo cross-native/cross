@@ -1688,9 +1688,10 @@ budgets, and may hold meta values in automatic cells and pass or copy them by
 value; pointers, arrays, records, and runtime callable types containing meta
 values have no representation, and no runtime or static storage may hold one.
 
-Expansion functions accept the hints `always_inline`, `noinline`, `hot`,
-`cold`, `no_stack_protector`, and `no_sanitize`, and redundant `eval_only`,
-under their ordinary argument and conflict rules; they create no runtime code.
+Expansion functions and translation-only helpers accept the hints
+`always_inline`, `noinline`, `hot`, `cold`, `no_stack_protector`, and
+`no_sanitize`, and redundant `eval_only`, under their ordinary argument and
+conflict rules; they create no runtime code.
 `noreturn` remains binding: reaching a normal return or fallthrough during
 evaluation is an error. Attributes that require an emitted symbol, physical
 ABI transport, or machine entry/exit machinery (`abi`, `alias`, `aligned`,
@@ -2834,9 +2835,14 @@ condition-code resource.
 
 A function pointer always has a stable interface. Taking a dynamic function's
 address creates a private registered-ABI adapter unless it already has a
-complete stable manual ABI. Indirect calls use the pointed-to modes/ABI and
-never infer a dynamic ABI. Adapters may bridge function-selectable ABIs, but
-never incompatible data models without an explicit target marshaling contract.
+complete stable manual ABI. Converting a named function to a pointer type
+whose interface differs from the function's own likewise creates an adapter
+when the target can synthesize one; converting one function pointer to
+another pointer type with a different interface is an error, because the
+pointed-to function is unknown. Indirect calls use the pointed-to modes/ABI
+and never infer a dynamic ABI. Adapters may bridge function-selectable ABIs,
+but never incompatible data models without an explicit target marshaling
+contract.
 
 ## Manual ABI locations
 
