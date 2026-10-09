@@ -206,7 +206,7 @@ static $::meta::tokens from_match(in $::meta::syntax_match input) {
         "static u32 probe() { execute!(u32 value = 3u32; value += 2u32;) return value; }",
         "static u32 probe() { u32 values[2u32] execute!(= {3u32, 4u32}); return values[0u32]; }",
         "static u32 probe() { if execute!((1u32)) return 13u32; return 0u32; }",
-        "static Word probe(in Word value) [[generic(execute!(Word))]] { return value; }",
+        "static Word probe<execute!(Word)>(in Word value) { return value; }",
         "static u32 probe(in execute!(Word) value) { return 0u32; }",
         "static u32 probe() { execute!(return 13u32;) }",
         "execute!(static u32 probe(in Word value) { return 0u32; })"

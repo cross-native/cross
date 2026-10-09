@@ -52,7 +52,7 @@ namespace HeaderNominals {
         syntax Keep : item { prefix "keep"; match declaration:declaration; expand keep; }
         syntax Keep;
         keep static u32 before<T>(in T value),
-            copied_extent(in u8 (*values)[bound(sizeof(T))]) [[generic(generic_names!(T))]];
+            copied_extent<generic_names!(T)>(in u8 (*values)[bound(sizeof(T))]);
         [[noinline]] static u32 before<T>(in T value) { return (u32)value; }
         [[noinline]] static u32 copied_extent<U>(in u8 (*storage)[sizeof(U)]) {
             return (u32)sizeof(*storage) + (u32)(*storage)[0uptr];
@@ -77,8 +77,8 @@ namespace HeaderNominals {
         [[noinline]] static u32 cell_nested<U>(in U source,
             in u32 (*callback)(in U input, in u8 (*storage)[sizeof(input)]),
             in u8 (*values)[sizeof(source)]) { return callback(source, values); }
-        keep static u32 copied_cell(in T input, in u8 (*values)[bound(sizeof(input))])
-            [[generic(generic_names!(T))]];
+        keep static u32 copied_cell<generic_names!(T)>(in T input,
+            in u8 (*values)[bound(sizeof(input))]);
         [[noinline]] static u32 copied_cell<U>(in U source, in u8 (*storage)[sizeof(source)]) {
             return (u32)sizeof(*storage) + (u32)(*storage)[0uptr];
         }
@@ -87,7 +87,7 @@ namespace HeaderNominals {
 #ifdef CUSTOM_SYNTAX_ABI
         [[abi("stack_result_abi")]]
 #endif
-        [[noinline, generic(T)]] static T shared_first(in T value), shared_second(in T value);
+        [[noinline]] static T shared_first<T>(in T value), shared_second<T>(in T value);
 #ifdef CUSTOM_SYNTAX_ABI
         [[abi("stack_result_abi")]]
 #endif
@@ -129,7 +129,7 @@ namespace HeaderNominals {
     [[noinline]] static uptr parameter<T, u32 N>(in struct { T value; u8 bytes[N]; } *value) {
         return sizeof(value->value) + sizeof(value->bytes);
     }
-    [[noinline]] static union { T value; u8 byte; } *variant(in T value) [[generic(T)]] {
+    [[noinline]] static union { T value; u8 byte; } *variant<T>(in T value) {
         return (void *)0uptr;
     }
     [[noinline]] static struct Named { T value; u8 bytes[N]; } *named<T, u32 N>(in T value) {
@@ -184,8 +184,9 @@ namespace HeaderNominals {
     hygienic_header;
     header_copy [[noinline]] static struct { T value; } *copied<T>(in T value) { return (void *)0uptr; }
     [[macro]] static $::meta::tokens fragment(in $::meta::tokens input) { return input; }
-    header_copy [[noinline]] static struct { T value; } *deferred(in T value)
-        [[generic(fragment!(T))]] { return (void *)0uptr; }
+    header_copy [[noinline]] static struct { T value; } *deferred<fragment!(T)>(in T value) {
+        return (void *)0uptr;
+    }
     header_copy [[noinline]] static struct NamedCopy { T value; } *named_copy<T>(in T value) {
         struct NamedCopy *result = (void *)0uptr;
         return result;
@@ -194,8 +195,8 @@ namespace HeaderNominals {
         enum CopiedCode result = copied_code;
         return result;
     }
-    header_copy [[noinline]] static struct DeferredNamed { T value; } *named_deferred(in T value)
-        [[generic(fragment!(T))]] {
+    header_copy [[noinline]] static struct DeferredNamed { T value; }
+        *named_deferred<fragment!(T)>(in T value) {
         struct DeferredNamed *result = (void *)0uptr;
         return result;
     }
@@ -338,11 +339,11 @@ namespace HeaderCallableCopies {
         (*plain(in T value))(in T argument), (*last<T>(in T value))(in T argument);
     callable_declaration static T (*bounded<T>(in T value))(in T argument,
         in u8 (*bytes)[sizeof(argument)]);
-    callable_declaration static T (*late(in T value)
+    callable_declaration static T (*late<names!(T)>(in T value)
 #ifdef CUSTOM_SYNTAX_ABI
         [[abi("stack_result_abi")]]
 #endif
-        [[noinline, generic(names!(T))]])(in T argument);
+        [[noinline]])(in T argument);
     callable_header [[noinline]] static T (*factory<T>(in T value))(in T argument) {
         return &identity<T>;
     }
@@ -356,11 +357,11 @@ namespace HeaderCallableCopies {
         in u8 (*bytes)[sizeof(argument)]) {
         return &bounded_identity<T>;
     }
-    callable_header static T (*late(in T value)
+    callable_header static T (*late<names!(T)>(in T value)
 #ifdef CUSTOM_SYNTAX_ABI
         [[abi("stack_result_abi")]]
 #endif
-        [[noinline, generic(names!(T))]])(in T argument) {
+        [[noinline]])(in T argument) {
         return &identity<T>;
     }
 

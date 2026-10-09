@@ -26,6 +26,12 @@ reject(arguments "may_alias does not take arguments" "typedef u32 bad [[may_alia
 reject(global_object "attribute 'may_alias' is not valid on an object" "global u32 x [[may_alias]];\n")
 reject(local_object "attribute 'may_alias' is not valid on a local object"
     "global u32 f() { u32 y [[may_alias]] = 1u32; return y; }\n")
+reject(member "attribute 'may_alias' is not valid on a record member"
+    "struct Pair { u32 first [[may_alias]]; };\n")
+reject(plain_record_view "meta pointer read violates effective type" "
+struct Pair { u32 first; u32 second; };
+static u32 first(in u64 bits) { u64 copy = bits; return ((struct Pair *)(void *)&copy)->first; }
+\$::static_assert(first(6u64) == 6u32, \"plain record view\");\n")
 reject(plain_view "meta pointer read violates effective type" "
 static u32 float_bits(in f32 value) { f32 copy = value; return *(u32 *)(void *)&copy; }
 \$::static_assert(float_bits(1.0f32) == 0x3f800000u32, \"plain view\");\n")

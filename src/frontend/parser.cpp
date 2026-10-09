@@ -2397,72 +2397,7 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                 const auto argument_first = index_;
                 const auto recording = recording_public_tree_;
                 recording_public_tree_ = false;
-                if (mode == AttributeParseMode::Semantic && attribute.name == "generic") {
-                    const auto saved_generic_types = active_generic_types_;
-                    for (;;) {
-                        const auto next_token = co_await current_async();
-                        if (next_token.is(")") || next_token.kind == TokenKind::End) break;
-                        const auto start = index_;
-                        auto parameter_location = (co_await current_async()).location;
-                        std::optional<std::string> parameter_name;
-                        TypePtr value_type;
-                        if ((co_await current_async()).kind == TokenKind::Identifier &&
-                            ((co_await current_async(1)).is(",") || (co_await current_async(1)).is(")"))) {
-                            parameter_name = identifier_binding_name((co_await current_async()));
-                            ++index_;
-                            active_generic_types_.push_back(*parameter_name);
-                        } else {
-                            value_type = co_await parse_type_async();
-                            if (value_type) {
-                                value_type = co_await parse_declarator_async(
-                                    std::move(value_type), parameter_name, DeclaratorContext::Named,
-                                    nullptr, &parameter_location);
-                            }
-                            if (value_type && !is_integer(value_type) &&
-                                value_type->kind != Type::Kind::Pointer &&
-                                value_type->kind != Type::Kind::Generic &&
-                                !(value_type->kind == Type::Kind::Builtin &&
-                                  value_type->builtin == BuiltinType::Label)) {
-                                diagnostics_.error(tokens_[start].location,
-                                    "generic value parameter requires an integer, enumeration, bool, label, or pointer type");
-                            }
-                        }
-                        if (!parameter_name ||
-                            parameter_name->find("::") != std::string::npos) {
-                            diagnostics_.error(tokens_[start].location,
-                                               "expected an unqualified generic parameter name");
-                        } else if (std::any_of(
-                                       attribute.generic_parameters.begin(),
-                                       attribute.generic_parameters.end(),
-                                       [&](const auto& parameter) {
-                                           return parameter.name == *parameter_name;
-                                       })) {
-                            diagnostics_.error(tokens_[start].location,
-                                               "duplicate 'generic' parameter '" +
-                                                   *parameter_name + "'");
-                        } else {
-                            attribute.generic_parameters.push_back(
-                                {std::move(*parameter_name), std::move(value_type), parameter_location});
-                        }
-                        std::string spelling;
-                        for (auto token = start; token < index_; ++token) {
-                            if (!spelling.empty()) spelling += ' ';
-                            spelling += tokens_[token].text;
-                        }
-                        attribute.arguments.push_back(std::move(spelling));
-                        if (index_ == start || !(co_await consume_async(","))) break;
-                        if ((co_await current_async()).is(")")) {
-                            (co_await error_here_async("empty 'generic' parameter"));
-                            break;
-                        }
-                    }
-                    if (attribute.generic_parameters.empty()) {
-                        diagnostics_.error(attribute.location,
-                                           "'generic' requires at least one parameter");
-                    }
-                    (co_await expect_async(")", "after generic parameters"));
-                    active_generic_types_ = saved_generic_types;
-                } else if (mode == AttributeParseMode::Semantic && attribute.name == "variadic") {
+                if (mode == AttributeParseMode::Semantic && attribute.name == "variadic") {
                     for (;;) {
                         const auto next_token = co_await current_async();
                         if (next_token.is(")") || next_token.kind == TokenKind::End) break;
@@ -2776,6 +2711,13 @@ void Parser::request_type_alignment(TypePtr& type, const Attribute& attribute) {
     }
     type = std::make_shared<Type>(*type);
     type->alignment = std::max(type->alignment, static_cast<unsigned>(value));
+}
+
+// Keywords are lexical identifiers, never declared names.
+void Parser::reject_keyword_name(const Token& token) {
+    if (token.kind == TokenKind::Identifier && is_reserved_identifier(token.text))
+        diagnostics_.error(token.location,
+            "reserved keyword '" + std::string(token.text) + "' cannot be a declared name");
 }
 
 void Parser::type_error(TypePtr& type, SourceLocation location, std::string message) {
@@ -3612,6 +3554,7 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
             const auto name_index = index_;
             const auto name_location = (co_await current_async()).location;
             const auto name = (co_await parse_qualified_name_async());
+            if (name) for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
             auto record_attributes = co_await parse_attributes_async();
             if (!name && !(co_await current_async()).is("{")) {
                 (co_await error_here_async("an anonymous record requires a definition"));
@@ -3718,6 +3661,7 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
             const auto name_index = index_;
             const auto name_location = (co_await current_async()).location;
             const auto name = (co_await parse_qualified_name_async());
+            if (name) for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
             auto enum_attributes = co_await parse_attributes_async();
             if (!name && !(co_await current_async()).is("{")) {
                 (co_await error_here_async("an anonymous enumeration requires a definition"));
@@ -3932,7 +3876,7 @@ EvaluationTask<std::vector<std::string>> Parser::preview_generic_types_async(boo
         co_await normalize_qualified_name_async();
     };
     std::size_t declarator_depth = 0;
-    const auto group_end_async = [&](std::size_t first, bool parameters = false) -> EvaluationTask<std::optional<std::size_t>> {
+    const auto group_end_async = [&](std::size_t first) -> EvaluationTask<std::optional<std::size_t>> {
         if (execution && declarator_depth >= execution->limits().depth) {
             execution->tree_limit_error(tokens_[first].location);
             if (recording_public_tree_) public_tree_failed_ = true;
@@ -3940,7 +3884,6 @@ EvaluationTask<std::vector<std::string>> Parser::preview_generic_types_async(boo
         }
         std::vector<std::string_view> closes{closer(tokens_[first].text)};
         for (auto at = first + 1; at < tokens_.size(); ++at) {
-            if (parameters && closes.size() == 1) (co_await expose_async(at));
             if (!work(at)) co_return {};
             if (tokens_[at].kind == TokenKind::End) co_return {};
             if (const auto close = closer(tokens_[at].text); !close.empty()) {
@@ -4040,23 +3983,16 @@ EvaluationTask<std::vector<std::string>> Parser::preview_generic_types_async(boo
             while (at < tokens_.size()) {
                 (co_await expose_async(at));
                 if (tokens_[at].kind != TokenKind::Identifier) break;
-                const auto name = at++;
-                bool qualified = false;
+                ++at;
                 (co_await expose_async(at));
                 while (at + 1 < tokens_.size() && tokens_[at].is("::")) {
-                    qualified = true;
                     (co_await expose_async(++at));
                     if (tokens_[at].kind != TokenKind::Identifier) break;
                     (co_await expose_async(++at));
                 }
                 if (at < tokens_.size() && tokens_[at].is("(")) {
-                    const bool generic = !qualified && tokens_[name].is("generic");
-                    const auto arguments_end = (co_await group_end_async(at, generic));
+                    const auto arguments_end = (co_await group_end_async(at));
                     if (!arguments_end) break;
-                    if (generic) {
-                        if (generic_header) *generic_header = true;
-                        (co_await append_types_async(at + 1, *arguments_end));
-                    }
                     at = *arguments_end + 1;
                 }
                 (co_await expose_async(at));
@@ -4192,6 +4128,7 @@ Parser::parse_angle_generic_parameters_impl_async() {
         TypePtr value_type;
         if ((co_await current_async()).kind == TokenKind::Identifier &&
             ((co_await current_async(1)).is(",") || (co_await current_async(1)).is(">"))) {
+            reject_keyword_name(co_await current_async());
             name = identifier_binding_name((co_await current_async()));
             ++index_;
         } else {
@@ -4202,12 +4139,14 @@ Parser::parse_angle_generic_parameters_impl_async() {
                     value_type = co_await parse_declarator_async(std::move(value_type), name, DeclaratorContext::TypePrefix);
             }
             if (const auto token = (co_await consume_kind_async(TokenKind::Identifier))) {
+                reject_keyword_name(*token);
                 name = identifier_binding_name(*token);
                 location = token->location;
             }
+            // A type-parameter-typed value is checked for each instance.
             if (value_type && !is_integer(value_type) &&
                 value_type->kind != Type::Kind::Pointer &&
-                !(public_header_uncertain_names_ && value_type->kind == Type::Kind::Generic) &&
+                value_type->kind != Type::Kind::Generic &&
                 !(value_type->kind == Type::Kind::Builtin &&
                   value_type->builtin == BuiltinType::Label))
                 diagnostics_.error(location,
@@ -4533,6 +4472,8 @@ EvaluationTask<TypePtr> Parser::parse_declarator_async(TypePtr base, std::option
         name = (co_await parse_qualified_name_async());
         if (probing_header_type_ && context == DeclaratorContext::TypeName && name)
             throw HeaderProbeRejected{};
+        if (name)
+            for (auto at = token_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
         if (name && name_location)
             *name_location = location;
         if (name && name_token_index) *name_token_index = token_index;
@@ -4579,7 +4520,7 @@ EvaluationTask<TypePtr> Parser::parse_declarator_async(TypePtr base, std::option
             apply_callable_attributes(base, suffix_attributes);
             if (!nested_callable && entity_suffix_attributes) {
                 // A named function inside grouping still denotes the declared
-                // entity. Preserve its body/generic attributes for that entity,
+                // entity. Preserve its function attributes for that entity,
                 // not for another callable formed by the outer suffix.
                 entity_suffix_attributes->insert(entity_suffix_attributes->end(),
                     std::make_move_iterator(suffix_attributes.begin()),
@@ -4788,23 +4729,6 @@ EvaluationTask<TypePtr> Parser::parse_array_suffix_async(
         if (element->array_bound) header_type_bounds_.insert(element->array_bound.get());
     }
     co_return element;
-}
-
-std::vector<FunctionDecl::GenericParameter> Parser::generic_parameters(
-    const std::vector<Attribute>& attributes) {
-    std::vector<FunctionDecl::GenericParameter> result;
-    bool seen = false;
-    for (const auto& attribute : attributes) {
-        if (attribute.name != "generic") continue;
-        if (seen) {
-            diagnostics_.error(attribute.location,
-                               "a function has at most one 'generic' attribute");
-            continue;
-        }
-        seen = true;
-        result = attribute.generic_parameters;
-    }
-    return result;
 }
 
 Program Parser::parse() {
@@ -5524,6 +5448,7 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         // A qualified header introduces every component, just as nested
         // namespace blocks do. Each binder uses its own identifier provenance.
         for (auto at = name_first; at < index_ && tokens_[at].kind == TokenKind::Identifier; at += 2) {
+            reject_keyword_name(tokens_[at]);
             const auto component = identifier_binding_name(tokens_[at]);
             const auto destination = join_namespace(active_namespace_, component);
             remember_fragment_name(component, destination, tokens_[at].location, FragmentNameDomain::Namespace);
@@ -5700,13 +5625,6 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
         (co_await consume_async(";"));
         co_return;
     }
-    // Only shared declaration attributes apply to every sibling. Angle lists
-    // and trailing attributes belong to the declarator that writes them.
-    std::vector<GenericParameter> shared_generic_parameters;
-    for (const auto& attribute : attributes)
-        if (attribute.name == "generic")
-            shared_generic_parameters.insert(shared_generic_parameters.end(),
-                attribute.generic_parameters.begin(), attribute.generic_parameters.end());
     // Replay grammar, not source expansion: procedural output is already in
     // this sequence and bounded expression/type output is a PreparedFragment.
     // Incoming parsed/spliced bindings are retained; newly inferred bindings
@@ -5854,16 +5772,10 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
             public_header_uncertain_names_ = false;
             (void)(co_await preview_generic_types_async(&public_header_uncertain_names_, nullptr, true));
         }
-        generic_header = !shared_generic_parameters.empty();
+        generic_header = false;
         shared_specifier_declarator_ = {};
         active_generic_types_ = (co_await preview_generic_types_async(nullptr, &generic_header, true, &shared_specifier_declarator_));
         (co_await remember_shared_declarator_async());
-        for (const auto& parameter : shared_generic_parameters) {
-            if (!parameter.value_type &&
-                std::find(active_generic_types_.begin(), active_generic_types_.end(), parameter.name) ==
-                    active_generic_types_.end())
-                active_generic_types_.push_back(parameter.name);
-        }
         generic_tag_owner_ = generic_header ? std::make_shared<const GenericTagOwner>() : nullptr;
         function_scope_ = generic_header ? std::make_shared<const FunctionScopeIdentity>()
                                         : nominal_owner_restore.scope;
@@ -6005,9 +5917,10 @@ EvaluationTask<void> Parser::parse_global_label_declaration_async(
             }
         }
         if (name && (co_await consume_async("::"))) {
-            if (const auto label = (co_await consume_kind_async(TokenKind::Identifier)))
+            if (const auto label = (co_await consume_kind_async(TokenKind::Identifier))) {
+                reject_keyword_name(*label);
                 *name += "::" + identifier_binding_name(*label);
-            else name.reset();
+            } else name.reset();
         } else name.reset();
     }
     if (!name || name->find("::") == std::string::npos) {
@@ -6045,6 +5958,7 @@ EvaluationTask<void> Parser::parse_enum_declaration_async(Program& program,
         synchronize_external();
         co_return;
     }
+    for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
     const auto written_name = *name;
     *name = join_namespace(name_space, *name);
     if (record_types_.contains(*name))
@@ -6145,6 +6059,7 @@ EvaluationTask<void> Parser::parse_enumerators_async(EnumDecl& declaration, std:
                 ++index_;
             }
         } else {
+            reject_keyword_name(*token);
             EnumDecl::Enumerator enumerator;
             enumerator.location = token->location;
             enumerator.name = identifier_binding_name(*token);
@@ -6211,6 +6126,7 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
         synchronize_external();
         co_return;
     }
+    for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
     const auto written_name = *name;
     *name = join_namespace(name_space, *name);
     auto trailing = co_await parse_attributes_async();
@@ -6558,14 +6474,7 @@ Parser::parse_function_async(std::size_t header_first, SourceLocation location, 
     function->attributes.insert(function->attributes.end(),
                                 std::make_move_iterator(trailing.begin()),
                                 std::make_move_iterator(trailing.end()));
-    function->generic_parameters = generic_parameters(function->attributes);
-    if (!angle_parameters.empty()) {
-        if (!function->generic_parameters.empty())
-            diagnostics_.error(location,
-                               "angle generic parameters cannot be combined with [[generic]]");
-        else
-            function->generic_parameters = std::move(angle_parameters);
-    }
+    function->generic_parameters = std::move(angle_parameters);
     if (!function->generic_parameters.empty()) {
         function->generic_tag_owner = generic_tag_owner_ ? generic_tag_owner_
             : std::make_shared<const GenericTagOwner>();
@@ -7427,6 +7336,7 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
         statement->kind = Statement::Kind::Label;
         statement->location = (co_await current_async()).location;
         (co_await consume_async("label"));
+        reject_keyword_name(co_await current_async());
         statement->label_name = identifier_binding_name((co_await current_async()));
         statement->label_location = (co_await current_async()).location;
         remember_label_binding(*statement, index_);
@@ -7623,6 +7533,7 @@ Parser::StatementTask Parser::parse_global_label_statement_async(
     if (!name) {
         (co_await error_here_async("expected label name after 'global label'"));
     } else {
+        reject_keyword_name(*name);
         statement->label_name = identifier_binding_name(*name);
         statement->label_location = name->location;
         remember_label_binding(*statement, index_ - 1);

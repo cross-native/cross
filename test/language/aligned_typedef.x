@@ -58,8 +58,7 @@ $::static_assert(sizeof(struct packed_plain) == 5uptr, "packing still packs");
 $::static_assert(sizeof(struct packed_array) == 48uptr, "packing keeps element requests");
 
 // Generic instances substitute and raise the requested alignment.
-[[generic(uptr N)]]
-static uptr generic_value() {
+static uptr generic_value<uptr N>() {
     typedef u16 local [[aligned(N)]];
     local values[2];
     return sizeof(values) + $::alignof(local);

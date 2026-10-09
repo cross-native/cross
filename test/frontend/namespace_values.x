@@ -107,7 +107,7 @@ namespace value_definition {
     }
     [[macro]] static $::meta::tokens generic_definition(in $::meta::tokens input) {
         return $::quote {
-            [[generic(u64 count), noinline]] static u64 macro_generic() {
+            [[noinline]] static u64 macro_generic<u64 count>() {
                 return helper() + count;
             }
         };
@@ -124,7 +124,7 @@ namespace value_caller {
     value_definition::relocated! { helper() }
     value_definition::generic_definition!{}
     $::static_assert(value_definition::required!{} == 84u64, "quote definition values");
-    [[generic(u64 *address), noinline]] static u64 *identity() { return address; }
+    [[noinline]] static u64 *identity<u64 *address>() { return address; }
     [[noinline]] static i32 check() {
         u64 generic_pick = 3u64;
         if (value_definition::quoted!{} != 115u64) return 1;

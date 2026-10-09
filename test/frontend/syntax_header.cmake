@@ -44,10 +44,10 @@ global u32 plain(in T value), ((grouped<T>))(in T value), after(in T value);
 global u32 plain(in T value) { return (u32)value; }
 global u32 grouped<T>(in T value) { return (u32)value; }
 global u32 after(in T value) { return (u32)value; }
-global u32 attribute(in T value) [[generic(T)]], after_attribute(in T value);
+global u32 attribute<T>(in T value) [[noinline]], after_attribute(in T value);
 global u32 attribute<T>(in T value) { return (u32)value; }
 global u32 after_attribute(in T value) { return (u32)value; }
-[[generic(T)]] global u32 shared_first(in T value), shared_second(in T value);
+global u32 shared_first<T>(in T value), shared_second<T>(in T value);
 global u32 shared_first<T>(in T value) { return (u32)value; }
 global u32 shared_second<T>(in T value) { return (u32)value; }
 global u32 mixed<T>(in T value), (*callback)(in T value) = second;
@@ -57,9 +57,9 @@ $::static_assert(first(300u32) + second(40u8) + third(500u32) == 840u32,
 $::static_assert(plain(1u8) + grouped(300u32) + after(2u8) == 303u32,
     "grouped later declarator lost its generic scope");
 $::static_assert(attribute(300u32) + after_attribute(3u8) == 303u32,
-    "trailing generic attribute leaked");
+    "generic list leaked past a trailing attribute");
 $::static_assert(shared_first(300u32) + shared_second(400u64) == 700u32,
-    "shared generic attribute did not apply independently");
+    "sibling generic lists did not apply independently");
 ]=] 0)
 
 check(header_parameter_type_lookup [=[
@@ -85,7 +85,7 @@ check(grouped_function_suffix_attributes [=[
 typedef u8 T;
 [[macro]] static $::meta::tokens names(in $::meta::tokens input) { return input; }
 static T identity<T>(in T value) { return value; }
-static T (*factory(in T value) [[noinline, generic(names!(T))]])(in T argument) {
+static T (*factory<names!(T)>(in T value) [[noinline]])(in T argument) {
     return &identity<T>;
 }
 static u32 check() {
@@ -95,8 +95,8 @@ static u32 check() {
 $::static_assert(check() == 1u32, "grouped function suffix lost its generic scope");
 ]=] 0)
 
-check(grouped_returned_callback_generic_rejected [=[
-static u32 (*factory(in u32 value))(in u32 argument) [[generic(T)]];
+check(grouped_returned_callback_attribute_rejected [=[
+static u32 (*factory(in u32 value))(in u32 argument) [[noinline]];
 ]=] 1 "error: function-only attribute cannot qualify a nested callable type")
 
 foreach(category declaration function_decl function_def)
@@ -118,8 +118,8 @@ syntax Keep;
 }
 syntax Bound : expression { prefix \"bound\"; match \"(\" value:expr \")\"; expand bound; }
 syntax Bound;
-keep static u32 copied(in T input, in u8 (*values)[bound(sizeof(input))])
-    [[generic(names!(T))]] ${suffix}
+keep static u32 copied<names!(T)>(in T input, in u8 (*values)[bound(sizeof(input))])
+    ${suffix}
 ${after}
 $::static_assert(copied(17u32, (void *)0uptr) == 4u32 && copied(3u16, (void *)0uptr) == 2u32,
     \"captured header lost earlier parameter type lookup\");" 0)
@@ -132,8 +132,8 @@ check(header_parameter_grouped_result_capture [=[
 }
 syntax Keep : item { prefix "keep"; match decl:function_def; expand keep; }
 syntax Keep;
-keep static u8 (*result(in T input, in u8 (*values)[sizeof(input)]))[sizeof(input)]
-    [[generic(names!(T))]] { return values; }
+keep static u8 (*result<names!(T)>(in T input, in u8 (*values)[sizeof(input)]))[sizeof(input)]
+    { return values; }
 $::static_assert(sizeof(*result(17u32, (void *)0uptr)) == 4uptr,
     "deferred result suffix lost its original prototype scope");
 ]=] 0)
@@ -356,7 +356,7 @@ global T third<T>(in T value) { return value; }
 global T plain(in T value), ((later<T>))(in T value), object = 9u8;
 global T plain(in T value) { return value; }
 global T later<T>(in T value) { return value; }
-[[generic(T)]] global T shared_first(in T value), shared_second(in T value);
+global T shared_first<T>(in T value), shared_second<T>(in T value);
 global T shared_first<T>(in T value) { return value; }
 global T shared_second<T>(in T value) { return value; }
 $::static_assert(first(300u32) + second(40u8) + third(500u16) == 840u32,
@@ -364,7 +364,7 @@ $::static_assert(first(300u32) + second(40u8) + third(500u16) == 840u32,
 $::static_assert(plain(4u8) + later(300u32) == 304u32 && sizeof(object) == 1uptr,
     "later generic result or object type leaked");
 $::static_assert(shared_first(300u32) + shared_second(400u16) == 700u32,
-    "shared generic result attributes failed");
+    "sibling generic results failed");
 struct Record { u32 value; } first_record, second_record;
 $::static_assert(sizeof(first_record) == 4uptr && sizeof(second_record) == 4uptr,
     "nongeneric shared record definition was duplicated");
@@ -557,12 +557,8 @@ syntax Compose;
 ]=])
 
 foreach(header
-        "static u32 test() [[generic(params!(u32 N))]]"
-        "[[generic(params!(u32 N))]] static u32 test()"
-        "static [[generic(params!(u32 N))]] u32 test()"
-        "static u32 [[generic(params!(u32 N))]] test()"
-        "static u32 test() [[params!(generic(u32 N))]]"
-        "static u32 test<params!(u32 N)>()")
+        "static u32 test<params!(u32 N)>()"
+        "static u32 test<params!(u32 N)>() [[params!(noinline)]]")
     string(MD5 case "${header}")
     check(captured_value_header_${case} "${compose}
 compose ${header} { return N; }
@@ -571,11 +567,10 @@ endforeach()
 
 foreach(category declaration function_decl)
     foreach(header
-            "static T ignored(in T value) [[generic(unknown!(T))]]"
             "static T ignored<unknown!(T)>(in T value)"
             "static T ((ignored<unknown!(T)>))(in T value)"
-            "static T (*ignored(in T value))(unknown!()) [[generic(unknown!(T))]]"
-            "[[unknown!(noinline)]] static T ignored(in T value) [[generic(unknown!(T))]]")
+            "static T (*ignored<unknown!(T)>(in T value))(unknown!())"
+            "[[unknown!(noinline)]] static T ignored<unknown!(T)>(in T value)")
         string(MD5 case "${category}-${header}")
         check(deferred_prototype_${case} "
 [[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) {
@@ -613,8 +608,8 @@ ${shadow}
 }
 syntax Keep : item { prefix \"keep\"; match value:${category}; expand keep; }
 syntax Keep;
-keep global T identity(in T value) [[generic(params!(T))]];
-global T identity(in T value) [[generic(T)]] { return value; }
+keep global T identity<params!(T)>(in T value);
+global T identity<T>(in T value) { return value; }
 $::static_assert(identity(300u32) == 300u32, \"prototype lost its generic type\");
 global u32 entry() { return identity(300u32); }" 0
                 "note: prototype-owner" "note: prototype-generic-fragment")
@@ -625,12 +620,12 @@ endforeach()
 # The broader category must not obtain provisional ordinary object types or
 # consume a function definition just because its header contains a macro.
 foreach(declaration
-        "static T object [[generic(unknown!(T))]];"
-        "static T (*object)(unknown!()) [[generic(unknown!(T))]];"
-        "static absent::T ignored() [[generic(unknown!(T))]];"
-        "static T ignored(in T value) [[generic(unknown!(T))]] { unknown!(); }"
+        "static T object<unknown!(T)>;"
+        "static T (*object<unknown!(T)>)(unknown!());"
+        "static absent::T ignored<unknown!(T)>();"
+        "static T ignored<unknown!(T)>(in T value) { unknown!(); }"
         "static u32 ignored(unknown!()) { unknown!(); }"
-        "static T first(in T value), second(in T value) [[generic(unknown!(T))]];")
+        "static T first(in T value), second<unknown!(T)>(in T value);")
     string(MD5 case "${declaration}")
     check(reject_provisional_declaration_${case} "
 [[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; }
@@ -640,10 +635,8 @@ drop ${declaration}" 1 "error: syntax-match error for active prefix")
 endforeach()
 
 foreach(header
-        "static T test(in T value) [[generic(params!(T))]]"
-        "[[generic(params!(T))]] static T test(in T value)"
         "static T test<params!(T)>(in T value)"
-        "static T test(in T value) [[params!(generic(T))]]")
+        "static T test<params!(T)>(in T value) [[params!(noinline)]]")
     string(MD5 case "${header}")
     check(captured_type_header_${case} "${compose}
 compose ${header} { return value; }
@@ -652,7 +645,7 @@ endforeach()
 
 check(captured_shadowed_alias "${compose}
 typedef u32 T();
-compose static T test(in T value) [[generic(params!(T))]] { return value; }
+compose static T test<params!(T)>(in T value) { return value; }
 $::static_assert(test(9u32) == 9u32, \"late generic did not shadow the callable alias\");" 0)
 
 check(captured_angle_value_alias "${compose}
@@ -663,16 +656,16 @@ $::static_assert(test<7u32, u32>() == 7u32, \"pending angle header rejected a sc
 check(captured_tag_types "${compose}
 struct Pair { u32 value; };
 enum Code { code = 4 };
-compose static struct Pair record(in u32 value) [[generic(params!(u32 N))]] {
+compose static struct Pair record<params!(u32 N)>(in u32 value) {
     struct Pair result = { value + N }; return result;
 }
-compose static enum Code enumeration() [[generic(params!(u32 N))]] { return code; }
+compose static enum Code enumeration<params!(u32 N)>() { return code; }
 $::static_assert(record<3u32>(4u32).value == 7u32, \"record header classification failed\");
 $::static_assert((u32)enumeration<3u32>() == 4u32, \"enum header classification failed\");" 0)
 
 check(captured_qualified_alias "${compose}
 namespace Types { typedef u32 Value; }
-compose static Types::Value test(in Types::Value value) [[generic(params!(u32 N))]] {
+compose static Types::Value test<params!(u32 N)>(in Types::Value value) {
     return value + N;
 }
 $::static_assert(test<3u32>(4u32) == 7u32, \"qualified header alias was deferred as an unknown generic\");" 0)
@@ -688,8 +681,8 @@ namespace Types { typedef u32 Value; }
 }
 syntax Known : expression { prefix "known"; match "(" value:expr ")"; expand known; }
 syntax Known;
-static u32 first() [[aligned(known(sizeof(struct Tag))), generic(params!(T))]] { return 1u32; }
-static u32 second() [[aligned(known(sizeof(Types::Value))), generic(params!(T))]] { return 2u32; }
+static u32 first<params!(T)>() [[aligned(known(sizeof(struct Tag)))]] { return 1u32; }
+static u32 second<params!(T)>() [[aligned(known(sizeof(Types::Value)))]] { return 2u32; }
 $::static_assert(first<u32>() + second<u32>() == 3u32, "independent capture changed");
 ]=] 0)
 
@@ -703,11 +696,10 @@ syntax Discard : item { prefix "discard"; match header:function_header body:bloc
 syntax Discard;
 ]=])
 foreach(header
-        "static u32 discarded() [[generic(unknown!(u32 N))]]"
-        "static T discarded(in T value) [[generic(unknown!(T))]]"
+        "static u32 discarded<unknown!(u32 N)>()"
         "static T discarded<unknown!(T)>(in T value)"
         "[[unknown!(noinline)]] static u32 discarded()"
-        "static u32 (*discarded(in u32 value))(unknown!()) [[generic(unknown!(T))]]")
+        "static u32 (*discarded<unknown!(T)>(in u32 value))(unknown!())")
     string(MD5 case "${header}")
     check(discarded_header_${case} "${discard_header}
 discard ${header} { completely noncore body; unknown!{discarded}; }" 0)
@@ -731,13 +723,13 @@ discard static u32 discarded() [[${attribute}]] { completely noncore body; }
 endforeach()
 
 foreach(header
-        "static u32 (*not_function)(unknown!()) [[generic(unknown!(T))]]"
-        "static T not_function [[generic(unknown!(T))]]"
-        "static u32 unknown!(not_function) [[generic(unknown!(T))]]"
-        "[[, generic(unknown!(T))]] static u32 not_function()"
-        "static u32 not_function(unknown!()) [[generic()]]"
+        "static u32 (*not_function<unknown!(T)>)(unknown!())"
+        "static T not_function<unknown!(T)>"
+        "static u32 unknown!(not_function)<unknown!(T)>"
+        "[[, noinline]] static u32 not_function<unknown!(T)>()"
+        "static u32 not_function<>(unknown!())"
         "static T not_function<unknown!(T)(in T value)"
-        "static absent::T not_function() [[generic(unknown!(T))]]")
+        "static absent::T not_function<unknown!(T)>()")
     string(MD5 case "${header}")
     check(rejected_header_${case} "${discard_header}
 discard ${header} { unknown!{discarded}; }" 1 "error: syntax-match error for active prefix")
@@ -745,7 +737,7 @@ endforeach()
 
 foreach(category function_decl function_def)
     set(suffix ";")
-    set(after "global T kept(in T value) [[generic(T)]] { return value; }")
+    set(after "global T kept<T>(in T value) { return value; }")
     if(category STREQUAL "function_def")
         set(suffix "{ return value; }")
         set(after "")
@@ -759,7 +751,7 @@ foreach(category function_decl function_def)
 }
 syntax Copy : item { prefix \"copy\"; match unit:${category}; expand copy; }
 syntax Copy;
-copy global T kept(in T value) [[generic(params!(T))]] ${suffix}
+copy global T kept<params!(T)>(in T value) ${suffix}
 ${after}
 $::static_assert(kept(11u32) == 11u32, \"function category lost its generic\");" 0)
 endforeach()
@@ -769,7 +761,7 @@ foreach(category function function_raw)
 [[syntax_expander]] static $::meta::tokens drop(in $::meta::syntax_match input) { return $::quote {}; }
 syntax Drop : item { prefix \"drop\"; match body:${category}; expand drop; }
 syntax Drop;
-drop static T ignored(in T value) [[generic(unknown!(T))]] { not core syntax; unknown!{}; }
+drop static T ignored(in T value) [[unknown!(noinline)]] { not core syntax; unknown!{}; }
 drop static T ignored_angle<unknown!(T)>(in T value) { not core syntax; unknown!{}; }" 0)
     check(raw_${category}_copy "
 [[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
@@ -778,7 +770,7 @@ drop static T ignored_angle<unknown!(T)>(in T value) { not core syntax; unknown!
 }
 syntax Copy : item { prefix \"copy\"; match body:${category}; expand copy; }
 syntax Copy;
-copy static T kept(in T value) [[generic(params!(T))]] { return value; }
+copy static T kept<params!(T)>(in T value) { return value; }
 $::static_assert(kept(13u32) == 13u32, \"raw function generic was lost\");" 0)
 endforeach()
 
@@ -800,22 +792,21 @@ foreach(expression "notice(unknown!{discarded})" "(T)notice(unknown!{discarded})
                    "sizeof(T *) + notice(unknown!{discarded})")
     string(MD5 case "${expression}")
     check(order_${case} "${prefix}
-static u32 test() [[aligned(${expression}), generic(bad!(T))]] { return 0u32; }"
+[[aligned(${expression})]] static u32 test<bad!(T)>() { return 0u32; }"
         1 "note: earlier-header-owner" "error: division by zero")
 endforeach()
 
-check(parameter_before_generic "${prefix}
-static u32 test(in u32 values[notice(unknown!{discarded})])
-    [[generic(bad!(T))]] { return 0u32; }"
-    1 "note: earlier-header-owner" "error: division by zero")
+check(generic_before_parameter "${prefix}
+static u32 test<bad!(T)>(in u32 values[notice(unknown!{discarded})]) { return 0u32; }"
+    1 "error: division by zero" "note: earlier-header-owner")
 
 foreach(siblings "" "first<T>(in T value)," "first<T>(in T value), second(in u8 value),"
                  "object = 1u32,")
     string(MD5 case "${siblings}")
     check(declarator_header_order_${case} "${prefix}
 global u32 ${siblings}
-    later(in u8 values[notice(unknown!{discarded})]) [[generic(bad!(T))]];"
-        1 "note: earlier-header-owner" "error: division by zero")
+    later<bad!(T)>(in u8 values[notice(unknown!{discarded})]);"
+        1 "error: division by zero" "note: earlier-header-owner")
 endforeach()
 
 check(declarator_header_shared_once "${prefix}
@@ -829,15 +820,15 @@ typedef u8 T;
     return input;
 }
 global result!(T) first<T>(in T value),
-    later(in u8 values[notice(unknown!{discarded})]) [[generic(generic_names!(T))]];"
-    0 "note: shared-before-siblings" "note: earlier-header-owner" "note: later-generic-names")
+    later<generic_names!(T)>(in u8 values[notice(unknown!{discarded})]);"
+    0 "note: shared-before-siblings" "note: later-generic-names" "note: earlier-header-owner")
 
-check(parameter_fragment_before_generic "${prefix}
+check(generic_before_parameter_fragment "${prefix}
 [[macro]] static $::meta::tokens parameter(in $::meta::tokens input) {
     return $::quote { in u32 value[notice(unknown!{discarded})] };
 }
-static u32 test(parameter!()) [[generic(bad!(T))]] { return 0u32; }"
-    1 "note: earlier-header-owner" "error: division by zero")
+static u32 test<bad!(T)>(parameter!()) { return 0u32; }"
+    1 "error: division by zero" "note: earlier-header-owner")
 
 check(nested_output "${prefix}
 [[syntax_expander]] static $::meta::tokens outer(in $::meta::syntax_match input) {
@@ -846,7 +837,7 @@ check(nested_output "${prefix}
 }
 syntax Outer : expression { prefix \"outer\"; match input:paren; expand outer; }
 syntax Outer;
-static u32 test() [[aligned(outer()), generic(bad!(T))]] { return 0u32; }"
+[[aligned(outer())]] static u32 test<bad!(T)>() { return 0u32; }"
     1 "note: outer-header-owner" "note: earlier-header-owner" "error: division by zero")
 
 check(nested_macro_before_later_fragment "${prefix}
@@ -856,7 +847,7 @@ check(nested_macro_before_later_fragment "${prefix}
 }
 syntax Outer : expression { prefix \"outer\"; match input:paren; expand outer; }
 syntax Outer;
-static u32 test() [[aligned(outer()), generic(bad!(T))]] { return 0u32; }"
+[[aligned(outer())]] static u32 test<bad!(T)>() { return 0u32; }"
     1 "note: outer-header-owner" "note: earlier-header-owner" "error: division by zero")
 
 set(capture [=[
@@ -869,9 +860,9 @@ syntax Capture : expression { prefix "capture"; match "(" value:expr ")"; expand
 syntax Capture;
 ]=])
 check(deferred_names "${prefix}${capture}
-static T first(in T value) [[aligned(capture(sizeof(T *))), generic(params!(T))]] { return value; }
-static T second(in T value) [[aligned(capture((T)16u32)), generic(params!(T))]] { return value; }
-static u32 third() [[aligned(capture(N)), generic(params!(u32 N))]] { return 3u32; }
+static T first<params!(T)>(in T value) [[aligned(capture(sizeof(T *)))]] { return value; }
+static T second<params!(T)>(in T value) [[aligned(capture((T)16u32))]] { return value; }
+static u32 third<params!(u32 N)>() [[aligned(capture(N))]] { return 3u32; }
 global u32 entry() { return first(1u32) + second(2u32) + third<16u32>(); }" 0)
 
 foreach(projection structured tokens)
@@ -888,7 +879,7 @@ typedef u8 T;
 syntax Keep : item { prefix \"keep\"; match declaration:declaration; expand keep; }
 syntax Keep;
 keep global T first<params!(T)>(in T value),
-    later(in T value, in u8 data[capture(sizeof(T))]) [[generic(params!(T))]];
+    later<params!(T)>(in T value, in u8 data[capture(sizeof(T))]);
 global T first<T>(in T value) { return value; }
 global T later<T>(in T value, in u8 *data) { return value; }
 static u32 check() { u8 data[4uptr]; return first(300u32) + later(400u32, data); }
@@ -913,7 +904,7 @@ check(bounded_precedence "${prefix}
 }
 syntax Sum : expression { prefix \"sum\"; match input:paren; expand sum; }
 syntax Sum;
-static T test(in T value) [[aligned(2u32 * sum()), generic(params!(T))]] { return value; }
+static T test<params!(T)>(in T value) [[aligned(2u32 * sum())]] { return value; }
 global u32 entry() { return test(3u32); }" 0)
 
 check(bounded_trailing_tokens "${prefix}
@@ -922,11 +913,11 @@ check(bounded_trailing_tokens "${prefix}
 }
 syntax Extra : expression { prefix \"extra\"; match input:paren; expand extra; }
 syntax Extra;
-static u32 test() [[aligned(extra()), generic(params!(T))]] { return 0u32; }"
+static u32 test<params!(T)>() [[aligned(extra())]] { return 0u32; }"
     1 "prepared expression must contain one assignment expression")
 
 check(body_not_prepared "${prefix}
-static T test(in T value) [[aligned(notice()), generic(params!(T))]] {
+static T test<params!(T)>(in T value) [[aligned(notice())]] {
     return value + bad!();
 }"
     1 "note: earlier-header-owner" "error: division by zero")
@@ -948,7 +939,7 @@ check(captured_header_owner_order "${prefix}
 }
 syntax Owner : item { prefix \"owner\"; match header:function_header body:block; expand owner; }
 syntax Owner;
-owner static u32 test() [[aligned(notice(unknown!{discarded})), generic(bad!(T))]] { return 0u32; }"
+owner [[aligned(notice(unknown!{discarded}))]] static u32 test<bad!(T)>() { return 0u32; }"
     1 "note: header-capture-owner" "note: earlier-header-owner" "error: division by zero")
 
 check(captured_header_parse_roundtrip [=[
@@ -965,7 +956,7 @@ check(captured_header_parse_roundtrip [=[
 }
 syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
 syntax Compose;
-compose static T test(in T value) [[generic(params!(T))]] { return value; }
+compose static T test<params!(T)>(in T value) { return value; }
 $::static_assert(test(17u32) == 17u32, "header parse roundtrip lost its generic");
 ]=] 0)
 
@@ -975,14 +966,14 @@ check(decorated_core_header [=[
     $::meta::syntax header = $::syntax::node(input, "header");
     $::static_assert(!$::meta::is_kind(header, "deferred"), "original header was not settled");
     header = $::meta::parse("function_header", $::quote {
-        [[params!(noinline)]] $::unquote(header) [[generic(params!(u32 N))]]
+        [[params!(noinline)]] $::unquote(header) [[params!(cold)]]
     }, $::syntax::context(input));
     $::static_assert($::meta::is_kind(header, "deferred"), "opaque decoration was not deferred");
     return $::quote { $::unquote(header) $::unquote($::syntax::capture(input, "body")) };
 }
 syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
 syntax Compose;
-compose static u32 kept(in u32 value) { return value; }
+compose static u32 kept<u32 N>(in u32 value) { return value; }
 $::static_assert(kept<3u32>(19u32) == 19u32, "decorated core header lost its generic");
 ]=] 0)
 
@@ -996,7 +987,7 @@ check(header_before_body_fragment "${prefix}
 }
 syntax Compose : item { prefix \"compose\"; match header:function_header \";\"; expand compose; }
 syntax Compose;
-compose static u32 kept() [[aligned(notice(unknown!{discarded})), generic(params!(T))]];"
+compose static u32 kept<params!(T)>() [[aligned(notice(unknown!{discarded}))]];"
     1 "note: earlier-header-owner" "error: division by zero")
 
 check(header_body_fragment_context [=[
@@ -1010,7 +1001,7 @@ check(header_body_fragment_context [=[
 }
 syntax Compose : item { prefix "compose"; match header:function_header body:block; expand compose; }
 syntax Compose;
-compose static T kept(in T value) [[generic(params!(T))]] { T copy = value; return copy; }
+compose static T kept<params!(T)>(in T value) { T copy = value; return copy; }
 $::static_assert(kept(23u32) == 23u32, "body fragment lost header generic bindings");
 ]=] 0)
 
@@ -1019,7 +1010,7 @@ foreach(tag struct union)
         string(MD5 case "${tag}-${generic}")
         check(inline_tag_generic_${case} "
 [[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
-static ${tag} Result { u32 value; } make(in T value) [[generic(${generic})]] {
+static ${tag} Result { u32 value; } make<${generic}>(in T value) {
     ${tag} Result result = { (u32)value }; return result;
 }
 $::static_assert(make(29u32).value == 29u32, \"inline result tag hid header generics\");" 0)
@@ -1028,7 +1019,7 @@ endforeach()
 
 check(inline_enum_generic [=[
 [[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
-static enum Result { value = 31 } make(in T input) [[generic(params!(T))]] { return value; }
+static enum Result { value = 31 } make<params!(T)>(in T input) { return value; }
 $::static_assert((u32)make(1u32) == 31u32, "inline enum hid header generics");
 ]=] 0)
 
@@ -1043,14 +1034,14 @@ drop static enum Code { code = 1 } make_enum() { not core syntax; unknown!{}; }"
 endforeach()
 
 check(captured_inline_tag "${compose}
-compose static struct Result { u32 value; } make(in T value) [[generic(params!(T))]] {
+compose static struct Result { u32 value; } make<params!(T)>(in T value) {
     struct Result result = { (u32)value }; return result;
 }
 $::static_assert(make(37u32).value == 37u32, \"captured inline result tag lost its binding\");" 0)
 
 check(inline_tag_owner_order "${prefix}
-static struct Result { u32 values[notice(unknown!{discarded})]; } make(in T value)
-    [[generic(bad!(T))]] { struct Result result = {}; return result; }"
+static struct Result { u32 values[notice(unknown!{discarded})]; } make<bad!(T)>(in T value)
+    { struct Result result = {}; return result; }"
     1 "note: earlier-header-owner" "error: division by zero")
 
 foreach(tag "struct Result { unknown!(members) }" "union Result { unknown!(members) }"
@@ -1078,7 +1069,7 @@ drop static u32 object { not a function body; unknown!(); }
 check(nested_inline_tag_generic [=[
 [[macro]] static $::meta::tokens params(in $::meta::tokens input) { return input; }
 [[noinline]] static struct Outer { struct Inner { u16 value; } nested; }
-make(in T value) [[generic(params!(T))]] {
+make<params!(T)>(in T value) {
     struct Outer result = { { (u16)value } }; return result;
 }
 $::static_assert(make(41u32).nested.value == 41u16, "nested inline tags lost header context");
@@ -1097,12 +1088,12 @@ $::static_assert((u16)make() == 47u16, \"deferred enumerators were not reparsed\
 
 check(inline_tag_attribute_owner_order "${prefix}
 static struct Result [[aligned(notice(unknown!{discarded}))]] { u32 value; }
-make(in T value) [[generic(bad!(T))]] { struct Result result = { 0u32 }; return result; }"
+make<bad!(T)>(in T value) { struct Result result = { 0u32 }; return result; }"
     1 "note: earlier-header-owner" "error: division by zero")
 
 check(inline_enum_owner_order "${prefix}
 static enum Result { first = notice(unknown!{discarded}) }
-make(in T value) [[generic(bad!(T))]] { return first; }"
+make<bad!(T)>(in T value) { return first; }"
     1 "note: earlier-header-owner" "error: division by zero")
 
 foreach(tag "struct Result { u32 first u32 second; unknown!(); }"
@@ -1135,8 +1126,8 @@ $::static_assert(identity(5u32) == 5u32 && nested(5u32) == 6u32, "grouped names 
 
 check(grouped_header_fragments "${prefix}
 [[macro]] static $::meta::tokens named(in $::meta::tokens input) { return input; }
-static T (named!(identity))(in T value)
-    [[aligned(notice(unknown!{discarded})), generic(params!(T))]] { return value; }
+static T (named!(identity)<params!(T)>)(in T value)
+    [[aligned(notice(unknown!{discarded}))]] { return value; }
 $::static_assert(identity(53u32) == 53u32, \"grouped generated header lost generics\");"
     0 "note: earlier-header-owner")
 
@@ -1177,15 +1168,15 @@ foreach(expression
     string(MD5 case "${expression}")
     check(opaque_header_type_order_${case} "${prefix}
 static u32 alignment<U>() { return 16u32; }
-static T test(in T value)
-    [[aligned(${expression} + notice(unknown!{discarded})), generic(bad!(T))]] {
+[[aligned(${expression} + notice(unknown!{discarded}))]]
+static T test<bad!(T)>(in T value) {
     return value;
 }" 1 "note: earlier-header-owner" "error: division by zero")
     check(opaque_header_type_valid_${case} "${prefix}
 static u32 alignment<U>() { return 16u32; }
-static T test(in T value)
+static T test<params!(T)>(in T value)
     [[aligned((${expression} != 0uptr ? 16u32 : 16u32) +
-               notice(unknown!{discarded}) - 16u32), generic(params!(T))]] {
+               notice(unknown!{discarded}) - 16u32)]] {
     return value;
 }
 $::static_assert(test(300u32) == 300u32, \"opaque type damaged final generic bindings\");"
@@ -1196,18 +1187,18 @@ foreach(expression "sizeof(T [notice(unknown!{discarded})])"
                    "sizeof(T (*)(in u32 values[notice(unknown!{discarded})]))")
     string(MD5 case "${expression}")
     check(opaque_type_owner_order_${case} "${prefix}
-static T test(in T value) [[aligned(${expression}), generic(bad!(T))]] { return value; }"
+[[aligned(${expression})]] static T test<bad!(T)>(in T value) { return value; }"
         1 "note: earlier-header-owner" "error: division by zero")
 endforeach()
 
 check(opaque_header_value_order "${prefix}
-static u32 test() [[aligned(sizeof(N params!(+ 1u32)) + notice(unknown!{discarded})),
-                   generic(bad!(u32 N))]] { return N; }"
+[[aligned(sizeof(N params!(+ 1u32)) + notice(unknown!{discarded}))]]
+static u32 test<bad!(u32 N)>() { return N; }"
     1 "note: earlier-header-owner" "error: division by zero")
 
 check(opaque_header_value_valid "${prefix}
-static u32 test() [[aligned(sizeof(N params!(+ 1u32)) + notice(unknown!{discarded}) - sizeof(u32)),
-                   generic(params!(u32 N))]] { return N; }
+static u32 test<params!(u32 N)>()
+    [[aligned(sizeof(N params!(+ 1u32)) + notice(unknown!{discarded}) - sizeof(u32))]] { return N; }
 $::static_assert(test<300u32>() == 300u32, \"value generic was forced into type grammar\");"
     0 "note: earlier-header-owner")
 
@@ -1216,17 +1207,15 @@ foreach(expression "sizeof(N * notice(unknown!{discarded}))"
     string(MD5 case "${expression}")
     check(opaque_header_expression_owner_${case} "${prefix}
 static u32 Target(in u32 value) { return value; }
-static u32 test() [[aligned(${expression} + 16u32 - sizeof(u32)),
-                   generic(params!(u32 N))]] { return N; }
+static u32 test<params!(u32 N)>() [[aligned(${expression} + 16u32 - sizeof(u32))]] { return N; }
 $::static_assert(test<300u32>() == 300u32, \"type probing damaged an expression owner\");"
         0 "note: earlier-header-owner")
 endforeach()
 
 check(opaque_probe_split_token_position "${prefix}
 static u32 alignment<U>() { return 16u32; }
-static T test(in T value)
-    [[aligned(sizeof(T [alignment::<alignment::<u32>>() + notice(unknown!{discarded})])),
-      generic(bad!(T))]] { return value; }"
+[[aligned(sizeof(T [alignment::<alignment::<u32>>() + notice(unknown!{discarded})]))]]
+static T test<bad!(T)>(in T value) { return value; }"
     1 "note: earlier-header-owner" "error: division by zero")
 
 check(generic_function_alignment [=[
@@ -1250,16 +1239,15 @@ syntax ParameterOwner;
 namespace Helpers {
     static u32 alignment<u32 N, U>() { return N; }
 }
-${wrapper}static T test(in T value)
-    [[aligned(Helpers::alignment::<16u32, T(Param(params!(in u32)))>()),
-      generic(params!(T))]] { return value; }
+${wrapper}static T test<params!(T)>(in T value)
+    [[aligned(Helpers::alignment::<16u32, T(Param(params!(in u32)))>())]] { return value; }
 $::static_assert(test(300u32) == 300u32, \"known type slot lost nested callable grammar\");" 0)
 endforeach()
 
 check(known_generic_type_slot_prefix_priority "${prefix}
 static u32 alignment<U>() { return 16u32; }
-static T test(in T value)
-    [[aligned(alignment::<notice(unknown!{discarded})>()), generic(bad!(T))]] { return value; }"
+[[aligned(alignment::<notice(unknown!{discarded})>())]]
+static T test<bad!(T)>(in T value) { return value; }"
     1 "note: earlier-header-owner" "error: division by zero")
 
 check(grouped_macro_input_opaque "${prefix}

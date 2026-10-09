@@ -252,9 +252,6 @@ struct Attribute {
     // Structured when an attribute argument is a required constant
     // expression. Other attributes retain their original token spelling.
     std::shared_ptr<Expr> expression_argument{};
-    // Parameter declarations are parsed with the ordinary type/declarator
-    // grammar; their spelling is never reparsed by semantic expansion.
-    std::vector<GenericParameter> generic_parameters{};
     // Source types/binders survive generic substitution and required queries;
     // the selected target model validates each named state's exact interface.
     struct VariadicBinding {
@@ -598,6 +595,7 @@ struct RecordDecl {
     // the program may also hold the original.
     bool carried{};
     [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity}; }
+    [[nodiscard]] const Attribute* attribute(std::string_view name) const;
 };
 
 TypePtr record_type(const RecordDecl& declaration);

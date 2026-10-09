@@ -15,32 +15,27 @@ global bool canonical_bool = 256;
 global uptr pointer_complement = ~0uptr;
 global u32 escaped_character = '\n' + 1;
 
-[[generic(T, uptr N), runtime_only, noinline]]
-global T constant_identity(in T value) { return value + N; }
+[[runtime_only, noinline]]
+global T constant_identity<T, uptr N>(in T value) { return value + N; }
 
-[[generic(i8 N)]]
-static i32 signed_parameter() { return N; }
+static i32 signed_parameter<i8 N>() { return N; }
 
-[[generic(u8 N)]]
-static i32 unsigned_parameter() { return N + 1; }
+static i32 unsigned_parameter<u8 N>() { return N + 1; }
 
-[[generic(bool N)]]
-static i32 bool_parameter() { return N; }
+static i32 bool_parameter<bool N>() { return N; }
 
-[[generic(i8 N), runtime_only, noinline]]
-static i64 narrow_to_wide() { return N; }
+[[runtime_only, noinline]]
+static i64 narrow_to_wide<i8 N>() { return N; }
 
-[[generic(u32 N), runtime_only, noinline]]
-static u64 unsigned_to_wide() { return N; }
+[[runtime_only, noinline]]
+static u64 unsigned_to_wide<u32 N>() { return N; }
 
-[[generic(uptr N)]]
-static uptr inner_constant() { return N + 1uptr; }
+static uptr inner_constant<uptr N>() { return N + 1uptr; }
 
-[[generic(uptr N)]]
-static uptr outer_constant() { return inner_constant::<N + 1uptr>(); }
+static uptr outer_constant<uptr N>() { return inner_constant::<N + 1uptr>(); }
 
-[[generic(uptr N), runtime_only, noinline]]
-static uptr recursive_constant(in uptr depth) {
+[[runtime_only, noinline]]
+static uptr recursive_constant<uptr N>(in uptr depth) {
     if (depth == 0uptr) return N;
     return recursive_constant::<N>(depth - 1uptr);
 }
@@ -71,8 +66,7 @@ static uptr later_helper() { return inner_constant::<3>(); }
 #ifdef TEST_WIDE
 global u128 high_bits = (1u128 << 100) | 0x1234u128;
 global i128 wide_negative = -1i32;
-[[generic(u128 N)]]
-static u128 wide_parameter() { return N; }
+static u128 wide_parameter<u128 N>() { return N; }
 global i32 required_wide_entry() {
     return high_bits == 0x10000000000000000000001234u128 &&
         wide_negative == -1i128 &&

@@ -42,11 +42,11 @@ void manual_modes(in u64 a "rdx", inout u64 b "rcx", out u64 c "*r8") {
     b = b + 1u64;
 }
 
-[[generic(plain_fn F), noinline]]
-static u64 invoke_plain(in u64 a, in u64 b) { return F(a, b); }
+[[noinline]]
+static u64 invoke_plain<plain_fn F>(in u64 a, in u64 b) { return F(a, b); }
 
-[[generic(manual_fn F), noinline]]
-static u64 invoke_manual(in u64 a, in u64 b) { return F(a, b); }
+[[noinline]]
+static u64 invoke_manual<manual_fn F>(in u64 a, in u64 b) { return F(a, b); }
 
 [[noinline]] u64 call_plain(in plain_fn f, in u64 a, in u64 b) {
     u64 keep = a ^ b;

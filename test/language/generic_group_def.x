@@ -10,12 +10,12 @@ namespace math {
         return first ? left : right;
     }
 
-    [[generic(V)]] V legacy(in V value) {
+    V renamed<V>(in V value) {
         return value;
     }
 }
 
-[[generic(label Address), noinline]] label group_label() { return Address; }
+[[noinline]] label group_label<label Address>() { return Address; }
 static void private_label_owner() { point: ; }
 global label group_other_label() { return group_label::<private_label_owner::point>(); }
 global label group_other_direct() { return private_label_owner::point; }

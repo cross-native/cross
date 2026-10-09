@@ -82,7 +82,8 @@ resolves where the helper is defined, by the same rules. In a generic helper,
 the helper's typedefs and tags denote those of the instance that runs.
 Identifiers made by `$::meta::parse` or `$::meta::token` resolve like
 identifiers written in a quote at that call. A function whose signature uses a
-`$::meta` type runs only during compilation and has no symbol.
+`$::meta` type runs only during compilation and has no symbol, so attributes
+that need one, such as `naked`, `abi`, or `section`, are errors on it.
 
 ### Token operations
 
@@ -245,13 +246,13 @@ static `u8` array:
 static $::meta::bytes upper($::meta::bytes text) {
     uptr size = $::meta::len(text);
     $::meta::buffer result = $::meta::alloc(size);
-    u8 *out = $::meta::data(result);
+    u8 *bytes = $::meta::data(result);
     for (uptr i = 0; i < size; ++i) {
         u8 c = $::meta::at(text, i);
         if (c >= 'a' && c <= 'z') {
             c = c - 32;
         }
-        out[i] = c;
+        bytes[i] = c;
     }
     return $::meta::freeze(result, size);
 }

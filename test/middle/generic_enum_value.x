@@ -6,8 +6,8 @@ enum generic_shade [[underlying(u8)]] {
     shade_light = 7u8,
 };
 
-[[generic(enum generic_shade Shade), noinline]]
-global enum generic_shade shade_identity() {
+[[noinline]]
+global enum generic_shade shade_identity<enum generic_shade Shade>() {
     return Shade;
 }
 
@@ -15,21 +15,21 @@ namespace palette {
     enum tone [[underlying(i16)]] { low = -17i16, high = 127i16 };
     typedef enum tone Tone;
 
-    [[generic(Tone Value), noinline]]
-    static Tone alias_identity() { return Value; }
+    [[noinline]]
+    static Tone alias_identity<Tone Value>() { return Value; }
 }
 
 using palette;
 
-[[generic(enum palette::tone Value), noinline]]
-static enum palette::tone qualified_identity() { return Value; }
+[[noinline]]
+static enum palette::tone qualified_identity<enum palette::tone Value>() { return Value; }
 
-[[generic(enum tone Value), noinline]]
-static enum tone imported_identity() { return Value; }
+[[noinline]]
+static enum tone imported_identity<enum tone Value>() { return Value; }
 
 // A builtin prefix in an identifier does not make it a value parameter.
-[[generic(u64Type, u64Type Value), noinline]]
-static u64Type dependent_identity() { return Value; }
+[[noinline]]
+static u64Type dependent_identity<u64Type, u64Type Value>() { return Value; }
 
 global u64 generic_enum_value_entry() {
     enum generic_shade dark = shade_identity::<shade_dark>();

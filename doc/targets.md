@@ -45,6 +45,10 @@ platform unwinder even without tables.
 Only address space 0 exists on the current targets, so
 `[[address_space(N)]]` with any other `N` is an error.
 
+A `label` is a code address with the size and alignment of a pointer.
+`(uptr)` converts it to that address; in a static initializer the conversion is
+a relocation against the label, like `(uptr)&function`.
+
 ## x86-64
 
 | Triple | Format | Default ABI |

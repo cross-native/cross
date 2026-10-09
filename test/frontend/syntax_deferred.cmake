@@ -226,7 +226,7 @@ syntax TypeSize : expression { prefix "type_size"; match "(" value:type ")"; exp
 syntax TypeSize;
 $::static_assert(type_size(T *) == sizeof(void *), "type capture lost required-type classification");
 [[macro]] static $::meta::tokens generic_name(in $::meta::tokens input) { return input; }
-static T identity(in T value) [[aligned(sizeof(T *)), generic(generic_name!(T))]] { return value; }
+static T identity<generic_name!(T)>(in T value) [[aligned(sizeof(T *))]] { return value; }
 $::static_assert(identity(11u32) == 11u32, "generic header changed expression dispatch");
 ]=])
 reject(active_prefix_does_not_fall_back_to_type "syntax-match error" [=[

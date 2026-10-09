@@ -20,8 +20,8 @@ endif()
 
 foreach(case
         "UNKNOWN_ENUM|unknown enumeration type 'missing'"
-        "DUPLICATE|duplicate 'generic' parameter 'T'"
-        "EMPTY|'generic' requires at least one parameter"
+        "DUPLICATE|duplicate generic parameter 'T'"
+        "EMPTY|a generic parameter list cannot be empty"
         "FLOAT|generic value parameter requires an integer"
         "DEPENDENT_FLOAT|generic value parameter requires an integer"
         "MISSING_NAME|expected an unqualified generic parameter name")

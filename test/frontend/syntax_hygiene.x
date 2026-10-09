@@ -9,7 +9,7 @@ namespace GenericCopies {
     [[macro]] static $::meta::tokens introduce(in $::meta::tokens name) {
         return $::quote { typedef uptr $::unquote(name); };
     }
-    [[generic(label Address), noinline]] static label identity() { return Address; }
+    [[noinline]] static label identity<label Address>() { return Address; }
     [[macro]] static $::meta::tokens fresh_storage(in $::meta::tokens name) {
         $::meta::tokens point = $::meta::gensym("point");
         return $::quote {
@@ -268,7 +268,7 @@ namespace LabelNames {
         return saved == owner::point ? owner() : 99u32;
     }
 }
-[[generic(label Address), noinline]] static label private_label_identity() { return Address; }
+[[noinline]] static label private_label_identity<label Address>() { return Address; }
 struct PrivateLabelBox { label first; label second; };
 static struct PrivateLabelBox private_label_box(in label first, in label second) {
     struct PrivateLabelBox result = {first, second};
@@ -526,19 +526,19 @@ syntax ProjectGeneric : item {
     prefix "project_generic"; match body:function_def; expand project_generic;
 }
 syntax RecomposeGeneric, ProjectGeneric;
-recompose_generic [[generic(T), noinline]] static label recomposed_static_label() {
+recompose_generic [[noinline]] static label recomposed_static_label<T>() {
     static label selected = private_label_identity::<point>();
     static label direct = point;
     return selected == direct ? selected : (label)0uptr;
     point: ;
 }
-project_generic [[generic(T), noinline]] static label projected_static_label() {
+project_generic [[noinline]] static label projected_static_label<T>() {
     static label selected = private_label_identity::<point>();
     static label direct = point;
     return selected == direct ? selected : (label)0uptr;
     point: ;
 }
-recompose_generic [[generic(T), noinline]] static uptr generic_body_attribute() {
+recompose_generic [[noinline]] static uptr generic_body_attribute<T>() {
     T value = 0;
     return sizeof(value);
 }
@@ -615,7 +615,7 @@ namespace RawLookup {
         $::meta::syntax source = $::syntax::node(input, "body");
         $::meta::syntax body = $::meta::child(source, $::meta::child_count(source) - 1uptr);
         return $::quote {
-            [[generic(u32 $::unquote($::syntax::capture(input, "name"))), noinline]] static u32 generic_nonlocal()
+            [[noinline]] static u32 generic_nonlocal<u32 $::unquote($::syntax::capture(input, "name"))>()
             $::unquote($::meta::tokens(body))
         };
     }
@@ -674,7 +674,7 @@ copy_deferred_function [[noinline]] static u32 raw_deferred_constructed(raw_cons
 copy_deferred_function [[noinline]] static u32 raw_deferred_nested(raw_nested_parameter!()) {
     return hold_labeled_tokens!(value);
 }
-copy_deferred_function [[noinline]] static u32 raw_deferred_generic() [[generic(raw_constructed_generic!())]] {
+copy_deferred_function [[noinline]] static u32 raw_deferred_generic<raw_constructed_generic!()>() {
     return hold_labeled_tokens!(value);
 }
 #ifdef CUSTOM_SYNTAX_ABI

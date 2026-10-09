@@ -54,7 +54,7 @@ string(APPEND declarations "static uptr forwarded<uptr N>() { return value_uptr<
 if(MODE STREQUAL custom)
     string(APPEND declarations [=[
         typedef i32 (*Stack)(in i32 n) [[abi("stack_result_abi")]];
-        [[abi("stack_result_abi")]] static i32 stack(in i32 n) { return n; }
+        [[abi("stack_result_abi")]] static i32 stacked(in i32 n) { return n; }
         static uptr stack_value<Stack F>() { return sizeof(F); }
         struct Pair { u64 low; u64 high; };
         typedef struct Pair (*Memory)(in u32 n) [[abi("memory_result_abi")]];
@@ -120,7 +120,7 @@ check_body(dependent_value_pointer pass pass "if (dependent_value_pointer<(${fou
 check_body(dependent_value_mismatch pass "incompatible|cannot convert" "if (0u32) dependent_value_pointer<${four}, &bytes>();")
 check_body(callee_body pass "unknown|undeclared|unresolved" "if (0u32) invalid_body<${four}>();")
 if(MODE STREQUAL custom)
-    check_body(stack_interface pass pass "if (stack_value<(${four} ? stack : stack)>() != sizeof(Stack)) return $::quote {wrong};")
+    check_body(stack_interface pass pass "if (stack_value<(${four} ? stacked : stacked)>() != sizeof(Stack)) return $::quote {wrong};")
     check_body(memory_interface pass pass "if (memory_value<(${four} ? memory : memory)>() != sizeof(Memory)) return $::quote {wrong};")
     check_body(alias_interface pass pass "if (alias_value<(${four} ? canonical : canonical)>() != sizeof(Alias)) return $::quote {wrong};")
     check_body(stack_mismatch "cannot change its callable ABI" "cannot change its callable ABI" "if (0u32) stack_value<(${four} ? odd : odd)>();")

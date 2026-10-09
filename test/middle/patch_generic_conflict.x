@@ -1,7 +1,6 @@
 global uptr generic_patch_sink;
 
-[[generic(T)]]
-static u64 generic_patch_value() {
+static u64 generic_patch_value<T>() {
     return $::patch(0x1020304050607080u64, generic_patch_sink);
 }
 

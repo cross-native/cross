@@ -133,7 +133,7 @@ static label unavailable(in $::meta::tokens input) {
 global u32 entry() { return 1u32; }
 ]=] -${level})
     reject(generic_meta_untaken_label_owner_${level} "cannot take a code label address of a translation-only function" [=[
-[[generic(T)]] static label unavailable(in T input) {
+static label unavailable<T>(in T input) {
     if (0u32) return point;
     return (label)0uptr;
     point: ;
@@ -145,7 +145,7 @@ global u32 entry() { return 1u32; }
 global u32 entry() { return invalid!(); }
 ]=] -${level})
     reject(generic_meta_label_owner_${level} "cannot take a code label address of a translation-only function" [=[
-[[generic(T)]] static label unavailable(in T input) {
+static label unavailable<T>(in T input) {
     return point;
     point: ;
 }

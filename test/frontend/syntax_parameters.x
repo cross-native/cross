@@ -33,7 +33,6 @@ namespace RelocatedParameters {
             [[noinline]] static u32 as_local() { u32 $::unquote(name) = 7u32; $::unquote(result) }
             [[noinline]] static u32 as_parameter(in u32 $::unquote(name)) { $::unquote(result) }
             [[noinline]] static u32 as_generic<u32 $::unquote(name)>() { $::unquote(result) }
-            [[noinline]] static u32 as_attribute() [[generic(u32 $::unquote(name))]] { $::unquote(result) }
             [[noinline]] static u32 projected(in u32 $::unquote(name)) { $::unquote($::meta::tokens(result)) }
         };
     }
@@ -50,9 +49,12 @@ namespace RelocatedParameters {
     }
 
     [[syntax_expander]] static $::meta::tokens decorate(in $::meta::syntax_match input) {
+        // Insert a generic list after the captured header's declared name.
+        $::meta::tokens header = $::meta::tokens($::syntax::node(input, "header"));
         $::meta::syntax definition = $::meta::parse("function_def", $::quote {
-            [[noinline, generic(u32 $::unquote($::syntax::capture(input, "name")))]]
-            $::unquote($::syntax::node(input, "header"))
+            [[noinline]] $::unquote($::meta::slice(header, 0uptr, 3uptr))
+            <u32 $::unquote($::syntax::capture(input, "name"))>
+            $::unquote($::meta::slice(header, 3uptr, $::meta::len(header) - 3uptr))
             $::unquote($::syntax::capture(input, "body"))
         }, $::syntax::context(input));
         return $::quote { $::unquote(definition) };
@@ -61,34 +63,34 @@ namespace RelocatedParameters {
     syntax Decorate;
     [[macro]] static $::meta::tokens forward(in $::meta::tokens input) { return input; }
     decorate N static u32 decorated(in u32 value) { return forward!(value) + forward!(N); }
-    $::static_assert(decorated<7u32>(2u32) == 9u32, "new generic around a retained header");
+    $::static_assert(decorated<7u32>(2u32) == 9u32, "new generic inside a captured header");
 
     $::static_assert(Ordinary::as_local() == 9u32 && Ordinary::as_parameter(8u32) == 10u32 &&
-        Ordinary::as_generic<9u32>() == 11u32 && Ordinary::as_attribute<10u32>() == 12u32 &&
+        Ordinary::as_generic<9u32>() == 11u32 &&
         Ordinary::projected(11u32) == 13u32, "ordinary parameter role changes");
     $::static_assert(Generic::as_local() == 9u32 && Generic::as_parameter(8u32) == 10u32 &&
-        Generic::as_generic<9u32>() == 11u32 && Generic::as_attribute<10u32>() == 12u32 &&
+        Generic::as_generic<9u32>() == 11u32 &&
         Generic::projected(11u32) == 13u32, "value-generic parameter role changes");
     $::static_assert(Local::as_local() == 9u32 && Local::as_parameter(8u32) == 10u32 &&
-        Local::as_generic<9u32>() == 11u32 && Local::as_attribute<10u32>() == 12u32 &&
+        Local::as_generic<9u32>() == 11u32 &&
         Local::projected(11u32) == 13u32, "local declaration role changes");
     $::static_assert(Variadic::as_local() == 9u32 && Variadic::as_parameter(8u32) == 10u32 &&
-        Variadic::as_generic<9u32>() == 11u32 && Variadic::as_attribute<10u32>() == 12u32 &&
+        Variadic::as_generic<9u32>() == 11u32 &&
         Variadic::projected(11u32) == 13u32, "variadic-state role changes");
 
     static u32 run() {
         if (decorated<7u32>(2u32) != 9u32) return 0u32;
         if (Ordinary::as_local() != 9u32 || Ordinary::as_parameter(8u32) != 10u32 ||
-            Ordinary::as_generic<9u32>() != 11u32 || Ordinary::as_attribute<10u32>() != 12u32 ||
+            Ordinary::as_generic<9u32>() != 11u32 ||
             Ordinary::projected(11u32) != 13u32) return 0u32;
         if (Generic::as_local() != 9u32 || Generic::as_parameter(8u32) != 10u32 ||
-            Generic::as_generic<9u32>() != 11u32 || Generic::as_attribute<10u32>() != 12u32 ||
+            Generic::as_generic<9u32>() != 11u32 ||
             Generic::projected(11u32) != 13u32) return 0u32;
         if (Local::as_local() != 9u32 || Local::as_parameter(8u32) != 10u32 ||
-            Local::as_generic<9u32>() != 11u32 || Local::as_attribute<10u32>() != 12u32 ||
+            Local::as_generic<9u32>() != 11u32 ||
             Local::projected(11u32) != 13u32) return 0u32;
         if (Variadic::as_local() != 9u32 || Variadic::as_parameter(8u32) != 10u32 ||
-            Variadic::as_generic<9u32>() != 11u32 || Variadic::as_attribute<10u32>() != 12u32 ||
+            Variadic::as_generic<9u32>() != 11u32 ||
             Variadic::projected(11u32) != 13u32) return 0u32;
         return 1u32;
     }

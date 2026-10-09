@@ -768,7 +768,7 @@ private:
     }
 
     bool parse_packed(const std::vector<Attribute>& attributes,
-                      std::string_view subject) {
+                      std::string_view subject, bool definition = false) {
         bool result = false;
         for (const auto& attribute : attributes) {
             if (attribute.name == "packed") {
@@ -779,7 +779,8 @@ private:
                         "packed on " + std::string(subject) +
                             " does not take arguments");
                 }
-            } else if (attribute.name != "aligned") {
+            } else if (attribute.name != "aligned" &&
+                       !(definition && attribute.name == "may_alias")) {
                 diagnostics_.error(
                     attribute.location,
                     "attribute '" + attribute.name + "' is not valid on " +
@@ -917,7 +918,7 @@ private:
             co_return {};
         }
         const auto errors = diagnostics_.errors();
-        const bool packed = parse_packed(definition->attributes, "a record definition");
+        const bool packed = parse_packed(definition->attributes, "a record definition", true);
         const auto name_space = source_namespace(definition->name);
         unsigned alignment = (co_await parse_alignment_async(definition->attributes, "a record definition", name_space));
         for (const auto& member : definition->members) {
@@ -1369,7 +1370,7 @@ private:
         record.location = definition->location;
         record.complete = true;
         record.packed = parse_packed(attributes,
-                                     "a record definition");
+                                     "a record definition", true);
         record.explicit_alignment =
             co_await parse_alignment_async(attributes,
                             "a record definition",
@@ -1568,9 +1569,16 @@ private:
             const auto& previous = *canonical.declarations.front();
             const auto previous_naked = previous.attribute("naked") != nullptr;
             const auto declaration_naked = declaration.attribute("naked") != nullptr;
-            if (previous_naked != declaration_naked ||
-                decode_attribute_string(previous.attribute("abi")) !=
-                    decode_attribute_string(declaration.attribute("abi")) ||
+            // An alias and its canonical name select the same registered entry.
+            const auto previous_abi = decode_attribute_string(previous.attribute("abi"));
+            const auto declaration_abi = decode_attribute_string(declaration.attribute("abi"));
+            const auto previous_entry = module_.abi_names.find(previous_abi);
+            const auto declaration_entry = module_.abi_names.find(declaration_abi);
+            const bool same_abi = previous_abi == declaration_abi ||
+                (previous_entry != module_.abi_names.end() &&
+                 declaration_entry != module_.abi_names.end() &&
+                 previous_entry->second == declaration_entry->second);
+            if (previous_naked != declaration_naked || !same_abi ||
                 decode_attribute_string(previous.attribute("stack_cleanup")) !=
                     decode_attribute_string(declaration.attribute("stack_cleanup")) ||
                 decoded_clobbers(previous) != decoded_clobbers(declaration)) return false;
@@ -2656,6 +2664,9 @@ TypeId Module::intern_type(const TypePtr& source) {
             } else {
                 candidate.record = found->second;
             }
+            // A record defined [[may_alias]] qualifies each use like a may_alias typedef.
+            if (const auto* definition = record(*candidate.record).definition)
+                candidate.may_alias = candidate.may_alias || definition->attribute("may_alias");
         }
     }
     if (const auto found = find_type(*this, candidate,

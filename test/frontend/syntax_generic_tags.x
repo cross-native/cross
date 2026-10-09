@@ -37,8 +37,7 @@ tag_header [[noinline]] static T header_generic_local<T>(in T value) {
     struct Local copied = LocalTagGeneric::pass(object);
     return copied.value;
 }
-tag_header [[noinline]] static T deferred_generic_local(in T value)
-    [[generic(fragment!(T))]] {
+tag_header [[noinline]] static T deferred_generic_local<fragment!(T)>(in T value) {
     struct Local { T value; } object = {value};
     struct Local copied = LocalTagGeneric::pass(object);
     return copied.value;

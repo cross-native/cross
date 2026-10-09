@@ -230,6 +230,8 @@ switch    syntax    typedef   u8        u16       u32        u64       union
 u128      uptr      using     void      volatile  while
 ```
 
+A reserved keyword cannot name a declared entity, member, parameter, generic
+parameter, tag, enumerator, label, or namespace.
 No other word is reserved. In particular, `auto`, `char`, `double`, `extern`,
 `float`, `int`, `long`, `short`, `signed`, `unsigned`, and every
 underscore-prefixed compatibility spelling are ordinary identifiers, not type
@@ -904,9 +906,10 @@ parameter value; it does not grant exclusivity over the caller object used only
 as an `out` or `inout` result destination. `[[may_alias]]` disables
 effective-type alias assumptions for accesses through the attributed type, but
 does not relax alignment, lifetime, address-space, atomic, or volatile rules.
-The attribute follows a typedef's declarator or qualifies a type in a
-declaration specifier or type name; accesses to members and elements of a
-`may_alias` aggregate are accesses through it. It does not make a distinct
+The attribute follows a typedef's declarator or a record's tag in its
+definition, or qualifies a type in a declaration specifier or type name; on a
+record definition it qualifies every use of that record type, and accesses to
+members and elements of a `may_alias` aggregate are accesses through it. It does not make a distinct
 type: compatibility, callable identity, deduction, and mangling ignore it.
 
 A typed memory operand of a `$::_mnemonic` form performs an access through that
@@ -1583,7 +1586,9 @@ header definition with the same kind, tag, members or enumerators, types, and
 attributes, in the same order, and then denotes the same per-instance types.
 
 A value parameter has integer, enumeration, `bool`, `label`, or pointer type,
-and its argument is a representable translation-time constant. Value
+and its argument is a representable translation-time constant; its type may
+be a type parameter of the same list, which each instance checks after
+substitution. Value
 parameters are never deduced. Type parameters may be deduced at a direct call;
 an explicit application supplies all arguments, or an initial sequence of type
 arguments with the remaining type arguments deduced. A missing value
@@ -2441,7 +2446,8 @@ resolved as follows:
    or manual locations.
 
 Conflicting definitions, linkage decorators, types, modes, manual locations,
-link names, or ABI clauses for the same entity are diagnosed.
+link names, or ABI clauses that select different registered entries (an
+alias names its entry) for the same entity are diagnosed.
 
 ### Link names
 
@@ -2647,7 +2653,9 @@ emission model and no `extern inline` form.
 `label` is a scalar code-address type; size, alignment, representation, null,
 relocation, signing, and tagging are target properties. It supports assignment,
 storage, aggregates, parameters/results, and `==`/`!=`, but not dereference,
-call, or arithmetic. Explicit `uptr` conversion is target-defined. Passing a
+call, or arithmetic. Explicit `uptr` conversion is target-defined; where the
+target defines it, `(uptr)function::label` is a relocatable address
+expression in static initialization. Passing a
 `label` through a registered ABI requires the ABI model to classify code
 addresses; otherwise it needs a complete manual location.
 

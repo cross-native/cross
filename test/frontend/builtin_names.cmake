@@ -88,6 +88,36 @@ check(quoted pass [=[
 }
 global u32 entry() { return apply!(1u32); }
 ]=])
+# Keywords are reserved too: no declaration may use one as its name, whether
+# it is written directly or supplied by an expansion.
+foreach(case
+        "stack|static i32 stack(in i32 n) { return n; }"
+        "while|global u32 while = 3u32;"
+        "return|global u32 f(in u32 return) { return 0u32; }"
+        "if|struct S { u32 if; };"
+        "switch|typedef u32 switch;"
+        "for|global u32 g() { u32 for = 1u32; return 1u32; }"
+        "goto|global u32 ns::goto;"
+        "in|global u32 k<u32 in>() { return 0u32; }"
+        "out|global u32 k<out>() { return 0u32; }"
+        "do|struct do { u32 value; };"
+        "union|enum union { first };"
+        "case|enum Kind { case = 1 };"
+        "inline|namespace inline { global u32 value; }"
+        "const|global u32 f() { const: return 1u32; }"
+        "volatile|global void f() { global label volatile: ; }"
+        "label|[[macro]] static $::meta::tokens declare(in $::meta::tokens input) { return $::quote { global u32 $::unquote(input) = 1u32; }; }\ndeclare!(label)")
+    string(FIND "${case}" "|" split)
+    string(SUBSTRING "${case}" 0 ${split} keyword)
+    math(EXPR start "${split} + 1")
+    string(SUBSTRING "${case}" ${start} -1 source)
+    check(keyword_name_${keyword} "reserved keyword '${keyword}' cannot be a declared name" "${source}\n")
+endforeach()
+check(keyword_prefixes pass [=[
+static i32 stacked(in i32 in_value) { return in_value; }
+global u32 whiles<u32 inner>() { return inner; }
+global u32 entry() { return (u32)stacked(1) + whiles<2u32>(); }
+]=])
 check(known_operations pass [=[
 global u32 [[atomic]] shared;
 static $::meta::tokens helper(in $::meta::tokens input) {

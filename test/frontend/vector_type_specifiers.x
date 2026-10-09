@@ -85,10 +85,10 @@ namespace VectorTypeSpecifiers {
             doubled<u16, 8uptr>(5u16) != 10u16) return 0u32;
 #endif
 #ifdef CUSTOM_SYNTAX_ABI
-        struct VectorBox memory = memory_result(3u32), stack = stack_result(7u32);
-        if (memory.lanes[2uptr] != 3u32 || stack.lanes[1uptr] != 7u32) return 0u32;
-        memory.lanes[2uptr] += stack.lanes[1uptr]++;
-        if (memory.lanes[2uptr] != 10u32 || stack.lanes[1uptr] != 8u32) return 0u32;
+        struct VectorBox memory = memory_result(3u32), stacked = stack_result(7u32);
+        if (memory.lanes[2uptr] != 3u32 || stacked.lanes[1uptr] != 7u32) return 0u32;
+        memory.lanes[2uptr] += stacked.lanes[1uptr]++;
+        if (memory.lanes[2uptr] != 10u32 || stacked.lanes[1uptr] != 8u32) return 0u32;
 #endif
         return validate!(89u32);
     }

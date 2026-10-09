@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-[[generic(label Address), noinline]] static label generic_label_identity() { return Address; }
-[[generic(label Address), noinline]] static label generic_label_forward() {
+[[noinline]] static label generic_label_identity<label Address>() { return Address; }
+[[noinline]] static label generic_label_forward<label Address>() {
     return generic_label_identity::<Address>();
 }
 namespace GenericLabelHelper {

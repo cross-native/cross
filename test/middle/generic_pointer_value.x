@@ -8,36 +8,36 @@ namespace pointer_values {
 }
 using pointer_values;
 
-[[generic(const u32 *P), noinline]]
+[[noinline]]
 #ifdef PRIVATE_POINTER_GENERIC
-static const u32 *pointer_identity() { return P; }
+static const u32 *pointer_identity<const u32 *P>() { return P; }
 #else
-global const u32 *pointer_identity() { return P; }
+global const u32 *pointer_identity<const u32 *P>() { return P; }
 #endif
 
-[[generic(const u8 *P), noinline]]
-static const u8 *string_identity() { return P; }
+[[noinline]]
+static const u8 *string_identity<const u8 *P>() { return P; }
 
-[[generic(T, T *P), noinline]]
-static T *typed_identity() { return P; }
+[[noinline]]
+static T *typed_identity<T, T *P>() { return P; }
 
-[[generic(const u32 *P), noinline]]
-static const u32 *pointer_forward() { return pointer_identity::<P>(); }
+[[noinline]]
+static const u32 *pointer_forward<const u32 *P>() { return pointer_identity::<P>(); }
 
-[[generic(const u32 *P), noinline, link_name("explicit_pointer")]]
+[[noinline, link_name("explicit_pointer")]]
 #ifdef HOST_ABI
 [[abi(HOST_ABI)]]
 #endif
-global const u32 *explicit_pointer() { return P; }
+global const u32 *explicit_pointer<const u32 *P>() { return P; }
 
-[[generic(const u32 *P), noinline]]
-static const u32 *static_pointer() {
+[[noinline]]
+static const u32 *static_pointer<const u32 *P>() {
     static const u32 *cached = P;
     return cached;
 }
 
-[[generic(const u32 *P), noinline]]
-static u32 instance_counter() {
+[[noinline]]
+static u32 instance_counter<const u32 *P>() {
     static u32 count = 0u32;
     count += 1u32;
     return count;
@@ -50,8 +50,8 @@ typedef u32 (*Callback)(in u32 value);
 [[noinline]]
 static u32 increment(in u32 value) { return value + 9u32; }
 
-[[generic(Callback F), noinline]]
-static u32 invoke(in u32 value) { return F(value); }
+[[noinline]]
+static u32 invoke<Callback F>(in u32 value) { return F(value); }
 
 static const u32 *advance_constant(in const u32 *base, in u32 count) {
     const u32 *p = base;
@@ -97,21 +97,21 @@ static OddCallback forward_callback(in OddCallback callback) {
 static StackCallback mismatched_callback(in OddCallback callback) { return callback; }
 #endif
 
-[[generic(OddCallback F), noinline]]
-static u32 invoke_odd(in u32 value) { return F(value); }
+[[noinline]]
+static u32 invoke_odd<OddCallback F>(in u32 value) { return F(value); }
 
-[[generic(StackCallback F), noinline]]
-static u32 invoke_stack(in u32 value) { return F(value); }
+[[noinline]]
+static u32 invoke_stack<StackCallback F>(in u32 value) { return F(value); }
 
-[[generic(const u32 *P), abi("odd_abi"), noinline]]
-static const u32 *register_result() { return P; }
+[[abi("odd_abi"), noinline]]
+static const u32 *register_result<const u32 *P>() { return P; }
 
-[[generic(const u32 *P), abi("stack_result_abi"), noinline]]
-static const u32 *stack_result() { return P; }
+[[abi("stack_result_abi"), noinline]]
+static const u32 *stack_result<const u32 *P>() { return P; }
 
 struct pointer_pair { const u32 *first; const u32 *second; };
-[[generic(const u32 *P), abi("memory_result_abi"), noinline]]
-static struct pointer_pair memory_result() {
+[[abi("memory_result_abi"), noinline]]
+static struct pointer_pair memory_result<const u32 *P>() {
     struct pointer_pair result = { P, P + 1 };
     return result;
 }

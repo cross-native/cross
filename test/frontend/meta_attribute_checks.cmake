@@ -274,6 +274,24 @@ foreach(attribute always_inline noinline)
     check(single_${attribute} pass
         "[[${attribute}]] static $::meta::tokens helper(in $::meta::tokens input) { return input; }\n[[macro]] static $::meta::tokens apply(in $::meta::tokens input) { return helper(input); }\n$::static_assert(apply!(7u32) == 7u32, \"helper result\");")
 endforeach()
+# A translation-only helper has no emitted symbol or call boundary either,
+# whether or not it runs.
+foreach(attribute "abi(\"cross\")" "alias(\"other\")" "aligned(16)" "clobber(\"r8\")"
+                  "interrupt(\"irq\")" "link_name(\"other\")" naked raw_inline retain returns_twice
+                  "section(\".text\")" "stack_cleanup(\"caller\")" used
+                  "variadic(uptr state \"gp\")" "visibility(\"hidden\")" weak "weakref(\"other\")")
+    string(MAKE_C_IDENTIFIER "${attribute}" name)
+    foreach(state unused called)
+        set(suffix "")
+        if(state STREQUAL called)
+            set(suffix "[[macro]] static $::meta::tokens apply(in $::meta::tokens input) { return helper(input); }\n$::static_assert(apply!(7u32) == 7u32, \"helper result\");")
+        endif()
+        check(helper_runtime_${name}_${state} "it is not valid on a translation-only helper"
+            "[[${attribute}]] static $::meta::tokens helper(in $::meta::tokens input) { return input; }\n${suffix}")
+    endforeach()
+endforeach()
+check(helper_runtime_generic "it is not valid on a translation-only helper"
+    "[[naked]] static $::meta::tokens helper<T>(in T value, in $::meta::tokens input) { return input; }")
 
 foreach(role macro syntax_expander)
     if(role STREQUAL macro)

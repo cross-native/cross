@@ -31,8 +31,8 @@ namespace Recognition {
     syntax Inspect;
     [[macro]] static $::meta::tokens parameters(in $::meta::tokens input) { return input; }
     typedef u8 HeaderT;
-    [[noinline]] static HeaderT header_identity(in HeaderT value)
-        [[aligned(sizeof(HeaderT parameters!(*))), generic(parameters!(HeaderT))]] { return value; }
+    [[noinline]] static HeaderT header_identity<parameters!(HeaderT)>(in HeaderT value)
+        [[aligned(sizeof(HeaderT parameters!(*)))]] { return value; }
     [[syntax_expander]] static $::meta::tokens regional(in $::meta::syntax_match input) {
         return $::quote { 61u32 };
     }

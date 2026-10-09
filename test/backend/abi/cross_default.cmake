@@ -89,3 +89,21 @@ foreach(pair "sysv_abi;rdi" "ms_abi;rcx")
         message(FATAL_ERROR "-mabi=${abi} was not applied\n${body}")
     endif()
 endforeach()
+
+# Redeclarations must select the same ABI entry; an alias of it agrees.
+file(WRITE "${OUTPUT}-conflict.x" [=[
+[[abi("sysv_abi")]] global u64 conflict(in u64 value);
+[[abi("ms")]] global u64 conflict(in u64 value) { return value; }
+]=])
+execute_process(
+    COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu "${OUTPUT}-conflict.x"
+            -o "${OUTPUT}-conflict.s"
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE compile_stdout
+    ERROR_VARIABLE compile_stderr
+)
+if(status EQUAL 0 OR NOT compile_stderr MATCHES
+   "conflict[.]x:2:[0-9]+: error: incompatible redeclaration of function 'conflict'")
+    message(FATAL_ERROR "conflicting ABI redeclaration was not diagnosed\n"
+        "${compile_stdout}\n${compile_stderr}")
+endif()

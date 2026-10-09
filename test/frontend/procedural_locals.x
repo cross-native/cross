@@ -58,7 +58,7 @@ namespace hygienic_locals {
         return value;
     }
 
-    [[generic(u64 value), noinline]] static u64 generic_value() {
+    [[noinline]] static u64 generic_value<u64 value>() {
         scope! { if (value != 29u64) return 104u64; }
         return value;
     }
@@ -108,7 +108,7 @@ namespace hygienic_locals {
 
     [[macro]] static $::meta::tokens generic_definition(in $::meta::tokens input) {
         return $::quote {
-            [[generic(u64 count), noinline]] static u64 generated_generic() {
+            [[noinline]] static u64 generated_generic<u64 count>() {
                 return count + $::unquote(input);
             }
         };
@@ -116,7 +116,7 @@ namespace hygienic_locals {
     generic_definition! { 5u64 }
 
     global u64 pointer_target[1] = { 41u64 };
-    [[generic(u64 *P), noinline]] static u64 *address() { return P; }
+    [[noinline]] static u64 *address<u64 *P>() { return P; }
     [[macro]] static $::meta::tokens address_scope(in $::meta::tokens input) {
         return $::quote {
             u64 pointer_target = 3u64;

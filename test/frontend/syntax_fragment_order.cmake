@@ -49,32 +49,32 @@ function(check source)
     endforeach()
 endfunction()
 foreach(header
-    "part!(T) test(in T value)"
-    "T part!(test)(in T value)"
-    "T (part!(test))(in T value)"
-    "T part!((test))(in T value)"
-    "T part!(test(in T value))"
-    "T test part!((in T value))"
-    "T test(in part!(T) value)"
-    "T test(in T part!(value))"
-    "T test(in T (part!(value)))"
-    "T test(part!(in T value))"
-    "T test(in T value) part!()"
-    "T test(in T value) [[part!(noinline)]]"
-    "T part!() test(in T value)"
-    "part!(const) T test(in T value)"
-    "T part!(const) test(in T value)"
-    "T test(in T value) part!([[noinline]])")
-    check("[[aligned(early(unknown!()))]] static ${header} [[generic(last!(T))]] { return value; }
+    "part!(T) test<T>(in T value)"
+    "T part!(test)<T>(in T value)"
+    "T (part!(test)<T>)(in T value)"
+    "T part!((test<T>))(in T value)"
+    "T part!(test<T>(in T value))"
+    "T test<T> part!((in T value))"
+    "T test<T>(in part!(T) value)"
+    "T test<T>(in T part!(value))"
+    "T test<T>(in T (part!(value)))"
+    "T test<T>(part!(in T value))"
+    "T test<T>(in T value) part!()"
+    "T test<T>(in T value) [[part!(noinline)]]"
+    "T part!() test<T>(in T value)"
+    "part!(const) T test<T>(in T value)"
+    "T part!(const) test<T>(in T value)"
+    "T test<T>(in T value) part!([[noinline]])")
+    check("[[aligned(early(unknown!()))]] static ${header} [[last!(hot)]] { return value; }
 $::static_assert(test(300u32) == 300u32, \"generic binding lost\");")
 endforeach()
 foreach(header
-    "T part!(*)test(in T *value)"
-    "T *part!(const) test(in T *value)"
-    "T (*part!(test)(in T *value))"
-    "T (*test(part!(in T *value)))"
-    "T (*test(in T *value))part!()")
-    check("[[aligned(early(unknown!()))]] static ${header} [[generic(last!(T))]] { return value; }
+    "T part!(*)test<T>(in T *value)"
+    "T *part!(const) test<T>(in T *value)"
+    "T (*part!(test)<T>(in T *value))"
+    "T (*test<T>(part!(in T *value)))"
+    "T (*test<T>(in T *value))part!()")
+    check("[[aligned(early(unknown!()))]] static ${header} [[last!(hot)]] { return value; }
 global uptr entry() { return sizeof(&test<u32>); }")
 endforeach()
 foreach(expression
@@ -99,7 +99,7 @@ foreach(expression
     "sizeof((T (*)(part!(in T)))0uptr)"
     "sizeof(T (*)(in T) [[part!(abi(\"cross\"))]])"
     "sizeof(T (*)(in T) part!([[abi(\"cross\")]]))")
-    check("[[aligned(early(unknown!()) + 0uptr * ${expression})]] static T test(in T value)
-[[generic(last!(T))]] { return value; }
+    check("[[aligned(early(unknown!()) + 0uptr * ${expression})]] static T test<T>(in T value)
+[[last!(hot)]] { return value; }
 $::static_assert(test(300u32) == 300u32, \"generic binding lost\");")
 endforeach()

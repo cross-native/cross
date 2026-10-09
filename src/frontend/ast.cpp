@@ -929,6 +929,11 @@ const Attribute* FunctionDecl::attribute(std::string_view sought) const {
     return nullptr;
 }
 
+const Attribute* RecordDecl::attribute(std::string_view sought) const {
+    for (const auto& item : attributes) if (item.name == sought) return &item;
+    return nullptr;
+}
+
 bool FunctionDecl::has_meta_signature() const {
     if (is_meta_type(return_type)) return true;
     return std::any_of(parameters.begin(), parameters.end(),

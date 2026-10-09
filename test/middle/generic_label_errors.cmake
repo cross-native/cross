@@ -18,7 +18,7 @@ function(reject_label_expression case expected source)
 endfunction()
 set(label_prefix [=[
 static void owner() { first: ; second: ; }
-[[generic(label Address), noinline]] static label identity() { return Address; }
+[[noinline]] static label identity<label Address>() { return Address; }
 static label choose(in bool select, in label first, in label second) { return select ? first : second; }
 ]=])
 foreach(level O0 O2)
@@ -29,7 +29,7 @@ foreach(level O0 O2)
         "${label_prefix} [[eval_only]] static void unavailable() { point: ; } global label entry() { return identity::<unavailable::point>(); }"
         -${level} -fno-eval-calls)
     reject_label_expression(eval_only_instance_label_${level} "cannot take a code label address of a translation-only function"
-        "${label_prefix} [[generic(T), eval_only]] static label unavailable() { return point; point: ; } global label saved = unavailable::<u32>();"
+        "${label_prefix} [[eval_only]] static label unavailable<T>() { return point; point: ; } global label saved = unavailable::<u32>();"
         -${level} -fno-eval-calls)
     reject_label_expression(eval_only_untaken_label_${level} "cannot take a code label address of a translation-only function"
         "${label_prefix} [[eval_only]] static label unavailable(in bool select) { if (select) return point; return owner::first; point: ; } global label saved = unavailable(0);"
@@ -41,10 +41,10 @@ foreach(level O0 O2)
         "${label_prefix} [[eval_only]] static void unavailable() { point: ; } global label entry() { return identity::<(1u32 ? owner::first : unavailable::point)>(); }"
         -${level} -fno-eval-calls)
     reject_label_expression(static_parameter_label_${level} "an ordinary value name cannot select a same-spelled label"
-        "${label_prefix} [[generic(T)]] static label use(in label point) { static label saved = identity::<point>(); point: return saved; } global label entry() { return use::<u32>(owner::first); }"
+        "${label_prefix} static label use<T>(in label point) { static label saved = identity::<point>(); point: return saved; } global label entry() { return use::<u32>(owner::first); }"
         -${level} -fno-eval-calls)
     reject_label_expression(static_inline_label_${level} "taking a label address conflicts with always_inline"
-        "${label_prefix} [[generic(T), always_inline]] static label use() { static label saved = point; point: return saved; } global label entry() { return use::<u32>(); }"
+        "${label_prefix} [[always_inline]] static label use<T>() { static label saved = point; point: return saved; } global label entry() { return use::<u32>(); }"
         -${level} -fno-eval-calls)
     reject_label_expression(missing_untaken_${level} "unresolved name 'owner::missing'"
         "${label_prefix} global label entry() { return identity::<(1u32 ? owner::first : owner::missing)>(); }" -${level} -fno-eval-calls)
@@ -57,7 +57,7 @@ foreach(level O0 O2)
     reject_label_expression(runtime_helper_${level} "call to runtime-only function"
         "${label_prefix} [[runtime_only]] static label select() { return owner::first; } global label entry() { return identity::<select()>(); }" -${level} -fno-eval-calls)
     reject_label_expression(missing_instance_label_${level} "generic function 'instance' has no label 'absent'"
-        "${label_prefix} [[generic(T)]] static void instance() { present: ; } global label entry() { return instance::<u32>::absent; }"
+        "${label_prefix} static void instance<T>() { present: ; } global label entry() { return instance::<u32>::absent; }"
         -${level} -fno-eval-calls)
     reject_label_expression(runtime_taken_${level} "runtime is invalid where a translation-time value is required"
         "${label_prefix} global label entry() { return identity::<(0u32 ? owner::first : $::runtime(owner::second))>(); }" -${level} -fno-eval-calls)

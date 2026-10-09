@@ -380,35 +380,38 @@ namespace flow {
         return $::meta::tokens(body);
     }
     syntax ParsedArray : item { prefix "parsed_array"; match body:declaration; expand parsed_array; }
+    static $::meta::syntax generic_list(in $::meta::syntax node) {
+        if ($::meta::is_production(node, "generic_parameter_list")) return node;
+        if ($::meta::is_kind(node, "core"))
+            for (uptr at = 0uptr; at < $::meta::child_count(node); ++at) {
+                $::meta::syntax result = generic_list($::meta::child(node, at));
+                if ($::meta::is_production(result, "generic_parameter_list")) return result;
+            }
+        return node;
+    }
+    // The second of two generic parameters, as `type_name identifier`.
+    static $::meta::syntax generic_value_type(in $::meta::syntax body) {
+        $::meta::syntax list = generic_list(body);
+        if (!$::meta::is_production(list, "generic_parameter_list") ||
+            $::meta::child_count(list) != 5uptr) return list;
+        $::meta::syntax value = $::meta::child(list, 3uptr);
+        if (!$::meta::is_production(value, "generic_parameter") ||
+            $::meta::child_count(value) != 2uptr ||
+            !$::meta::is_kind($::meta::child(value, 1uptr), "token")) return value;
+        return $::meta::child(value, 0uptr);
+    }
     [[syntax_expander]] static $::meta::tokens parsed_generic(in $::meta::syntax_match input) {
         $::meta::syntax body = $::syntax::node(input, "body");
-        $::meta::syntax attributes = $::meta::child(body, 0uptr);
-        if (!$::meta::is_production(attributes, "attribute_specifier") ||
-            $::meta::child_count(attributes) != 5uptr) return $::quote { public_schema_failure; };
-        $::meta::syntax attribute = $::meta::child(attributes, 1uptr);
-        if (!$::meta::is_production(attribute, "attribute") ||
-            $::meta::child_count(attribute) != 4uptr) return $::quote { public_schema_failure; };
-        $::meta::syntax arguments = $::meta::child(attribute, 2uptr);
-        if (!$::meta::is_production(arguments, "balanced_token_sequence") ||
-            $::meta::child_count(arguments) != 4uptr) return $::quote { public_schema_failure; };
-        for (uptr at = 0uptr; at < 4uptr; ++at)
-            if (!$::meta::is_kind($::meta::child(arguments, at), "token"))
-                return $::quote { public_schema_failure; };
+        $::meta::syntax type = generic_value_type(body);
+        if (!$::meta::is_production(type, "type_name") ||
+            $::meta::child_count(type) != 1uptr) return $::quote { public_schema_failure; };
         return $::meta::tokens(body);
     }
     syntax ParsedGeneric : item { prefix "parsed_generic"; match body:function_def; expand parsed_generic; }
     [[syntax_expander]] static $::meta::tokens drop_generic(in $::meta::syntax_match input) {
-        $::meta::syntax attributes = $::meta::child($::syntax::node(input, "body"), 0uptr);
-        $::meta::syntax attribute = $::meta::child(attributes, 1uptr);
-        $::meta::syntax arguments = $::meta::child(attribute, 2uptr);
-        if (!$::meta::is_production(arguments, "balanced_token_sequence") ||
-            $::meta::child_count(arguments) != 5uptr) return $::quote { public_schema_failure; };
-        $::meta::syntax group = $::meta::child(arguments, 3uptr);
-        if (!$::meta::is_production(group, "balanced_token_tree") ||
-            $::meta::child_count(group) != 3uptr) return $::quote { public_schema_failure; };
-        $::meta::syntax contents = $::meta::child(group, 1uptr);
-        if (!$::meta::is_production(contents, "balanced_tokens") ||
-            $::meta::child_count(contents) != 2uptr) return $::quote { public_schema_failure; };
+        $::meta::syntax type = generic_value_type($::syntax::node(input, "body"));
+        if (!$::meta::is_production(type, "type_name") ||
+            $::meta::child_count(type) != 2uptr) return $::quote { public_schema_failure; };
         return $::quote {};
     }
     syntax DropGeneric : item { prefix "drop_generic"; match body:function_def; expand drop_generic; }
@@ -502,22 +505,22 @@ parsed_decl union InlineUnion { u32 value; u16 halves[2]; } inline_union = { .va
 parsed_decl struct OuterInline { struct InnerInline { u16 value; } inner; } outer_inline = { { 9u16 } };
 parsed_decl struct ParsedMembers { u32 *pointer, scalar; };
 parsed_array global u32 parsed_array[3] = { [0] = 5u32, [2] = 7u32 };
-parsed_generic [[generic(T, u32 count), noinline]] static T parsed_generic(in T value) {
+parsed_generic [[noinline]] static T parsed_generic<T, u32 count>(in T value) {
     return value + count;
 }
-drop_generic [[generic(T, u32 (*callback)(in u32 value))]] static T discarded_generic(in T value) {
+drop_generic static T discarded_generic<T, u32 (*)(in u32 value) callback>(in T value) {
     return value;
 }
 namespace ReorderedGeneric {
     typedef u8 T;
-    parsed_definition static T [[noinline, generic(T)]] interleaved(in T value) {
+    parsed_definition static T [[noinline]] interleaved<T>(in T value) {
         return value + 1u32;
     }
-    parsed_prototype static T trailing(in T value) [[generic(T), noinline]];
-    parsed_definition static T trailing(in T value) [[generic(T), noinline]] {
+    parsed_prototype static T trailing<T>(in T value) [[noinline]];
+    parsed_definition static T trailing<T>(in T value) [[noinline]] {
         return value + 2u32;
     }
-    parsed_header static T recursive(in T value, in u32 depth) [[noinline, generic(T)]] {
+    parsed_header static T recursive<T>(in T value, in u32 depth) [[noinline]] {
         if (depth == 0u32) return value;
         return recursive<T>(value + 1u32, depth - 1u32);
     }
@@ -623,7 +626,7 @@ namespace frozen {
     if (raw_record (5u32 + 6u32) != 11u32) return 0u32;
     return raw_project (3u32 + 4u32) * 2u32;
 }
-[[generic(u32 number), noinline]] static u32 actual() { return number; }
+[[noinline]] static u32 actual<u32 number>() { return number; }
 [[noinline]] static u32 angle_boundary() {
     syntax flow::Greater;
     return actual<greater ()>();

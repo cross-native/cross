@@ -414,11 +414,11 @@ static u32 lists() {
 }
 $::static_assert(lists() == 5u32, \"token list fragments did not compose\");")
     accept_splice(token_macro_header_attribute_${mode} "${parameter_prefix}
-static T identity(in T value) parameters!([[generic(T)]]) { return value; }
+static T identity<T>(in T value) parameters!([[noinline]]) { return value; }
 global u32 entry() { return identity(5u32); }")
     accept_splice(token_macro_nested_header_attribute_${mode} "${parameter_prefix}
-static T first(in T value) [[parameters!(generic(T))]] { return value; }
-static T second(in T value) [[generic(parameters!(T))]] { return value; }
+static T first<T>(in T value) [[parameters!(noinline)]] { return value; }
+static T second<parameters!(T)>(in T value) [[parameters!(noinline)]] { return value; }
 static T third<parameters!(T)>(in T value) { return value; }
 static U fourth<parameters!(T, U)>(in T a, in U b) { return b; }
 global u32 entry() { return first(second(third(fourth(1u16, 5u32)))); }")
@@ -444,8 +444,9 @@ $::static_assert(composed() == 7u32 && header_type() == 3u32, \"assembled invoca
 [[macro]] static $::meta::tokens make(in $::meta::tokens input) {
     $::meta::tokens type = $::meta::gensym(\"Type\");
     return $::quote {
-        static $::unquote(type) $::unquote(input)(in $::unquote(type) value)
-            [[generic($::unquote(type))]] { return value; }
+        static $::unquote(type) $::unquote(input)<$::unquote(type)>(in $::unquote(type) value) {
+            return value;
+        }
     };
 }
 make!(identity)
@@ -478,7 +479,7 @@ foreach(mode macro_only syntax_enabled)
         if(position STREQUAL result)
             string(APPEND source "static bad!(unknown!{ discarded }) broken() { return 0u32; }\n")
         elseif(position STREQUAL attribute)
-            string(APPEND source "static u32 broken() [[generic(bad!(unknown!{ discarded }))]] { return 0u32; }\n")
+            string(APPEND source "static u32 broken() [[section(bad!(unknown!{ discarded }))]] { return 0u32; }\n")
         elseif(position STREQUAL angle)
             string(APPEND source "static u32 broken<bad!(unknown!{ discarded })>() { return 0u32; }\n")
         else()
@@ -508,8 +509,8 @@ accept_splice(header_attribute_owner_first "${parameter_list_macros}
 }
 syntax Alignment : expression { prefix \"alignment\"; match body:paren; expand alignment; }
 syntax Alignment;
-static T identity(in T value)
-    [[aligned(alignment(unknown!{ discarded input })), parameters!(generic(T))]] { return value; }
+static T identity<parameters!(T)>(in T value)
+    [[aligned(alignment(unknown!{ discarded input }))]] { return value; }
 global u32 entry() { return identity(7u32); }")
 
 set(raw_header_prefix [=[
@@ -592,7 +593,7 @@ accept_splice(function_header_generic_attribute "${attribute_expander}
 decorate [[noinline, aligned(sizeof(T))]]; static T composed<T>(in T value) { return value; }
 global u32 entry() { return composed(4u32); }")
 accept_splice(function_header_value_generic_attribute "${attribute_expander}
-decorate [[generic(u32 N), aligned(N)]]; static u32 composed(in u32 value) { return value; }
+decorate [[noinline, aligned(N)]]; static u32 composed<u32 N>(in u32 value) { return value; }
 global u32 entry() { return composed<16u32>(4u32); }")
 reject_splice(function_header_unknown_attribute "unknown attribute" "${attribute_expander}
 decorate [[not_a_cross_attribute]]; static u32 composed() { return 1u32; }" note)

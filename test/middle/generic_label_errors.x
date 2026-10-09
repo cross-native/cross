@@ -6,8 +6,7 @@ void local_label_owner() {
     ;
 }
 
-[[generic(label L)]]
-static label label_identity_error() {
+static label label_identity_error<label L>() {
     return L;
 }
 

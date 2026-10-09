@@ -85,7 +85,7 @@ syntax NamespaceValueContext : expression {
 }
 syntax NamespaceValueContext;
 
-[[generic(label Address), noinline]] static label fragment_label_identity() { return Address; }
+[[noinline]] static label fragment_label_identity<label Address>() { return Address; }
 
 namespace FragmentLibrary {
     static u32 free_value = 13u32;

@@ -29,7 +29,7 @@ struct LabelMemberBox { label point; };
     return sizeof(point) + $::alignof((point));
     point: ;
 }
-[[generic(T), eval_only]] static uptr instance_label_layout() {
+[[eval_only]] static uptr instance_label_layout<T>() {
     return sizeof(point) + $::alignof(point) + sizeof(T);
     point: ;
 }
@@ -124,24 +124,24 @@ $::static_assert(choose_label((bool)1u32, generic_private_label_owner::first,
     generic_private_label_owner::second) == generic_private_label_owner::first,
     "a selected symbolic label keeps its source identity");
 
-[[generic(label L), noinline]]
+[[noinline]]
 #ifdef TEST_MIPS
-static label label_identity() {
+static label label_identity<label L>() {
 #else
-static label label_identity() -> "r8" {
+static label label_identity<label L>() -> "r8" {
 #endif
     return L;
 }
 
-[[generic(label First, label Second), noinline]] static label label_forward() {
+[[noinline]] static label label_forward<label First, label Second>() {
     return label_identity::<choose_label((bool)0u32, First, Second)>();
 }
-[[generic(T), noinline]] static T deduced_label(in T value) { return value; }
-[[generic(label Address), noinline]] static label deduced_label_forward() {
+[[noinline]] static T deduced_label<T>(in T value) { return value; }
+[[noinline]] static label deduced_label_forward<label Address>() {
     return deduced_label(Address);
 }
 
-[[generic(T), noinline]] static label instance_owned_label() {
+[[noinline]] static label instance_owned_label<T>() {
     static label direct = point;
     static label forwarded = label_identity::<point>();
     static struct LabelBox values = {{point, label_identity::<point>()}, sizeof(T)};
@@ -150,7 +150,7 @@ static label label_identity() -> "r8" {
         ? values.values[1] : (label)0uptr;
     point: ;
 }
-[[generic(T), noinline]] static label constant_instance_label() {
+[[noinline]] static label constant_instance_label<T>() {
     return point;
     point: ;
 }

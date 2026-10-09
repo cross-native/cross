@@ -8,11 +8,11 @@ global const struct immutable_record immutable_object = { 3u32, { 5u32, 7u32 } }
 global u32 *cell;
 [[thread_local]] global u32 tls = 9u32;
 
-[[generic(u32 *P)]] static u32 *identity() { return P; }
-[[generic(const u32 **P)]] static const u32 **nested() { return P; }
+static u32 *identity<u32 *P>() { return P; }
+static const u32 **nested<const u32 **P>() { return P; }
 [[eval_only]] static u32 only_eval(in u32 x) { return x; }
 typedef u32 (*Callback)(in u32 x);
-[[generic(Callback F)]] static u32 call(in u32 x) { return F(x); }
+static u32 call<Callback F>(in u32 x) { return F(x); }
 
 [[runtime_only]] static u32 *runtime_address() { return values; }
 static u32 *read_static() { return values + values[0]; }

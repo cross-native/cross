@@ -11,8 +11,8 @@ global i32 model_entry() {
 
 global i32 model_data = 19;
 
-[[generic(T), runtime_only]]
-global T model_identity(in T value) {
+[[runtime_only]]
+global T model_identity<T>(in T value) {
     return value;
 }
 
@@ -20,8 +20,8 @@ global i32 model_generic_entry() {
     return model_identity::<i32>(23);
 }
 
-[[generic(uptr N), runtime_only]]
-global uptr model_count() {
+[[runtime_only]]
+global uptr model_count<uptr N>() {
     return N;
 }
 

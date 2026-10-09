@@ -121,7 +121,7 @@ int main() {
                 [[noinline, abi("factory_abi"), clobber("factory-resource"),
                   stack_cleanup("callee")]])(in u32 argument) -> "callback.result"
                 [[abi("callback_abi"), clobber("callback-resource"), stack_cleanup("caller")]];
-            static T (*generic(in T value) [[generic(T), noinline]])(in T argument);
+            static T (*generic<T>(in T value) [[noinline]])(in T argument);
             static T (*plain(in T value))(in T argument);
         )");
         Parser parser(Lexer(*source, diagnostics).lex(), diagnostics);
@@ -302,9 +302,9 @@ int main() {
         namespace T { typedef u16 Word; }
         namespace Aliased {
         typedef u8 T;
-        static T [[generic(T), noinline]] interleaved(in T value) { return value; }
-        static T trailing(in T value) [[generic(T), noinline]] { return value; }
-        [[generic(T *pointer, T)]] static T forward(in T value) { return value; }
+        static T [[noinline]] interleaved<T>(in T value) { return value; }
+        static T trailing<T>(in T value) [[noinline]] { return value; }
+        static T forward<T *pointer, T>(in T value) { return value; }
         static T angle<T>(in T value) { return value; }
         T after;
         }

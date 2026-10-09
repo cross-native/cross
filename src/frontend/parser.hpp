@@ -333,6 +333,7 @@ private:
     BuiltinType enum_underlying(const std::vector<Attribute>& attributes,
         std::shared_ptr<const CapturedTypeErrors>& errors);
     void type_error(TypePtr& type, SourceLocation location, std::string message);
+    void reject_keyword_name(const Token& token);
     EvaluationTask<void> validate_captured_type_async(TypePtr type);
     void parse_enumerators(EnumDecl& declaration, const std::string& name_space);
     EvaluationTask<void> parse_enumerators_async(EnumDecl& declaration, std::string name_space);
@@ -406,8 +407,6 @@ private:
     ExpressionTask parse_primary_async();
     ExpressionTask parse_quote_async();
     ExpressionTask parse_expression_replacement_async();
-    std::vector<FunctionDecl::GenericParameter> generic_parameters(
-        const std::vector<Attribute>& attributes);
     static int precedence(std::string_view operation);
 
     struct ProductionEvent {

@@ -63,7 +63,7 @@ syntax PatchProject;
 [[noinline]] static u32 projected_patch() {
     return patch_project($::patch(9u32));
 }
-[[generic(T), noinline]] static u32 generic_patch() {
+[[noinline]] static u32 generic_patch<T>() {
     return patch_twice!($::patch((u32)sizeof(T)));
 }
 [[noinline]] static u32 fresh_patches() { return patch_fresh!() + patch_fresh!(); }

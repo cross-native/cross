@@ -57,9 +57,9 @@ typedef volatile struct Packet (*MemoryCallback)(in u32) [[abi("memory_result_ab
     struct Packet result = { (u64)value, 43u64 };
     return result;
 }
-[[noinline]] static u32 custom_callbacks(in StackCallback stack, in MemoryCallback memory) {
+[[noinline]] static u32 custom_callbacks(in StackCallback stacked, in MemoryCallback memory) {
     struct Packet result = memory(41u32);
-    return stack(39u32) == 40uptr && result.first == 41u64 && result.second == 43u64;
+    return stacked(39u32) == 40uptr && result.first == 41u64 && result.second == 43u64;
 }
 #endif
 

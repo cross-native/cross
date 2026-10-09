@@ -29,3 +29,13 @@ global u32 gimple_may_alias_member(in f32 *slot, in any_pair *view) {
     view->first = 7u32;
     return *slot == 1.0f32;
 }
+
+// So is a member of a record defined may_alias.
+struct TaggedPair [[may_alias]] { u32 first; u32 second; };
+
+[[abi("ms_abi"), link_name("gimple_may_alias_tag"), noinline]]
+global u32 gimple_may_alias_tag(in f32 *slot, in struct TaggedPair *view) {
+    *slot = 1.0f32;
+    view->first = 7u32;
+    return *slot == 1.0f32;
+}

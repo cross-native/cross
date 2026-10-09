@@ -530,18 +530,19 @@ int main() {
                 "unsettled deferred input was silently structured-spliced");
     }
     for (const bool inherited : {false, true}) {
-        const auto* header_source = sources.add("generic-attribute.x",
-            "[[generic(u32 N), aligned(N)]] static u32 f() { return 0u32; }");
+        const auto* header_source = sources.add("generic-value-attribute.x",
+            "[[aligned(N)]] static u32 f<u32 N>() { return 0u32; }");
         auto header = Lexer(*header_source, diagnostics).lex();
-        unsigned names{};
         for (auto& item : header)
-            if (item.text == "N" && ++names == 2 && inherited)
+            if (item.text == "N" && inherited) {
                 item.value_binding.kind = ValueBinding::Kind::Nonlocal;
+                break;
+            }
         Parser header_parser(std::move(header), diagnostics);
         auto parsed = header_parser.parse();
-        require(parsed.functions.size() == 1 && parsed.functions.front()->attributes.size() == 2,
-                "generic attribute binding fixture failed to parse");
-        const auto& value = parsed.functions.front()->attributes[1].expression_argument;
+        require(parsed.functions.size() == 1 && parsed.functions.front()->attributes.size() == 1,
+                "generic value attribute fixture failed to parse");
+        const auto& value = parsed.functions.front()->attributes[0].expression_argument;
         require(value && value->name_context &&
                 value->name_context->value_binding.kind ==
                     (inherited ? ValueBinding::Kind::Nonlocal : ValueBinding::Kind::Local),
@@ -866,8 +867,8 @@ int main() {
     child(header, 2, P::AttributeSpecifier, 3);
     for (const auto kind : {K::FunctionHeader, K::FunctionDefinition}) {
         auto inline_header = production(parse(
-            "static struct InlineResult { u32 value; } fn(in T value) "
-            "[[generic(T)]] { struct InlineResult result = { (u32)value }; return result; }", kind),
+            "static struct InlineResult { u32 value; } fn<T>(in T value) "
+            "[[noinline]] { struct InlineResult result = { (u32)value }; return result; }", kind),
             kind == K::FunctionHeader ? P::FunctionHeader : P::FunctionDefinition,
             kind == K::FunctionHeader ? 3 : 4);
         auto record = production(descendant(inline_header, P::StructOrUnionSpecifier),
@@ -967,8 +968,8 @@ int main() {
             syntax Keep;
             syntax Project;
         )cross") + projection + R"cross( global T first<params!(T)>(in T value),
-                second(in u8 data[1uptr][capture(sizeof(T))]) [[generic(params!(T))]],
-                third(in u8 data[1uptr][capture(sizeof(T))]) [[generic(params!(T))]];
+                second<params!(T)>(in u8 data[1uptr][capture(sizeof(T))]),
+                third<params!(T)>(in u8 data[1uptr][capture(sizeof(T))]);
         )cross");
         Parser parser(Lexer(*source, diagnostics).lex(), diagnostics, sibling_execution, bits);
         const auto program = parser.parse();
@@ -1057,20 +1058,20 @@ int main() {
     child(type, 1, P::AbstractDeclarator, 1);
     token(generic_parameter->children[1], "P");
 
-    definition = production(parse("static T [[generic(T), noinline]] "
-                                  "identity(in T value) { return value; }",
+    definition = production(parse("static T [[noinline, cold]] "
+                                  "identity<T>(in T value) { return value; }",
                                   K::FunctionDefinition), P::FunctionDefinition, 3);
     specifiers = child(definition, 0, P::DeclarationSpecifiers, 3);
     auto interleaved = child(specifiers, 2, P::DeclarationSpecifier, 1);
     child(interleaved, 0, P::AttributeSpecifier, 5);
-    definition = production(parse("static T identity(in T value) "
-                                  "[[noinline, generic(T, T *pointer)]] { return value; }",
+    definition = production(parse("static T identity<T, T *pointer>(in T value) "
+                                  "[[noinline, cold]] { return value; }",
                                   K::FunctionDefinition), P::FunctionDefinition, 4);
     child(definition, 2, P::AttributeSpecifier, 5);
-    header = production(parse("static T identity(in T value) [[generic(T)]]",
+    header = production(parse("static T identity<T>(in T value) [[noinline]]",
                               K::FunctionHeader), P::FunctionHeader, 3);
     child(header, 2, P::AttributeSpecifier, 3);
-    declaration = production(parse("static T identity(in T value) [[generic(T)]];",
+    declaration = production(parse("static T identity<T>(in T value) [[noinline]];",
                                    K::FunctionDeclaration), P::Declaration, 3);
     item = child(child(declaration, 1, P::InitDeclaratorList, 1),
                  0, P::InitDeclarator, 2);
@@ -1153,9 +1154,9 @@ int main() {
         require(diagnostics.errors() == 0, "opaque-led statement recognition executed nested code");
     }
     for (const auto text : {
-             "static T prototype(in T value) [[generic(unknown!(T))]];",
+             "static T prototype<unknown!(T)>(in T value);",
              "static T ((prototype<unknown!(T)>))(in T value);",
-             "static T (*prototype(in T value))(unknown!()) [[generic(unknown!(T))]];"}) {
+             "static T (*prototype<unknown!(T)>(in T value))(unknown!());"}) {
         const auto* source = sources.add("prototype-schema.x", std::string(text) + " global u32 sentinel;");
         const auto input = Lexer(*source, diagnostics).lex();
         const auto end = static_cast<std::size_t>(std::find_if(input.begin(), input.end(),
@@ -1544,7 +1545,7 @@ int main() {
         require(factory_attribute_tokens.size() == 8 && factory_attribute_tokens[1].text == "noinline" &&
                 factory_attribute_tokens[5].text == "\"factory\"",
                 "grouped callable attributes did not stay under their written suffix");
-        production(complete("static T (*factory(in T value) [[generic(T)]])(in T argument)",
+        production(complete("static T (*factory<T>(in T value) [[noinline]])(in T argument)",
                             "function_header"), P::FunctionHeader, 2);
         production(complete("static Word fn(in Word value) -> \"memory.result\";", "function_decl"),
                    P::Declaration, 3);

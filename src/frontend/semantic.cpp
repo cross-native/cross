@@ -40,7 +40,7 @@ std::span<const std::string_view> core_attribute_names() {
     static constexpr std::string_view names[] = {
         "abi", "address_space", "alias", "aligned", "always_inline",
         "atomic", "clobber", "cold", "eval_only", "ext_vector_type",
-        "generic", "hot", "interrupt", "link_name", "macro", "may_alias",
+        "hot", "interrupt", "link_name", "macro", "may_alias",
         "musttail", "naked", "no_sanitize", "no_stack_protector", "noinit",
         "noinline", "noreturn", "operator", "packed", "raw_inline",
         "retain", "returns_twice", "runtime_only", "scalable_vector",
@@ -166,6 +166,22 @@ std::optional<std::string> function_attribute_error(const Attribute& attribute) 
     return {};
 }
 
+// These contracts need an emitted function, physical call boundary or machine
+// entry/exit. Expansion functions and meta helpers have none, on any model.
+bool runtime_contract_attribute(std::string_view name) {
+    static constexpr std::string_view names[] = {
+        "abi", "alias", "aligned", "clobber", "interrupt", "link_name",
+        "naked", "raw_inline", "retain", "returns_twice", "section",
+        "stack_cleanup", "used", "variadic", "visibility", "weak", "weakref",
+    };
+    return std::find(std::begin(names), std::end(names), name) != std::end(names);
+}
+
+std::string runtime_contract_error(const Attribute& attribute, std::string_view subject) {
+    return "attribute '" + attribute.name + "' requires runtime symbol, ABI transport or "
+        "entry/exit machinery; it is not valid on " + std::string(subject);
+}
+
 std::optional<std::string> function_attribute_conflict(const FunctionDecl& function) {
     // These are source contracts, not lowering constraints. Check them before
     // evaluation or generic-template erasure, including the implicit eval-only
@@ -230,6 +246,11 @@ bool validate_attribute_names(const Program& program,
         validate(function->attributes, Subject::Function);
         if (const auto error = function_attribute_conflict(*function))
             diagnostics.error(function->location, *error);
+        if (function->has_meta_signature())
+            for (const auto& attribute : function->attributes)
+                if (runtime_contract_attribute(attribute.name))
+                    diagnostics.error(attribute.location,
+                        runtime_contract_error(attribute, "a translation-only helper"));
         const auto visit_statement = [&](const auto& self,
                                          const Statement& statement) -> void {
             validate(statement.attributes);
@@ -2260,16 +2281,14 @@ std::unique_ptr<FunctionDecl> instantiate(
              clone_type(parameter.declared_array_type, types, values), parameter.binding});
     }
     for (const auto& attribute : source.attributes) {
-        if (attribute.name != "generic") {
-            auto copy = attribute;
-            for (auto& binding : copy.variadic_bindings)
-                binding.type = clone_type(binding.type, types, values);
-            if (attribute.expression_argument) {
-                copy.expression_argument = std::shared_ptr<Expr>(
-                    clone_expr(*attribute.expression_argument, types, values));
-            }
-            result->attributes.push_back(std::move(copy));
+        auto copy = attribute;
+        for (auto& binding : copy.variadic_bindings)
+            binding.type = clone_type(binding.type, types, values);
+        if (attribute.expression_argument) {
+            copy.expression_argument = std::shared_ptr<Expr>(
+                clone_expr(*attribute.expression_argument, types, values));
         }
+        result->attributes.push_back(std::move(copy));
     }
     // Concrete instances have a new entity name and templates disappear before
     // evaluation/lowering. Keep a no-return contract supplied by a redeclaration
@@ -11350,10 +11369,18 @@ private:
             {MetaProjectionQuery::Kind::Subobject, requested, length, qualified_pointer_read, 0}));
     }
 
+    // A record defined [[may_alias]] qualifies each use like a may_alias typedef.
+    bool may_alias(const TypePtr& type) const {
+        if (type->may_alias) return true;
+        if (type->kind != Type::Kind::Record) return false;
+        const auto definition = program_.record_definition(type->nominal_key());
+        return definition && definition->attribute("may_alias");
+    }
+
     EvaluationTask<bool> meta_record_effective_access_async(const EvalValue& base,
                                       SourceLocation location, bool write = false) {
         if (!base.meta_pointer || !base.meta_pointer->mutable_buffer ||
-            base.meta_pointer->union_member_view || base.type->pointee->may_alias) co_return true;
+            base.meta_pointer->union_member_view || may_alias(base.type->pointee)) co_return true;
         const auto index = (co_await meta_access_index_async(base, location, write));
         const auto size = (co_await meta_object_size_async(base.type->pointee));
         if (!index || !size) co_return false;
@@ -11638,7 +11665,7 @@ private:
                     frame.alignment = (co_await meta_object_alignment_async(type->element));
                     if (!frame.stride || !frame.alignment) co_return false;
                     if (type->kind == Type::Kind::Vector && frame.base.meta_pointer->mutable_buffer &&
-                        !frame.base.meta_pointer->union_member_view && !type->may_alias) {
+                        !frame.base.meta_pointer->union_member_view && !may_alias(type)) {
                         const auto& tags = frame.base.meta_pointer->mutable_buffer->effective_type;
                         for (std::size_t byte = 0; byte < *frame.size; ++byte) {
                             const auto tag = tags[*frame.index + byte];
@@ -11707,7 +11734,7 @@ private:
             }
             EvalValue value = frame.base;
             value.type = pointer_type(clone_type(child));
-            value.type->pointee->may_alias = value.type->pointee->may_alias || type->may_alias;
+            value.type->pointee->may_alias = value.type->pointee->may_alias || may_alias(type);
             auto& pointer = *value.meta_pointer;
             pointer.view_offset = *frame.index + offset;
             pointer.view_length = size;
@@ -11897,7 +11924,7 @@ private:
         type->is_const = type->is_const || base->type->pointee->is_const;
         type->is_volatile = type->is_volatile ||
             base->type->pointee->is_volatile;
-        type->may_alias = type->may_alias || base->type->pointee->may_alias;
+        type->may_alias = type->may_alias || may_alias(base->type->pointee);
         auto pointer_type_value = pointer_type(type);
         pointer_type_value->address_space = base->type->address_space;
         base->type = std::move(pointer_type_value);
@@ -12123,7 +12150,7 @@ private:
                         co_return std::nullopt;
                     }
                     const auto tag = pointer.mutable_buffer->effective_type[*index + byte];
-                    if (!pointer.union_member_view && !base.type->pointee->may_alias &&
+                    if (!pointer.union_member_view && !may_alias(base.type->pointee) &&
                         tag != 0 && tag != 0xffU) {
                         fail(location, "meta pointer read violates effective type");
                         co_return std::nullopt;
@@ -12260,7 +12287,7 @@ private:
                 }
                 const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
                 bool typed = required != 0 && !pointer.union_member_view &&
-                    !base.type->pointee->may_alias;
+                    !may_alias(base.type->pointee);
                 if (typed && pointer.bit_field) typed = !(co_await meta_bit_field_record_view_async(pointer));
                 if (typed && !byte_meta_type(access_type) && tag != 0 &&
                     !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
@@ -12635,7 +12662,7 @@ private:
             if (!source) co_return std::nullopt;
             for (std::size_t byte = 0; byte < extent; ++byte) {
                 const auto tag = target.mutable_buffer->effective_type[*offset + byte];
-                if (!target.union_member_view && !pointer->type->pointee->may_alias &&
+                if (!target.union_member_view && !may_alias(pointer->type->pointee) &&
                     tag != 0 && tag != 0xffU) {
                     fail(location, "meta pointer write violates effective type");
                     co_return std::nullopt;
@@ -12680,7 +12707,7 @@ private:
                              location));
             if (!source || !source->object) co_return std::nullopt;
             const auto size = *(co_await meta_object_size_async(pointer->type->pointee));
-            const bool untyped = pointer->type->pointee->may_alias;
+            const bool untyped = may_alias(pointer->type->pointee);
             for (std::size_t byte = 0; byte < size; ++byte) {
                 const auto incoming = source->object->effective_type[byte];
                 const auto previous = target.mutable_buffer->effective_type[*offset + byte];
@@ -12719,7 +12746,7 @@ private:
         const auto access_type = pointer->type->pointee->builtin;
         // Like a byte access, a may_alias access neither checks nor
         // establishes an effective type.
-        const bool untyped = byte_meta_type(access_type) || pointer->type->pointee->may_alias;
+        const bool untyped = byte_meta_type(access_type) || may_alias(pointer->type->pointee);
         if (!untyped && !target.bit_field &&
             !(co_await meta_record_effective_access_async(*pointer, location, true))) co_return std::nullopt;
         if (!untyped && !target.union_member_view &&
@@ -14594,6 +14621,7 @@ bool contains_relocation_candidate(const Expr& expression,
         }
         if (node->kind == Expr::Kind::Unary && node->text == "&") return true;
         if (node->kind == Expr::Kind::Name) {
+            if (node->name_context && node->name_context->label_address) return true;
             const auto selected = value_namespace(program, nullptr, *node, source_namespace);
             if (selected && std::any_of(program.objects.begin(), program.objects.end(),
                     [&](const auto& object) {
@@ -15504,6 +15532,36 @@ TypePtr initializer_child_type(const Program& program, const TypePtr& parent,
     return {};
 }
 
+// An explicit uptr conversion of a function label is a code-address
+// relocation, like `(uptr)&function`. Resolve the label while its lexical
+// owner is known; every other label use, and an unavailable label address,
+// keeps its evaluated meaning and diagnostics.
+void bind_label_conversions(std::unique_ptr<Expr>& root, const FunctionDecl* owner,
+                            Program& program) {
+    std::vector<Expr*> pending{root.get()};
+    while (!pending.empty()) {
+        auto* node = pending.back();
+        pending.pop_back();
+        if (!node || node->kind == Expr::Kind::Sizeof || node->kind == Expr::Kind::Alignof) continue;
+        if (node->kind == Expr::Kind::Cast && node->left && node->type &&
+            node->type->kind == Type::Kind::Builtin && node->type->builtin == BuiltinType::Uptr) {
+            auto* operand = &node->left;
+            while ((*operand)->kind == Expr::Kind::Parenthesized && (*operand)->left)
+                operand = &(*operand)->left;
+            if ((*operand)->kind == Expr::Kind::Name)
+                if (auto address = resolve_label_constant(**operand, owner, program);
+                    address && !label_address_error(*address)) {
+                    *operand = label_constant_expression(std::move(address), (*operand)->location);
+                    continue;
+                }
+        }
+        for (auto& argument : node->arguments) pending.push_back(argument.get());
+        pending.push_back(node->third.get());
+        pending.push_back(node->right.get());
+        pending.push_back(node->left.get());
+    }
+}
+
 EvaluationTask<void> fold_static_initializer_async(Expr& initializer, TypePtr type,
                              Program& program, Diagnostics& diagnostics,
                              const LayoutQuery* size_of = nullptr,
@@ -15572,6 +15630,7 @@ EvaluationTask<void> fold_static_initializer_async(Expr& initializer, TypePtr ty
             (void)(co_await fold_pointer_integer_initializer_async(entry.value, program, diagnostics,
                 caller, source_namespace, size_of, align_of));
         } else if (is_integer(destination)) {
+            bind_label_conversions(entry.value, caller, program);
             if (contains_relocation_candidate(*entry.value, program,
                                               source_namespace)) continue;
             const bool target_dependent =
@@ -15921,6 +15980,8 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
                 continue;
             }
             bool folded_pointer{};
+            if (is_integer(object->type))
+                bind_label_conversions(object->initializer, owner, program);
             if (object->type && object->type->kind == Type::Kind::Pointer)
                 folded_pointer = co_await fold_pointer_integer_initializer_async(object->initializer,
                     program, diagnostics, owner, source_namespace);
@@ -16930,18 +16991,9 @@ bool validate_expansion_function_declaration(const FunctionDecl& function,
             attribute.name == "hot" || attribute.name == "cold" ||
             attribute.name == "no_stack_protector" || attribute.name == "no_sanitize" ||
             attribute.name == "noreturn") continue;
-        // These contracts need an emitted function, physical call boundary or
-        // machine entry/exit. Expansion functions have none, on any model.
-        static constexpr std::string_view runtime_contracts[] = {
-            "abi", "alias", "aligned", "clobber", "interrupt", "link_name",
-            "naked", "raw_inline", "retain", "returns_twice", "section",
-            "stack_cleanup", "used", "variadic", "visibility", "weak", "weakref",
-        };
-        if (std::find(std::begin(runtime_contracts), std::end(runtime_contracts), attribute.name) !=
-            std::end(runtime_contracts))
+        if (runtime_contract_attribute(attribute.name))
             diagnostics.error(attribute.location,
-                "attribute '" + attribute.name + "' requires runtime symbol, ABI transport or entry/exit machinery; "
-                "it is not valid on an expansion function");
+                runtime_contract_error(attribute, "an expansion function"));
         else diagnostics.error(attribute.location,
             "attribute '" + attribute.name + "' is not valid on an expansion function");
     }

@@ -56,6 +56,10 @@ foreach(name abi aligned macro naked operator section)
         message(FATAL_ERROR "attribute registry is missing '${name}'\n${attributes}")
     endif()
 endforeach()
+# Generic parameters are spelled only as an angle list after the name.
+if(attributes MATCHES "(^|\n)generic(\r?\n|$)")
+    message(FATAL_ERROR "'generic' must not be an attribute\n${attributes}")
+endif()
 
 capture("--print-features" features)
 foreach(feature evaluation automatic_evaluation generics procedural_macros fixed_vectors atomics variadics

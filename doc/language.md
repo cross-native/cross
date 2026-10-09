@@ -27,8 +27,9 @@ register restrict return sizeof stack static struct switch syntax typedef u8
 u16 u32 u64 union u128 uptr using void volatile while
 ```
 
-`int`, `char`, `long`, `float`, `double`, `extern`, `auto`, `true`, and
-`false` are ordinary identifiers.
+A keyword cannot name anything a program declares. `int`, `char`, `long`,
+`float`, `double`, `extern`, `auto`, `true`, and `false` are ordinary
+identifiers.
 
 | Literal | Type |
 | --- | --- |
@@ -101,7 +102,9 @@ $::static_assert(sizeof(struct counters) == 128uptr, "one line per counter");
 
 `[[may_alias]]` exempts a type from the effective-type aliasing rules, which
 otherwise follow C (any object may be accessed through `u8` or `i8`). Write it
-after a typedef's name or as a qualifier, as in `u32 [[may_alias]] *`.
+after a typedef's name, after a record's tag in its definition
+(`struct bits [[may_alias]] { ... }`), or as a qualifier, as in
+`u32 [[may_alias]] *`.
 Converting between unrelated pointer types still goes through `void *`:
 
 ```x
@@ -398,7 +401,8 @@ odd:
 ```
 
 Computed jumps must stay within one function. `global label name:` exports a
-label for use as a symbol.
+label for use as a symbol. `(uptr)function::name` is the label's address, also
+in a static initializer.
 
 ## ABIs and interoperability
 
@@ -421,6 +425,8 @@ global i32 add(i32 a, i32 b) {   // int add(int, int) in C
 
 Under a platform ABI, `in` parameters are passed by value and `out` and
 `inout` parameters as pointers. `cc --print-abis` lists the ABIs of a target.
+All declarations of a function select the same ABI; an alias such as `linux`
+for `sysv_abi` names the same one.
 
 Parameters and results can also be pinned to registers, which is useful for
 assembly interfaces (x86-64):

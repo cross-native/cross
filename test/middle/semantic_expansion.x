@@ -28,13 +28,11 @@ static u64 hash40(in const u8 *text) {
     return value;
 }
 
-[[generic(T)]]
-static T choose(in bool first, in T left, in T right) {
+static T choose<T>(in bool first, in T left, in T right) {
     return first ? left : right;
 }
 
-[[generic(T, uptr N)]]
-static T add_count(in T value) {
+static T add_count<T, uptr N>(in T value) {
     return value + N;
 }
 

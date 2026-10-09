@@ -342,6 +342,34 @@ if(BUILD_TESTING)
         set_tests_properties(cross_runtime_may_alias_${level} PROPERTIES
             LABELS "frontend;backend.native;arch.x86_64;check.runtime;feature.attributes;feature.evaluation;opt.${level}")
     endforeach()
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_label_relocations_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/label_relocations.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/label-relocations-${level}
+                         -DENTRY=label_relocation_entry
+                         -DEXPECTED=1
+                         "-DCC_FLAGS=-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_label_relocations_${level} PROPERTIES
+            LABELS "backend.native;arch.x86_64;check.runtime;feature.labels;feature.relocation;feature.initializer;opt.${level}")
+        add_test(NAME cross_runtime_abi_alias_redeclaration_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/abi_alias_redeclaration.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/abi-alias-redeclaration-${level}
+                         -DENTRY=abi_alias_entry
+                         -DEXPECTED=1
+                         "-DCC_FLAGS=-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_abi_alias_redeclaration_${level} PROPERTIES
+            LABELS "backend.native;arch.x86_64;check.runtime;feature.abi;feature.linkage;opt.${level}")
+    endforeach()
     add_test(NAME cross_may_alias_checks
              COMMAND "${CMAKE_COMMAND}"
                      -DCC=$<TARGET_FILE:cross_cc>
@@ -541,23 +569,23 @@ if(BUILD_TESTING)
     set_tests_properties(cross_generic_angle_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;feature.generic")
     foreach(profile host odd)
-        set(generic_attribute_flags
+        set(generic_noalloc_flags
             "--model=${CMAKE_SOURCE_DIR}/test/model/custom.y"
             -O2 -fno-register-allocation -fno-eval-calls)
         if(profile STREQUAL odd)
-            list(APPEND generic_attribute_flags -mabi=odd_abi)
+            list(APPEND generic_noalloc_flags -mabi=odd_abi)
         endif()
-        add_test(NAME cross_runtime_generic_attribute_noalloc_${profile}
+        add_test(NAME cross_runtime_generic_noalloc_${profile}
             COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DHOST_CXX=${CMAKE_CXX_COMPILER}
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_angle_custom_abi.x
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
-                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-attribute-noalloc-${profile}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-noalloc-${profile}
                 -DENTRY=generic_angle_custom_abi_entry -DEXPECTED=1
-                "-DCC_FLAGS=${generic_attribute_flags}"
+                "-DCC_FLAGS=${generic_noalloc_flags}"
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
-        set_tests_properties(cross_runtime_generic_attribute_noalloc_${profile} PROPERTIES
+        set_tests_properties(cross_runtime_generic_noalloc_${profile} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.generic")
     endforeach()
     add_test(NAME cross_generic_actual_floats

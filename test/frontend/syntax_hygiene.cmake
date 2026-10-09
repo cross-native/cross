@@ -72,7 +72,7 @@ namespace Definition {
         return $::quote {
             namespace Inner {
                 static u32 read() { return later::<u32>(7u32); }
-                [[generic(T)]] static T later(in T value) { return value; }
+                static T later<T>(in T value) { return value; }
             }
         };
     }
@@ -158,12 +158,12 @@ endforeach()
 # binding with a same-spelled label in the destination generic function.
 foreach(level O0 O2)
     reject(copied_static_label_${level} "requires a visible label in a concrete function" [=[
-[[generic(label Address)]] static label identity() { return Address; }
+static label identity<label Address>() { return Address; }
 [[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
     $::meta::syntax source = $::syntax::node(input, "body");
     $::meta::syntax body = $::meta::child(source, $::meta::child_count(source) - 1uptr);
     return $::quote {
-        [[generic(T)]] static label destination() {
+        static label destination<T>() {
             $::unquote($::meta::tokens($::meta::child(body, 1uptr)))
             point: return (label)0uptr;
         }
@@ -281,7 +281,7 @@ move [[naked]] static void original(in label point "r9") { goto point; point: $:
 endforeach()
 
 set(qualified_copied_label [=[
-[[generic(label Address), noinline]] static label identity() { return Address; }
+[[noinline]] static label identity<label Address>() { return Address; }
 global void owner() { @TARGET_LABEL@ point: ; }
 @TARGET_DECLARATION@
 [[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
@@ -422,7 +422,7 @@ set(moved_generic_prefix [=[
 [[syntax_expander]] static $::meta::tokens move(in $::meta::syntax_match input) {
     $::meta::syntax source = $::syntax::node(input, "body");
     $::meta::syntax body = $::meta::child(source, $::meta::child_count(source) - 1uptr);
-    return $::quote { [[generic(T), noinline]] static uptr moved() $::unquote(body) };
+    return $::quote { [[noinline]] static uptr moved<T>() $::unquote(body) };
 }
 syntax Move : item { prefix "move"; match body:function_def; expand move; }
 syntax Move;
@@ -436,14 +436,14 @@ foreach(flags "-O0" "-O2;-fno-eval-calls")
         reject_splice(generic_binder_${suffix}_${body_id}
             "captured generic type parameter 'T' is not visible in this instantiation"
             "${moved_generic_prefix}
-            move [[generic(T)]] static uptr original() { ${body} }
+            move static uptr original<T>() { ${body} }
             global uptr entry() { return moved::<u8>(); }" ${flags})
         string(REPLACE "$::unquote(body)" "$::unquote($::meta::tokens(body))"
             projected_generic_prefix "${moved_generic_prefix}")
         reject(generic_projected_binder_${suffix}_${body_id}
             "captured generic type parameter 'T' is not visible in this instantiation"
             "${projected_generic_prefix}
-            move [[generic(T)]] static uptr original() { ${body} }
+            move static uptr original<T>() { ${body} }
             global uptr entry() { return moved::<u8>(); }" ${flags})
     endforeach()
 endforeach()
@@ -465,7 +465,7 @@ syntax Move : item { prefix "move"; match name:ident body:function_def; expand m
 syntax Move;
 ]=])
 string(REPLACE "global u32 moved(in u32 $::unquote($::syntax::capture(input, \"name\")))"
-    "[[generic(u32 $::unquote($::syntax::capture(input, \"name\")))]] static u32 moved()"
+    "static u32 moved<u32 $::unquote($::syntax::capture(input, \"name\"))>()"
     raw_generic_prefix "${raw_value_prefix}")
 foreach(flags "-O0" "-O2;-fno-eval-calls")
     string(REPLACE ";" "_" suffix "${flags}")
@@ -479,7 +479,7 @@ foreach(flags "-O0" "-O2;-fno-eval-calls")
         reject(raw_generic_rebound_${suffix}_${body_id}
             "captured local value 'value' is not visible"
             "${raw_generic_prefix}
-            move value [[generic(u32 value)]] static u32 original() { ${body} }
+            move value static u32 original<u32 value>() { ${body} }
             global u32 entry() { return moved::<7u32>(); }" ${flags})
     endforeach()
 endforeach()
@@ -509,7 +509,7 @@ foreach(flags "-O0" "-O2;-fno-eval-calls")
 endforeach()
 
 set(generic_label_context [=[
-[[generic(label Address), noinline]] static label identity() { return Address; }
+[[noinline]] static label identity<label Address>() { return Address; }
 namespace Definition {
     @DEFINITION@
     [[macro]] static $::meta::tokens address(in $::meta::tokens input) {
@@ -532,7 +532,7 @@ foreach(flags "-O0" "-O2;-fno-eval-calls")
     string(REPLACE "@DEFINITION@" "global void owner() { other: ; }" source "${generic_label_context}")
     reject(generic_local_label_context_${suffix}
         "generic label argument requires a visible label in a concrete function" "${source}" ${flags})
-    set(identity "[[generic(label Address), noinline]] static label identity() { return Address; }")
+    set(identity "[[noinline]] static label identity<label Address>() { return Address; }")
     reject(generic_label_runtime_parameter_${suffix} "ordinary value name cannot select a same-spelled label"
         "${identity} global label owner(in label point) { global label point: return identity::<point>(); }" ${flags})
     reject(generic_label_runtime_local_${suffix} "ordinary value name cannot select a same-spelled label"

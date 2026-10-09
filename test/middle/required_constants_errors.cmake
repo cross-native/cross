@@ -39,24 +39,24 @@ reject(runtime_only "[[runtime_only]] static i32 seed() { return 1; } global i32
 reject(runtime_chain "[[runtime_only]] static i32 seed() { return 1; } static i32 helper() { return seed(); } global i32 value = helper();"
     "while evaluating call to 'helper'")
 reject(static_read "global i32 state = 7; global i32 value = state;" "not a translation-time value|runtime/static storage cannot be read")
-reject(unsigned "[[generic(u8 N)]] static i32 g() { return N; } global i32 f() { return g::<-1>(); }"
+reject(unsigned "static i32 g<u8 N>() { return N; } global i32 f() { return g::<-1>(); }"
     "not representable in parameter type 'u8'")
-reject(narrow "[[generic(i8 N)]] static i32 g() { return N; } global i32 f() { return g::<128>(); }"
+reject(narrow "static i32 g<i8 N>() { return N; } global i32 f() { return g::<128>(); }"
     "not representable in parameter type 'i8'")
-reject(bool "[[generic(bool N)]] static i32 g() { return N; } global i32 f() { return g::<2>(); }"
+reject(bool "static i32 g<bool N>() { return N; } global i32 f() { return g::<2>(); }"
     "not representable in parameter type 'bool'")
-reject(generic_divzero "[[generic(i32 N)]] static i32 g() { return N; } global i32 f() { return g::<9 / 0>(); }"
+reject(generic_divzero "static i32 g<i32 N>() { return N; } global i32 f() { return g::<9 / 0>(); }"
     "division by zero")
-reject(generic_unknown "[[generic(i32 N)]] static i32 g() { return N; } global i32 f() { return g::<1 ? 7 : missing>(); }"
+reject(generic_unknown "static i32 g<i32 N>() { return N; } global i32 f() { return g::<1 ? 7 : missing>(); }"
     "unresolved name")
-reject(generic_runtime "[[generic(i32 N)]] static i32 g() { return N; } global i32 f(in i32 x) { return g::<x>(); }"
+reject(generic_runtime "static i32 g<i32 N>() { return N; } global i32 f(in i32 x) { return g::<x>(); }"
     "not a translation-time value")
-reject(generic_const_write "[[generic(i32 N)]] static i32 g() { return N; } global i32 f(in const i32 x) { return g::<1 || ++x>(); }"
+reject(generic_const_write "static i32 g<i32 N>() { return N; } global i32 f(in const i32 x) { return g::<1 || ++x>(); }"
     "cannot write a const cell")
-reject(budget "[[generic(uptr N)]] static i32 g() { return g::<N + 1>(); } global i32 f() { return g::<0>(); }"
+reject(budget "static i32 g<uptr N>() { return g::<N + 1>(); } global i32 f() { return g::<0>(); }"
     "generic instantiation budget exceeded")
 
-set(pointer_source "[[generic(uptr N)]] static uptr g() { return N; } global uptr f() { return g::<1u64 << 32>(); }")
+set(pointer_source "static uptr g<uptr N>() { return N; } global uptr f() { return g::<1u64 << 32>(); }")
 reject(pointer32 "${pointer_source}" "not representable in parameter type 'uptr'" -mprofile=vr4300-o32)
 file(WRITE "${OUTPUT}/pointer64.x" "${pointer_source}\n")
 foreach(profile mips64-n64 mips64el-n64)

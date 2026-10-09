@@ -249,3 +249,21 @@ check(tls_unselected_and_shadowed "${accepted_tls}" "${tls_declarations}
             return input;
         }
     }")
+# An explicit uptr conversion of a code label is a relocation against the
+# label, with the addends of a function address; other widths stay invalid.
+check(label_uptr_relocation pass [=[
+    global void label_owner() { global label resume: ; }
+    static void local_owner() { point: ; }
+    global uptr resume_address = (uptr)label_owner::resume;
+    global uptr point_after = (uptr)local_owner::point + 4uptr;
+    static struct { uptr address; u32 tag; } labelled = { (uptr)(local_owner::point), 1u32 };
+    global uptr entry() { static uptr own = (uptr)here; here: return own + labelled.address; }
+]=])
+check(label_integer_conversion "code labels permit only same-type or explicit uptr conversions" [=[
+    static void local_owner() { point: ; }
+    global u64 bits = (u64)local_owner::point;
+]=])
+check(label_uptr_missing "unresolved name 'local_owner::missing'" [=[
+    static void local_owner() { point: ; }
+    global uptr bits = (uptr)local_owner::missing;
+]=])

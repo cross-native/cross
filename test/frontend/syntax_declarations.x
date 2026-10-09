@@ -430,13 +430,13 @@ namespace CapturedPrototypes {
     syntax Project : item { prefix "project"; match value:declaration; expand project; }
     syntax Keep, Project;
     namespace Unknown {
-        keep [[noinline]] global T identity(in T value) [[generic(fragment!(T, u32 N))]];
-        [[noinline]] global T identity(in T value) [[generic(T, u32 N)]] { return value + (T)N; }
+        keep [[noinline]] global T identity<fragment!(T, u32 N)>(in T value);
+        [[noinline]] global T identity<T, u32 N>(in T value) { return value + (T)N; }
     }
     namespace Shadowed {
         typedef u8 T;
-        project [[noinline]] global T identity(in T value) [[generic(fragment!(T, u32 N))]];
-        [[noinline]] global T identity(in T value) [[generic(T, u32 N)]] { return value + (T)N; }
+        project [[noinline]] global T identity<fragment!(T, u32 N)>(in T value);
+        [[noinline]] global T identity<T, u32 N>(in T value) { return value + (T)N; }
     }
     $::static_assert(Unknown::identity<u32, 7u32>(600u32) == 607u32 &&
         Shadowed::identity<u16, 9u32>(300u16) == 309u16, "captured generic prototypes");

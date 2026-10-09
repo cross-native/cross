@@ -42,6 +42,16 @@ static u32 pair_sum(in u64 bits) {
     return pair->first + pair->second + whole.first + whole.second;
 }
 
+// A record defined may_alias is accessed through it under its tag too.
+struct TaggedPair [[may_alias]] { u32 first; u32 second; };
+
+static u32 tagged_sum(in u64 bits) {
+    u64 copy = bits;
+    struct TaggedPair *pair = (struct TaggedPair *)(void *)&copy;
+    struct TaggedPair whole = *pair;
+    return pair->first + pair->second + whole.first + whole.second;
+}
+
 // Redeclarations may spell the type either way.
 u32 shared;
 any_u32 shared = 5u32;
@@ -53,10 +63,12 @@ $::static_assert(rebuilt(0x40000000u32) == 2.0f32, "may_alias write");
 $::static_assert(first_half(0x56785678u32) == 0x5678u16, "may_alias qualifier");
 $::static_assert(double_bits(-2.0f64) == 0xc000000000000000u64, "may_alias leading attribute");
 $::static_assert(pair_sum(0x0000000700000006u64) == 26u32, "may_alias record");
+$::static_assert(tagged_sum(0x0000000700000006u64) == 26u32, "may_alias record definition");
 
 global u32 may_alias_entry() {
     any_u16 half = first_half(0xabcdabcdu32);
     return float_bits(1.0f32) == 0x3f800000u32 && rebuilt(0x40000000u32) == 2.0f32 &&
            half == 0xabcdu16 && double_bits(-2.0f64) == 0xc000000000000000u64 &&
-           pair_sum(0x0000000700000006u64) == 26u32 && next(shared) == 6u32;
+           pair_sum(0x0000000700000006u64) == 26u32 &&
+           tagged_sum(0x0000000700000006u64) == 26u32 && next(shared) == 6u32;
 }

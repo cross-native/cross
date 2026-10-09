@@ -18,11 +18,11 @@ static T copy<T>(in T value) {
     return value;
 }
 
-static T [[noinline, generic(T)]] copy_interleaved(in T value) {
+static T [[noinline]] copy_interleaved<T>(in T value) {
     return value;
 }
 
-static T copy_trailing(in T value) [[generic(T), noinline]] {
+static T copy_trailing<T>(in T value) [[noinline]] {
     return value;
 }
 

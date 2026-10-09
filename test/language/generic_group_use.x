@@ -7,10 +7,10 @@ static T isolated<T>(in T value) {
 }
 namespace math {
     T choose<T>(in bool first, in T left, in T right);
-    [[generic(T)]] T legacy(in T value);
+    T renamed<T>(in T value);
 }
 
-[[generic(label Address), noinline]] label group_label();
+[[noinline]] label group_label<label Address>();
 static void private_label_owner() { point: ; }
 global label group_other_label();
 global label group_other_direct();
@@ -20,12 +20,12 @@ global i32 generic_group_entry() {
     i32 qualified = math::choose<i32>(1 == 1, 8i32, 9i32);
     using math;
     i32 imported = choose<i32>(1 == 0, 10i32, 11i32);
-    i32 transitional = legacy<i32>(12i32);
+    i32 renamed_result = renamed<i32>(12i32);
     i32 private_result = isolated<i32>(1i32);
     label own_label = group_label::<private_label_owner::point>();
     label other_label = group_other_label();
     return forward_result == 7i32 && qualified == 8i32 &&
-           imported == 11i32 && transitional == 12i32 &&
+           imported == 11i32 && renamed_result == 12i32 &&
            private_result == 4i32 && own_label == private_label_owner::point &&
            other_label == group_other_direct() && own_label != other_label &&
            own_label == group_label::<private_label_owner::point>() ? 1i32 : 2i32;

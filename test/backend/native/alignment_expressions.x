@@ -21,8 +21,8 @@ $::static_assert(sizeof(struct expression_aligned_member) == 64uptr,
   aligned(sizeof(struct expression_aligned_record))]]
 global u8 expression_aligned_object = 7u8;
 
-[[generic(uptr N), aligned(N), noinline]]
-static i32 generic_alignment() {
+[[aligned(N), noinline]]
+static i32 generic_alignment<uptr N>() {
     [[aligned(N)]] stack u8 bytes[3];
     bytes[0] = 9u8;
     return ((uptr)&bytes[0] & (N - 1uptr)) == 0uptr &&

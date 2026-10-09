@@ -251,17 +251,17 @@ syntax CapturedHeader : item {
 syntax CapturedHeader;
 static uptr header_alignment<U>() { return sizeof(U); }
 captured_header
-[[noinline]] static T captured_header_identity(in T value)
-    [[aligned(header_value(header_alignment::<T (parameter_list_fragment!(*))(in u32)>())),
-      generic(parameter_list_fragment!(T))]] {
+[[noinline]] static T captured_header_identity<parameter_list_fragment!(T)>(in T value)
+    [[aligned(header_value(header_alignment::<T (parameter_list_fragment!(*))(in u32)>()))]] {
     return value;
 }
-captured_header [[noinline]] static u32 captured_header_value(in u32 value)
-    [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
+captured_header [[noinline]] static u32
+captured_header_value<parameter_list_fragment!(u32 N)>(in u32 value)
+    [[aligned(header_value(N))]] {
     return value + N;
 }
 captured_header [[noinline]] static struct InlineHeaderResult { uptr value; }
-captured_inline_header(in T value) [[generic(parameter_list_fragment!(T))]] {
+captured_inline_header<parameter_list_fragment!(T)>(in T value) {
     struct InlineHeaderResult result = { (uptr)value + 1uptr };
     return result;
 }
@@ -279,12 +279,10 @@ syntax RawInlineHeader : item {
 }
 syntax RawInlineHeader;
 raw_inline_header [[noinline]] static enum InlineRawResult [[underlying(u32)]] { raw_result_base = 8u32 }
-copied_inline_enum(in T value) [[generic(parameter_list_fragment!(T))]] {
+copied_inline_enum<parameter_list_fragment!(T)>(in T value) {
     return (enum InlineRawResult)((u32)value + raw_result_base);
 }
 namespace HeaderFragments { typedef u32 Value; }
-[[noinline]] static T header_fragment_identity(in T value)
-    [[parameter_list_fragment!(generic(T))]] { return value; }
 [[noinline]] static T angle_fragment_identity<parameter_list_fragment!(T)>(in T value) {
     return value;
 }
@@ -365,16 +363,17 @@ static u32 stack_header_function(parameter_fragment!(value)) { return value + 9u
 struct HeaderMemoryResult { u64 low; u64 high; };
 assign_header_abi "memory_result_abi"
 static struct HeaderMemoryResult
-memory_header_function(in T value) [[generic(parameter_list_fragment!(T))]] {
+memory_header_function<parameter_list_fragment!(T)>(in T value) {
     struct HeaderMemoryResult result = { (u64)value + 10u64, (u64)value + 11u64 };
     return result;
 }
 assign_header_abi "stack_result_abi"
-static u32 (captured_stack_header_value)(in u32 value)
-    [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] { return value + N; }
+static u32 (captured_stack_header_value<parameter_list_fragment!(u32 N)>)(in u32 value)
+    [[aligned(header_value(N))]] { return value + N; }
 assign_header_abi "memory_result_abi"
-static struct HeaderMemoryResult ((captured_memory_header_value))(in u32 value)
-    [[aligned(header_value(N)), generic(parameter_list_fragment!(u32 N))]] {
+static struct HeaderMemoryResult
+((captured_memory_header_value<parameter_list_fragment!(u32 N)>))(in u32 value)
+    [[aligned(header_value(N))]] {
     struct HeaderMemoryResult result = { (u64)value + (u64)N, (u64)value + (u64)N + 1u64 };
     return result;
 }
@@ -658,8 +657,7 @@ global u32 syntax_raw_entry() {
     if (grouped_callback(fragmented_type) != 7u32 ||
         GroupedHeaders::identity(fragmented_type + 300u32) != 305u32) return 0u32;
     uptr inline_header_value = read_inline_header_result(captured_inline_header(fragmented_type));
-    if (header_fragment_identity(fragmented_type) != 5u32 ||
-        angle_fragment_identity(fragmented_type) != 5u32 ||
+    if (angle_fragment_identity(fragmented_type) != 5u32 ||
         captured_header_identity(fragmented_type) != 5u32 ||
         captured_header_value<16u32>(fragmented_type) != 21u32 ||
         inline_header_value != 6uptr ||

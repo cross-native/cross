@@ -11,7 +11,7 @@ set(cases generic_angle_conflict generic_angle_missing_value
           generic_angle_mixed_declaration generic_angle_assertion
           generic_angle_shadow_non_generic generic_angle_vector_mismatch)
 set(patterns "conflicting deductions" "requires an explicit argument"
-             "cannot be combined" "static_assert failed"
+             "unknown attribute .generic." "static_assert failed"
              "generic arguments applied to non-generic function"
              "cannot determine generic call argument type")
 list(LENGTH cases count)
