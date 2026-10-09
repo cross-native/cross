@@ -57,4 +57,10 @@ struct AssemblySymbolRequest {
 
 [[nodiscard]] bool assembly_uses_dwarf_cfi(ObjectFormat format);
 
+// Returns the assembler spelling of the object-file symbol for a link name:
+// Mach-O prefixes C-level names with `_`, and a name outside the assembler's
+// identifier characters is quoted.
+[[nodiscard]] std::string assembly_symbol(ObjectFormat format,
+                                          std::string_view link_name);
+
 } // namespace cross

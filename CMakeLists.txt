@@ -1345,6 +1345,13 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/backend/frame/runtime.cmake")
     set_tests_properties(cross_frame_runtime PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.frame")
+    add_test(NAME cross_hard_register_unwind COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/frame/hard_register_unwind.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/hard-register-unwind
+        -P "${CMAKE_SOURCE_DIR}/test/backend/frame/hard_register_unwind.cmake")
+    set_tests_properties(cross_hard_register_unwind PROPERTIES
+        LABELS "check.runtime;arch.x86_64;backend.native;feature.frame;feature.abi;feature.object")
     add_test(NAME cross_indirect_runtime COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-runtime
@@ -2777,6 +2784,23 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_overaligned_vla PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.array;feature.frame;opt.O2")
+    # Allocation is off at these levels; the frame still needs its CFA anchor.
+    foreach(level O0 O1)
+        string(TOLOWER ${level} level_name)
+        add_test(NAME cross_runtime_native_overaligned_vla_${level_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/overaligned_vla.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-overaligned-vla-${level_name}
+                    -DENTRY=overaligned_vla_entry
+                    -DEXPECTED=46
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_overaligned_vla_${level_name} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.array;feature.frame;opt.${level}")
+    endforeach()
     add_test(NAME cross_runtime_native_f128
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2872,6 +2896,7 @@ if(BUILD_TESTING)
                 -DRAW_SOURCE=${CMAKE_SOURCE_DIR}/test/backend/raw/raw_naked.x
                 -DDATA_SOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/static_objects.x
                 -DNAMESPACE_SOURCE=${CMAKE_SOURCE_DIR}/test/language/namespace.x
+                -DSYMBOL_SOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/macho_symbols.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/macho-object
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/macho_object.cmake")
     set_tests_properties(cross_macho_object PROPERTIES
@@ -3989,6 +4014,15 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/abi/hard_register_errors.cmake")
     set_tests_properties(cross_hard_register_diagnostics PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;backend.native;feature.abi")
+    add_test(NAME cross_abi_placement_diagnostics
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/placement_errors.x
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/backend/abi/placement.y
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/abi-placement-errors
+                -P "${CMAKE_SOURCE_DIR}/test/backend/abi/placement_errors.cmake")
+    set_tests_properties(cross_abi_placement_diagnostics PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;backend.native;feature.abi;feature.model")
     add_test(NAME cross_hard_register_sysv
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 -target x86_64-unknown-linux-gnu

@@ -3904,17 +3904,6 @@ bool safe_assembly_text(std::string_view text) {
     });
 }
 
-std::string quoted(std::string_view text) { return '"' + std::string(text) + '"'; }
-
-std::string assembly_symbol(std::string_view symbol) {
-    const bool simple = !symbol.empty() &&
-        std::all_of(symbol.begin(), symbol.end(), [](unsigned char ch) {
-            return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                   (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '$';
-        });
-    return simple ? std::string(symbol) : quoted(symbol);
-}
-
 std::string block_symbol(const mir::RawFunction& function, mir::BlockId block) {
     return ".Lcross." + std::to_string(function.source.value) + '.' +
            std::to_string(block.value);
@@ -4038,7 +4027,7 @@ private:
                                "raw symbol or section name cannot be represented by the selected assembler");
             return;
         }
-        const auto symbol = assembly_symbol(function.symbol);
+        const auto symbol = assembly_symbol(format_, function.symbol);
         const auto patch_function = function_has_patch(function);
         const auto split_function = options_.function_sections ||
                                     entity.retain ||
@@ -4128,7 +4117,8 @@ private:
                 output_ << ".Lcross.label." << function.source.value
                         << '.' << label.id.value << ":\n";
                 if (label.is_global) {
-                    const auto label_symbol = assembly_symbol(label.link_symbol);
+                    const auto label_symbol =
+                        assembly_symbol(format_, label.link_symbol);
                     output_ << ".globl " << label_symbol << "\n";
                     if (format_ == ObjectFormat::Elf) {
                         output_ << ".type " << label_symbol << ",@function\n";

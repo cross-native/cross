@@ -2418,7 +2418,7 @@ link names, or ABI clauses for the same entity are diagnosed.
 
 ### Link names
 
-An external declaration or definition may specify an exact linker spelling:
+An external declaration or definition may specify an exact link name:
 
 ```x
 global i32 app::start() [[link_name("_start")]];
@@ -2442,7 +2442,11 @@ run::resume  -> run::resume    /* global label */
 
 GNU and LLVM assembly printers quote a spelling containing `::`; object files,
 linker diagnostics, and map files retain the unquoted name. Quoting is an
-assembly serialization rule, not part of mangling.
+assembly serialization rule, not part of mangling. The object format maps a
+link name to its object-file symbol: Mach-O prefixes `_`, as C compilers for
+that format do, so `[[link_name("write")]]` names the C function `write`
+(symbol `_write`); ELF and COFF on the current targets use the link name
+unchanged. Like quoting, this mapping is not part of mangling.
 
 Nothing is implicitly encoded merely because it appears in a declaration.
 The model receives entity kind, qualified name, result/object type, ordered

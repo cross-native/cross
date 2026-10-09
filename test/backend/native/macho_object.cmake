@@ -1,7 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC NATIVE_SOURCE RAW_SOURCE DATA_SOURCE NAMESPACE_SOURCE OUTPUT)
+foreach(required CC NATIVE_SOURCE RAW_SOURCE DATA_SOURCE NAMESPACE_SOURCE
+        SYMBOL_SOURCE OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -19,7 +20,7 @@ function(compile_macho source stem)
             set(result "${object}")
         endif()
         execute_process(
-            COMMAND "${CC}" ${arguments} -funwind-tables -target x86_64-apple-darwin
+            COMMAND "${CC}" ${arguments} ${ARGN} -target x86_64-apple-darwin
                     "${source}" -o "${result}"
             RESULT_VARIABLE status
             OUTPUT_VARIABLE stdout
@@ -39,10 +40,12 @@ function(compile_macho source stem)
     endif()
 endfunction()
 
-compile_macho("${NATIVE_SOURCE}" native)
-compile_macho("${RAW_SOURCE}" raw)
-compile_macho("${DATA_SOURCE}" data)
-compile_macho("${NAMESPACE_SOURCE}" namespace)
+compile_macho("${NATIVE_SOURCE}" native -funwind-tables)
+compile_macho("${RAW_SOURCE}" raw -funwind-tables)
+compile_macho("${DATA_SOURCE}" data -funwind-tables)
+compile_macho("${NAMESPACE_SOURCE}" namespace -funwind-tables)
+# A global label cannot appear inside a Mach-O CFI procedure.
+compile_macho("${SYMBOL_SOURCE}" symbols)
 
 file(READ "${OUTPUT}-native.s" native)
 foreach(pattern
@@ -58,8 +61,8 @@ endforeach()
 
 file(READ "${OUTPUT}-namespace.s" namespace)
 foreach(pattern
-        ".globl \"math::twice\""
-        ".globl \"app::entry\"")
+        ".globl \"_math::twice\""
+        ".globl \"_app::entry\"")
     string(FIND "${namespace}" "${pattern}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
@@ -70,7 +73,7 @@ endforeach()
 file(READ "${OUTPUT}-raw.s" raw)
 foreach(pattern
         ".section __TEXT,.boot,regular,pure_instructions"
-        "raw_const:"
+        "_raw_const:"
         "movabsq"
         ".subsections_via_symbols")
     string(FIND "${raw}" "${pattern}" position)
@@ -85,9 +88,9 @@ foreach(pattern
         ".section __DATA,__data"
         ".section __DATA,.cross.data"
         ".section __DATA,__noinit,zerofill"
-        ".no_dead_strip retained_object"
-        ".quad addressed_object"
-        ".quad addressed_function")
+        ".no_dead_strip _retained_object"
+        ".quad _addressed_object"
+        ".quad _addressed_function")
     string(FIND "${data}" "${pattern}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "data Mach-O assembly is missing '${pattern}'")
@@ -98,5 +101,41 @@ foreach(text IN ITEMS native raw data namespace)
     if("${${text}}" MATCHES "(^|\n)\\.(def|type|size|local) ")
         message(FATAL_ERROR
             "${text} Mach-O assembly contains ELF/COFF-only metadata")
+    endif()
+endforeach()
+
+# Every link name, including one given by link_name, gets the leading `_` of
+# Mach-O C symbols, while assembler-local labels keep their spelling.
+find_program(LLVM_READOBJ NAMES llvm-readobj REQUIRED)
+execute_process(
+    COMMAND "${LLVM_READOBJ}" --symbols "${OUTPUT}-symbols.o"
+    RESULT_VARIABLE status
+    OUTPUT_VARIABLE symbols
+    ERROR_VARIABLE stderr
+)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "Mach-O symbol dump failed\n${stderr}")
+endif()
+foreach(name
+        _write _external_counter _defined_value _value_pointer _writer
+        _aliased_value _retained_value _weak_target _label_owner
+        "_label_owner::point" _label_address _call_write _read_counter
+        _patched_address)
+    if(NOT symbols MATCHES "Name: ${name} \\(")
+        message(FATAL_ERROR "Mach-O object lacks symbol ${name}\n${symbols}")
+    endif()
+endforeach()
+if(symbols MATCHES "Name: [a-z]")
+    message(FATAL_ERROR "Mach-O object has an unprefixed link name\n${symbols}")
+endif()
+file(READ "${OUTPUT}-symbols.s" symbol_assembly)
+foreach(pattern "jmp\t_write" ".quad _write" ".quad _defined_value"
+        ".quad \"_label_owner::point\"" ".set _aliased_value,_defined_value"
+        ".weak_reference _weak_target" ".no_dead_strip _retained_value"
+        "movabsq\t$_defined_value")
+    string(FIND "${symbol_assembly}" "${pattern}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "Mach-O symbol assembly is missing '${pattern}'\n${symbol_assembly}")
     endif()
 endforeach()

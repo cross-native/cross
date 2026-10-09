@@ -133,7 +133,8 @@ initialization code runs before your entry point.
 
 Local storage can be constrained: `register T x;` has no address and never
 spills, `stack T x;` always gets an addressable frame slot, and
-`register T x "rax";` binds a register by name. Arrays with runtime bounds are
+`register T x "rax";` binds a register by name; the function still restores a
+bound register that its ABI preserves. Arrays with runtime bounds are
 allocated in the frame and released when their block exits; there is no
 `alloca`.
 

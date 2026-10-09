@@ -82,8 +82,8 @@ run_cc("${OUTPUT}-macho-large.s" -S -O2
        -target x86_64-apple-darwin -fpic -mcmodel=large)
 run_cc("${OUTPUT}-macho-large.o" -c -O2
        -target x86_64-apple-darwin -fpic -mcmodel=large)
-require_text("${OUTPUT}-macho-large.s" "movabsq\t$external_data@GOT")
-require_text("${OUTPUT}-macho-large.s" "movabsq\t$external_function@GOT")
+require_text("${OUTPUT}-macho-large.s" "movabsq\t$_external_data@GOT")
+require_text("${OUTPUT}-macho-large.s" "movabsq\t$_external_function@GOT")
 require_text("${OUTPUT}-macho-large.s" "call\t*")
 reject_text("${OUTPUT}-macho-large.s" "@GOTOFF")
 reject_text("${OUTPUT}-macho-large.s" "@PLTOFF")

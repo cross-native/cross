@@ -81,6 +81,7 @@ enum class LoweringPass : std::uint16_t {
     ClusterSharedCompareSelects,
     SplitEntryParameters,
     SelectRematerialization,
+    SelectCfaAnchor,
     AllocateRegisters,
     PreserveBoundaryContract,
     CreateWidePhiTemporary,
@@ -781,6 +782,26 @@ bool returns_twice_or_interrupt(const hir::Function& entity) {
                        special);
 }
 
+bool has_dynamic_stack(const machine::Function& function) {
+    return std::any_of(
+        function.blocks.begin(), function.blocks.end(),
+        [](const machine::Block& block) {
+            return std::any_of(
+                block.instructions.begin(), block.instructions.end(),
+                [](const machine::Instruction& instruction) {
+                    return instruction.opcode == Opcode::StackSave ||
+                           instruction.opcode == Opcode::StackAllocate ||
+                           instruction.opcode == Opcode::StackRestore;
+                });
+        });
+}
+
+bool has_over_aligned_slot(const machine::Function& function) {
+    return std::any_of(
+        function.stack_slots.begin(), function.stack_slots.end(),
+        [](const machine::StackSlot& slot) { return slot.alignment > 16; });
+}
+
 class MachineLowerer {
 public:
     MachineLowerer(const mir::ManagedModule& managed,
@@ -943,19 +964,20 @@ private:
     // scratch choices; do not widen them to conceal a preservation violation.
     void preserve_boundary_contract() {
         if (current_.frame.elide_incoming_saves) return;
-        std::unordered_set<std::uint16_t> explicitly_preserved;
+        // A hard-register object changes storage that the boundary may
+        // preserve; the prologue saves it with the other preserved registers.
         for (const auto& slot : current_.stack_slots) {
             if (!slot.hard_register) continue;
-            if (const auto* view = machine_register_view(*slot.hard_register)) {
-                explicitly_preserved.insert(view->storage_id);
+            const auto* view = machine_register_view(*slot.hard_register);
+            if (view &&
+                (view->register_class == RegisterClass::integer ||
+                 view->register_class == RegisterClass::simd) &&
+                !current_function_may_clobber(*view)) {
+                add_preserved_storage(view->storage_id);
             }
         }
-        if (current_.frame.cfa_anchor_register) {
-            explicitly_preserved.insert(
-                static_cast<std::uint16_t>(
-                    current_.frame.cfa_anchor_register->value));
-        }
-
+        // The realigned dynamic prologue pushes its CFA anchor itself.
+        const auto anchor = current_.frame.cfa_anchor_register;
         std::unordered_set<std::uint32_t> required;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -976,7 +998,7 @@ private:
                     if (!feature_available ||
                         (view->register_class != RegisterClass::integer &&
                          view->register_class != RegisterClass::simd) ||
-                        explicitly_preserved.contains(view->storage_id) ||
+                        (anchor && anchor->value == view->storage_id) ||
                         current_function_may_clobber(*view)) {
                         continue;
                     }
@@ -1059,23 +1081,15 @@ private:
                     std::string(view->storage_name)).second) {
                 continue;
             }
-            for (const auto prefix :
-                 {std::string_view("$hard.abi."),
-                  std::string_view("$hard.call.")}) {
-                machine::StackSlot save;
-                save.id = {
-                    static_cast<std::uint32_t>(
-                        current_.stack_slots.size())};
-                save.kind = machine::StackSlotKind::Spill;
-                save.size =
-                    view->register_class == RegisterClass::simd ? 16 : 8;
-                save.alignment = save.size;
-                save.location = slot.location;
-                save.name =
-                    std::string(prefix) +
-                    std::string(view->storage_name);
-                current_.stack_slots.push_back(std::move(save));
-            }
+            machine::StackSlot save;
+            save.id = {
+                static_cast<std::uint32_t>(current_.stack_slots.size())};
+            save.kind = machine::StackSlotKind::Spill;
+            save.size = view->register_class == RegisterClass::simd ? 16 : 8;
+            save.alignment = save.size;
+            save.location = slot.location;
+            save.name = "$hard.call." + std::string(view->storage_name);
+            current_.stack_slots.push_back(std::move(save));
         }
         const auto& entity = hir_.function(source.source);
         if (entity.variadic && !entity.variadic_bindings.empty()) {
@@ -6057,6 +6071,65 @@ private:
         }
     }
 
+    // A frame with dynamic allocations and an over-aligned local keeps the
+    // incoming stack pointer in a register that no boundary or hard-register
+    // object uses; the prologue saves and sets it.
+    void select_cfa_anchor() {
+        if (!has_dynamic_stack(current_) || !has_over_aligned_slot(current_))
+            return;
+        std::unordered_set<std::uint16_t> unavailable;
+        for (const auto& slot : current_.stack_slots) {
+            if (!slot.hard_register) continue;
+            if (const auto* view =
+                    machine_register_view(*slot.hard_register)) {
+                unavailable.insert(view->storage_id);
+            }
+        }
+        const auto exclude_boundary = [&](const ManualBoundary& boundary) {
+            if (boundary.register_view) {
+                unavailable.insert(boundary.register_view->storage_id);
+            }
+            for (const auto& piece : boundary.register_pieces) {
+                if (piece.register_view) {
+                    unavailable.insert(piece.register_view->storage_id);
+                }
+            }
+        };
+        if (const auto* plan = manual_plans_.find(current_.source)) {
+            for (const auto& parameter : plan->parameters) {
+                exclude_boundary(parameter.input);
+                exclude_boundary(parameter.output);
+            }
+            exclude_boundary(plan->result.output);
+        } else if (const auto* abi =
+                       abi_model(hir_.function(current_.source).abi)) {
+            for (const auto& bank : abi->banks) {
+                for (const auto& endpoint : bank.arguments) {
+                    if (const auto* view = find_register_view(endpoint)) {
+                        unavailable.insert(view->storage_id);
+                    }
+                }
+                for (const auto& endpoint : bank.results) {
+                    if (const auto* view = find_register_view(endpoint)) {
+                        unavailable.insert(view->storage_id);
+                    }
+                }
+            }
+        }
+        for (const auto candidate : {"r15", "r14", "r13", "r12"}) {
+            const auto* view = find_register_view(candidate);
+            if (view && !unavailable.contains(view->storage_id)) {
+                current_.frame.cfa_anchor_register =
+                    machine::PhysicalRegisterId{view->storage_id};
+                return;
+            }
+        }
+        diagnostics_.error(
+            current_.location,
+            "over-aligned VLA frame has no available reserved x86-64 CFA "
+            "anchor register");
+    }
+
     void allocate_registers() {
         if (!options_.register_allocation ||
             manual_plans_.find(current_.source) ||
@@ -7544,77 +7617,6 @@ private:
                 register_use_counts[id] + 1 >= 2 * crossed_calls[id];
         }
 
-        const bool dynamic_stack_frame = std::any_of(
-            current_.blocks.begin(), current_.blocks.end(),
-            [](const machine::Block& block) {
-                return std::any_of(
-                    block.instructions.begin(), block.instructions.end(),
-                    [](const machine::Instruction& instruction) {
-                        return instruction.opcode == Opcode::StackSave ||
-                               instruction.opcode == Opcode::StackAllocate ||
-                               instruction.opcode == Opcode::StackRestore;
-                    });
-            });
-        const bool over_aligned_fixed_frame = std::any_of(
-            current_.stack_slots.begin(), current_.stack_slots.end(),
-            [](const machine::StackSlot& slot) {
-                return slot.alignment > 16;
-            });
-        if (dynamic_stack_frame && over_aligned_fixed_frame) {
-            std::unordered_set<std::uint16_t> unavailable;
-            for (const auto& slot : current_.stack_slots) {
-                if (!slot.hard_register) continue;
-                if (const auto* view =
-                        machine_register_view(*slot.hard_register)) {
-                    unavailable.insert(view->storage_id);
-                }
-            }
-            const auto exclude_boundary = [&](const ManualBoundary& boundary) {
-                if (boundary.register_view) {
-                    unavailable.insert(boundary.register_view->storage_id);
-                }
-                for (const auto& piece : boundary.register_pieces) {
-                    if (piece.register_view) {
-                        unavailable.insert(piece.register_view->storage_id);
-                    }
-                }
-            };
-            if (const auto* plan = manual_plans_.find(current_.source)) {
-                for (const auto& parameter : plan->parameters) {
-                    exclude_boundary(parameter.input);
-                    exclude_boundary(parameter.output);
-                }
-                exclude_boundary(plan->result.output);
-            } else {
-                for (const auto& bank : function_abi->banks) {
-                    for (const auto& endpoint : bank.arguments) {
-                        if (const auto* view = find_register_view(endpoint)) {
-                            unavailable.insert(view->storage_id);
-                        }
-                    }
-                    for (const auto& endpoint : bank.results) {
-                        if (const auto* view = find_register_view(endpoint)) {
-                            unavailable.insert(view->storage_id);
-                        }
-                    }
-                }
-            }
-            for (const auto candidate : {"r15", "r14", "r13", "r12"}) {
-                const auto* view = find_register_view(candidate);
-                if (view && !unavailable.contains(view->storage_id)) {
-                    current_.frame.cfa_anchor_register =
-                        machine::PhysicalRegisterId{view->storage_id};
-                    break;
-                }
-            }
-            if (!current_.frame.cfa_anchor_register) {
-                diagnostics_.error(
-                    current_.location,
-                    "over-aligned VLA frame has no available reserved "
-                    "x86-64 CFA anchor register");
-                return;
-            }
-        }
         const auto function_may_clobber =
             [&](const RegisterView& candidate) {
                 return current_function_may_clobber(candidate);
@@ -8078,7 +8080,7 @@ private:
         // frame anchor.  COFF is conservative because late spill coloring can
         // push a frame across its probing threshold.
         const bool reserve_frame_pointer =
-            dynamic_stack_frame || over_aligned_fixed_frame ||
+            has_dynamic_stack(current_) || has_over_aligned_slot(current_) ||
             !options_.omit_frame_pointer ||
             subtarget_.object_format() == ObjectFormat::Coff;
         if (reserve_frame_pointer) {
@@ -8864,17 +8866,7 @@ private:
             largest_outgoing);
         current_.frame.outgoing_argument_alignment =
             static_cast<std::uint32_t>(largest_outgoing_alignment);
-        const bool dynamic_stack = std::any_of(
-            current_.blocks.begin(), current_.blocks.end(),
-            [](const machine::Block& block) {
-                return std::any_of(
-                    block.instructions.begin(), block.instructions.end(),
-                    [](const machine::Instruction& instruction) {
-                        return instruction.opcode == Opcode::StackSave ||
-                               instruction.opcode == Opcode::StackAllocate ||
-                               instruction.opcode == Opcode::StackRestore;
-                    });
-            });
+        const bool dynamic_stack = has_dynamic_stack(current_);
         const bool dynamic_call_probe =
             dynamic_stack && largest_outgoing >= 4096;
         const auto add_dynamic_save_slot = [&](std::string name) {
@@ -8902,13 +8894,7 @@ private:
         if (has_indirect_call) add_dynamic_save_slot("$indirect.call.target");
         if (has_spilled_indirect_target)
             add_dynamic_save_slot("$indirect.call.capture");
-        const bool dynamic_realign =
-            dynamic_stack && std::any_of(
-                current_.stack_slots.begin(), current_.stack_slots.end(),
-                [](const machine::StackSlot& slot) {
-                    return slot.alignment > 16;
-                });
-        if (dynamic_realign) {
+        if (dynamic_stack && has_over_aligned_slot(current_)) {
             add_dynamic_save_slot("$dynamic.frame.anchor");
         }
         std::unordered_set<std::uint32_t> call_live_homes;
@@ -8948,10 +8934,8 @@ private:
                 [](const machine::StackSlot& slot) {
                     return !slot.elided && slot.alignment > 16;
                 });
-        std::uint32_t offset = dynamic_stack
-            ? 0U : current_.frame.outgoing_argument_size;
-        std::uint32_t static_alignment = 16;
-        std::uint32_t fixed_cfa_distance = 0;
+        std::uint32_t offset{};
+        std::uint32_t static_alignment{};
         std::unordered_map<std::uint32_t, std::int32_t> color_offsets;
         const auto place_slot = [&](machine::StackSlot& slot) {
             if (slot.elided) return;
@@ -8975,35 +8959,59 @@ private:
             slot.frame_offset = static_cast<std::int32_t>(offset);
             offset += slot.size;
         };
-        // A realigned RSP has no constant relation to the caller's CFA. Keep
-        // callee-save homes below the stable RBP frame record instead; their
-        // negative offsets remain directly expressible by DWARF and can be
-        // translated to Win64's pre-realignment prologue RSP.
-        for (auto& slot : current_.stack_slots) {
-            if (!slot.name.starts_with("$callee.save.")) continue;
-            if (!realigned_local_frame) {
-                place_slot(slot);
-                continue;
+        // A realigned RSP has no constant relation to the caller's CFA, and
+        // Win64 unwind codes address saves at or above the frame register's
+        // base. Keep callee-save homes below the stable RBP frame record in
+        // both cases; their negative offsets remain directly expressible by
+        // DWARF and by Win64 codes relative to the prologue RSP.
+        const auto place_frame = [&](bool fixed_cfa_saves) {
+            offset = dynamic_stack
+                ? 0U : current_.frame.outgoing_argument_size;
+            static_alignment = 16;
+            color_offsets.clear();
+            // Win64 codes reach 240 bytes below the frame register; the
+            // vector homes go first so that alignment adds no padding.
+            std::uint32_t fixed_cfa_distance = 0;
+            for (const bool vector_home : {true, false}) {
+                for (auto& slot : current_.stack_slots) {
+                    if (!fixed_cfa_saves ||
+                        !slot.name.starts_with("$callee.save.") ||
+                        (slot.alignment == 16) != vector_home) {
+                        continue;
+                    }
+                    static_alignment =
+                        std::max(static_alignment, slot.alignment);
+                    fixed_cfa_distance = align_up(
+                        fixed_cfa_distance + slot.size, slot.alignment);
+                    slot.frame_offset =
+                        -static_cast<std::int32_t>(fixed_cfa_distance);
+                }
             }
-            static_alignment = std::max(static_alignment, slot.alignment);
-            fixed_cfa_distance = align_up(
-                fixed_cfa_distance + slot.size, slot.alignment);
-            slot.frame_offset =
-                -static_cast<std::int32_t>(fixed_cfa_distance);
-        }
-        for (auto& slot : current_.stack_slots) {
-            if (!slot.name.starts_with("$callee.save.")) place_slot(slot);
-        }
-        current_.frame.stack_alignment = dynamic_stack
-            ? static_alignment
-            : std::max(static_alignment,
-                       current_.frame.outgoing_argument_alignment);
-        current_.frame.local_size = offset;
+            for (auto& slot : current_.stack_slots) {
+                if (!fixed_cfa_saves && slot.name.starts_with("$callee.save."))
+                    place_slot(slot);
+            }
+            for (auto& slot : current_.stack_slots) {
+                if (!slot.name.starts_with("$callee.save.")) place_slot(slot);
+            }
+            current_.frame.stack_alignment = dynamic_stack
+                ? static_alignment
+                : std::max(static_alignment,
+                           current_.frame.outgoing_argument_alignment);
+            current_.frame.local_size = offset;
+        };
+        place_frame(realigned_local_frame);
+        const bool coff =
+            subtarget_.object_format() == ObjectFormat::Coff;
         current_.frame.has_frame_pointer =
             dynamic_stack || current_.frame.stack_alignment > 16 ||
             !options_.omit_frame_pointer ||
-            (subtarget_.object_format() == ObjectFormat::Coff &&
-             current_.frame.local_size >= 4096);
+            (coff && current_.frame.local_size >= 4096);
+        if (coff && current_.frame.has_frame_pointer &&
+            !realigned_local_frame && !current_.callee_saved_registers.empty() &&
+            (options_.unwind_tables || options_.asynchronous_unwind_tables)) {
+            place_frame(true);
+        }
         current_.frame.finalized = true;
     }
 
@@ -9098,9 +9106,89 @@ private:
         current_.stack_slots.push_back(std::move(temporary));
     }
 
+    // Diagnoses the first value of an automatic interface that its ABI
+    // model cannot place. Manual interfaces and private dynamic plans place
+    // their values themselves.
+    bool placeable(const hir::FunctionSignature& signature,
+                   const std::vector<hir::TypeId>& argument_types,
+                   SourceLocation location, bool definition) {
+        const auto* abi = abi_model(signature.abi);
+        if (!abi) return true;
+        std::vector<AbiValue> arguments;
+        arguments.reserve(argument_types.size());
+        for (std::size_t index = 0; index < argument_types.size(); ++index) {
+            const bool direct = index >= signature.parameters.size() ||
+                signature.parameters[index].mode == ParameterMode::In;
+            arguments.push_back(abi_value_for(
+                hir_, argument_types[index], *abi,
+                direct ? ValueTransport::Direct
+                       : ValueTransport::ByReference));
+        }
+        std::vector<AbiValue> results;
+        if (!is_void(hir_, signature.result_type)) {
+            results.push_back(abi_value_for(hir_, signature.result_type, *abi));
+        }
+        const auto classified = signature.variadic
+            ? classify_variadic_signature(
+                  *abi, arguments, results, signature.parameters.size(),
+                  subtarget_.enabled_features())
+            : classify_signature(*abi, arguments, results,
+                                 subtarget_.enabled_features());
+        if (classified) return true;
+        const auto index = classified.error_value;
+        std::string value = "the result";
+        auto type = signature.result_type;
+        if (!classified.error_in_results) {
+            type = argument_types[index];
+            if (definition) {
+                location = signature.parameters[index].location;
+                value = "parameter '" + signature.parameters[index].name + "'";
+            } else {
+                value = "argument " + std::to_string(index + 1);
+            }
+        }
+        diagnostics_.error(location, "ABI '" + abi->canonical_name +
+                                         "' cannot place " + value +
+                                         " of type '" +
+                                         hir::type_name(hir_, type) + "'");
+        return false;
+    }
+
+    bool interfaces_placeable(const mir::ManagedFunction& source) {
+        const auto& entity = hir_.function(source.source);
+        bool valid = true;
+        if (!manual_plans_.find(entity.id) && !dynamic_plans_.find(entity.id)) {
+            const auto signature =
+                hir::call_signature(hir_, entity.id, std::nullopt);
+            std::vector<hir::TypeId> types;
+            for (const auto& parameter : signature->parameters) {
+                types.push_back(parameter.type);
+            }
+            valid = placeable(*signature, types, entity.location, true);
+        }
+        for (const auto& value : source.values) {
+            if (value.kind != mir::ValueKind::Call ||
+                manual_plans_.find(value.callee, value.call_signature) ||
+                (value.callee && dynamic_plans_.find(*value.callee))) {
+                continue;
+            }
+            const auto signature =
+                hir::call_signature(hir_, value.callee, value.call_signature);
+            if (!signature) continue;
+            std::vector<hir::TypeId> types;
+            for (const auto& argument : value.call_arguments) {
+                types.push_back(argument.type);
+            }
+            valid = placeable(*signature, types, value.location, false) &&
+                    valid;
+        }
+        return valid;
+    }
+
     void lower_function(const mir::ManagedFunction& source) {
         current_ = {};
         source_ = &source;
+        if (!interfaces_placeable(source)) return;
         const auto& entity = hir_.function(source.source);
         const auto unsupported_vector = std::find_if(
             source.values.begin(), source.values.end(),
@@ -9262,6 +9350,8 @@ private:
         add(LoweringPass::SelectRematerialization,
             Stage::RegisterAllocation, "select-rematerialization",
             &MachineLowerer::select_rematerialization);
+        add(LoweringPass::SelectCfaAnchor, Stage::RegisterAllocation,
+            "select-cfa-anchor", &MachineLowerer::select_cfa_anchor);
         add(LoweringPass::AllocateRegisters, Stage::RegisterAllocation,
             "allocate-registers", &MachineLowerer::allocate_registers);
         add(LoweringPass::PreserveBoundaryContract,
@@ -9295,21 +9385,6 @@ bool safe_assembly_text(std::string_view text) {
     return std::all_of(text.begin(), text.end(), [](unsigned char ch) {
         return ch >= 0x20 && ch != 0x7f && ch != '"' && ch != '\\';
     });
-}
-
-std::string quoted(std::string_view text) {
-    return '"' + std::string(text) + '"';
-}
-
-std::string assembly_symbol(std::string_view symbol) {
-    const bool simple = !symbol.empty() &&
-        std::all_of(symbol.begin(), symbol.end(), [](unsigned char ch) {
-            return (ch >= 'a' && ch <= 'z') ||
-                   (ch >= 'A' && ch <= 'Z') ||
-                   (ch >= '0' && ch <= '9') ||
-                   ch == '_' || ch == '.' || ch == '$';
-        });
-    return simple ? std::string(symbol) : quoted(symbol);
 }
 
 char suffix(unsigned bits) {
@@ -10102,9 +10177,22 @@ private:
         }
     }
 
-    static std::string symbol_with_addend(
-        const machine::SymbolOperand& source) {
-        auto result = assembly_symbol(source.name);
+    std::string assembly_symbol(std::string_view link_name) const {
+        return cross::assembly_symbol(format_, link_name);
+    }
+
+    // A symbol operand names a link symbol, or the assembler-local label of
+    // a label that is not global.
+    std::string operand_symbol(const machine::SymbolOperand& source) const {
+        if (source.label && !hir_.labels.at(source.label->value).is_global) {
+            return source.name;
+        }
+        return assembly_symbol(source.name);
+    }
+
+    std::string symbol_with_addend(
+        const machine::SymbolOperand& source) const {
+        auto result = operand_symbol(source);
         if (source.addend > 0) {
             result += '+' + std::to_string(source.addend);
         } else if (source.addend < 0) {
@@ -10209,7 +10297,7 @@ private:
     void materialize_symbol_address(
         const machine::SymbolOperand& source,
         std::string_view destination) {
-        const auto base = assembly_symbol(source.name);
+        const auto base = operand_symbol(source);
         if (const auto* object = symbol_object(source);
             object && object->is_thread_local) {
             if (format_ == ObjectFormat::Coff) {
@@ -10323,8 +10411,8 @@ private:
             return std::to_string(offset) + "(%rbp)";
         }
         if (dynamic_stack_) {
-            const auto relative =
-                static_cast<std::int64_t>(offset) - frame_size_;
+            const auto relative = static_cast<std::int64_t>(offset) -
+                frame_size_ - fixed_cfa_storage_;
             return std::to_string(relative) + "(%rbp)";
         }
         if (red_zone_storage_ != 0 && offset >= 0 &&
@@ -10350,7 +10438,7 @@ private:
         if (realigned_dynamic_frame_) {
             base = "rbp";
         } else if (dynamic_stack_) {
-            relative -= frame_size_;
+            relative -= frame_size_ + fixed_cfa_storage_;
             base = "rbp";
         } else if (red_zone_storage_ != 0) {
             relative += red_zone_base_;
@@ -10656,19 +10744,6 @@ private:
         for (const auto& candidate : function.blocks) {
             for (const auto& instruction : candidate.instructions) {
                 if (instruction.kind == machine::InstructionKind::Call) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    bool has_dynamic_stack(const machine::Function& function) const {
-        for (const auto& block : function.blocks) {
-            for (const auto& instruction : block.instructions) {
-                if (instruction.opcode == Opcode::StackSave ||
-                    instruction.opcode == Opcode::StackAllocate ||
-                    instruction.opcode == Opcode::StackRestore) {
                     return true;
                 }
             }
@@ -11025,7 +11100,7 @@ private:
                     "allocated callee-saved register has no frame slot");
                 continue;
             }
-            const bool fixed_cfa = realigned_stack_ && *slot < 0;
+            const bool fixed_cfa = *slot < 0;
             const auto address = fixed_cfa
                 ? fixed_cfa_memory(*slot)
                 : memory(*slot);
@@ -11058,7 +11133,8 @@ private:
                 const auto cfa_offset = fixed_cfa
                     ? static_cast<std::int64_t>(*slot) -
                           (realigned_dynamic_frame_ ? 24 : 16)
-                    : static_cast<std::int64_t>(*slot) - frame_size_ -
+                    : static_cast<std::int64_t>(*slot) + red_zone_base_ -
+                          frame_size_ -
                           (function.frame.has_frame_pointer ? 16 : 8);
                 output_ << ".cfi_offset %" << view->name << ", "
                         << cfa_offset << '\n';
@@ -11107,7 +11183,7 @@ private:
                 function,
                 "$callee.save." + std::string(view->storage_name));
             if (!slot) continue;
-            const auto address = realigned_stack_ && *slot < 0
+            const auto address = *slot < 0
                 ? fixed_cfa_memory(*slot)
                 : memory(*slot);
             if (view->register_class == RegisterClass::simd) {
@@ -11120,13 +11196,11 @@ private:
         }
     }
 
-    void save_hard_registers(const machine::Function& function,
-                             std::string_view prefix) {
+    // Hard-register objects keep their values across calls.
+    void save_hard_registers(const machine::Function& function) {
         for (const auto* view : hard_register_views(function)) {
             const auto slot = named_slot_offset(
-                function,
-                std::string(prefix) +
-                    std::string(view->storage_name));
+                function, "$hard.call." + std::string(view->storage_name));
             if (!slot) {
                 diagnostics_.error(
                     function.location,
@@ -11149,15 +11223,12 @@ private:
         }
     }
 
-    void restore_hard_registers(const machine::Function& function,
-                                std::string_view prefix) {
+    void restore_hard_registers(const machine::Function& function) {
         auto views = hard_register_views(function);
         for (auto item = views.rbegin(); item != views.rend(); ++item) {
             const auto* view = *item;
             const auto slot = named_slot_offset(
-                function,
-                std::string(prefix) +
-                    std::string(view->storage_name));
+                function, "$hard.call." + std::string(view->storage_name));
             if (!slot) continue;
             if (view->register_class == RegisterClass::simd) {
                 const auto xmm =
@@ -20296,10 +20367,10 @@ private:
                                "machine call has no ABI model");
             return;
         }
-        if (!tail) save_hard_registers(function, "$hard.call.");
+        if (!tail) save_hard_registers(function);
         if (entity && symbol &&
             !prepare_call_target(function, *entity, *symbol, value.location)) {
-            if (!tail) restore_hard_registers(function, "$hard.call.");
+            if (!tail) restore_hard_registers(function);
             return;
         }
         if (!entity) {
@@ -20310,7 +20381,7 @@ private:
             if (!target || !slot || tail) {
                 diagnostics_.error(value.location,
                                    "invalid indirect x86-64 call target");
-                if (!tail) restore_hard_registers(function, "$hard.call.");
+                if (!tail) restore_hard_registers(function);
                 return;
             }
             // Target capture happens before argument placement. The selected
@@ -20323,7 +20394,7 @@ private:
                 const auto scratch = named_slot_offset(function, "$indirect.call.capture");
                 if (!scratch) {
                     diagnostics_.error(value.location, "indirect call has no capture scratch slot");
-                    if (!tail) restore_hard_registers(function, "$hard.call.");
+                    if (!tail) restore_hard_registers(function);
                     return;
                 }
                 instruction("movq", "%rax, " + memory(*scratch));
@@ -20339,7 +20410,7 @@ private:
         if (const auto* manual = manual_plans_.find(value.direct_callee,
                                                     value.call_signature);
             manual && emit_manual_call(function, value, entity, *manual)) {
-            if (!tail) restore_hard_registers(function, "$hard.call.");
+            if (!tail) restore_hard_registers(function);
             return;
         }
         for (std::size_t index = 0; index < modes.size(); ++index) {
@@ -20372,7 +20443,7 @@ private:
             diagnostics_.error(value.location,
                                "x86-64 could not classify managed call "
                                "arguments");
-            if (!tail) restore_hard_registers(function, "$hard.call.");
+            if (!tail) restore_hard_registers(function);
             return;
         }
         struct CallRegisterCopy {
@@ -21018,7 +21089,7 @@ private:
                 }
             }
         }
-        restore_hard_registers(function, "$hard.call.");
+        restore_hard_registers(function);
     }
 
     std::string_view dynamic_tail_call_failure(
@@ -21868,9 +21939,10 @@ private:
         }
         if (realigned_stack_) {
             instruction("movq", "%rbp, %rsp");
-        } else if (frame_size_ != 0) {
-            instruction("addq", "$" + std::to_string(frame_size_) +
-                                    ", %rsp");
+        } else if (frame_size_ + fixed_cfa_storage_ != 0) {
+            instruction("addq",
+                        "$" + std::to_string(frame_size_ + fixed_cfa_storage_) +
+                            ", %rsp");
         }
         if (function.frame.has_frame_pointer && frame_pointer_save_size_ != 0) {
             instruction("popq", "%rbp");
@@ -21887,7 +21959,6 @@ private:
                               const machine::Instruction& value) {
         const auto* plan = manual_plans_.find(function.source);
         if (!plan) return false;
-        restore_hard_registers(function, "$hard.abi.");
         // Outputs come from frame homes; clear upper lanes before a wide
         // output register is written.
         if (uses_wide_vectors_) instruction("vzeroupper");
@@ -21966,7 +22037,6 @@ private:
     void emit_epilogue(const machine::Function& function,
                        const machine::Instruction& value) {
         if (emit_manual_epilogue(function, value)) return;
-        restore_hard_registers(function, "$hard.abi.");
         const auto& entity = hir_.function(function.source);
         // A result wider than 128 bits in a register keeps its upper lanes.
         bool wide_result = false;
@@ -23190,10 +23260,8 @@ private:
         const auto storage = function.frame.local_size;
         const auto red_zone = !compact_gpr_saves_ &&
             use_red_zone(function, entity, storage);
-        const auto fixed_cfa_storage =
-            realigned_stack_
-                ? fixed_cfa_save_size(function)
-                : 0U;
+        fixed_cfa_storage_ = fixed_cfa_save_size(function);
+        const auto fixed_cfa_storage = fixed_cfa_storage_;
         framed_ = machine::framed_blocks(function);
         if (function.frame.program) {
             frame_size_ = function.frame.program->stack_size - frame_pointer_save_size_;
@@ -23244,7 +23312,7 @@ private:
                                ".cfi_offset %rbp, -16\n";
                 }
                 instruction("movq", "%rsp, %rbp");
-                if (seh && !realigned_stack_) {
+                if (seh && !realigned_stack_ && fixed_cfa_storage == 0) {
                     output_ << ".seh_setframe %rbp, 0\n";
                 }
                 if (dwarf_cfi_enabled()) {
@@ -23268,8 +23336,9 @@ private:
                 frame_size_ < storage) {
                 frame_size_ = align_up(storage + 8U, 16U) - 8U;
             }
-            const bool fixed_cfa_realign_prologue = realigned_stack_;
-            if (fixed_cfa_realign_prologue) {
+            const bool fixed_cfa_prologue =
+                realigned_stack_ || fixed_cfa_storage != 0;
+            if (fixed_cfa_prologue) {
                 if (fixed_cfa_storage != 0) {
                     instruction("subq",
                                 "$" + std::to_string(fixed_cfa_storage) + ", %rsp");
@@ -23287,7 +23356,7 @@ private:
                 save_allocated_preserved_registers(function, seh);
                 // Win64 cannot encode an arbitrary stack-align instruction. The
                 // stable frame-register relationship and all fixed saves are
-                // complete here; the local aligned region begins after prologue.
+                // complete here; the local region begins after prologue.
                 if (seh)
                     output_ << ".seh_endprologue\n";
             }
@@ -23321,6 +23390,9 @@ private:
                 emit_probed_static_frame(function, realigned_dynamic_frame_
                                                        ? fixed_cfa_storage + 8U
                                                        : fixed_cfa_storage);
+                if (dwarf_cfi_enabled() && !function.frame.has_frame_pointer) {
+                    output_ << ".cfi_def_cfa_offset " << frame_size_ + 8U << '\n';
+                }
             } else if (realigned_stack_) {
                 if (frame_size_ != 0) {
                     instruction("subq", "$" +
@@ -23334,7 +23406,7 @@ private:
                                         ", %rsp");
             } else if (frame_size_ != 0) {
                 instruction("subq", "$" + std::to_string(frame_size_) + ", %rsp");
-                if (seh) {
+                if (seh && !fixed_cfa_prologue) {
                     output_ << ".seh_stackalloc " << frame_size_ << "\n";
                 }
                 if (dwarf_cfi_enabled() && !function.frame.has_frame_pointer) {
@@ -23354,7 +23426,7 @@ private:
                 instruction("movq", "%" + dynamic_frame_anchor_register_ + ", " +
                                         memory(*anchor));
             }
-            if (!fixed_cfa_realign_prologue) {
+            if (!fixed_cfa_prologue) {
                 save_allocated_preserved_registers(function, seh);
                 if (seh)
                     output_ << ".seh_endprologue\n";
@@ -23431,7 +23503,6 @@ private:
             }
         }
         emit_variadic_prologue(function, entity);
-        save_hard_registers(function, "$hard.abi.");
 
         copy_locations_.emplace(function);
         edge_temporaries_ = edge_offsets(function);
@@ -23488,6 +23559,8 @@ private:
     bool frame_pointer_active_{};
     bool realigned_stack_{};
     bool realigned_dynamic_frame_{};
+    // Bytes of callee-save homes kept directly below the RBP frame record.
+    std::uint32_t fixed_cfa_storage_{};
     bool compact_gpr_saves_{};
     bool compact_gpr_call_pad_{};
     bool uses_wide_vectors_{};

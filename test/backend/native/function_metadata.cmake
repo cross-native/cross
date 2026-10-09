@@ -52,7 +52,7 @@ compile_assembly(macho x86_64-apple-darwin)
 foreach(pattern
         "[.]section __TEXT,__text_hot,regular,pure_instructions"
         "[.]section __TEXT,__text_cold,regular,pure_instructions"
-        "[.]no_dead_strip metadata_cold")
+        "[.]no_dead_strip _metadata_cold")
     if(NOT macho MATCHES "${pattern}")
         message(FATAL_ERROR "Mach-O function metadata lacks ${pattern}\n${macho}")
     endif()

@@ -27,7 +27,7 @@ compile_assembly(binding_mips "${BINDING}" mips64el-unknown-elf binding-mips)
 foreach(pair
         "binding_elf;[.]weak cross_weak_function;[.]weak cross_weak_object"
         "binding_coff;[.]weak cross_weak_function;[.]weak cross_weak_object"
-        "binding_macho;[.]weak_definition cross_weak_function;[.]weak_definition cross_weak_object"
+        "binding_macho;[.]weak_definition _cross_weak_function;[.]weak_definition _cross_weak_object"
         "binding_mips;[.]weak cross_weak_function;[.]weak cross_weak_object")
     list(GET pair 0 variable)
     list(GET pair 1 function_pattern)
@@ -54,8 +54,8 @@ endforeach()
 
 compile_assembly(hidden_macho "${HIDDEN}" x86_64-apple-darwin hidden-macho)
 foreach(pattern
-        "[.]private_extern cross_hidden_function"
-        "[.]private_extern cross_hidden_object")
+        "[.]private_extern _cross_hidden_function"
+        "[.]private_extern _cross_hidden_object")
     if(NOT hidden_macho MATCHES "${pattern}")
         message(FATAL_ERROR "Mach-O lacks hidden symbol directive ${pattern}")
     endif()

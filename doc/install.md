@@ -71,7 +71,7 @@ run the output natively or under emulation. They use these external tools:
 
 | Tool | Used for |
 | --- | --- |
-| `llvm-mc`, `llvm-as`, `llvm-readobj`, `llvm-readelf`, `llvm-objcopy`, `llc`, `ld.lld` | Assembling, linking, and inspecting objects. |
+| `llvm-mc`, `llvm-as`, `llvm-readobj`, `llvm-readelf`, `llvm-dwarfdump`, `llvm-objcopy`, `llc`, `ld.lld` | Assembling, linking, and inspecting objects. |
 | The host C++ compiler and `gcc` | Linking generated x86-64 code into host test programs. |
 | `qemu-system-mips64`, `qemu-system-mips64el` | MIPS runtime tests; skipped when missing. |
 | Python 3.11 or later with pytest | Benchmark-driver tests; omitted when Python is missing. |

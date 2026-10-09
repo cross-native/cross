@@ -24,6 +24,11 @@ endfunction()
 foreach(target x86_64-unknown-linux-gnu x86_64-w64-windows-gnu
                x86_64-apple-darwin mips64el-unknown-elf)
     string(REPLACE "-" "_" suffix "${target}")
+    # Mach-O spells link names with a leading underscore.
+    set(prefix "")
+    if(target STREQUAL "x86_64-apple-darwin")
+        set(prefix "_")
+    endif()
     compile_assembly(alias_${suffix} "${ALIAS}" "${target}" alias-${suffix})
     foreach(pair
             "cross_alias_function;cross_alias_target_function"
@@ -31,7 +36,7 @@ foreach(target x86_64-unknown-linux-gnu x86_64-w64-windows-gnu
         list(GET pair 0 alias_name)
         list(GET pair 1 target_name)
         if(NOT "${alias_${suffix}}" MATCHES
-           "[.]set ${alias_name},${target_name}")
+           "[.]set ${prefix}${alias_name},${prefix}${target_name}")
             message(FATAL_ERROR
                 "${target} lacks alias ${alias_name}\n${alias_${suffix}}")
         endif()
@@ -40,7 +45,7 @@ foreach(target x86_64-unknown-linux-gnu x86_64-w64-windows-gnu
                      weakref-${suffix})
     foreach(name cross_optional_function cross_optional_object)
         if(target STREQUAL "x86_64-apple-darwin")
-            set(pattern "[.]weak_reference ${name}")
+            set(pattern "[.]weak_reference _${name}")
         else()
             set(pattern "[.]weak ${name}")
         endif()

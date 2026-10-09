@@ -25,22 +25,6 @@ bool safe_assembly_text(std::string_view text) {
            });
 }
 
-std::string quoted(std::string_view value) {
-    return '"' + std::string(value) + '"';
-}
-
-std::string symbol(std::string_view name) {
-    const bool simple =
-        !name.empty() &&
-        std::all_of(name.begin(), name.end(), [](unsigned char ch) {
-            return (ch >= 'a' && ch <= 'z') ||
-                   (ch >= 'A' && ch <= 'Z') ||
-                   (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' ||
-                   ch == '$';
-        });
-    return simple ? std::string(name) : quoted(name);
-}
-
 AssemblySymbolVisibility assembly_visibility(
     hir::SymbolVisibility visibility) {
     switch (visibility) {
@@ -145,8 +129,8 @@ private:
                 "alias link name cannot be represented by the selected assembler");
             return;
         }
-        const auto alias = symbol(alias_name);
-        const auto target = symbol(target_name);
+        const auto alias = assembly_symbol(format_, alias_name);
+        const auto target = assembly_symbol(format_, target_name);
         std::string error;
         const auto directives = assembly_symbol_directives(
             format_, {alias, true, true, weak,
@@ -184,7 +168,7 @@ private:
                 "weakref link name cannot be represented by the selected assembler");
             return;
         }
-        const auto name = symbol(target);
+        const auto name = assembly_symbol(format_, target);
         std::string error;
         const auto directives = assembly_symbol_directives(
             format_, {name, true, false, true,
@@ -320,14 +304,17 @@ private:
     std::string address(const data::AddressConstant& address) const {
         std::string result;
         if (address.kind == data::AddressKind::Object) {
-            result = symbol(module_.hir().object(*address.object).link_symbol);
+            result = assembly_symbol(
+                format_, module_.hir().object(*address.object).link_symbol);
         } else if (address.kind == data::AddressKind::Function) {
-            result = symbol(module_.hir().function(*address.function).link_symbol);
+            result = assembly_symbol(
+                format_,
+                module_.hir().function(*address.function).link_symbol);
         } else {
             const auto& label =
                 module_.hir().labels.at(address.label->value);
             result = label.is_global
-                         ? symbol(label.link_symbol)
+                         ? assembly_symbol(format_, label.link_symbol)
                          : ".Lcross.label." +
                                std::to_string(address.function->value) + '.' +
                                std::to_string(address.label->value);
@@ -523,7 +510,7 @@ private:
 
     void emit_object(const data::Object& object) {
         const auto& entity = module_.hir().object(object.source);
-        const auto name = symbol(entity.link_symbol);
+        const auto name = assembly_symbol(format_, entity.link_symbol);
         if (object.initializer == data::InitializerKind::Declaration) {
             if (entity.alias_target) return;
             out_ << ".extern " << name << '\n';

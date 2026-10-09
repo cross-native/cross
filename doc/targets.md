@@ -28,8 +28,11 @@ An alias must name a compatible definition in the same compilation.
 forces emission. `[[no_stack_protector]]` and `[[no_sanitize("name")]]` are
 accepted; Cross generates neither kind of instrumentation.
 
-Mach-O output does not prefix symbol names with an underscore, so a C symbol
-needs its full name, as in `[[link_name("_write")]]`.
+Mach-O output spells every link name with the leading underscore of C symbols
+on that format, so `[[link_name("write")]]` refers to the C function `write`
+(object-file symbol `_write`) and a definition of `app::run` defines
+`_app::run`. ELF and COFF use link names unchanged. Mach-O cannot hold a
+`global label` in a function with unwind tables.
 
 `-funwind-tables` (or `-fasynchronous-unwind-tables`) emits CFI or SEH unwind
 records; no unwinder is linked. By default functions assume nothing unwinds

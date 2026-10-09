@@ -235,4 +235,10 @@ bool assembly_uses_dwarf_cfi(ObjectFormat format) {
     return format == ObjectFormat::Elf || format == ObjectFormat::MachO;
 }
 
+std::string assembly_symbol(ObjectFormat format, std::string_view link_name) {
+    return assembly_name(format == ObjectFormat::MachO
+                             ? '_' + std::string(link_name)
+                             : std::string(link_name));
+}
+
 } // namespace cross
