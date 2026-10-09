@@ -273,6 +273,11 @@ VariadicStateValue variadic_state_value(
     std::span<const AbiCursorUsage> named_cursors,
     std::size_t variadic_stack_offset);
 
+// The low bits of a general register that a call under `abi` preserves when
+// its call_clobbers omit the register: no more than the narrowest
+// "integer" bank carries, on a CPU whose registers have `register_bits`.
+unsigned preserved_integer_bits(const AbiEntry& abi, unsigned register_bits);
+
 constexpr std::size_t callee_stack_offset(const ValuePiece& piece,
                                           const AbiEntry& abi) {
     return piece.location.stack_offset + abi.return_address_bytes;

@@ -1222,4 +1222,13 @@ VariadicStateValue variadic_state_value(
                 state.base};
 }
 
+unsigned preserved_integer_bits(const AbiEntry& abi, unsigned register_bits) {
+    for (const auto& bank : abi.banks) {
+        if (bank.register_class == "integer") {
+            register_bits = std::min(register_bits, bank.register_bits);
+        }
+    }
+    return register_bits;
+}
+
 } // namespace cross

@@ -1680,21 +1680,16 @@ private:
     // as its ABI's narrowest integer bank has: 32 under o32 and cross32, even
     // on a MIPS III CPU whose GPRs have 64.
     unsigned call_preserved_gpr_bits(const machine::Instruction& call) const {
-        if (!subtarget_.has_feature(Feature::Mips3)) return 32U;
-        unsigned bits = 64U;
+        const unsigned register_bits =
+            subtarget_.has_feature(Feature::Mips3) ? 64U : 32U;
         const auto signature = hir::call_signature(
             hir_, call.direct_callee, call.call_signature);
         const auto* abi = call.direct_callee
             ? managed_abi_model(hir_, hir_.function(*call.direct_callee),
                                 subtarget_, options_)
             : signature ? abi_model(signature->abi) : nullptr;
-        if (!abi) return bits;
-        for (const auto& bank : abi->banks) {
-            if (bank.register_class == "integer") {
-                bits = std::min(bits, bank.register_bits);
-            }
-        }
-        return bits;
+        return abi ? preserved_integer_bits(*abi, register_bits)
+                   : register_bits;
     }
 
     bool allocate_registers(machine::Function& function) {

@@ -3042,6 +3042,73 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_parallel_copy PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.register_allocation;opt.Oz")
+    if(WIN32)
+        set(scratch_host_abi ms_abi)
+    else()
+        set(scratch_host_abi sysv_abi)
+    endif()
+    foreach(level O0 O2)
+        foreach(abi ms_abi cross)
+            set(scratch_flags -${level} -mabi=${abi} "-DHOST_ABI=\"${scratch_host_abi}\"")
+            add_test(NAME cross_runtime_native_implicit_scratch_${level}_${abi}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/implicit_scratch.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-implicit-scratch-${level}-${abi}
+                        -DENTRY=implicit_scratch_entry
+                        -DEXPECTED=63
+                        "-DCC_FLAGS=${scratch_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_native_implicit_scratch_${level}_${abi} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.register_allocation;feature.abi;opt.${level}")
+            add_test(NAME cross_runtime_native_argument_cycle_${level}_${abi}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/argument_cycle.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-argument-cycle-${level}-${abi}
+                        -DENTRY=argument_cycle_entry
+                        -DEXPECTED=4
+                        "-DCC_FLAGS=${scratch_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_native_argument_cycle_${level}_${abi} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.register_allocation;feature.abi;opt.${level}")
+        endforeach()
+        set(narrow_model "--model=${CMAKE_SOURCE_DIR}/test/model/narrow32.y")
+        foreach(abi narrow32 narrow32_partial)
+            set(narrow_flags -${level} ${narrow_model} -mabi=${abi} "-DHOST_ABI=\"${scratch_host_abi}\"")
+            add_test(NAME cross_runtime_native_narrow_bank_${level}_${abi}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/narrow_bank.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-narrow-bank-${level}-${abi}
+                        -DENTRY=narrow_entry
+                        -DEXPECTED=127
+                        "-DCC_FLAGS=${narrow_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_native_narrow_bank_${level}_${abi} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;opt.${level};profile.custom")
+        endforeach()
+        set(narrow_flags -${level} ${narrow_model} "-DHOST_ABI=\"${scratch_host_abi}\"")
+        add_test(NAME cross_runtime_native_narrow_bank_preserved_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/narrow_bank_preserved.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-narrow-bank-preserved-${level}
+                    -DENTRY=narrow_preserve_entry
+                    -DEXPECTED=3
+                    "-DCC_FLAGS=${narrow_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_narrow_bank_preserved_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.register_allocation;opt.${level};profile.custom")
+    endforeach()
     add_test(NAME cross_runtime_native_if_conversion
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -3517,6 +3584,19 @@ if(BUILD_TESTING)
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_native_int128_f80_${level} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;opt.${level}")
+        add_test(NAME cross_runtime_native_int128_float_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/conversion/int128_float.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-int128-float-${level}
+                    -DENTRY=int128_float_entry
+                    -DEXPECTED=180
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_int128_float_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;feature.integer128;opt.${level}")
     endforeach()
     add_test(NAME cross_arrays
         COMMAND $<TARGET_FILE:cross_cc> -S -O2

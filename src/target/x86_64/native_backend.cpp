@@ -125,6 +125,36 @@ const AbiEntry* abi_model(AbiId abi) {
     return model && model->architecture == "x86-64" ? model : nullptr;
 }
 
+// The low bits of the general registers its call_clobbers omit that a
+// function preserves. A function with a dynamic plan is compiled here and
+// saves whole registers.
+unsigned preserved_integer_bits(const hir::Module& module,
+                                const DynamicAbiPlans& dynamic_plans,
+                                std::optional<hir::FunctionId> direct,
+                                std::optional<hir::TypeId> signature) {
+    if (direct && dynamic_plans.find(*direct)) return 64U;
+    const auto callee = hir::call_signature(module, direct, signature);
+    const auto* abi = callee ? abi_model(callee->abi) : nullptr;
+    return abi ? preserved_integer_bits(*abi, 64U) : 64U;
+}
+
+// The general registers whose upper bits a call under a narrow integer bank
+// may change: all but the stack and frame pointers.
+const std::unordered_set<std::uint32_t>& partially_preserved_registers() {
+    static const auto result = [] {
+        std::unordered_set<std::uint32_t> storage;
+        for (const auto* name :
+             {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",
+              "r11", "r12", "r13", "r14", "r15"}) {
+            if (const auto* view = find_register_view(name)) {
+                storage.insert(view->storage_id);
+            }
+        }
+        return storage;
+    }();
+    return result;
+}
+
 const RegisterView* canonical_storage_view(
     machine::PhysicalRegisterId physical) {
     const auto& views = register_views();
@@ -651,6 +681,8 @@ private:
 struct ParameterStoragePlan {
     std::unordered_set<std::uint16_t> used;
     std::vector<std::optional<std::uint16_t>> direct;
+    // A direct value in several pieces is assembled in its frame home.
+    std::vector<bool> split;
     std::vector<bool> scratch_free_capture;
     bool needs_capture_scratch{};
 };
@@ -1000,6 +1032,34 @@ private:
                         continue;
                     }
                     required.insert(view->storage_id);
+                }
+            }
+        }
+        // A callee under a narrower integer bank may change the upper bits
+        // of registers this function's callers expect whole.
+        const auto own_bits = preserved_integer_bits(
+            hir_, dynamic_plans_, current_.source, std::nullopt);
+        const bool narrow_call = std::any_of(
+            current_.blocks.begin(), current_.blocks.end(),
+            [&](const machine::Block& block) {
+                return std::any_of(
+                    block.instructions.begin(), block.instructions.end(),
+                    [&](const machine::Instruction& instruction) {
+                        return instruction.kind ==
+                                   machine::InstructionKind::Call &&
+                               preserved_integer_bits(
+                                   hir_, dynamic_plans_,
+                                   instruction.direct_callee,
+                                   instruction.call_signature) < own_bits;
+                    });
+            });
+        if (narrow_call) {
+            for (const auto storage : partially_preserved_registers()) {
+                const auto* view = canonical_storage_view(
+                    machine::PhysicalRegisterId{storage});
+                if (view && !(anchor && anchor->value == storage) &&
+                    !current_function_may_clobber(*view)) {
+                    required.insert(storage);
                 }
             }
         }
@@ -7063,10 +7123,162 @@ private:
                 }
             }
         }
+        const auto has_operand_of_class =
+            [&](const machine::Instruction& instruction,
+                machine::VirtualRegisterClass value_class) {
+                const auto matches = [&](const machine::Register& reg) {
+                    return reg.kind == machine::RegisterKind::Virtual &&
+                           reg.id < count &&
+                           current_.virtual_register_classes[reg.id] ==
+                               value_class;
+                };
+                return std::any_of(instruction.uses.begin(),
+                                   instruction.uses.end(), matches) ||
+                       std::any_of(instruction.defs.begin(),
+                                   instruction.defs.end(), matches);
+            };
+        // The narrow leaf proof below admits RAX/RCX as general colors only
+        // when every instruction passes this test.
+        const auto leaf_scratch_free =
+            [&](const machine::Instruction& instruction) {
+                if (has_operand_of_class(
+                        instruction, machine::VirtualRegisterClass::Memory)) {
+                    return false;
+                }
+                if (instruction.kind != machine::InstructionKind::Target) {
+                    if (instruction.kind == machine::InstructionKind::Call) {
+                        if (!instruction.direct_callee) return false;
+                        const auto* dynamic =
+                            dynamic_plans_.find(*instruction.direct_callee);
+                        if (!dynamic ||
+                            dynamic->call.outgoing_area_size != 0 ||
+                            instruction.call_argument_types.size() + 1U !=
+                                instruction.operands.size()) {
+                            return false;
+                        }
+                        for (std::size_t index = 0;
+                             index < instruction.call_argument_types.size();
+                             ++index) {
+                            const auto type =
+                                instruction.call_argument_types[index];
+                            if (is_aggregate(hir_, type) ||
+                                is_vector(hir_, type) ||
+                                is_floating(hir_, type) ||
+                                type_bits(hir_, type) > 64 ||
+                                !std::holds_alternative<
+                                    machine::RegisterOperand>(
+                                    instruction.operands[index + 1U])) {
+                                return false;
+                            }
+                        }
+                        // Direct scalar dynamic calls express their integer
+                        // clobbers and endpoint copies explicitly; their
+                        // only cycle scratch is XMM2.
+                        return true;
+                    }
+                    const bool jump_table =
+                        instruction.kind ==
+                            machine::InstructionKind::IndirectBranch &&
+                        instruction.operands.size() >= 2 &&
+                        std::holds_alternative<machine::ImmediateOperand>(
+                            instruction.operands[1]);
+                    return instruction.kind !=
+                               machine::InstructionKind::IndirectBranch ||
+                           jump_table;
+                }
+                const auto base = binary_base_opcode(instruction.opcode);
+                if (instruction.opcode == Opcode::Parameter ||
+                    instruction.opcode == Opcode::Constant ||
+                    instruction.opcode == Opcode::Fconstant ||
+                    instruction.opcode == Opcode::Fphi ||
+                    instruction.opcode == Opcode::FindexedLoad ||
+                    base == Opcode::Fadd || base == Opcode::Fsub ||
+                    base == Opcode::Fmul || base == Opcode::Fdiv ||
+                    instruction.opcode == Opcode::Expect ||
+                    instruction.opcode == Opcode::Select ||
+                    instruction.opcode == Opcode::IntrinsicNoop ||
+                    instruction.opcode == Opcode::Phi ||
+                    instruction.opcode == Opcode::LifetimeStart ||
+                    instruction.opcode == Opcode::LifetimeEnd ||
+                    instruction.opcode == Opcode::IndexedLoad ||
+                    instruction.opcode == Opcode::IndexedStore ||
+                    instruction.opcode == Opcode::FindexedStore ||
+                    base == Opcode::Add || base == Opcode::Sub ||
+                    base == Opcode::Mul || base == Opcode::And ||
+                    base == Opcode::Or || base == Opcode::Xor ||
+                    base == Opcode::Shl || base == Opcode::ShrS ||
+                    base == Opcode::ShrU || base == Opcode::Rotl ||
+                    base == Opcode::Rotr ||
+                    instruction.opcode == Opcode::Sdiv ||
+                    instruction.opcode == Opcode::Udiv ||
+                    instruction.opcode == Opcode::Srem ||
+                    instruction.opcode == Opcode::Urem ||
+                    instruction.opcode == Opcode::Sdivrem ||
+                    instruction.opcode == Opcode::Udivrem ||
+                    instruction.opcode == Opcode::Mulhs ||
+                    instruction.opcode == Opcode::Mulhu ||
+                    has_property(base, OpcodeProperty::Comparison) ||
+                    instruction.opcode == Opcode::Vphi ||
+                    instruction.opcode == Opcode::VsignMask ||
+                    instruction.opcode == Opcode::Vsplat ||
+                    instruction.opcode == Opcode::Vadd ||
+                    instruction.opcode == Opcode::Vsub ||
+                    instruction.opcode == Opcode::Vxor ||
+                    instruction.opcode == Opcode::Vmul ||
+                    instruction.opcode == Opcode::VmulImm ||
+                    instruction.opcode == Opcode::Vsdiv ||
+                    instruction.opcode == Opcode::VindexedLoad ||
+                    instruction.opcode == Opcode::VindexedStore ||
+                    instruction.opcode == Opcode::Vload ||
+                    instruction.opcode == Opcode::Vstore ||
+                    has_property(instruction.opcode,
+                                 OpcodeProperty::Reduction) ||
+                    instruction.opcode == Opcode::Vextract) {
+                    return true;
+                }
+                if (instruction.opcode == Opcode::Vxor) {
+                    return instruction.uses.size() == 2 &&
+                           instruction.uses[0] == instruction.uses[1];
+                }
+                if (instruction.opcode == Opcode::VsplatConstant &&
+                    instruction.operands.size() >= 2) {
+                    const auto* shape =
+                        std::get_if<machine::ImmediateOperand>(
+                            &instruction.operands.back());
+                    return shape && (shape->high & (1ULL << 32U)) == 0;
+                }
+                return false;
+            };
+        // Besides the leaf set, these expansions write RAX/RCX only as their
+        // own result or to stage a home-resident operand, which the scratch
+        // audit after coloring covers. Every other expansion may write
+        // either register implicitly.
+        const auto scratch_only_for_homes =
+            [&](const machine::Instruction& instruction) {
+                if (leaf_scratch_free(instruction)) return true;
+                if (instruction.kind != machine::InstructionKind::Target ||
+                    has_operand_of_class(
+                        instruction, machine::VirtualRegisterClass::Memory)) {
+                    return false;
+                }
+                if (instruction.opcode == Opcode::Reinterpret) {
+                    return !has_operand_of_class(
+                        instruction, machine::VirtualRegisterClass::Floating);
+                }
+                return instruction.opcode == Opcode::Zext ||
+                       instruction.opcode == Opcode::Sext ||
+                       instruction.opcode == Opcode::Trunc ||
+                       instruction.opcode == Opcode::Neg ||
+                       instruction.opcode == Opcode::Not ||
+                       instruction.opcode == Opcode::Iszero ||
+                       instruction.opcode == Opcode::StackAddress ||
+                       instruction.opcode == Opcode::LabelAddress;
+            };
         std::vector<std::unordered_set<std::uint32_t>> forbidden(count);
         // Colors a crossed call clobbers. A value may still take one and be
         // split through its home around that call.
         std::vector<std::unordered_set<std::uint32_t>> call_forbidden(count);
+        const auto& partially_preserved = partially_preserved_registers();
         for (const auto& block : current_.blocks) {
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
@@ -7146,13 +7358,21 @@ private:
                         }
                     }
                 }
-                const bool scalar_rotate =
+                const bool legacy_shift =
+                    (item->opcode == Opcode::Shl ||
+                     item->opcode == Opcode::ShrS ||
+                     item->opcode == Opcode::ShrU) &&
+                    !item->uses.empty() &&
+                    !(item->uses.front().mode.bits >= 32 &&
+                      subtarget_.has_feature(Feature::Bmi2));
+                const bool count_in_cl =
                     item->opcode == Opcode::Rotl ||
-                    item->opcode == Opcode::Rotr;
-                if (scalar_rotate && rcx) {
-                    // Variable rotates use CL. The count may already reside
-                    // there, but neither the destructive result nor a value
-                    // live across the rotate may occupy RCX.
+                    item->opcode == Opcode::Rotr || legacy_shift;
+                if (count_in_cl && rcx) {
+                    // Variable rotates, and shifts without a BMI2 form, use
+                    // CL. The count may already reside there, but neither the
+                    // destructive result nor a value live across the
+                    // operation may occupy RCX.
                     for (const auto id : live) {
                         if (id < count) {
                             forbidden[id].insert(rcx->storage_id);
@@ -7174,6 +7394,31 @@ private:
                         // reside in RCX.
                         forbidden[item->uses.front().id].insert(
                             rcx->storage_id);
+                    }
+                }
+                if (!scratch_only_for_homes(*item) && rax && rcx) {
+                    // The emitter may write RAX or RCX before it reads the
+                    // operands or computes the result. A phi's copies run on
+                    // the incoming edge together with the block's other phis.
+                    const auto forbid_scratch = [&](std::uint32_t id) {
+                        if (id >= count) return;
+                        forbidden[id].insert(rax->storage_id);
+                        forbidden[id].insert(rcx->storage_id);
+                    };
+                    const auto forbid_virtual = [&](machine::Register reg) {
+                        if (reg.kind == machine::RegisterKind::Virtual) {
+                            forbid_scratch(reg.id);
+                        }
+                    };
+                    for (const auto id : live) forbid_scratch(id);
+                    for (const auto& use : item->uses) forbid_virtual(use);
+                    if (phi) {
+                        for (const auto& other : block.instructions) {
+                            if (!is_phi(other)) continue;
+                            for (const auto& reg : other.defs) {
+                                forbid_virtual(reg);
+                            }
+                        }
                     }
                 }
                 const bool uses_wide_integer_scratch =
@@ -7279,6 +7524,23 @@ private:
                                 forbidden[definition.id].insert(clobber.id);
                             }
                         }
+                    }
+                }
+                if (item->kind == machine::InstructionKind::Call) {
+                    // A value wider than the general-register bits the call
+                    // preserves is split around it like a clobbered one.
+                    const auto preserved_bits = preserved_integer_bits(
+                        hir_, dynamic_plans_, item->direct_callee,
+                        item->call_signature);
+                    for (const auto id : live) {
+                        if (id >= count ||
+                            current_.virtual_registers[id].bits <=
+                                preserved_bits) {
+                            continue;
+                        }
+                        call_forbidden[id].insert(
+                            partially_preserved.begin(),
+                            partially_preserved.end());
                     }
                 }
                 if (!phi) {
@@ -7836,136 +8098,12 @@ private:
         // indexed kernels while preserving the conservative fallback for
         // general code until every fixed-register use is explicit Machine IR.
         const bool integer_opcode_set_safe = std::all_of(
-                current_.blocks.begin(), current_.blocks.end(),
-                [&](const machine::Block& block) {
-                    return std::all_of(
-                        block.instructions.begin(),
-                        block.instructions.end(),
-                        [&](const machine::Instruction& instruction) {
-                            if (instruction.kind !=
-                                    machine::InstructionKind::Target) {
-                                if (instruction.kind ==
-                                        machine::InstructionKind::Call) {
-                                    if (!instruction.direct_callee) {
-                                        return false;
-                                    }
-                                    const auto* dynamic =
-                                        dynamic_plans_.find(
-                                            *instruction.direct_callee);
-                                    if (!dynamic ||
-                                        dynamic->call.outgoing_area_size != 0 ||
-                                        instruction.call_argument_types.size() +
-                                                1U !=
-                                            instruction.operands.size()) {
-                                        return false;
-                                    }
-                                    for (std::size_t index = 0;
-                                         index < instruction
-                                                     .call_argument_types
-                                                     .size();
-                                         ++index) {
-                                        const auto type = instruction
-                                            .call_argument_types[index];
-                                        if (is_aggregate(hir_, type) ||
-                                            is_vector(hir_, type) ||
-                                            is_floating(hir_, type) ||
-                                            type_bits(hir_, type) > 64 ||
-                                            !std::holds_alternative<
-                                                machine::RegisterOperand>(
-                                                instruction.operands[
-                                                    index + 1U])) {
-                                            return false;
-                                        }
-                                    }
-                                    // Direct scalar dynamic calls express
-                                    // their integer clobbers and endpoint
-                                    // copies explicitly; their only cycle
-                                    // scratch is XMM2.
-                                    return true;
-                                }
-                                const bool jump_table =
-                                    instruction.kind ==
-                                        machine::InstructionKind::IndirectBranch &&
-                                    instruction.operands.size() >= 2 &&
-                                    std::holds_alternative<
-                                        machine::ImmediateOperand>(
-                                            instruction.operands[1]);
-                                return (instruction.kind !=
-                                         machine::InstructionKind::IndirectBranch ||
-                                     jump_table);
-                            }
-                            const auto base =
-                                binary_base_opcode(instruction.opcode);
-                            if (instruction.opcode == Opcode::Parameter ||
-                                instruction.opcode == Opcode::Constant ||
-                                instruction.opcode == Opcode::Fconstant ||
-                                instruction.opcode == Opcode::Fphi ||
-                                instruction.opcode == Opcode::FindexedLoad ||
-                                base == Opcode::Fadd ||
-                                base == Opcode::Fsub ||
-                                base == Opcode::Fmul ||
-                                base == Opcode::Fdiv ||
-                                instruction.opcode == Opcode::Expect ||
-                                instruction.opcode == Opcode::Select ||
-                                instruction.opcode == Opcode::IntrinsicNoop ||
-                                instruction.opcode == Opcode::Phi ||
-                                instruction.opcode == Opcode::LifetimeStart ||
-                                instruction.opcode == Opcode::LifetimeEnd ||
-                                instruction.opcode == Opcode::IndexedLoad ||
-                                instruction.opcode == Opcode::IndexedStore ||
-                                instruction.opcode == Opcode::FindexedStore ||
-                                base == Opcode::Add || base == Opcode::Sub ||
-                                base == Opcode::Mul || base == Opcode::And ||
-                                base == Opcode::Or || base == Opcode::Xor ||
-                                base == Opcode::Shl || base == Opcode::ShrS ||
-                                base == Opcode::ShrU ||
-                                base == Opcode::Rotl ||
-                                base == Opcode::Rotr ||
-                                instruction.opcode == Opcode::Sdiv ||
-                                instruction.opcode == Opcode::Udiv ||
-                                instruction.opcode == Opcode::Srem ||
-                                instruction.opcode == Opcode::Urem ||
-                                instruction.opcode == Opcode::Sdivrem ||
-                                instruction.opcode == Opcode::Udivrem ||
-                                instruction.opcode == Opcode::Mulhs ||
-                                instruction.opcode == Opcode::Mulhu ||
-                                has_property(base,
-                                             OpcodeProperty::Comparison) ||
-                                instruction.opcode == Opcode::Vphi ||
-                                instruction.opcode == Opcode::VsignMask ||
-                                instruction.opcode == Opcode::Vsplat ||
-                                instruction.opcode == Opcode::Vadd ||
-                                instruction.opcode == Opcode::Vsub ||
-                                instruction.opcode == Opcode::Vxor ||
-                                instruction.opcode == Opcode::Vmul ||
-                                instruction.opcode == Opcode::VmulImm ||
-                                instruction.opcode == Opcode::Vsdiv ||
-                                instruction.opcode == Opcode::VindexedLoad ||
-                                instruction.opcode == Opcode::VindexedStore ||
-                                instruction.opcode == Opcode::Vload ||
-                                instruction.opcode == Opcode::Vstore ||
-                                has_property(instruction.opcode,
-                                             OpcodeProperty::Reduction) ||
-                                instruction.opcode == Opcode::Vextract) {
-                                return true;
-                            }
-                            if (instruction.opcode == Opcode::Vxor) {
-                                return instruction.uses.size() == 2 &&
-                                       instruction.uses[0] ==
-                                           instruction.uses[1];
-                            }
-                            if (instruction.opcode ==
-                                    Opcode::VsplatConstant &&
-                                instruction.operands.size() >= 2) {
-                                const auto* shape =
-                                    std::get_if<machine::ImmediateOperand>(
-                                        &instruction.operands.back());
-                                return shape &&
-                                       (shape->high & (1ULL << 32U)) == 0;
-                            }
-                            return false;
-                        });
-                });
+            current_.blocks.begin(), current_.blocks.end(),
+            [&](const machine::Block& block) {
+                return std::all_of(block.instructions.begin(),
+                                   block.instructions.end(),
+                                   leaf_scratch_free);
+            });
         const bool dynamic_integer_endpoint_safe =
             dynamic_function_plan && direct_result_view &&
             direct_result_view->register_class == RegisterClass::integer &&
@@ -8563,13 +8701,13 @@ private:
         {
             // Fixed call/result endpoint affinity can assign RAX/RCX even
             // when the opcode-set audit did not admit them as general colors.
-            // Any scalar fallback home still needs those emitter scratches;
+            // Any scalar fallback home, including that of a value never
+            // eligible for a register, still needs those emitter scratches;
             // audit all assignments, not only the extra-color path.
             bool unassigned_integer = false;
             for (std::uint32_t id = 0; id < count; ++id) {
                 if (current_.virtual_register_classes[id] ==
                         machine::VirtualRegisterClass::Integer &&
-                    eligible[id] &&
                     !current_.rematerialized_immediates[id] &&
                     !current_.virtual_register_assignments[id]) {
                     unassigned_integer = true;
@@ -8741,6 +8879,9 @@ private:
                     }
                 }
                 if (item->kind == machine::InstructionKind::Call) {
+                    const auto preserved_bits = preserved_integer_bits(
+                        hir_, dynamic_plans_, item->direct_callee,
+                        item->call_signature);
                     std::vector<std::uint32_t> ids(live.begin(), live.end());
                     std::sort(ids.begin(), ids.end());
                     for (const auto id : ids) {
@@ -8756,7 +8897,10 @@ private:
                                 return clobber.kind ==
                                            machine::RegisterKind::Physical &&
                                        clobber.id == assigned.value;
-                            });
+                            }) ||
+                            (current_.virtual_registers[id].bits >
+                                 preserved_bits &&
+                             partially_preserved.contains(assigned.value));
                         if (call_clobbers_assignment) {
                             item->live_across_call.push_back(
                                 machine::Register::virtual_register(
@@ -8776,6 +8920,7 @@ private:
     }
 
     void finalize_frame() {
+        std::unordered_set<std::uint32_t> split_homes;
         std::size_t largest_outgoing = 0;
         std::size_t largest_outgoing_alignment = 16;
         bool has_call = false;
@@ -8872,6 +9017,57 @@ private:
                 largest_outgoing_alignment = std::max(
                     largest_outgoing_alignment,
                     layout.layout.call.outgoing_area_alignment);
+                const auto& placed = layout.layout.call.arguments;
+                for (std::size_t index = 0; index < placed.size() &&
+                         index + 1U < instruction.operands.size();
+                     ++index) {
+                    const auto* operand =
+                        std::get_if<machine::RegisterOperand>(
+                            &instruction.operands[index + 1U]);
+                    if (operand && !placed[index].indirect &&
+                        placed[index].pieces.size() > 1) {
+                        split_homes.insert(operand->value.id);
+                    }
+                }
+                if (!instruction.defs.empty() &&
+                    !layout.layout.results.empty() &&
+                    !layout.layout.results.front().indirect &&
+                    layout.layout.results.front().pieces.size() > 1) {
+                    split_homes.insert(instruction.defs.front().id);
+                }
+            }
+        }
+        // A scalar transported in several pieces is assembled and taken
+        // apart in its frame home, even when it has a register.
+        const auto& entity = hir_.function(current_.source);
+        if (!manual_plans_.find(current_.source)) {
+            const auto incoming = parameter_storage_plan(
+                hir_, current_.source, dynamic_plans_, subtarget_);
+            const auto result = dynamic_plans_.find(current_.source)
+                ? std::optional<ReturnAssignment>{}
+                : classify_function_result(hir_, entity, subtarget_);
+            const bool split_result = result && *result &&
+                !result->indirect && result->pieces.size() > 1;
+            for (const auto& block : current_.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.opcode == Opcode::Parameter &&
+                        !instruction.operands.empty() &&
+                        !instruction.defs.empty()) {
+                        const auto index = static_cast<std::size_t>(
+                            std::get<machine::ImmediateOperand>(
+                                instruction.operands.front()).value);
+                        if (index < incoming.split.size() &&
+                            incoming.split[index]) {
+                            split_homes.insert(instruction.defs.front().id);
+                        }
+                    }
+                    if (split_result &&
+                        instruction.kind ==
+                            machine::InstructionKind::Return &&
+                        !instruction.uses.empty()) {
+                        split_homes.insert(instruction.uses.front().id);
+                    }
+                }
             }
         }
         current_.frame.outgoing_argument_size = static_cast<std::uint32_t>(
@@ -8923,7 +9119,8 @@ private:
                      .at(slot.spill_for->value) ||
                  current_.rematerialized_immediates
                      .at(slot.spill_for->value)) &&
-                !call_live_homes.contains(slot.spill_for->value)) {
+                !call_live_homes.contains(slot.spill_for->value) &&
+                !split_homes.contains(slot.spill_for->value)) {
                 slot.frame_offset.reset();
                 slot.elided = true;
             }
@@ -9654,6 +9851,7 @@ ParameterStoragePlan parameter_storage_plan(
     ParameterStoragePlan result;
     const auto& entity = hir_module.function(function);
     result.direct.resize(entity.parameters.size());
+    result.split.resize(entity.parameters.size());
     result.scratch_free_capture.resize(entity.parameters.size());
     const auto* abi = abi_model(entity.abi);
     if (!abi) return result;
@@ -9691,7 +9889,11 @@ ParameterStoragePlan parameter_storage_plan(
         if (index >= entity.parameters.size() ||
             (entity.parameters[index].mode != ParameterMode::In &&
              !pointer_transport) ||
-            location.indirect || location.pieces.size() != 1 ||
+            location.indirect) {
+            continue;
+        }
+        result.split[index] = location.pieces.size() > 1;
+        if (location.pieces.size() != 1 ||
             !location.pieces.front().in_register) {
             continue;
         }
@@ -11328,6 +11530,28 @@ private:
         instruction("mov" + std::string(1, suffix(target.mode.bits)),
                     register_name(low, target.mode.bits) + ", " +
                         memory(offset));
+    }
+
+    // A scalar integer or pointer that its ABI cuts into several pieces is
+    // assembled and taken apart in its frame home, like a 128-bit integer.
+    static bool split_scalar(const machine::Function& function,
+                             machine::Register value, std::size_t pieces) {
+        return pieces > 1 && value.kind == machine::RegisterKind::Virtual &&
+               value.id < function.virtual_register_classes.size() &&
+               function.virtual_register_classes[value.id] ==
+                   machine::VirtualRegisterClass::Integer;
+    }
+
+    // Copies an allocated split scalar between its register and its home.
+    void transfer_split_home(const machine::Function& function,
+                             machine::Register value, bool to_home) {
+        const auto* assigned = assigned_integer_register(function, value);
+        if (!assigned) return;
+        const auto home = memory(vreg_offset(function, value));
+        const auto reg =
+            register_name(assigned->storage_name, value.mode.bits);
+        instruction("mov" + std::string(1, suffix(value.mode.bits)),
+                    to_home ? reg + ", " + home : home + ", " + reg);
     }
 
     void load_slot(const machine::Function& function,
@@ -16410,6 +16634,64 @@ private:
         instruction("fstpt", memory(offset));
     }
 
+    // The magnitude narrows to 64 bits with every discarded bit folded into
+    // bit 0, which lies below the f32/f64 rounding position, so the one
+    // CVTSI rounding is the correct one. Scaling back by the shift adds to
+    // the exponent of a normal result (2^128 becomes the f32 infinity).
+    void integer128_to_float(const machine::Function& function,
+                             machine::Register source,
+                             machine::Register target, bool signed_integer) {
+        const bool single = target.mode.bits == 32;
+        const auto narrowed = private_label(function, "i128.tofp.narrowed");
+        load(function, source, "rax", "rdx");
+        instruction("xorl", "%r8d, %r8d");
+        if (signed_integer) {
+            const auto magnitude = private_label(function, "i128.tofp.magnitude");
+            instruction("testq", "%rdx, %rdx");
+            instruction("jns", magnitude);
+            instruction("movl", "$1, %r8d");
+            instruction("negq", "%rax");
+            instruction("adcq", "$0, %rdx");
+            instruction("negq", "%rdx");
+            output_ << magnitude << ":\n";
+        }
+        instruction("xorl", "%r9d, %r9d");
+        instruction("testq", "%rdx, %rdx");
+        instruction("jz", narrowed);
+        // Shift right by one more than the high word's top bit index.
+        instruction("bsrq", "%rdx, %rcx");
+        instruction("movq", "%rax, %r11");
+        instruction("shrdq", "%cl, %rdx, %rax");
+        instruction("shrq", "%cl, %rdx");
+        instruction("shrdq", "$1, %rdx, %rax");
+        instruction("leal", "1(%rcx), %r9d");
+        instruction("movl", "$64, %ecx");
+        instruction("subl", "%r9d, %ecx");
+        instruction("shlq", "%cl, %r11");
+        instruction("testq", "%r11, %r11");
+        instruction("setne", "%r11b");
+        instruction("movzbl", "%r11b, %r11d");
+        instruction("orq", "%r11, %rax");
+        output_ << narrowed << ":\n";
+        integer_register_to_float(function, false, 64, target.mode.bits);
+        if (single) {
+            instruction("movd", "%xmm0, %eax");
+            instruction("shll", "$23, %r9d");
+            instruction("addl", "%r9d, %eax");
+            instruction("shll", "$31, %r8d");
+            instruction("orl", "%r8d, %eax");
+            instruction("movd", "%eax, %xmm0");
+        } else {
+            instruction("movq", "%xmm0, %rax");
+            instruction("shlq", "$52, %r9");
+            instruction("addq", "%r9, %rax");
+            instruction("shlq", "$63, %r8");
+            instruction("orq", "%r8, %rax");
+            instruction("movq", "%rax, %xmm0");
+        }
+        store_float(function, target, "xmm0");
+    }
+
     void emit_integer128_to_f128(const machine::Function& function,
                                  const machine::Instruction& value,
                                  machine::Register output) {
@@ -16674,25 +16956,9 @@ private:
             }
             if (target.mode.bits == 80) {
                 integer128_to_f80(function, source, target, signed_integer);
-                return;
-            }
-            // Preserve the integer SSA home while it temporarily carries the
-            // exact binary128 conversion consumed by the narrower converter.
-            load(function, source, "rax", "rdx");
-            instruction("movq", "%rax, " + f128_scratch(function, 144));
-            instruction("movq", "%rdx, " + f128_scratch(function, 152));
-            emit_integer128_to_f128(function, value, source);
-            auto conversion = value;
-            conversion.uses = {source};
-            conversion.defs = {target};
-            if (target.mode.bits == 80) {
-                emit_f128_truncate_to_f80(function, conversion);
             } else {
-                emit_f128_truncate(function, conversion);
+                integer128_to_float(function, source, target, signed_integer);
             }
-            instruction("movq", f128_scratch(function, 144) + ", %rax");
-            instruction("movq", f128_scratch(function, 152) + ", %rdx");
-            store(function, source, "rax", "rdx");
             return;
         }
         load(function, source, "rax");
@@ -17807,7 +18073,36 @@ private:
         }
         const auto& location = locations[index];
         const auto& parameter = entity.parameters[index];
+        const auto assemble_split = [&] {
+            const auto home = vreg_offset(function, target);
+            for (const bool stack_piece : {false, true}) {
+                for (const auto& piece : location.pieces) {
+                    if (piece.in_register == stack_piece) continue;
+                    const auto offset = home + static_cast<std::int32_t>(
+                                                   piece.value_bit_offset / 8U);
+                    if (stack_piece) {
+                        copy_incoming_to_frame(
+                            piece.stack_offset, offset,
+                            static_cast<unsigned>(
+                                (piece.value_bits + 7U) / 8U));
+                    } else {
+                        store_abi_piece(
+                            piece.reg,
+                            [&](unsigned byte) {
+                                return memory(
+                                    offset + static_cast<std::int32_t>(byte));
+                            },
+                            piece.value_bits);
+                    }
+                }
+            }
+            transfer_split_home(function, target, false);
+        };
         if (parameter.mode != ParameterMode::In) {
+            if (split_scalar(function, target, location.pieces.size())) {
+                assemble_split();
+                return;
+            }
             // The managed body copies in and out through this pointer.
             const auto& source = location.pieces.front();
             if (source.in_register) {
@@ -17917,6 +18212,10 @@ private:
                     instruction("movq", "%rax, " + memory(destination));
                 }
             }
+            return;
+        }
+        if (split_scalar(function, target, location.pieces.size())) {
+            assemble_split();
             return;
         }
         const auto& source = location.pieces.front();
@@ -18112,7 +18411,7 @@ private:
                 return;
             }
         } else if (source_bits == 128 && target_bits <= 64) {
-            store(function, target, "rax");
+            store(function, target, destination);
             return;
         } else if (source_bits <= 64 && target_bits == 128) {
             instruction("xorl", "%edx, %edx");
@@ -20604,8 +20903,13 @@ private:
                 const auto destination = register_name(
                     copy.destination->storage_name, bits);
                 if (copy.source_temporary) {
-                    instruction(bits <= 32 ? "movd" : "movq",
-                                "%xmm2, " + destination);
+                    // MOVD/MOVQ write a 32- or 64-bit view; the ABI extension
+                    // of the endpoint follows the parallel copy.
+                    const auto view_bits = bits <= 32 ? 32U : 64U;
+                    instruction(view_bits == 32 ? "movd" : "movq",
+                                "%xmm2, " + register_name(
+                                                copy.destination->storage_name,
+                                                view_bits));
                     return;
                 }
                 const auto* source = assigned_integer_register(
@@ -20720,19 +21024,32 @@ private:
                     std::get_if<machine::StackSlotOperand>(&operand)) {
                 const auto address = slot_offset(function, cell->slot) +
                                      cell->offset;
-                const auto& destination = location.pieces.front();
-                if (destination.in_register != registers) return;
-                if (destination.in_register) {
-                    instruction("leaq", memory(address) + ", " +
-                                            register_name(destination.reg, 64));
-                    apply_abi_register_extension(
-                        destination.reg, destination);
-                } else {
-                    instruction("leaq", memory(address) + ", %rax");
-                    instruction(
-                        "movq", "%rax, " +
-                                    outgoing_memory(
-                                        destination.stack_offset));
+                // The address may be cut into several pieces.
+                for (const auto& destination : location.pieces) {
+                    if (destination.in_register != registers) continue;
+                    const auto* view = destination.in_register
+                        ? find_register_view(destination.reg) : nullptr;
+                    const auto target = register_name(
+                        view ? view->storage_name : "rax", 64);
+                    instruction("leaq", memory(address) + ", " + target);
+                    if (destination.value_bit_offset != 0) {
+                        instruction(
+                            "shrq",
+                            "$" + std::to_string(
+                                      destination.value_bit_offset) +
+                                ", " + target);
+                    }
+                    if (destination.in_register) {
+                        apply_abi_register_extension(
+                            destination.reg, destination);
+                    } else {
+                        instruction(
+                            "mov" + std::string(
+                                        1, suffix(destination.value_bits)),
+                            register_name("rax", destination.value_bits) +
+                                ", " +
+                                outgoing_memory(destination.stack_offset));
+                    }
                 }
                 return;
             }
@@ -20843,6 +21160,30 @@ private:
                 }
                 return;
             }
+            if (split_scalar(function, source, location.pieces.size())) {
+                const auto home = vreg_offset(function, source);
+                for (const auto& destination : location.pieces) {
+                    if (destination.in_register != registers) continue;
+                    const auto offset = home + static_cast<std::int32_t>(
+                        destination.value_bit_offset / 8U);
+                    if (destination.in_register) {
+                        load_abi_piece(
+                            [&](unsigned byte) {
+                                return memory(
+                                    offset + static_cast<std::int32_t>(byte));
+                            },
+                            destination.reg, destination.value_bits);
+                        apply_abi_register_extension(
+                            destination.reg, destination);
+                    } else {
+                        copy_frame_to_outgoing(
+                            offset, destination.stack_offset,
+                            static_cast<unsigned>(
+                                (destination.value_bits + 7U) / 8U));
+                    }
+                }
+                return;
+            }
             if (source.mode.bits == 128) {
                 const auto source_offset = vreg_offset(function, source);
                 for (std::size_t piece = 0; piece < 2; ++piece) {
@@ -20891,6 +21232,17 @@ private:
                                 outgoing_memory(destination.stack_offset));
             }
         };
+        // Split arguments are read from their homes. Store any that has a
+        // register before an argument move can overwrite that register.
+        for (std::size_t index = 0; index < modes.size(); ++index) {
+            const auto* operand = std::get_if<machine::RegisterOperand>(
+                &value.operands[index + 1U]);
+            if (operand && !locations[index].indirect &&
+                split_scalar(function, operand->value,
+                             locations[index].pieces.size())) {
+                transfer_split_home(function, operand->value, true);
+            }
+        }
         // Treat ABI argument placement as a parallel boundary move. The
         // stack phase may use rax/xmm0; hidden result and argument register
         // channels are materialized only after it completes.
@@ -21144,7 +21496,9 @@ private:
                 } else {
                     store_float(function, target, source.reg);
                 }
-            } else if (target.mode.bits == 128) {
+            } else if (target.mode.bits == 128 ||
+                       split_scalar(function, target,
+                                    result->pieces.size())) {
                 const auto destination = vreg_offset(function, target);
                 for (const bool stack_piece : {false, true}) {
                     for (const auto& piece : result->pieces) {
@@ -21179,6 +21533,7 @@ private:
                         }
                     }
                 }
+                transfer_split_home(function, target, false);
             } else {
                 const auto& source = result->pieces.front().location;
                 if (source.kind == LocationKind::Stack) {
@@ -21435,6 +21790,13 @@ private:
             result.kind != machine::InstructionKind::Return ||
             call.operands.empty()) {
             return "the call is indirect or is not immediately returned";
+        }
+        if (preserved_integer_bits(hir_, dynamic_plans_, call.direct_callee,
+                                   call.call_signature) <
+            preserved_integer_bits(hir_, dynamic_plans_, function.source,
+                                   std::nullopt)) {
+            return "the callee preserves fewer general-register bits than "
+                   "the caller";
         }
         const auto* caller_manual = manual_plans_.find(function.source);
         const auto* callee_manual =
@@ -22581,7 +22943,10 @@ private:
                         load_float(function, value.uses.front(),
                                    destination.reg);
                     }
-                } else if (type_bits(hir_, entity.result_type) == 128) {
+                } else if (type_bits(hir_, entity.result_type) == 128 ||
+                           split_scalar(function, value.uses.front(),
+                                        result->pieces.size())) {
+                    transfer_split_home(function, value.uses.front(), true);
                     const auto source =
                         vreg_offset(function, value.uses.front());
                     for (const bool stack_piece : {true, false}) {
