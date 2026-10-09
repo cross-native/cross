@@ -358,6 +358,9 @@ call_signature(const Module& module, std::optional<FunctionId> direct,
 // a result's requested alignment.
 [[nodiscard]] bool same_interface(const Module& module, const FunctionSignature& left,
                                   const FunctionSignature& right);
+// Whether two types are the same for callable identity: may_alias is ignored
+// at every level and a top-level typedef alignment request is ignored.
+[[nodiscard]] bool same_callable_type(const Module& module, TypeId left, TypeId right);
 // An observable entry address uses its stable interface, never a private
 // dynamically selected transport: unfixed parts of a manual interface take
 // the function's registered ABI.

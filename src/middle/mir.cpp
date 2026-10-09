@@ -5394,7 +5394,8 @@ private:
                 const auto position =
                     static_cast<std::size_t>(found - copy_outs_.begin());
                 if (found == copy_outs_.end() ||
-                    found->first.type != parameter.type ||
+                    !hir::same_callable_type(hir_, found->first.type,
+                                             parameter.type) ||
                     forwarded[position]) {
                     diagnostics_.error(
                         actual.location,
@@ -7894,7 +7895,10 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                          ? !value.must_tail ||
                                                actual->kind !=
                                                    hir::Type::Kind::Pointer ||
-                                               actual->pointee != expected
+                                               !actual->pointee ||
+                                               !hir::same_callable_type(
+                                                   hir_module, *actual->pointee,
+                                                   expected)
                                          : function
                                                    .values[argument.value
                                                                ->value]

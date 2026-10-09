@@ -62,6 +62,14 @@ global void musttail_half_sum(out f64 d, in i32 v, in i32 w) {
     [[musttail]] return musttail_half(d, v + w);
 }
 
+// A may_alias spelling of the same type forwards like the type itself.
+typedef i32 musttail_any [[may_alias]];
+
+[[abi("sysv_abi"), noinline]]
+global void musttail_aliased_out(out musttail_any x) {
+    [[musttail]] return musttail_out_callee(x);
+}
+
 global i32 musttail_outputs_entry() {
     i32 seed = $::runtime(4);
     i32 x = 0;
@@ -77,7 +85,9 @@ global i32 musttail_outputs_entry() {
     musttail_fill_twice(pair, (u64)seed);
     f64 d = 0.0;
     musttail_half_sum(d, seed, 2);
+    musttail_any w = 0;
+    musttail_aliased_out(w);
     return (x == 7) + (y == 15) + (z == 18) +
            (a == 11 && b == 40 && r == 3) +
-           (pair.low == 8u64 && pair.high == 9u64) + (d == 3.0);
+           (pair.low == 8u64 && pair.high == 9u64) + (d == 3.0) + (w == 7);
 }

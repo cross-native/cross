@@ -977,6 +977,8 @@ private:
         if (current_.frame.elide_incoming_saves) return;
         // A hard-register object changes storage that the boundary may
         // preserve; the prologue saves it with the other preserved registers.
+        // Adding a save appends a slot, so collect the registers first.
+        std::vector<std::uint32_t> bound;
         for (const auto& slot : current_.stack_slots) {
             if (!slot.hard_register) continue;
             const auto* view = machine_register_view(*slot.hard_register);
@@ -984,9 +986,10 @@ private:
                 (view->register_class == RegisterClass::integer ||
                  view->register_class == RegisterClass::simd) &&
                 !current_function_may_clobber(*view)) {
-                add_preserved_storage(view->storage_id);
+                bound.push_back(view->storage_id);
             }
         }
+        for (const auto storage : bound) add_preserved_storage(storage);
         // The realigned dynamic prologue pushes its CFA anchor itself.
         const auto anchor = current_.frame.cfa_anchor_register;
         std::unordered_set<std::uint32_t> required;

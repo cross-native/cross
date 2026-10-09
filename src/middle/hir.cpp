@@ -3119,25 +3119,53 @@ call_signature(const Module& module, std::optional<FunctionId> direct,
     return type.kind == Type::Kind::Function ? type.function : std::nullopt;
 }
 
+static bool same_callable_type(const Module& module, TypeId left, TypeId right,
+                               bool top, bool ignore_const) {
+    if (left == right) return true;
+    auto a = module.type(left), b = module.type(right);
+    if (a.kind != b.kind) return false;
+    a.may_alias = b.may_alias = false;
+    if (top) a.alignment = b.alignment = 0;
+    if (ignore_const) a.is_const = b.is_const = false;
+    if (a.kind == Type::Kind::Function) {
+        if (!a.function || !b.function ||
+            !same_interface(module, *a.function, *b.function))
+            return false;
+        a.function.reset();
+        b.function.reset();
+    }
+    if (a.pointee.has_value() != b.pointee.has_value()) return false;
+    if (a.pointee) {
+        if (!same_callable_type(module, *a.pointee, *b.pointee, false, false))
+            return false;
+        a.pointee = b.pointee;
+    }
+    if (a.element.has_value() != b.element.has_value()) return false;
+    if (a.element) {
+        if (!same_callable_type(module, *a.element, *b.element, false, false))
+            return false;
+        a.element = b.element;
+    }
+    return identical(a, b);
+}
+
+bool same_callable_type(const Module& module, TypeId left, TypeId right) {
+    return same_callable_type(module, left, right, true, false);
+}
+
 bool same_interface(const Module& module, const FunctionSignature& left,
                     const FunctionSignature& right) {
     if (left.parameters.size() != right.parameters.size()) return false;
     auto normalized = right;
-    if (left.result_type != right.result_type) {
-        auto a = module.type(left.result_type), b = module.type(right.result_type);
-        a.alignment = b.alignment = 0;
-        a.may_alias = b.may_alias = false;
-        if (identical(a, b)) normalized.result_type = left.result_type;
-    }
+    if (same_callable_type(module, left.result_type, right.result_type, true, false))
+        normalized.result_type = left.result_type;
     for (std::size_t index = 0; index < left.parameters.size(); ++index) {
         const auto& parameter = left.parameters[index];
         auto& other = normalized.parameters[index];
-        if (parameter.mode != other.mode || parameter.type == other.type) continue;
-        auto a = module.type(parameter.type), b = module.type(other.type);
-        if (parameter.mode == ParameterMode::In) a.is_const = b.is_const = false;
-        a.alignment = b.alignment = 0;
-        a.may_alias = b.may_alias = false;
-        if (identical(a, b)) other.type = parameter.type;
+        if (parameter.mode != other.mode) continue;
+        if (same_callable_type(module, parameter.type, other.type, true,
+                               parameter.mode == ParameterMode::In))
+            other.type = parameter.type;
     }
     return left == normalized;
 }

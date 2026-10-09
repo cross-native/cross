@@ -2908,7 +2908,7 @@ if(BUILD_TESTING)
                     -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-musttail-outputs-${level}
                     -DENTRY=musttail_outputs_entry
-                    -DEXPECTED=6
+                    -DEXPECTED=7
                     "-DCC_FLAGS=-${level};-fno-optimize-sibling-calls"
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_native_musttail_outputs_${level} PROPERTIES

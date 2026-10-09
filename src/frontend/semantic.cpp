@@ -12660,15 +12660,16 @@ private:
             if (!(co_await meta_record_effective_access_async(*pointer, location, true))) co_return std::nullopt;
             source = (co_await convert_async(*source, pointer->type->pointee, location));
             if (!source) co_return std::nullopt;
+            const bool untyped = may_alias(pointer->type->pointee);
             for (std::size_t byte = 0; byte < extent; ++byte) {
                 const auto tag = target.mutable_buffer->effective_type[*offset + byte];
-                if (!target.union_member_view && !may_alias(pointer->type->pointee) &&
-                    tag != 0 && tag != 0xffU) {
+                if (!target.union_member_view && !untyped && tag != 0 && tag != 0xffU) {
                     fail(location, "meta pointer write violates effective type");
                     co_return std::nullopt;
                 }
             }
-            if (!(co_await register_meta_record_async(*target.mutable_buffer, *offset, pointer->type->pointee, location)))
+            if (!untyped && !(co_await register_meta_record_async(*target.mutable_buffer, *offset,
+                    pointer->type->pointee, location)))
                 co_return std::nullopt;
             erase_pointer_slots();
             const bool opaque = source->meta_pointer || source->string || source->label_address ||
@@ -12683,7 +12684,7 @@ private:
                 target.mutable_buffer->data[*offset + byte] = static_cast<char>(
                     shift_right(bits, static_cast<unsigned>(lane * 8)).low & 0xffU);
                 target.mutable_buffer->assigned[*offset + byte] = 0xffU;
-                target.mutable_buffer->effective_type[*offset + byte] = 0xffU;
+                if (!untyped) target.mutable_buffer->effective_type[*offset + byte] = 0xffU;
             }
             if (opaque) {
                 if (!charge_meta_bytes(64 + type_name(source->type).size(), location)) co_return std::nullopt;
