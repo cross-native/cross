@@ -89,10 +89,23 @@ struct table {
     plain_fn rest[2];
 };
 
+struct pair {
+    plain_fn first;
+    plain_fn second;
+};
+
+struct chain {
+    struct pair inner;
+    plain_fn next;
+};
+
 plain_fn plain_table[3] = { manual_source, [2] = &global_manual, [1] = plain_source };
 manual_fn manual_table[2] = { plain_source, &sysv_source };
 struct table record_table = { 7u32, manual_source, .second = manual_source,
                               { plain_source, manual_other } };
+// After a designator chain, the next entry initializes the member that
+// follows the chain's first member.
+struct chain chain_table = { .inner.first = manual_source, manual_other };
 cleanup_fn saved_cleanup = plain_source;
 u64 zero = 0u64;
 
@@ -122,6 +135,11 @@ global u32 manual_adapter_entry() {
         call_manual(record_table.second, one, one) != 101u64 ||
         call_plain(record_table.rest[0], one, one) != 3u64 ||
         call_plain(record_table.rest[1], one, one) != 201u64) return 13u32;
+    struct chain local_chain = { .inner.second = manual_other, manual_source };
+    if (call_plain(chain_table.inner.first, one, one) != 101u64 ||
+        call_plain(chain_table.next, one, one) != 201u64 ||
+        call_plain(local_chain.inner.second, one, one) != 201u64 ||
+        call_plain(local_chain.next, one, one) != 101u64) return 19u32;
     if (call_cleanup(saved_cleanup, one, 5u64) != 11u64 + 12u64 + 13u64) return 14u32;
     if (call_modes(plain_modes, one + 3u64) != 15000u64 + 9u64) return 15u32;
     if (call_plain_modes(manual_modes, one + 3u64) != 6000u64 + 20u64) return 16u32;

@@ -3291,8 +3291,9 @@ private:
     }
 
     // Each entry of a brace list receives its element or member type, so a
-    // function name in a table is adapted like any other initializer. After
-    // a nested designator chain the next positional member is left unknown.
+    // function name in a table is adapted like any other initializer. As in
+    // the initializer planner, the first designator of an entry sets the next
+    // positional member, also for a chain such as `.a.first`.
     void rewrite_initializer(Expr& initializer, const TypePtr& destination) {
         const auto record = destination && destination->kind == Type::Kind::Record
             ? program_.record_definition(destination->nominal_key()) : nullptr;
@@ -3309,8 +3310,7 @@ private:
                 target = designated_type(destination, entry.designators);
                 position.reset();
                 const auto& first = entry.designators.front();
-                if (record && entry.designators.size() == 1 &&
-                    first.kind == Expr::InitializerDesignator::Kind::Member) {
+                if (record && first.kind == Expr::InitializerDesignator::Kind::Member) {
                     named_members([&](const RecordMemberDecl& member, std::size_t logical) {
                         if (member.member_name() != first.member_name()) return false;
                         position = logical + 1;

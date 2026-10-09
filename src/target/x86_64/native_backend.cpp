@@ -19997,7 +19997,6 @@ private:
                             const hir::Function& callee,
                             const machine::SymbolOperand& symbol,
                             SourceLocation location) {
-        if (uses_wide_vectors_) instruction("vzeroupper");
         const auto call_symbol = assembly_symbol(symbol.name);
         if (options_.code_model == CodeModel::Large) {
             const auto slot = named_slot_offset(function, "$large.call.target");
@@ -20021,7 +20020,6 @@ private:
 
     // The target was captured before argument placement.
     void emit_indirect_call_transfer(const machine::Function& function) {
-        if (uses_wide_vectors_) instruction("vzeroupper");
         instruction("call", "*" + memory(*named_slot_offset(
                                       function, "$indirect.call.target")));
     }
@@ -20338,6 +20336,10 @@ private:
                 instruction("movq", memory(*scratch) + ", %rax");
             }
         }
+        // Clear upper vector lanes before any argument is placed: vector
+        // arguments come from frame homes, and a wide argument register must
+        // still hold its whole value at the transfer.
+        if (uses_wide_vectors_) instruction("vzeroupper");
         if (const auto* manual = manual_plans_.find(value.direct_callee,
                                                     value.call_signature);
             manual && emit_manual_call(function, value, entity, *manual)) {
@@ -20840,7 +20842,6 @@ private:
             }
         }
         if (tail) {
-            if (uses_wide_vectors_) instruction("vzeroupper");
             emit_frame_exit(function);
             emit_tail_call_transfer(*entity, *symbol);
             if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
@@ -21891,6 +21892,9 @@ private:
         const auto* plan = manual_plans_.find(function.source);
         if (!plan) return false;
         restore_hard_registers(function, "$hard.abi.");
+        // Outputs come from frame homes; clear upper lanes before a wide
+        // output register is written.
+        if (uses_wide_vectors_) instruction("vzeroupper");
         const auto direct_register =
             [](const ManualBoundary& boundary) {
                 return (boundary.kind ==
@@ -21950,7 +21954,6 @@ private:
             }
         }
         publish_manual_x87_outputs(function, *plan, value);
-        if (uses_wide_vectors_) instruction("vzeroupper");
         emit_frame_exit(function);
         if (plan->callee_cleanup &&
             plan->stack.outgoing_area_size != 0) {
@@ -21969,6 +21972,8 @@ private:
         if (emit_manual_epilogue(function, value)) return;
         restore_hard_registers(function, "$hard.abi.");
         const auto& entity = hir_.function(function.source);
+        // A result wider than 128 bits in a register keeps its upper lanes.
+        bool wide_result = false;
         if (!value.uses.empty()) {
             std::optional<ReturnAssignment> classified_result;
             if (const auto* dynamic =
@@ -21979,6 +21984,15 @@ private:
                 classified_result = classify_function_result(
                     hir_, entity, subtarget_);
             }
+            wide_result = classified_result && *classified_result &&
+                !classified_result->indirect &&
+                std::any_of(classified_result->pieces.begin(),
+                            classified_result->pieces.end(),
+                            [](const ValuePiece& piece) {
+                                return piece.location.kind ==
+                                           LocationKind::Register &&
+                                       piece.value_bits > 128;
+                            });
             const auto emit_indirect_result =
                 [&](const ReturnAssignment& result) {
                     if (result.pieces.empty()) {
@@ -22223,7 +22237,7 @@ private:
                 }
             }
         }
-        if (uses_wide_vectors_) instruction("vzeroupper");
+        if (uses_wide_vectors_ && !wide_result) instruction("vzeroupper");
         emit_frame_exit(function);
         instruction("retq");
         if (compact_gpr_saves_ && dwarf_cfi_enabled()) {

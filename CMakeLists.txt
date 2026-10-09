@@ -3919,6 +3919,21 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     set_tests_properties(cross_runtime_manual_wide_simd_vectors PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.llvm;feature.abi;feature.vector")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_wide_vector_calls_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/wide_vector_calls.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-wide-vector-calls-${level}
+                    -DENTRY=wide_vector_entry
+                    -DEXPECTED=200
+                    "-DCC_FLAGS=-mavx;-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_wide_vector_calls_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.calls;feature.vector;opt.${level}")
+    endforeach()
     add_test(NAME cross_runtime_manual_ymm_scalar
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
