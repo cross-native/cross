@@ -149,11 +149,13 @@ endforeach()
 
 # Source-type checks can diagnose an invalid return before target lowering.
 # Isolate the cases so an early failure cannot hide any later tail constraint.
-foreach(case NONCALL EMPTY OUTPUT VLA CONVERSION)
+foreach(case NONCALL EMPTY OUTPUT OUTPUT_TWICE OUTPUT_MANUAL VLA CONVERSION)
     if(case STREQUAL "NONCALL" OR case STREQUAL "EMPTY")
         set(pattern "musttail requires returning a call expression directly")
-    elseif(case STREQUAL "OUTPUT")
-        set(pattern "musttail output-parameter forwarding is not implemented")
+    elseif(case STREQUAL "OUTPUT" OR case STREQUAL "OUTPUT_TWICE")
+        set(pattern "musttail requires each output argument to be a distinct caller output parameter of the same type")
+    elseif(case STREQUAL "OUTPUT_MANUAL")
+        set(pattern "musttail output-parameter forwarding through manual endpoints is not implemented")
     elseif(case STREQUAL "VLA")
         set(pattern "musttail cannot restore variable-length array storage")
     else()

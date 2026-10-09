@@ -133,14 +133,19 @@ std::optional<std::string> assembly_section_directive(
         error = "section name cannot be empty";
         return std::nullopt;
     }
+    const bool grouped = !request.group.empty();
     switch (format) {
     case ObjectFormat::Elf:
-        if (!request.retain && request.name == ".text") return ".text";
-        if (!request.retain && request.name == ".data") return ".data";
-        if (!request.retain && request.name == ".bss") return ".bss";
+        if (!grouped && !request.retain) {
+            if (request.name == ".text") return ".text";
+            if (request.name == ".data") return ".data";
+            if (request.name == ".bss") return ".bss";
+        }
         return ".section " + quoted(request.name) + ",\"" +
-               elf_flags(request) + "\"," +
-               (zero_fill(request.kind) ? "@nobits" : "@progbits");
+               elf_flags(request) + (grouped ? "G" : "") + "\"," +
+               (zero_fill(request.kind) ? "@nobits" : "@progbits") +
+               (grouped ? ',' + std::string(request.group) + ",comdat"
+                        : std::string{});
     case ObjectFormat::Coff:
         if (request.kind == AssemblySectionKind::ThreadData ||
             request.kind == AssemblySectionKind::ThreadZeroFill) {
@@ -149,11 +154,17 @@ std::optional<std::string> assembly_section_directive(
                 return std::nullopt;
             }
         }
-        if (request.name == ".text") return ".text";
-        if (request.name == ".data") return ".data";
-        if (request.name == ".bss") return ".bss";
+        if (!grouped) {
+            if (request.name == ".text") return ".text";
+            if (request.name == ".data") return ".data";
+            if (request.name == ".bss") return ".bss";
+        }
         return ".section " + quoted(request.name) + ",\"" +
-               coff_flags(request.kind) + '"';
+               coff_flags(request.kind) + '"' +
+               (grouped ? std::string(request.associated ? ",associative,"
+                                                         : ",discard,") +
+                              std::string(request.group)
+                        : std::string{});
     case ObjectFormat::MachO:
         return macho_directive(request, error);
     case ObjectFormat::Unsupported:
@@ -183,15 +194,14 @@ std::optional<std::string> assembly_symbol_directives(
         result += std::move(directive);
     };
     if (request.external && (request.definition || request.weak)) {
-        if (request.weak) {
-            if (format == ObjectFormat::MachO && request.definition) {
-                append(".globl " + std::string(request.name));
-            }
-            append(std::string(
-                       format == ObjectFormat::MachO
-                           ? request.definition ? ".weak_definition "
-                                                : ".weak_reference "
-                           : ".weak ") +
+        if (format == ObjectFormat::MachO && request.definition &&
+            (request.weak || request.mergeable)) {
+            append(".globl " + std::string(request.name));
+            append(".weak_definition " + std::string(request.name));
+        } else if (request.weak) {
+            append(std::string(format == ObjectFormat::MachO
+                                   ? ".weak_reference "
+                                   : ".weak ") +
                    std::string(request.name));
         } else {
             append(".globl " + std::string(request.name));

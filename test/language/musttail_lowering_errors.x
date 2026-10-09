@@ -18,9 +18,31 @@ global i32 musttail_error_empty(in i32 value) {
 }
 #endif
 
+global void musttail_error_output_callee(out i32 first, out i32 second) {
+    first = 1;
+    second = 2;
+}
+
 #ifdef BAD_OUTPUT
-global i32 musttail_error_output(inout i32 value) {
-    [[musttail]] return musttail_error_callee(value);
+global void musttail_error_output(out i32 value) {
+    i32 local = 0;
+    [[musttail]] return musttail_error_output_callee(value, local);
+}
+#endif
+
+#ifdef BAD_OUTPUT_TWICE
+global void musttail_error_output_twice(out i32 value) {
+    [[musttail]] return musttail_error_output_callee(value, value);
+}
+#endif
+
+#ifdef BAD_OUTPUT_MANUAL
+[[clobber()]]
+global void musttail_error_manual_callee(inout u64 value "rcx");
+
+[[clobber()]]
+global void musttail_error_output_manual(inout u64 value "rcx") {
+    [[musttail]] return musttail_error_manual_callee(value);
 }
 #endif
 

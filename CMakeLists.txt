@@ -2429,6 +2429,39 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/symbol_indirection.cmake")
     set_tests_properties(cross_symbol_indirection PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.object;feature.calls")
+    foreach(arch IN ITEMS
+            "x86_64;x86_64-unknown-linux-gnu,x86_64-w64-windows-gnu,x86_64-apple-darwin"
+            "mips;mips-unknown-elf,mips64el-unknown-elf")
+        list(GET arch 1 generic_instance_targets)
+        list(GET arch 0 arch)
+        string(REPLACE "," ";" generic_instance_targets "${generic_instance_targets}")
+        add_test(NAME cross_generic_instance_objects_${arch}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DFIRST=${CMAKE_SOURCE_DIR}/test/backend/native/generic_instance_first.x
+                    -DSECOND=${CMAKE_SOURCE_DIR}/test/backend/native/generic_instance_second.x
+                    "-DTARGETS=${generic_instance_targets}"
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-instance-${arch}
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/native/generic_instance.cmake")
+        set_tests_properties(cross_generic_instance_objects_${arch} PROPERTIES
+            LABELS "check.compile;arch.${arch};backend.native;feature.object;feature.generic;feature.linkage")
+    endforeach()
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_generic_instance_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/generic_instance_first.x
+                    -DEXTRA_SOURCES=${CMAKE_SOURCE_DIR}/test/backend/native/generic_instance_second.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-generic-instance-${level}
+                    -DENTRY=generic_instance_entry
+                    -DEXPECTED=11
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_generic_instance_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.object;feature.generic;feature.linkage;opt.${level}")
+    endforeach()
     foreach(level O0 O2)
         add_test(NAME cross_runtime_alignment_expressions_${level}
             COMMAND "${CMAKE_COMMAND}"
@@ -2686,7 +2719,41 @@ if(BUILD_TESTING)
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_native_musttail_reuse_home_${level} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.musttail;opt.${level}")
+        add_test(NAME cross_runtime_native_musttail_manual_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail_manual.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-musttail-manual-${level}
+                    -DENTRY=musttail_manual_entry
+                    -DEXPECTED=6
+                    "-DCC_FLAGS=-${level};-fno-optimize-sibling-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_musttail_manual_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.musttail;opt.${level}")
+        add_test(NAME cross_runtime_native_musttail_outputs_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/musttail_outputs.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-musttail-outputs-${level}
+                    -DENTRY=musttail_outputs_entry
+                    -DEXPECTED=6
+                    "-DCC_FLAGS=-${level};-fno-optimize-sibling-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_musttail_outputs_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.musttail;opt.${level}")
     endforeach()
+    add_test(NAME cross_musttail_manual_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DERRORS=${CMAKE_SOURCE_DIR}/test/language/musttail_manual_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/musttail-manual-errors
+                -P "${CMAKE_SOURCE_DIR}/test/language/musttail_manual.cmake")
+    set_tests_properties(cross_musttail_manual_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;backend.native;feature.abi;feature.musttail")
     foreach(mode O0 O2 noalloc)
         foreach(profile native custom)
             set(symbol_address_flags
@@ -3028,6 +3095,24 @@ if(BUILD_TESTING)
         set_tests_properties(cross_runtime_native_vector_reduction_bounds_${variant_name} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.vector")
     endforeach()
+    foreach(variant IN ITEMS "default;-O3" "sse41;-O2;-march=x86-64-v2"
+                             "avx2;-O3;-march=x86-64-v3")
+        list(GET variant 0 variant_name)
+        list(REMOVE_AT variant 0)
+        add_test(NAME cross_runtime_native_vector_memory_alignment_${variant_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/memory_alignment.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vector-memory-alignment-${variant_name}
+                    -DENTRY=vector_memory_alignment_entry
+                    -DEXPECTED=8
+                    "-DCC_FLAGS=${variant}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_vector_memory_alignment_${variant_name} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;feature.optimization")
+    endforeach()
     add_test(NAME cross_x86_64_early_exit_vectorization
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -3182,6 +3267,21 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_numeric_conversions PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;opt.O2")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_native_int128_f80_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/conversion/int128_f80.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-int128-f80-${level}
+                    -DENTRY=int128_f80_entry
+                    -DEXPECTED=16
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_int128_f80_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;opt.${level}")
+    endforeach()
     add_test(NAME cross_arrays
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/backend/native/array/runtime.x"

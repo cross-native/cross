@@ -178,6 +178,9 @@ struct Function {
     unsigned minimum_alignment{1};
     SymbolVisibility visibility{SymbolVisibility::Default};
     bool weak{};
+    // An instance of a `global` generic: every group that uses it emits a
+    // definition, and the linker keeps one.
+    bool mergeable{};
     std::optional<std::string> alias_target;
     std::optional<std::string> weakref_target;
     FunctionTemperature temperature{FunctionTemperature::Normal};
@@ -346,6 +349,7 @@ bool validate_source_address_spaces(Program& program,
 // `out`/`inout` cells to the caller; every other managed function copies them
 // out in MIR through the transport pointer.
 [[nodiscard]] bool manual_interface(const Function& function);
+[[nodiscard]] bool manual_interface(const FunctionSignature& signature);
 [[nodiscard]] std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,
                std::optional<TypeId> indirect);

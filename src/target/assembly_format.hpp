@@ -27,6 +27,12 @@ struct AssemblySectionRequest {
     AssemblySectionKind kind{AssemblySectionKind::WritableData};
     bool custom{};
     bool retain{};
+    // Assembler spelling of the symbol whose mergeable definition keys this
+    // section's COMDAT group, or empty. An associated section, such as a
+    // jump table, belongs to the group without defining that symbol. Mach-O
+    // has no groups and merges weak definitions instead.
+    std::string_view group{};
+    bool associated{};
 };
 
 enum class AssemblySymbolVisibility { Default, Hidden, Protected, Internal };
@@ -37,6 +43,9 @@ struct AssemblySymbolRequest {
     bool definition{true};
     bool weak{};
     AssemblySymbolVisibility visibility{AssemblySymbolVisibility::Default};
+    // A definition that other objects may duplicate. ELF and COFF place it
+    // in a COMDAT group section keyed by this symbol; Mach-O marks it weak.
+    bool mergeable{};
 };
 
 // Returns one complete assembler directive without a trailing newline.  The

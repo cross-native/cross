@@ -10718,6 +10718,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 });
         });
     const auto split_function = options_.function_sections || entity.retain ||
+                                entity.mergeable ||
                                 entity.temperature !=
                                     hir::FunctionTemperature::Normal;
     const auto section = entity.section
@@ -10736,7 +10737,9 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     std::string section_error;
     const auto directive = assembly_section_directive(
         format_, {section, AssemblySectionKind::Code,
-                  entity.section.has_value(), entity.retain},
+                  entity.section.has_value(), entity.retain,
+                  entity.mergeable ? std::string_view(symbol)
+                                   : std::string_view{}},
         section_error);
     if (!directive) {
         diagnostics_.error(function.location, section_error);
@@ -10764,7 +10767,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     std::string symbol_error;
     const auto symbol_directives = assembly_symbol_directives(
         format_, {symbol, entity.linkage == Linkage::Global, true,
-                  entity.weak, assembly_visibility(entity.visibility)},
+                  entity.weak, assembly_visibility(entity.visibility),
+                  entity.mergeable},
         symbol_error);
     if (!symbol_directives) {
         diagnostics_.error(function.location, symbol_error);

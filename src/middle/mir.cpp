@@ -5338,6 +5338,14 @@ private:
         };
         std::vector<CallArgument> arguments;
         std::vector<PendingCopyOut> copyouts;
+        // A `[[musttail]]` call passes the transport pointer of each caller
+        // output given as an output argument on to the callee, which then
+        // delivers it; the caller delivers its other outputs before the call.
+        const bool forward_outputs =
+            &expression == musttail_call_ &&
+            !hir::manual_interface(signature) &&
+            !hir::manual_interface(hir_.function(current_.source));
+        std::vector<bool> forwarded(copy_outs_.size());
         for (std::size_t index = 0; index < signature.parameters.size();
              ++index) {
             const auto& parameter = signature.parameters[index];
@@ -5350,6 +5358,39 @@ private:
                 if (!argument) co_return std::nullopt;
                 arguments.push_back(
                     {*argument, std::nullopt, parameter.type, false});
+                continue;
+            }
+            if (forward_outputs && parameter.mode != ParameterMode::In) {
+                const auto name = local_name(actual);
+                const auto* local = name ? find_local(*name) : nullptr;
+                const auto found = std::find_if(
+                    copy_outs_.begin(), copy_outs_.end(),
+                    [&](const std::pair<LocalBinding, ValueId>& output) {
+                        return local && output.first.slot == local->slot;
+                    });
+                const auto position =
+                    static_cast<std::size_t>(found - copy_outs_.begin());
+                if (found == copy_outs_.end() ||
+                    found->first.type != parameter.type ||
+                    forwarded[position]) {
+                    diagnostics_.error(
+                        actual.location,
+                        "musttail requires each output argument to be a "
+                        "distinct caller output parameter of the same type");
+                    failed_ = true;
+                    co_return std::nullopt;
+                }
+                forwarded[position] = true;
+                // The callee reads an `inout` value through the pointer.
+                if (parameter.mode == ParameterMode::InOut &&
+                    !store_pointer(found->second,
+                                   load_slot(found->first, actual.location),
+                                   actual.location)) {
+                    failed_ = true;
+                    co_return std::nullopt;
+                }
+                arguments.push_back(
+                    {found->second, std::nullopt, parameter.type, false});
                 continue;
             }
             std::optional<LocalBinding> actual_local;
@@ -5463,6 +5504,18 @@ private:
             if (!value) co_return std::nullopt;
             value = cast(*value, promoted, actual.location);
             arguments.push_back({*value, std::nullopt, promoted, true});
+        }
+        if (forward_outputs) {
+            for (std::size_t index = 0; index < copy_outs_.size(); ++index) {
+                if (forwarded[index]) continue;
+                const auto& [cell, pointer] = copy_outs_[index];
+                const auto value = load_slot(cell, expression.location);
+                current_.values[value.value].copy_out_read = true;
+                if (!store_pointer(pointer, value, expression.location)) {
+                    failed_ = true;
+                    co_return std::nullopt;
+                }
+            }
         }
         const auto result = add_effectful(
             ValueKind::Call, signature.result_type, expression.location);
@@ -6081,7 +6134,9 @@ private:
             }
             std::optional<ValueId> result;
             if (statement.expression) {
+                musttail_call_ = musttail ? returned_call(statement) : nullptr;
                 result = lower_expression(*statement.expression, current_.result_type);
+                musttail_call_ = nullptr;
             }
             if (musttail && result) {
                 auto& call = current_.values[result->value];
@@ -6114,16 +6169,26 @@ private:
                         [](const hir::Parameter& parameter) {
                             return parameter.mode != ParameterMode::In;
                         });
-                if (caller_outputs || callee_outputs) {
+                if ((caller_outputs || callee_outputs) &&
+                    (!signature || hir::manual_interface(caller) ||
+                     hir::manual_interface(*signature))) {
                     diagnostics_.error(
                         musttail->location,
-                        "musttail output-parameter forwarding is not implemented");
+                        "musttail output-parameter forwarding through manual "
+                        "endpoints is not implemented");
                     failed_ = true;
                     return;
                 }
+                // The call may end the lifetimes of its own argument cells.
                 const auto& values =
                     current_.blocks[current_block_->value].values;
-                if (values.empty() || values.back() != *result) {
+                const auto last = std::find(values.rbegin(), values.rend(),
+                                            *result);
+                if (last == values.rend() ||
+                    !std::all_of(values.rbegin(), last, [&](ValueId value) {
+                        return current_.values[value.value].kind ==
+                               ValueKind::LifetimeEnd;
+                    })) {
                     diagnostics_.error(
                         musttail->location,
                         "musttail call requires work after the call and cannot be a tail transfer");
@@ -6139,7 +6204,8 @@ private:
                 failed_ = true;
                 return;
             }
-            copy_out_parameters(statement.location);
+            // A tail call has already delivered or forwarded every output.
+            if (!musttail) copy_out_parameters(statement.location);
             end_lifetimes_from(0, statement.location);
             terminate(TerminatorKind::Return, statement.location,
                       void_result ? std::nullopt : result, {});
@@ -6491,6 +6557,8 @@ private:
     // Parameter cells and the transport pointers their normal returns copy
     // them through.
     std::vector<std::pair<LocalBinding, ValueId>> copy_outs_;
+    // The call of the `[[musttail]]` return being lowered.
+    const Expr* musttail_call_{};
     NameSet address_taken_names_;
     NameSet modified_names_;
     NameSet local_names_;
@@ -6679,6 +6747,26 @@ void check_out_definite_assignment(const ManagedFunction& function,
                 }
             }
         }
+        // A tail call that forwards the parameter's transport pointer leaves
+        // the assignment to its callee.
+        const auto forwarded = [&](const ManagedBlock& block) {
+            const auto pointer = *slot.source_parameter <
+                                         function.parameters.size()
+                ? std::optional<ValueId>(
+                      function.parameters[*slot.source_parameter])
+                : std::nullopt;
+            return pointer && std::any_of(
+                block.values.begin(), block.values.end(), [&](ValueId id) {
+                    const auto& value = function.values[id.value];
+                    return value.kind == ValueKind::Call && value.must_tail &&
+                           std::any_of(
+                               value.call_arguments.begin(),
+                               value.call_arguments.end(),
+                               [&](const CallArgument& argument) {
+                                   return argument.value == pointer;
+                               });
+                });
+        };
         bool read_reported = false;
         bool return_reported = false;
         for (const auto& block : function.blocks) {
@@ -6724,7 +6812,8 @@ void check_out_definite_assignment(const ManagedFunction& function,
             }
             if (!out_type_complete(hir_module, target, slot.type, 0,
                                    assigned) && !return_reported &&
-                block.terminator.kind == TerminatorKind::Return) {
+                block.terminator.kind == TerminatorKind::Return &&
+                !forwarded(block)) {
                 diagnostics.error(block.terminator.location,
                     "normal return leaves 'out' parameter '" +
                     parameter.name + "' unassigned");
@@ -7744,14 +7833,31 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                 const auto expected =
                                     unnamed ? argument.type
                                             : callee.parameters[index].type;
-                                if ((!unnamed &&
-                                     callee.parameters[index].mode !=
-                                         ParameterMode::In) ||
-                                    argument.value->value >=
-                                        function.values.size() ||
-                                    function.values[argument.value->value]
-                                            .type != expected ||
-                                    argument.type != expected) {
+                                // A tail call forwards a caller output as
+                                // its transport pointer.
+                                const bool forwarded =
+                                    !unnamed &&
+                                    callee.parameters[index].mode !=
+                                        ParameterMode::In;
+                                const auto* actual =
+                                    argument.value->value <
+                                            function.values.size()
+                                        ? &hir_module.type(
+                                              function
+                                                  .values[argument.value
+                                                              ->value]
+                                                  .type)
+                                        : nullptr;
+                                if (!actual || argument.type != expected ||
+                                    (forwarded
+                                         ? !value.must_tail ||
+                                               actual->kind !=
+                                                   hir::Type::Kind::Pointer ||
+                                               actual->pointee != expected
+                                         : function
+                                                   .values[argument.value
+                                                               ->value]
+                                                   .type != expected)) {
                                     fail(value.location,
                                          "call value argument type or mode "
                                          "mismatch");

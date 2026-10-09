@@ -23,10 +23,13 @@ map to each format as follows:
 | `[[weakref("name")]]` | Yes | Yes | Yes |
 | `[[retain]]` | `SHF_GNU_RETAIN` | Linker include directive | `no_dead_strip` |
 
-An alias must name a compatible definition in the same compilation.
-`[[hot]]` and `[[cold]]` functions go to separate text sections. `[[used]]`
-forces emission. `[[no_stack_protector]]` and `[[no_sanitize("name")]]` are
-accepted; Cross generates neither kind of instrumentation.
+An alias must name a compatible definition in the same compilation. An
+instance of a `global` generic goes to a COMDAT group keyed by its link name
+on ELF and COFF, and is a weak definition on Mach-O, so the linker keeps one
+copy. `[[hot]]` and `[[cold]]` functions go to separate text sections.
+`[[used]]` forces emission. `[[no_stack_protector]]` and
+`[[no_sanitize("name")]]` are accepted; Cross generates neither kind of
+instrumentation.
 
 Mach-O output spells every link name with the leading underscore of C symbols
 on that format, so `[[link_name("write")]]` refers to the C function `write`
@@ -79,6 +82,12 @@ Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
 atomics, thread-local storage, and variadic functions are supported, but a
 variadic function or function pointer cannot use register or stack locations.
+
+A `[[musttail]]` call cannot target a variadic function and passes every
+argument in a register. With automatic locations, each argument must be an
+integer or a pointer and the result must fit in one register. A function with
+register or stack locations can tail-call only another such function or
+function pointer, and neither may have `out` or `inout` parameters.
 
 `[[naked]]` functions can inline `[[raw_inline]]` functions whose locals,
 control flow, pointer accesses, and integer, `f32`, and `f64` operations fit
@@ -165,7 +174,9 @@ function pointers, variable-length arrays, computed goto, `$::patch` values,
 and LL/SC atomics. Not supported: vectors, integers wider than 64 bits,
 variadic function definitions, manual register locations, machine-instruction
 built-ins, position-independent code (`-mabicalls`), thread-local storage,
-MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used.
+MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used. A
+`[[musttail]]` call passes every argument in a register, and neither function
+may have `out` or `inout` parameters.
 
 ## Limits on all targets
 

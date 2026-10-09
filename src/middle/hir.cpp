@@ -1670,6 +1670,9 @@ private:
             function.location = representative->location;
             function.source_unit = representative->source_unit;
             function.linkage = representative->linkage;
+            function.mergeable = function.linkage == Linkage::Global &&
+                                 function.definition &&
+                                 function.definition->generic_instance;
             function.link_symbol = resolved_link_name(*representative, options_);
             if (function.link_symbol.empty()) {
                 diagnostics_.error(
@@ -3051,15 +3054,28 @@ bool stabilize_label_address(Module& module, LabelId id,
     return true;
 }
 
-bool manual_interface(const Function& function) {
+namespace {
+
+bool manual_endpoints(const std::optional<std::string>& result_location,
+                      const std::vector<Parameter>& parameters) {
     const auto manual = [](const std::optional<std::string>& location) {
         return location && *location != "auto";
     };
-    return manual(function.result_location) ||
-           std::any_of(function.parameters.begin(), function.parameters.end(),
+    return manual(result_location) ||
+           std::any_of(parameters.begin(), parameters.end(),
                        [&](const Parameter& parameter) {
                            return manual(parameter.physical_location);
                        });
+}
+
+} // namespace
+
+bool manual_interface(const Function& function) {
+    return manual_endpoints(function.result_location, function.parameters);
+}
+
+bool manual_interface(const FunctionSignature& signature) {
+    return manual_endpoints(signature.result_location, signature.parameters);
 }
 
 std::optional<FunctionSignature>

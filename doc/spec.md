@@ -2570,6 +2570,12 @@ ABI model forbids, unrepresentable address spaces, and scalable vectors are
 invalid. A complete manual variadic ABI must expose iterable state; a definition
 that ignores unnamed arguments may omit bindings.
 
+Manual locations on a variadic interface overlay the automatic classification
+of the complete call as at any mixed boundary: unnamed arguments, the count
+register, and the `variadic` state follow the automatic classification, and a
+fixed location that overlaps a position the model can give an unnamed
+argument, or the count register, is invalid.
+
 ### Abstract parameter cells
 
 Each parameter denotes a distinct automatic **parameter cell** in the callee.
@@ -3721,7 +3727,10 @@ unwinder; see [targets.md](targets.md#object-formats).
 callee have compatible physical ABI, stack cleanup, result locations, and
 clobber contracts. Any caller parameter outputs must either have been delivered
 before the transfer or be forwarded in exactly the locations from which the
-tail callee will deliver compatible results. Destruction of managed dynamic
+tail callee will deliver compatible results: a caller output passed directly
+as an `out` or `inout` argument of the same type is forwarded, and the caller
+delivers its other outputs, and the current value of an output forwarded to an
+`inout` parameter, before the transfer. Destruction of managed dynamic
 storage and restoration of the caller frame must also be expressible before
 the tail transfer. Failure of any condition is a required diagnostic.
 The returned expression, after ignoring redundant parentheses, must be a call.

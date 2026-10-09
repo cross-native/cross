@@ -2351,6 +2351,7 @@ std::unique_ptr<FunctionDecl> instantiate(
     result->linkage = source.linkage;
     result->variadic = source.variadic;
     result->inline_hint = source.inline_hint;
+    result->generic_instance = true;
     if (types.nominal) {
         // Clone into temporary vectors: publication can reallocate the program
         // tables, and definitions may refer to each other in either direction.
@@ -16403,6 +16404,7 @@ std::unique_ptr<FunctionDecl> copy_evaluation_declaration(const FunctionDecl& so
     result->variadic = source.variadic;
     result->inline_hint = source.inline_hint;
     result->invocation_specialization = source.invocation_specialization;
+    result->generic_instance = source.generic_instance;
     return result;
 }
 

@@ -28,9 +28,29 @@ if(NOT compile_result EQUAL 0)
         "${compile_stdout}\n${compile_stderr}")
 endif()
 
+# EXTRA_SOURCES are further compilation groups linked into the same program.
+set(objects "${OUTPUT}.o")
+set(group 0)
+foreach(extra IN LISTS EXTRA_SOURCES)
+    math(EXPR group "${group} + 1")
+    execute_process(
+        COMMAND "${CC}" "-mabi=${HOST_ABI}" ${CC_FLAGS}
+                -c "${extra}" -o "${OUTPUT}.${group}.o"
+        RESULT_VARIABLE compile_result
+        OUTPUT_VARIABLE compile_stdout
+        ERROR_VARIABLE compile_stderr
+    )
+    if(NOT compile_result EQUAL 0)
+        message(FATAL_ERROR
+            "native Cross compilation of ${extra} failed (${compile_result})\n"
+            "${compile_stdout}\n${compile_stderr}")
+    endif()
+    list(APPEND objects "${OUTPUT}.${group}.o")
+endforeach()
+
 execute_process(
     COMMAND "${HOST_CXX}" "-DCROSS_ENTRY=${ENTRY}" "${RUNNER}"
-            "${OUTPUT}.o" -o "${OUTPUT}.exe"
+            ${objects} -o "${OUTPUT}.exe"
     RESULT_VARIABLE link_result
     OUTPUT_VARIABLE link_stdout
     ERROR_VARIABLE link_stderr

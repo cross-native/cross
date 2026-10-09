@@ -528,6 +528,8 @@ struct FunctionDecl {
     // Created while preparing an invocation, not an emitted-use obligation.
     // Surviving runtime references promote it through the ordinary call graph.
     bool invocation_specialization{};
+    // A concrete instance of a generic function.
+    bool generic_instance{};
 
     [[nodiscard]] bool definition() const { return body != nullptr; }
     [[nodiscard]] const Attribute* attribute(std::string_view name) const;

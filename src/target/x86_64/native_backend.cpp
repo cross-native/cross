@@ -766,6 +766,13 @@ bool packed_integer_operation_supported(const Subtarget& subtarget,
             subtarget.has_feature(Feature::Avx2));
 }
 
+// Packed-integer selection uses VEX or EVEX forms, which accept any memory
+// operand alignment, above 128 bits or with AVX2. The legacy-SSE forms
+// selected otherwise fault on a memory operand that is not 16-byte aligned.
+bool vex_packed_integer_form(const Subtarget& subtarget, unsigned width) {
+    return width != 128 || subtarget.has_feature(Feature::Avx2);
+}
+
 bool phi_instruction(const machine::Instruction& instruction) {
     return instruction.opcode == Opcode::Phi ||
            instruction.opcode == Opcode::Fphi ||
@@ -4955,7 +4962,12 @@ private:
     }
 
     void fold_vector_memory_operands() {
-        if (!options_.fold_memory_operands) return;
+        // Machine IR does not prove the alignment of an indexed vector access,
+        // so only a form that is VEX-encoded at every width may consume it.
+        if (!options_.fold_memory_operands ||
+            !vex_packed_integer_form(subtarget_, 128)) {
+            return;
+        }
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -9757,7 +9769,7 @@ public:
         collect_float_literals();
         collect_vector_literals();
         for (auto& function : module_.functions) emit_function(function);
-        emit_jump_tables();
+        emit_jump_tables(0, format_ == ObjectFormat::Coff ? ".rdata" : ".rodata");
         emit_float_literal_pool();
         emit_vector_literal_pool();
         return output_.str();
@@ -10155,26 +10167,32 @@ private:
         }
     }
 
-    void emit_jump_tables() {
-        if (jump_tables_.empty()) return;
+    // Emits and removes the jump tables from `first` on. A group names the
+    // COMDAT group of the function whose labels they reference.
+    void emit_jump_tables(std::size_t first, std::string_view name,
+                          std::string_view group = {}) {
+        if (jump_tables_.size() <= first) return;
         std::string error;
         const auto section = assembly_section_directive(
             format_,
-            {format_ == ObjectFormat::Coff ? ".rdata" : ".rodata",
-             AssemblySectionKind::ReadOnlyData, false, false},
+            {name, AssemblySectionKind::ReadOnlyData, false, false, group,
+             true},
             error);
         if (!section) {
             diagnostics_.error(module_.functions.front().location, error);
             return;
         }
         output_ << *section << "\n.p2align 2\n";
-        for (const auto& table : jump_tables_) {
-            output_ << table.label << ":\n";
-            for (const auto& target : table.targets) {
-                output_ << "\t.long " << target << '-' << table.label
+        for (auto table = jump_tables_.begin() +
+                          static_cast<std::ptrdiff_t>(first);
+             table != jump_tables_.end(); ++table) {
+            output_ << table->label << ":\n";
+            for (const auto& target : table->targets) {
+                output_ << "\t.long " << target << '-' << table->label
                         << '\n';
             }
         }
+        jump_tables_.resize(first);
     }
 
     std::string assembly_symbol(std::string_view link_name) const {
@@ -13762,8 +13780,7 @@ private:
             } else if (value.opcode == Opcode::VshrU) {
                 opcode = "psrlv" + packed_lane_suffix(shape.element_bits);
             }
-            const bool vex = width != 128 ||
-                             subtarget_.has_feature(Feature::Avx2);
+            const bool vex = vex_packed_integer_form(subtarget_, width);
             const auto left_register = vector_register(
                 value.uses[0], 0, width);
             const auto right_register = indexed_memory
@@ -16357,6 +16374,42 @@ private:
         instruction("fstpt", memory(offset));
     }
 
+    // Each 64-bit half loads exactly and scaling the high half by 2^64 is
+    // exact, so the final x87 addition rounds the 128-bit integer once.
+    void integer128_to_f80(const machine::Function& function,
+                           machine::Register source,
+                           machine::Register target, bool signed_integer) {
+        const auto offset = vreg_offset(function, target);
+        const auto power_of_two_64 = [&] {
+            instruction("movabsq", "$-9223372036854775808, %r10");
+            instruction("movq", "%r10, " + memory(offset));
+            instruction("movw", "$16447, " + memory(offset + 8));
+            instruction("fldt", memory(offset));
+        };
+        // FILD reads a signed quadword; an unsigned half with its top bit
+        // set loads as the half minus 2^64.
+        const auto load_half = [&](std::string_view reg, bool is_signed) {
+            instruction("movq", "%" + std::string(reg) + ", " +
+                                    memory(offset));
+            instruction("fildq", memory(offset));
+            if (is_signed) return;
+            const auto done = private_label(function, "i128tof80.half");
+            instruction("testq", "%" + std::string(reg) + ", %" +
+                                     std::string(reg));
+            instruction("jns", done);
+            power_of_two_64();
+            instruction("faddp", "%st, %st(1)");
+            output_ << done << ":\n";
+        };
+        load(function, source, "rax", "rdx");
+        load_half("rdx", signed_integer);
+        power_of_two_64();
+        instruction("fmulp", "%st, %st(1)");
+        load_half("rax", false);
+        instruction("faddp", "%st, %st(1)");
+        instruction("fstpt", memory(offset));
+    }
+
     void emit_integer128_to_f128(const machine::Function& function,
                                  const machine::Instruction& value,
                                  machine::Register output) {
@@ -16617,6 +16670,10 @@ private:
         if (source.mode.bits == 128) {
             if (target.mode.bits == 128) {
                 emit_integer128_to_f128(function, value, target);
+                return;
+            }
+            if (target.mode.bits == 80) {
+                integer128_to_f80(function, source, target, signed_integer);
                 return;
             }
             // Preserve the integer SSA home while it temporarily carries the
@@ -20108,7 +20165,7 @@ private:
     bool emit_manual_call(const machine::Function& function,
                           const machine::Instruction& value,
                           const hir::Function* callee,
-                          const ManualAbiPlan& plan) {
+                          const ManualAbiPlan& plan, bool tail) {
         if (!plan.valid ||
             plan.parameters.size() + 1 != value.operands.size()) {
             diagnostics_.error(value.location,
@@ -20143,7 +20200,20 @@ private:
                         operand);
                 }
             }
-            if (plan.result.present &&
+            if (tail && plan.result.present &&
+                plan.result.output.kind ==
+                    ManualBoundaryKind::IndirectRegister &&
+                registers) {
+                // Forward the caller's own result address; a stack address
+                // already sits where the callee reads it.
+                instruction(
+                    "movq",
+                    memory(*named_slot_offset(function, "$manualresultptr")) +
+                        ", " +
+                        register_name(
+                            plan.result.output.register_view->storage_name,
+                            64));
+            } else if (!tail && plan.result.present &&
                 plan.result.output.is_indirect() &&
                 register_boundary(plan.result.output) == registers) {
                 if (value.defs.empty()) {
@@ -20183,6 +20253,30 @@ private:
             load_call_x87_value(
                 function, value.operands[parameter_index + 1],
                 plan.parameters[parameter_index].type);
+        }
+        if (tail) {
+            const RegisterView* target{};
+            if (!callee) {
+                target = manual_tail_jump_register(
+                    function, *manual_plans_.find(function.source), plan);
+                instruction("movq",
+                            memory(*named_slot_offset(
+                                function, "$indirect.call.target")) +
+                                ", " + register_name(target->storage_name, 64));
+            }
+            emit_frame_exit(function);
+            if (callee) {
+                emit_tail_call_transfer(
+                    *callee,
+                    std::get<machine::SymbolOperand>(value.operands.front()));
+            } else {
+                instruction("jmp",
+                            "*" + register_name(target->storage_name, 64));
+            }
+            if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
+                output_ << ".cfi_restore_state\n";
+            }
+            return true;
         }
         if (callee) {
             emit_call_transfer(
@@ -20378,7 +20472,7 @@ private:
                 std::get_if<machine::RegisterOperand>(&value.operands.front());
             const auto slot =
                 named_slot_offset(function, "$indirect.call.target");
-            if (!target || !slot || tail) {
+            if (!target || !slot) {
                 diagnostics_.error(value.location,
                                    "invalid indirect x86-64 call target");
                 if (!tail) restore_hard_registers(function);
@@ -20409,7 +20503,8 @@ private:
         if (uses_wide_vectors_) instruction("vzeroupper");
         if (const auto* manual = manual_plans_.find(value.direct_callee,
                                                     value.call_signature);
-            manual && emit_manual_call(function, value, entity, *manual)) {
+            manual && emit_manual_call(function, value, entity, *manual,
+                                       tail)) {
             if (!tail) restore_hard_registers(function);
             return;
         }
@@ -20452,6 +20547,12 @@ private:
             const RegisterView* destination{};
             bool source_temporary{};
         };
+        // A register operand of an output parameter is a transport pointer
+        // that a tail call forwards.
+        const auto reference = [&](std::size_t index) {
+            return index < callee->parameters.size() &&
+                   callee->parameters[index].mode != ParameterMode::In;
+        };
         std::vector<bool> parallel_integer_argument(modes.size());
         std::vector<CallRegisterCopy> register_copies;
         std::vector<CallRegisterCopy> deferred_register_loads;
@@ -20460,8 +20561,10 @@ private:
                 &value.operands[index + 1U]);
             const auto type = value.call_argument_types[index];
             const auto& location = locations[index];
-            if (!operand || is_aggregate(hir_, type) ||
-                is_vector(hir_, type) || is_floating(hir_, type) ||
+            if (!operand ||
+                (!reference(index) && (is_aggregate(hir_, type) ||
+                                       is_vector(hir_, type) ||
+                                       is_floating(hir_, type))) ||
                 operand->value.mode.bits > 64 || location.indirect ||
                 location.pieces.size() != 1 ||
                 !location.pieces.front().in_register ||
@@ -20678,7 +20781,7 @@ private:
                 return;
             }
             const auto source_type = value.call_argument_types[index];
-            if (is_aggregate(hir_, source_type)) {
+            if (!reference(index) && is_aggregate(hir_, source_type)) {
                 const auto source_offset = vreg_offset(function, source);
                 for (const auto& destination : location.pieces) {
                     if (destination.in_register != registers) continue;
@@ -20704,7 +20807,7 @@ private:
                 }
                 return;
             }
-            if (is_vector(hir_, source_type)) {
+            if (!reference(index) && is_vector(hir_, source_type)) {
                 if (location.pieces.size() != 1) {
                     diagnostics_.error(
                         value.location,
@@ -21092,6 +21195,229 @@ private:
         restore_hard_registers(function);
     }
 
+    // The registers a manual interface lets its body clobber: its ABI's
+    // volatile set, its explicit clobbers, and its direct outputs.
+    static std::vector<std::string> manual_clobber_contract(
+        const ManualAbiPlan& plan) {
+        auto names = plan.abi_info->call_clobbers;
+        names.insert(names.end(), plan.clobbers.begin(), plan.clobbers.end());
+        const auto add = [&](const ManualBoundary& boundary) {
+            if (boundary.kind == ManualBoundaryKind::DirectRegister &&
+                boundary.register_view) {
+                names.emplace_back(boundary.register_view->storage_name);
+            }
+            for (const auto& piece : boundary.register_pieces) {
+                names.emplace_back(piece.register_view->storage_name);
+            }
+        };
+        for (const auto& parameter : plan.parameters) {
+            if (parameter.mode != ParameterMode::In) add(parameter.output);
+        }
+        add(plan.result.output);
+        if (!plan.result.indirect_result_register.empty()) {
+            names.push_back(plan.result.indirect_result_register);
+        }
+        return names;
+    }
+
+    static bool names_register(const std::vector<std::string>& names,
+                               const RegisterView& view) {
+        return std::any_of(
+            names.begin(), names.end(), [&](const std::string& name) {
+                const auto* named = find_register_view(name);
+                return named && shares_register_storage(view, *named);
+            });
+    }
+
+    // Registers that carry the callee's inputs at a manual tail transfer.
+    static std::vector<const RegisterView*> manual_tail_inputs(
+        const ManualAbiPlan& callee) {
+        std::vector<const RegisterView*> inputs;
+        const auto add = [&](const ManualBoundary& boundary) {
+            if (boundary.register_view) {
+                inputs.push_back(boundary.register_view);
+            }
+            for (const auto& piece : boundary.register_pieces) {
+                inputs.push_back(piece.register_view);
+            }
+        };
+        for (const auto& parameter : callee.parameters) add(parameter.input);
+        if (callee.result.output.kind ==
+            ManualBoundaryKind::IndirectRegister) {
+            add(callee.result.output);
+        }
+        return inputs;
+    }
+
+    // A register the caller may clobber that holds an indirect tail target
+    // across the frame teardown without disturbing a callee input.
+    const RegisterView* manual_tail_jump_register(
+        const machine::Function& function, const ManualAbiPlan& caller,
+        const ManualAbiPlan& callee) const {
+        const auto inputs = manual_tail_inputs(callee);
+        for (const auto& name : manual_clobber_contract(caller)) {
+            const auto* view = find_register_view(name);
+            if (!view || view->register_class != RegisterClass::integer ||
+                view->storage_name == "rsp" || view->storage_name == "rbp" ||
+                std::ranges::any_of(
+                    function.callee_saved_registers,
+                    [&](machine::PhysicalRegisterId saved) {
+                        return saved.value == view->storage_id;
+                    }) ||
+                std::ranges::any_of(
+                    inputs, [&](const RegisterView* input) {
+                        return shares_register_storage(*view, *input);
+                    })) {
+                continue;
+            }
+            return find_register_view(view->storage_name);
+        }
+        return nullptr;
+    }
+
+    // Both sides have manual interfaces. The transfer is valid when the
+    // callee's inputs are register values the caller frame need not
+    // restore, results and stack cleanup coincide, and the callee's clobbers
+    // stay within the caller's contract.
+    std::string_view manual_tail_call_failure(
+        const machine::Function& function,
+        const machine::Instruction& call,
+        const machine::Instruction& result,
+        const ManualAbiPlan& caller,
+        const ManualAbiPlan& callee) const {
+        if (!caller.valid || !callee.valid || !caller.abi_info ||
+            !callee.abi_info) {
+            return "the caller or callee manual ABI plan is invalid";
+        }
+        if (caller.abi_info->return_address_bytes !=
+            callee.abi_info->return_address_bytes) {
+            return "caller and callee return-address layouts differ";
+        }
+        if (callee.abi_info->stack_alignment == 0 ||
+            caller.abi_info->stack_alignment %
+                    callee.abi_info->stack_alignment != 0) {
+            return "caller and callee stack alignments are incompatible";
+        }
+        const auto popped = [](const ManualAbiPlan& plan) {
+            return plan.callee_cleanup ? plan.stack.outgoing_area_size
+                                       : std::uint64_t{0};
+        };
+        if (popped(caller) != popped(callee)) {
+            return "caller and callee stack cleanup differ";
+        }
+        if (callee.stack.outgoing_area_size >
+            caller.stack.outgoing_area_size) {
+            return "the callee requires more incoming stack space than the caller provides";
+        }
+        if (caller.x87.has_x87 || callee.x87.has_x87) {
+            return "x87 stack endpoints require a fixed call boundary";
+        }
+        if (!hard_register_views(function).empty()) {
+            return "hard-register values require restoration after the call";
+        }
+        const auto outputs = [](const ManualAbiPlan& plan) {
+            return std::ranges::any_of(
+                plan.parameters, [](const ManualParameterPlan& parameter) {
+                    return parameter.mode != ParameterMode::In;
+                });
+        };
+        if (outputs(caller) || outputs(callee)) {
+            return "output-capable parameters are not forwarded";
+        }
+        for (const auto& parameter : callee.parameters) {
+            if (parameter.input.is_stack()) {
+                return "a tail argument is passed on the stack";
+            }
+            if (parameter.input.is_indirect()) {
+                return "a tail argument is passed by address";
+            }
+        }
+
+        if (caller.result.present != callee.result.present) {
+            return "caller and callee results differ";
+        }
+        if (!caller.result.present) {
+            if (!call.defs.empty() || !result.uses.empty()) {
+                return "a void tail transfer carries a result";
+            }
+        } else {
+            if (caller.result.type != callee.result.type ||
+                call.defs.size() != 1 || result.uses.size() != 1 ||
+                call.defs.front() != result.uses.front()) {
+                return "the result is not forwarded unchanged";
+            }
+            const auto& mine = caller.result.output;
+            const auto& theirs = callee.result.output;
+            const auto same_storage = [](const RegisterView* left,
+                                         const RegisterView* right) {
+                return left && right && left->storage_id == right->storage_id;
+            };
+            bool same = false;
+            if (mine.is_indirect() || theirs.is_indirect()) {
+                // The caller forwards its result address: the transfer
+                // reloads it into a register endpoint, and a stack endpoint
+                // must already hold it where the callee looks.
+                same = mine.is_indirect() && theirs.is_indirect() &&
+                       caller.result.indirect_result_register ==
+                           callee.result.indirect_result_register &&
+                       (theirs.kind == ManualBoundaryKind::IndirectRegister ||
+                        (mine.kind == ManualBoundaryKind::IndirectStack &&
+                         manual_caller_offset(caller, mine) ==
+                             manual_caller_offset(callee, theirs)));
+            } else if (mine.kind != theirs.kind) {
+                same = false;
+            } else if (mine.kind == ManualBoundaryKind::DirectRegister) {
+                same = same_storage(mine.register_view, theirs.register_view);
+            } else if (mine.kind == ManualBoundaryKind::RegisterPieces) {
+                same = std::ranges::equal(
+                    mine.register_pieces, theirs.register_pieces,
+                    [&](const ManualRegisterPiece& left,
+                        const ManualRegisterPiece& right) {
+                        return same_storage(left.register_view,
+                                            right.register_view) &&
+                               left.value_bit_offset ==
+                                   right.value_bit_offset &&
+                               left.value_bits == right.value_bits &&
+                               left.carrier_bits == right.carrier_bits;
+                    });
+            } else if (mine.kind == ManualBoundaryKind::Stack) {
+                // The callee writes the result slot the caller's caller
+                // reserved.
+                same = manual_caller_offset(caller, mine) ==
+                       manual_caller_offset(callee, theirs);
+            }
+            if (!same) {
+                return "caller and callee result locations are incompatible";
+            }
+        }
+
+        const auto allowed = manual_clobber_contract(caller);
+        for (const auto* input : manual_tail_inputs(callee)) {
+            if (!names_register(allowed, *input)) {
+                return "a tail argument endpoint is preserved by the caller contract";
+            }
+            if (std::ranges::any_of(
+                    function.callee_saved_registers,
+                    [&](machine::PhysicalRegisterId saved) {
+                        return saved.value == input->storage_id;
+                    })) {
+                return "a tail argument endpoint conflicts with caller restoration";
+            }
+        }
+        for (const auto& clobber : call.clobbers) {
+            if (clobber.kind != machine::RegisterKind::Physical) continue;
+            const auto* view = canonical_storage_view({clobber.id});
+            if (view && !names_register(allowed, *view)) {
+                return "the callee clobber contract exceeds the caller contract";
+            }
+        }
+        if (!call.direct_callee &&
+            !manual_tail_jump_register(function, caller, callee)) {
+            return "no register the caller may clobber can hold the tail target";
+        }
+        return {};
+    }
+
     std::string_view dynamic_tail_call_failure(
         const machine::Function& function,
         const machine::Instruction& call,
@@ -21105,10 +21431,22 @@ private:
         if (dynamic_stack_) {
             return "the caller has dynamic stack storage";
         }
-        if (
-            call.kind != machine::InstructionKind::Call ||
+        if (call.kind != machine::InstructionKind::Call ||
             result.kind != machine::InstructionKind::Return ||
-            !call.direct_callee || call.operands.empty()) {
+            call.operands.empty()) {
+            return "the call is indirect or is not immediately returned";
+        }
+        const auto* caller_manual = manual_plans_.find(function.source);
+        const auto* callee_manual =
+            manual_plans_.find(call.direct_callee, call.call_signature);
+        if (caller_manual && callee_manual) {
+            return manual_tail_call_failure(
+                function, call, result, *caller_manual, *callee_manual);
+        }
+        if (caller_manual || callee_manual) {
+            return "only one of the caller and callee has manual ABI endpoints";
+        }
+        if (!call.direct_callee) {
             return "the call is indirect or is not immediately returned";
         }
         const auto& caller = hir_.function(function.source);
@@ -21117,21 +21455,6 @@ private:
         const auto* callee_plan = dynamic_plans_.find(callee.id);
         if (callee.variadic) {
             return "the callee is variadic";
-        }
-        if (manual_plans_.find(caller.id) || manual_plans_.find(callee.id)) {
-            return "manual ABI endpoints require a fixed call boundary";
-        }
-        if (std::ranges::any_of(
-                caller.parameters,
-                [](const hir::Parameter& parameter) {
-                    return parameter.mode != ParameterMode::In;
-                }) ||
-            std::ranges::any_of(
-                callee.parameters,
-                [](const hir::Parameter& parameter) {
-                    return parameter.mode != ParameterMode::In;
-                })) {
-            return "output-capable parameters are not forwarded";
         }
         if (!hard_register_views(function).empty()) {
             return "hard-register values require restoration after the call";
@@ -21289,9 +21612,15 @@ private:
             const auto* source = std::get_if<machine::RegisterOperand>(
                 &call.operands[index + 1U]);
             const auto type = call.call_argument_types[index];
+            // A register output argument is the caller's own transport
+            // pointer; an output cell of this frame never reaches here.
+            const bool reference = index < callee.parameters.size() &&
+                callee.parameters[index].mode != ParameterMode::In;
             const auto& location = locations[index];
-            if (!source || is_aggregate(hir_, type) ||
-                is_vector(hir_, type) || is_floating(hir_, type) ||
+            if (!source ||
+                (!reference && (is_aggregate(hir_, type) ||
+                                is_vector(hir_, type) ||
+                                is_floating(hir_, type))) ||
                 source->value.mode.bits > 64 || location.indirect ||
                 location.pieces.size() != 1 ||
                 !location.pieces.front().in_register) {
@@ -23176,7 +23505,7 @@ private:
         const auto symbol = assembly_symbol(function.symbol);
         const auto patch_function = has_patch(function);
         const auto split_function = options_.function_sections ||
-                                    entity.retain ||
+                                    entity.retain || entity.mergeable ||
                                     entity.temperature !=
                                         hir::FunctionTemperature::Normal;
         const auto section_prefix = [&]() -> std::string {
@@ -23203,10 +23532,12 @@ private:
             : split_function
                 ? section_prefix() + function.symbol
                 : std::string(".text");
+        const auto group = entity.mergeable ? std::string_view(symbol)
+                                            : std::string_view{};
         std::string section_error;
         const auto directive = assembly_section_directive(
             format_, {section, AssemblySectionKind::Code,
-                      entity.section.has_value(), entity.retain},
+                      entity.section.has_value(), entity.retain, group},
             section_error);
         if (!directive) {
             diagnostics_.error(function.location, section_error);
@@ -23236,7 +23567,8 @@ private:
         std::string symbol_error;
         const auto symbol_directives = assembly_symbol_directives(
             format_, {symbol, entity.linkage == Linkage::Global, true,
-                      entity.weak, assembly_visibility(entity.visibility)},
+                      entity.weak, assembly_visibility(entity.visibility),
+                      entity.mergeable},
             symbol_error);
         if (!symbol_directives) {
             diagnostics_.error(function.location, symbol_error);
@@ -23253,6 +23585,7 @@ private:
                     << "; .type 32; .endef\n";
         }
         output_ << symbol << ":\n";
+        const auto first_jump_table = jump_tables_.size();
         if (dwarf_cfi_enabled()) output_ << ".cfi_startproc\n";
         const bool seh = format_ == ObjectFormat::Coff && unwind_enabled();
         if (seh) output_ << ".seh_proc " << symbol << "\n";
@@ -23523,6 +23856,13 @@ private:
         if (seh) output_ << ".seh_endproc\n";
         if (format_ == ObjectFormat::Elf) {
             output_ << ".size " << symbol << ", .-" << symbol << "\n";
+        }
+        if (!group.empty() && format_ != ObjectFormat::MachO) {
+            emit_jump_tables(first_jump_table,
+                             (format_ == ObjectFormat::Coff ? ".rdata$"
+                                                            : ".rodata.") +
+                                 function.symbol,
+                             group);
         }
         if (entity.retain && format_ == ObjectFormat::Coff &&
             entity.linkage == Linkage::Global) {
