@@ -184,6 +184,12 @@ may have `out` or `inout` parameters.
 
 ## Limits on all targets
 
+- Specified but not implemented yet: incomplete array declarations, expression
+  lists in `for` clauses, `$::offsetof`, the floating intrinsics, `exhaustive`,
+  `address`, attribute regions, explicit casts between function-pointer types
+  and to `uptr`, `-fwrapv`, `-fzero-init-in-data`, `-fbounds-trap`, `-MP`,
+  `-ffile-prefix-map`, the generic budget options, `debug` entries and `-g`,
+  and the profile floating-environment properties.
 - Generic records and unions (`struct list<T>`) are specified but not
   implemented; `$::feature::generic_types` is absent.
 - Function pointers can be converted to another ABI or other register

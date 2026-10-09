@@ -90,6 +90,7 @@ kind "name" {
 }
 ```
 
+The kinds are `abi`, `mangling`, `optimization`, `profile`, and `debug`.
 Only `abi` entries contain blocks (`bank`, `rule`, `variadic_state`, and
 `variadic_shadow`), and a block has no `;` after its closing brace. Every
 property and every mangling rule ends in `;`. `#` and `//` start comments
@@ -915,6 +916,10 @@ profile "x86_64-kernel" {
 | `mangling` | text | none | no |
 | `optimization` | text | none | no |
 | `f.*`, `m.*` | option value | | no |
+| `debug` | text | `dwarf` | no |
+| `fp_traps` | list | `[]` | no |
+| `fp_denormal_operand` | text | `ieee` | no |
+| `fp_denormal_result` | text | `ieee` | no |
 
 `default_for` lists target-triple patterns in which `*` matches any
 sequence of characters; the profile is the default for the triples it
@@ -929,10 +934,49 @@ With `-mprofile=NAME`, the profile's `target` applies only when the command
 line has no `-target`. A profile chosen by `default_for` never changes the
 target. The target is fixed before the profile's `m.*` options are checked.
 
+`debug` names the entry `-g` selects. `fp_traps` lists the floating-point
+exceptions the program runs with enabled, from `invalid`, `divide-by-zero`,
+`overflow`, `underflow`, and `inexact`; `fp_denormal_operand` is `ieee` or
+`trap`; `fp_denormal_result` is `ieee` or `flush`. The language specification
+defines what the compiler may and may not do under each environment.
+
 `-O` replaces the profile's `optimization` but not its `f.*` and `m.*`
 settings, which override the preset's values. Explicit `-f` and `-m`
 options override both, wherever they appear; when one option is given more
 than once, the last one counts.
+
+## Debug entries
+
+A `debug` entry describes the debugging information a compilation emits with
+`-g`. `format` names an emitter the compiler implements; the other properties
+select the contents the emitter supports:
+
+```text
+debug "dwarf" {
+    format = "dwarf";
+    version = 5;
+    frame_section = "debug_frame";
+    lines = true;
+    frames = true;
+    variables = true;
+    types = true;
+}
+```
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `format` | text | none | `dwarf` is the only shipped emitter. |
+| `version` | integer | emitter default | The format version. |
+| `frame_section` | text | `debug_frame` | Where call-frame information goes: `debug_frame` (not loaded) or `eh_frame` (loaded; `-funwind-tables` emits the latter independently). |
+| `lines` | bool | `true` | Line tables and inlining origins for every emitted function, including clones. |
+| `frames` | bool | `true` | Call-frame information for every emitted function. |
+| `variables` | bool | `true` | Locations of parameters, including the pointer channels of `out` and `inout` parameters at ABI boundaries, and of locals. |
+| `types` | bool | `true` | Type descriptions, namespaces, and generic instances. |
+
+`-g=NAME` selects an entry; `-g` selects the profile's `debug` entry, or the
+shipped `dwarf` when the profile names none; `-g0` emits nothing. The shipped
+`dwarf-lines` entry enables only `lines` and `frames`. A `debug` entry contains
+no block.
 
 ## Queries and inspection
 

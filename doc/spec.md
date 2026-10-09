@@ -84,7 +84,7 @@ These rules override any less-specific text:
 | translation-only function | An explicit `eval_only` function, procedural macro, syntax expander, or translation-only helper (a function whose signature uses a `$::meta` type); it runs only during translation. |
 | runtime expression | An expression emitted into the output program rather than executed by `cc`. |
 | token tree | A balanced delimiter group and its contents; each construct specifies its permitted outer delimiters. |
-| compiler model | A declarative ABI, mangling, optimization, or profile entry loaded from a model file ([models.md](models.md)); never Cross source or executable code. |
+| compiler model | A declarative ABI, mangling, optimization, profile, or debug entry loaded from a model file ([models.md](models.md)); never Cross source or executable code. |
 | registered ABI | An ABI defined by a loaded compiler model, as opposed to a dynamic or manual ABI. |
 | target registry | The facts about the selected target that `cc` and the loaded models provide: register views, instruction forms and their effects, address spaces, ABIs, and options. `cc --print-registers`, `--print-instructions`, `--print-abis`, and `--print-options=target` list them. |
 
@@ -306,7 +306,11 @@ typedef u64 word;                  // type alias
 Parentheses in a declarator override binding. Postfix `[]` and `()` bind more
 tightly than prefix `*`, so `T *a[N]` is an array of pointers and
 `T (*p)[N]` is a pointer to an array. Every array bound except an omitted first
-bound in an initialized array must be a positive integer expression.
+bound must be a positive integer expression. An omitted first bound in an
+initialized array is inferred from the initializer; in a file- or
+namespace-scope declaration without an initializer it declares an incomplete
+array type, which indexing and decay may use, which `sizeof` may not, and
+which a definition of the same object in the compilation group completes.
 File-scope array bounds are translation-time values. A runtime block-scope
 bound creates a variable-length array under the managed-frame rules.
 
@@ -357,8 +361,9 @@ a brace-enclosed, comma-separated list. Entries initialize successive members
 or elements; `.member = value` and `[constant_index] = value` select a
 destination and reset the successive position after it. A nested brace list
 initializes a nested aggregate. Missing members/elements and padding are zero
-initialized. Excess entries, duplicate designators, invalid member names, and
-out-of-range indices are errors.
+initialized, except that an initializer of a record declared `exhaustive`
+must name every member. Excess entries, duplicate designators, invalid member
+names, and out-of-range indices are errors.
 
 For an automatic variable-length array, the bound is evaluated once before
 initialization. The runtime bound must include every explicitly initialized
@@ -377,7 +382,10 @@ An array of `u8` may be initialized by a UTF-8 string when the array is large
 enough for its bytes and terminating zero; an omitted bound is inferred.
 Static-duration initializers must be translation-time values or
 target/object-format relocatable address expressions. No initializer invokes a
-hidden initialization routine.
+hidden initialization routine. A static-duration object whose value is all
+zero bits may be placed in storage the loader zeroes; `-fzero-init-in-data`
+places every such object with the initialized data instead, so an image
+patcher can change it.
 
 ### Values, conversions, and casts
 
@@ -391,7 +399,10 @@ Assignment converts the source to the destination type. A cast `(T) value`
 requests the same conversion explicitly. Conversions are permitted between
 arithmetic types, between compatible pointer types, between `void *` and
 object pointers, and between pointers and sufficiently wide integers as
-specified below. A scalar converts to `bool` as false when it is numeric zero
+specified below. An explicit cast may also convert between any two
+function-pointer types; calling through a pointer whose callable interface
+differs from the called function's own is undefined unless the target
+documents that the two interfaces are physically identical. A scalar converts to `bool` as false when it is numeric zero
 or null and true otherwise. Converting to a narrower integer keeps the low
 bits; converting an unsigned integer wider zero-extends it; converting a signed
 integer wider sign-extends it. Floating/integer conversion truncates toward
@@ -476,8 +487,8 @@ as their operand, so `-(u32)value` and `*(u32 *)address` need no extra grouping.
 Prefix `++`/`--` and expression-form `sizeof` still take unary expressions.
 This grammar does not make a cast result an lvalue or relax operand type rules.
 
-Comma separates declarations, arguments, initializers, and generic parameters;
-it is not a Cross expression operator.
+Comma separates declarations, arguments, initializers, generic parameters, and
+the expressions of a `for` clause; it is not a Cross expression operator.
 
 Operands and call arguments are evaluated left-to-right. Assignment first
 evaluates and remembers its destination, then evaluates its source, then
@@ -566,7 +577,7 @@ if (expression) statement [ else statement ]
 switch (expression) statement
 while (expression) statement
 do statement while (expression) ;
-for ([declaration-or-expression] ; [expression] ; [expression]) statement
+for ([declaration-or-expression-list] ; [expression] ; [expression-list]) statement
 break ;
 continue ;
 return [expression] ;
@@ -578,7 +589,8 @@ default:
 
 Conditions use scalar truth conversion. `while` tests before its body;
 `do` tests after it; `for` executes initializer once, then test, body, and
-increment in that order. `break` exits the nearest loop or switch. `continue`
+increment in that order. The initializer and increment clauses of `for` may
+list several expressions separated by commas, evaluated left to right. `break` exits the nearest loop or switch. `continue`
 starts the next iteration of the nearest loop. A non-`void` return requires a
 convertible value; a `void` return has none. Falling off a `void` function is a
 normal return. Other fallthrough from a value-returning function is undefined.
@@ -644,7 +656,10 @@ overflow, minimum/-1 division, invalid shift counts, and unrepresentable signed
 left shifts are undefined; right shift of a negative value is target-defined.
 The x86-64 and MIPS targets define it as arithmetic (sign-extending)
 right shift, including during translation-time evaluation.
-Wrapping/saturating/checked operations require user code or instructions.
+Wrapping/saturating/checked operations require user code or instructions. The
+registered option `-fwrapv` instead makes signed `+`, `-`, `*`, and `<<` wrap
+modulo 2^N, at runtime and during translation-time evaluation alike; division
+of the minimum value by -1 and invalid shift counts remain undefined.
 
 `bool`, 8-bit, and 16-bit integers promote to `i32`. Other integer ranks
 increase with width; equal-width signed/unsigned types have equal rank;
@@ -680,8 +695,17 @@ of the 80 value bits. Noncanonical x87 encodings are not `f80` values.
 
 Ordinary floating expressions round to their nominal result type using
 round-to-nearest, ties-to-even; Cross grants no implicit excess precision. The
-default floating environment has masked exceptions and is not source
-observable. Machine operations that change x87 precision, rounding, or control
+floating environment is a property of the selected profile
+([models.md](models.md#profiles)): which exceptions trap, whether a denormal
+operand traps, and whether a denormal result flushes to zero. The shipped
+profiles declare a masked environment with gradual underflow, which is not
+source observable. Under a profile that declares traps or flushing, an
+operation that may raise an enabled trap is executed only where the source
+executes it, never speculatively, and translation-time evaluation follows the
+declared environment: a result flushes to zero where the profile says so, and
+an operation that would trap is not folded, so a mandatory evaluation of it
+is diagnosed. `-ffast-math` never introduces an operation that can trap where
+the source has none. Machine operations that change x87 precision, rounding, or control
 state must restore the target default before ordinary floating code or a
 managed call. Cross never inserts a hidden floating-environment helper.
 
@@ -849,7 +873,9 @@ pointer/integer comparisons are invalid. A null pointer
 compares unequal to every pointer to an object/function. Object pointers
 convert to/from `void *` without changing their address and recover their
 original value when converted back. Function and object pointers are distinct;
-conversion between them exists only when the target ABI explicitly defines it.
+conversion between them, and explicit conversion between a function pointer
+and `uptr`, exist only when the target defines them. The shipped x86-64 and
+MIPS targets define the `uptr` conversion as the code address, like `label`.
 
 An object's lifetime begins after its storage and initialization are
 established and ends when its block exits, its dynamic stack region is
@@ -1360,8 +1386,11 @@ Dependencies come from the textual include graph and active, declared
 emit dependencies instead of source; `-MD` and
 `-MMD` emit source and a dependency file; `-MF`, `-MT`, and `-MQ` select the
 file and target spelling. Spaces and `#` are escaped and `$` is doubled for
-Make. Multiple inputs emit one rule per input. Because there are no implicit
-system directories, `-MM` is equivalent to `-M`, and `-MMD` to `-MD`.
+Make. `cpp` emits one rule per input; `cc` emits one rule per output whose
+prerequisites are every input, included file, and embedded file of the group.
+`-MP` adds a phony target for each prerequisite other than a primary input.
+Because there are no implicit system directories, `-MM` is equivalent to
+`-M`, and `-MMD` to `-MD`.
 
 ### Restrictions
 
@@ -1640,8 +1669,9 @@ and semantic checking; two identical normalized argument lists denote the same
 instance. Declaration-time `$::static_assert` checks and the ordinary
 constraints of the substituted
 body diagnose invalid instances. Recursive instantiation of the same argument
-list denotes the in-progress instance; unbounded creation of new instances is
-diagnosed.
+list denotes the in-progress instance; creating more instances than the
+documented, adjustable budgets allow (`-fgeneric-instance-limit=N` and
+`-fgeneric-depth-limit=N`) is diagnosed.
 
 A generic declaration has no runtime address, link symbol, or ABI, and its
 address cannot be taken without an argument list. An instance is an ordinary
@@ -3538,6 +3568,8 @@ Required intrinsics are:
 | `$::unreachable()` | Emit no required instruction; terminate the block; execution is undefined. |
 | `$::trap()` | When available, emit a documented inline abnormal transfer; preserve prior sequenced effects; never return normally. |
 | `$::alignof(type-or-expression)` | Unevaluated compile-time `uptr` alignment query. |
+| `$::offsetof(type, designator)` | Unevaluated compile-time `uptr` offset of a member designator (a member name followed by `.member` and `[constant]` steps) within a complete record type. |
+| `$::sqrt(x)`, `$::fabs(x)`, `$::copysign(x, y)`, `$::fmin(x, y)`, `$::fmax(x, y)` | Floating operations on one floating type: correctly rounded square root, absolute value, sign transfer, and IEEE 754 `minNum`/`maxNum`; each lowers to one instruction or a finite inline sequence, or is diagnosed. |
 | `$::static_assert(constant, string)` | Compile-time declaration requiring nonzero `constant`. |
 | `$::patch(initial[, site])` | Siteful runtime scalar source with the lifecycle, identity, sink, and lowering contract defined under patchable values. |
 
@@ -3556,6 +3588,10 @@ still retain their ordinary source constraints. An assumption never executes
 its condition merely to validate it.
 
 `$::trap` and `$::unreachable` perform no copy-out or managed-stack cleanup.
+An implementation may offer optional instrumentation that inserts inline
+checks ending in `$::trap()`, such as array-bound and output-channel checks
+under `-fbounds-trap`; `no_sanitize("name")` suppresses the named
+instrumentation per function, and no instrumentation calls a helper.
 The atomic intrinsics are listed under “Atomic and concurrent access.”
 `$::eval`, `$::runtime`, `$::quote`, and `$::unquote` are translation
 intrinsics and therefore emit no runtime operation. Additional intrinsics must
@@ -3667,6 +3703,22 @@ is invalid for the entity. These ownership constraints are checked when the
 declaration survives expansion; captured syntax preserves the written
 placement.
 
+An attribute region, one or more attribute specifiers followed by a braced
+group of external items, applies its attributes to each declaration and
+definition in the group for which they are valid, as leading attributes; an
+attribute written on a declaration inside takes precedence over a region
+attribute of the same name, regions nest, and a region attribute valid for
+none of the region's declarations is an error. Like a `syntax` region, an
+attribute region is a transparent declaration group that creates no namespace
+or scope.
+
+```text
+[[abi("sysv_abi")]] {
+    i32 c_read(in i32 fd, in void *buffer, in uptr count);
+    i32 c_close(in i32 fd);
+}
+```
+
 Core attributes use one identifier, for example `[[interrupt("irq")]]`. A target
 may define qualified contextual names. Unknown attributes are errors.
 Cross has no user-defined attributes or ignored annotation namespace;
@@ -3695,6 +3747,8 @@ The following object, type, and symbol attributes are normative:
 | `alias("name")` | Defines the entity as an alias of a compatible definition with that link name. |
 | `visibility("kind")` | Selects `default`, `hidden`, `protected`, or `internal` visibility when supported. |
 | `noinit` | Places an uninitialized static-duration object in non-zeroed storage. |
+| `address(N)` | On a declaration without an initializer or body: the entity is at the fixed address `N`; no storage is emitted and references use that address. |
+| `exhaustive` | On a record definition: a brace initializer of the record must name every member. |
 | `thread_local` | Gives a static-duration object thread-local storage. |
 | `tls_model("model")` | Selects a target TLS model for a thread-local entity. |
 | `link_name("name")` | Replaces the default link name of a global function, object, or label. |
@@ -3725,7 +3779,12 @@ global void boot_entry() {
 It implies no linkage, retention, entry-point, or section flags. Those come
 from other attributes, the target/object format, or a user linker script. A
 global label remains in its function's section. Unrepresentable names or
-placements are diagnosed.
+placements are diagnosed. The definitions a source unit places in one named
+section are emitted into that section contiguously in definition order, with
+only the padding their alignments require; `-ffunction-sections` and
+`-fdata-sections` affect only definitions without an explicit section, which
+they place in a section named after the definition's link name in the object
+format's convention.
 
 The following function and statement attributes are normative:
 
@@ -3819,6 +3878,19 @@ primary-input boundary; compatible declarations and undecorated definitions do
 cross source units in the same group. File order does not affect semantic
 resolution. A procedural invocation requires its macro definition to be
 visible through its primary input, normally by textual inclusion.
+
+The output of a compilation is a function of its inputs, options, loaded
+models, and compiler build: the same command on the same files produces
+byte-identical preprocessed, assembly, object, and dependency output
+regardless of the working directory, environment, host, thread count, or
+allocator behavior. A source unit is identified by its primary input's path as
+written on the command line, after `-ffile-prefix-map=OLD=NEW` replaces a
+leading `OLD` with `NEW`; `$::source::file`, source-unit identities,
+implementation-internal symbol names, and debugging information use that
+spelling, never a path the compiler resolved. Within a source unit and
+section, definitions are emitted in definition order, and source units in
+command-line order, so adding a definition to one source unit changes no other
+unit's symbols or layout.
 
 All inputs of one `cc` command form one compilation group with one output;
 objects produced by separate commands belong to separate groups.
@@ -3927,6 +3999,9 @@ The core options are:
 -M/-MM          emit dependencies
 -MD/-MMD        emit source and dependencies
 -MF/-MT/-MQ     control dependency output
+-MP             add phony targets for prerequisites
+-ffile-prefix-map=OLD=NEW
+                spell source paths starting with OLD as NEW
 -target triple  select the target macro and feature environment
 -march=name     select target instruction compatibility
 -mtune=name     select target scheduling and cost preferences
@@ -3979,6 +4054,8 @@ The required core options are:
 -O0/-Og/-O1/-O2/-O3/-Os/-Oz
                 select a loaded standard optimization preset
 -O=name         select any loaded optimization preset
+-g[=name]       emit debugging information per a loaded debug entry
+-g0             emit no debugging information
 -foption/-fno-option/-foption=value
                 set a registered target-independent compiler option
 -moption/-mno-option/-moption=value
@@ -4110,7 +4187,8 @@ Each target description shall document:
   patch-value materializers, patchable operand fields, and runtime-free
   lowering; and
 - predefined macros/queries plus trap, privilege, unwind, exception, and exact
-  machine-region behavior.
+  machine-region behavior; and
+- the debugging-information formats its `debug` entries may name.
 
 Delegated behavior is implementation-defined by that target description, not
 undefined merely because this common document delegates it.
@@ -4136,8 +4214,13 @@ external_item
     | syntax_declaration
     | syntax_activation
     | syntax_region
+    | attribute_region
     | syntax_invocation
     | macro_invocation ;
+
+attribute_region
+    = attribute_specifier { attribute_specifier }
+      "{" { external_item } "}" ;
 
 namespace_declaration
     = "namespace" namespace_name "{" { external_item } "}" ;
@@ -4298,9 +4381,11 @@ iteration_statement
     = "while" "(" expression ")" statement
     | "do" statement "while" "(" expression ")" ";"
     | "for" "(" for_initializer ";" [ expression ] ";"
-      [ expression ] ")" statement ;
+      [ expression_list ] ")" statement ;
 for_initializer
-    = /* empty */ | expression | declaration_without_final_semicolon ;
+    = /* empty */ | expression_list | declaration_without_final_semicolon ;
+expression_list
+    = expression { "," expression } ;
 jump_statement
     = "break" ";" | "continue" ";"
     | "return" [ expression ] ";"
@@ -4358,11 +4443,14 @@ argument_list
 primary_expression
     = qualified_name | builtin_name | literal
     | "$::alignof" "(" (type_name | expression) ")"
+    | "$::offsetof" "(" type_name "," member_designator ")"
     | "$::atomic_is_lock_free" "(" (type_name | argument_list) ")"
     | "(" expression ")" | embed_expression
     | quote_expression | syntax_invocation | macro_invocation
     | structured_expression_splice ;
 
+member_designator
+    = identifier { "." identifier | "[" constant_expression "]" } ;
 generic_arguments
     = [ "::" ] "<" generic_argument { "," generic_argument } ">" ;
 generic_argument
