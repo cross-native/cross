@@ -87,6 +87,11 @@ struct Type {
     VectorBoundUnit vector_bound_unit{VectorBoundUnit::Lanes};
     enum class VectorExtentDependency { None, ExpansionContext };
     VectorExtentDependency vector_extent_dependency{VectorExtentDependency::None};
+    // Minimum alignment requested by `aligned` on a typedef of this type: the
+    // largest resolved request, or zero. Requests whose required constant is
+    // not resolved yet stay in `alignment_requests`. Values ignore both.
+    unsigned alignment{};
+    std::vector<std::shared_ptr<const Expr>> alignment_requests{};
     bool scalable{};
     std::string generic_name;
     SourceLocation generic_location;
@@ -188,13 +193,33 @@ bool is_meta_type(const TypePtr& type);
 bool is_vector(const TypePtr& type);
 bool is_nominal(const TypePtr& type);
 unsigned type_bits(const TypePtr& type);
+// Natural storage of builtin scalars and fixed vectors, shared by target layout
+// and translation-time evaluation. Void has no storage.
+std::optional<std::uint64_t> builtin_storage_size(BuiltinType type, unsigned address_bits,
+                                                  unsigned f80_storage_bytes);
+std::uint64_t natural_storage_alignment(std::uint64_t size, bool f80,
+                                        unsigned alignment_limit, unsigned f80_alignment);
+struct StorageLayout {
+    std::uint64_t size{};
+    std::uint64_t alignment{1};
+};
+// An object of a type requesting `requested` alignment over its natural
+// layout takes the larger alignment and rounds its size up to it, so array
+// elements and members keep that alignment. Empty when the size overflows.
+std::optional<StorageLayout> requested_storage(StorageLayout natural, std::uint64_t requested);
 
 enum class Linkage { Group, Static, Global };
 enum class ParameterMode { In, Out, InOut };
 
-// The top-level const of an in parameter qualifies its local cell, not the
-// callable boundary. Preserve all nested and non-const qualifiers.
+// The top-level const of an in parameter and the requested alignment of any
+// parameter qualify its local cell, not the callable boundary. Preserve all
+// nested and non-const qualifiers.
 TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode);
+// A copy of the type without its own requested (typedef) alignment.
+TypePtr without_alignment(const TypePtr& type);
+// A result's requested alignment qualifies only the object receiving the
+// value; callable identity uses the result's base type.
+TypePtr callable_result_type(const TypePtr& type);
 
 struct Expr;
 struct ObjectDecl;

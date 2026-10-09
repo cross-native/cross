@@ -8,6 +8,7 @@
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 #include "target/x86_64/features.hpp"
+#include "target/x86_64/target.hpp"
 
 #include <algorithm>
 #include <array>
@@ -66,40 +67,21 @@ unsigned type_bits(const hir::Module& module, hir::TypeId id) {
     return 0;
 }
 
-unsigned storage_size(const hir::Module& module, hir::TypeId id) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Pointer) return 8;
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        const auto size = module.record(*type.record).size;
-        return size <= std::numeric_limits<unsigned>::max()
-                   ? static_cast<unsigned>(size)
-                   : 0;
-    }
-    if (type.kind == hir::Type::Kind::Array) {
-        if (!type.element || type.lanes == 0) return 0;
-        const auto element = storage_size(module, *type.element);
-        return element != 0 &&
-                       type.lanes <=
-                           std::numeric_limits<unsigned>::max() / element
-                   ? element * type.lanes
-                   : 0;
-    }
-    const auto bits = type_bits(module, id);
-    if (bits == 80) return 16;
-    return std::max(1U, (bits + 7U) / 8U);
+// Values travel as their type without its own requested alignment; members
+// keep the storage alignment of theirs.
+unsigned value_size(const hir::Module& module, hir::TypeId id) {
+    const auto size = hir::natural_size(module, id, x86_64_target()).value_or(0);
+    return size <= std::numeric_limits<unsigned>::max() ? static_cast<unsigned>(size) : 0;
 }
 
-unsigned natural_alignment(const hir::Module& module, hir::TypeId id) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        return module.record(*type.record).alignment;
-    }
-    if (type.kind == hir::Type::Kind::Array && type.element) {
-        return natural_alignment(module, *type.element);
-    }
-    const auto size = storage_size(module, id);
-    if (size >= 16) return 16;
-    return std::max(1U, std::min(8U, size));
+unsigned value_alignment(const hir::Module& module, hir::TypeId id) {
+    return static_cast<unsigned>(
+        hir::natural_alignment(module, id, x86_64_target()).value_or(1));
+}
+
+unsigned storage_alignment(const hir::Module& module, hir::TypeId id) {
+    return static_cast<unsigned>(
+        hir::layout_alignment(module, id, x86_64_target()).value_or(1));
 }
 
 bool void_type(const hir::Module& module, hir::TypeId id) {
@@ -232,7 +214,7 @@ std::optional<AbiValue> abi_value(const hir::Module& module,
     result.transport = transport;
     result.alignment_bits = static_cast<std::uint16_t>(
         std::min<unsigned>(
-            natural_alignment(module, type) * 8U,
+            value_alignment(module, type) * 8U,
             std::numeric_limits<std::uint16_t>::max()));
     if (item.kind == hir::Type::Kind::Record && item.record) {
         const auto& record = module.record(*item.record);
@@ -256,7 +238,7 @@ std::optional<AbiValue> abi_value(const hir::Module& module,
             field->alignment_bits = static_cast<std::uint16_t>(
                 std::min<unsigned>(
                     std::max(member.alignment,
-                             natural_alignment(module, member.type)) * 8U,
+                             storage_alignment(module, member.type)) * 8U,
                     std::numeric_limits<std::uint16_t>::max()));
             result.elements.push_back(std::move(*field));
             result.element_offsets_bits.push_back(
@@ -267,9 +249,23 @@ std::optional<AbiValue> abi_value(const hir::Module& module,
     if (item.kind == hir::Type::Kind::Array && item.element) {
         auto element = abi_value(module, *item.element, abi);
         if (!element) return std::nullopt;
-        result.mode = ScalarMode::array(static_cast<std::uint16_t>(bits));
         result.element_count = item.lanes;
-        result.elements.push_back(std::move(*element));
+        const auto stride =
+            hir::layout_size(module, *item.element, x86_64_target()).value_or(0) * 8U;
+        if (stride == element->mode.bits) {
+            result.mode = ScalarMode::array(static_cast<std::uint16_t>(bits));
+            result.elements.push_back(std::move(*element));
+            return result;
+        }
+        // Padded elements are placed explicitly at their storage stride.
+        result.mode = ScalarMode::array(static_cast<std::uint16_t>(
+            std::min<std::uint64_t>(stride * item.lanes,
+                                    std::numeric_limits<std::uint16_t>::max())));
+        for (std::uint32_t index = 0; index < item.lanes; ++index) {
+            result.elements.push_back(*element);
+            result.element_offsets_bits.push_back(
+                static_cast<std::uint32_t>(index * stride));
+        }
         return result;
     }
     if (item.kind == hir::Type::Kind::Pointer ||
@@ -735,11 +731,11 @@ private:
             const auto size =
                 indirect ? std::uint64_t{8}
                          : static_cast<std::uint64_t>(
-                               storage_size(module_, parameter.type));
+                               value_size(module_, parameter.type));
             const auto alignment =
                 indirect ? std::uint64_t{8}
                          : static_cast<std::uint64_t>(
-                               natural_alignment(module_, parameter.type));
+                               value_alignment(module_, parameter.type));
             const bool same =
                 input_stack && output_stack &&
                 parameter.input.fixed_stack_offset &&
@@ -792,11 +788,11 @@ private:
                  indirect
                      ? std::uint64_t{8}
                      : static_cast<std::uint64_t>(
-                           storage_size(module_, plan.result.type)),
+                           value_size(module_, plan.result.type)),
                  indirect
                      ? std::uint64_t{8}
                      : static_cast<std::uint64_t>(
-                           natural_alignment(module_, plan.result.type))});
+                           value_alignment(module_, plan.result.type))});
         }
 
         for (const auto& atom : atoms) {

@@ -327,6 +327,19 @@ if(BUILD_TESTING)
                      -P "${CMAKE_SOURCE_DIR}/test/language/storage_constraints.cmake")
     set_tests_properties(cross_storage_constraints PROPERTIES
         LABELS "feature.storage;arch.x86_64;check.compile;diagnostics")
+    foreach(arch x86_64 mips)
+        add_test(NAME cross_aligned_typedef_${arch}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/aligned_typedef.x
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aligned-typedef-${arch}
+                         -DARCH=${arch}
+                         -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+                         -DGIMPLE_TEXT=${CROSS_ENABLE_GCC_GIMPLE_TEXT}
+                         -P "${CMAKE_SOURCE_DIR}/test/language/aligned_typedef.cmake")
+        set_tests_properties(cross_aligned_typedef_${arch} PROPERTIES
+            LABELS "frontend;diagnostics;feature.layout;feature.attributes;feature.records;feature.array;feature.evaluation;arch.${arch};check.compile")
+    endforeach()
     foreach(level O0 O2)
         add_test(NAME cross_runtime_vector_explicit_splat_${level}
                  COMMAND "${CMAKE_COMMAND}"
@@ -2365,6 +2378,47 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/alignment_expressions_mips.cmake")
     set_tests_properties(cross_alignment_expressions_mips PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.frame")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_aligned_typedef_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aligned_typedef.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aligned-typedef-runtime-${level}
+                    -DENTRY=aligned_typedef_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_aligned_typedef_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.layout;feature.frame;feature.records;feature.evaluation;opt.${level}")
+        # o32 on R3000 and VR4300 in both byte orders, then n64 in each.
+        add_test(NAME cross_mips_aligned_typedef_o32_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aligned_typedef.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/aligned_typedef_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aligned-typedef-o32-${level}
+                    -DEXPECTED=P "-DCC_FLAGS=-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_aligned_typedef_o32_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.layout;feature.frame;feature.records;profile.o32;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(endian big little)
+            add_test(NAME cross_mips_aligned_typedef_n64_${level}_${endian}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aligned_typedef.x
+                        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/aligned_typedef_start.s
+                        -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aligned-typedef-n64-${level}-${endian}
+                        -DN64_ENDIAN=${endian} "-DEXTRA_FLAGS=-${level}"
+                        -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_mips_aligned_typedef_n64_${level}_${endian} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.layout;feature.frame;feature.records;profile.n64;opt.${level};endian.${endian}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     add_test(NAME cross_x86_64_dynamic_call_alignment
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2763,6 +2817,16 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/abi/aggregate_transport.cmake")
     set_tests_properties(cross_x86_64_aggregate_abi PROPERTIES
         LABELS "check.compile;arch.x86_64;backend.native;feature.abi;feature.records")
+    add_test(NAME cross_x86_64_aligned_typedef_abi
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/aligned_typedef.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/backend/abi/aligned_typedef_runner.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aligned-typedef-abi
+                -P "${CMAKE_SOURCE_DIR}/test/backend/abi/aggregate_transport.cmake")
+    set_tests_properties(cross_x86_64_aligned_typedef_abi PROPERTIES
+        LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.records;feature.calls")
     add_test(NAME cross_dynamic_abi
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

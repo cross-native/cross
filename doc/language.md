@@ -78,7 +78,27 @@ typedef u32 u32x4 [[vector_size(16)]];   // four u32 lanes
 
 An enumeration uses `i32` unless `[[underlying(T)]]` selects another integer.
 Atomic objects are written `T [[atomic]]`, and an address space
-`T [[address_space(N)]] *`. Records support `[[packed]]` and `[[aligned(N)]]`.
+`T [[address_space(N)]] *`. Records support `[[packed]]`. `[[aligned(N)]]`
+raises the alignment of an object, record, member, or typedef. A typedef's
+request applies to storage of its type: every object, member, and array
+element of the type is aligned, and the type's size rounds up to the
+alignment. Values of the type convert, compare, and are passed and returned
+like the base type; function types, pointer conversions, and dereferences use
+the base type. Packing does not lower a member below the alignment its type
+requests. A bit-field cannot have such a type, and a vector's lanes carry no
+request, although a vector typedef can request alignment for the whole vector.
+
+```x
+typedef u32 line_u32 [[aligned(64)]];   // sizeof and $::alignof are both 64
+
+struct counters {
+    line_u32 hits;                      // offset 0
+    line_u32 misses;                    // offset 64
+};
+
+$::static_assert(sizeof(struct counters) == 128uptr, "one line per counter");
+```
+
 `[[may_alias]]` exempts a type from the effective-type aliasing rules, which
 otherwise follow C (any object may be accessed through `u8` or `i8`).
 

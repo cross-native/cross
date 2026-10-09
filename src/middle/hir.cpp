@@ -87,7 +87,7 @@ std::string resolved_link_name(const FunctionDecl& function,
         return encode_model_link_name(
             {.qualified_name = model_name,
              .kind = "function",
-             .result = canonical_type_name(function.return_type),
+             .result = canonical_type_name(callable_result_type(function.return_type)),
              .parameters = parameters,
              .variadic = function.variadic},
             false, options.mangling);
@@ -210,7 +210,6 @@ public:
         if (seed.evaluation_layout_scope && seed.evaluation_layout_scope == program_.evaluation_layout_scope) {
             module_ = std::move(seed);
             seeded_records_ = module_.records.size();
-            address_bytes_ = std::max(1U, (module_.address_bits + 7U) / 8U);
             return;
         }
         module_.evaluation_layout_scope = program_.evaluation_layout_scope;
@@ -231,7 +230,6 @@ public:
         module_.address_bits = abi && abi->address_bits != 0
                                    ? abi->address_bits
                                    : 64U;
-        address_bytes_ = std::max(1U, (module_.address_bits + 7U) / 8U);
         for (unsigned kind = static_cast<unsigned>(BuiltinType::Void);
              kind <= static_cast<unsigned>(BuiltinType::Label); ++kind) {
             (void)intern_type(builtin_type(static_cast<BuiltinType>(kind)));
@@ -305,6 +303,7 @@ public:
             if (!source || !visited.insert(source.get()).second) return;
             if (source->array_bound) retained_bounds.push_back(source->array_bound.get());
             if (source->vector_bound) retained_bounds.push_back(source->vector_bound.get());
+            for (const auto& request : source->alignment_requests) retained_bounds.push_back(request.get());
             if (source->pending_address_space) {
                 diagnostics_.error(source->pending_address_space->second,
                                    "address_space requires a pointer declarator");
@@ -840,103 +839,38 @@ private:
                                                        SourceLocation location) {
         if (resource_failed()) co_return {0, 1};
         const auto type = module_.type(id);
-        if (type.kind == Type::Kind::Pointer) {
-            co_return {address_bytes_, std::max(
-                                       1U, std::min(address_bytes_,
-                                                    target_.data_layout
-                                                        .natural_alignment_limit))};
-        }
+        // Complete the nominal and extent dependencies first; the module's
+        // layout functions then give the storage itself.
         if (type.kind == Type::Kind::Record) {
             if (!type.record || !(co_await layout_record_async(*type.record, location))) {
                 co_return {0, 1};
             }
-            const auto& record = module_.record(*type.record);
-            co_return {record.size, record.alignment};
-        }
-        if (type.kind == Type::Kind::Array) {
-            if (!type.element || type.lanes == 0) {
-                diagnostics_.error(location,
-                                   "record member cannot have variable-length or incomplete array type");
+        } else if (type.kind == Type::Kind::Array || type.kind == Type::Kind::Vector) {
+            const bool array = type.kind == Type::Kind::Array;
+            if (!type.element || type.lanes == 0 || (!array && type.scalable)) {
+                diagnostics_.error(location, array
+                    ? "record member cannot have variable-length or incomplete array type"
+                    : "record member cannot have scalable or incomplete vector type");
                 co_return {0, 1};
             }
-            const auto [element_size, element_alignment] =
-                (co_await storage_layout_async(*type.element, location));
-            if (resource_failed()) co_return {0, element_alignment};
-            if (element_size == 0 ||
-                type.lanes > std::numeric_limits<std::uint64_t>::max() /
-                                 element_size) {
-                diagnostics_.error(location,
-                                   "record member array size overflows target storage");
-                co_return {0, element_alignment};
+            const auto element = co_await storage_layout_async(*type.element, location);
+            const auto fallback = array ? element.second : 1U;
+            if (resource_failed()) co_return {0, fallback};
+            if (element.first == 0 ||
+                type.lanes > std::numeric_limits<std::uint64_t>::max() / element.first) {
+                diagnostics_.error(location, array
+                    ? "record member array size overflows target storage"
+                    : "record member vector size overflows target storage");
+                co_return {0, fallback};
             }
-            co_return {element_size * type.lanes, element_alignment};
-        }
-        if (type.kind == Type::Kind::Vector) {
-            if (type.scalable || !type.element || type.lanes == 0) {
-                diagnostics_.error(location,
-                                   "record member cannot have scalable or incomplete vector type");
-                co_return {0, 1};
-            }
-            const auto [element_size, unused] =
-                (co_await storage_layout_async(*type.element, location));
-            if (resource_failed()) co_return {0, 1};
-            (void)unused;
-            if (element_size == 0 ||
-                type.lanes > std::numeric_limits<std::uint64_t>::max() /
-                                 element_size) {
-                diagnostics_.error(location,
-                                   "record member vector size overflows target storage");
-                co_return {0, 1};
-            }
-            const auto size = element_size * type.lanes;
-            co_return {size, std::max(
-                              1U, std::min(
-                                      static_cast<unsigned>(std::min<
-                                          std::uint64_t>(
-                                          size,
-                                          std::numeric_limits<unsigned>::max())),
-                                      target_.data_layout
-                                          .natural_alignment_limit))};
-        }
-        if (type.kind != Type::Kind::Builtin ||
-            type.builtin == BuiltinType::Void) {
+        } else if (type.kind != Type::Kind::Pointer &&
+                   (type.kind != Type::Kind::Builtin || type.builtin == BuiltinType::Void)) {
             diagnostics_.error(location,
                                "record member has an incomplete or non-object type");
             co_return {0, 1};
         }
-        std::uint64_t size{};
-        switch (type.builtin) {
-        case BuiltinType::Bool:
-        case BuiltinType::I8:
-        case BuiltinType::U8: size = 1; break;
-        case BuiltinType::I16:
-        case BuiltinType::U16: size = 2; break;
-        case BuiltinType::I32:
-        case BuiltinType::U32:
-        case BuiltinType::F32: size = 4; break;
-        case BuiltinType::I64:
-        case BuiltinType::U64:
-        case BuiltinType::F64: size = 8; break;
-        case BuiltinType::Iptr:
-        case BuiltinType::Uptr:
-        case BuiltinType::Fptr:
-        case BuiltinType::Label: size = address_bytes_; break;
-        case BuiltinType::I128:
-        case BuiltinType::U128:
-        case BuiltinType::F128: size = 16; break;
-        case BuiltinType::F80:
-            size = target_.data_layout.f80_storage_bytes;
-            break;
-        case BuiltinType::Void: break;
-        }
-        const auto alignment = type.builtin == BuiltinType::F80
-                                   ? target_.data_layout.f80_alignment
-                                   : std::max(
-                                         1U, std::min(
-                                                 static_cast<unsigned>(size),
-                                                 target_.data_layout
-                                                     .natural_alignment_limit));
-        co_return {size, alignment};
+        co_return {layout_size(module_, id, target_).value_or(0),
+                   static_cast<unsigned>(layout_alignment(module_, id, target_).value_or(1))};
     }
 
     ContinuationTask<std::optional<unsigned>> required_alignment_async(TypePtr source, SourceLocation location) {
@@ -945,9 +879,13 @@ private:
         const auto prepare_type = program_.evaluation_prepare_type;
         if (prepare_type &&
             !(co_await prepare_type.async(source, EvaluationLayoutKind::Alignment))) co_return {};
+        if (!(co_await resolve_alignment_async(source, {}))) co_return {};
         // Array counts and pointee layouts do not determine alignment.
-        if (source->kind == cross::Type::Kind::Array)
-            co_return (co_await required_alignment_async(source->element, location));
+        if (source->kind == cross::Type::Kind::Array) {
+            const auto element = co_await required_alignment_async(source->element, location);
+            if (!element) co_return {};
+            co_return std::max(*element, source->alignment);
+        }
         const auto id = intern_type(source);
         if (source->kind != cross::Type::Kind::Record) {
             if (source->kind == cross::Type::Kind::Vector && !(co_await resolve_member_bounds_async(source, {}))) co_return {};
@@ -956,7 +894,8 @@ private:
         }
         const auto record_id = *module_.type(id).record;
         adopt_seed_record(record_id);
-        if (module_.record(record_id).alignment_complete) co_return module_.record(record_id).alignment;
+        if (module_.record(record_id).alignment_complete)
+            co_return std::max(module_.record(record_id).alignment, source->alignment);
         const auto key = source->nominal_key();
         if (!alignment_active_.insert(key).second) {
             diagnostics_.error(location, "record alignment depends on itself");
@@ -989,7 +928,9 @@ private:
             if (!natural) co_return {};
             // This is the same placement-alignment rule as full layout. Width,
             // including a zero-width field, does not change that rule.
-            alignment = std::max(alignment, std::max(requested, packed || member_packed ? 1U : *natural));
+            const auto kept = packed || member_packed
+                ? std::max(1U, hir::requested_alignment(module_, intern_type(member.type))) : *natural;
+            alignment = std::max(alignment, std::max(requested, kept));
         }
         if (resource_failed() || diagnostics_.errors() != errors) co_return {};
         auto& record = module_.record(record_id);
@@ -997,7 +938,19 @@ private:
         record.retained_definition = definition;
         record.alignment = alignment;
         record.alignment_complete = true;
-        co_return alignment;
+        co_return std::max(alignment, source->alignment);
+    }
+
+    // Typedef alignment requests use the same required-constant evaluator as
+    // every other `aligned` placement.
+    ContinuationTask<bool> resolve_alignment_async(TypePtr type, std::string_view name_space) {
+        if (resource_failed()) co_return false;
+        if (type->alignment_requests.empty()) co_return true;
+        co_return co_await with_record_layout_async(type->alignment_requests.front()->location,
+            [&](const LayoutQuery& size_of, const LayoutQuery& align_of) -> ContinuationTask<bool> {
+                co_return co_await resolve_alignment_requests_async(program_, type, diagnostics_,
+                    size_of, align_of, name_space);
+            });
     }
 
     ContinuationTask<bool> set_bit_field_width_async(RecordMember& member,
@@ -1083,6 +1036,7 @@ private:
                     co_return co_await resolve_vector_bound_async(program_, type, diagnostics_, size_of, align_of, name_space);
                 })) && valid;
         }
+        valid = (co_await resolve_alignment_async(type, name_space)) && valid;
         co_return valid;
     }
 
@@ -1196,7 +1150,7 @@ private:
             const auto placement_alignment =
                 std::max(member.alignment,
                          (record.packed || member.packed)
-                             ? 1U
+                             ? std::max(1U, hir::requested_alignment(module_, member.type))
                              : natural_alignment);
             member.alignment = placement_alignment;
             record_alignment = std::max(record_alignment,
@@ -1598,7 +1552,8 @@ private:
     }
 
     bool compatible(const Function& canonical, const FunctionDecl& declaration) {
-        if (canonical.result_type != intern_type(declaration.return_type) ||
+        if (module_.without_alignment(canonical.result_type) !=
+                module_.without_alignment(intern_type(declaration.return_type)) ||
             canonical.parameters.size() != declaration.parameters.size() ||
             canonical.variadic != declaration.variadic) return false;
         const auto same_location = [](const std::optional<std::string>& left,
@@ -2528,7 +2483,6 @@ private:
     RecordSourceProofs* record_source_proofs_;
     // Records below this ID come from the seed of an extended view.
     std::size_t seeded_records_{};
-    unsigned address_bytes_{8};
     std::vector<unsigned char> layout_state_;
     bool required_layout_query_{};
     std::unordered_set<NominalTypeKey, NominalTypeKeyHash> alignment_active_;
@@ -2582,7 +2536,8 @@ bool identical(const Type& type, const Type& candidate) {
         type.is_volatile == candidate.is_volatile &&
         type.is_restrict == candidate.is_restrict &&
         type.is_atomic == candidate.is_atomic &&
-        type.address_space == candidate.address_space;
+        type.address_space == candidate.address_space &&
+        type.alignment == candidate.alignment;
 }
 
 } // namespace
@@ -2598,7 +2553,7 @@ std::optional<TypeId> Module::builtin(BuiltinType kind) const {
     return find_type(*this, type, [&](const Type& candidate) {
         return candidate.kind == Type::Kind::Builtin && candidate.builtin == kind &&
             !candidate.is_const && !candidate.is_volatile &&
-            !candidate.is_atomic && !candidate.is_restrict;
+            !candidate.is_atomic && !candidate.is_restrict && !candidate.alignment;
     });
 }
 
@@ -2620,12 +2575,13 @@ TypeId Module::intern_type(const TypePtr& source) {
         candidate.is_atomic = source->is_atomic;
         candidate.is_restrict = source->is_restrict;
         candidate.address_space = source->address_space;
+        candidate.alignment = source->alignment;
         if (source->kind == cross::Type::Kind::Pointer) {
             candidate.pointee = intern_type(source->pointee);
         } else if (source->kind == cross::Type::Kind::Function &&
                    source->function) {
             FunctionSignature signature;
-            signature.result_type = intern_type(source->function->result);
+            signature.result_type = intern_type(callable_result_type(source->function->result));
             signature.variadic = source->function->variadic;
             signature.result_location = source->function->result_location;
             signature.clobbers = source->function->clobbers;
@@ -2677,7 +2633,9 @@ TypeId Module::function_type(FunctionSignature signature) {
     for (auto& parameter : signature.parameters) {
         if (parameter.mode == ParameterMode::In)
             parameter.type = without_top_level_const(parameter.type);
+        parameter.type = without_alignment(parameter.type);
     }
+    signature.result_type = without_alignment(signature.result_type);
     Type type;
     type.kind = Type::Kind::Function;
     type.function = std::move(signature);
@@ -2711,6 +2669,7 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
             node.is_volatile = type.is_volatile;
             node.is_atomic = type.is_atomic;
             node.is_restrict = type.is_restrict;
+            node.alignment = type.alignment;
             node.address_space = type.address_space;
             node.extent = type.lanes;
             node.scalable = type.scalable;
@@ -2720,6 +2679,7 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
             auto a = module.type(left), b = module.type(right);
             a.is_const = b.is_const = a.is_volatile = b.is_volatile = false;
             a.is_restrict = b.is_restrict = false;
+            a.alignment = b.alignment = 0;
             return identical(a, b) ? PointerJoinEquality::Same : PointerJoinEquality::Different;
         }
         Type rebuild(Type base, const PointerJoinNode<Type>& node) {
@@ -2728,6 +2688,7 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
             result.is_volatile = node.is_volatile;
             result.is_atomic = node.is_atomic;
             result.is_restrict = node.is_restrict;
+            result.alignment = node.alignment;
             result.address_space = node.address_space;
             if (node.kind == PointerJoinKind::Pointer) result.pointee = node.child;
             else if (node.kind == PointerJoinKind::Array || node.kind == PointerJoinKind::Vector)
@@ -2752,7 +2713,7 @@ TypeId Module::pointer_to(TypeId pointee) {
                 candidate.pointee == pointee && !candidate.is_const &&
                 !candidate.is_volatile && !candidate.is_atomic &&
                 !candidate.is_restrict && candidate.address_space == 0 &&
-                candidate.nominal_key().empty();
+                !candidate.alignment && candidate.nominal_key().empty();
         }))
         return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
@@ -2765,6 +2726,19 @@ TypeId Module::without_top_level_const(TypeId id) {
     if (!source.is_const) return id;
     Type candidate = source;
     candidate.is_const = false;
+    if (const auto found = find_type(*this, candidate,
+            [&](const Type& existing) { return identical(existing, candidate); }))
+        return *found;
+    const TypeId result{static_cast<std::uint32_t>(types.size())};
+    types.push_back(std::move(candidate));
+    return result;
+}
+
+TypeId Module::without_alignment(TypeId id) {
+    const auto& source = type(id);
+    if (!source.alignment) return id;
+    Type candidate = source;
+    candidate.alignment = 0;
     if (const auto found = find_type(*this, candidate,
             [&](const Type& existing) { return identical(existing, candidate); }))
         return *found;
@@ -2822,7 +2796,7 @@ TypeId Module::vector_of(TypeId element, std::uint32_t lanes,
                 candidate.element == element && candidate.lanes == lanes &&
                 candidate.scalable == scalable && !candidate.is_const &&
                 !candidate.is_volatile && !candidate.is_atomic &&
-                !candidate.is_restrict;
+                !candidate.is_restrict && !candidate.alignment;
         }))
         return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
@@ -2839,7 +2813,7 @@ TypeId Module::array_of(TypeId element, std::uint32_t elements) {
             return candidate.kind == Type::Kind::Array &&
                 candidate.element == element && candidate.lanes == elements &&
                 !candidate.is_const && !candidate.is_volatile &&
-                !candidate.is_atomic && !candidate.is_restrict;
+                !candidate.is_atomic && !candidate.is_restrict && !candidate.alignment;
         }))
         return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
@@ -3065,6 +3039,27 @@ call_signature(const Module& module, std::optional<FunctionId> direct,
     return type.kind == Type::Kind::Function ? type.function : std::nullopt;
 }
 
+bool same_interface(const Module& module, const FunctionSignature& left,
+                    const FunctionSignature& right) {
+    if (left.parameters.size() != right.parameters.size()) return false;
+    auto normalized = right;
+    if (left.result_type != right.result_type) {
+        auto a = module.type(left.result_type), b = module.type(right.result_type);
+        a.alignment = b.alignment = 0;
+        if (identical(a, b)) normalized.result_type = left.result_type;
+    }
+    for (std::size_t index = 0; index < left.parameters.size(); ++index) {
+        const auto& parameter = left.parameters[index];
+        auto& other = normalized.parameters[index];
+        if (parameter.mode != other.mode || parameter.type == other.type) continue;
+        auto a = module.type(parameter.type), b = module.type(other.type);
+        if (parameter.mode == ParameterMode::In) a.is_const = b.is_const = false;
+        a.alignment = b.alignment = 0;
+        if (identical(a, b)) other.type = parameter.type;
+    }
+    return left == normalized;
+}
+
 std::string type_name(const Module& module, TypeId id) {
     const auto& type = module.type(id);
     std::string prefix;
@@ -3072,6 +3067,7 @@ std::string type_name(const Module& module, TypeId id) {
     if (type.is_volatile) prefix += "volatile ";
     if (type.is_restrict) prefix += "restrict ";
     if (type.is_atomic) prefix += "[[atomic]] ";
+    if (type.alignment) prefix += "[[aligned(" + std::to_string(type.alignment) + ")]] ";
     if (type.kind == Type::Kind::Pointer) {
         return prefix + type_name(module, *type.pointee) +
                (type.address_space == 0
@@ -3120,24 +3116,18 @@ std::string type_name(const Module& module, TypeId id) {
     return prefix + std::string(names[static_cast<unsigned>(type.builtin)]);
 }
 
-static std::optional<std::uint64_t> builtin_storage_size(BuiltinType type, unsigned address_bits,
-                                                        const TargetInfo& target) {
-    if (type == BuiltinType::Void) return {};
-    if (type == BuiltinType::F80) return target.data_layout.f80_storage_bytes;
-    const auto bits = type == BuiltinType::Bool || type == BuiltinType::I8 || type == BuiltinType::U8 ? 8U
-        : type == BuiltinType::I16 || type == BuiltinType::U16 ? 16U
-        : type == BuiltinType::I32 || type == BuiltinType::U32 || type == BuiltinType::F32 ? 32U
-        : type == BuiltinType::I64 || type == BuiltinType::U64 || type == BuiltinType::F64 ? 64U
-        : type == BuiltinType::Iptr || type == BuiltinType::Uptr || type == BuiltinType::Fptr ||
-          type == BuiltinType::Label ? address_bits : 128U;
-    return (bits + 7U) / 8U;
-}
+namespace {
 
-std::optional<std::uint64_t> layout_size(const Module& module, const TypePtr& type,
-                                      const TargetInfo& target) {
-    if (!type) return {};
+std::optional<std::uint64_t> source_alignment(const Module& module, const TypePtr& type,
+                                              const TargetInfo& target);
+
+// Natural size of a prepared AST type; elements keep their requests.
+std::optional<std::uint64_t> source_natural_size(const Module& module, const TypePtr& type,
+                                                 const TargetInfo& target) {
     switch (type->kind) {
-    case cross::Type::Kind::Builtin: return builtin_storage_size(type->builtin, module.address_bits, target);
+    case cross::Type::Kind::Builtin:
+        return builtin_storage_size(type->builtin, module.address_bits,
+                                    target.data_layout.f80_storage_bytes);
     case cross::Type::Kind::Pointer: return (module.address_bits + 7U) / 8U;
     case cross::Type::Kind::Record: {
         const auto* record = module.record(type->nominal_key());
@@ -3154,8 +3144,39 @@ std::optional<std::uint64_t> layout_size(const Module& module, const TypePtr& ty
     }
 }
 
-std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,
-                                         const TargetInfo& target) {
+std::optional<std::uint64_t> source_alignment(const Module& module, const TypePtr& type,
+                                              const TargetInfo& target) {
+    if (!type) return {};
+    std::optional<std::uint64_t> natural;
+    if (type->kind == cross::Type::Kind::Record) {
+        const auto* record = module.record(type->nominal_key());
+        if (record && (record->complete || record->alignment_complete)) natural = record->alignment;
+    } else if (type->kind == cross::Type::Kind::Array) {
+        natural = source_alignment(module, type->element, target);
+    } else if (const auto size = source_natural_size(module, type, target)) {
+        natural = natural_storage_alignment(*size,
+            type->kind == cross::Type::Kind::Builtin && type->builtin == BuiltinType::F80,
+            target.data_layout.natural_alignment_limit, target.data_layout.f80_alignment);
+    }
+    if (!natural) return {};
+    return std::max<std::uint64_t>(*natural, type->alignment);
+}
+
+} // namespace
+
+std::optional<std::uint64_t> layout_size(const Module& module, const TypePtr& type,
+                                      const TargetInfo& target) {
+    if (!type) return {};
+    const auto size = source_natural_size(module, type, target);
+    if (!size || !type->alignment) return size;
+    const auto alignment = source_alignment(module, type, target);
+    if (!alignment) return {};
+    const auto storage = requested_storage({*size, *alignment}, type->alignment);
+    return storage ? std::optional{storage->size} : std::nullopt;
+}
+
+std::optional<std::uint64_t> natural_size(const Module& module, TypeId id,
+                                          const TargetInfo& target) {
     const auto& type = module.type(id);
     if (type.kind == Type::Kind::Pointer) {
         return (module.address_bits + 7U) / 8U;
@@ -3189,14 +3210,12 @@ std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,
         }
         return *element * type.lanes;
     }
-    if (type.kind != Type::Kind::Builtin ||
-        type.builtin == BuiltinType::Void) {
-        return std::nullopt;
-    }
-    return builtin_storage_size(type.builtin, module.address_bits, target);
+    if (type.kind != Type::Kind::Builtin) return std::nullopt;
+    return builtin_storage_size(type.builtin, module.address_bits,
+                                target.data_layout.f80_storage_bytes);
 }
 
-std::optional<std::uint64_t> layout_alignment(
+std::optional<std::uint64_t> natural_alignment(
     const Module& module, TypeId id, const TargetInfo& target) {
     const auto& type = module.type(id);
     if (type.kind == Type::Kind::Record) {
@@ -3209,15 +3228,39 @@ std::optional<std::uint64_t> layout_alignment(
     if (type.kind == Type::Kind::Array && type.element) {
         return layout_alignment(module, *type.element, target);
     }
-    if (type.kind == Type::Kind::Builtin &&
-        type.builtin == BuiltinType::F80) {
-        return target.data_layout.f80_alignment;
-    }
-    const auto size = layout_size(module, id, target);
+    const auto size = natural_size(module, id, target);
     if (!size) return std::nullopt;
-    return std::max<std::uint64_t>(
-        1, std::min<std::uint64_t>(
-               *size, target.data_layout.natural_alignment_limit));
+    return natural_storage_alignment(*size,
+        type.kind == Type::Kind::Builtin && type.builtin == BuiltinType::F80,
+        target.data_layout.natural_alignment_limit, target.data_layout.f80_alignment);
+}
+
+std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,
+                                         const TargetInfo& target) {
+    const auto size = natural_size(module, id, target);
+    const auto requested = module.type(id).alignment;
+    if (!size || !requested) return size;
+    const auto alignment = natural_alignment(module, id, target);
+    if (!alignment) return std::nullopt;
+    const auto storage = requested_storage({*size, *alignment}, requested);
+    return storage ? std::optional{storage->size} : std::nullopt;
+}
+
+std::optional<std::uint64_t> layout_alignment(
+    const Module& module, TypeId id, const TargetInfo& target) {
+    const auto alignment = natural_alignment(module, id, target);
+    if (!alignment) return std::nullopt;
+    return std::max<std::uint64_t>(*alignment, module.type(id).alignment);
+}
+
+unsigned requested_alignment(const Module& module, TypeId id) {
+    unsigned result = 0;
+    for (;;) {
+        const auto& type = module.type(id);
+        result = std::max(result, type.alignment);
+        if (type.kind != Type::Kind::Array || !type.element) return result;
+        id = *type.element;
+    }
 }
 
 bool lock_free_atomic_type(const Module& module, TypeId id,
@@ -3226,7 +3269,7 @@ bool lock_free_atomic_type(const Module& module, TypeId id,
     if (type.kind != Type::Kind::Builtin && type.kind != Type::Kind::Pointer) return false;
     if (type.kind == Type::Kind::Builtin &&
         (type.builtin == BuiltinType::Void || type.builtin == BuiltinType::Label)) return false;
-    const auto size = layout_size(module, id, target);
+    const auto size = natural_size(module, id, target);
     if (!size) return false;
     // Extended floating storage may include target padding; capability entries
     // describe the scalar representation width, as they do in MIR selection.

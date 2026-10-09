@@ -84,9 +84,11 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             type.kind == hir::Type::Kind::Array && type.element &&
             module.hir().type(*type.element).kind == hir::Type::Kind::Builtin &&
             module.hir().type(*type.element).builtin == BuiltinType::U8;
+        // A scalar padded to its requested alignment is stored as an image.
         const bool aggregate = type.kind == hir::Type::Kind::Array ||
                                type.kind == hir::Type::Kind::Record ||
-                               (type.kind == hir::Type::Kind::Vector && !type.scalable);
+                               (type.kind == hir::Type::Kind::Vector && !type.scalable) ||
+                               type.alignment != 0;
         const bool declaration =
             object.initializer == data::InitializerKind::Declaration;
         if (declaration != (entity.definition == nullptr) ||
@@ -316,6 +318,28 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
         }
     }
     return valid;
+}
+
+std::optional<SourceLocation> requested_alignment_location(const ModuleView& module) {
+    const auto& hir = module.hir();
+    const auto requests = [&](hir::TypeId id) {
+        for (;;) {
+            const auto& type = hir.type(id);
+            if (type.alignment) return true;
+            if (type.pointee) id = *type.pointee;
+            else if (type.element) id = *type.element;
+            else return false;
+        }
+    };
+    for (const auto& object : hir.objects)
+        if (requests(object.type)) return object.location;
+    for (const auto& function : module.managed().functions) {
+        for (const auto& slot : function.slots)
+            if (requests(slot.type)) return slot.location;
+        for (const auto& value : function.values)
+            if (requests(value.type)) return value.location;
+    }
+    return std::nullopt;
 }
 
 } // namespace cross::codegen

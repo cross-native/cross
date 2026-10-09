@@ -20,6 +20,8 @@ struct PointerJoinNode {
     PointerJoinKind kind{PointerJoinKind::Other};
     std::optional<Type> child;
     bool is_const{}, is_volatile{}, is_atomic{}, is_restrict{};
+    // A requested (typedef) alignment; it never affects compatibility.
+    unsigned alignment{};
     std::uint32_t address_space{}, extent{};
     bool scalable{}, deferred_extent{};
 };
@@ -54,6 +56,7 @@ PointerJoinResult<typename Traits::Type> join_pointer_pointees(
         node.is_const = node.is_const || frame.a.is_const || frame.b.is_const;
         node.is_volatile = frame.a.is_volatile || frame.b.is_volatile;
         node.is_restrict = frame.a.is_restrict && frame.b.is_restrict;
+        node.alignment = frame.a.alignment == frame.b.alignment ? frame.a.alignment : 0;
         changed = changed || node.is_const != frame.a.is_const || node.is_const != frame.b.is_const ||
             node.is_volatile != frame.a.is_volatile || node.is_volatile != frame.b.is_volatile;
         return Result{traits.rebuild(frame.base, node), frame.deferred, changed};
@@ -123,6 +126,7 @@ PointerJoinResult<typename Traits::Type> join_pointer_types(
     a.child = *result.type;
     a.address_space = *space;
     a.is_const = a.is_volatile = a.is_atomic = a.is_restrict = false;
+    a.alignment = 0;
     result.type = traits.rebuild(left, a);
     result.qualification_changed = false;
     return result;

@@ -618,6 +618,10 @@ LlvmTextSerializer::LlvmTextSerializer(const CompilerOptions& options,
     : options_(options), diagnostics_(diagnostics) {}
 
 std::string LlvmTextSerializer::serialize(const codegen::ModuleView& module) {
+    if (const auto location = codegen::requested_alignment_location(module)) {
+        diagnostics_.error(*location, "LLVM debug serialization does not encode typedef alignment");
+        return {};
+    }
     return ModuleEmitter(options_, diagnostics_, module).run();
 }
 

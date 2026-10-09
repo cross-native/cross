@@ -321,6 +321,10 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
         }
     }
     const bool substituted = source->kind == Type::Kind::Generic && result->kind != Type::Kind::Generic;
+    // A typedef's requested alignment raises any alignment of the substituted type.
+    result->alignment = std::max(result->alignment, source->alignment);
+    for (const auto& request : source->alignment_requests)
+        result->alignment_requests.push_back(co_await clone_expr_async(*request, substitutions, values));
     result->is_const = source->is_const || (substituted && result->is_const);
     result->is_volatile = source->is_volatile || (substituted && result->is_volatile);
     result->is_atomic = source->is_atomic || (substituted && result->is_atomic);
@@ -334,6 +338,8 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
         result->is_const = result->is_const || result->element->is_const;
         result->is_volatile = result->is_volatile || result->element->is_volatile;
         result->element->is_const = result->element->is_volatile = false;
+        result->element->alignment = 0;
+        result->element->alignment_requests.clear();
     }
     result->address_space_location = source->address_space_location;
     result->pending_address_space = source->pending_address_space;
@@ -760,7 +766,7 @@ std::string generic_link_name(const FunctionDecl& function,
     return encode_model_generic_link_name(
         {.qualified_name = function.name,
          .kind = "function",
-         .result = canonical_type_name(function.return_type),
+         .result = canonical_type_name(callable_result_type(function.return_type)),
          .parameters = parameters,
          .variadic = function.variadic},
         rendered, mangling);
@@ -1374,8 +1380,8 @@ bool match_deduced_type(const TypePtr& formal, const TypePtr& actual,
                 right.stack_cleanup.value_or("caller") ||
             left_clobbers != right_clobbers ||
             left.parameters.size() != right.parameters.size()) return false;
-        if (!match_deduced_type(left.result, right.result, bindings,
-                                type_parameters, conflict, allow_deferred)) return false;
+        if (!match_deduced_type(callable_result_type(left.result), callable_result_type(right.result),
+                                bindings, type_parameters, conflict, allow_deferred)) return false;
         for (std::size_t index = 0; index < left.parameters.size(); ++index) {
             if (left.parameters[index].mode != right.parameters[index].mode ||
                 left.parameters[index].location_name.value_or("auto") !=
@@ -1606,6 +1612,19 @@ EvaluationTask<void> rewrite_generic_type_bounds_async(TypePtr type, const Funct
                 caller && evaluation_only(*caller) ? EvaluationIntegerContext::StagedDefinition
                                                    : EvaluationIntegerContext::Definition));
     }
+    if (!type->alignment_requests.empty()) {
+        for (auto& request : type->alignment_requests) {
+            auto expression = clone_expr(*request);
+            co_await rewrite_generic_expr_async(expression, caller, program, diagnostics, state, mangling);
+            request = std::move(expression);
+            if (state.resource_failed(program)) co_return;
+        }
+        (void)(co_await resolve_alignment_requests_async(program, type, diagnostics,
+            program.evaluation_size_of, program.evaluation_align_of,
+            caller ? caller->source_namespace : std::string_view{}, caller, state.local_types,
+            caller && evaluation_only(*caller) ? EvaluationIntegerContext::StagedDefinition
+                                               : EvaluationIntegerContext::Definition));
+    }
     if (!type->array_bound || type->lanes != 0 || state.resource_failed(program)) co_return;
     auto expression = clone_expr(*type->array_bound);
     co_await rewrite_generic_expr_async(expression, caller, program, diagnostics, state, mangling);
@@ -1691,8 +1710,10 @@ EvaluationTask<void> prepare_generic_local_types_async(FunctionDecl& function, P
         if (!value || state.resource_failed(program) || !visited_types.insert(value.get()).second) co_return;
         const auto array_bound = value->array_bound;
         const auto vector_bound = value->vector_bound;
+        const auto alignment_requests = value->alignment_requests;
         co_await expression(array_bound.get());
         co_await expression(vector_bound.get());
+        for (const auto& request : alignment_requests) co_await expression(request.get());
         co_await type(value->element);
         co_await type(value->pointee);
         if (value->function) {
@@ -2687,6 +2708,7 @@ private:
         if (!type || !rewritten_types_.insert(type.get()).second) return;
         rewrite(type->array_bound);
         rewrite(type->vector_bound);
+        for (auto& request : type->alignment_requests) rewrite(request);
         rewrite_type(type->element);
         rewrite_type(type->pointee);
         if (type->function) {
@@ -2869,7 +2891,8 @@ private:
                                const FunctionType& destination) {
         if (source.variadic != destination.variadic ||
             source.parameters.size() != destination.parameters.size() ||
-            !same_type(source.return_type, destination.result)) {
+            !same_type(callable_result_type(source.return_type),
+                       callable_result_type(destination.result))) {
             return false;
         }
         for (std::size_t index = 0; index < source.parameters.size(); ++index) {
@@ -7457,6 +7480,12 @@ public:
 
     EvaluationTask<Preparation> prepare_layout_async(const TypePtr& type, EvaluationLayoutKind kind) {
         if (!type) co_return Preparation::Ready;
+        if (!type->alignment_requests.empty()) {
+            GenericExpansionState bindings;
+            if (current_function_) collect_function_types(*current_function_, bindings);
+            const auto prepared = co_await prepare_alignment_requests_async(type, bindings.local_types);
+            if (prepared != Preparation::Ready) co_return prepared;
+        }
         if (type->kind == Type::Kind::Vector) {
             GenericExpansionState bindings;
             if (current_function_) collect_function_types(*current_function_, bindings);
@@ -7612,6 +7641,41 @@ public:
         co_return Preparation::Ready;
     }
 
+    EvaluationTask<Preparation> prepare_alignment_requests_async(const TypePtr& type,
+        std::span<const std::pair<NameKey, TypePtr>> local_types) {
+        if (!preparing_type_bounds_.insert(type.get()).second) {
+            fail(type->alignment_requests.front()->location, "type alignment depends on its own layout");
+            co_return Preparation::Invalid;
+        }
+        const auto requests = std::move(type->alignment_requests);
+        type->alignment_requests.clear();
+        auto result = Preparation::Ready;
+        for (const auto& request : requests) {
+            if (result == Preparation::Invalid) {
+                type->alignment_requests.push_back(request);
+                continue;
+            }
+            bool needs_context{};
+            const auto value = co_await probe_integer_async(*request, local_types,
+                validation_phase_ == SourceValidationPhase::Definition ? &needs_context : nullptr, true);
+            if (needs_context || (!value && context_unavailable_ && !resource_exhausted_)) {
+                type->alignment_requests.push_back(request);
+                result = Preparation::Deferred;
+                continue;
+            }
+            const auto alignment = value ? alignment_value(*value) : std::nullopt;
+            if (!alignment) {
+                if (value) fail(request->location, "aligned argument must be a positive power-of-two integer constant");
+                type->alignment_requests.push_back(request);
+                result = Preparation::Invalid;
+                continue;
+            }
+            type->alignment = std::max(type->alignment, *alignment);
+        }
+        preparing_type_bounds_.erase(type.get());
+        co_return result;
+    }
+
     EvaluationTask<bool> prepare_bound_types_async(const FunctionDecl& function, SourceValidationPhase phase) {
         if (!evaluation_only(function) || !function.generic_parameters.empty()) co_return true;
         GenericExpansionState bindings;
@@ -7730,6 +7794,7 @@ public:
                         expression(inferred->second->initializer.get());
                     expression(source->array_bound.get());
                     expression(source->vector_bound.get());
+                    for (const auto& request : source->alignment_requests) expression(request.get());
                     if (source->function) {
                         // This dependency walk uses exact NameKeys, so retaining
                         // all visited prototype cells cannot expose them by
@@ -7774,6 +7839,15 @@ public:
                         }
                     }
                     continue;
+                }
+                if (!source->alignment_requests.empty()) {
+                    const auto location = source->alignment_requests.front()->location;
+                    const auto result = co_await prepare_alignment_requests_async(source, bindings.local_types);
+                    if (result == Preparation::Invalid) co_return false;
+                    if (result == Preparation::Deferred && phase == SourceValidationPhase::Invocation) {
+                        fail_context(location);
+                        co_return false;
+                    }
                 }
                 if (source->kind == Type::Kind::Record) {
                     const auto result = co_await prepare_layout_async(source, EvaluationLayoutKind::Complete);
@@ -9872,7 +9946,7 @@ private:
             to->builtin == BuiltinType::Bool) return true;
         if (explicit_cast && is_integer(from) && to->kind == Type::Kind::Pointer) return true;
         if (to->kind == Type::Kind::Record && from->kind == Type::Kind::Record) {
-            auto a = clone_type(from), b = clone_type(to);
+            auto a = without_alignment(from), b = without_alignment(to);
             a->is_const = b->is_const = false;
             return same_type(a, b);
         }
@@ -10092,8 +10166,8 @@ private:
                 return {};
             }
             if (conditional && left->kind == Type::Kind::Record && right->kind == Type::Kind::Record) {
-                auto a = clone_type(left);
-                auto b = clone_type(right);
+                auto a = without_alignment(left);
+                auto b = without_alignment(right);
                 a->is_const = b->is_const = false;
                 return same_type(a, b) ? a : TypePtr{};
             }
@@ -10553,8 +10627,8 @@ private:
                 fail(location, "translation-time aggregate conversion requires a matching value");
                 co_return std::nullopt;
             }
-            auto from = clone_type(value.type);
-            auto to = clone_type(type);
+            auto from = without_alignment(value.type);
+            auto to = without_alignment(type);
             from->is_const = to->is_const = false;
             if (!same_type(from, to) || from->scalable || to->scalable) {
                 fail(location, "translation-time aggregate conversion requires the same complete type");
@@ -10976,14 +11050,8 @@ private:
     }
 
     std::size_t meta_scalar_size(const EvalValue& value) const {
-        const auto& pointee = value.type->pointee;
-        if (pointee->builtin == BuiltinType::F80)
-            return program_.evaluation_layout.f80_storage_bytes;
-        const auto bits = pointee->builtin == BuiltinType::Fptr ||
-                pointee->builtin == BuiltinType::Iptr ||
-                pointee->builtin == BuiltinType::Uptr
-            ? program_.address_bits : type_bits(pointee);
-        return (bits + 7U) / 8U;
+        return static_cast<std::size_t>(builtin_storage_size(value.type->pointee->builtin,
+            program_.address_bits, program_.evaluation_layout.f80_storage_bytes).value_or(0));
     }
 
     static UInt128 meta_bit_field_mask(
@@ -11004,15 +11072,26 @@ private:
     }
 
     EvaluationTask<std::optional<std::size_t>> meta_object_size_async(TypePtr type) const {
+        // A typedef's requested alignment rounds the natural size up.
+        if (type && type->alignment) {
+            const auto size = co_await meta_object_size_async(without_alignment(type));
+            const auto alignment = co_await meta_object_alignment_async(type);
+            if (!size || !alignment) co_return std::nullopt;
+            const auto storage = requested_storage({*size, *alignment}, type->alignment);
+            co_return storage && storage->size <= std::numeric_limits<std::size_t>::max()
+                ? std::optional<std::size_t>(static_cast<std::size_t>(storage->size)) : std::nullopt;
+        }
         // Multiply out nested array layers in one pass rather than revisiting
-        // the rest of the chain at every level.
+        // the rest of the chain at every level; a layer with its own requested
+        // alignment is sized separately.
         if (type && type->kind == Type::Kind::Array) {
             std::size_t count = 1;
-            for (; type->kind == Type::Kind::Array; type = type->element) {
+            do {
                 if (!type->lanes || !type->element ||
                     count > std::numeric_limits<std::size_t>::max() / type->lanes) co_return std::nullopt;
                 count *= type->lanes;
-            }
+                type = type->element;
+            } while (type->kind == Type::Kind::Array && !type->alignment);
             const auto element = co_await meta_object_size_async(type);
             if (!element || *element == 0 || count > std::numeric_limits<std::size_t>::max() / *element)
                 co_return std::nullopt;
@@ -11047,39 +11126,36 @@ private:
     }
 
     EvaluationTask<std::optional<std::size_t>> meta_object_alignment_async(TypePtr type) const {
-        while (type && type->kind == Type::Kind::Array) type = type->element;
+        // Array counts do not affect alignment; every layer's request does.
+        std::size_t requested = 1;
+        for (; type; type = type->element) {
+            requested = std::max<std::size_t>(requested, type->alignment);
+            if (type->kind != Type::Kind::Array) break;
+        }
         if (!type) co_return std::nullopt;
-        if (is_label_type(type)) {
-            std::optional<std::uint64_t> alignment;
+        const auto natural = type->alignment ? without_alignment(type) : type;
+        std::optional<std::uint64_t> alignment;
+        if (is_label_type(type) || type->kind == Type::Kind::Pointer ||
+            type->kind == Type::Kind::Record || type->kind == Type::Kind::Vector) {
             if (align_of_) alignment = co_await align_of_->async(type);
-            co_return alignment && *alignment != 0 && *alignment <= std::numeric_limits<std::size_t>::max()
-                ? std::optional<std::size_t>(static_cast<std::size_t>(*alignment)) : std::nullopt;
+            else if (type->kind == Type::Kind::Pointer) {
+                const auto size = co_await meta_object_size_async(natural);
+                if (size) alignment = natural_storage_alignment(*size, false,
+                    program_.evaluation_layout.natural_alignment_limit, program_.evaluation_layout.f80_alignment);
+            }
+        } else if (const auto size = co_await meta_object_size_async(natural)) {
+            alignment = natural_storage_alignment(*size,
+                type->builtin == BuiltinType::F80, program_.evaluation_layout.natural_alignment_limit,
+                program_.evaluation_layout.f80_alignment);
         }
-        if (type->kind == Type::Kind::Pointer && align_of_) {
-            const auto alignment = co_await align_of_->async(type);
-            co_return alignment && *alignment != 0 && *alignment <= std::numeric_limits<std::size_t>::max()
-                ? std::optional<std::size_t>(static_cast<std::size_t>(*alignment)) : std::nullopt;
-        }
-        if (type->kind == Type::Kind::Record ||
-            type->kind == Type::Kind::Vector) {
-            if (!align_of_) co_return std::nullopt;
-            const auto alignment = co_await align_of_->async(type);
-            if (!alignment || *alignment == 0 ||
-                *alignment > std::numeric_limits<std::size_t>::max())
-                co_return std::nullopt;
-            co_return static_cast<std::size_t>(*alignment);
-        }
-        const auto size = co_await meta_object_size_async(type);
-        if (!size) co_return std::nullopt;
-        co_return type->builtin == BuiltinType::F80
-            ? std::max<std::size_t>(1, program_.evaluation_layout.f80_alignment)
-            : std::max<std::size_t>(1, std::min<std::size_t>(*size,
-                program_.evaluation_layout.natural_alignment_limit));
+        if (!alignment || *alignment == 0 || *alignment > std::numeric_limits<std::size_t>::max())
+            co_return std::nullopt;
+        co_return std::max(static_cast<std::size_t>(*alignment), requested);
     }
 
     static bool same_meta_object_type(const TypePtr& left, const TypePtr& right) {
-        auto a = clone_type(left);
-        auto b = clone_type(right);
+        auto a = without_alignment(left);
+        auto b = without_alignment(right);
         a->is_const = b->is_const = false;
         return same_type(a, b);
     }
@@ -16989,6 +17065,37 @@ ContinuationTask<bool> resolve_vector_bound_async(Program& program, const TypePt
     type->lanes = *extent.lanes;
     type->vector_extent_dependency = Type::VectorExtentDependency::None;
     co_return true;
+}
+
+ContinuationTask<bool> resolve_alignment_requests_async(Program& program, const TypePtr& type,
+    Diagnostics& diagnostics, const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::string_view source_namespace, const FunctionDecl* caller,
+    std::span<const std::pair<NameKey, TypePtr>> local_types, EvaluationIntegerContext context) {
+    if (!type || type->alignment_requests.empty()) co_return true;
+    const auto requests = std::move(type->alignment_requests);
+    type->alignment_requests.clear();
+    bool valid = true;
+    for (const auto& request : requests) {
+        const auto result = co_await evaluate_target_integer_requirement_async(program, *request,
+            diagnostics, size_of, align_of, source_namespace, caller, local_types, context);
+        if (result.status == EvaluationIntegerResult::Status::ContextUnavailable) {
+            type->alignment_requests.push_back(request);
+            continue;
+        }
+        if (!result.value) {
+            valid = false;
+            continue;
+        }
+        const auto alignment = alignment_value(*result.value);
+        if (!alignment) {
+            diagnostics.error(request->location,
+                "aligned argument must be a positive power-of-two integer constant");
+            valid = false;
+            continue;
+        }
+        type->alignment = std::max(type->alignment, *alignment);
+    }
+    co_return valid;
 }
 
 std::unique_ptr<Expr> evaluate_target_pointer_constant(

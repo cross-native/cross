@@ -172,5 +172,8 @@ MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used.
 - Function pointers can be converted to another ABI or other register
   locations only when the function is named directly; see
   [language.md](language.md#function-pointers).
-- `[[aligned(N)]]` applies to objects, records, members, and function
-  definitions; it is not supported on a typedef of a non-record type.
+- `-emit-llvm` and `-emit-gimple` reject code whose objects have a typedef type
+  that requests alignment.
+- On MIPS, a function that allocates a variable-length array cannot also have
+  a local aligned beyond the stack alignment (8 bytes under o32 and EABI, 16
+  under n64 and the Cross ABIs).

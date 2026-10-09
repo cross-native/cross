@@ -148,6 +148,8 @@ inline std::optional<RecordSourceError> record_source_error(const RecordDecl& so
             if (!member.type || (!is_integer(member.type) && member.type->kind != Type::Kind::Generic))
                 return error("bit-field base type must be bool, an integer, or an enumeration");
             if (member.type->is_atomic) return error("a bit-field cannot have atomic type");
+            if (member.type->alignment || !member.type->alignment_requests.empty())
+                return error("a bit-field base type cannot request alignment");
         }
         auto type = member.type;
         seen.clear();

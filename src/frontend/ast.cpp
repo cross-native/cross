@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,6 +27,7 @@ private:
         release.take(node.element);
         release.take(node.array_bound);
         release.take(node.vector_bound);
+        for (auto& request : node.alignment_requests) release.take(request);
         // Shared callable metadata is not edited speculatively. Its own
         // destructor forwards its edges only when the last owner releases it.
         node.function.reset();
@@ -199,7 +201,7 @@ bool has_pending_type_bound(const TypePtr& type) {
         if (((next->array_bound || next->vector_bound) && next->lanes == 0) ||
             (next->kind == Type::Kind::Array && !next->lanes &&
              next->array_extent_dependency == Type::ArrayExtentDependency::ExpansionContext) ||
-            deferred_vector_extent(next) ||
+            deferred_vector_extent(next) || !next->alignment_requests.empty() ||
             next->kind == Type::Kind::Generic) return true;
         pending.push_back(next->element);
         pending.push_back(next->pointee);
@@ -378,6 +380,7 @@ std::string type_name(const TypePtr& type) {
     if (type->is_volatile) prefix += "volatile ";
     if (type->is_restrict) prefix += "restrict ";
     if (type->is_atomic) prefix += "[[atomic]] ";
+    if (type->alignment) prefix += "[[aligned(" + std::to_string(type->alignment) + ")]] ";
     if (type->kind == Type::Kind::Pointer) {
         return prefix + type_name(type->pointee) +
                (type->address_space == 0
@@ -452,6 +455,7 @@ std::string canonical_type_name(const TypePtr& type) {
     if (type->is_volatile) result += 'V';
     if (type->is_restrict) result += 'R';
     if (type->is_atomic) result += 'A';
+    if (type->alignment) result += 'L' + std::to_string(type->alignment) + '_';
     if (type->kind == Type::Kind::Pointer) {
         result += 'P';
         if (type->address_space != 0) {
@@ -471,7 +475,7 @@ std::string canonical_type_name(const TypePtr& type) {
         const auto append_text = [&](const std::string& item) {
             result += std::to_string(item.size()) + "_" + item;
         };
-        append(signature.result);
+        append(callable_result_type(signature.result));
         append_text(signature.result_location.value_or("auto"));
         append_text(signature.stack_cleanup.value_or("caller"));
         auto clobbers = signature.clobbers;
@@ -537,6 +541,16 @@ static bool same_type_impl(const TypePtr& left, const TypePtr& right,
         left->is_volatile != right->is_volatile ||
         left->is_restrict != right->is_restrict ||
         left->is_atomic != right->is_atomic) return false;
+    if (!left->alignment_requests.empty() || !right->alignment_requests.empty()) {
+        if (mode == TypeComparisonMode::Exact) {
+            if (left->alignment != right->alignment ||
+                left->alignment_requests != right->alignment_requests) return false;
+        } else {
+            pending_extent = true;
+        }
+    } else if (left->alignment != right->alignment) {
+        return false;
+    }
     if (left->kind == Type::Kind::Pointer)
         return left->address_space == right->address_space &&
                same(left->pointee, right->pointee);
@@ -555,7 +569,7 @@ static bool same_type_impl(const TypePtr& left, const TypePtr& right,
                 b.stack_cleanup.value_or("caller") ||
             a_clobbers != b_clobbers ||
             a.parameters.size() != b.parameters.size() ||
-            !same(a.result, b.result))
+            !same(callable_result_type(a.result), callable_result_type(b.result)))
             return false;
         for (std::size_t index = 0; index < a.parameters.size(); ++index) {
             if (a.parameters[index].mode != b.parameters[index].mode ||
@@ -657,10 +671,24 @@ TypeComparison compare_generic_types(const TypePtr& left, const TypePtr& right) 
 }
 
 TypePtr callable_parameter_type(const TypePtr& type, ParameterMode mode) {
-    if (!type || mode != ParameterMode::In || !type->is_const) return type;
-    auto normalized = std::make_shared<Type>(*type);
-    normalized->is_const = false;
+    if (!type || ((mode != ParameterMode::In || !type->is_const) &&
+                  !type->alignment && type->alignment_requests.empty())) return type;
+    auto normalized = without_alignment(type);
+    if (mode == ParameterMode::In) normalized->is_const = false;
     return normalized;
+}
+
+TypePtr without_alignment(const TypePtr& type) {
+    if (!type) return type;
+    auto result = std::make_shared<Type>(*type);
+    result->alignment = 0;
+    result->alignment_requests.clear();
+    return result;
+}
+
+TypePtr callable_result_type(const TypePtr& type) {
+    return type && (type->alignment || !type->alignment_requests.empty())
+        ? without_alignment(type) : type;
 }
 
 PointeeCompatibility compare_pointee(const TypePtr& source, const TypePtr& destination,
@@ -707,8 +735,8 @@ PointeeCompatibility compare_pointee(const TypePtr& source, const TypePtr& desti
             to = to->element;
             continue;
         }
-        auto unqualified_from = std::make_shared<Type>(*from);
-        auto unqualified_to = std::make_shared<Type>(*to);
+        auto unqualified_from = without_alignment(from);
+        auto unqualified_to = without_alignment(to);
         unqualified_from->is_const = unqualified_to->is_const = false;
         unqualified_from->is_volatile = unqualified_to->is_volatile = false;
         unqualified_from->is_restrict = unqualified_to->is_restrict = false;
@@ -756,6 +784,7 @@ PointerJoinResult<TypePtr> common_pointer_type(const TypePtr& left, const TypePt
             node.is_volatile = type->is_volatile;
             node.is_atomic = type->is_atomic;
             node.is_restrict = type->is_restrict;
+            node.alignment = type->alignment;
             node.address_space = type->address_space;
             node.extent = type->lanes;
             node.scalable = type->scalable;
@@ -766,7 +795,7 @@ PointerJoinResult<TypePtr> common_pointer_type(const TypePtr& left, const TypePt
             return node;
         }
         PointerJoinEquality equal_leaf(const Type& left, const Type& right) const {
-            auto a = std::make_shared<cross::Type>(*left), b = std::make_shared<cross::Type>(*right);
+            auto a = without_alignment(left), b = without_alignment(right);
             a->is_const = b->is_const = a->is_volatile = b->is_volatile = false;
             a->is_restrict = b->is_restrict = false;
             switch (compare_source_types(a, b)) {
@@ -782,6 +811,10 @@ PointerJoinResult<TypePtr> common_pointer_type(const TypePtr& left, const TypePt
             result->is_volatile = node.is_volatile;
             result->is_atomic = node.is_atomic;
             result->is_restrict = node.is_restrict;
+            if (result->alignment != node.alignment) {
+                result->alignment = node.alignment;
+                result->alignment_requests.clear();
+            }
             result->address_space = node.address_space;
             if (node.kind == PointerJoinKind::Pointer) result->pointee = *node.child;
             else if (node.kind == PointerJoinKind::Array || node.kind == PointerJoinKind::Vector)
@@ -860,6 +893,35 @@ unsigned type_bits(const TypePtr& type) {
     case BuiltinType::Void: return 0;
     }
     return 0;
+}
+
+std::optional<std::uint64_t> builtin_storage_size(BuiltinType type, unsigned address_bits,
+                                                  unsigned f80_storage_bytes) {
+    switch (type) {
+    case BuiltinType::Void: return std::nullopt;
+    case BuiltinType::Bool: case BuiltinType::I8: case BuiltinType::U8: return 1;
+    case BuiltinType::I16: case BuiltinType::U16: return 2;
+    case BuiltinType::I32: case BuiltinType::U32: case BuiltinType::F32: return 4;
+    case BuiltinType::I64: case BuiltinType::U64: case BuiltinType::F64: return 8;
+    case BuiltinType::I128: case BuiltinType::U128: case BuiltinType::F128: return 16;
+    case BuiltinType::F80: return f80_storage_bytes;
+    case BuiltinType::Iptr: case BuiltinType::Uptr: case BuiltinType::Fptr:
+    case BuiltinType::Label: return (address_bits + 7U) / 8U;
+    }
+    return std::nullopt;
+}
+
+std::uint64_t natural_storage_alignment(std::uint64_t size, bool f80,
+                                        unsigned alignment_limit, unsigned f80_alignment) {
+    if (f80) return std::max(1U, f80_alignment);
+    return std::max<std::uint64_t>(1, std::min<std::uint64_t>(size, alignment_limit));
+}
+
+std::optional<StorageLayout> requested_storage(StorageLayout natural, std::uint64_t requested) {
+    const auto alignment = std::max(natural.alignment, requested);
+    const auto padding = (alignment - natural.size % alignment) % alignment;
+    if (natural.size > std::numeric_limits<std::uint64_t>::max() - padding) return std::nullopt;
+    return StorageLayout{natural.size + padding, alignment};
 }
 
 const Attribute* FunctionDecl::attribute(std::string_view sought) const {

@@ -179,6 +179,13 @@ ContinuationTask<bool> resolve_vector_bound_async(Program& program, const TypePt
     std::string_view source_namespace = {}, const FunctionDecl* caller = nullptr,
     std::span<const std::pair<NameKey, TypePtr>> local_types = {},
     EvaluationIntegerContext context = EvaluationIntegerContext::Definition);
+// Fold a type's retained typedef `aligned` requests into its alignment. A
+// request that needs expansion context stays retained; false on an error.
+ContinuationTask<bool> resolve_alignment_requests_async(Program& program, const TypePtr& type,
+    Diagnostics& diagnostics, const LayoutQuery& size_of, const LayoutQuery& align_of,
+    std::string_view source_namespace = {}, const FunctionDecl* caller = nullptr,
+    std::span<const std::pair<NameKey, TypePtr>> local_types = {},
+    EvaluationIntegerContext context = EvaluationIntegerContext::Definition);
 
 // Required pointer calls use the ordinary bounded evaluator. The resolver
 // supplies target-owned address operations; no runtime storage is read.

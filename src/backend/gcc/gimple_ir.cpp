@@ -1798,6 +1798,10 @@ GimpleTextSerializer::GimpleTextSerializer(const CompilerOptions& options,
 }
 
 std::string GimpleTextSerializer::serialize(const codegen::ModuleView& module) {
+    if (const auto location = codegen::requested_alignment_location(module)) {
+        diagnostics_.error(*location, "GIMPLE serialization does not encode typedef alignment");
+        return {};
+    }
     return ModuleEmitter(options_, diagnostics_, module, start_).run();
 }
 

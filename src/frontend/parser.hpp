@@ -225,6 +225,7 @@ private:
         TypePtr& type, const Attribute& attribute,
         std::optional<std::pair<std::uint32_t, SourceLocation>>*
             pending_address_space = nullptr);
+    void request_type_alignment(TypePtr& type, const Attribute& attribute);
     EvaluationTask<std::optional<std::string>> parse_qualified_name_async(
         SyntaxProduction production = SyntaxProduction::QualifiedName);
     EvaluationTask<std::string> peek_qualified_name_async();

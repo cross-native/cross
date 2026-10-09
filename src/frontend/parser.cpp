@@ -2676,6 +2676,8 @@ void Parser::apply_type_attribute(
         const bool is_const = type->is_const, is_volatile = type->is_volatile;
         auto element = copy_type(type);
         element->is_const = element->is_volatile = false;
+        element->alignment = 0;
+        element->alignment_requests.clear();
         type = vector_type(std::move(element), static_cast<std::uint32_t>(lanes),
                            attribute.name == "scalable_vector", is_const, is_volatile);
         type->vector_bound = attribute.expression_argument;
@@ -2737,6 +2739,37 @@ void Parser::apply_type_attribute(
     reject(attribute.location,
                        "attribute '" + attribute.name +
                            "' is not valid as a type qualifier here");
+}
+
+void Parser::request_type_alignment(TypePtr& type, const Attribute& attribute) {
+    if (attribute.arguments.size() != 1 || !attribute.expression_argument) {
+        type_error(type, attribute.location, "aligned on a typedef requires one integer argument");
+        return;
+    }
+    if (type->kind == Type::Kind::Function ||
+        (type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void) ||
+        is_meta_type(type)) {
+        type_error(type, attribute.location, "aligned on a typedef requires an object type");
+        return;
+    }
+    // A decimal literal is checked now; any other required constant is
+    // retained and resolved with the type's other extents.
+    std::uint64_t value{};
+    const auto& text = attribute.arguments.front();
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (attribute.expression_argument->kind != Expr::Kind::Integer ||
+        parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        type = std::make_shared<Type>(*type);
+        type->alignment_requests.push_back(attribute.expression_argument);
+        return;
+    }
+    if (value == 0 || (value & (value - 1)) != 0 || value > std::numeric_limits<unsigned>::max()) {
+        type_error(type, attribute.location,
+            "aligned argument must be a positive power-of-two integer constant");
+        return;
+    }
+    type = std::make_shared<Type>(*type);
+    type->alignment = std::max(type->alignment, static_cast<unsigned>(value));
 }
 
 void Parser::type_error(TypePtr& type, SourceLocation location, std::string message) {
@@ -4799,12 +4832,12 @@ AliasDefinitionPtr Parser::register_typedef(SourceLocation location, std::string
             !is_vector_type_attribute(attribute.name))
             type_error(type, attribute.location,
                 "attribute '" + attribute.name + "' is not valid on a typedef");
-        if (attribute.name == "aligned")
-            type_error(type, attribute.location,
-                "aligned on a typedef is not implemented; align the object, record, or member instead");
         if (is_vector_type_attribute(attribute.name))
             apply_type_attribute(type, attribute);
     }
+    // Alignment applies to the declared type, after any vector construction.
+    for (const auto& attribute : attributes)
+        if (attribute.name == "aligned") request_type_alignment(type, attribute);
 
     auto definition = make_alias_definition(type);
     if (!definition) return {};

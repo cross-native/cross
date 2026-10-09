@@ -55,5 +55,10 @@ private:
 // requires ModuleView::fully_lowered().
 [[nodiscard]] bool verify(const ModuleView& module, Diagnostics& diagnostics);
 
+// The first object, stack cell, or value whose type, pointee, or array element
+// requests alignment: a layout the debugging serializers do not encode.
+[[nodiscard]] std::optional<SourceLocation>
+requested_alignment_location(const ModuleView& module);
+
 } // namespace codegen
 } // namespace cross

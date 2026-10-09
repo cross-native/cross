@@ -71,74 +71,11 @@ std::string string_attribute(const ObjectDecl& object,
     return *value;
 }
 
+// Static objects use the same target storage as every other layout client.
 unsigned type_size(const hir::Module& module, hir::TypeId id,
                    const Subtarget& subtarget) {
-    const auto& type = module.type(id);
-    const auto address_bytes = subtarget.abi_info().address_bits / 8;
-    if (type.kind == hir::Type::Kind::Pointer) return address_bytes;
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        const auto size = module.record(*type.record).size;
-        return size <= std::numeric_limits<unsigned>::max()
-                   ? static_cast<unsigned>(size)
-                   : 0;
-    }
-    if (type.kind == hir::Type::Kind::Vector ||
-        type.kind == hir::Type::Kind::Array) {
-        if ((type.kind == hir::Type::Kind::Vector && type.scalable) ||
-            !type.element || type.lanes == 0) {
-            return 0;
-        }
-        const auto element = type_size(module, *type.element, subtarget);
-        if (element == 0 ||
-            type.lanes > std::numeric_limits<unsigned>::max() / element) {
-            return 0;
-        }
-        return element * type.lanes;
-    }
-    switch (type.builtin) {
-    case BuiltinType::Bool:
-    case BuiltinType::I8:
-    case BuiltinType::U8: return 1;
-    case BuiltinType::I16:
-    case BuiltinType::U16: return 2;
-    case BuiltinType::I32:
-    case BuiltinType::U32:
-    case BuiltinType::F32: return 4;
-    case BuiltinType::I64:
-    case BuiltinType::U64:
-    case BuiltinType::F64: return 8;
-    case BuiltinType::Iptr:
-    case BuiltinType::Uptr:
-    case BuiltinType::Fptr:
-    case BuiltinType::Label: return address_bytes;
-    case BuiltinType::I128:
-    case BuiltinType::U128:
-    case BuiltinType::F128: return 16;
-    case BuiltinType::F80:
-        return subtarget.target().data_layout.f80_storage_bytes;
-    case BuiltinType::Void: return 0;
-    }
-    return 0;
-}
-
-unsigned natural_alignment(const hir::Module& module, hir::TypeId id,
-                           unsigned size, const Subtarget& subtarget) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        return module.record(*type.record).alignment;
-    }
-    if (type.kind == hir::Type::Kind::Array && type.element) {
-        const auto element_size = type_size(module, *type.element, subtarget);
-        return natural_alignment(module, *type.element, element_size,
-                                 subtarget);
-    }
-    if (type.kind == hir::Type::Kind::Builtin &&
-        type.builtin == BuiltinType::F80) {
-        return subtarget.target().data_layout.f80_alignment;
-    }
-    return std::max(
-        1U, std::min(size,
-                     subtarget.target().data_layout.natural_alignment_limit));
+    const auto size = hir::layout_size(module, id, subtarget.target()).value_or(0);
+    return size <= std::numeric_limits<unsigned>::max() ? static_cast<unsigned>(size) : 0;
 }
 
 std::optional<UInt128> integer_value(const Expr& expression) {
@@ -518,25 +455,7 @@ struct AddressValue {
 std::uint64_t source_storage_size(const hir::Module& module,
                                   const TypePtr& type,
                                   const Subtarget& subtarget) {
-    if (!type) return 0;
-    if (type->kind == Type::Kind::Pointer)
-        return (module.address_bits + 7U) / 8U;
-    if (type->kind == Type::Kind::Record) {
-        const auto* record = module.record(type->nominal_key());
-        return record && record->complete ? record->size : 0;
-    }
-    if (type->kind == Type::Kind::Array && type->element) {
-        const auto element = source_storage_size(module, type->element,
-                                                 subtarget);
-        return element && type->lanes <=
-                std::numeric_limits<std::uint64_t>::max() / element
-            ? element * type->lanes : 0;
-    }
-    if (type->kind == Type::Kind::Vector)
-        return type->scalable ? 0 : (type_bits(type) + 7U) / 8U;
-    if (type->kind != Type::Kind::Builtin) return 0;
-    const auto builtin = module.builtin(type->builtin);
-    return builtin ? type_size(module, *builtin, subtarget) : 0;
+    return hir::layout_size(module, type, subtarget.target()).value_or(0);
 }
 
 bool add_address_addend(AddressConstant& address, std::uint64_t bytes) {
@@ -966,7 +885,7 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
                 hir::call_signature(module, result.address->function, {});
             if (!expected_function ||
                 result.address->kind != AddressKind::Function || !actual ||
-                module.type(*type.pointee).function != actual) {
+                !hir::same_interface(module, *module.type(*type.pointee).function, *actual)) {
                 diagnostics.error(expression.location,
                                   "global function-pointer initializer has an "
                                   "incompatible signature or ABI");
@@ -1191,8 +1110,27 @@ bool lower_initializer(Object& result, const hir::Module& module,
                               "brace initializer requires an aggregate object");
             return false;
         }
-        return lower_scalar_initializer(result, module, entity, expression,
-                                        subtarget, diagnostics);
+        const auto value_size =
+            hir::natural_size(module, entity.type, subtarget.target()).value_or(0);
+        if (value_size >= result.size)
+            return lower_scalar_initializer(result, module, entity, expression,
+                                            subtarget, diagnostics);
+        // A requested alignment pads the scalar; its value bytes come first.
+        Object value;
+        value.location = result.location;
+        value.type = result.type;
+        value.size = static_cast<unsigned>(value_size);
+        if (!lower_scalar_initializer(value, module, entity, expression,
+                                      subtarget, diagnostics))
+            return false;
+        result.initializer = InitializerKind::Aggregate;
+        result.bytes.assign(result.size, 0);
+        if (value.initializer == InitializerKind::Address && value.address)
+            result.relocations.push_back({0, value.size, std::move(*value.address)});
+        else
+            store_bits(result.bytes, 0, value.size, value.bits,
+                       subtarget.target().data_layout.byte_order);
+        return true;
     }
     if (expression.kind != Expr::Kind::AggregateInitializer) {
         diagnostics.error(expression.location,
@@ -1263,7 +1201,9 @@ bool lower_initializer(Object& result, const hir::Module& module,
         Object scalar;
         scalar.location = item.expression->location;
         scalar.type = item.type;
-        scalar.size = static_cast<unsigned>(*item_size);
+        // The value of a padded scalar occupies the start of its storage.
+        scalar.size = static_cast<unsigned>(
+            hir::natural_size(module, item.type, subtarget.target()).value_or(*item_size));
         hir::Object scalar_entity = entity;
         scalar_entity.type = item.type;
         if (!lower_scalar_initializer(scalar, module, scalar_entity,
@@ -1620,7 +1560,7 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
                  index < signature.parameters.size(); ++index)
                 actual->parameters[index].physical_location =
                     signature.parameters[index].physical_location;
-            if (*actual != signature || value->address.addend != 0)
+            if (!hir::same_interface(module, *actual, signature) || value->address.addend != 0)
                 co_return reject(expression->location, "generic pointer argument has an incompatible function signature");
             normalized.kind = cross::AddressConstant::Kind::Function;
             normalized.function = function.definition ? function.definition
@@ -1746,8 +1686,8 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
             diagnostics.error(declaration->location,
                               "object has incomplete storage type");
         }
-        const auto natural =
-            natural_alignment(hir_module, entity.type, object.size, subtarget);
+        const auto natural = static_cast<unsigned>(
+            hir::layout_alignment(hir_module, entity.type, subtarget.target()).value_or(1));
         object.alignment = std::max(natural, entity.minimum_alignment);
         object.retain = marker_attribute(*declaration, "retain", diagnostics);
         object.used = marker_attribute(*declaration, "used", diagnostics);

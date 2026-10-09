@@ -311,7 +311,9 @@ bound creates a variable-length array under the managed-frame rules.
 `const`, `volatile`, and `restrict` qualify the type immediately built at their
 declarator position. A `const` object cannot be changed through that qualified
 lvalue. `volatile` and `restrict` have the contracts defined later.
-`typedef` declares aliases, not objects. Aliases do not create distinct types.
+`typedef` declares aliases, not objects. An alias does not create a distinct
+type, except that an alias declared with `aligned` is distinct for layout only,
+as described under alignment and packing.
 
 `struct`, `union`, and `enum` tags occupy a tag-name space. A structure stores
 members in declaration order; a union overlays all members at offset zero.
@@ -719,9 +721,9 @@ promotion, arithmetic, bit-fields, and ABI follow the underlying type.
 
 A bit-field base is `bool`, an integer, or an enumeration. Width is a
 nonnegative integer constant no greater than the base width; zero width requires
-an unnamed field. Its declared type fixes signedness. Atomic bit-fields are
-invalid; allocation, ordering, crossing, and zero-width effects are target ABI
-facts.
+an unnamed field. Its declared type fixes signedness and shall not request
+alignment. Atomic bit-fields are invalid; allocation, ordering, crossing, and
+zero-width effects are target ABI facts.
 
 ### Size, alignment, and translation checks
 
@@ -767,7 +769,11 @@ parameter cell and is omitted from callable identity, ABI classification, and
 mangling descriptors. The defining declarator supplies that cell's local
 qualification; another declaration may spell it differently. Qualification of
 a pointed-to type remains part of parameter type and compatibility. Other
-qualifiers retain their ordinary type and access rules.
+qualifiers retain their ordinary type and access rules. Likewise, the `aligned`
+request of a typedef used as a parameter or result type applies only to the
+parameter's callee cell or to the object that receives the result: callable
+identity, ABI classification, mangling descriptors, deduction, and
+function-pointer compatibility use the base types.
 
 Declarations, definitions, and pointer-to-function declarators can state the
 same complete callable contract. A parameter location follows its declarator;
@@ -857,8 +863,10 @@ Dereferencing a pointer is valid only when all of the following hold:
 
 - the address range is mapped for that access by a live Cross object or by a
   target, linker-script, operating-system, or device-memory contract;
-- the pointer satisfies the pointee type's alignment, unless the access is
-  explicitly declared unaligned by a target built-in;
+- the pointer satisfies the pointee type's alignment without its typedef
+  `aligned` request, which neither raises this requirement nor asserts
+  pointee alignment, unless the access is explicitly declared unaligned by a
+  target built-in;
 - the address space permits the requested read, write, or instruction fetch;
 - the access follows the effective-type and qualifier rules below.
 
@@ -1020,7 +1028,9 @@ typedef u32 scalable_u32 [[scalable_vector(4)]];
 `ext_vector_type(N)` creates a fixed vector of `N` elements. The element type
 must be a non-atomic integer, floating, or target-supported scalar type, and
 the resulting size and lane count must be supported by the target. Fixed
-vectors have ordinary object size and alignment. Arithmetic, bitwise, shift,
+vectors have ordinary object size and alignment. A vector's lane type carries
+no `aligned` request; a vector's alignment is its natural one unless the vector
+type itself is declared with `aligned`. Arithmetic, bitwise, shift,
 and comparison operators apply lane-wise when meaningful for the element
 type. A comparison lane contains all zero bits for false and all one bits for
 true. Scalar-to-vector conversion splats the scalar only when the conversion
@@ -1095,15 +1105,24 @@ other volatile objects may use any storage preserving these rules.
 
 `N` is a positive power-of-two integer constant expression. Effective
 alignment is the maximum of natural and requested alignments; repeated requests
-take their maximum. `aligned` is invalid on parameters, does not lower
-natural alignment, and does not assert a pointer's pointee alignment. The frame,
-object writer, and linker must preserve every accepted request or diagnose it.
+take their maximum. A type whose effective alignment exceeds its size has its
+size rounded up to that alignment, so arrays and record members of the type
+keep every element aligned; `sizeof` reports the rounded size. A typedef
+declared with `aligned` denotes a type that is distinct for layout only: its
+size and alignment follow the request, and arrays and members of it use that
+layout; its values convert, compare, and are passed and returned like the base
+type, and the request qualifies storage only. `aligned` is invalid on
+parameters, does not lower natural alignment, and does not assert a pointer's
+pointee alignment. The frame, object writer, and linker must preserve every
+accepted request or diagnose it.
 
-A packed record treats each non-zero-width member as packed. Members appear in
-declaration order at the first offset satisfying effective alignment. Record
-alignment is the maximum of one, member alignments, and explicit record
-alignment; size includes required tail padding. Union members remain at offset
-zero and union size is its largest member rounded to union alignment.
+A packed record treats each non-zero-width member as packed, but keeps the
+alignment that a member's type requests, including a typedef request and the
+request of an array member's element type. Members appear in declaration order
+at the first offset satisfying effective alignment. Record alignment is the
+maximum of one, member alignments, and explicit record alignment; size
+includes required tail padding. Union members remain at offset zero and union
+size is its largest member rounded to union alignment.
 
 Packing is not recursive: a nested record keeps its internal layout even if its
 containing member is under-aligned. Such rooted member access is valid and uses

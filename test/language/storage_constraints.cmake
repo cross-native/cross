@@ -1,8 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# A register object has no address, and typedef alignment is diagnosed rather
-# than ignored.
+# A register object has no address, and alignment requested through a typedef
+# reaches the object.
 foreach(required CC OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} is required")
@@ -48,9 +48,10 @@ global u64 f(in u64 input) { register u64 x = input; x += 1u64; return x; }\n")
 compile(register_pointer_element "" "${prelude}
 global u64 f() { u64 data[2] = {1, 2}; register u64 *p = data; sink(&p[1]); return data[1]; }\n")
 
-compile(typedef_aligned "aligned on a typedef is not implemented" "
+compile(typedef_aligned "" "
 typedef u32 wide [[aligned(16)]];
-global wide object;\n")
+global wide object;
+\$::static_assert(\$::alignof(wide) == 16uptr, \"scalar alignment through a typedef\");\n")
 compile(typedef_record_aligned "" "
 typedef struct [[aligned(16)]] { u32 value; } Wide;
 global Wide object;

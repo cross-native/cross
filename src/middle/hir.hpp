@@ -103,6 +103,9 @@ struct Type {
     std::optional<FunctionSignature> function{};
     bool is_restrict{};
     std::uint32_t address_space{};
+    // Alignment requested by a typedef's `aligned`, or zero. It distinguishes
+    // object layouts; values convert like the type without it.
+    unsigned alignment{};
     std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
     [[nodiscard]] NominalTypeKey nominal_key() const { return {nominal_name, nominal_identity}; }
 };
@@ -231,6 +234,7 @@ public:
     [[nodiscard]] TypeId function_type(FunctionSignature signature);
     [[nodiscard]] TypeId pointer_to(TypeId pointee);
     [[nodiscard]] TypeId without_top_level_const(TypeId type);
+    [[nodiscard]] TypeId without_alignment(TypeId type);
     [[nodiscard]] TypeId unqualified(TypeId type);
     [[nodiscard]] TypeId add_qualifiers(TypeId type, bool is_const,
                                         bool is_volatile);
@@ -340,6 +344,11 @@ bool validate_source_address_spaces(Program& program,
 [[nodiscard]] std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,
                std::optional<TypeId> indirect);
+// Callable identity, which ignores what qualifies only a parameter's own cell
+// (the top-level const of an `in` parameter and any requested alignment) and
+// a result's requested alignment.
+[[nodiscard]] bool same_interface(const Module& module, const FunctionSignature& left,
+                                  const FunctionSignature& right);
 // An observable entry address uses its stable interface, never a private
 // dynamically selected transport: unfixed parts of a manual interface take
 // the function's registered ABI.
@@ -349,6 +358,8 @@ void stabilize_function_address(Module& module, FunctionId function);
 bool stabilize_label_address(Module& module, LabelId label,
                              SourceLocation location, Diagnostics& diagnostics);
 [[nodiscard]] std::string type_name(const Module& module, TypeId type);
+// Storage of an object of the type: its natural layout raised to the
+// alignment the type requests, with the size rounded up to that alignment.
 [[nodiscard]] std::optional<std::uint64_t>
 layout_size(const Module& module, TypeId type, const TargetInfo& target);
 // Prepared AST types used by raw lowering share the same storage contract.
@@ -357,6 +368,15 @@ layout_size(const Module& module, const TypePtr& type, const TargetInfo& target)
 [[nodiscard]] std::optional<std::uint64_t>
 layout_alignment(const Module& module, TypeId type,
                  const TargetInfo& target);
+// The layout without the type's own request, which values of the type and
+// their ABI transport use. Members and elements keep their requests.
+[[nodiscard]] std::optional<std::uint64_t>
+natural_size(const Module& module, TypeId type, const TargetInfo& target);
+[[nodiscard]] std::optional<std::uint64_t>
+natural_alignment(const Module& module, TypeId type, const TargetInfo& target);
+// The largest alignment requested by the type or its array elements; packing
+// never lowers a member below it.
+[[nodiscard]] unsigned requested_alignment(const Module& module, TypeId type);
 // Naturally aligned scalar capability shared by required evaluation and MIR.
 // Concrete access alignment/address-space checks remain in target lowering.
 [[nodiscard]] bool lock_free_atomic_type(const Module& module, TypeId type,

@@ -67,54 +67,19 @@ unsigned type_bits(const hir::Module& module, hir::TypeId id) {
 
 std::uint64_t storage_size(const hir::Module& module, hir::TypeId id,
                            const TargetInfo& target) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Pointer) {
-        return (module.address_bits + 7U) / 8U;
-    }
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        return module.record(*type.record).size;
-    }
-    if (type.kind == hir::Type::Kind::Array) {
-        if (!type.element || type.lanes == 0) return 0;
-        const auto element = storage_size(module, *type.element, target);
-        if (element == 0 ||
-            type.lanes > std::numeric_limits<std::uint64_t>::max() / element) {
-            return 0;
-        }
-        return element * type.lanes;
-    }
-    if (type.kind == hir::Type::Kind::Vector) {
-        return type.scalable ? 0 : (type_bits(module, id) + 7U) / 8U;
-    }
-    if (type.kind != hir::Type::Kind::Builtin ||
-        type.builtin == BuiltinType::Void) {
-        return 0;
-    }
-    if (type.builtin == BuiltinType::F80) {
-        return target.data_layout.f80_storage_bytes;
-    }
-    return (type_bits(module, id) + 7U) / 8U;
+    return hir::layout_size(module, id, target).value_or(0);
 }
 
 unsigned storage_alignment(const hir::Module& module, hir::TypeId id,
                            const TargetInfo& target) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        return module.record(*type.record).alignment;
-    }
-    if (type.kind == hir::Type::Kind::Array && type.element) {
-        return storage_alignment(module, *type.element, target);
-    }
-    if (type.kind == hir::Type::Kind::Builtin &&
-        type.builtin == BuiltinType::F80) {
-        return target.data_layout.f80_alignment;
-    }
-    const auto bytes = storage_size(module, id, target);
-    return std::max(
-        1U, std::min(static_cast<unsigned>(
-                         std::min<std::uint64_t>(
-                             bytes, std::numeric_limits<unsigned>::max())),
-                     target.data_layout.natural_alignment_limit));
+    return static_cast<unsigned>(hir::layout_alignment(module, id, target).value_or(1));
+}
+
+// What a dereference may assume and an access requires: the alignment of the
+// type without its own (typedef) request.
+unsigned access_alignment(const hir::Module& module, hir::TypeId id,
+                          const TargetInfo& target) {
+    return static_cast<unsigned>(hir::natural_alignment(module, id, target).value_or(1));
 }
 
 bool integer_type(const hir::Module& module, hir::TypeId id) {
@@ -1647,7 +1612,7 @@ private:
             }
             co_return DesignatorAddress{
                 *address, *pointer.pointee,
-                storage_alignment(hir_, *pointer.pointee, target_)};
+                access_alignment(hir_, *pointer.pointee, target_)};
         }
         if (expression.kind == Expr::Kind::Binary &&
             expression.text == "index" && expression.left &&
@@ -1684,7 +1649,7 @@ private:
                 }
                 element = *pointer.pointee;
                 base_alignment =
-                    storage_alignment(hir_, element, target_);
+                    access_alignment(hir_, element, target_);
             }
             auto index = co_await lower_expression_async(*expression.right);
             if (!index ||
@@ -1713,8 +1678,8 @@ private:
                         pointer.pointee) {
                         base = DesignatorAddress{
                             *address, *pointer.pointee,
-                            storage_alignment(hir_, *pointer.pointee,
-                                              target_)};
+                            access_alignment(hir_, *pointer.pointee,
+                                             target_)};
                     }
                 }
             }
@@ -1982,7 +1947,7 @@ private:
         }
 
         if (auto designator = co_await lower_designator_address_async(expression)) {
-            const auto natural = storage_alignment(
+            const auto natural = access_alignment(
                 hir_, *object_type, target_);
             if (designator->alignment < natural) {
                 diagnostics_.error(
@@ -3809,7 +3774,7 @@ private:
                             failed_ = true;
                             break;
                         }
-                        const auto natural = storage_alignment(
+                        const auto natural = access_alignment(
                             hir_, designator->type, target_);
                         if (designator->alignment < natural) {
                             diagnostics_.warning(

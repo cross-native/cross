@@ -11,6 +11,7 @@
 #include "target/assembly_format.hpp"
 #include "target/x86_64/features.hpp"
 #include "target/x86_64/machine_description.hpp"
+#include "target/x86_64/target.hpp"
 
 #include "model/model.hpp"
 
@@ -319,41 +320,24 @@ unsigned mode_alignment(machine::IntegerMode mode) {
 }
 
 unsigned storage_size(const hir::Module& module, hir::TypeId id) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Pointer) return 8;
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        const auto size = module.record(*type.record).size;
-        return size <= std::numeric_limits<unsigned>::max()
-                   ? static_cast<unsigned>(size)
-                   : 0;
-    }
-    if (type.kind == hir::Type::Kind::Array) {
-        if (!type.element || type.lanes == 0) return 0;
-        const auto element = storage_size(module, *type.element);
-        if (element == 0 ||
-            type.lanes > std::numeric_limits<unsigned>::max() / element) {
-            return 0;
-        }
-        return element * type.lanes;
-    }
-    if (type.kind == hir::Type::Kind::Vector) {
-        return type.scalable ? 0 : mode_bytes(mode_for(module, id));
-    }
-    return type.builtin == BuiltinType::Void
-               ? 0
-               : mode_bytes(mode_for(module, id));
+    const auto size = hir::layout_size(module, id, x86_64_target()).value_or(0);
+    return size <= std::numeric_limits<unsigned>::max() ? static_cast<unsigned>(size) : 0;
 }
 
 unsigned storage_alignment(const hir::Module& module, hir::TypeId id) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        return module.record(*type.record).alignment;
-    }
-    if (type.kind == hir::Type::Kind::Array && type.element) {
-        return storage_alignment(module, *type.element);
-    }
-    if (type.kind == hir::Type::Kind::Pointer) return 8;
-    return mode_alignment(mode_for(module, id));
+    return static_cast<unsigned>(
+        hir::layout_alignment(module, id, x86_64_target()).value_or(1));
+}
+
+// A value is transported as its type without the type's own requested alignment.
+unsigned value_size(const hir::Module& module, hir::TypeId id) {
+    const auto size = hir::natural_size(module, id, x86_64_target()).value_or(0);
+    return size <= std::numeric_limits<unsigned>::max() ? static_cast<unsigned>(size) : 0;
+}
+
+unsigned value_alignment(const hir::Module& module, hir::TypeId id) {
+    return static_cast<unsigned>(
+        hir::natural_alignment(module, id, x86_64_target()).value_or(1));
 }
 
 AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
@@ -364,7 +348,7 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
     result.transport = transport;
     result.alignment_bits = static_cast<std::uint16_t>(
         std::min<unsigned>(
-            storage_alignment(module, id) * 8U,
+            value_alignment(module, id) * 8U,
             std::numeric_limits<std::uint16_t>::max()));
     if (type.kind == hir::Type::Kind::Record && type.record) {
         const auto& record = module.record(*type.record);
@@ -396,11 +380,23 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
         return result;
     }
     if (type.kind == hir::Type::Kind::Array && type.element) {
-        result.mode = ScalarMode::array(
-            static_cast<std::uint16_t>(type_bits(module, id)));
+        auto element = abi_value_for(module, *type.element, abi);
         result.element_count = type.lanes;
-        result.elements.push_back(
-            abi_value_for(module, *type.element, abi));
+        const auto stride = storage_size(module, *type.element) * 8U;
+        if (stride == element.mode.bits) {
+            result.mode = ScalarMode::array(
+                static_cast<std::uint16_t>(type_bits(module, id)));
+            result.elements.push_back(std::move(element));
+            return result;
+        }
+        // Padded elements are placed explicitly at their storage stride.
+        result.mode = ScalarMode::array(static_cast<std::uint16_t>(
+            std::min<std::uint64_t>(std::uint64_t{stride} * type.lanes,
+                                    std::numeric_limits<std::uint16_t>::max())));
+        for (std::uint32_t index = 0; index < type.lanes; ++index) {
+            result.elements.push_back(element);
+            result.element_offsets_bits.push_back(index * stride);
+        }
         return result;
     }
     result.mode = abi_scalar_mode(module, id, abi);
@@ -1172,7 +1168,7 @@ private:
                     register_input.kind =
                         machine::StackSlotKind::Local;
                     register_input.size = std::max(
-                        16U, storage_size(hir_, entity.parameters[index].type));
+                        16U, value_size(hir_, entity.parameters[index].type));
                     register_input.alignment = 16;
                     register_input.location =
                         entity.parameters[index].location;
@@ -1545,7 +1541,7 @@ private:
             // any model-selected register, including those scratch locations.
             if (instruction.opcode == Opcode::AggregatePointerLoad) {
                 append_fixed_clobber(instruction, "r10", machine::i64);
-                const auto bytes = storage_size(hir_, value.type);
+                const auto bytes = value_size(hir_, value.type);
                 if (bytes % 16U != 0) append_fixed_clobber(instruction, "rax", machine::i64);
                 if (bytes >= 16U) append_fixed_clobber(instruction, "xmm0", machine::i128);
             } else {
@@ -17404,7 +17400,7 @@ private:
             if (is_aggregate(hir_, type)) {
                 copy_frame_storage(
                     *snapshot, vreg_offset(function, target),
-                    storage_size(hir_, type));
+                    value_size(hir_, type));
             } else if (boundary.register_view->register_class ==
                 RegisterClass::simd) {
                 const auto scratch = simd_scratch_register(type);
@@ -17425,7 +17421,7 @@ private:
             copy_incoming_to_frame(
                 manual_caller_offset(plan, boundary),
                 vreg_offset(function, target),
-                storage_size(hir_, type));
+                value_size(hir_, type));
             return;
         }
         if (boundary.is_indirect()) {
@@ -17438,7 +17434,7 @@ private:
             instruction("movq", memory(*slot) + ", %r10");
             copy_pointer_to_frame(
                 "r10", vreg_offset(function, target),
-                storage_size(hir_, type));
+                value_size(hir_, type));
         }
     }
 
@@ -17721,7 +17717,7 @@ private:
                     source.indirect_value_bits != 0
                         ? static_cast<unsigned>(
                               (source.indirect_value_bits + 7U) / 8U)
-                        : storage_size(hir_, parameter.type);
+                        : value_size(hir_, parameter.type);
                 copy_pointer_to_frame(
                     "r10",
                     vreg_offset(function, target) +
@@ -17768,7 +17764,7 @@ private:
             } else {
                 copy_incoming_to_frame(
                     source.stack_offset, vreg_offset(function, target),
-                    storage_size(hir_, parameter.type));
+                    value_size(hir_, parameter.type));
             }
             return;
         }
@@ -19881,7 +19877,7 @@ private:
         if (boundary.kind == ManualBoundaryKind::Stack) {
             const auto outgoing = manual_outgoing_offset(plan, boundary);
             copy_frame_to_outgoing(
-                source_offset(), outgoing, storage_size(hir_, type));
+                source_offset(), outgoing, value_size(hir_, type));
         }
     }
 
@@ -19950,7 +19946,7 @@ private:
                 slot_offset(function, destination.slot) +
                 destination.offset;
             copy_outgoing_to_frame(
-                outgoing, target, storage_size(hir_, type));
+                outgoing, target, value_size(hir_, type));
         }
     }
 
@@ -20212,7 +20208,7 @@ private:
                     manual_outgoing_offset(plan, output);
                 copy_outgoing_to_frame(
                     outgoing, vreg_offset(function, target),
-                    storage_size(hir_, plan.result.type));
+                    value_size(hir_, plan.result.type));
             }
         };
         const auto uses_rax = [](const ManualBoundary& boundary) {
@@ -20654,7 +20650,7 @@ private:
                     copy_frame_to_outgoing(
                         vreg_offset(function, source),
                         destination.stack_offset,
-                        storage_size(hir_, source_type));
+                        value_size(hir_, source_type));
                 }
                 return;
             }
@@ -21784,7 +21780,7 @@ private:
         if (boundary.kind == ManualBoundaryKind::Stack) {
             copy_frame_to_incoming(
                 value_offset, manual_caller_offset(plan, boundary),
-                storage_size(hir_, type));
+                value_size(hir_, type));
         } else if (boundary.is_indirect()) {
             const auto pointer = named_slot_offset(function, pointer_home);
             if (!pointer) {
@@ -21795,7 +21791,7 @@ private:
             }
             instruction("movq", memory(*pointer) + ", %r10");
             copy_frame_to_pointer(value_offset, "r10",
-                                  storage_size(hir_, type));
+                                  value_size(hir_, type));
         } else {
             return;
         }
@@ -22004,7 +22000,7 @@ private:
                     const auto source =
                         vreg_offset(function, value.uses.front());
                     const auto object_bytes =
-                        storage_size(hir_, entity.result_type);
+                        value_size(hir_, entity.result_type);
                     for (std::size_t index = 0;
                          index < result.pieces.size(); ++index) {
                         const auto& piece = result.pieces[index];

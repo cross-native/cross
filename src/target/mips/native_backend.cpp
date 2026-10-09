@@ -263,56 +263,14 @@ machine::IntegerMode mode_for(const hir::Module& module, hir::TypeId id) {
 }
 
 unsigned storage_size(const hir::Module& module, hir::TypeId id,
-                      const TargetDataLayout& layout) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Pointer) {
-        return (module.address_bits + 7U) / 8U;
-    }
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        const auto bytes = module.record(*type.record).size;
-        return bytes <= std::numeric_limits<unsigned>::max()
-                   ? static_cast<unsigned>(bytes)
-                   : 0U;
-    }
-    if (type.kind == hir::Type::Kind::Array) {
-        if (!type.element || type.lanes == 0) return 0;
-        const auto element = storage_size(module, *type.element, layout);
-        return element != 0 &&
-                       type.lanes <= std::numeric_limits<unsigned>::max() /
-                                         element
-                   ? element * type.lanes
-                   : 0U;
-    }
-    if (type.kind == hir::Type::Kind::Vector) {
-        const auto bits = type_bits(module, id);
-        return bits == 0 ? 0U : (bits + 7U) / 8U;
-    }
-    if (type.builtin == BuiltinType::F80) return layout.f80_storage_bytes;
-    const auto bits = type_bits(module, id);
-    return bits == 0 ? 0U : (bits + 7U) / 8U;
+                      const TargetInfo& target) {
+    const auto size = hir::layout_size(module, id, target).value_or(0);
+    return size <= std::numeric_limits<unsigned>::max() ? static_cast<unsigned>(size) : 0U;
 }
 
 unsigned storage_alignment(const hir::Module& module, hir::TypeId id,
-                           const TargetDataLayout& layout) {
-    const auto& type = module.type(id);
-    if (type.kind == hir::Type::Kind::Record && type.record) {
-        return module.record(*type.record).alignment;
-    }
-    if (type.kind == hir::Type::Kind::Array && type.element) {
-        return storage_alignment(module, *type.element, layout);
-    }
-    if (type.kind == hir::Type::Kind::Pointer) {
-        return std::min((module.address_bits + 7U) / 8U,
-                        layout.natural_alignment_limit);
-    }
-    if (type.kind == hir::Type::Kind::Builtin &&
-        type.builtin == BuiltinType::F80) {
-        return layout.f80_alignment;
-    }
-    const auto bytes = storage_size(module, id, layout);
-    const auto natural = bytes >= 16 ? 16U : bytes >= 8 ? 8U :
-                         bytes >= 4 ? 4U : bytes >= 2 ? 2U : 1U;
-    return std::min(natural, layout.natural_alignment_limit);
+                           const TargetInfo& target) {
+    return static_cast<unsigned>(hir::layout_alignment(module, id, target).value_or(1));
 }
 
 ScalarMode scalar_mode(const hir::Module& module, hir::TypeId id,
@@ -334,13 +292,14 @@ ScalarMode scalar_mode(const hir::Module& module, hir::TypeId id,
 }
 
 AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
-                       const TargetDataLayout& layout, const AbiEntry& abi,
+                       const TargetInfo& target, const AbiEntry& abi,
                        ValueTransport transport = ValueTransport::Direct) {
     AbiValue result;
     result.mode = scalar_mode(module, id, abi);
     result.transport = transport;
-    result.alignment_bits = static_cast<std::uint16_t>(std::min<unsigned>(
-        storage_alignment(module, id, layout) * 8U,
+    // A value is transported as its type without the type's own request.
+    result.alignment_bits = static_cast<std::uint16_t>(std::min<std::uint64_t>(
+        hir::natural_alignment(module, id, target).value_or(1) * 8U,
         std::numeric_limits<std::uint16_t>::max()));
     const auto& type = module.type(id);
     if (type.kind == hir::Type::Kind::Record && type.record) {
@@ -359,14 +318,26 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
                 bit_field_unit.reset();
             }
             result.elements.push_back(
-                abi_value_for(module, member.type, layout, abi));
+                abi_value_for(module, member.type, target, abi));
             result.element_offsets_bits.push_back(
                 static_cast<std::uint32_t>(member.offset * 8U));
         }
     } else if (type.kind == hir::Type::Kind::Array && type.element) {
+        auto element = abi_value_for(module, *type.element, target, abi);
         result.element_count = type.lanes;
-        result.elements.push_back(
-            abi_value_for(module, *type.element, layout, abi));
+        const auto stride = storage_size(module, *type.element, target) * 8U;
+        if (stride == element.mode.bits) {
+            result.elements.push_back(std::move(element));
+            return result;
+        }
+        // Padded elements are placed explicitly at their storage stride.
+        result.mode = ScalarMode::array(static_cast<std::uint16_t>(
+            std::min<std::uint64_t>(std::uint64_t{stride} * type.lanes,
+                                    std::numeric_limits<std::uint16_t>::max())));
+        for (std::uint32_t index = 0; index < type.lanes; ++index) {
+            result.elements.push_back(element);
+            result.element_offsets_bits.push_back(index * stride);
+        }
     }
     return result;
 }
@@ -383,14 +354,14 @@ std::optional<SignatureLayout> classify_managed_interface(
     arguments.reserve(entity.parameters.size());
     for (const auto& parameter : entity.parameters) {
         arguments.push_back(abi_value_for(
-            module, parameter.type, subtarget.target().data_layout, abi,
+            module, parameter.type, subtarget.target(), abi,
             parameter.mode == ParameterMode::In
                 ? ValueTransport::Direct : ValueTransport::ByReference));
     }
     std::vector<AbiValue> results;
     if (!is_void(module, entity.result_type)) {
         results.push_back(abi_value_for(
-            module, entity.result_type, subtarget.target().data_layout, abi));
+            module, entity.result_type, subtarget.target(), abi));
     }
     auto classified = entity.variadic
         ? classify_variadic_signature(abi, arguments, results, entity.parameters.size(),
@@ -804,11 +775,11 @@ private:
                 : source_->values[value.operands.back().value].type;
         return !is_aggregate(hir_, type) &&
                value.memory_alignment <
-                   storage_size(hir_, type, subtarget_.target().data_layout);
+                   hir::natural_size(hir_, type, subtarget_.target()).value_or(0);
     }
 
     void create_stack_slots(const mir::ManagedFunction& source) {
-        const auto& layout = subtarget_.target().data_layout;
+        const auto& layout = subtarget_.target();
         for (const auto& slot : source.slots) {
             machine::StackSlot target;
             target.id = {
@@ -885,8 +856,10 @@ private:
             temporary.id = {
                 static_cast<std::uint32_t>(current_.stack_slots.size())};
             temporary.kind = machine::StackSlotKind::Local;
-            temporary.size = storage_size(hir_, value.type, layout);
-            temporary.alignment = storage_alignment(hir_, value.type, layout);
+            temporary.size = static_cast<unsigned>(
+                hir::natural_size(hir_, value.type, layout).value_or(0));
+            temporary.alignment = static_cast<unsigned>(
+                hir::natural_alignment(hir_, value.type, layout).value_or(1));
             temporary.location = value.location;
             temporary.name =
                 "$aggregate.phi." + std::to_string(reg(value.id).id);
@@ -968,8 +941,7 @@ private:
             }
             if (value.kind == ValueKind::IndexedLoad) {
                 result.operands.push_back(immediate_operand(
-                    storage_size(hir_, value.type,
-                                 subtarget_.target().data_layout),
+                    storage_size(hir_, value.type, subtarget_.target()),
                     0, machine::i32));
             }
             if (aggregate_load) result.defs.push_back(reg(value.id));
@@ -1110,8 +1082,7 @@ private:
             }
             const auto& pointer = hir_.type(value.type);
             const auto element = pointer.pointee
-                ? storage_size(hir_, *pointer.pointee,
-                               subtarget_.target().data_layout)
+                ? storage_size(hir_, *pointer.pointee, subtarget_.target())
                 : 0U;
             result.operands.push_back(
                 immediate_operand(element, 0, machine::i32));
@@ -1237,8 +1208,7 @@ private:
                 result.uses.push_back(source);
             }
             result.operands.push_back(immediate_operand(
-                storage_size(hir_, value.type,
-                             subtarget_.target().data_layout),
+                storage_size(hir_, value.type, subtarget_.target()),
                 0, machine::i32));
             result.defs.push_back(reg(value.id));
             result.may_load = true;
@@ -1399,13 +1369,13 @@ private:
                             : ValueTransport::Direct;
                     arguments.push_back(abi_value_for(
                         hir_, value.call_arguments[index].type,
-                        subtarget_.target().data_layout, *abi, transport));
+                        subtarget_.target(), *abi, transport));
                 }
                 std::vector<AbiValue> results;
                 if (!is_void(hir_, callee.result_type)) {
                     results.push_back(
                         abi_value_for(hir_, callee.result_type,
-                                      subtarget_.target().data_layout, *abi));
+                                      subtarget_.target(), *abi));
                 }
                 const auto classified =
                     callee.variadic
@@ -4511,7 +4481,7 @@ public:
             // Dynamic SP effects are not yet part of the pinned fixed-frame
             // program contract. Retain the verified MIR marks and late frame
             // emitter, with a stable FP for every fixed home.
-            if (has_dynamic_stack(function)) continue;
+            if (has_dynamic_stack(function) || frame_realignment(function)) continue;
             active_signature_ = classify_entity(hir_.function(function.source), function.location);
             if (!active_signature_) continue;
             prepare_parameter_homes(function);
@@ -5025,6 +4995,12 @@ private:
                                      : std::string_view{"sp"};
     }
 
+    // Register saves and incoming arguments keep a fixed distance from the
+    // caller's stack pointer, which only $sp preserves in a realigned frame.
+    std::string save_memory(std::int64_t offset) const {
+        return realignment_ ? memory(offset, "sp") : memory(offset);
+    }
+
     std::string block_label(const machine::Function& function,
                             machine::BlockId block) const {
         return ".Lcross.mips." + std::to_string(function.source.value) +
@@ -5341,13 +5317,12 @@ private:
                     ? ValueTransport::ByReference
                     : ValueTransport::Direct;
             arguments.push_back(abi_value_for(
-                hir_, type, subtarget_.target().data_layout, *abi, transport));
+                hir_, type, subtarget_.target(), *abi, transport));
         }
         std::vector<AbiValue> results;
         if (!is_void(hir_, entity.result_type)) {
             results.push_back(abi_value_for(hir_, entity.result_type,
-                                            subtarget_.target().data_layout,
-                                            *abi));
+                                            subtarget_.target(), *abi));
         }
         const auto classified =
             entity.variadic
@@ -5612,8 +5587,7 @@ private:
             instruction(!floating_name.empty()
                             ? slot->size > 4 ? "sdc1" : "swc1"
                             : slot->size > 4 ? "sd" : "sw",
-                        reg_name(name) + "," +
-                            memory(*slot->frame_offset));
+                        reg_name(name) + "," + save_memory(*slot->frame_offset));
             if (cfi) {
                 output_ << ".cfi_offset " << physical.value << ','
                         << static_cast<std::int64_t>(*slot->frame_offset) -
@@ -5636,8 +5610,7 @@ private:
             instruction(!floating_name.empty()
                             ? slot->size > 4 ? "ldc1" : "lwc1"
                             : slot->size > 4 ? "ld" : "lw",
-                        reg_name(name) + "," +
-                            memory(*slot->frame_offset));
+                        reg_name(name) + "," + save_memory(*slot->frame_offset));
             if (cfi) output_ << ".cfi_restore " << item->value << '\n';
         }
     }
@@ -6223,10 +6196,12 @@ private:
         std::int64_t offset{};
         if (piece.location.kind == LocationKind::Stack) {
             offset = static_cast<std::int64_t>(piece.location.stack_offset);
-            if (parameter_entry)
+            if (parameter_entry) {
                 offset += frame_size_ + abi.return_address_bytes;
-            else
+                if (realignment_) base = "sp";
+            } else {
                 base = "sp";
+            }
         } else if (parameter_entry) {
             const auto* home =
                 named_slot(function, parameter_home_name(piece.location.reg));
@@ -6281,10 +6256,29 @@ private:
         return size;
     }
 
+    // The largest slot alignment beyond the ABI stack alignment, or zero.
+    static std::uint32_t frame_realignment(const machine::Function& function) {
+        const auto stack = std::max(8U, function.frame.stack_alignment);
+        std::uint32_t result = 0;
+        for (const auto& slot : function.stack_slots)
+            if (!slot.elided && slot.alignment > stack) result = std::max(result, slot.alignment);
+        return result;
+    }
+
     bool finalize_frame(machine::Function& function) {
         auto offset = outgoing_size(function);
         function.frame.outgoing_argument_size = offset;
         if (has_dynamic_stack(function)) offset = 0;
+        // A realigned frame keeps $sp at the fixed frame bottom, which also
+        // addresses incoming arguments and register saves, and rounds $fp up
+        // to the largest slot alignment as the base of every other slot.
+        realignment_ = frame_realignment(function);
+        if (realignment_ && (has_dynamic_stack(function) || realignment_ > 32768U)) {
+            diagnostics_.error(function.location, has_dynamic_stack(function)
+                ? "MIPS cannot realign a frame that also has a variable-length allocation"
+                : "MIPS frame alignment exceeds 32768 bytes");
+            return false;
+        }
         bool has_call = false;
         for (const auto& block : function.blocks) {
             for (std::size_t index = 0;
@@ -6300,11 +6294,23 @@ private:
                 has_call = has_call || !tail;
             }
         }
+        const auto realigned_save = [&](const machine::StackSlot& slot) {
+            return realignment_ && slot.name.starts_with("$callee.save.");
+        };
         for (auto& slot : function.stack_slots) {
-            if (slot.elided) continue;
+            if (slot.elided || realigned_save(slot)) continue;
             offset = align_up(offset, slot.alignment);
             slot.frame_offset = static_cast<std::int32_t>(offset);
             offset += slot.size;
+        }
+        if (realignment_) {
+            offset += realignment_ - std::max(8U, function.frame.stack_alignment);
+            for (auto& slot : function.stack_slots) {
+                if (slot.elided || !realigned_save(slot)) continue;
+                offset = align_up(offset, slot.alignment);
+                slot.frame_offset = static_cast<std::int32_t>(offset);
+                offset += slot.size;
+            }
         }
         bool incoming_stack = false;
         if (active_signature_) {
@@ -6331,7 +6337,7 @@ private:
             return true;
         }
         function.frame.has_frame_pointer = has_dynamic_stack(function) ||
-            !options_.omit_frame_pointer;
+            realignment_ || !options_.omit_frame_pointer;
         // $fp and $ra carry addresses, so their homes are as wide as the
         // ABI's address model: one word under o32/EABI, a doubleword under
         // n64.
@@ -6370,7 +6376,7 @@ private:
                                 const AbiEntry& abi) const {
         const auto offset = static_cast<std::uint64_t>(frame_size_) +
                             callee_stack_offset(piece, abi);
-        return memory(static_cast<std::int64_t>(offset));
+        return save_memory(static_cast<std::int64_t>(offset));
     }
 
     void load_abi_piece(const machine::Function& function,
@@ -7309,7 +7315,7 @@ private:
                 frame_delay = emit_prepared_epilogue(function);
             } else {
                 emit_callee_restores(function, cfi);
-                if (function.frame.has_frame_pointer) {
+                if (function.frame.has_frame_pointer && !realignment_) {
                     instruction("move", "$sp,$fp");
                 }
                 if (saves_fp_) {
@@ -8284,6 +8290,8 @@ private:
     std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::optional<ActiveSignature> active_signature_;
     std::uint32_t frame_size_{};
+    // Alignment of $fp in a realigned frame, or zero.
+    std::uint32_t realignment_{};
     std::uint32_t saved_fp_offset_{};
     std::uint32_t saved_ra_offset_{};
     // Blocks of the active function that run with its frame, and whether the
@@ -10683,6 +10691,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // and fallback captures would let an early value destroy a later one.
     if (function.frame.program) {
         frame_size_ = function.frame.program->stack_size;
+        realignment_ = 0;
         saves_fp_ = false;
         saves_ra_ = false;
     } else {
@@ -10767,8 +10776,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     output_ << ".type " << symbol << ",@function\n"
             << ".ent " << symbol << '\n' << symbol << ":\n"
             << "\t.frame\t"
-            << respell_registers(function.frame.has_frame_pointer ? "$fp"
-                                                                  : "$sp")
+            << respell_registers(function.frame.has_frame_pointer && !realignment_
+                                     ? "$fp" : "$sp")
             << ',' << frame_size_ << ','
             << respell_registers("$ra") << '\n';
     const bool cfi = (options_.unwind_tables ||
@@ -10807,7 +10816,12 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                         << '\n';
             }
         }
-        if (function.frame.has_frame_pointer) {
+        if (realignment_) {
+            instruction(address_add_immediate(),
+                        "$fp,$sp," + std::to_string(realignment_ - 1U));
+            instruction("addiu", "$at,$zero,-" + std::to_string(realignment_));
+            instruction("and", "$fp,$fp,$at");
+        } else if (function.frame.has_frame_pointer) {
             instruction("move", "$fp,$sp");
             if (cfi) output_ << ".cfi_def_cfa_register 30\n";
         }
@@ -10943,7 +10957,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             else instruction("nop");
         } else {
             emit_callee_restores(function, cfi);
-            if (function.frame.has_frame_pointer) {
+            if (function.frame.has_frame_pointer && !realignment_) {
                 instruction("move", "$sp,$fp");
             }
             if (saves_fp_) {
