@@ -93,7 +93,7 @@ reject_body(conditional_nonzero "conditional pointer/integer operands require an
     "u32 *a; 1u32 ? a : 1u32;")
 reject_body(conditional_runtime_zero "conditional pointer/integer operands require an integer constant zero"
     "u32 *a; u32 zero = 0u32; sizeof(1u32 ? zero : a);")
-reject(conditional_callable_abi "conditional pointer operands have no compatible common type" [=[
+reject(conditional_callable_abi "conditional function-pointer operands differ in their callable ABI" [=[
 typedef u32 (*A)(in u32) [[abi("odd_abi")]];
 typedef u32 (*B)(in u32) [[abi("stack_result_abi")]];
 static $::meta::tokens helper(in $::meta::tokens input) {

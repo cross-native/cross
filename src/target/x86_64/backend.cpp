@@ -86,7 +86,8 @@ public:
         Diagnostics& diagnostics) const override {
         const auto& target = subtarget.target();
         auto manual_plans = build_manual_abi_plans(
-            hir_module, target, subtarget, options, diagnostics);
+            hir_module, target, subtarget, options, diagnostics,
+            &managed_module);
         if (diagnostics.errors() != 0) return false;
 
         auto dynamic_plans = build_dynamic_abi_plans(
@@ -119,7 +120,8 @@ public:
         Diagnostics& diagnostics) const override {
         const auto& target = subtarget.target();
         const auto manual_plans = build_manual_abi_plans(
-            hir_module, target, subtarget, options, diagnostics);
+            hir_module, target, subtarget, options, diagnostics,
+            &managed_module);
         if (diagnostics.errors() != 0) return {};
         const auto dynamic_plans = build_dynamic_abi_plans(
             managed_module, hir_module, manual_plans, options, diagnostics);
@@ -243,7 +245,8 @@ public:
         const Subtarget& subtarget, const CompilerOptions& options,
         Diagnostics& diagnostics) const override {
         const auto manual_plans = build_manual_abi_plans(
-            hir_module, subtarget.target(), subtarget, options, diagnostics);
+            hir_module, subtarget.target(), subtarget, options, diagnostics,
+            &managed_module);
         if (diagnostics.errors() != 0) return {};
         const auto dynamic_plans = build_dynamic_abi_plans(
             managed_module, hir_module, manual_plans, options,

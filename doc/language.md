@@ -407,7 +407,10 @@ global i32 transform(in u64 source "rdi", out u64 flags "rdx") -> "eax" {
 
 A function pointer type includes the parameter modes and the ABI. A pointer
 uses the compilation's ABI unless its type names another one, such as
-`[[abi("ms_abi")]] typedef u32 (*operation)(u32 x);`.
+`[[abi("ms_abi")]] typedef u32 (*operation)(u32 x);`. Like a function
+declaration, the type can also pin parameters and the result to registers or
+stack slots, declare clobbers, and select callee stack cleanup; calls through
+the pointer follow that complete interface.
 
 ```x
 typedef u32 (*operation)(u32 x);
@@ -425,10 +428,26 @@ global u32 example() {
 }
 ```
 
-When a function is converted to a pointer with a different ABI, `cc` emits a
-small wrapper with the pointer's ABI. Parameter types, modes, and result must
-match exactly, and an existing function-pointer value is never converted to
-another ABI.
+When a named function is converted to a pointer whose ABI, register or stack
+locations, clobbers, or stack cleanup differ from the function's, `cc` emits a
+small wrapper with the pointer's interface:
+
+```x
+typedef u64 (*hash_fn)(in u64 value);
+
+static u64 mix(in u64 value "rdi") -> "rax" {
+    return value * 31;
+}
+
+global hash_fn hasher() {
+    return mix;   // a wrapper with the plain hash_fn interface
+}
+```
+
+Parameter types, modes, and result must match exactly, and an existing
+function-pointer value is never converted to another interface. A conditional
+never selects a wrapper either: both of its function-pointer operands must
+already have the same interface.
 
 ### Machine code
 

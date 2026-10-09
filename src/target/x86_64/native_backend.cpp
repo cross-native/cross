@@ -591,6 +591,29 @@ machine::TargetOpcodeId vector_binary_opcode(
     return Opcode::Invalid;
 }
 
+// Registers a manual call sequence overwrites besides its callee's effects:
+// the caller writes inputs and channel addresses itself, even where the ABI
+// preserves those registers, and stack boundary copies use RAX and XMM0.
+std::vector<std::string> manual_call_registers(const ManualAbiPlan& plan) {
+    std::vector<std::string> names;
+    const auto add = [&](const ManualBoundary& boundary) {
+        if (boundary.is_x87()) return;
+        if (boundary.register_view) {
+            names.emplace_back(boundary.register_view->storage_name);
+        }
+        for (const auto& piece : boundary.register_pieces) {
+            names.emplace_back(piece.register_view->storage_name);
+        }
+    };
+    for (const auto& parameter : plan.parameters) {
+        add(parameter.input);
+        add(parameter.output);
+    }
+    add(plan.result.output);
+    if (plan.stack.has_stack) names.insert(names.end(), {"rax", "xmm0"});
+    return names;
+}
+
 // Storage that a parallel phi copy reads or writes. Unallocated values with
 // one frame color share a home, so copy ordering must treat them as one
 // location. An unallocated rematerialized immediate reads no storage.
@@ -1738,8 +1761,11 @@ private:
             } else if (const auto* abi = abi_model(callee.abi)) {
                 append_clobbers(abi->call_clobbers);
             }
-            if (value.callee)
-                append_clobbers(hir_.function(*value.callee).clobbers);
+            append_clobbers(callee.clobbers);
+            if (const auto* manual =
+                    manual_plans_.find(value.callee, value.call_signature)) {
+                append_clobbers(manual_call_registers(*manual));
+            }
             instruction.has_side_effects = true;
             return instruction;
         }
@@ -2992,8 +3018,8 @@ private:
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (instruction.kind == machine::InstructionKind::Call &&
-                    instruction.direct_callee &&
-                    manual_plans_.find(*instruction.direct_callee)) {
+                    manual_plans_.find(instruction.direct_callee,
+                                       instruction.call_signature)) {
                     return;
                 }
                 const bool storage_boundary =
@@ -6335,8 +6361,9 @@ private:
                     const auto* callee = instruction.direct_callee
                         ? &hir_.function(*instruction.direct_callee)
                         : nullptr;
-                    const bool manual = callee &&
-                        manual_plans_.find(callee->id);
+                    const bool manual = manual_plans_.find(
+                        instruction.direct_callee,
+                        instruction.call_signature) != nullptr;
                     for (std::size_t index = 0;
                          index < instruction.call_argument_types.size();
                          ++index) {
@@ -6368,8 +6395,7 @@ private:
                     // staging cell. Keep those definitions in their homes
                     // until manual boundaries become explicit Machine IR
                     // copies as well.
-                    if (instruction.direct_callee &&
-                        manual_plans_.find(*instruction.direct_callee)) {
+                    if (manual) {
                         for (const auto& reg : instruction.defs) {
                             mark_ineligible(reg);
                         }
@@ -8776,10 +8802,8 @@ private:
                     hir::call_signature(hir_, instruction.direct_callee,
                                         instruction.call_signature);
                 if (!callee) continue;
-                if (const auto* manual =
-                        instruction.direct_callee
-                            ? manual_plans_.find(*instruction.direct_callee)
-                            : nullptr) {
+                if (const auto* manual = manual_plans_.find(
+                        instruction.direct_callee, instruction.call_signature)) {
                     if (!manual->valid) {
                         diagnostics_.error(
                             instruction.location,
@@ -20009,6 +20033,13 @@ private:
         }
     }
 
+    // The target was captured before argument placement.
+    void emit_indirect_call_transfer(const machine::Function& function) {
+        if (uses_wide_vectors_) instruction("vzeroupper");
+        instruction("call", "*" + memory(*named_slot_offset(
+                                      function, "$indirect.call.target")));
+    }
+
     void emit_tail_call_transfer(const hir::Function& callee,
                                  const machine::SymbolOperand& symbol) {
         const auto call_symbol = assembly_symbol(symbol.name);
@@ -20025,7 +20056,7 @@ private:
 
     bool emit_manual_call(const machine::Function& function,
                           const machine::Instruction& value,
-                          const hir::Function& callee,
+                          const hir::Function* callee,
                           const ManualAbiPlan& plan) {
         if (!plan.valid ||
             plan.parameters.size() + 1 != value.operands.size()) {
@@ -20102,10 +20133,14 @@ private:
                 function, value.operands[parameter_index + 1],
                 plan.parameters[parameter_index].type);
         }
-        emit_call_transfer(
-            function, callee,
-            std::get<machine::SymbolOperand>(value.operands.front()),
-            value.location);
+        if (callee) {
+            emit_call_transfer(
+                function, *callee,
+                std::get<machine::SymbolOperand>(value.operands.front()),
+                value.location);
+        } else {
+            emit_indirect_call_transfer(function);
+        }
         if (plan.callee_cleanup &&
             plan.stack.outgoing_area_size != 0) {
             instruction("subq", "$" +
@@ -20317,9 +20352,9 @@ private:
                 instruction("movq", memory(*scratch) + ", %rax");
             }
         }
-        if (const auto* manual =
-                entity ? manual_plans_.find(entity->id) : nullptr;
-            manual && emit_manual_call(function, value, *entity, *manual)) {
+        if (const auto* manual = manual_plans_.find(value.direct_callee,
+                                                    value.call_signature);
+            manual && emit_manual_call(function, value, entity, *manual)) {
             if (!tail) restore_hard_registers(function, "$hard.call.");
             return;
         }
@@ -20843,9 +20878,7 @@ private:
         if (entity && symbol) {
             emit_call_transfer(function, *entity, *symbol, value.location);
         } else {
-            if (uses_wide_vectors_) instruction("vzeroupper");
-            instruction("call", "*" + memory(*named_slot_offset(
-                                          function, "$indirect.call.target")));
+            emit_indirect_call_transfer(function);
         }
         if (!value.defs.empty()) {
             const auto target = value.defs.front();

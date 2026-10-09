@@ -72,7 +72,8 @@ Target options:
 
 Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
-atomics, thread-local storage, and variadic functions are supported.
+atomics, thread-local storage, and variadic functions are supported, but a
+variadic function or function pointer cannot use register or stack locations.
 
 `[[naked]]` functions can inline `[[raw_inline]]` functions whose locals,
 control flow, pointer accesses, and integer, `f32`, and `f64` operations fit
@@ -163,7 +164,8 @@ MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used.
 - `case` and `default` labels cannot be nested inside another statement of
   the `switch` body (as in Duff's device), and a `switch` body cannot declare a
   variable-length array.
-- Function pointers can be converted to another ABI only when the function is
-  named directly; see [language.md](language.md#function-pointers).
+- Function pointers can be converted to another ABI or other register
+  locations only when the function is named directly; see
+  [language.md](language.md#function-pointers).
 - `[[aligned(N)]]` applies to objects, records, members, and function
   definitions; it is not supported on a typedef of a non-record type.

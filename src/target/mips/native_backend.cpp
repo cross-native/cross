@@ -1432,7 +1432,7 @@ private:
                     }
                 }
             }
-            if (entity) append_clobbers(entity->clobbers);
+            append_clobbers(callee.clobbers);
             result.has_side_effects = true;
             return result;
         }

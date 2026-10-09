@@ -1610,8 +1610,16 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
                 !module.type(*expected.pointee).function)
                 co_return reject(expression->location, "generic pointer argument has an incompatible function type");
             auto signature = *module.type(*expected.pointee).function;
-            // Contextual registered-ABI adapters run after instantiation.
+            // Contextual adapters run after instantiation and supply the
+            // destination's ABI, endpoints, result location, clobbers, and cleanup.
             actual->abi = signature.abi;
+            actual->result_location = signature.result_location;
+            actual->clobbers = signature.clobbers;
+            actual->stack_cleanup = signature.stack_cleanup;
+            for (std::size_t index = 0; index < actual->parameters.size() &&
+                 index < signature.parameters.size(); ++index)
+                actual->parameters[index].physical_location =
+                    signature.parameters[index].physical_location;
             if (*actual != signature || value->address.addend != 0)
                 co_return reject(expression->location, "generic pointer argument has an incompatible function signature");
             normalized.kind = cross::AddressConstant::Kind::Function;
@@ -1807,8 +1815,7 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                 (void)hir::stabilize_label_address(hir_module, *address.label,
                                                   declaration->location, diagnostics);
             else if (address.kind == AddressKind::Function && address.function)
-                (void)hir::stabilize_function_address(hir_module, *address.function,
-                                                     declaration->location, diagnostics);
+                hir::stabilize_function_address(hir_module, *address.function);
         };
         if (object.address) stabilize(*object.address);
         for (const auto& relocation : object.relocations) {

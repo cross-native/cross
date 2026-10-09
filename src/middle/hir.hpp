@@ -340,11 +340,10 @@ bool validate_source_address_spaces(Program& program,
 [[nodiscard]] std::optional<FunctionSignature>
 call_signature(const Module& module, std::optional<FunctionId> direct,
                std::optional<TypeId> indirect);
-// An observable entry address uses its registered interface, never a private
-// dynamically selected transport. Explicit endpoint adapters remain deferred.
-bool stabilize_function_address(Module& module, FunctionId function,
-                                SourceLocation location,
-                                Diagnostics& diagnostics);
+// An observable entry address uses its stable interface, never a private
+// dynamically selected transport: unfixed parts of a manual interface take
+// the function's registered ABI.
+void stabilize_function_address(Module& module, FunctionId function);
 // A label is a code address, not a callable entry or an ABI adapter request.
 // Preserve the owner's canonical body and its explicit endpoint contract.
 bool stabilize_label_address(Module& module, LabelId label,

@@ -19,6 +19,7 @@
 #include "model/model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <fstream>
 #include <limits>
@@ -2862,39 +2863,18 @@ private:
                    : nullptr;
     }
 
-    static bool same_shape(const FunctionDecl& source,
-                           const FunctionType& destination) {
+    // The adapter supplies the rest of the destination interface: ABI,
+    // endpoints, result location, clobbers, and stack cleanup.
+    static bool same_signature(const FunctionDecl& source,
+                               const FunctionType& destination) {
         if (source.variadic != destination.variadic ||
             source.parameters.size() != destination.parameters.size() ||
-            source.result_location.value_or("auto") !=
-                destination.result_location.value_or("auto") ||
             !same_type(source.return_type, destination.result)) {
             return false;
         }
-        const auto* cleanup = source.attribute("stack_cleanup");
-        const auto cleanup_name =
-            cleanup && cleanup->arguments.size() == 1
-                ? decode_string_literal(cleanup->arguments.front())
-                : std::nullopt;
-        if (cleanup_name.value_or("caller") !=
-            destination.stack_cleanup.value_or("caller")) return false;
-        std::vector<std::string> source_clobbers;
-        for (const auto& attribute : source.attributes) {
-            if (attribute.name != "clobber") continue;
-            for (const auto& argument : attribute.arguments) {
-                if (const auto value = decode_string_literal(argument))
-                    source_clobbers.push_back(*value);
-            }
-        }
-        auto destination_clobbers = destination.clobbers;
-        std::sort(source_clobbers.begin(), source_clobbers.end());
-        std::sort(destination_clobbers.begin(), destination_clobbers.end());
-        if (source_clobbers != destination_clobbers) return false;
         for (std::size_t index = 0; index < source.parameters.size(); ++index) {
             if (source.parameters[index].mode !=
                     destination.parameters[index].mode ||
-                source.parameters[index].location_name.value_or("auto") !=
-                    destination.parameters[index].location_name.value_or("auto") ||
                 !same_type(callable_parameter_type(source.parameters[index].type,
                                                    source.parameters[index].mode),
                            callable_parameter_type(destination.parameters[index].type,
@@ -2912,24 +2892,27 @@ private:
             .value_or(std::string{});
     }
 
+    // A non-dynamic function whose complete interface already matches the
+    // destination keeps its own address.
     bool already_stable(const FunctionDecl& source,
-                        std::string_view destination_abi) const {
+                        const TypePtr& destination) const {
         const auto source_abi = explicit_abi(source);
         const bool dynamic = source.definition() && !source.variadic &&
                              source.linkage != Linkage::Global;
         if (dynamic && source_abi.empty()) return false;
-        const auto effective_source =
-            source_abi.empty() ? std::string_view(default_abi_)
-                               : std::string_view(source_abi);
-        const auto effective_destination =
-            destination_abi.empty() ? std::string_view(default_abi_)
-                                    : destination_abi;
-        if (program_.canonical_callable_abi) {
-            const auto source_identity = program_.canonical_callable_abi(effective_source);
-            const auto destination_identity = program_.canonical_callable_abi(effective_destination);
-            return source_identity && destination_identity && *source_identity == *destination_identity;
-        }
-        return effective_source == effective_destination;
+        const auto canonical = [&](std::string_view abi) -> std::optional<std::string> {
+            const auto effective = abi.empty() ? std::string_view(default_abi_) : abi;
+            if (program_.canonical_callable_abi) return program_.canonical_callable_abi(effective);
+            return std::string(effective);
+        };
+        auto own = source_function_type(source);
+        auto wanted = clone_type(destination);
+        const auto own_abi = canonical(source_abi);
+        const auto wanted_abi = canonical(wanted->function->abi);
+        if (!own_abi || !wanted_abi) return false;
+        own->function->abi = *own_abi;
+        wanted->function->abi = *wanted_abi;
+        return compare_source_types(own, wanted) != TypeComparison::Different;
     }
 
     TypePtr lookup(const Expr& expression) const {
@@ -3058,14 +3041,21 @@ private:
     }
 
     std::string make_adapter(const FunctionDecl& source,
-                             const FunctionType& signature,
+                             const TypePtr& destination,
                              SourceLocation location) {
+        const auto& signature = *destination->function;
+        const auto adapter_abi = signature.abi.empty()
+                                     ? default_abi_
+                                     : signature.abi;
+        // Spellings of one interface share an adapter, preserving address
+        // identity across conversions.
+        auto identity = clone_type(destination);
+        if (program_.canonical_callable_abi)
+            identity->function->abi =
+                program_.canonical_callable_abi(adapter_abi).value_or(adapter_abi);
         const auto key = source.name + '#' +
                          (source.linkage == Linkage::Static ? source.source_unit : "") + '#' +
-                         canonical_type_name(function_type(
-                             clone_type(signature.result),
-                             signature.parameters, signature.variadic,
-                             signature.abi));
+                         canonical_type_name(identity);
         if (const auto found = adapters_.find(key); found != adapters_.end()) {
             return found->second;
         }
@@ -3077,11 +3067,18 @@ private:
         adapter->return_type = clone_type(signature.result);
         adapter->linkage = Linkage::Static;
         adapter->variadic = signature.variadic;
-        const auto adapter_abi = signature.abi.empty()
-                                     ? default_abi_
-                                     : signature.abi;
         adapter->attributes.push_back(
             {"abi", {"\"" + adapter_abi + "\""}, location});
+        adapter->result_location = signature.result_location;
+        if (!signature.clobbers.empty()) {
+            Attribute clobber{"clobber", {}, location};
+            for (const auto& resource : signature.clobbers)
+                clobber.arguments.push_back("\"" + resource + "\"");
+            adapter->attributes.push_back(std::move(clobber));
+        }
+        if (signature.stack_cleanup)
+            adapter->attributes.push_back(
+                {"stack_cleanup", {"\"" + *signature.stack_cleanup + "\""}, location});
 
         auto call = std::make_unique<Expr>();
         call->kind = Expr::Kind::Call;
@@ -3138,6 +3135,24 @@ private:
         return name;
     }
 
+    const FunctionDecl* named_function(const Expr& expression) const {
+        if (expression.kind == Expr::Kind::Address && expression.evaluated_address)
+            return expression.evaluated_address->function;
+        if (expression.kind != Expr::Kind::Name) return nullptr;
+        return resolve_function(program_, caller_, expression,
+                                [](const FunctionDecl&) { return true; });
+    }
+
+    // The pointer to a named function's own interface, else null.
+    TypePtr own_pointer_type(const Expr& expression) const {
+        const auto* selected = &expression;
+        while (selected->left && (selected->kind == Expr::Kind::Parenthesized ||
+               (selected->kind == Expr::Kind::Unary && selected->text == "&")))
+            selected = selected->left.get();
+        const auto* source = named_function(*selected);
+        return source ? pointer_type(source_function_type(*source)) : TypePtr{};
+    }
+
     bool adapt(std::unique_ptr<Expr>& expression,
                const TypePtr& destination) {
         const auto* signature = pointed_function(destination);
@@ -3152,15 +3167,13 @@ private:
         }
         const bool address = expression->kind == Expr::Kind::Address &&
                              expression->evaluated_address;
-        if (expression->kind != Expr::Kind::Name && !address) return false;
-        const auto* source = address ? expression->evaluated_address->function
-            : resolve_function(program_, caller_, *expression,
-                               [](const FunctionDecl&) { return true; });
-        if (!source || evaluation_only(*source) || !same_shape(*source, *signature) ||
-            already_stable(*source, signature->abi) || source->variadic) {
+        const auto* source = named_function(*expression);
+        if (!source || evaluation_only(*source) || source->variadic ||
+            !same_signature(*source, *signature) ||
+            already_stable(*source, destination->pointee)) {
             return false;
         }
-        bind_exact_name(*expression, make_adapter(*source, *signature,
+        bind_exact_name(*expression, make_adapter(*source, destination->pointee,
                                                   expression->location));
         if (address) {
             expression->evaluated_address->function = resolve_function(
@@ -3184,12 +3197,17 @@ private:
             return;
         }
         case Expr::Kind::Conditional:
+            // A conditional chooses no adapter: a named arm only decays to
+            // its own stable pointer, and both arms must share one interface.
             rewrite(expression->left);
-            rewrite(expression->right, destination);
-            rewrite(expression->third, destination);
+            rewrite(expression->right, own_pointer_type(*expression->right));
+            rewrite(expression->third, own_pointer_type(*expression->third));
             return;
         case Expr::Kind::Cast:
             rewrite(expression->left, expression->type);
+            return;
+        case Expr::Kind::AggregateInitializer:
+            rewrite_initializer(*expression, destination);
             return;
         case Expr::Kind::Binary:
             if (expression->text == "==" || expression->text == "!=") {
@@ -3249,9 +3267,68 @@ private:
         for (auto& argument : expression->generic_arguments) {
             rewrite(argument.value);
         }
-        visit_initializer_children(
-            *expression,
-            [&](std::unique_ptr<Expr>& child) { rewrite(child); });
+    }
+
+    // The element or member type a designator chain selects, if known.
+    TypePtr designated_type(TypePtr type,
+                            const std::vector<Expr::InitializerDesignator>& designators) const {
+        for (const auto& designator : designators) {
+            if (!type) return {};
+            if (designator.kind == Expr::InitializerDesignator::Kind::Index) {
+                type = type->kind == Type::Kind::Array ? qualified_element_type(type) : TypePtr{};
+                continue;
+            }
+            const auto record = type->kind == Type::Kind::Record
+                ? program_.record_definition(type->nominal_key()) : nullptr;
+            if (!record) return {};
+            const auto member = std::find_if(record->members.begin(), record->members.end(),
+                [&](const RecordMemberDecl& candidate) {
+                    return candidate.member_name() == designator.member_name();
+                });
+            type = member == record->members.end() ? TypePtr{} : member->type;
+        }
+        return type;
+    }
+
+    // Each entry of a brace list receives its element or member type, so a
+    // function name in a table is adapted like any other initializer. After
+    // a nested designator chain the next positional member is left unknown.
+    void rewrite_initializer(Expr& initializer, const TypePtr& destination) {
+        const auto record = destination && destination->kind == Type::Kind::Record
+            ? program_.record_definition(destination->nominal_key()) : nullptr;
+        const auto named_members = [&](auto&& visit) {
+            std::size_t logical = 0;
+            for (const auto& member : record->members)
+                if (!member.name.empty() && visit(member, logical++)) return;
+        };
+        std::optional<std::size_t> position = 0;
+        for (auto& entry : initializer.initializer_entries) {
+            for (auto& designator : entry.designators) rewrite(designator.index);
+            TypePtr target;
+            if (!entry.designators.empty()) {
+                target = designated_type(destination, entry.designators);
+                position.reset();
+                const auto& first = entry.designators.front();
+                if (record && entry.designators.size() == 1 &&
+                    first.kind == Expr::InitializerDesignator::Kind::Member) {
+                    named_members([&](const RecordMemberDecl& member, std::size_t logical) {
+                        if (member.member_name() != first.member_name()) return false;
+                        position = logical + 1;
+                        return true;
+                    });
+                }
+            } else if (destination && destination->kind == Type::Kind::Array) {
+                target = qualified_element_type(destination);
+            } else if (record && position) {
+                named_members([&](const RecordMemberDecl& member, std::size_t logical) {
+                    if (logical != *position) return false;
+                    target = member.type;
+                    return true;
+                });
+                ++*position;
+            }
+            rewrite(entry.value, target);
+        }
     }
 
     void rewrite(Statement& statement) {
@@ -4365,6 +4442,79 @@ std::optional<SourceExpressionIssue> source_object_expression_error(const Expr& 
     return {};
 }
 
+// Parts of a callable interface that an adapter can bridge for a named function.
+enum CallableInterfacePart : unsigned {
+    CallableAbi = 1U << 0,
+    CallableEndpoints = 1U << 1,
+    CallableResultLocation = 1U << 2,
+    CallableClobbers = 1U << 3,
+    CallableCleanup = 1U << 4,
+    CallableInterface = (1U << 5) - 1,
+};
+
+void adopt_callable_interface(FunctionType& target, const FunctionType& source, unsigned parts) {
+    if (parts & CallableAbi) target.abi = source.abi;
+    if (parts & CallableEndpoints)
+        for (std::size_t index = 0; index < target.parameters.size(); ++index)
+            target.parameters[index].location_name = source.parameters[index].location_name;
+    if (parts & CallableResultLocation) target.result_location = source.result_location;
+    if (parts & CallableClobbers) target.clobbers = source.clobbers;
+    if (parts & CallableCleanup) target.stack_cleanup = source.stack_cleanup;
+}
+
+// The interface parts in which two function types differ, or zero when their
+// results, parameter types, modes, or variadic forms differ as well.
+unsigned callable_interface_differences(const TypePtr& source, const TypePtr& destination) {
+    if (!source->function || !destination->function ||
+        source->function->parameters.size() != destination->function->parameters.size())
+        return 0;
+    const auto agrees_with = [&](unsigned parts) {
+        auto adapted = clone_type(source);
+        adopt_callable_interface(*adapted->function, *destination->function, parts);
+        return compare_source_types(adapted, destination) != TypeComparison::Different;
+    };
+    if (!agrees_with(CallableInterface)) return 0;
+    unsigned differences = 0;
+    for (unsigned part = 1; part < CallableInterface; part <<= 1)
+        if (!agrees_with(CallableInterface & ~part)) differences |= part;
+    return differences;
+}
+
+// One message per combination of differing parts: the prefix followed by a
+// list such as "ABI and result location".
+std::array<std::string, CallableInterface + 1> callable_interface_messages(std::string_view prefix) {
+    constexpr std::array<std::string_view, 5> names{
+        "ABI", "parameter endpoints", "result location", "clobbers", "stack cleanup"};
+    std::array<std::string, CallableInterface + 1> result;
+    for (unsigned mask = 1; mask <= CallableInterface; ++mask) {
+        std::vector<std::string_view> parts;
+        for (unsigned bit = 0; bit < names.size(); ++bit)
+            if (mask & (1U << bit)) parts.push_back(names[bit]);
+        auto& text = result[mask];
+        text = prefix;
+        for (std::size_t index = 0; index < parts.size(); ++index) {
+            if (index != 0)
+                text += index + 1 < parts.size() ? ", " : parts.size() > 2 ? ", and " : " and ";
+            text += parts[index];
+        }
+    }
+    return result;
+}
+
+// Only a named function can be adapted; a held value keeps its interface.
+const char* callable_value_conversion_error(unsigned differences) {
+    static const auto messages =
+        callable_interface_messages("a function-pointer value cannot change its callable ");
+    return messages[differences & CallableInterface].c_str();
+}
+
+// A conditional chooses no adapter, so its arms must share one interface.
+const char* conditional_callable_error(unsigned differences) {
+    static const auto messages =
+        callable_interface_messages("conditional function-pointer operands differ in their callable ");
+    return messages[differences & CallableInterface].c_str();
+}
+
 // Source operator constraints are independent of execution and target layout.
 // Share these between erased-body validation and required/unevaluated trees.
 template<class TypeOf, class NullInteger>
@@ -4415,9 +4565,14 @@ const char* source_operator_error(const Expr& node, const Program& program,
             (no->kind == Type::Kind::Pointer && is_floating(yes)))
             return "conditional operands cannot mix pointer and floating types";
         if (yes->kind == Type::Kind::Pointer || no->kind == Type::Kind::Pointer) {
-            if (yes->kind == Type::Kind::Pointer && no->kind == Type::Kind::Pointer)
-                return common_pointer_type(yes, no).type ? nullptr
-                    : "conditional pointer operands have no compatible common type";
+            if (yes->kind == Type::Kind::Pointer && no->kind == Type::Kind::Pointer) {
+                if (common_pointer_type(yes, no).type) return nullptr;
+                if (yes->pointee && no->pointee && yes->pointee->kind == Type::Kind::Function &&
+                    no->pointee->kind == Type::Kind::Function)
+                    if (const auto differences = callable_interface_differences(yes->pointee, no->pointee))
+                        return conditional_callable_error(differences);
+                return "conditional pointer operands have no compatible common type";
+            }
             auto& integer = yes->kind == Type::Kind::Pointer ? *node.third : *node.right;
             const auto integer_type = yes->kind == Type::Kind::Pointer ? no : yes;
             return is_integer(integer_type) && null_integer(integer) ? nullptr
@@ -4540,6 +4695,8 @@ const char* source_value_error(const TypePtr& type) {
     return is_void_type(type) ? "void expression cannot supply a value" : nullptr;
 }
 
+
+
 // Target-independent constraints only. Integer/address representation and
 // cross-address-space conversions remain owned by the resolved target. This
 // check must not execute a source value, including in an untaken helper branch.
@@ -4564,19 +4721,17 @@ const char* source_conversion_error(const TypePtr& source, const TypePtr& destin
             ? "explicit cast cannot convert between a pointer and a non-integer type"
             : "conversion cannot convert between a pointer and a floating type";
     // ABI spellings have been canonicalized by the resolved model. An existing
-    // pointer value must keep its complete stable interface. A known function
-    // designator can instead use the ordinary registered-ABI adapter path when
-    // its non-ABI interface agrees; no adapter is inferred for an indirect value.
+    // pointer value must keep its complete stable interface. A known
+    // non-variadic function designator can instead use an adapter when only
+    // its interface differs; no adapter is inferred for an indirect value.
     if (source_pointer && destination_pointer && source->pointee && destination->pointee &&
         source->pointee->kind == Type::Kind::Function &&
         destination->pointee->kind == Type::Kind::Function) {
         if (compare_pointee(source->pointee, destination->pointee) != PointeeCompatibility::Incompatible) return nullptr;
-        if (direct_function && source->pointee->function && destination->pointee->function &&
-            !source->pointee->function->variadic) {
-            auto adapted = clone_type(source->pointee);
-            adapted->function->abi = destination->pointee->function->abi;
-            if (compare_source_types(adapted, destination->pointee) != TypeComparison::Different) return nullptr;
-        }
+        const bool variadic = source->pointee->function && source->pointee->function->variadic;
+        if (const auto differences = callable_interface_differences(source->pointee, destination->pointee);
+            differences && !(direct_function && variadic))
+            return direct_function ? nullptr : callable_value_conversion_error(differences);
         return conversion == SourceConversion::Explicit
             ? "explicit pointer conversion discards qualifiers or uses incompatible pointee types"
             : "implicit pointer conversion discards qualifiers or uses incompatible pointee types";

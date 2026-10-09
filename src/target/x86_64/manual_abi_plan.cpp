@@ -4,6 +4,7 @@
 
 #include "common/diagnostic.hpp"
 #include "common/options.hpp"
+#include "middle/mir.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 #include "target/x86_64/features.hpp"
@@ -151,17 +152,26 @@ std::string attribute_string(const Attribute* attribute) {
         .value_or(std::string{});
 }
 
-bool is_manual(const hir::Function& function) {
-    if (function.result_location && *function.result_location != "auto") {
-        return true;
-    }
+bool is_manual(const std::vector<hir::Parameter>& parameters,
+               const std::optional<std::string>& result_location) {
+    if (result_location && *result_location != "auto") return true;
     return std::any_of(
-        function.parameters.begin(), function.parameters.end(),
+        parameters.begin(), parameters.end(),
         [](const hir::Parameter& parameter) {
             return parameter.physical_location &&
                    *parameter.physical_location != "auto";
         });
 }
+
+// The interface being planned: a function, or the pointee of an indirect
+// call's function-pointer type, diagnosed at the call.
+struct PlanSource {
+    SourceLocation location;
+    const std::vector<hir::Parameter>& parameters;
+    hir::TypeId result_type;
+    const std::optional<std::string>& result_location;
+    bool naked{};
+};
 
 const RegisterView* integer_view(std::string_view storage, unsigned bits) {
     for (const auto& view : register_views()) {
@@ -335,7 +345,7 @@ struct AutomaticLayout {
 };
 
 AutomaticLayout automatic_layout(
-    const hir::Module& module, const hir::Function& function,
+    const hir::Module& module, const PlanSource& function,
     const AbiEntry& abi, AbiFeatureSet features) {
     AutomaticLayout result;
     result.parameters.resize(function.parameters.size());
@@ -431,6 +441,22 @@ void for_each_register_view(const ManualBoundary& boundary,
     }
 }
 
+bool compiler_owned_endpoint(const ManualAbiPlan& plan) {
+    bool owned = false;
+    const auto check = [&](const ManualBoundary& boundary) {
+        for_each_register_view(boundary, [&](const RegisterView* view) {
+            owned |= view && (view->storage_name == "rsp" ||
+                              view->storage_name == "rbp");
+        });
+    };
+    for (const auto& parameter : plan.parameters) {
+        check(parameter.input);
+        check(parameter.output);
+    }
+    check(plan.result.output);
+    return owned;
+}
+
 bool checked_add(std::uint64_t left, std::uint64_t right,
                  std::uint64_t& result) {
     if (left > std::numeric_limits<std::uint64_t>::max() - right) {
@@ -450,11 +476,59 @@ public:
         (void)options;
     }
 
-    ManualAbiPlans run() {
+    ManualAbiPlans run(const mir::ManagedModule* managed) {
         std::vector<ManualAbiPlan> entries;
         for (const auto& function : module_.functions) {
-            if (!is_manual(function)) continue;
+            if (!is_manual(function.parameters, function.result_location)) {
+                continue;
+            }
             entries.push_back(plan_function(function));
+        }
+        if (!managed) return ManualAbiPlans(std::move(entries));
+        for (const auto& function : managed->functions) {
+            for (const auto& value : function.values) {
+                if (value.kind != mir::ValueKind::Call) continue;
+                const auto signature = hir::call_signature(
+                    module_, value.callee, value.call_signature);
+                if (!signature || !is_manual(signature->parameters,
+                                             signature->result_location)) {
+                    continue;
+                }
+                // A manual call sequence has no variadic hidden state.
+                if (signature->variadic) {
+                    diagnostics_.error(
+                        value.location,
+                        "calls to a variadic interface with manual x86-64 "
+                        "locations are not implemented yet");
+                    continue;
+                }
+                if (value.callee) {
+                    // Only a naked definition may take RSP or RBP endpoints;
+                    // a managed caller owns both.
+                    const auto plan = std::find_if(
+                        entries.begin(), entries.end(),
+                        [&](const ManualAbiPlan& candidate) {
+                            return !candidate.signature &&
+                                   candidate.function == *value.callee;
+                        });
+                    if (plan != entries.end() && compiler_owned_endpoint(*plan)) {
+                        diagnostics_.error(
+                            value.location,
+                            "a managed call cannot pass a stack or frame "
+                            "pointer endpoint");
+                    }
+                    continue;
+                }
+                const bool planned = std::any_of(
+                    entries.begin(), entries.end(),
+                    [&](const ManualAbiPlan& plan) {
+                        return plan.signature == value.call_signature;
+                    });
+                if (!planned) {
+                    entries.push_back(plan_signature(
+                        *value.call_signature, *signature, value.location));
+                }
+            }
         }
         return ManualAbiPlans(std::move(entries));
     }
@@ -463,19 +537,43 @@ private:
     ManualAbiPlan plan_function(const hir::Function& function) {
         ManualAbiPlan plan;
         plan.function = function.id;
+        plan.clobbers = function.clobbers;
+        plan.callee_cleanup = cleanup(function, plan);
+        plan_interface({function.location, function.parameters,
+                        function.result_type, function.result_location,
+                        function.naked},
+                       function.abi, plan);
+        return plan;
+    }
+
+    ManualAbiPlan plan_signature(hir::TypeId type,
+                                 const hir::FunctionSignature& signature,
+                                 SourceLocation location) {
+        ManualAbiPlan plan;
+        plan.signature = type;
+        plan.clobbers = signature.clobbers;
+        plan.callee_cleanup =
+            signature.stack_cleanup.value_or("caller") == "callee";
+        plan_interface({location, signature.parameters,
+                        signature.result_type, signature.result_location},
+                       signature.abi, plan);
+        return plan;
+    }
+
+    void plan_interface(const PlanSource& function, AbiId abi,
+                        ManualAbiPlan& plan) {
         plan.manual = true;
-        plan.abi_info = find_abi(target_, function.abi);
+        plan.abi_info = find_abi(target_, abi);
         if (!plan.abi_info) {
             diagnostics_.error(
                 function.location,
                 "unsupported x86-64 manual ABI id " +
-                    std::to_string(function.abi.value));
+                    std::to_string(abi.value));
             plan.valid = false;
-            return plan;
+            return;
         }
         plan.stack.home_space_size =
             plan.abi_info->argument_stack_base;
-        plan.callee_cleanup = cleanup(function, plan);
 
         auto automatic =
             automatic_layout(module_, function, *plan.abi_info,
@@ -491,7 +589,6 @@ private:
         build_stack(function, plan);
         build_x87(function, plan);
         validate(function, plan);
-        return plan;
     }
 
     bool cleanup(const hir::Function& function, ManualAbiPlan& plan) {
@@ -513,7 +610,7 @@ private:
     }
 
     ManualParameterPlan resolve_parameter(
-        const hir::Function& function, std::size_t index,
+        const PlanSource& function, std::size_t index,
         const AutomaticPlacement& automatic, ManualAbiPlan& plan) {
         const auto& parameter = function.parameters[index];
         ManualParameterPlan result;
@@ -566,7 +663,7 @@ private:
         return result;
     }
 
-    void resolve_result(const hir::Function& function,
+    void resolve_result(const PlanSource& function,
                         const AutomaticLayout& automatic,
                         ManualAbiPlan& plan) {
         plan.result.type = function.result_type;
@@ -581,36 +678,30 @@ private:
         }
         const auto parsed =
             parse_manual_endpoint(*function.result_location);
-        if (!parsed) {
-            diagnostics_.error(
-                function.location,
-                "ordinary result requires a supported direct x86-64 "
-                "register '" +
-                    *function.result_location + "'");
-            plan.valid = false;
-            return;
-        }
-        if (parsed.endpoint.kind == ManualEndpointKind::stack) {
+        const auto kind =
+            parsed ? parsed.endpoint.kind : ManualEndpointKind::invalid;
+        if (kind == ManualEndpointKind::stack) {
             plan.result.output = stack_boundary(
                 false, parsed.endpoint.stack_offset,
                 parsed.endpoint.has_fixed_stack_offset,
                 parsed.endpoint.has_fixed_stack_offset);
-            return;
-        }
-        if (parsed.endpoint.kind ==
-            ManualEndpointKind::direct_register) {
+        } else if (kind == ManualEndpointKind::direct_register) {
             plan.result.output =
                 direct_boundary(parsed.endpoint.register_view);
-            return;
+        } else if (kind == ManualEndpointKind::indirect_register) {
+            plan.result.output =
+                indirect_boundary(parsed.endpoint.register_view);
+        } else {
+            diagnostics_.error(
+                function.location,
+                "ordinary result requires a supported x86-64 register, "
+                "stack, or indirect register location '" +
+                    *function.result_location + "'");
+            plan.valid = false;
         }
-        diagnostics_.error(
-            function.location,
-            "ordinary result requires a supported direct x86-64 register '" +
-                *function.result_location + "'");
-        plan.valid = false;
     }
 
-    void build_stack(const hir::Function& function,
+    void build_stack(const PlanSource& function,
                      ManualAbiPlan& plan) {
         struct Atom {
             std::size_t parameter{};
@@ -854,7 +945,7 @@ private:
         return static_cast<unsigned>(name[2] - '0');
     }
 
-    void build_x87(const hir::Function& function,
+    void build_x87(const PlanSource& function,
                    ManualAbiPlan& plan) {
         const auto insert = [&](auto& slots, unsigned position,
                                 std::size_t parameter, bool input) {
@@ -1009,18 +1100,16 @@ private:
                       storage) != plan.abi_info->call_clobbers.end()) {
             return true;
         }
-        if (plan.function.value >= module_.functions.size()) return false;
-        const auto& function = module_.function(plan.function);
         const auto* sought = find_register(target_, storage);
         return sought && std::any_of(
-            function.clobbers.begin(), function.clobbers.end(),
+            plan.clobbers.begin(), plan.clobbers.end(),
             [&](const std::string& name) {
                 const auto* declared = find_register(target_, name);
                 return declared && declared->storage == sought->storage;
             });
     }
 
-    bool validate_boundary(const hir::Function& function,
+    bool validate_boundary(const PlanSource& function,
                            const hir::Parameter& parameter,
                            const ManualBoundary& boundary, bool output,
                            ManualAbiPlan& plan) {
@@ -1133,7 +1222,7 @@ private:
         return true;
     }
 
-    void validate(const hir::Function& function,
+    void validate(const PlanSource& function,
                   ManualAbiPlan& plan) {
         if (plan.callee_cleanup && plan.stack.has_stack) {
             if (plan.stack.outgoing_area_size > 65535) {
@@ -1231,19 +1320,22 @@ private:
         const bool explicit_result =
             function.result_location &&
             *function.result_location != "auto";
-        if (plan.result.output.is_stack()) {
+        // resolve_result has diagnosed an unsupported explicit location.
+        if (plan.result.output.is_stack() ||
+            (explicit_result &&
+             plan.result.output.kind == ManualBoundaryKind::None)) {
             return;
         }
         if (plan.result.output.is_indirect()) {
             const auto* entry = register_entry(target_, plan.result.output);
             const auto* view = plan.result.output.register_view;
-            if (explicit_result || !entry || !view ||
+            if (!entry || !view ||
                 view->register_class != RegisterClass::integer ||
                 view->bits < 64 || view->bit_offset != 0) {
                 diagnostics_.error(
                     function.location,
-                    "automatic indirect result requires a supported x86-64 "
-                    "pointer register");
+                    "indirect result requires a supported x86-64 pointer "
+                    "register");
                 plan.valid = false;
                 return;
             }
@@ -1251,14 +1343,14 @@ private:
                 (entry->storage == "rsp" || entry->storage == "rbp")) {
                 diagnostics_.error(
                     function.location,
-                    "automatic indirect result cannot use compiler-owned "
-                    "register '" + std::string(entry->storage) + "'");
+                    "indirect result cannot use compiler-owned register '" +
+                        std::string(entry->storage) + "'");
                 plan.valid = false;
             } else if (!input_storage.insert(entry->storage).second) {
                 diagnostics_.error(
                     function.location,
-                    "automatic indirect result overlaps manual input "
-                    "register '" + std::string(entry->storage) + "'");
+                    "indirect result overlaps manual input register '" +
+                        std::string(entry->storage) + "'");
                 plan.valid = false;
             }
             return;
@@ -1372,7 +1464,16 @@ const ManualAbiPlan* ManualAbiPlans::find(
     const auto found = std::find_if(
         entries_.begin(), entries_.end(),
         [function](const ManualAbiPlan& plan) {
-            return plan.function == function;
+            return !plan.signature && plan.function == function;
+        });
+    return found == entries_.end() ? nullptr : &*found;
+}
+
+const ManualAbiPlan* ManualAbiPlans::find(hir::TypeId signature) const {
+    const auto found = std::find_if(
+        entries_.begin(), entries_.end(),
+        [signature](const ManualAbiPlan& plan) {
+            return plan.signature == signature;
         });
     return found == entries_.end() ? nullptr : &*found;
 }
@@ -1380,8 +1481,9 @@ const ManualAbiPlan* ManualAbiPlans::find(
 ManualAbiPlans build_manual_abi_plans(
     const hir::Module& module, const TargetInfo& target,
     const Subtarget& subtarget, const CompilerOptions& options,
-    Diagnostics& diagnostics) {
-    return Planner(module, target, subtarget, options, diagnostics).run();
+    Diagnostics& diagnostics, const mir::ManagedModule* managed) {
+    return Planner(module, target, subtarget, options, diagnostics)
+        .run(managed);
 }
 
 } // namespace cross::x86_64

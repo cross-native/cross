@@ -22,6 +22,10 @@ struct CompilerOptions;
 class Subtarget;
 struct TargetInfo;
 
+namespace mir {
+struct ManagedModule;
+}
+
 namespace x86_64 {
 
 enum class ManualBoundaryKind : std::uint8_t {
@@ -114,12 +118,17 @@ struct ManualX87Layout {
     bool has_x87{};
 };
 
+// A plan describes a function's own interface or, with `signature`, the
+// pointed-to function type of indirect calls.
 struct ManualAbiPlan {
     hir::FunctionId function;
+    std::optional<hir::TypeId> signature;
     const AbiEntry* abi_info{};
     bool manual{};
     bool callee_cleanup{};
     bool valid{true};
+    // Resources the interface clobbers in addition to its ABI's.
+    std::vector<std::string> clobbers;
     std::vector<ManualParameterPlan> parameters;
     ManualResultPlan result;
     ManualStackLayout stack;
@@ -133,24 +142,30 @@ public:
         : entries_(std::move(entries)) {}
 
     [[nodiscard]] const ManualAbiPlan* find(hir::FunctionId function) const;
+    [[nodiscard]] const ManualAbiPlan* find(hir::TypeId signature) const;
+    // The plan of a direct callee or of an indirect call's pointed-to type.
+    [[nodiscard]] const ManualAbiPlan* find(
+        std::optional<hir::FunctionId> direct,
+        std::optional<hir::TypeId> indirect) const {
+        return direct ? find(*direct) : indirect ? find(*indirect) : nullptr;
+    }
     [[nodiscard]] const std::vector<ManualAbiPlan>& entries() const {
         return entries_;
     }
 
 private:
-    friend ManualAbiPlans build_manual_abi_plans(
-        const hir::Module&, const TargetInfo&, const Subtarget&,
-        const CompilerOptions&, Diagnostics&);
     std::vector<ManualAbiPlan> entries_;
 };
 
-// Builds plans only for functions with a non-auto physical parameter or result
-// location. Diagnostics are emitted once while planning; invalid plans remain
-// queryable with `valid == false` so later ownership decisions are stable.
+// Builds plans only for interfaces with a non-auto physical parameter or result
+// location: those of functions and, given managed MIR, the pointed-to types of
+// its indirect calls. Diagnostics are emitted once while planning; invalid
+// plans remain queryable with `valid == false` so later ownership decisions
+// are stable.
 [[nodiscard]] ManualAbiPlans build_manual_abi_plans(
     const hir::Module& module, const TargetInfo& target,
     const Subtarget& subtarget, const CompilerOptions& options,
-    Diagnostics& diagnostics);
+    Diagnostics& diagnostics, const mir::ManagedModule* managed = nullptr);
 
 } // namespace x86_64
 } // namespace cross

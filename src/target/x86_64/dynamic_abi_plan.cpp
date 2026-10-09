@@ -503,6 +503,10 @@ DynamicAbiPlans build_dynamic_abi_plans(
                         changed |=
                             append_unique(plan.clobbers, abi->call_clobbers);
                     }
+                    if (signature) {
+                        changed |=
+                            append_unique(plan.clobbers, signature->clobbers);
+                    }
                     continue;
                 }
                 const auto& callee = hir_module.function(*value.callee);

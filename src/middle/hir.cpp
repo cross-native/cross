@@ -3004,24 +3004,8 @@ bool validate_source_address_spaces(Program& program,
     return diagnostics.errors() == 0;
 }
 
-bool stabilize_function_address(Module& module, FunctionId id,
-                                SourceLocation location,
-                                Diagnostics& diagnostics) {
-    auto& function = module.function(id);
-    if ((function.result_location && *function.result_location != "auto") ||
-        !function.clobbers.empty() ||
-        std::any_of(function.parameters.begin(), function.parameters.end(),
-                    [](const Parameter& parameter) {
-                        return parameter.physical_location &&
-                               *parameter.physical_location != "auto";
-                    })) {
-        diagnostics.error(
-            location, "function-pointer adapters for manual endpoints or extra "
-                      "clobbers are not implemented yet");
-        return false;
-    }
-    function.abi_contract = AbiContract::Registered;
-    return true;
+void stabilize_function_address(Module& module, FunctionId id) {
+    module.function(id).abi_contract = AbiContract::Registered;
 }
 
 bool stabilize_label_address(Module& module, LabelId id,

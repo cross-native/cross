@@ -1344,6 +1344,15 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/backend/indirect/mips.cmake")
     set_tests_properties(cross_indirect_mips PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.calls")
+    add_test(NAME cross_indirect_clobber_mips COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/indirect/mips_clobber.x
+        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/indirect/mips_clobber_start.s
+        -DEXPECTED=P
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/indirect-clobber-mips
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_indirect_clobber_mips PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;feature.calls;feature.abi")
     add_test(NAME cross_aggregate_mips COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-mips
@@ -3620,6 +3629,49 @@ if(BUILD_TESTING)
                 -o "${CMAKE_CURRENT_BINARY_DIR}/manual-register-indirect-pairs-sysv.s")
     set_tests_properties(cross_manual_register_indirect_pairs_sysv PROPERTIES
         LABELS "check.compile;arch.x86_64;backend.native;feature.abi;feature.calls;opt.O2")
+    foreach(variant O0 O2 O2_noinline)
+        string(REPLACE "_noinline" ";-fno-inline" manual_pointer_flags "-${variant}")
+        string(REPLACE "_noinline" "" manual_pointer_level "${variant}")
+        foreach(manual_pointer IN ITEMS "manual_indirect_call;manual_indirect_entry"
+                                        "manual_adapter;manual_adapter_entry")
+            list(GET manual_pointer 0 manual_pointer_source)
+            list(GET manual_pointer 1 manual_pointer_entry)
+            add_test(NAME cross_runtime_native_${manual_pointer_source}_${variant}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/${manual_pointer_source}.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-${manual_pointer_source}-${variant}
+                        -DENTRY=${manual_pointer_entry}
+                        -DEXPECTED=200
+                        "-DCC_FLAGS=${manual_pointer_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_native_${manual_pointer_source}_${variant} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.calls;opt.${manual_pointer_level}")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_runtime_manual_adapter
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/manual_adapter.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-manual-adapter.ll
+                -DENTRY=manual_adapter_entry
+                -DEXPECTED=200
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+    set_tests_properties(cross_runtime_manual_adapter PROPERTIES
+        LABELS "check.runtime;arch.x86_64;backend.llvm;feature.abi;feature.calls")
+    foreach(arch x86_64 mips)
+        add_test(NAME cross_manual_indirect_diagnostics_${arch}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/manual_indirect_errors.x
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/manual-indirect-errors-${arch}
+                    -DARCH=${arch}
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/abi/manual_indirect_errors.cmake")
+        set_tests_properties(cross_manual_indirect_diagnostics_${arch} PROPERTIES
+            LABELS "check.compile;diagnostics;arch.${arch};backend.native;feature.abi;feature.calls")
+    endforeach()
     add_test(NAME cross_manual_register_mixed
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/backend/abi/manual_register_mixed.x"

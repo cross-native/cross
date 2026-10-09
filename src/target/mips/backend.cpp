@@ -442,6 +442,32 @@ public:
                          const Subtarget& subtarget,
                          const CompilerOptions& options,
                          Diagnostics& diagnostics) const override {
+        for (const auto& function : managed_module.functions) {
+            for (const auto& value : function.values) {
+                if (value.kind != mir::ValueKind::Call || value.callee ||
+                    !value.call_signature) {
+                    continue;
+                }
+                const auto& signature =
+                    hir_module.type(*value.call_signature).function;
+                const auto manual = [](const std::optional<std::string>& location) {
+                    return location && *location != "auto";
+                };
+                if (signature &&
+                    (manual(signature->result_location) ||
+                     std::any_of(signature->parameters.begin(),
+                                 signature->parameters.end(),
+                                 [&](const hir::Parameter& parameter) {
+                                     return manual(parameter.physical_location);
+                                 }))) {
+                    diagnostics.error(
+                        value.location,
+                        "manual MIPS function-pointer endpoints are not "
+                        "implemented yet; use a registered ABI");
+                }
+            }
+        }
+        if (diagnostics.errors() != 0) return false;
         // MIPS registered ABIs, including Cross's internal convention, are
         // interpreted directly during frame/call lowering. No ABI name is
         // hard-coded and no LLVM convention ID is involved.

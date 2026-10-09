@@ -53,7 +53,7 @@ execute_process(COMMAND "${CC}" "--model=${CUSTOM_MODEL}" "-mabi=${abi}"
     -c "${SOURCE}" -o "${OUTPUT}-callback-abi-error.o"
     RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
 if(NOT status EQUAL 1 OR NOT stderr MATCHES
-   "implicit pointer conversion discards qualifiers or uses incompatible pointee types in return" OR
+   "a function-pointer value cannot change its callable ABI in return" OR
    NOT stderr MATCHES "generic_pointer_value.x:[0-9]+:[0-9]+: error:" OR
    NOT stderr MATCHES "while evaluating call to 'mismatched_callback'")
     message(FATAL_ERROR "typed function pointer lost its ABI during evaluation\n${stdout}\n${stderr}")

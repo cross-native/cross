@@ -859,7 +859,8 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             attribute.name != "noinline" &&
             attribute.name != "noreturn" &&
             attribute.name != "variadic" &&
-            attribute.name != "stack_cleanup") {
+            attribute.name != "stack_cleanup" &&
+            attribute.name != "clobber") {
             return false;
         }
     }
@@ -1465,11 +1466,7 @@ private:
 
     std::optional<ValueId> function_address(const hir::Function& function,
                                             SourceLocation location) {
-        if (!hir::stabilize_function_address(hir_, function.id, location,
-                                             diagnostics_)) {
-            failed_ = true;
-            return std::nullopt;
-        }
+        hir::stabilize_function_address(hir_, function.id);
         const auto id = function.id;
         const auto type = function_pointer_type(function);
         const auto value =
@@ -5338,28 +5335,6 @@ private:
             failed_ = true;
             co_return std::nullopt;
         }
-        if ((signature.result_location &&
-             *signature.result_location != "auto") ||
-            !signature.clobbers.empty() ||
-            (signature.stack_cleanup &&
-             *signature.stack_cleanup != "caller")) {
-            diagnostics_.error(expression.location,
-                               "indirect calls with manual result locations, "
-                               "extra clobbers, or callee stack cleanup are "
-                               "not implemented yet");
-            failed_ = true;
-            co_return std::nullopt;
-        }
-        for (const auto& parameter : signature.parameters) {
-            if (parameter.physical_location &&
-                *parameter.physical_location != "auto") {
-                diagnostics_.error(expression.location,
-                                   "manual function-pointer endpoints are not "
-                                   "implemented yet");
-                failed_ = true;
-                co_return std::nullopt;
-            }
-        }
         co_return co_await lower_resolved_call_async(expression, signature, nullptr, *target,
                                    type);
     }
@@ -5639,17 +5614,15 @@ private:
                     failed_ = true;
                     return std::nullopt;
                 }
-                const bool stabilized = initial_address->kind == data::AddressKind::Label &&
-                        initial_address->label
-                    ? hir::stabilize_label_address(hir_, *initial_address->label,
-                                                  initial_expression.location, diagnostics_)
-                    : initial_address->kind != data::AddressKind::Function ||
-                        !initial_address->function ||
-                        hir::stabilize_function_address(hir_, *initial_address->function,
-                                                       initial_expression.location, diagnostics_);
-                if (!stabilized) {
-                    failed_ = true;
-                    return std::nullopt;
+                if (initial_address->kind == data::AddressKind::Label && initial_address->label) {
+                    if (!hir::stabilize_label_address(hir_, *initial_address->label,
+                                                      initial_expression.location, diagnostics_)) {
+                        failed_ = true;
+                        return std::nullopt;
+                    }
+                } else if (initial_address->kind == data::AddressKind::Function &&
+                           initial_address->function) {
+                    hir::stabilize_function_address(hir_, *initial_address->function);
                 }
             }
         }
