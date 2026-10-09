@@ -81,7 +81,7 @@ These rules override any less-specific text:
 | visible implementation | A compatible definition resolvable for a direct call in the compilation group. |
 | normal return | Return through the managed Cross epilogue, including fallthrough from `void`; excludes traps, non-local transfers, and raw returns. |
 | translation-time value | A typed value known by `cc` without executing the output program. |
-| translation-only function | An explicit `eval_only` function, procedural macro, syntax expander, or implicit meta helper (a function whose signature uses a `$::meta` type); it runs only during translation. |
+| translation-only function | An explicit `eval_only` function, procedural macro, syntax expander, or translation-only helper (a function whose signature uses a `$::meta` type); it runs only during translation. |
 | runtime expression | An expression emitted into the output program rather than executed by `cc`. |
 | token tree | A balanced delimiter group and its contents; each construct specifies its permitted outer delimiters. |
 | compiler model | A declarative ABI, mangling, optimization, or profile entry loaded from a model file ([models.md](models.md)); never Cross source or executable code. |
@@ -732,12 +732,14 @@ Layout and aggregate passing are target properties. `sizeof` returns `uptr`;
 alignment. `$::static_assert(constant, string);` requires a nonzero scalar constant and
 emits no code. At file or namespace scope and in an ordinary function it is a
 declaration-time check: parameter and local values are unavailable, untaken
-branches and unused functions do not suppress it, and a generic function's
+branches and unused nongeneric functions do not suppress it, and a generic
+function's
 assertions are checked for each instance. In a translation-only function (an
-explicit `eval_only` function, procedural macro, syntax expander, or implicit
-meta helper) it is instead a statement that executes each time it is reached,
+explicit `eval_only` function, procedural macro, syntax expander, or
+translation-only helper) it is instead a statement that executes each time it
+is reached,
 with that invocation's parameters, locals, and generic arguments, under the
-invocation's resource limits; an unreached assertion keeps its name and type
+invocation's resource limits; an unreached assertion keeps its source
 constraints but is not evaluated.
 
 Atomic and thread-local facilities are attributes;
@@ -1400,10 +1402,11 @@ an enumerator, case label, fixed array bound, attribute constant,
 static-duration non-relocatable initializer, generic value argument,
 `$::static_assert`, and every other translation-time-only context. A
 source-constant check such as a fixed-vector index bound or an
-integer-zero-to-null conversion is also mandatory evaluation: it includes
-direct calls to visible ordinary helpers with constant inputs, independently
-of `-fno-eval-calls` and without a purity attribute, and never uses a
-caller's runtime values.
+integer-zero-to-null conversion also accepts a direct call to a visible
+ordinary helper with constant inputs whose sandboxed evaluation proves the
+result, independently of `-fno-eval-calls` and without a purity attribute.
+Caller runtime values are never inputs; a call that is not proved leaves the
+expression non-constant, but exhausting a budget during the proof is an error.
 
 The staging controls are:
 
@@ -1469,7 +1472,8 @@ the invocation, such as an integer-zero proof over quoted tokens or an inferred
 array extent, is checked by each invocation in its real expansion context
 before the body executes, including in untaken branches; a constraint
 independent of the invocation is checked at definition, and an unavailable
-context never yields an invented constant. Block assertions in such a function
+context never yields an invented constant. Deferral does not widen the
+source-constant expression categories. Block assertions in such a function
 instead execute when reached (see “Size, alignment, and translation checks”).
 
 Undefined behavior reached by mandatory evaluation is diagnosed. Diagnostics
@@ -1489,9 +1493,10 @@ expansion is an error; an opportunistic attempt may defer to runtime.
 
 Every token and syntax node carries an immutable lexical context: the name
 bindings, namespace and `using` imports, and syntax activations visible where
-it was written or constructed. Lookup of a name always uses the context its
-token carries, wherever the token is placed, and later declarations, imports,
-or activations never change an existing context.
+it was written or constructed. Except as the binder rule below and the reparse
+of deferred nodes (see “Patterns and captures”) provide, lookup of a name uses
+the context its token carries, wherever the token is placed, and later
+declarations, imports, or activations never change an existing context.
 
 - **Definition context.** Identifiers written literally in a `$::quote` and
   identifiers constructed by `$::meta::token` or `$::meta::parse` use the
@@ -1514,10 +1519,11 @@ or activations never change an existing context.
   and the definition context; text cannot recover a private identity or an
   earlier binding. A copied token keeps its identity, context, and span.
   Constructed tokens default to the enclosing invocation's span; an explicit
-  span changes diagnostics only.
+  span is kept whole and changes diagnostics only.
 - **Binders.** When generated or spliced source is first parsed, its
   declarations bind in the destination scope and bind that fragment's own uses
-  of them; uses that already carry a context keep it, and unrelated destination
+  of them; free names keep the lookup of their carried context, and unrelated
+  destination
   declarations never capture a generated use. Once parsed, bindings are fixed
   through copying, token projection, and relocation.
 - **Expansion identity.** Every expansion receives a fresh identity. A
@@ -1551,7 +1557,8 @@ type and definition, including the result type before the name; this does not
 make undeclared ordinary type names valid. In a comma-separated declaration,
 each declarator has its own generic scope: shared declaration specifiers are
 interpreted independently for each declarator, and one declarator's generic
-parameters are not visible in its siblings.
+parameters are not visible in its siblings. A macro or syntax invocation in
+the shared specifiers still expands once, in source order.
 
 A generic redeclaration matches type parameters by position, not by name, and
 has the same surrounding types and complete callable contract. An array or
@@ -1573,7 +1580,8 @@ A value parameter has integer, enumeration, `bool`, `label`, or pointer type,
 and its argument is a representable translation-time constant. Value
 parameters are never deduced. Type parameters may be deduced at a direct call;
 an explicit application supplies all arguments, or an initial sequence of type
-arguments with the rest deduced. A missing value argument, an undeduced type
+arguments with the remaining type arguments deduced. A missing value
+argument, an undeduced type
 argument, or a conflicting deduction is an error.
 
 Deduction first resolves the named generic entity, applies the ordinary
@@ -1610,16 +1618,19 @@ whitespace.
 
 Each used argument list creates one monomorphized instance after substitution
 and semantic checking; two identical normalized argument lists denote the same
-instance. `$::static_assert` and the ordinary constraints of the substituted
+instance. Declaration-time `$::static_assert` checks and the ordinary
+constraints of the substituted
 body diagnose invalid instances. Recursive instantiation of the same argument
 list denotes the in-progress instance; unbounded creation of new instances is
 diagnosed.
 
 A generic declaration has no runtime address, link symbol, or ABI, and its
 address cannot be taken without an argument list. An instance is an ordinary
-function with the linkage of its declaration; its address may be taken, and
-its definition must be visible in the compilation group unless a compatible
-instance declaration is provided.
+function with the linkage of its declaration, and its address may be taken.
+The generic's definition must be visible in every compilation group that uses
+it. An instance of a `global` generic is emitted by each such group as a
+mergeable definition (the object format's COMDAT group or weak definition), so
+separately compiled groups may each instantiate it.
 
 An instance without `link_name` is named by the `generic` rule of the selected
 mangling model (see [models.md](models.md#mangling-entries)), which receives
@@ -1674,14 +1685,16 @@ exactly one `in $::meta::tokens` parameter, returns `$::meta::tokens`, and has
 no runtime symbol or address. The meta types below `$::meta` (`tokens`, `span`,
 `context`, `syntax_match`, `syntax`, `bytes`, and `buffer`) exist only during
 translation and have no runtime size, layout, address, or ABI. Any function
-with one of them in its signature is a translation-only helper: it is `static`
-and implicitly `eval_only`, with only `in` parameters and no runtime symbol or
+with one of them in its signature is a translation-only helper: it must be
+declared `static` and is implicitly `eval_only`, with only `in` parameters and
+no runtime symbol or
 address. Helpers are called directly, may recurse within the evaluation
 budgets, and may hold meta values in automatic cells and pass or copy them by
 value; pointers, arrays, records, and runtime callable types containing meta
 values have no representation, and no runtime or static storage may hold one.
 
-Expansion functions and translation-only helpers accept the hints
+Expansion functions (macros and syntax expanders) and translation-only
+helpers accept the hints
 `always_inline`, `noinline`, `hot`, `cold`, `no_stack_protector`, and
 `no_sanitize`, and redundant `eval_only`, under their ordinary argument and
 conflict rules; they create no runtime code.
@@ -1709,7 +1722,8 @@ framework defines a private sublanguage inside an explicit token tree or
 declares a syntax prefix under the rules below.
 
 `$::quote { ... }` constructs tokens written as Cross source, and
-`$::unquote(value)` inside a quote inserts a token value or a syntax node.
+`$::unquote(value)`, valid only inside a quote, inserts a token value or a
+syntax node.
 Quotation does not splice by itself: there is no `$::emit`, `$::expand`, or
 attribute-macro facility. To transform a declaration or statement, put that
 complete source inside `name! { ... }`.
@@ -1718,9 +1732,9 @@ The `$::meta` token operations are translation-only. `one` is a
 `$::meta::tokens` value with exactly one top-level element; a balanced group or
 a structured syntax-node splice counts as one, and empty or multi-element
 values are errors where `one` is required. Inspection never executes an
-expansion or reparses a structured splice. `concat` and `parse` are the
-minimum constructors; `$::has_intrinsic` reports every other operation
-separately.
+expansion or reparses a structured splice. Every operation in the following
+table is required; `concat` and `parse` are the minimum constructors, and
+`$::has_intrinsic` reports every additional operation separately.
 
 | Operation | Result and contract |
 | --- | --- |
@@ -1733,7 +1747,7 @@ separately.
 | `$::meta::token(kind, text[, span])` | One lexical leaf, validated against `kind`. `text` is a translation-time string or immutable bytes value. Group delimiters and structured splices cannot be forged. |
 | `$::meta::group(delimiters, contents[, span])` | One balanced group around `$::meta::tokens` contents, using one of the four delimiter strings above. Contents retain their provenance and grouping. |
 | `$::meta::parse(text)` | Tokens lexed from a translation-time string or a complete immutable bytes value read as UTF-8 source. |
-| `$::meta::error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; an error stops the expansion, while warnings and notes do not. |
+| `$::meta::error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; `span` is a `$::meta::span` and `message` a translation-time string. An error stops the expansion, while warnings and notes do not. |
 
 `kind` is one of `"identifier"`, `"builtin"`, `"integer"`, `"floating"`,
 `"character"`, `"string"`, `"punctuation"`, `"group"`, and `"splice"`; an
@@ -1849,8 +1863,9 @@ The `$::meta` sequence operations are:
 | `freeze(buffer, length)` | Consume its initialized prefix as `bytes`. |
 
 `len`, `at`, `slice`, and `concat` are exact-type overloads shared with
-`$::meta::tokens`; no mixed tokens/bytes operation is implicit. Length and
-capacity queries return target `uptr`, and a count that does not fit is an
+`$::meta::tokens`; no mixed tokens/bytes operation is implicit. File length,
+capacity, and materialized size must fit target `uptr`; length and capacity
+queries return target `uptr`, and a count that does not fit is an
 error, not a wrapped value. An index is a nonnegative integer within the
 sequence's bounds; a negative signed value is not reinterpreted as unsigned.
 
@@ -1875,7 +1890,7 @@ every scalar type the target supports), effective-type, width, and byte-order
 rules; non-byte writes acquire effective type as in ordinary raw storage, and
 byte writes do not erase it. Conversion through `void *` preserves backing and
 view. Pointers into translation-time storage are opaque capabilities: they
-cannot be cast to integers, inspected or overwritten through byte or
+cannot be cast to integers, inspected through byte or
 non-pointer lvalues, frozen as bytes, or placed in runtime storage, including
 inside an aggregate result. Typed pointer loads, stores, and containing-object
 copies preserve them; a byte overwrite invalidates the stored value until a
@@ -2030,7 +2045,7 @@ validates the complete graph (left recursion, nullable cycles, rule-dependent
 progress, repetition continuations, and expression and type fences) before
 committing any binding. Forward references and productive mutual recursion are
 permitted; unresolved names and rule-graph errors are diagnosed only when an
-activation needs the graph. A successful activation fixes the rule and
+activation needs the graph. The first successful activation fixes the rule and
 expander identities, which later declarations do not retarget; a failed
 activation installs nothing and does not prevent a later valid activation.
 
@@ -2117,7 +2132,8 @@ alternative = identifier ":" "(" pattern ")" ;
 may contain a library-owned sublanguage. A raw-group capture accepts written
 delimiters or a structured splice of a `group` node with matching delimiters
 (`paren` `()`, `bracket` `[]`, `block` `{}`, and `group` any of those or
-`[[]]`): the splice is consumed as one element, and the capture exposes its
+`[[]]`): the splice is consumed as one element and retained as the original
+group node, and the capture exposes its
 tokens with nested splice boundaries intact and the original group's span.
 Quoted delimiter terminals do not open a structured group; project it
 explicitly to match its interior as separate elements. A named rule reference
@@ -2168,7 +2184,8 @@ bindings of its original header when it belongs to one; a procedural fragment
 later in a header may introduce generic parameters whose scope includes earlier
 parts of that header, and a capture that depends on them is deferred rather
 than executed ahead of its owner. Recognition may leave an independently
-bounded parameter, attribute, generic argument, dependent result suffix, or
+bounded parameter, attribute, generic parameter list, dependent result-array
+suffix, or
 inline tag group opaque while classifying a declarator, but never guesses from
 delimiters: parentheses in a macro invocation are not evidence of a function
 declarator, a function-pointer object does not match a direct-function
@@ -2194,8 +2211,9 @@ expansion that emits it earlier. When several surviving copies of the original
 block are equally associated with the node, a name that needs those copies'
 declarations is ambiguous and diagnosed rather than resolved to the first or
 latest copy; already captured bindings and names that do not depend on the
-copies remain usable, and a declaration omitted from the selected copy is not
-supplied by another. Value, alias, and tag lookup follow the same rule. An
+copies remain usable. A node associated with one copy is never supplied a
+declaration omitted from that copy by another copy. Value, alias, and tag
+lookup follow the same rule. An
 unresolved `struct` or `union` type use introduces its implicit forward tag in
 its carried scope, repeated uses in that scope share it, and moving the use
 neither merges the tag with a destination tag nor binds it there; explicit tag
@@ -2233,9 +2251,9 @@ The `$::syntax::` operations are:
 | `node(match, field)` | One parsed syntax node, or a `group` tree for a raw balanced-group capture. |
 | `count(match, field)`, `at(match, field, index)` | Number of nested child records and one such record. |
 | `is_variant(record, label)` | Test the selected choice tag. |
-| `span(match)`, `capture_span(match, field)` | Original source spans; an empty capture's span is anchored at its input boundary. |
+| `span(match)`, `capture_span(match, field)` | Original source spans as `$::meta::span` values; an empty capture's span is anchored at its input boundary. |
 | `context(match_or_node)` | Immutable lexical name-binding, namespace/import, and syntax-activation context. |
-| `error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; an error stops the current expansion, while warnings and notes do not fail translation. |
+| `error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics with the argument types of `$::meta::error`, returning `void`; an error stops the current expansion, while warnings and notes do not fail translation. |
 
 `context` returns an opaque `$::meta::context` value: it may be copied,
 assigned, or selected by a scalar conditional whose alternatives have that same
@@ -2323,12 +2341,15 @@ The owner expands before the nested invocations in its input, and inspecting a
 public tree never executes it. Attributes, `case`/`default` labels without an
 enclosing switch or with duplicate defaults, and object declarations whose
 omitted bound is not yet completed remain inspectable: their placement,
-control-flow, and completeness constraints apply to source that survives
+argument, conflict, control-flow, initializer, and completeness constraints
+apply to source that survives
 expansion, not to discarded or repaired syntax, and an owner may discard a
 captured statement or supply its receiving switch without changing captured
 lookup. A replacement occupies only its matched subtree: it cannot consume
 adjacent source, attach to an outside `else`, or register syntax, and
-expression output remains a subtree even when it contains token macros.
+expression output remains a subtree. These boundaries hold even when the
+output contains token macros, and a structured node containing a macro
+invocation likewise keeps its boundary and category.
 
 The procedural sandbox and its budgets govern matching, tree construction,
 expander execution, and replacement. Diagnostics identify the invocation,
@@ -2846,8 +2867,8 @@ address creates a private registered-ABI adapter unless it already has a
 complete stable manual ABI. Converting a named function to a pointer type
 whose interface differs from the function's own likewise creates an adapter
 when the target can synthesize one; converting one function pointer to
-another pointer type with a different interface is an error, because the
-pointed-to function is unknown. Indirect calls use the pointed-to modes/ABI
+another function-pointer type with a different interface is an error.
+Indirect calls use the pointed-to modes/ABI
 and never infer a dynamic ABI. Adapters may bridge function-selectable ABIs,
 but never incompatible data models without an explicit target marshaling
 contract.
@@ -3552,8 +3573,9 @@ target is unambiguous. `[[...]]` is an isolated grammar context, so its names
 are compiler attributes without a `$::` root. `[[$::name]]` is invalid and
 receives no compatibility interpretation.
 
-A leading attribute applies to the one subject of the declaration that can
-carry it. When an inline record or enumeration definition and a declared
+A leading attribute applies to the subjects of the declaration that can carry
+it: each declared entity, or the type it declares or defines inline. When an
+inline record or enumeration definition and a declared
 entity could both carry it, for example `aligned` on an inline record
 followed by an object, typedef, member, or function definition, or `packed`
 on an inline nested record inside a member declaration, the placement is
