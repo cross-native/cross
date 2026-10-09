@@ -1824,6 +1824,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/model_system.cmake")
     set_tests_properties(cross_model_system PROPERTIES
         LABELS "check.compile;arch.x86_64;feature.model;profile.custom")
+    add_test(NAME cross_model_validation
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-validation
+                -P "${CMAKE_SOURCE_DIR}/test/model/model_validation.cmake")
+    set_tests_properties(cross_model_validation PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver")
     add_test(NAME cross_mangling_dsl
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1832,7 +1840,7 @@ if(BUILD_TESTING)
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mangling-dsl
                 -P "${CMAKE_SOURCE_DIR}/test/model/mangling_dsl.cmake")
     set_tests_properties(cross_mangling_dsl PROPERTIES
-        LABELS "check.compile;arch.x86_64;feature.names;feature.model")
+        LABELS "check.compile;arch.x86_64;feature.names;feature.model;feature.generic")
     add_test(NAME cross_operator_binding
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

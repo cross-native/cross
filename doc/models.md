@@ -43,7 +43,10 @@ otherwise a relative name is looked up in the `--model-path` directories in
 command-line order, wherever those options appear. A `--model-path`
 directory is searched only for `--model` names; nothing else in it is
 loaded. Loading the same file twice has no further effect. Include paths
-(`-I`) play no part in model lookup.
+(`-I`) play no part in model lookup. Once every file is loaded, all entries
+are checked, whether or not the compilation selects them; an error stops the
+compilation and is reported at the file and line of the entry or property,
+the same under `cc` and `cpp`. An entry may name entries of any loaded file.
 
 A later file cannot replace an entry: reusing the name of a loaded entry, or
 an ABI alias, is an error. Mangling, optimization, and profile names are
@@ -62,7 +65,8 @@ is an error; nothing falls back to another entry. Without `-mprofile`, or
 with `-mprofile=default`, the profile whose `default_for` pattern matches the
 target triple most specifically applies: a pattern with more non-`*`
 characters is more specific, and two profiles with equally specific matches
-are an error. A profile supplies its `optimization` only when no `-O` option
+are an error that names them, even when `-mprofile` names a profile, because
+the default profile also fixes the triple's default ABI. A profile supplies its `optimization` only when no `-O` option
 is given. Explicit `-f` and `-m` options override profile and preset values
 wherever they appear relative to `-O`.
 
@@ -231,8 +235,7 @@ An entry also needs at least one `bank` and one `rule` block. It may have
 in [Variadic functions](#variadic-functions).
 
 - `architecture` is an architecture name that `cc --print-targets` prints:
-  `x86-64` or `mips`. An entry for an architecture that is not compiled into
-  `cc` is loaded without checks and never applies.
+  `x86-64` or `mips`. Any other name is an error.
 - `address_bits` is the nonzero width of addresses: of pointers, of the
   addresses passed for `out` and `inout` parameters, and of the addresses
   that `indirect` rules pass.
@@ -279,11 +282,11 @@ may change the upper 32 bits of `s0`-`s7`.
 
 `elf_abi_tag` sets the ELF ABI tag of objects compiled with the entry as
 their ABI (`-mabi` or the profile's `abi`); without it, objects get the tag
-implied by the triple and `address_bits`. Only MIPS supports the property.
-It accepts `"eabi32"`, which requires `address_bits = 32` and writes
+implied by the triple and `address_bits`. Each architecture defines the tags
+it accepts, and any other tag is an error when the file loads. x86-64 defines
+none. MIPS defines `"eabi32"`, which requires `address_bits = 32` and writes
 `EF_MIPS_ABI_EABI32` and GNU's `.mdebug.eabi32` and `.gcc_compiled_long32`
-marker sections; any other tag in a loaded MIPS entry is an error when
-compiling for MIPS.
+marker sections.
 
 `private_carrier_bits` marks the entry as the convention that
 `-fprivate-abi` uses on MIPS for calls to functions defined without `global`
@@ -404,7 +407,8 @@ The filters are:
 - `requires_features` and `forbids_features`: target features that must be
   enabled or disabled. Feature names are the target extensions that
   `cc --print-features` lists, without the `$::feature::` prefix, such as
-  `avx`, `avx512f`, `mips3`, and `hard-float`. To accept any of several
+  `avx`, `avx512f`, `mips3`, and `hard-float`; other names are errors. To
+  accept any of several
   feature combinations, repeat the rule once per combination. The features
   are those of the compilation (`-march` and `-m` options), so objects that
   call each other through such a rule must be compiled with the same
@@ -478,12 +482,11 @@ as `"indirect"` or `"stack"` handles the value. A field that by itself fits
 one register of a listed bank, such as a 128-bit vector, stays in one
 register.
 
-Each compilation checks every loaded ABI entry whose `architecture` is
-compiled in, whatever the selected target: register names, classes, and
-widths; references to banks, cursors, and stack regions; the directions
+Loading checks each ABI entry against its architecture, whatever the
+selected target: register names, classes, and widths; feature names; the
+ELF ABI tag; references to banks, cursors, and stack regions; the directions
 that rules use; bit ranges; clobbers; and alignments. An error in any entry
-stops the compilation. Entries whose `architecture` is not compiled in are
-not checked.
+stops the compilation.
 
 ### Variadic functions
 
@@ -745,10 +748,12 @@ The values and operations mean:
   with its declared type.
 
 Mapper items may use every value of the enclosing rule. The `generic` rule
-receives the generic arguments in order, whether they were written
-`name<...>` or `name::<...>` or deduced. The link name of a generic instance
-does not depend on that spelling, on a top-level `const` of an `in`
-parameter, or on the names of the generic function's type parameters.
+receives the generic arguments in order, whether they were written `name<...>`
+or `name::<...>` or deduced. The link name of a generic instance does not
+depend on that spelling, on a top-level `const` of an `in` parameter, or on the
+names of the generic function's type parameters. In the `generic` rule,
+`result` and the parameters' `text` spell the instance's types: each generic
+argument replaces its parameter.
 
 ### Type spellings
 
@@ -858,8 +863,9 @@ entry of the chain sets keep their defaults.
 
 A preset may set only the options that `cc --print-options` marks
 `presettable: yes`. An entry with `m.*` properties needs `targets`, a list
-of architecture names as printed by `cc --print-targets`, and selecting it
-for another architecture is an error. The presettable target options are
+of architecture names as printed by `cc --print-targets`; each `m.*`
+property must be an option of every listed architecture, and selecting the
+entry for another architecture is an error. The presettable target options are
 `m.tune` and `m.risc-cisc-balance`, and on x86-64 also
 `m.prefer-vector-width`; `m.arch`, `m.cmodel`, `m.red-zone`, and the
 instruction-set features belong in a profile or on the command line.
@@ -909,8 +915,10 @@ profile "x86_64-kernel" {
 `default_for` lists target-triple patterns in which `*` matches any
 sequence of characters; the profile is the default for the triples it
 matches (see [Loading and selection](#loading-and-selection)). `target` is
-a target triple, `abi` an ABI name or alias, `mangling` a mangling name,
-and `optimization` a preset name. The option properties are defaults:
+a target triple of a compiled-in architecture, `abi` an ABI name or alias,
+`mangling` a mangling name, and `optimization` a preset name; an `m.*`
+property must be an option of `target`'s architecture or, without `target`,
+of some compiled-in architecture. The option properties are defaults:
 explicit `-f` and `-m` options override them.
 
 With `-mprofile=NAME`, the profile's `target` applies only when the command

@@ -110,5 +110,8 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 
 Diagnostics have the form `file:line:column: error: message`, followed by the
 source line and a caret. Errors in generated code also show the macro or
-syntax expansion chain. `cc` and `cpp` exit with status 1 after an error and 0
-otherwise.
+syntax expansion chain. Errors in a model file have the form
+`file:line: error: message`, the same under `cc` and `cpp`, and errors that
+belong to no file, such as an unknown option, have the form
+`cc: error: message` or `cpp: error: message`. `cc` and `cpp` exit with
+status 1 after an error and 0 otherwise.

@@ -308,6 +308,21 @@ std::optional<OptionValue> coerce_value(const OptionDefinition& definition,
 
 } // namespace
 
+std::optional<OptionValue> checked_option_value(
+    const OptionDefinition& definition, const OptionValue& value,
+    std::string& reason) {
+    auto result = coerce_value(definition, value, reason);
+    if (result && (definition.name == "f.align-functions" ||
+                   definition.name == "f.align-loops")) {
+        const auto alignment = std::get<std::uint64_t>(*result);
+        if (alignment != 0 && (alignment & (alignment - 1U)) != 0) {
+            reason = "alignment must be zero or a power of two";
+            return std::nullopt;
+        }
+    }
+    return result;
+}
+
 std::span<const OptionDefinition> common_option_definitions() {
     static const std::vector<OptionDefinition> definitions{
         {"f.optimize-for", {}, OptionValueKind::Enumeration,
@@ -664,26 +679,14 @@ bool resolve_registered_options(
             return;
         }
         std::string reason;
-        auto value = coerce_value(*definition, assignment.value, reason);
+        auto value =
+            checked_option_value(*definition, assignment.value, reason);
         if (!value) {
             diagnostics.command_error(
                 "invalid value for option '" +
                 command_spelling(definition->name) + "' from " +
                 assignment.source + ": " + reason);
             return;
-        }
-        if (definition->name == "f.align-functions" ||
-            definition->name == "f.align-loops") {
-            const auto alignment = std::get<std::uint64_t>(*value);
-            if (alignment != 0 &&
-                (alignment & (alignment - 1U)) != 0) {
-                diagnostics.command_error(
-                    "invalid value for option '" +
-                    command_spelling(definition->name) + "' from " +
-                    assignment.source +
-                    ": alignment must be zero or a power of two");
-                return;
-            }
         }
         options.resolved_options[definition->name] =
             ResolvedOption{std::move(*value), origin, assignment.source};

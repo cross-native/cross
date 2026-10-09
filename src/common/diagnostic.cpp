@@ -8,7 +8,8 @@
 
 namespace cross {
 
-Diagnostics::Diagnostics(std::ostream& stream) : stream_(stream) {}
+Diagnostics::Diagnostics(std::ostream& stream, std::string_view tool)
+    : stream_(stream), tool_(tool) {}
 
 void Diagnostics::report(DiagnosticLevel level, SourceLocation location,
                          std::string_view message) {
@@ -24,7 +25,8 @@ void Diagnostics::report(DiagnosticLevel level, SourceLocation location,
     const auto emit = [&](SourceLocation item, std::string_view item_label,
                           std::string_view item_message) {
         if (!item.valid()) {
-            stream_ << "cc: " << item_label << ": " << item_message << '\n';
+            stream_ << tool_ << ": " << item_label << ": " << item_message
+                    << '\n';
             return;
         }
         if (item.line != 0 && item.line <= item.file->line_origins.size()) {
@@ -91,6 +93,12 @@ void Diagnostics::note(SourceLocation location, std::string_view message) {
 
 void Diagnostics::command_error(std::string_view message) {
     error({}, message);
+}
+
+void Diagnostics::file_error(std::string_view position,
+                             std::string_view message) {
+    ++errors_;
+    stream_ << position << ": error: " << message << '\n';
 }
 
 } // namespace cross

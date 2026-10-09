@@ -42,3 +42,49 @@ if(NOT msvc_assembly MATCHES
     message(FATAL_ERROR
         "shipped MSVC DSL mangler result is wrong\n${msvc_assembly}")
 endif()
+
+# A generic instance's link name does not depend on the names of the type
+# parameters: the mangling sees the instance's own signature.
+foreach(parameter T Elem)
+    set(source "${OUTPUT}.generic-${parameter}.x")
+    set(P "${parameter}")
+    file(WRITE "${source}" "global ${P} larger<${P}>(${P} a, ${P} b) {
+    return a > b ? a : b;
+}
+global ${P} apply<${P}>(${P} (*f)(${P}), ${P} x) {
+    return f(x);
+}
+static u32 twice(u32 x) {
+    return x * 2;
+}
+global u64 pick(u64 x, u32 y) {
+    return larger(x, 10u64) + apply(twice, y);
+}
+")
+    foreach(name itanium signature-test)
+        execute_process(
+            COMMAND "${CC}" "--model=${MODEL}" "-mmangling=${name}"
+                    -S "${source}" -o "${source}.${name}.s"
+            RESULT_VARIABLE status
+            OUTPUT_VARIABLE stdout
+            ERROR_VARIABLE stderr
+        )
+        if(NOT status EQUAL 0)
+            message(FATAL_ERROR
+                "generic ${parameter} with ${name} failed\n${stdout}\n${stderr}")
+        endif()
+        file(READ "${source}.${name}.s" assembly)
+        if(name STREQUAL itanium)
+            set(expected "_Z6largerIyEyy")
+        else()
+            set(expected "larger__u64__inu64_inu64"
+                "apply__u32__inPF5_cross3_u324_auto6_caller0__1_i3_u324_autoE_inu32")
+        endif()
+        foreach(symbol IN LISTS expected)
+            if(NOT assembly MATCHES "${symbol}")
+                message(FATAL_ERROR
+                    "${symbol} depends on the type-parameter name ${parameter}\n${assembly}")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()

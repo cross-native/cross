@@ -168,6 +168,7 @@ struct AbiRule {
 struct AbiEntry {
     AbiId id;
     std::string canonical_name;
+    std::string source;  // "file:line" of the model declaration
     std::vector<std::string> aliases;
     std::string architecture;
     unsigned address_bits{};
@@ -175,7 +176,8 @@ struct AbiEntry {
     std::string gcc_calling_attribute;
     bool compilation_selectable{true};
     bool function_selectable{true};
-    // Target-interpreted object tag; empty keeps the object writer's default.
+    // One of the target's elf_abi_tags; empty keeps the object writer's
+    // default.
     std::string elf_abi_tag;
     // Nonzero marks a private-call convention candidate for subtargets whose
     // native integer registers have this width.
@@ -439,6 +441,14 @@ struct LanguageFeatureEntry {
     std::string_view option;
 };
 
+// An ELF ABI tag that model ABI entries of the architecture may request
+// through `elf_abi_tag`; a nonzero `address_bits` restricts it to entries of
+// that address width.
+struct ElfAbiTagEntry {
+    std::string_view name;
+    unsigned address_bits{};
+};
+
 struct TargetInfo {
     std::string_view architecture;
     std::vector<std::string_view> triple_prefixes;
@@ -457,6 +467,7 @@ struct TargetInfo {
     std::vector<AddressSpaceEntry> address_spaces;
     std::vector<InstructionAddressMode> instruction_address_modes{};
     std::vector<LanguageFeatureEntry> language_features{};
+    std::vector<ElfAbiTagEntry> elf_abi_tags{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;

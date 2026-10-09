@@ -751,27 +751,6 @@ std::vector<ManglingArgument> generic_argument_descriptors(
     return rendered;
 }
 
-std::string generic_link_name(const FunctionDecl& function,
-                              const std::vector<Expr::GenericArgument>& arguments,
-                              std::string_view mangling) {
-    const auto rendered = generic_argument_descriptors(arguments);
-    std::vector<ManglingParameter> parameters;
-    parameters.reserve(function.parameters.size());
-    for (const auto& parameter : function.parameters) {
-        parameters.push_back(
-            {.spelling = canonical_type_name(
-                 callable_parameter_type(parameter.type, parameter.mode)),
-             .mode = std::string(parameter_mode_name(parameter.mode))});
-    }
-    return encode_model_generic_link_name(
-        {.qualified_name = function.name,
-         .kind = "function",
-         .result = canonical_type_name(callable_result_type(function.return_type)),
-         .parameters = parameters,
-         .variadic = function.variadic},
-        rendered, mangling);
-}
-
 struct GenericArgumentKey {
     enum class Kind { Type, Integer, Address, Label } kind{Kind::Type};
     TypePtr type;
@@ -869,6 +848,39 @@ bool normalize_generic_callable_abis(TypePtr& type,
     if (canonicalize_callable_abis(type, state.canonical_abi, &unknown)) return true;
     diagnostics.error(location, "unknown callable ABI '" + unknown + "'");
     return false;
+}
+
+// A generic instance's mangling input is the instance's own signature:
+// arguments replace the generic parameters and callable types name their
+// canonical ABI, so the names of type parameters never reach link names.
+std::optional<std::string> generic_link_name(
+    std::string_view name, const FunctionDecl& instance,
+    const std::vector<Expr::GenericArgument>& arguments,
+    const GenericExpansionState& state, Diagnostics& diagnostics,
+    std::string_view mangling) {
+    const auto spelling = [&](const TypePtr& source) -> std::optional<std::string> {
+        auto type = clone_type(source);
+        if (!normalize_generic_callable_abis(type, state, diagnostics, instance.location))
+            return std::nullopt;
+        return canonical_type_name(type);
+    };
+    std::vector<ManglingParameter> parameters;
+    parameters.reserve(instance.parameters.size());
+    for (const auto& parameter : instance.parameters) {
+        auto text = spelling(callable_parameter_type(parameter.type, parameter.mode));
+        if (!text) return std::nullopt;
+        parameters.push_back({.spelling = std::move(*text),
+                              .mode = std::string(parameter_mode_name(parameter.mode))});
+    }
+    const auto result = spelling(callable_result_type(instance.return_type));
+    if (!result) return std::nullopt;
+    return encode_model_generic_link_name(
+        {.qualified_name = name,
+         .kind = "function",
+         .result = *result,
+         .parameters = parameters,
+         .variadic = instance.variadic},
+        generic_argument_descriptors(arguments), mangling);
 }
 
 TypePtr source_function_type(const FunctionDecl& function,
@@ -2453,8 +2465,6 @@ EvaluationTask<void> rewrite_generic_expr_async(std::unique_ptr<Expr>& expressio
     }
     designator->deferred_generic_signature.reset();
     expression->generic_arguments = std::move(arguments);
-    const auto link_name = generic_link_name(
-        *generic, expression->generic_arguments, mangling);
     // A user mangler controls external spelling, never semantic equivalence.
     std::string identity;
     const auto append_identity = [&](std::string_view text) {
@@ -2493,8 +2503,11 @@ EvaluationTask<void> rewrite_generic_expr_async(std::unique_ptr<Expr>& expressio
         instance->invocation_specialization = state.invocation_owner != nullptr ||
             (caller && evaluation_only(*caller));
         if (instance->linkage == Linkage::Global && !instance->attribute("link_name")) {
+            const auto link_name = generic_link_name(generic->name, *instance,
+                expression->generic_arguments, state, diagnostics, mangling);
+            if (!link_name) co_return;
             instance->attributes.push_back(
-                {"link_name", {'"' + link_name + '"'}, instance->location});
+                {"link_name", {'"' + *link_name + '"'}, instance->location});
         }
         state.instances.push_back({generic, std::move(keys), internal_name});
         auto* concrete = instance.get();

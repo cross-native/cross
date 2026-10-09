@@ -52,3 +52,12 @@ mangling "recursive-test" {
         arguments("", parameter(text), concat("V", text))
     );
 }
+
+# Shows the result and parameter spellings that a generic instance passes.
+mangling "signature-test" {
+    entity = name;
+    label = name;
+    generic = concat(
+        name, "__", result, "__", parameters("_", concat(mode, text))
+    );
+}

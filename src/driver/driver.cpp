@@ -821,7 +821,7 @@ bool emit_dependencies(
 } // namespace
 
 int cpp_main(int argc, char** argv) {
-    Diagnostics diagnostics(std::cerr);
+    Diagnostics diagnostics(std::cerr, "cpp");
     CompilerOptions options;
     if (!parse_cpp_options(argc, argv, options, diagnostics)) return 1;
     if (options.show_help) { print_cpp_help(); return 0; }

@@ -11,7 +11,6 @@
 #include <charconv>
 #include <cctype>
 #include <fstream>
-#include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -175,6 +174,24 @@ struct ModelProperty {
 
 using ModelProperties = std::unordered_map<std::string, ModelProperty>;
 
+// The compiled-in target of an architecture name that `cc --print-targets`
+// prints.
+const TargetInfo* architecture_target(std::string_view architecture) {
+    for (const auto* target : all_targets()) {
+        if (target->architecture == architecture) return target;
+    }
+    return nullptr;
+}
+
+// Whether `name` is a target extension that `cc --print-features` lists.
+bool target_extension(const TargetInfo& target, std::string_view name) {
+    const auto& features = target.subtargets->features;
+    return std::any_of(features.begin(), features.end(),
+                       [&](const SubtargetFeature& feature) {
+                           return feature.selectable && feature.name == name;
+                       });
+}
+
 struct ModelDocument {
     std::vector<AbiEntry> abis;
     std::vector<ManglingEntry> manglings;
@@ -215,12 +232,14 @@ public:
             }
             if (domain == "mangling") {
                 if (auto entry = parse_mangling(std::move(name), line)) {
+                    entry->source = position(line);
                     result.manglings.push_back(std::move(*entry));
                 }
                 continue;
             }
             if (domain == "abi") {
                 if (auto entry = parse_abi(std::move(name), line)) {
+                    entry->source = position(line);
                     result.abis.push_back(std::move(*entry));
                 }
                 continue;
@@ -230,9 +249,11 @@ public:
             if (domain == "optimization") {
                 if (auto entry =
                         make_optimization(name, *properties, line)) {
+                    entry->source = position(line);
                     result.optimizations.push_back(std::move(*entry));
                 }
             } else if (auto entry = make_profile(name, *properties, line)) {
+                entry->source = position(line);
                 result.profiles.push_back(std::move(*entry));
             }
         }
@@ -240,9 +261,16 @@ public:
         return result;
     }
 
+    [[nodiscard]] const std::string& error_position() const {
+        return error_position_;
+    }
     [[nodiscard]] const std::string& error() const { return error_; }
 
 private:
+    [[nodiscard]] std::string position(unsigned line) const {
+        return origin_ + ':' + std::to_string(line);
+    }
+
     void advance() { current_ = lexer_.next(); }
 
     bool expect(ModelTokenKind kind, std::string_view context) {
@@ -256,8 +284,8 @@ private:
 
     void fail(unsigned line, std::string message) {
         if (error_.empty()) {
-            error_ = origin_ + ':' + std::to_string(line) + ": " +
-                     std::move(message);
+            error_position_ = position(line);
+            error_ = std::move(message);
         }
     }
 
@@ -275,6 +303,15 @@ private:
         std::string name;
         ModelProperties properties;
         unsigned line{};
+    };
+
+    // An ABI entry's blocks in source order, parallel to the entry's banks,
+    // rules, variadic states, and variadic shadows.
+    struct AbiBlocks {
+        std::vector<AbiNestedBlock> banks;
+        std::vector<AbiNestedBlock> rules;
+        std::vector<AbiNestedBlock> variadic_states;
+        std::vector<AbiNestedBlock> variadic_shadows;
     };
 
     std::optional<ManglingExpression> parse_mangling_expression(
@@ -1128,10 +1165,7 @@ private:
     std::optional<AbiEntry> parse_abi(std::string name,
                                       unsigned entry_line) {
         ModelProperties properties;
-        std::vector<AbiNestedBlock> banks;
-        std::vector<AbiNestedBlock> rules;
-        std::vector<AbiNestedBlock> variadic_states;
-        std::vector<AbiNestedBlock> variadic_shadows;
+        AbiBlocks blocks;
         while (current_.kind != ModelTokenKind::RightBrace &&
                current_.kind != ModelTokenKind::End) {
             if (current_.kind != ModelTokenKind::Identifier) {
@@ -1163,18 +1197,17 @@ private:
             }
             auto block_properties = parse_properties();
             if (!block_properties) return std::nullopt;
-            auto& destination = bank ? banks
-                              : rule ? rules
-                              : state ? variadic_states
-                                      : variadic_shadows;
+            auto& destination = bank ? blocks.banks
+                              : rule ? blocks.rules
+                              : state ? blocks.variadic_states
+                                      : blocks.variadic_shadows;
             destination.push_back(
                 {std::move(block_name), std::move(*block_properties), line});
         }
         if (!expect(ModelTokenKind::RightBrace, "'}' after ABI entry")) {
             return std::nullopt;
         }
-        return make_abi(std::move(name), properties, banks, rules,
-                        variadic_states, variadic_shadows, entry_line);
+        return make_abi(std::move(name), properties, blocks, entry_line);
     }
 
     bool known_properties(
@@ -1189,13 +1222,15 @@ private:
         return true;
     }
 
+    // A nonzero `required_at` makes the property required and is the line of
+    // the entry or block that lacks it.
     std::optional<std::string> text_property(
         const ModelProperties& properties, std::string_view name,
-        bool required = false) {
+        unsigned required_at = 0) {
         const auto found = properties.find(std::string(name));
         if (found == properties.end()) {
-            if (required) {
-                fail(current_.line,
+            if (required_at != 0) {
+                fail(required_at,
                      "missing required model property '" + std::string(name) + "'");
             }
             return std::nullopt;
@@ -1317,11 +1352,7 @@ private:
 
     std::optional<AbiEntry> make_abi(
         std::string name, const ModelProperties& properties,
-        const std::vector<AbiNestedBlock>& bank_blocks,
-        const std::vector<AbiNestedBlock>& rule_blocks,
-        const std::vector<AbiNestedBlock>& variadic_state_blocks,
-        const std::vector<AbiNestedBlock>& variadic_shadow_blocks,
-        unsigned line) {
+        const AbiBlocks& blocks, unsigned line) {
         if (!known_properties(
                 properties,
                 {"architecture", "address_bits", "aliases",
@@ -1344,8 +1375,14 @@ private:
         AbiEntry result;
         result.canonical_name = std::move(name);
         const auto architecture =
-            text_property(properties, "architecture", true);
+            text_property(properties, "architecture", line);
         if (!architecture || !error_.empty()) return std::nullopt;
+        const auto* target_info = architecture_target(*architecture);
+        if (!target_info) {
+            fail(properties.at("architecture").line,
+                 "unknown architecture '" + *architecture + "'");
+            return std::nullopt;
+        }
         result.architecture = *architecture;
         const auto address_bits =
             unsigned_property(properties, "address_bits");
@@ -1513,7 +1550,7 @@ private:
         }
 
         std::unordered_set<std::string> bank_names;
-        for (const auto& block : bank_blocks) {
+        for (const auto& block : blocks.banks) {
             if (!bank_names.insert(block.name).second) {
                 fail(block.line,
                      "duplicate ABI register bank '" + block.name + "'");
@@ -1528,7 +1565,7 @@ private:
             AbiRegisterBank bank;
             bank.canonical_name = block.name;
             const auto register_class =
-                text_property(block.properties, "class", true);
+                text_property(block.properties, "class", block.line);
             const auto register_bits =
                 unsigned_property(block.properties, "register_bits");
             if (!register_bits && error_.empty()) {
@@ -1565,7 +1602,7 @@ private:
         }
 
         std::unordered_set<std::string> rule_names;
-        for (const auto& block : rule_blocks) {
+        for (const auto& block : blocks.rules) {
             if (!rule_names.insert(block.name).second) {
                 fail(block.line, "duplicate ABI rule '" + block.name + "'");
                 return std::nullopt;
@@ -1588,7 +1625,7 @@ private:
             const auto matches =
                 list_property(block.properties, "match");
             const auto action =
-                text_property(block.properties, "action", true);
+                text_property(block.properties, "action", block.line);
             if (!matches && error_.empty()) {
                 fail(block.line,
                      "missing required ABI rule property 'match'");
@@ -1738,7 +1775,7 @@ private:
         }
 
         std::unordered_set<std::string> variadic_state_names;
-        for (const auto& block : variadic_state_blocks) {
+        for (const auto& block : blocks.variadic_states) {
             if (!variadic_state_names.insert(block.name).second) {
                 fail(block.line, "duplicate ABI variadic state '" +
                                      block.name + "'");
@@ -1752,8 +1789,8 @@ private:
             }
             AbiVariadicState state;
             state.canonical_name = block.name;
-            const auto type = text_property(block.properties, "type", true);
-            const auto kind = text_property(block.properties, "kind", true);
+            const auto type = text_property(block.properties, "type", block.line);
+            const auto kind = text_property(block.properties, "kind", block.line);
             if (!type || type->empty() || !kind || !error_.empty()) {
                 if (type && type->empty() && error_.empty()) {
                     fail(block.line,
@@ -1813,7 +1850,7 @@ private:
         }
 
         std::unordered_set<std::string> variadic_shadow_names;
-        for (const auto& block : variadic_shadow_blocks) {
+        for (const auto& block : blocks.variadic_shadows) {
             if (!variadic_shadow_names.insert(block.name).second) {
                 fail(block.line, "duplicate ABI variadic shadow '" +
                                      block.name + "'");
@@ -1828,9 +1865,9 @@ private:
             AbiVariadicShadow shadow;
             shadow.canonical_name = block.name;
             const auto source =
-                text_property(block.properties, "source_bank", true);
+                text_property(block.properties, "source_bank", block.line);
             const auto target =
-                text_property(block.properties, "target_bank", true);
+                text_property(block.properties, "target_bank", block.line);
             if (!source || source->empty() || !target || target->empty() ||
                 !error_.empty()) {
                 fail(block.line,
@@ -1903,7 +1940,385 @@ private:
                  "ABI variadic policy requires variadic_supported = true");
             return std::nullopt;
         }
+        if (!check_abi(*target_info, result, properties, blocks, line)) {
+            return std::nullopt;
+        }
         return result;
+    }
+
+    // Checks an ABI entry against its architecture and the references among
+    // its banks, rules, cursors, and stack regions.
+    bool check_abi(const TargetInfo& target, const AbiEntry& abi,
+                   const ModelProperties& properties, const AbiBlocks& blocks,
+                   unsigned line) {
+        const auto model = "ABI model '" + abi.canonical_name + "'";
+        const auto property_line = [](const ModelProperties& owner,
+                                      std::string_view name) {
+            return owner.at(std::string(name)).line;
+        };
+        if (!abi.elf_abi_tag.empty()) {
+            const auto tag = std::find_if(
+                target.elf_abi_tags.begin(), target.elf_abi_tags.end(),
+                [&](const ElfAbiTagEntry& entry) {
+                    return entry.name == abi.elf_abi_tag;
+                });
+            const auto tag_line = property_line(properties, "elf_abi_tag");
+            if (tag == target.elf_abi_tags.end()) {
+                fail(tag_line, model + " requests ELF ABI tag '" +
+                                   abi.elf_abi_tag + "', which " +
+                                   std::string(target.architecture) +
+                                   " does not define");
+                return false;
+            }
+            if (tag->address_bits != 0 &&
+                tag->address_bits != abi.address_bits) {
+                fail(tag_line, model + " requests ELF ABI tag '" +
+                                   abi.elf_abi_tag + "', which requires " +
+                                   std::to_string(tag->address_bits) +
+                                   "-bit addresses");
+                return false;
+            }
+        }
+        for (std::size_t index = 0; index < abi.banks.size(); ++index) {
+            const auto& bank = abi.banks[index];
+            const auto& block = blocks.banks[index];
+            const auto registers_valid =
+                [&](const std::vector<std::string>& names,
+                    std::string_view property) {
+                    for (const auto& name : names) {
+                        const auto* entry = find_register(target, name);
+                        if (entry &&
+                            entry->register_class == bank.register_class &&
+                            entry->bits >= bank.register_bits) {
+                            continue;
+                        }
+                        fail(property_line(block.properties, property),
+                             model + " bank '" + bank.canonical_name +
+                                 "' property '" + std::string(property) +
+                                 "' contains an incompatible register '" +
+                                 name + "'");
+                        return false;
+                    }
+                    return true;
+                };
+            if (!registers_valid(bank.arguments, "arguments") ||
+                !registers_valid(bank.results, "results")) {
+                return false;
+            }
+        }
+        for (const auto& clobber : abi.call_clobbers) {
+            if (clobber != "memory" && clobber != "flags" &&
+                !find_register(target, clobber)) {
+                fail(property_line(properties, "call_clobbers"),
+                     model + " contains unknown call clobber '" + clobber +
+                         "'");
+                return false;
+            }
+        }
+        const auto has_stack_region = [&](AbiStackRegion sought) {
+            return std::find(abi.stack_order.begin(), abi.stack_order.end(),
+                             sought) != abi.stack_order.end();
+        };
+        std::unordered_set<std::string_view> slot_cursors;
+        bool needs_argument_stack{};
+        bool needs_result_stack{};
+        for (std::size_t index = 0; index < abi.rules.size(); ++index) {
+            const auto& rule = abi.rules[index];
+            const auto rule_line = blocks.rules[index].line;
+            const auto rule_model =
+                model + " rule '" + rule.canonical_name + "'";
+            for (const auto* features :
+                 {&rule.required_features, &rule.forbidden_features}) {
+                for (const auto& feature : *features) {
+                    if (target_extension(target, feature)) continue;
+                    fail(rule_line, rule_model + " names unknown " +
+                                        std::string(target.architecture) +
+                                        " feature '" + feature + "'");
+                    return false;
+                }
+            }
+            std::unordered_set<std::string_view> required_features;
+            for (const auto& feature : rule.required_features) {
+                if (!required_features.insert(feature).second) {
+                    fail(rule_line,
+                         rule_model + " contains a duplicate required feature");
+                    return false;
+                }
+            }
+            std::unordered_set<std::string_view> forbidden_features;
+            for (const auto& feature : rule.forbidden_features) {
+                if (!forbidden_features.insert(feature).second ||
+                    required_features.contains(feature)) {
+                    fail(rule_line,
+                         rule_model + " contains a duplicate or "
+                                      "contradictory forbidden feature");
+                    return false;
+                }
+            }
+            const bool needs_bank =
+                rule.action == AbiRuleAction::Direct ||
+                rule.action == AbiRuleAction::Split ||
+                rule.action == AbiRuleAction::Coerce ||
+                rule.action == AbiRuleAction::Indirect;
+            if (rule.extension != AbiExtensionKind::None &&
+                rule.action != AbiRuleAction::Direct &&
+                rule.action != AbiRuleAction::Split &&
+                rule.action != AbiRuleAction::Coerce) {
+                fail(rule_line,
+                     rule_model +
+                         " uses extension without a direct register transport");
+                return false;
+            }
+            const auto rule_failure = [&](bool arguments) {
+                if (rule.failure_override) return rule.failure;
+                return arguments ? abi.argument_register_failure
+                                 : abi.result_register_failure;
+            };
+            if (rule.arguments &&
+                (rule.action == AbiRuleAction::Stack ||
+                 (needs_bank &&
+                  rule_failure(true) != AbiRegisterFailure::Error))) {
+                needs_argument_stack = true;
+            }
+            if (rule.results &&
+                (rule.action == AbiRuleAction::Stack ||
+                 (needs_bank && rule.action != AbiRuleAction::Indirect &&
+                  rule_failure(false) != AbiRegisterFailure::Error))) {
+                needs_result_stack = true;
+            }
+            const auto bank = std::find_if(
+                abi.banks.begin(), abi.banks.end(),
+                [&](const AbiRegisterBank& candidate) {
+                    return candidate.canonical_name == rule.bank;
+                });
+            if (needs_bank && bank == abi.banks.end()) {
+                fail(rule_line,
+                     rule_model + " names unknown bank '" + rule.bank + "'");
+                return false;
+            }
+            if (rule.extension != AbiExtensionKind::None &&
+                bank != abi.banks.end() &&
+                bank->register_class != "integer") {
+                fail(rule_line,
+                     rule_model +
+                         " uses extension with a non-integer register bank");
+                return false;
+            }
+            if (!needs_bank && !rule.bank.empty()) {
+                fail(rule_line, rule_model + " supplies a bank to an action "
+                                             "that does not use one");
+                return false;
+            }
+            if (needs_bank) {
+                if (rule.arguments && bank->arguments.empty()) {
+                    fail(rule_line,
+                         rule_model + " applies to arguments but its bank "
+                                      "has no argument registers");
+                    return false;
+                }
+                const auto& result_registers =
+                    rule.action == AbiRuleAction::Indirect ? bank->arguments
+                                                           : bank->results;
+                if (rule.results && result_registers.empty()) {
+                    fail(rule_line,
+                         rule_model + " applies to results but its bank has "
+                                      "no compatible result channel");
+                    return false;
+                }
+                if (abi.stack_layout == AbiStackLayout::Slots &&
+                    rule.arguments) {
+                    slot_cursors.insert(bank->cursor);
+                }
+            }
+            if (rule.max_bits != 0 && rule.min_bits > rule.max_bits) {
+                fail(rule_line,
+                     rule_model + " has min_bits greater than max_bits");
+                return false;
+            }
+            if ((rule.action == AbiRuleAction::Split ||
+                 rule.action == AbiRuleAction::Coerce) &&
+                rule.unit_bits == 0 &&
+                (bank == abi.banks.end() || bank->register_bits == 0)) {
+                fail(rule_line, rule_model + " requires a nonzero unit_bits "
+                                             "or bank register_bits");
+                return false;
+            }
+            if ((!rule.merge_banks.empty() ||
+                 rule.require_natural_alignment) &&
+                rule.action != AbiRuleAction::Flatten) {
+                fail(rule_line,
+                     rule_model +
+                         " uses flatten-only merge/alignment properties");
+                return false;
+            }
+            if (!rule.merge_banks.empty() && rule.unit_bits == 0) {
+                fail(rule_line, rule_model + " requires nonzero unit_bits "
+                                             "when merge_banks is present");
+                return false;
+            }
+            std::unordered_set<std::string_view> merge_names;
+            for (const auto& merge_name : rule.merge_banks) {
+                const auto merge_bank = std::find_if(
+                    abi.banks.begin(), abi.banks.end(),
+                    [&](const AbiRegisterBank& candidate) {
+                        return candidate.canonical_name == merge_name;
+                    });
+                if (merge_name.empty() || merge_bank == abi.banks.end() ||
+                    !merge_names.insert(merge_name).second) {
+                    fail(rule_line, rule_model + " has an empty, duplicate, "
+                                                 "or unknown merge bank");
+                    return false;
+                }
+                if (merge_bank->register_bits < rule.unit_bits) {
+                    fail(rule_line, rule_model + " has a merge bank narrower "
+                                                 "than unit_bits");
+                    return false;
+                }
+            }
+            if (bank != abi.banks.end() &&
+                (rule.action == AbiRuleAction::Split ||
+                 rule.action == AbiRuleAction::Coerce) &&
+                rule.unit_bits > bank->register_bits) {
+                fail(rule_line, rule_model + " has unit_bits wider than its "
+                                             "register bank");
+                return false;
+            }
+            if ((rule.cursor_alignment != 1 || rule.cursor_advance != 0) &&
+                !needs_bank) {
+                fail(rule_line, rule_model + " uses cursor policy without a "
+                                             "register bank");
+                return false;
+            }
+            std::unordered_set<std::string_view> required_unused_names;
+            for (const auto& required : rule.requires_unused_banks) {
+                const auto known = std::find_if(
+                    abi.banks.begin(), abi.banks.end(),
+                    [&](const AbiRegisterBank& candidate) {
+                        return candidate.canonical_name == required;
+                    });
+                if (required.empty() || known == abi.banks.end() ||
+                    !required_unused_names.insert(required).second) {
+                    fail(rule_line,
+                         rule_model + " has an empty, duplicate, or unknown "
+                                      "required-unused bank");
+                    return false;
+                }
+            }
+            if (bank != abi.banks.end() &&
+                rule.carrier_bits > bank->register_bits) {
+                fail(rule_line, rule_model + " has carrier_bits wider than "
+                                             "its register bank");
+                return false;
+            }
+            if (bank != abi.banks.end() &&
+                rule.action == AbiRuleAction::Indirect &&
+                bank->register_bits < abi.address_bits) {
+                fail(rule_line, rule_model + " uses an indirect bank narrower "
+                                             "than address_bits");
+                return false;
+            }
+            if (rule.action == AbiRuleAction::Indirect &&
+                rule.unit_bits != 0 && rule.unit_bits % 8U != 0) {
+                fail(rule_line, rule_model + " indirect unit_bits must be "
+                                             "byte-addressable");
+                return false;
+            }
+        }
+        if (abi.stack_layout == AbiStackLayout::Slots &&
+            slot_cursors.size() > 1) {
+            fail(line, model + " uses positional stack slots but its "
+                               "argument banks do not share one cursor");
+            return false;
+        }
+        if (needs_argument_stack &&
+            !has_stack_region(AbiStackRegion::Arguments)) {
+            fail(line, model + " can place arguments on the stack but "
+                               "stack_order omits 'arguments'");
+            return false;
+        }
+        if (needs_result_stack &&
+            !has_stack_region(AbiStackRegion::Results)) {
+            fail(line, model + " can place results on the stack but "
+                               "stack_order omits 'results'");
+            return false;
+        }
+        const auto bank_named = [&](std::string_view name)
+            -> const AbiRegisterBank* {
+            const auto found = std::find_if(
+                abi.banks.begin(), abi.banks.end(),
+                [&](const AbiRegisterBank& bank) {
+                    return bank.canonical_name == name;
+                });
+            return found == abi.banks.end() ? nullptr : &*found;
+        };
+        const auto cursor_known = [&](std::string_view cursor) {
+            return std::any_of(
+                abi.banks.begin(), abi.banks.end(),
+                [&](const AbiRegisterBank& bank) {
+                    return bank.cursor == cursor;
+                });
+        };
+        if (!abi.variadic_count_cursor.empty()) {
+            const auto* count_register =
+                find_register(target, abi.variadic_count_register);
+            if (!cursor_known(abi.variadic_count_cursor) || !count_register ||
+                count_register->bits < abi.variadic_count_bits) {
+                fail(property_line(properties, "variadic_count_register"),
+                     model + " has an invalid variadic count "
+                             "cursor/register");
+                return false;
+            }
+        }
+        for (std::size_t index = 0; index < abi.variadic_shadows.size();
+             ++index) {
+            const auto& shadow = abi.variadic_shadows[index];
+            const auto* source = bank_named(shadow.source_bank);
+            const auto* destination = bank_named(shadow.target_bank);
+            if (!source || !destination ||
+                source->cursor != destination->cursor ||
+                destination->arguments.size() < source->arguments.size()) {
+                fail(blocks.variadic_shadows[index].line,
+                     model + " variadic shadow '" + shadow.canonical_name +
+                         "' requires compatible banks sharing one cursor");
+                return false;
+            }
+        }
+        for (const auto& bank_name : abi.variadic_save_banks) {
+            const auto* bank = bank_named(bank_name);
+            if (!bank || bank->arguments.empty()) {
+                fail(property_line(properties, "variadic_save_banks"),
+                     model + " variadic_save_banks contains unknown or "
+                             "empty bank '" + bank_name + "'");
+                return false;
+            }
+        }
+        if (!abi.variadic_home_bank.empty()) {
+            const auto* bank = bank_named(abi.variadic_home_bank);
+            if (!bank || bank->arguments.empty()) {
+                fail(property_line(properties, "variadic_home_bank"),
+                     model + " has an invalid variadic home bank");
+                return false;
+            }
+        }
+        for (std::size_t index = 0; index < abi.variadic_states.size();
+             ++index) {
+            const auto& state = abi.variadic_states[index];
+            const bool needs_cursor =
+                state.kind == AbiVariadicStateKind::CursorOffset ||
+                state.kind == AbiVariadicStateKind::CursorAddress;
+            if ((needs_cursor && !cursor_known(state.cursor)) ||
+                (state.kind == AbiVariadicStateKind::RegisterSaveAddress &&
+                 abi.variadic_save_banks.empty()) ||
+                (state.llvm_va_list_offset &&
+                 (*state.llvm_va_list_offset >= abi.variadic_va_list_bytes ||
+                  abi.variadic_va_list_bytes == 0))) {
+                fail(blocks.variadic_states[index].line,
+                     model + " has invalid variadic state '" +
+                         state.canonical_name + "'");
+                return false;
+            }
+        }
+        return true;
     }
 
     std::optional<OptionValue> option_value(
@@ -1938,7 +2353,7 @@ private:
             if (!value) return false;
             result.push_back(
                 {name, std::move(*value),
-                 origin_ + ':' + std::to_string(property.line)});
+                 position(property.line)});
         }
         std::sort(result.begin(), result.end(),
                   [](const OptionAssignment& left,
@@ -1998,6 +2413,7 @@ private:
     ModelLexer lexer_;
     std::string origin_;
     ModelToken current_;
+    std::string error_position_;
     std::string error_;
 };
 
@@ -2034,402 +2450,25 @@ bool glob_matches(std::string_view pattern, std::string_view text) {
     return pattern_index == pattern.size();
 }
 
-bool validate_abi_model(const TargetInfo& target, const AbiEntry& abi,
-                        Diagnostics& diagnostics) {
-    const auto registers_valid = [&](const AbiRegisterBank& bank,
-                                     const std::vector<std::string>& names,
-                                     std::string_view property) {
-        for (const auto& name : names) {
-            const auto* entry = find_register(target, name);
-            if (!entry || entry->register_class != bank.register_class ||
-                entry->bits < bank.register_bits) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' bank '" +
-                    bank.canonical_name + "' property '" +
-                    std::string(property) +
-                    "' contains an incompatible register '" + name + "'");
-                return false;
-            }
-        }
-        return true;
-    };
-    std::unordered_set<std::string_view> bank_names;
-    std::unordered_set<std::string_view> slot_cursors;
-    const auto has_stack_region = [&](AbiStackRegion sought) {
-        return std::find(abi.stack_order.begin(), abi.stack_order.end(),
-                         sought) != abi.stack_order.end();
-    };
-    bool needs_argument_stack{};
-    bool needs_result_stack{};
-    for (const auto& bank : abi.banks) {
-        if (!bank_names.insert(bank.canonical_name).second) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' contains duplicate register bank '" +
-                bank.canonical_name + "'");
-            return false;
-        }
-        if (!registers_valid(bank, bank.arguments, "arguments") ||
-            !registers_valid(bank, bank.results, "results")) {
-            return false;
-        }
-    }
-    for (const auto& clobber : abi.call_clobbers) {
-        if (clobber != "memory" && clobber != "flags" &&
-            !find_register(target, clobber)) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' contains unknown call clobber '" + clobber + "'");
-            return false;
-        }
-    }
-    for (const auto& rule : abi.rules) {
-        std::unordered_set<std::string_view> required_features;
-        for (const auto& feature : rule.required_features) {
-            if (feature.empty() ||
-                !required_features.insert(feature).second) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' contains an empty or duplicate required feature");
-                return false;
-            }
-        }
-        std::unordered_set<std::string_view> forbidden_features;
-        for (const auto& feature : rule.forbidden_features) {
-            if (feature.empty() ||
-                !forbidden_features.insert(feature).second ||
-                required_features.contains(feature)) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' contains an empty, duplicate, or contradictory "
-                    "forbidden feature");
-                return false;
-            }
-        }
-        const bool needs_bank =
-            rule.action == AbiRuleAction::Direct ||
-            rule.action == AbiRuleAction::Split ||
-            rule.action == AbiRuleAction::Coerce ||
-            rule.action == AbiRuleAction::Indirect;
-        if (rule.extension != AbiExtensionKind::None &&
-            rule.action != AbiRuleAction::Direct &&
-            rule.action != AbiRuleAction::Split &&
-            rule.action != AbiRuleAction::Coerce) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' uses extension without a direct register transport");
-            return false;
-        }
-        const auto rule_failure = [&](bool arguments) {
-            if (rule.failure_override) return rule.failure;
-            return arguments ? abi.argument_register_failure
-                             : abi.result_register_failure;
-        };
-        if (rule.arguments &&
-            (rule.action == AbiRuleAction::Stack ||
-             (needs_bank &&
-              rule_failure(true) != AbiRegisterFailure::Error))) {
-            needs_argument_stack = true;
-        }
-        if (rule.results &&
-            (rule.action == AbiRuleAction::Stack ||
-             (needs_bank && rule.action != AbiRuleAction::Indirect &&
-              rule_failure(false) != AbiRegisterFailure::Error))) {
-            needs_result_stack = true;
-        }
-        const auto bank = std::find_if(
-            abi.banks.begin(), abi.banks.end(),
-            [&](const AbiRegisterBank& candidate) {
-                return candidate.canonical_name == rule.bank;
-            });
-        if (needs_bank && bank == abi.banks.end()) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name + "' names unknown bank '" +
-                rule.bank + "'");
-            return false;
-        }
-        if (rule.extension != AbiExtensionKind::None &&
-            bank != abi.banks.end() &&
-            bank->register_class != "integer") {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' uses extension with a non-integer register bank");
-            return false;
-        }
-        if (!needs_bank && !rule.bank.empty()) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' supplies a bank to an action that does not use one");
-            return false;
-        }
-        if (needs_bank) {
-            if (rule.arguments && bank->arguments.empty()) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' applies to arguments but its bank has no argument "
-                    "registers");
-                return false;
-            }
-            const auto& result_registers =
-                rule.action == AbiRuleAction::Indirect
-                    ? bank->arguments
-                    : bank->results;
-            if (rule.results && result_registers.empty()) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' applies to results but its bank has no compatible "
-                    "result channel");
-                return false;
-            }
-            if (abi.stack_layout == AbiStackLayout::Slots &&
-                rule.arguments) {
-                slot_cursors.insert(bank->cursor);
-            }
-        }
-        if (rule.max_bits != 0 && rule.min_bits > rule.max_bits) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' has min_bits greater than max_bits");
-            return false;
-        }
-        if ((rule.action == AbiRuleAction::Split ||
-             rule.action == AbiRuleAction::Coerce) &&
-            rule.unit_bits == 0 &&
-            (bank == abi.banks.end() || bank->register_bits == 0)) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' requires a nonzero unit_bits or bank register_bits");
-            return false;
-        }
-        if ((!rule.merge_banks.empty() ||
-             rule.require_natural_alignment) &&
-            rule.action != AbiRuleAction::Flatten) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' uses flatten-only merge/alignment properties");
-            return false;
-        }
-        if (!rule.merge_banks.empty() && rule.unit_bits == 0) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' requires nonzero unit_bits when merge_banks is present");
-            return false;
-        }
-        std::unordered_set<std::string_view> merge_names;
-        for (const auto& merge_name : rule.merge_banks) {
-            const auto merge_bank = std::find_if(
-                abi.banks.begin(), abi.banks.end(),
-                [&](const AbiRegisterBank& candidate) {
-                    return candidate.canonical_name == merge_name;
-                });
-            if (merge_name.empty() || merge_bank == abi.banks.end() ||
-                !merge_names.insert(merge_name).second) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' has an empty, duplicate, or unknown merge bank");
-                return false;
-            }
-            if (merge_bank->register_bits < rule.unit_bits) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' has a merge bank narrower than unit_bits");
-                return false;
-            }
-        }
-        if (bank != abi.banks.end() &&
-            (rule.action == AbiRuleAction::Split ||
-             rule.action == AbiRuleAction::Coerce) &&
-            rule.unit_bits > bank->register_bits) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' has unit_bits wider than its register bank");
-            return false;
-        }
-        if ((rule.cursor_alignment != 1 || rule.cursor_advance != 0) &&
-            !needs_bank) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' uses cursor policy without a register bank");
-            return false;
-        }
-        std::unordered_set<std::string_view> required_unused_names;
-        for (const auto& required : rule.requires_unused_banks) {
-            const auto known = std::find_if(
-                abi.banks.begin(), abi.banks.end(),
-                [&](const AbiRegisterBank& candidate) {
-                    return candidate.canonical_name == required;
-                });
-            if (required.empty() || known == abi.banks.end() ||
-                !required_unused_names.insert(required).second) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name + "' rule '" +
-                    rule.canonical_name +
-                    "' has an empty, duplicate, or unknown required-unused bank");
-                return false;
-            }
-        }
-        if (bank != abi.banks.end() &&
-            rule.carrier_bits > bank->register_bits) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' has carrier_bits wider than its register bank");
-            return false;
-        }
-        if (bank != abi.banks.end() &&
-            rule.action == AbiRuleAction::Indirect &&
-            bank->register_bits < abi.address_bits) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' uses an indirect bank narrower than address_bits");
-            return false;
-        }
-        if (rule.action == AbiRuleAction::Indirect &&
-            rule.unit_bits != 0 && rule.unit_bits % 8U != 0) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name + "' rule '" +
-                rule.canonical_name +
-                "' indirect unit_bits must be byte-addressable");
-            return false;
-        }
-    }
-    if (abi.stack_layout == AbiStackLayout::Slots &&
-        slot_cursors.size() > 1) {
-        diagnostics.command_error(
-            "ABI model '" + abi.canonical_name +
-            "' uses positional stack slots but its argument banks do not "
-            "share one cursor");
-        return false;
-    }
-    if (needs_argument_stack &&
-        !has_stack_region(AbiStackRegion::Arguments)) {
-        diagnostics.command_error(
-            "ABI model '" + abi.canonical_name +
-            "' can place arguments on the stack but stack_order omits "
-            "'arguments'");
-        return false;
-    }
-    if (needs_result_stack &&
-        !has_stack_region(AbiStackRegion::Results)) {
-        diagnostics.command_error(
-            "ABI model '" + abi.canonical_name +
-            "' can place results on the stack but stack_order omits "
-            "'results'");
-        return false;
-    }
-    const auto bank_named = [&](std::string_view name)
-        -> const AbiRegisterBank* {
-        const auto found = std::find_if(
-            abi.banks.begin(), abi.banks.end(),
-            [&](const AbiRegisterBank& bank) {
-                return bank.canonical_name == name;
-            });
-        return found == abi.banks.end() ? nullptr : &*found;
-    };
-    const auto cursor_known = [&](std::string_view cursor) {
-        return std::any_of(
-            abi.banks.begin(), abi.banks.end(),
-            [&](const AbiRegisterBank& bank) {
-                return bank.cursor == cursor;
-            });
-    };
-    if (!abi.variadic_count_cursor.empty()) {
-        const auto* count_register =
-            find_register(target, abi.variadic_count_register);
-        if (!cursor_known(abi.variadic_count_cursor) || !count_register ||
-            count_register->bits < abi.variadic_count_bits) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' has an invalid variadic count cursor/register");
-            return false;
-        }
-    }
-    for (const auto& shadow : abi.variadic_shadows) {
-        const auto* source = bank_named(shadow.source_bank);
-        const auto* destination = bank_named(shadow.target_bank);
-        if (!source || !destination ||
-            source->cursor != destination->cursor ||
-            destination->arguments.size() < source->arguments.size()) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' variadic shadow '" + shadow.canonical_name +
-                "' requires compatible banks sharing one cursor");
-            return false;
-        }
-    }
-    for (const auto& bank_name : abi.variadic_save_banks) {
-        const auto* bank = bank_named(bank_name);
-        if (!bank || bank->arguments.empty()) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' variadic_save_banks contains unknown or empty bank '" +
-                bank_name + "'");
-            return false;
-        }
-    }
-    if (!abi.variadic_home_bank.empty()) {
-        const auto* bank = bank_named(abi.variadic_home_bank);
-        if (!bank || bank->arguments.empty()) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' has an invalid variadic home bank");
-            return false;
-        }
-    }
-    for (const auto& state : abi.variadic_states) {
-        const bool needs_cursor =
-            state.kind == AbiVariadicStateKind::CursorOffset ||
-            state.kind == AbiVariadicStateKind::CursorAddress;
-        if ((needs_cursor && !cursor_known(state.cursor)) ||
-            (state.kind == AbiVariadicStateKind::RegisterSaveAddress &&
-             abi.variadic_save_banks.empty()) ||
-            (state.llvm_va_list_offset &&
-             (*state.llvm_va_list_offset >= abi.variadic_va_list_bytes ||
-              abi.variadic_va_list_bytes == 0))) {
-            diagnostics.command_error(
-                "ABI model '" + abi.canonical_name +
-                "' has invalid variadic state '" +
-                state.canonical_name + "'");
-            return false;
-        }
-    }
-    return true;
-}
-
 } // namespace
 
 ModelRegistry::ModelRegistry() {
+    std::ostringstream errors;
+    Diagnostics diagnostics(errors);
     for (const auto& source : shipped_model_sources()) {
-        if (!load_text(source.text, std::string(source.name), nullptr)) {
-            throw std::logic_error("invalid shipped Cross model '" +
-                                   std::string(source.name) + "'");
+        if (!load_text(source.text, std::string(source.name), diagnostics)) {
+            throw std::logic_error("invalid shipped Cross model: " +
+                                   errors.str());
         }
     }
 }
 
 bool ModelRegistry::load_text(std::string_view text, std::string origin,
-                              Diagnostics* diagnostics) {
+                              Diagnostics& diagnostics) {
     ModelParser parser(text, origin);
     auto document = parser.parse();
     if (!document) {
-        if (diagnostics) diagnostics->command_error(parser.error());
+        diagnostics.file_error(parser.error_position(), parser.error());
         return false;
     }
 
@@ -2457,11 +2496,9 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
                            "-bit addresses";
         const auto add_name = [&](std::string_view name) {
             if (abi_names.insert(abi_key(entry, name)).second) return true;
-            if (diagnostics) {
-                diagnostics->command_error(
-                    origin + ": duplicate ABI model name or alias '" +
-                    std::string(name) + "'" + model);
-            }
+            diagnostics.file_error(entry.source,
+                                   "duplicate ABI model name or alias '" +
+                                       std::string(name) + "'" + model);
             return false;
         };
         if (!add_name(entry.canonical_name)) return false;
@@ -2473,79 +2510,53 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
                  .insert(abi_key(entry,
                                  std::to_string(entry.private_carrier_bits)))
                  .second) {
-            if (diagnostics) {
-                diagnostics->command_error(
-                    origin + ": ABI model '" + entry.canonical_name +
+            diagnostics.file_error(
+                entry.source,
+                "ABI model '" + entry.canonical_name +
                     "' duplicates the private convention for " +
                     std::to_string(entry.private_carrier_bits) +
                     "-bit carriers" + model);
-            }
             return false;
         }
     }
 
-    std::unordered_set<std::string> mangling_names;
-    for (const auto& entry : manglings_) {
-        mangling_names.insert(entry.canonical_name);
-    }
-    for (const auto& entry : document->manglings) {
-        if (!mangling_names.insert(entry.canonical_name).second) {
-            if (diagnostics) {
-                diagnostics->command_error(
-                    origin + ": duplicate mangling model '" +
-                    entry.canonical_name + "'");
-            }
+    // Mangling, optimization, and profile names are unique within their
+    // kind.
+    const auto unique_names = [&](const auto& loaded, const auto& added,
+                                  std::string_view kind) {
+        std::unordered_set<std::string_view> names;
+        for (const auto& entry : loaded) names.insert(entry.canonical_name);
+        for (const auto& entry : added) {
+            if (names.insert(entry.canonical_name).second) continue;
+            diagnostics.file_error(entry.source,
+                                   "duplicate " + std::string(kind) +
+                                       " model '" + entry.canonical_name +
+                                       "'");
             return false;
         }
-    }
-
-    std::unordered_set<std::string> optimization_names;
-    for (const auto& entry : optimizations_) {
-        optimization_names.insert(entry.canonical_name);
-    }
-    for (const auto& entry : document->optimizations) {
-        if (!optimization_names.insert(entry.canonical_name).second) {
-            if (diagnostics) {
-                diagnostics->command_error(
-                    origin + ": duplicate optimization model '" +
-                    entry.canonical_name + "'");
-            }
-            return false;
-        }
-    }
-
-    std::unordered_set<std::string> profile_names;
-    for (const auto& entry : profiles_) {
-        profile_names.insert(entry.canonical_name);
-    }
-    for (const auto& entry : document->profiles) {
-        if (!profile_names.insert(entry.canonical_name).second) {
-            if (diagnostics) {
-                diagnostics->command_error(
-                    origin + ": duplicate profile model '" +
-                    entry.canonical_name + "'");
-            }
-            return false;
-        }
+        return true;
+    };
+    if (!unique_names(manglings_, document->manglings, "mangling") ||
+        !unique_names(optimizations_, document->optimizations,
+                      "optimization") ||
+        !unique_names(profiles_, document->profiles, "profile")) {
+        return false;
     }
 
     const auto abi_capacity = static_cast<std::size_t>(AbiId::invalid_value);
     if (abis_.size() > abi_capacity ||
         document->abis.size() > abi_capacity - abis_.size()) {
-        if (diagnostics) {
-            diagnostics->command_error(
-                origin + ": ABI model count exceeds the typed registry limit");
-        }
+        diagnostics.file_error(
+            origin, "ABI model count exceeds the typed registry limit");
         return false;
     }
     for (const auto& entry : document->abis) {
         if (entry.variadic_states.size() >
             static_cast<std::size_t>(AbiStateId::invalid_value)) {
-            if (diagnostics) {
-                diagnostics->command_error(
-                    origin + ": ABI model '" + entry.canonical_name +
-                    "' has too many variadic-state entries");
-            }
+            diagnostics.file_error(entry.source,
+                                   "ABI model '" + entry.canonical_name +
+                                       "' has too many variadic-state "
+                                       "entries");
             return false;
         }
     }
@@ -2584,32 +2595,36 @@ bool ModelRegistry::load_file(const std::filesystem::path& path,
     }
     std::ostringstream contents;
     contents << input.rdbuf();
-    if (!load_text(contents.str(), identity, &diagnostics)) return false;
+    if (!load_text(contents.str(), identity, diagnostics)) return false;
     loaded_files_.insert(identity);
     return true;
 }
 
-const ProfileEntry* ModelRegistry::default_profile(
+std::vector<const ProfileEntry*> ModelRegistry::default_profiles(
     std::string_view triple) const {
-    const ProfileEntry* best{};
+    std::vector<const ProfileEntry*> best;
     std::size_t best_score{};
-    bool ambiguous = false;
     for (const auto& profile : profiles_) {
+        std::optional<std::size_t> score;
         for (const auto& pattern : profile.default_for) {
             if (!glob_matches(pattern, triple)) continue;
-            const auto score = static_cast<std::size_t>(std::count_if(
+            const auto specificity = static_cast<std::size_t>(std::count_if(
                 pattern.begin(), pattern.end(),
                 [](char ch) { return ch != '*'; }));
-            if (!best || score > best_score) {
-                best = &profile;
-                best_score = score;
-                ambiguous = false;
-            } else if (score == best_score && best != &profile) {
-                ambiguous = true;
-            }
+            score = std::max(score.value_or(0), specificity);
         }
+        if (!score || (!best.empty() && *score < best_score)) continue;
+        if (best.empty() || *score > best_score) best.clear();
+        best.push_back(&profile);
+        best_score = *score;
     }
-    return ambiguous ? nullptr : best;
+    return best;
+}
+
+const ProfileEntry* ModelRegistry::default_profile(
+    std::string_view triple) const {
+    const auto profiles = default_profiles(triple);
+    return profiles.size() == 1 ? profiles.front() : nullptr;
 }
 
 std::string_view ModelRegistry::default_abi(
@@ -2689,6 +2704,169 @@ ModelRegistry& model_registry() {
     return registry;
 }
 
+namespace {
+
+const OptionDefinition* option_definition(
+    std::span<const OptionDefinition> definitions, std::string_view name) {
+    const auto found = std::find_if(
+        definitions.begin(), definitions.end(),
+        [&](const OptionDefinition& definition) {
+            return definition.name == name;
+        });
+    return found == definitions.end() ? nullptr : &*found;
+}
+
+// Why an f.* or m.* property does not suit `definitions`, or nothing.
+std::optional<std::string> option_problem(
+    const OptionAssignment& option,
+    std::span<const OptionDefinition> definitions, bool preset) {
+    const auto* definition = option_definition(definitions, option.name);
+    if (!definition) return "unknown option '" + option.name + "'";
+    if (preset && !definition->presettable) {
+        return "optimization presets cannot set option '" + option.name +
+               "'";
+    }
+    std::string reason;
+    if (!checked_option_value(*definition, option.value, reason)) {
+        return "invalid value for option '" + option.name + "': " + reason;
+    }
+    return std::nullopt;
+}
+
+// Checks the f.* and m.* properties of a preset or profile. An m.* property
+// must suit each of `targets`, or, when `targets` is empty, some compiled-in
+// target that defines it.
+bool check_options(std::span<const OptionAssignment> options,
+                   std::span<const TargetInfo* const> targets, bool preset,
+                   Diagnostics& diagnostics) {
+    for (const auto& option : options) {
+        std::optional<std::string> problem;
+        if (option.name.starts_with("f.")) {
+            problem =
+                option_problem(option, common_option_definitions(), preset);
+        } else if (!targets.empty()) {
+            for (const auto* target : targets) {
+                problem = option_problem(option, target->options, preset);
+                if (problem) {
+                    *problem += " for " + std::string(target->architecture);
+                    break;
+                }
+            }
+        } else {
+            problem = "unknown option '" + option.name + "'";
+            for (const auto* target : all_targets()) {
+                if (!option_definition(target->options, option.name)) continue;
+                problem = option_problem(option, target->options, preset);
+                if (!problem) break;
+            }
+        }
+        if (problem) {
+            diagnostics.file_error(option.source, *problem);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Checks the names that presets and profiles use, once every file is loaded:
+// parents, architectures, targets, ABIs, manglings, presets, and options.
+bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
+    const auto& presets = registry.optimizations();
+    for (const auto& preset : presets) {
+        const auto fail = [&](std::string message) {
+            diagnostics.file_error(preset.source,
+                                   "optimization preset '" +
+                                       preset.canonical_name + "' " +
+                                       std::move(message));
+            return false;
+        };
+        if (preset.inherits &&
+            !registry.find_optimization(*preset.inherits)) {
+            return fail("inherits unknown preset '" + *preset.inherits +
+                        "'");
+        }
+        std::string cycle = preset.canonical_name;
+        const auto* parent = &preset;
+        for (std::size_t step = 0; step < presets.size() && parent->inherits;
+             ++step) {
+            parent = registry.find_optimization(*parent->inherits);
+            if (!parent) break;
+            cycle += " -> " + parent->canonical_name;
+            if (parent == &preset) {
+                diagnostics.file_error(
+                    preset.source, "optimization inheritance cycle: " + cycle);
+                return false;
+            }
+        }
+        std::vector<const TargetInfo*> targets;
+        for (const auto& architecture : preset.targets) {
+            const auto* target = architecture_target(architecture);
+            if (!target) {
+                return fail("names unknown architecture '" + architecture +
+                            "'");
+            }
+            targets.push_back(target);
+        }
+        if (!check_options(preset.options, targets, true, diagnostics)) {
+            return false;
+        }
+    }
+    for (const auto& profile : registry.profiles()) {
+        const auto fail = [&](std::string message) {
+            diagnostics.file_error(profile.source,
+                                   "profile '" + profile.canonical_name +
+                                       "' " + std::move(message));
+            return false;
+        };
+        const TargetInfo* target{};
+        if (profile.target) {
+            target = target_for_triple(*profile.target);
+            if (!target) {
+                return fail("names unimplemented target '" +
+                            *profile.target + "'");
+            }
+        }
+        if (profile.abi &&
+            std::none_of(registry.abis().begin(), registry.abis().end(),
+                         [&](const AbiEntry& abi) {
+                             return (!target || abi.architecture ==
+                                                    target->architecture) &&
+                                    (abi.canonical_name == *profile.abi ||
+                                     std::find(abi.aliases.begin(),
+                                               abi.aliases.end(),
+                                               *profile.abi) !=
+                                         abi.aliases.end());
+                         })) {
+            return fail("names unknown ABI '" + *profile.abi + "'" +
+                        (target ? " for " + std::string(target->architecture)
+                                : std::string{}));
+        }
+        if (profile.mangling &&
+            std::none_of(registry.manglings().begin(),
+                         registry.manglings().end(),
+                         [&](const ManglingEntry& mangling) {
+                             return mangling.canonical_name ==
+                                    *profile.mangling;
+                         })) {
+            return fail("names unknown mangling '" + *profile.mangling + "'");
+        }
+        if (profile.optimization &&
+            !registry.find_optimization(*profile.optimization)) {
+            return fail("names unknown optimization preset '" +
+                        *profile.optimization + "'");
+        }
+        const std::span<const TargetInfo* const> targets =
+            target ? std::span<const TargetInfo* const>(&target, 1)
+                   : std::span<const TargetInfo* const>{};
+        if (!check_options(profile.options, targets, false, diagnostics)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
     auto& registry = model_registry();
     for (const auto& path : options.model_paths) {
@@ -2722,17 +2900,7 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
         }
         if (!registry.load_file(*resolved, diagnostics)) return false;
     }
-    for (const auto& abi : registry.abis()) {
-        const auto target = std::find_if(
-            all_targets().begin(), all_targets().end(),
-            [&](const TargetInfo* candidate) {
-                return candidate->architecture == abi.architecture;
-            });
-        if (target != all_targets().end() &&
-            !validate_abi_model(**target, abi, diagnostics)) {
-            return false;
-        }
-    }
+    if (!check_entries(registry, diagnostics)) return false;
 
     const ProfileEntry* profile{};
     if (options.profile_explicit && options.profile != "default") {
@@ -2745,9 +2913,27 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
         if (!options.target_explicit && profile->target) {
             options.target = *profile->target;
         }
-    } else {
-        profile = registry.default_profile(options.target);
     }
+    // The default profile also fixes the triple's default ABI, so an
+    // ambiguous default is an error even when -mprofile names a profile.
+    const auto defaults = registry.default_profiles(options.target);
+    if (defaults.size() > 1) {
+        std::string names;
+        for (std::size_t index = 0; index < defaults.size(); ++index) {
+            if (index != 0) {
+                names += index + 1 < defaults.size() ? ", "
+                         : defaults.size() > 2      ? ", and "
+                                                    : " and ";
+            }
+            names += "'" + defaults[index]->canonical_name + "' (" +
+                     defaults[index]->source + ")";
+        }
+        diagnostics.command_error("profiles " + names +
+                                  " are equally specific defaults for "
+                                  "target '" + options.target + "'");
+        return false;
+    }
+    if (!profile && !defaults.empty()) profile = defaults.front();
     if (!profile && options.profile_explicit) {
         diagnostics.command_error(
             "no default Cross model profile matches target '" +
@@ -2774,67 +2960,37 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
         return false;
     }
 
+    // Loading checked that every chain of parents ends; settings apply from
+    // the root down.
+    std::vector<const OptimizationEntry*> chain;
+    for (const auto* entry = optimization; entry;
+         entry = entry->inherits ? registry.find_optimization(*entry->inherits)
+                                 : nullptr) {
+        chain.push_back(entry);
+    }
     std::vector<OptionAssignment> preset_options;
     std::unordered_map<std::string, std::size_t> preset_indices;
-    std::unordered_map<std::string, unsigned> visit_state;
-    std::vector<std::string> visit_stack;
-    std::function<bool(const OptimizationEntry&)> inherit =
-        [&](const OptimizationEntry& entry) {
-            auto& state = visit_state[entry.canonical_name];
-            if (state == 2) return true;
-            if (state == 1) {
-                std::string cycle;
-                for (const auto& name : visit_stack) {
-                    if (!cycle.empty()) cycle += " -> ";
-                    cycle += name;
-                }
-                if (!cycle.empty()) cycle += " -> ";
-                cycle += entry.canonical_name;
-                diagnostics.command_error(
-                    "optimization inheritance cycle: " + cycle);
-                return false;
+    for (auto entry = chain.rbegin(); entry != chain.rend(); ++entry) {
+        const auto& targets = (*entry)->targets;
+        if (!targets.empty() &&
+            (!selected_target ||
+             std::find(targets.begin(), targets.end(),
+                       selected_target->architecture) == targets.end())) {
+            diagnostics.command_error(
+                "optimization preset '" + (*entry)->canonical_name +
+                "' is unavailable for target '" + options.target + "'");
+            return false;
+        }
+        for (const auto& setting : (*entry)->options) {
+            const auto found = preset_indices.find(setting.name);
+            if (found == preset_indices.end()) {
+                preset_indices.emplace(setting.name, preset_options.size());
+                preset_options.push_back(setting);
+            } else {
+                preset_options[found->second] = setting;
             }
-            state = 1;
-            visit_stack.push_back(entry.canonical_name);
-            if (entry.inherits) {
-                const auto* parent =
-                    registry.find_optimization(*entry.inherits);
-                if (!parent) {
-                    diagnostics.command_error(
-                        "optimization preset '" + entry.canonical_name +
-                        "' inherits unknown preset '" + *entry.inherits +
-                        "'");
-                    return false;
-                }
-                if (!inherit(*parent)) return false;
-            }
-            if (!entry.targets.empty()) {
-                if (!selected_target ||
-                    std::find(entry.targets.begin(), entry.targets.end(),
-                              selected_target->architecture) ==
-                        entry.targets.end()) {
-                    diagnostics.command_error(
-                        "optimization preset '" + entry.canonical_name +
-                        "' is unavailable for target '" + options.target +
-                        "'");
-                    return false;
-                }
-            }
-            for (const auto& setting : entry.options) {
-                const auto found = preset_indices.find(setting.name);
-                if (found == preset_indices.end()) {
-                    preset_indices.emplace(setting.name,
-                                           preset_options.size());
-                    preset_options.push_back(setting);
-                } else {
-                    preset_options[found->second] = setting;
-                }
-            }
-            visit_stack.pop_back();
-            state = 2;
-            return true;
-        };
-    if (!inherit(*optimization)) return false;
+        }
+    }
 
     const std::span<const OptionDefinition> target_definitions =
         selected_target

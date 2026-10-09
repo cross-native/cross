@@ -219,6 +219,10 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
                        Diagnostics& diagnostics);
 
 std::span<const OptionDefinition> common_option_definitions();
+// The typed value of `value` for `definition`, or nothing with `reason` set.
+std::optional<OptionValue> checked_option_value(
+    const OptionDefinition& definition, const OptionValue& value,
+    std::string& reason);
 bool resolve_registered_options(
     CompilerOptions& options,
     std::span<const OptionDefinition> target_definitions,

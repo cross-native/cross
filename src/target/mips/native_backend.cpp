@@ -11001,10 +11001,9 @@ std::string emit_managed_machine_assembly(
                            diagnostics).run();
 }
 
-std::optional<ElfAbiTag> elf_abi_tag(const AbiEntry& abi) {
-    if (abi.elf_abi_tag.empty()) return ElfAbiTag::Default;
-    if (abi.elf_abi_tag == "eabi32") return ElfAbiTag::Eabi32;
-    return std::nullopt;
+ElfAbiTag elf_abi_tag(const AbiEntry& abi) {
+    return abi.elf_abi_tag == "eabi32" ? ElfAbiTag::Eabi32
+                                       : ElfAbiTag::Default;
 }
 
 } // namespace cross::mips

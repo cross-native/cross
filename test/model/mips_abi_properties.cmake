@@ -156,11 +156,12 @@ function(expect_model_error label expected name address_bits properties)
     endif()
 endfunction()
 
+# Tags are checked at load time, at the line of the property.
 expect_model_error(unknown-tag
-    "ABI model 'bad_tag' requests the unsupported MIPS ELF ABI tag 'o64'"
+    "unknown-tag[.]y:6: error: ABI model 'bad_tag' requests ELF ABI tag 'o64', which mips does not define"
     bad_tag 32 "elf_abi_tag = \"o64\";")
 expect_model_error(wide-eabi
-    "ABI model 'wide_eabi' requests the ELF32 'eabi32' tag but has 64-bit addresses"
+    "wide-eabi[.]y:6: error: ABI model 'wide_eabi' requests ELF ABI tag 'eabi32', which requires 32-bit addresses"
     wide_eabi 64 "elf_abi_tag = \"eabi32\";")
 expect_model_error(empty-tag "ABI elf_abi_tag must not be empty"
     empty_tag 32 "elf_abi_tag = \"\";")

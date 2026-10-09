@@ -19,7 +19,9 @@ foreach(level O0 O2 O3 Oz)
             list(APPEND flags "--model=${CUSTOM_MODEL}" -DCUSTOM_POINTER_ABI)
         endif()
         if(mode STREQUAL private-mangler)
-            list(APPEND flags "--model=${MODEL}" -mmangling=erase-generic-arguments
+            # MODEL's profile names an ABI that CUSTOM_MODEL defines.
+            list(APPEND flags "--model=${CUSTOM_MODEL}" "--model=${MODEL}"
+                              -mmangling=erase-generic-arguments
                               -DPRIVATE_POINTER_GENERIC)
         endif()
         if(mode STREQUAL profile)
@@ -163,7 +165,8 @@ if(NOT status EQUAL 0)
     message(FATAL_ERROR "64-bit pointer arithmetic rejected a representable result\n${stdout}\n${stderr}")
 endif()
 
-execute_process(COMMAND "${CC}" "--model=${MODEL}" -mmangling=erase-generic-arguments
+execute_process(COMMAND "${CC}" "--model=${CUSTOM_MODEL}" "--model=${MODEL}"
+    -mmangling=erase-generic-arguments
     -c "${SOURCE}" -o "${OUTPUT}-collision.o"
     RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
 if(status EQUAL 0 OR NOT stderr MATCHES "link name|link symbol")

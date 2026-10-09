@@ -87,6 +87,7 @@ struct ManglingHelper {
 
 struct ManglingEntry {
     std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
     ManglingExpression entity;
     ManglingExpression label;
     ManglingExpression generic;
@@ -113,6 +114,7 @@ struct ManglingEntityDescriptor {
 
 struct ProfileEntry {
     std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
     std::vector<std::string> default_for;
     std::optional<std::string> target;
     std::optional<std::string> abi;
@@ -123,6 +125,7 @@ struct ProfileEntry {
 
 struct OptimizationEntry {
     std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
     std::optional<std::string> inherits;
     std::vector<std::string> targets;
     std::vector<OptionAssignment> options;
@@ -153,6 +156,10 @@ public:
         std::string_view name) const;
     [[nodiscard]] const OptimizationEntry* find_optimization(
         std::string_view name) const;
+    // The profiles whose default_for patterns match `triple` most
+    // specifically; more than one is an ambiguous default.
+    [[nodiscard]] std::vector<const ProfileEntry*> default_profiles(
+        std::string_view triple) const;
     [[nodiscard]] const ProfileEntry* default_profile(
         std::string_view triple) const;
 
@@ -172,7 +179,7 @@ public:
 
 private:
     bool load_text(std::string_view text, std::string origin,
-                   Diagnostics* diagnostics);
+                   Diagnostics& diagnostics);
 
     std::vector<AbiEntry> abis_;
     std::vector<ManglingEntry> manglings_;

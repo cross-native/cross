@@ -5,7 +5,6 @@
 
 #include "common/options.hpp"
 #include "middle/machine_ir.hpp"
-#include "model/model.hpp"
 #include "target/backend.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/machine_description.hpp"
@@ -277,22 +276,6 @@ public:
                 "' ABI has 32-bit addresses and cannot be selected for a "
                 "mips64 target triple; use -mabi=cross, -mabi=n64, or a "
                 "mips/mipsel triple");
-        }
-        // Object tags are model data; this writer implements EABI32 only.
-        for (const auto& abi : model_registry().abis()) {
-            if (abi.architecture != subtarget.target().architecture) continue;
-            const auto tag = elf_abi_tag(abi);
-            if (!tag) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name +
-                    "' requests the unsupported MIPS ELF ABI tag '" +
-                    abi.elf_abi_tag + "'; only 'eabi32' is implemented");
-            } else if (*tag == ElfAbiTag::Eabi32 && abi.address_bits != 32) {
-                diagnostics.command_error(
-                    "ABI model '" + abi.canonical_name +
-                    "' requests the ELF32 'eabi32' tag but has " +
-                    std::to_string(abi.address_bits) + "-bit addresses");
-            }
         }
         if (wide_abi && !subtarget.has_feature(Feature::Mips3)) {
             diagnostics.command_error(

@@ -335,6 +335,7 @@ TargetInfo make_target(ByteOrder order,
         {{0, 0, 0, 0, true, true, true, true, false, true, true}},
         {},
         {{"atomics", "m.llsc"}},
+        {{"eabi32", 32}},
     };
 }
 
