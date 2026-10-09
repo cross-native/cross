@@ -306,6 +306,10 @@ private:
         return result;
     }
 
+    static std::string attributes(const hir::Type& type) {
+        return type.may_alias ? " __attribute__((may_alias))" : "";
+    }
+
     std::string builtin(const hir::Type& type) const {
         switch (type.builtin) {
         case BuiltinType::Void: return "void";
@@ -353,7 +357,7 @@ private:
             break;
         case hir::Type::Kind::Builtin:
             out << "typedef " << qualifiers(type) << builtin(type) << ' '
-                << name(id) << ";\n";
+                << name(id) << attributes(type) << ";\n";
             break;
         case hir::Type::Kind::Pointer:
             if (!type.pointee) {
@@ -363,7 +367,7 @@ private:
             }
             emit_one(*type.pointee, out);
             out << "typedef " << name(*type.pointee) << " *" << name(id)
-                << ";\n";
+                << attributes(type) << ";\n";
             break;
         case hir::Type::Kind::Vector: {
             if (!type.element || type.scalable) {
@@ -403,7 +407,7 @@ private:
             }
             emit_one(*type.element, out);
             out << "typedef " << name(*type.element) << ' ' << name(id) << '['
-                << type.lanes << "];\n";
+                << type.lanes << ']' << attributes(type) << ";\n";
             break;
         case hir::Type::Kind::Record:
             if (!type.record) {
@@ -412,7 +416,7 @@ private:
                 break;
             }
             out << "typedef struct cross_record_" << type.record->value << ' '
-                << name(id) << ";\n";
+                << name(id) << attributes(type) << ";\n";
             break;
         }
         active_[id.value] = false;
@@ -998,8 +1002,13 @@ private:
         }
         if (value.kind == ValueKind::PointerStore) {
             const auto source = value.operands.at(1);
+            // A store through a may_alias pointee uses that type even when
+            // the stored value's conversion to it was folded away.
+            const auto& pointer = hir_.type(function_.values.at(value.operands.at(0).value).type);
+            const auto access = pointer.pointee && hir_.type(*pointer.pointee).may_alias
+                ? *pointer.pointee : function_.values.at(source.value).type;
             out_ << "  "
-                 << memory_reference(function_.values.at(source.value).type,
+                 << memory_reference(access,
                                      reference(value.operands.at(0)),
                                      value.memory_alignment,
                                      value.is_volatile_access)

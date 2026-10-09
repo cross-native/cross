@@ -100,7 +100,18 @@ $::static_assert(sizeof(struct counters) == 128uptr, "one line per counter");
 ```
 
 `[[may_alias]]` exempts a type from the effective-type aliasing rules, which
-otherwise follow C (any object may be accessed through `u8` or `i8`).
+otherwise follow C (any object may be accessed through `u8` or `i8`). Write it
+after a typedef's name or as a qualifier, as in `u32 [[may_alias]] *`.
+Converting between unrelated pointer types still goes through `void *`:
+
+```x
+typedef u32 any_u32 [[may_alias]];
+
+u32 float_bits(in f32 value) {
+    f32 copy = value;
+    return *(any_u32 *)(void *)&copy;   // the representation of value
+}
+```
 
 ## Declarations and linkage
 

@@ -78,8 +78,11 @@ global i32 point_sum(i32 x, i32 y) {
 ```
 
 Macros can call other `static` functions; a quote inside such a helper
-resolves where the helper is defined, by the same rules. A function whose
-signature uses a `$::meta` type runs only during compilation and has no symbol.
+resolves where the helper is defined, by the same rules. In a generic helper,
+the helper's typedefs and tags denote those of the instance that runs.
+Identifiers made by `$::meta::parse` or `$::meta::token` resolve like
+identifiers written in a quote at that call. A function whose signature uses a
+`$::meta` type runs only during compilation and has no symbol.
 
 ### Token operations
 

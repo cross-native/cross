@@ -237,9 +237,15 @@ private:
                                 AliasDefinitionPtr definition, bool declaration);
     void transfer_alias_rebindings(const Parser& child, const AliasDefinitionPtr& definition);
     TypePtr resolve_tag_type(std::string_view name, const Token& token) const;
-    // Block-scope typedef and tag visible at the current token, if any.
-    AliasDefinitionPtr block_type_alias(std::string_view name) const;
-    TypePtr block_tag_type(std::string_view name) const;
+    // Block-scope typedef and tag visible to a name at `location`, if any.
+    AliasDefinitionPtr block_type_alias(std::string_view name, SourceLocation location) const;
+    TypePtr block_tag_type(std::string_view name, SourceLocation location) const;
+    // A constructed name bound to a block-scope typedef or tag of this function
+    // keeps denoting that type wherever the generated code is placed, together
+    // with the block-scope definitions that the type needs.
+    void bind_block_type(MetaToken& token, bool tag, SourceLocation location) const;
+    // Every block-scope typedef and tag name visible at `location`, bound.
+    TokenSequence block_type_names(SourceLocation location) const;
     // This function's block-scope definitions that `type` needs, if any.
     std::shared_ptr<const CarriedDefinitions> block_definitions(const TypePtr& type) const;
     void import_carried(const std::shared_ptr<const CarriedDefinitions>& carried);

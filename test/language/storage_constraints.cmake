@@ -1,8 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# A register object has no address, and alignment requested through a typedef
-# reaches the object.
+# A register object has no address, register and stack storage are block-only,
+# and alignment requested through a typedef reaches the object.
 foreach(required CC OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} is required")
@@ -56,3 +56,23 @@ compile(typedef_record_aligned "" "
 typedef struct [[aligned(16)]] { u32 value; } Wide;
 global Wide object;
 \$::static_assert(\$::alignof(Wide) == 16uptr, \"record alignment through a typedef\");\n")
+
+# At file scope the storage class itself is diagnosed, once.
+function(reject_once case expected source)
+    set(input "${OUTPUT}/${case}.x")
+    file(WRITE "${input}" "${source}")
+    execute_process(COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu "${input}"
+                            -o "${OUTPUT}/${case}.s"
+        RESULT_VARIABLE status ERROR_VARIABLE err)
+    string(REGEX MATCHALL "error:" errors "${err}")
+    list(LENGTH errors count)
+    if(status EQUAL 0 OR NOT count EQUAL 1 OR
+       NOT err MATCHES "${case}\.x:[0-9]+:[0-9]+: error: ${expected}")
+        message(FATAL_ERROR "${case} was not diagnosed once with '${expected}'\n${err}")
+    endif()
+endfunction()
+set(block_only "storage is valid only at block scope")
+reject_once(file_register "'register' ${block_only}" "register u64 value \"rax\";\n")
+reject_once(file_stack "'stack' ${block_only}" "stack u32 slot;\n")
+reject_once(file_static_register "'register' ${block_only}" "static register u64 counter;\n")
+reject_once(namespace_stack "'stack' ${block_only}" "namespace inner { stack u8 bytes[4]; }\n")

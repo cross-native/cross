@@ -904,6 +904,10 @@ parameter value; it does not grant exclusivity over the caller object used only
 as an `out` or `inout` result destination. `[[may_alias]]` disables
 effective-type alias assumptions for accesses through the attributed type, but
 does not relax alignment, lifetime, address-space, atomic, or volatile rules.
+The attribute follows a typedef's declarator or qualifies a type in a
+declaration specifier or type name; accesses to members and elements of a
+`may_alias` aggregate are accesses through it. It does not make a distinct
+type: compatibility, callable identity, deduction, and mangling ignore it.
 
 A typed memory operand of a `$::_mnemonic` form performs an access through that
 operand's lvalue type. An instruction form explicitly documented as a raw or
@@ -1502,7 +1506,9 @@ declarations, imports, or activations never change an existing context.
   identifiers constructed by `$::meta::token` or `$::meta::parse` use the
   definition context of the executing macro, expander, or helper at the
   construction site, including a helper's block-scope typedefs and tags: a
-  quoted name bound to one denotes that type wherever the output is placed.
+  quoted name bound to one denotes that type wherever the output is placed,
+  and in a generic helper these are the typedefs and tags of the instance that
+  runs.
 - **Call-site context.** Tokens copied or unquoted from an invocation's input
   keep the context they were captured with. `$::meta::call_site(identifier)`
   takes a one-identifier token value and returns a token with the same
@@ -2843,8 +2849,8 @@ base-ABI location is diagnosed rather than repaired by inventing a different
 stable ABI.
 
 ```x
-void normalize(i32 status "eax");
-i32 transform(in u64 source "rdi", out u64 flags "rdx") -> "eax";
+void normalize(i32 status "eax") [[clobber()]];
+i32 transform(in u64 source "rdi", out u64 flags "rdx") -> "eax" [[clobber()]];
 ```
 
 A direct manual endpoint on `out`/`inout` replaces standard channel lowering;
@@ -2855,8 +2861,11 @@ result, unless the target defines one indivisible multi-result location.
 `[[clobber("flags", "rcx", "memory")]]` adds effects not already named as
 inputs/outputs. Standard ABIs contribute their clobbers; dynamic ABIs infer
 them. A stable definition must preserve every undeclared resource or be
-diagnosed, never silently widen its contract. A fully custom unresolved
-declaration requires `clobber(...)`; empty arguments mean no extra clobber.
+diagnosed, never silently widen its contract. A declaration is fully custom
+when it names no `abi` and every parameter and its non-`void` result have a
+manual location; a fully custom declaration of a function without a
+definition in the compilation group requires `clobber(...)`, where empty
+arguments mean no extra clobber.
 `"memory"` covers externally reachable memory and `"flags"` the ordinary
 condition-code resource.
 
@@ -2934,7 +2943,7 @@ or hard-bound `register` object may then place an integer, object pointer, or
 `label` in a floating/SIMD register view:
 
 ```x
-global void receive(in void *context "xmm0");
+global void receive(in void *context "xmm0") [[clobber()]];
 
 global void forward(in void *context) {
     register uptr opaque_bits "xmm3" = (uptr)context;
@@ -3016,7 +3025,7 @@ adjustment and load/store sequence unless the code is in an exact machine
 region supplied by a target extension.
 
 ```x
-void normalize(inout i32 status "push=>pop");
+void normalize(inout i32 status "push=>pop") [[clobber()]];
 
 global i32 update() {
     i32 status = 0;

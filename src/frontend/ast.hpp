@@ -107,6 +107,9 @@ struct Type {
     bool is_volatile{};
     bool is_atomic{};
     bool is_restrict{};
+    // Accesses through this type may alias incompatible effective types. Like
+    // an alias, the attribute does not make a distinct type.
+    bool may_alias{};
     // Only pointer types carry an address-space number. Zero is the ordinary
     // generic address space; the source location supports target diagnostics.
     std::uint32_t address_space{};
@@ -336,6 +339,8 @@ struct Expr {
     std::vector<std::unique_ptr<Expr>> arguments;
     // Quote literals alternate with token-valued unquotes in arguments.
     // Literal token sequences retain definition spans separately from splices.
+    // A `$::meta::parse` or `$::meta::token` call instead keeps the block-scope
+    // typedef and tag names visible there, bound as a quote binds them.
     std::vector<TokenSequence> quote_fragments;
     std::vector<GenericArgument> generic_arguments;
     std::vector<InitializerEntry> initializer_entries;

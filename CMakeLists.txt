@@ -327,6 +327,29 @@ if(BUILD_TESTING)
                      -P "${CMAKE_SOURCE_DIR}/test/language/storage_constraints.cmake")
     set_tests_properties(cross_storage_constraints PROPERTIES
         LABELS "feature.storage;arch.x86_64;check.compile;diagnostics")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_may_alias_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/may_alias.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/may-alias-${level}
+                         -DENTRY=may_alias_entry
+                         -DEXPECTED=1
+                         "-DCC_FLAGS=-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_may_alias_${level} PROPERTIES
+            LABELS "frontend;backend.native;arch.x86_64;check.runtime;feature.attributes;feature.evaluation;opt.${level}")
+    endforeach()
+    add_test(NAME cross_may_alias_checks
+             COMMAND "${CMAKE_COMMAND}"
+                     -DCC=$<TARGET_FILE:cross_cc>
+                     -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/may_alias.x
+                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/may-alias-checks
+                     -P "${CMAKE_SOURCE_DIR}/test/language/may_alias_checks.cmake")
+    set_tests_properties(cross_may_alias_checks PROPERTIES
+        LABELS "frontend;arch.x86_64;arch.mips;endian.big;endian.little;check.compile;diagnostics;feature.attributes;feature.evaluation")
     foreach(arch x86_64 mips)
         add_test(NAME cross_aligned_typedef_${arch}
                  COMMAND "${CMAKE_COMMAND}"
@@ -414,6 +437,32 @@ if(BUILD_TESTING)
                          -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_quote_local_records_${level} PROPERTIES
             LABELS "frontend;backend.native;arch.x86_64;check.runtime;feature.meta;feature.nominal;opt.${level}")
+        add_test(NAME cross_runtime_quote_local_generic_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/quote_local_generic.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/quote-local-generic-${level}
+                         -DENTRY=quote_local_generic_entry
+                         -DEXPECTED=1
+                         "-DCC_FLAGS=-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_quote_local_generic_${level} PROPERTIES
+            LABELS "frontend;backend.native;arch.x86_64;check.runtime;feature.meta;feature.generic;feature.nominal;opt.${level}")
+        add_test(NAME cross_runtime_parse_local_types_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/parse_local_types.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/parse-local-types-${level}
+                         -DENTRY=parse_local_types_entry
+                         -DEXPECTED=1
+                         "-DCC_FLAGS=-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_parse_local_types_${level} PROPERTIES
+            LABELS "frontend;backend.native;arch.x86_64;check.runtime;feature.meta;feature.generic;feature.nominal;opt.${level}")
         add_test(NAME cross_runtime_generic_header_redeclaration_${level}
                  COMMAND "${CMAKE_COMMAND}"
                          -DCC=$<TARGET_FILE:cross_cc>
@@ -1889,6 +1938,16 @@ if(BUILD_TESTING)
                         -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_bridge.cmake")
             set_tests_properties(cross_gcc_gimple_bridge PROPERTIES
                 LABELS "check.compile;arch.x86_64;backend.gcc")
+            add_test(NAME cross_gcc_gimple_may_alias
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_may_alias.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_may_alias_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-may-alias
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_may_alias.cmake")
+            set_tests_properties(cross_gcc_gimple_may_alias PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.gcc;feature.attributes;opt.O2;opt.O3")
         endif()
     endif()
     add_test(NAME cross_namespace
@@ -3689,6 +3748,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/abi/manual_register_errors.cmake")
     set_tests_properties(cross_manual_register_diagnostics PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;backend.native;feature.abi")
+    add_test(NAME cross_manual_clobber_contract
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/manual-clobber-contract
+                -P "${CMAKE_SOURCE_DIR}/test/backend/abi/manual_clobber_contract.cmake")
+    set_tests_properties(cross_manual_clobber_contract PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;middle;feature.abi")
     add_test(NAME cross_manual_register_sysv_optimizer
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -210,7 +210,8 @@ bool validate_attribute_names(const Program& program,
                                                                       : attribute_argument_error(attribute)) {
                 diagnostics.error(attribute.location, *error);
             } else if (subject == Subject::Object &&
-                       (attribute.name == "packed" || attribute.name == "underlying")) {
+                       (attribute.name == "packed" || attribute.name == "underlying" ||
+                        attribute.name == "may_alias")) {
                 diagnostics.error(attribute.location,
                     "attribute '" + attribute.name + "' is not valid on an object");
             }
@@ -329,6 +330,7 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
     result->is_volatile = source->is_volatile || (substituted && result->is_volatile);
     result->is_atomic = source->is_atomic || (substituted && result->is_atomic);
     result->is_restrict = source->is_restrict || (substituted && result->is_restrict);
+    result->may_alias = source->may_alias || (substituted && result->may_alias);
     if (!substituted || source->address_space_location.valid()) {
         result->address_space = source->address_space;
         result->address_space_location = source->address_space_location;
@@ -352,6 +354,9 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
             ? substitutions.nominal->substitute(source->nominal_identity) : source->nominal_identity;
     co_return result;
 }
+
+void instantiate_token_bindings(TokenSequence& tokens, const TypeSubstitutions& types,
+                                const ValueSubstitutions& values);
 
 ContinuationTask<std::unique_ptr<Expr>> clone_expr_async(const Expr& source,
                                  const TypeSubstitutions& types,
@@ -392,6 +397,9 @@ ContinuationTask<std::unique_ptr<Expr>> clone_expr_async(const Expr& source,
         }
         copy->string_value = node->string_value;
         copy->quote_fragments = node->quote_fragments;
+        if (types.nominal)
+            for (auto& fragment : copy->quote_fragments)
+                instantiate_token_bindings(fragment, types, *active_values);
         copy->evaluated_integer = node->evaluated_integer;
         copy->evaluated_floating = node->evaluated_floating;
         copy->evaluated_address = node->evaluated_address;
@@ -505,6 +513,81 @@ std::vector<Attribute> clone_attributes(
         }
     }
     return result;
+}
+
+RecordDecl instantiate_record(const RecordDecl& source, const TypeSubstitutions& types,
+                              const ValueSubstitutions& values) {
+    RecordDecl copy;
+    copy.location = source.location;
+    copy.name = source.name;
+    copy.is_union = source.is_union;
+    copy.complete = source.complete;
+    copy.nominal_identity = types.nominal->substitute(source.nominal_identity);
+    copy.attributes = clone_attributes(source.attributes, types, values);
+    for (const auto& member : source.members)
+        copy.members.push_back({member.location, member.name, clone_type(member.type, types, values),
+            member.bit_width ? clone_expr(*member.bit_width, types, values) : nullptr,
+            clone_attributes(member.attributes, types, values), member.fresh});
+    return copy;
+}
+
+EnumDecl instantiate_enumeration(const EnumDecl& source, const TypeSubstitutions& types,
+                                 const ValueSubstitutions& values) {
+    EnumDecl copy;
+    copy.location = source.location;
+    copy.name = source.name;
+    copy.local = source.local;
+    copy.underlying = source.underlying;
+    copy.captured_type_errors = source.captured_type_errors;
+    copy.nominal_identity = types.nominal->substitute(source.nominal_identity);
+    copy.attributes = clone_attributes(source.attributes, types, values);
+    for (const auto& enumerator : source.enumerators) {
+        auto binding = enumerator.binding;
+        binding.enumeration = types.nominal->substitute(binding.enumeration);
+        copy.enumerators.push_back({enumerator.location, enumerator.name,
+            enumerator.initializer ? clone_expr(*enumerator.initializer, types, values) : nullptr,
+            {}, std::move(binding)});
+    }
+    return copy;
+}
+
+// A generic instance's constructed names denote the instance's block-scope
+// types: substitute into the template's typedef and tag bindings and into the
+// definitions they carry.
+void instantiate_token_bindings(TokenSequence& tokens, const TypeSubstitutions& types,
+                                const ValueSubstitutions& values) {
+    std::unordered_map<const CarriedDefinitions*, std::shared_ptr<const CarriedDefinitions>> instances;
+    const auto carried = [&](const std::shared_ptr<const CarriedDefinitions>& source)
+        -> std::shared_ptr<const CarriedDefinitions> {
+        if (!source) return {};
+        auto& instance = instances[source.get()];
+        if (!instance) {
+            auto result = std::make_shared<CarriedDefinitions>();
+            for (const auto& record : source->records)
+                result->records.push_back(
+                    std::make_shared<const RecordDecl>(instantiate_record(*record, types, values)));
+            for (const auto& enumeration : source->enumerations)
+                result->enumerations.push_back(
+                    std::make_shared<const EnumDecl>(instantiate_enumeration(*enumeration, types, values)));
+            instance = std::move(result);
+        }
+        return instance;
+    };
+    for (auto& token : tokens) {
+        if (const auto alias = token.origin.alias_binding) {
+            auto binding = std::make_shared<AliasBinding>(*alias);
+            binding->definition = std::make_shared<const AliasDefinition>(
+                clone_type(alias->definition->instantiate(), types, values), alias->definition->storage());
+            binding->carried = carried(alias->carried);
+            token.origin.alias_binding = std::move(binding);
+        }
+        if (const auto tag = token.origin.tag_binding) {
+            auto binding = std::make_shared<TagBinding>(*tag);
+            binding->type.identity = types.nominal->substitute(tag->type.identity);
+            binding->carried = carried(tag->carried);
+            token.origin.tag_binding = std::move(binding);
+        }
+    }
 }
 
 std::unique_ptr<VariableDecl> clone_variable(
@@ -2273,42 +2356,14 @@ std::unique_ptr<FunctionDecl> instantiate(
         // tables, and definitions may refer to each other in either direction.
         std::vector<RecordDecl> records;
         std::vector<EnumDecl> enumerations;
-        for (const auto& record : program.records) {
-            if (!record.nominal_identity ||
-                record.nominal_identity->generic_owner != source.generic_tag_owner) continue;
-            RecordDecl copy;
-            copy.location = record.location;
-            copy.name = record.name;
-            copy.is_union = record.is_union;
-            copy.complete = record.complete;
-            copy.nominal_identity = types.nominal->substitute(record.nominal_identity);
-            copy.attributes = clone_attributes(record.attributes, types, values);
-            for (const auto& member : record.members)
-                copy.members.push_back({member.location, member.name, clone_type(member.type, types, values),
-                    member.bit_width ? clone_expr(*member.bit_width, types, values) : nullptr,
-                    clone_attributes(member.attributes, types, values), member.fresh});
-            records.push_back(std::move(copy));
-        }
-        for (const auto& enumeration : program.enumerations) {
-            if (!enumeration.nominal_identity ||
-                enumeration.nominal_identity->generic_owner != source.generic_tag_owner) continue;
-            EnumDecl copy;
-            copy.location = enumeration.location;
-            copy.name = enumeration.name;
-            copy.local = enumeration.local;
-            copy.underlying = enumeration.underlying;
-            copy.captured_type_errors = enumeration.captured_type_errors;
-            copy.nominal_identity = types.nominal->substitute(enumeration.nominal_identity);
-            copy.attributes = clone_attributes(enumeration.attributes, types, values);
-            for (const auto& enumerator : enumeration.enumerators) {
-                auto binding = enumerator.binding;
-                binding.enumeration = types.nominal->substitute(binding.enumeration);
-                copy.enumerators.push_back({enumerator.location, enumerator.name,
-                    enumerator.initializer ? clone_expr(*enumerator.initializer, types, values) : nullptr,
-                    {}, std::move(binding)});
-            }
-            enumerations.push_back(std::move(copy));
-        }
+        for (const auto& record : program.records)
+            if (record.nominal_identity &&
+                record.nominal_identity->generic_owner == source.generic_tag_owner)
+                records.push_back(instantiate_record(record, types, values));
+        for (const auto& enumeration : program.enumerations)
+            if (enumeration.nominal_identity &&
+                enumeration.nominal_identity->generic_owner == source.generic_tag_owner)
+                enumerations.push_back(instantiate_enumeration(enumeration, types, values));
         if (diagnostics.errors() != initial_errors) return {};
         program.records.insert(program.records.end(),
             std::make_move_iterator(records.begin()), std::make_move_iterator(records.end()));
@@ -8920,6 +8975,18 @@ private:
             value.origin = {token_origin(macro_context_->invocation).span,
                             {}, context, {}, 0, {}};
             value.origin.span_end = token_origin(macro_context_->invocation).last_span();
+            // The construction site's block-scope typedefs and tags bind names
+            // as they do in a quote there.
+            if (value.kind == TokenKind::Identifier && !construction.quote_fragments.empty()) {
+                const bool tag = !result.empty() && (result.back().text == "struct" ||
+                    result.back().text == "union" || result.back().text == "enum");
+                for (const auto& bound : construction.quote_fragments.front()) {
+                    if (bound.text != value.text) continue;
+                    if (tag && bound.origin.tag_binding) value.origin.tag_binding = bound.origin.tag_binding;
+                    else if (!tag && bound.origin.alias_binding)
+                        value.origin.alias_binding = bound.origin.alias_binding;
+                }
+            }
             if (!append_tokens(result, {value}, location)) return std::nullopt;
         }
         return result;
@@ -11285,7 +11352,7 @@ private:
     EvaluationTask<bool> meta_record_effective_access_async(const EvalValue& base,
                                       SourceLocation location, bool write = false) {
         if (!base.meta_pointer || !base.meta_pointer->mutable_buffer ||
-            base.meta_pointer->union_member_view) co_return true;
+            base.meta_pointer->union_member_view || base.type->pointee->may_alias) co_return true;
         const auto index = (co_await meta_access_index_async(base, location, write));
         const auto size = (co_await meta_object_size_async(base.type->pointee));
         if (!index || !size) co_return false;
@@ -11570,7 +11637,7 @@ private:
                     frame.alignment = (co_await meta_object_alignment_async(type->element));
                     if (!frame.stride || !frame.alignment) co_return false;
                     if (type->kind == Type::Kind::Vector && frame.base.meta_pointer->mutable_buffer &&
-                        !frame.base.meta_pointer->union_member_view) {
+                        !frame.base.meta_pointer->union_member_view && !type->may_alias) {
                         const auto& tags = frame.base.meta_pointer->mutable_buffer->effective_type;
                         for (std::size_t byte = 0; byte < *frame.size; ++byte) {
                             const auto tag = tags[*frame.index + byte];
@@ -11639,6 +11706,7 @@ private:
             }
             EvalValue value = frame.base;
             value.type = pointer_type(clone_type(child));
+            value.type->pointee->may_alias = value.type->pointee->may_alias || type->may_alias;
             auto& pointer = *value.meta_pointer;
             pointer.view_offset = *frame.index + offset;
             pointer.view_length = size;
@@ -11828,6 +11896,7 @@ private:
         type->is_const = type->is_const || base->type->pointee->is_const;
         type->is_volatile = type->is_volatile ||
             base->type->pointee->is_volatile;
+        type->may_alias = type->may_alias || base->type->pointee->may_alias;
         auto pointer_type_value = pointer_type(type);
         pointer_type_value->address_space = base->type->address_space;
         base->type = std::move(pointer_type_value);
@@ -12053,7 +12122,8 @@ private:
                         co_return std::nullopt;
                     }
                     const auto tag = pointer.mutable_buffer->effective_type[*index + byte];
-                    if (!pointer.union_member_view && tag != 0 && tag != 0xffU) {
+                    if (!pointer.union_member_view && !base.type->pointee->may_alias &&
+                        tag != 0 && tag != 0xffU) {
                         fail(location, "meta pointer read violates effective type");
                         co_return std::nullopt;
                     }
@@ -12188,7 +12258,8 @@ private:
                     co_return std::nullopt;
                 }
                 const auto tag = pointer.mutable_buffer->effective_type[*index + offset];
-                bool typed = required != 0 && !pointer.union_member_view;
+                bool typed = required != 0 && !pointer.union_member_view &&
+                    !base.type->pointee->may_alias;
                 if (typed && pointer.bit_field) typed = !(co_await meta_bit_field_record_view_async(pointer));
                 if (typed && !byte_meta_type(access_type) && tag != 0 &&
                     !compatible_meta_type(static_cast<BuiltinType>(tag - 1),
@@ -12563,7 +12634,8 @@ private:
             if (!source) co_return std::nullopt;
             for (std::size_t byte = 0; byte < extent; ++byte) {
                 const auto tag = target.mutable_buffer->effective_type[*offset + byte];
-                if (!target.union_member_view && tag != 0 && tag != 0xffU) {
+                if (!target.union_member_view && !pointer->type->pointee->may_alias &&
+                    tag != 0 && tag != 0xffU) {
                     fail(location, "meta pointer write violates effective type");
                     co_return std::nullopt;
                 }
@@ -12607,10 +12679,11 @@ private:
                              location));
             if (!source || !source->object) co_return std::nullopt;
             const auto size = *(co_await meta_object_size_async(pointer->type->pointee));
+            const bool untyped = pointer->type->pointee->may_alias;
             for (std::size_t byte = 0; byte < size; ++byte) {
                 const auto incoming = source->object->effective_type[byte];
                 const auto previous = target.mutable_buffer->effective_type[*offset + byte];
-                if (!target.union_member_view && incoming != 0 && previous != 0 &&
+                if (!target.union_member_view && !untyped && incoming != 0 && previous != 0 &&
                     incoming != previous &&
                     (incoming == 0xffU || previous == 0xffU ||
                      !compatible_meta_type(
@@ -12631,10 +12704,11 @@ private:
             for (std::size_t byte = 0; byte < size; ++byte) {
                 target.mutable_buffer->data[*offset + byte] = source->object->data[byte];
                 target.mutable_buffer->assigned[*offset + byte] = source->object->assigned[byte];
-                target.mutable_buffer->effective_type[*offset + byte] =
-                    source->object->effective_type[byte];
+                if (!untyped)
+                    target.mutable_buffer->effective_type[*offset + byte] =
+                        source->object->effective_type[byte];
             }
-            if (!(co_await register_meta_record_async(*target.mutable_buffer, *offset,
+            if (!untyped && !(co_await register_meta_record_async(*target.mutable_buffer, *offset,
                     pointer->type->pointee, location)))
                 co_return std::nullopt;
             co_return source;
@@ -12642,9 +12716,12 @@ private:
         if (!scalar_meta_pointer(*pointer, location)) co_return std::nullopt;
         const auto size = meta_scalar_size(*pointer);
         const auto access_type = pointer->type->pointee->builtin;
-        if (!byte_meta_type(access_type) && !target.bit_field &&
+        // Like a byte access, a may_alias access neither checks nor
+        // establishes an effective type.
+        const bool untyped = byte_meta_type(access_type) || pointer->type->pointee->may_alias;
+        if (!untyped && !target.bit_field &&
             !(co_await meta_record_effective_access_async(*pointer, location, true))) co_return std::nullopt;
-        if (!byte_meta_type(access_type) && !target.union_member_view &&
+        if (!untyped && !target.union_member_view &&
             (!target.bit_field || !(co_await meta_bit_field_record_view_async(target)))) {
             for (std::size_t index = 0; index < size; ++index) {
                 if (target.bit_field) {
@@ -12729,7 +12806,7 @@ private:
                 shift_right(bits,
                     static_cast<unsigned>(lane * 8)).low & 0xffU);
             target.mutable_buffer->assigned[*offset + index] = 0xffU;
-            if (!byte_meta_type(access_type))
+            if (!untyped)
                 target.mutable_buffer->effective_type[*offset + index] =
                     static_cast<std::uint8_t>(access_type) + 1;
         }

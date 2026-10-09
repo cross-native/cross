@@ -1923,6 +1923,20 @@ private:
                     }
                 }
             }
+            // Without an ABI base, nothing else states an external
+            // interface's clobbers.
+            if (!function.definition && !function.alias_target &&
+                fully_custom(function)) {
+                for (const auto* declaration : function.declarations) {
+                    if (!declaration->attribute("clobber")) {
+                        diagnostics_.error(
+                            declaration->location,
+                            "a fully custom unresolved declaration requires "
+                            "a clobber attribute; clobber() declares no extra "
+                            "clobbers");
+                    }
+                }
+            }
             if (!function.definition) {
                 function.ownership = BodyOwnership::None;
             } else if (function.naked) {
@@ -2131,6 +2145,21 @@ private:
         }
     }
 
+    // Every endpoint is manual and no abi attribute supplies a base.
+    bool fully_custom(const Function& function) const {
+        const auto& result = module_.type(function.result_type);
+        const bool is_void = result.kind == Type::Kind::Builtin &&
+                             result.builtin == BuiltinType::Void;
+        const auto manual = [](const Parameter& parameter) {
+            return !automatic(parameter.physical_location);
+        };
+        return !function.abi_explicit && !function.variadic &&
+               (is_void || !automatic(function.result_location)) &&
+               std::all_of(function.parameters.begin(), function.parameters.end(), manual) &&
+               (!automatic(function.result_location) ||
+                std::any_of(function.parameters.begin(), function.parameters.end(), manual));
+    }
+
     void validate_naked_interface(const Function& function) {
         if (function.variadic) {
             diagnostics_.error(function.location,
@@ -2184,7 +2213,9 @@ private:
                 module_.objects.push_back(make_object(*source, allow_inferred_bounds));
             } else {
                 id = found->second;
-                if (module_.objects[id.value].type != intern_type(source->type)) {
+                // A may_alias typedef denotes the same type.
+                if (module_.without_may_alias(module_.objects[id.value].type) !=
+                    module_.without_may_alias(intern_type(source->type))) {
                     diagnostics_.error(source->location,
                                        "incompatible redeclaration of object '" + source->name + "'");
                 }
@@ -2536,6 +2567,7 @@ bool identical(const Type& type, const Type& candidate) {
         type.is_volatile == candidate.is_volatile &&
         type.is_restrict == candidate.is_restrict &&
         type.is_atomic == candidate.is_atomic &&
+        type.may_alias == candidate.may_alias &&
         type.address_space == candidate.address_space &&
         type.alignment == candidate.alignment;
 }
@@ -2553,7 +2585,8 @@ std::optional<TypeId> Module::builtin(BuiltinType kind) const {
     return find_type(*this, type, [&](const Type& candidate) {
         return candidate.kind == Type::Kind::Builtin && candidate.builtin == kind &&
             !candidate.is_const && !candidate.is_volatile &&
-            !candidate.is_atomic && !candidate.is_restrict && !candidate.alignment;
+            !candidate.is_atomic && !candidate.is_restrict && !candidate.may_alias &&
+            !candidate.alignment;
     });
 }
 
@@ -2574,6 +2607,7 @@ TypeId Module::intern_type(const TypePtr& source) {
         candidate.is_volatile = source->is_volatile;
         candidate.is_atomic = source->is_atomic;
         candidate.is_restrict = source->is_restrict;
+        candidate.may_alias = source->may_alias;
         candidate.address_space = source->address_space;
         candidate.alignment = source->alignment;
         if (source->kind == cross::Type::Kind::Pointer) {
@@ -2678,7 +2712,7 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
         PointerJoinEquality equal_leaf(Type left, Type right) const {
             auto a = module.type(left), b = module.type(right);
             a.is_const = b.is_const = a.is_volatile = b.is_volatile = false;
-            a.is_restrict = b.is_restrict = false;
+            a.is_restrict = b.is_restrict = a.may_alias = b.may_alias = false;
             a.alignment = b.alignment = 0;
             return identical(a, b) ? PointerJoinEquality::Same : PointerJoinEquality::Different;
         }
@@ -2712,7 +2746,7 @@ TypeId Module::pointer_to(TypeId pointee) {
             return candidate.kind == Type::Kind::Pointer &&
                 candidate.pointee == pointee && !candidate.is_const &&
                 !candidate.is_volatile && !candidate.is_atomic &&
-                !candidate.is_restrict && candidate.address_space == 0 &&
+                !candidate.is_restrict && !candidate.may_alias && candidate.address_space == 0 &&
                 !candidate.alignment && candidate.nominal_key().empty();
         }))
         return *found;
@@ -2747,10 +2781,25 @@ TypeId Module::without_alignment(TypeId id) {
     return result;
 }
 
+TypeId Module::without_may_alias(TypeId id) {
+    Type candidate = type(id);
+    if (candidate.pointee) candidate.pointee = without_may_alias(*candidate.pointee);
+    if (candidate.element) candidate.element = without_may_alias(*candidate.element);
+    if (!candidate.may_alias && candidate.pointee == type(id).pointee &&
+        candidate.element == type(id).element) return id;
+    candidate.may_alias = false;
+    if (const auto found = find_type(*this, candidate,
+            [&](const Type& existing) { return identical(existing, candidate); }))
+        return *found;
+    const TypeId result{static_cast<std::uint32_t>(types.size())};
+    types.push_back(std::move(candidate));
+    return result;
+}
+
 TypeId Module::unqualified(TypeId id) {
     const auto& source = type(id);
     if (!source.is_const && !source.is_volatile && !source.is_atomic &&
-        !source.is_restrict) {
+        !source.is_restrict && !source.may_alias) {
         return id;
     }
     Type candidate = source;
@@ -2758,6 +2807,7 @@ TypeId Module::unqualified(TypeId id) {
     candidate.is_volatile = false;
     candidate.is_atomic = false;
     candidate.is_restrict = false;
+    candidate.may_alias = false;
     if (const auto found = find_type(*this, candidate,
             [&](const Type& existing) { return identical(existing, candidate); }))
         return *found;
@@ -2767,15 +2817,17 @@ TypeId Module::unqualified(TypeId id) {
 }
 
 TypeId Module::add_qualifiers(TypeId id, bool is_const,
-                              bool is_volatile) {
+                              bool is_volatile, bool may_alias) {
     const auto& source = type(id);
     if ((!is_const || source.is_const) &&
-        (!is_volatile || source.is_volatile)) {
+        (!is_volatile || source.is_volatile) &&
+        (!may_alias || source.may_alias)) {
         return id;
     }
     Type candidate = source;
     candidate.is_const = candidate.is_const || is_const;
     candidate.is_volatile = candidate.is_volatile || is_volatile;
+    candidate.may_alias = candidate.may_alias || may_alias;
     if (const auto found = find_type(*this, candidate,
             [&](const Type& existing) { return identical(existing, candidate); }))
         return *found;
@@ -2796,7 +2848,7 @@ TypeId Module::vector_of(TypeId element, std::uint32_t lanes,
                 candidate.element == element && candidate.lanes == lanes &&
                 candidate.scalable == scalable && !candidate.is_const &&
                 !candidate.is_volatile && !candidate.is_atomic &&
-                !candidate.is_restrict && !candidate.alignment;
+                !candidate.is_restrict && !candidate.may_alias && !candidate.alignment;
         }))
         return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
@@ -2813,7 +2865,8 @@ TypeId Module::array_of(TypeId element, std::uint32_t elements) {
             return candidate.kind == Type::Kind::Array &&
                 candidate.element == element && candidate.lanes == elements &&
                 !candidate.is_const && !candidate.is_volatile &&
-                !candidate.is_atomic && !candidate.is_restrict && !candidate.alignment;
+                !candidate.is_atomic && !candidate.is_restrict && !candidate.may_alias &&
+                !candidate.alignment;
         }))
         return *found;
     const TypeId id{static_cast<std::uint32_t>(types.size())};
@@ -3046,6 +3099,7 @@ bool same_interface(const Module& module, const FunctionSignature& left,
     if (left.result_type != right.result_type) {
         auto a = module.type(left.result_type), b = module.type(right.result_type);
         a.alignment = b.alignment = 0;
+        a.may_alias = b.may_alias = false;
         if (identical(a, b)) normalized.result_type = left.result_type;
     }
     for (std::size_t index = 0; index < left.parameters.size(); ++index) {
@@ -3055,6 +3109,7 @@ bool same_interface(const Module& module, const FunctionSignature& left,
         auto a = module.type(parameter.type), b = module.type(other.type);
         if (parameter.mode == ParameterMode::In) a.is_const = b.is_const = false;
         a.alignment = b.alignment = 0;
+        a.may_alias = b.may_alias = false;
         if (identical(a, b)) other.type = parameter.type;
     }
     return left == normalized;
@@ -3067,6 +3122,7 @@ std::string type_name(const Module& module, TypeId id) {
     if (type.is_volatile) prefix += "volatile ";
     if (type.is_restrict) prefix += "restrict ";
     if (type.is_atomic) prefix += "[[atomic]] ";
+    if (type.may_alias) prefix += "[[may_alias]] ";
     if (type.alignment) prefix += "[[aligned(" + std::to_string(type.alignment) + ")]] ";
     if (type.kind == Type::Kind::Pointer) {
         return prefix + type_name(module, *type.pointee) +

@@ -1501,7 +1501,8 @@ private:
 
     hir::TypeId qualified_array_element(hir::TypeId array) {
         const auto& type = hir_.type(array);
-        return hir_.add_qualifiers(*type.element, type.is_const, type.is_volatile);
+        return hir_.add_qualifiers(*type.element, type.is_const, type.is_volatile,
+                                   type.may_alias);
     }
 
     ValueId decay_array_address(ValueId address, hir::TypeId array,
@@ -1546,7 +1547,7 @@ private:
                                       const hir::RecordMember& member) {
         const auto& owner = hir_.type(record_type);
         return hir_.add_qualifiers(member.type, owner.is_const,
-                                   owner.is_volatile);
+                                   owner.is_volatile, owner.may_alias);
     }
 
     hir::TypeId bit_field_storage_type(hir::TypeId member_type) {

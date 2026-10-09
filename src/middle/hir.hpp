@@ -102,6 +102,9 @@ struct Type {
     std::optional<RecordId> record;
     std::optional<FunctionSignature> function{};
     bool is_restrict{};
+    // Accesses through this type may alias any effective type. Values convert
+    // like the type without it.
+    bool may_alias{};
     std::uint32_t address_space{};
     // Alignment requested by a typedef's `aligned`, or zero. It distinguishes
     // object layouts; values convert like the type without it.
@@ -235,9 +238,11 @@ public:
     [[nodiscard]] TypeId pointer_to(TypeId pointee);
     [[nodiscard]] TypeId without_top_level_const(TypeId type);
     [[nodiscard]] TypeId without_alignment(TypeId type);
+    // The type with may_alias removed at every pointer and element level.
+    [[nodiscard]] TypeId without_may_alias(TypeId type);
     [[nodiscard]] TypeId unqualified(TypeId type);
     [[nodiscard]] TypeId add_qualifiers(TypeId type, bool is_const,
-                                        bool is_volatile);
+                                        bool is_volatile, bool may_alias = false);
     [[nodiscard]] TypeId vector_of(TypeId element, std::uint32_t lanes,
                                    bool scalable = false);
     [[nodiscard]] TypeId array_of(TypeId element, std::uint32_t elements);

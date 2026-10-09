@@ -2694,6 +2694,12 @@ void Parser::apply_type_attribute(
         else type->is_atomic = true;
         return;
     }
+    if (attribute.name == "may_alias") {
+        if (!attribute.arguments.empty())
+            reject(attribute.location, "may_alias does not take arguments");
+        else type->may_alias = true;
+        return;
+    }
     if (attribute.name == "address_space") {
         if (attribute.arguments.size() != 1) {
             reject(attribute.location,
@@ -3049,8 +3055,8 @@ void Parser::remember_tag_binding(std::size_t token_index, std::string_view spel
     token.tag_binding = std::move(binding);
 }
 
-AliasDefinitionPtr Parser::block_type_alias(std::string_view name) const {
-    const NameKey key(name, current().location);
+AliasDefinitionPtr Parser::block_type_alias(std::string_view name, SourceLocation location) const {
+    const NameKey key(name, location);
     for (auto scope = local_type_scopes_.size(); scope != 0; --scope) {
         if (const auto found = local_type_scopes_[scope - 1].find(key);
             found != local_type_scopes_[scope - 1].end()) return found->second;
@@ -3059,17 +3065,58 @@ AliasDefinitionPtr Parser::block_type_alias(std::string_view name) const {
     return {};
 }
 
-TypePtr Parser::block_tag_type(std::string_view name) const {
-    const NameKey key(name, current().location);
+TypePtr Parser::block_tag_type(std::string_view name, SourceLocation location) const {
+    const NameKey key(name, location);
     for (auto scope = local_tag_scopes_.size(); scope != 0; --scope)
         if (const auto found = local_tag_scopes_[scope - 1].find(key);
             found != local_tag_scopes_[scope - 1].end()) return found->second.type;
     return {};
 }
 
+void Parser::bind_block_type(MetaToken& token, bool tag, SourceLocation location) const {
+    if (tag && !token.origin.tag_binding) {
+        if (const auto type = block_tag_type(token.text, location)) {
+            auto binding = std::make_shared<TagBinding>(TagBinding{
+                type->kind != Type::Kind::Record ? TagBinding::Kind::Enumeration
+                    : type->is_union ? TagBinding::Kind::Union : TagBinding::Kind::Structure,
+                TagBinding::Role::Use, token.text, type->nominal_key(), type->builtin,
+                type->captured_tag_errors});
+            binding->carried = block_definitions(type);
+            token.origin.tag_binding = std::move(binding);
+        }
+    } else if (!tag && !token.origin.alias_binding) {
+        if (auto alias = block_type_alias(token.text, location)) {
+            auto carried = block_definitions(alias->instantiate());
+            token.origin.alias_binding = std::make_shared<const AliasBinding>(AliasBinding{
+                AliasBinding::Role::Use, token.text, std::move(alias), nullptr, std::move(carried)});
+        }
+    }
+}
+
+TokenSequence Parser::block_type_names(SourceLocation location) const {
+    TokenSequence result;
+    const auto add = [&](const NameKey& key, bool tag) {
+        // Text cannot spell a private identity.
+        if (key.fresh || std::any_of(result.begin(), result.end(), [&](const MetaToken& bound) {
+                return bound.text == key.spelling && (tag ? bound.origin.tag_binding != nullptr
+                                                          : bound.origin.alias_binding != nullptr);
+            })) return;
+        MetaToken token;
+        token.kind = TokenKind::Identifier;
+        token.text = key.spelling;
+        bind_block_type(token, tag, location);
+        if (token.origin.tag_binding || token.origin.alias_binding) result.push_back(std::move(token));
+    };
+    for (const auto& scope : local_type_scopes_)
+        for (const auto& [key, alias] : scope) add(key, false);
+    for (const auto& scope : local_tag_scopes_)
+        for (const auto& [key, tag] : scope) add(key, true);
+    return result;
+}
+
 std::shared_ptr<const CarriedDefinitions> Parser::block_definitions(const TypePtr& type) const {
-    // Definitions of the current function are still pending; generic-owned ones
-    // are instantiated per instance instead of being carried.
+    // Definitions of the current function are still pending. A generic
+    // instance substitutes its arguments into the copies of its own.
     auto result = std::make_shared<CarriedDefinitions>();
     std::unordered_set<const Type*> seen;
     std::vector<TypePtr> types{type};
@@ -3084,7 +3131,7 @@ std::shared_ptr<const CarriedDefinitions> Parser::block_definitions(const TypePt
             if (!expression) continue;
             const auto enumeration = expression->kind == Expr::Kind::Name
                 ? name_key(*expression).binding.enumeration : nullptr;
-            if (enumeration && !enumeration->generic_owner &&
+            if (enumeration &&
                 std::none_of(result->enumerations.begin(), result->enumerations.end(),
                     [&](const auto& carried) { return carried->nominal_identity == enumeration; })) {
                 const auto found = std::find_if(pending_enumerations_.begin(), pending_enumerations_.end(),
@@ -3116,8 +3163,7 @@ std::shared_ptr<const CarriedDefinitions> Parser::block_definitions(const TypePt
             types.push_back(next->function->result);
             for (const auto& parameter : next->function->parameters) types.push_back(parameter.type);
         }
-        if (next->kind != Type::Kind::Record || !next->nominal_identity ||
-            next->nominal_identity->generic_owner) continue;
+        if (next->kind != Type::Kind::Record || !next->nominal_identity) continue;
         const auto key = next->nominal_key();
         if (std::any_of(result->records.begin(), result->records.end(),
                 [&](const auto& record) { return record->nominal_key() == key; })) continue;
@@ -3375,7 +3421,7 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
         leading_attributes.swap(*declaration_attributes);
         for (auto& attribute : leading_attributes) {
             if (attribute.name == "atomic" || attribute.name == "address_space" ||
-                is_vector_type_attribute(attribute.name))
+                attribute.name == "may_alias" || is_vector_type_attribute(attribute.name))
                 deferred_type_attributes.push_back(std::move(attribute));
             else declaration_attributes->push_back(std::move(attribute));
         }
@@ -3383,7 +3429,7 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
     const auto consume_specifier_attributes = [&](TypePtr* built_type) -> EvaluationTask<void> {
         for (auto& attribute : (co_await parse_attributes_async(true))) {
             if (attribute.name == "atomic" || attribute.name == "address_space" ||
-                is_vector_type_attribute(attribute.name)) {
+                attribute.name == "may_alias" || is_vector_type_attribute(attribute.name)) {
                 if (built_type)
                     apply_type_attribute(*built_type, attribute, &pending_address_space);
                 else deferred_type_attributes.push_back(std::move(attribute));
@@ -3956,9 +4002,10 @@ EvaluationTask<std::vector<std::string>> Parser::preview_generic_types_async(boo
         // but never inspect expression arguments or a function's body.
         (co_await expose_async(cursor));
         if (!work(cursor)) break;
+        // A static assertion has no declarator, so no generic header either.
         if (tokens_[cursor].kind == TokenKind::End || tokens_[cursor].is(";") ||
             tokens_[cursor].is("{") || tokens_[cursor].is("=") ||
-            tokens_[cursor].is(",")) break;
+            tokens_[cursor].is(",") || tokens_[cursor].is("$::static_assert")) break;
         if (tokens_[cursor].is("struct") || tokens_[cursor].is("union") ||
             tokens_[cursor].is("enum")) {
             // A written tag definition is part of the result specifier, not
@@ -4829,10 +4876,10 @@ AliasDefinitionPtr Parser::register_typedef(SourceLocation location, std::string
     for (const auto& attribute : attributes) {
         if (attribute.name != "aligned" && attribute.name != "abi" &&
             attribute.name != "clobber" && attribute.name != "stack_cleanup" &&
-            !is_vector_type_attribute(attribute.name))
+            attribute.name != "may_alias" && !is_vector_type_attribute(attribute.name))
             type_error(type, attribute.location,
                 "attribute '" + attribute.name + "' is not valid on a typedef");
-        if (is_vector_type_attribute(attribute.name))
+        if (attribute.name == "may_alias" || is_vector_type_attribute(attribute.name))
             apply_type_attribute(type, attribute);
     }
     // Alignment applies to the declared type, after any vector construction.
@@ -5570,6 +5617,7 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
     bool linkage_seen = false;
     bool inline_hint = false;
     bool typedef_seen = false;
+    bool block_storage = false;
     const auto consume_storage_async = [&]() -> EvaluationTask<bool> {
         const auto location = (co_await current_async()).location;
         if ((co_await consume_async("typedef"))) {
@@ -5600,8 +5648,16 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
     for (;;) {
         const auto next_token = co_await current_async();
         if (!next_token.is("typedef") && !next_token.is("global") &&
-            !next_token.is("static") && !next_token.is("inline")) break;
+            !next_token.is("static") && !next_token.is("inline") &&
+            !next_token.is("register") && !next_token.is("stack")) break;
         ProductionScope specifier(*this, SyntaxProduction::DeclarationSpecifier);
+        if (next_token.is("register") || next_token.is("stack")) {
+            diagnostics_.error(next_token.location, "'" + std::string(next_token.text) +
+                "' storage is valid only at block scope");
+            block_storage = true;
+            ++index_;
+            continue;
+        }
         (void)(co_await consume_storage_async());
     }
 
@@ -5632,6 +5688,7 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
     if (preparing_header_) prepared_declarator_start_ = index_;
     retaining_shared_specifiers_ = shared_specifiers_restore.previous;
     specifiers.finish();
+    if (block_storage) { synchronize_external(); co_return; }
     if (typedef_seen) {
         resolve_specifier_attributes(specifier_attributes, true);
         co_await parse_typedef_async(name_space, std::move(attributes), std::move(base_type), location);
@@ -7949,6 +8006,10 @@ Parser::ExpressionTask Parser::parse_postfix_async(std::unique_ptr<Expr> seed) {
             if (expression->kind == Expr::Kind::Name && (expression->text == "$::meta::parse" ||
                 expression->text == "$::meta::token" || expression->text == "$::meta::group"))
                 call->translation_context = syntax_context(expression->location);
+            if (expression->kind == Expr::Kind::Name && (expression->text == "$::meta::parse" ||
+                expression->text == "$::meta::token") && !parsing_public_fragment_)
+                if (auto names = block_type_names(expression->location); !names.empty())
+                    call->quote_fragments.push_back(std::move(names));
             call->generic_visible_at_call =
                 expression->kind == Expr::Kind::Name &&
                 known_generic_name(*expression);
@@ -8096,31 +8157,10 @@ Parser::ExpressionTask Parser::parse_quote_async() {
                 co_return result;
             }
         }
-        // A name bound to a block-scope typedef or tag of this function keeps
-        // denoting that type wherever the generated code is placed, together
-        // with the block-scope definitions that the type needs.
         MetaToken token((co_await current_async()));
-        if (token.kind == TokenKind::Identifier && !parsing_public_fragment_) {
-            const bool tag = !literal.empty() && (literal.back().text == "struct" ||
-                literal.back().text == "union" || literal.back().text == "enum");
-            if (tag && !token.origin.tag_binding) {
-                if (const auto type = block_tag_type(token.text)) {
-                    auto binding = std::make_shared<TagBinding>(TagBinding{
-                        type->kind != Type::Kind::Record ? TagBinding::Kind::Enumeration
-                            : type->is_union ? TagBinding::Kind::Union : TagBinding::Kind::Structure,
-                        TagBinding::Role::Use, token.text, type->nominal_key(), type->builtin,
-                        type->captured_tag_errors});
-                    binding->carried = block_definitions(type);
-                    token.origin.tag_binding = std::move(binding);
-                }
-            } else if (!tag && !token.origin.alias_binding) {
-                if (auto alias = block_type_alias(token.text)) {
-                    auto carried = block_definitions(alias->instantiate());
-                    token.origin.alias_binding = std::make_shared<const AliasBinding>(AliasBinding{
-                        AliasBinding::Role::Use, token.text, std::move(alias), nullptr, std::move(carried)});
-                }
-            }
-        }
+        if (token.kind == TokenKind::Identifier && !parsing_public_fragment_)
+            bind_block_type(token, !literal.empty() && (literal.back().text == "struct" ||
+                literal.back().text == "union" || literal.back().text == "enum"), quoted.location);
         literal.push_back(std::move(token));
         ++index_;
     }

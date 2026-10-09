@@ -6,6 +6,13 @@ $::static_assert(identity(7u32) == 7u32, "direct inferred generic assertion");
 $::static_assert(identity<u16>(9u16) == 9u16, "direct explicit generic assertion");
 $::static_assert(identity((uptr)11u32) == (uptr)11u32, "model-sized generic assertion");
 
+// An assertion has no generic header: a typedef in its argument list names
+// the aliased type.
+typedef u32 plain_t;
+static uptr align_of<T>() { return $::alignof(T); }
+$::static_assert(align_of<plain_t>() == 4uptr, "typedef as an explicit type argument");
+$::static_assert(identity<plain_t>(5u32) == 5u32, "typedef argument with an operand");
+
 static T asserted<T>(in T value) {
     $::static_assert(identity((T)13u32) == (T)13u32, "newly appended generic assertion");
     return value;
