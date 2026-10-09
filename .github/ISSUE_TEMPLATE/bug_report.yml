@@ -1,0 +1,67 @@
+name: Bug report
+description: A miscompile, crash, missing or wrong diagnostic, or build failure
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reduce the program to the smallest source that still shows the problem, and report one bug per issue.
+  - type: input
+    id: version
+    attributes:
+      label: Compiler version
+      description: The first line of `cc --version`, plus the commit if you built from source.
+      placeholder: Cross toolchain 0.1.0 (language 0.8)
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: Operating system and the C++ toolchain or binary release used.
+      placeholder: Windows 11, MSYS2 Clang 21
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command line
+      description: The exact `cc` or `cpp` invocation, including `-target`, `-mprofile`, `-O`, and model options.
+      placeholder: cc -S -O2 -target mips64-unknown-elf test.x
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Source
+      description: The complete minimal `.x` program, and any `.xm` model it needs.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: The diagnostic, the emitted assembly, or the runtime result, as text.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Preprocessor (cpp)
+        - Language semantics or diagnostics
+        - Translation-time evaluation, macros, or syntax extensions
+        - x86-64 code generation
+        - MIPS code generation
+        - ABI or compiler models
+        - Build or installation
+        - Documentation

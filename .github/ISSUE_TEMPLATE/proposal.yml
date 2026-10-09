@@ -1,0 +1,38 @@
+name: Proposal
+description: A change to the language, the compiler models, or the command-line contract
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The language is defined by `doc/spec.md` and the model format by `doc/models.md`. A proposal says what those documents would say after the change.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What cannot be expressed or done today, with a short example.
+    validations:
+      required: true
+  - type: textarea
+    id: rule
+    attributes:
+      label: Proposed rule
+      description: The wording the specification or the model format would gain or change.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: Source showing the change in use, and what it compiles or evaluates to where that matters.
+      render: text
+  - type: textarea
+    id: precedent
+    attributes:
+      label: Precedent
+      description: How C, C++, Go, Rust, or another language handles this, and why the proposal follows or departs from it.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other rules or mechanisms considered, including leaving things as they are.
