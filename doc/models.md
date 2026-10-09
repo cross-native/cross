@@ -455,7 +455,9 @@ When a value's bank has too few registers left, `register_failure`, which
 defaults to the entry's `argument_register_failure` or
 `result_register_failure`, decides: `"stack"` passes the whole value on the
 stack and frees the registers already given to it, `"partial"` keeps the
-pieces that found registers and passes the rest on the stack, and `"error"`
+pieces that found registers and passes the rest on the stack (each such piece
+takes at least one slot and the bytes of its carrier, and in a `"packed"`
+area is aligned to that size, up to `stack_alignment`), and `"error"`
 rejects the function's signature. A `"flatten"` value counts as one value.
 
 `cursor_alignment`, a power of two, aligns the position of every cursor
@@ -588,7 +590,8 @@ the kinds are:
 
 - `"cursor_offset"`: the integer `base + n * stride`;
 - `"cursor_address"`: the address `base + n * stride` in the incoming stack
-  arguments;
+  arguments, counted from the start of the caller's argument area, including
+  its `argument_stack_base` bytes;
 - `"register_save_address"`: the address `base + n * stride` in the area of
   `variadic_save_banks`, which must not be empty; without `cursor`, `n` is
   0; and
