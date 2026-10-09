@@ -787,12 +787,12 @@ attributes do not become part of a pointer type. The location strings and
 clobber resources are validated against the selected target and ABI model,
 never assumed to name a default-profile register.
 
-~~~x
+```x
 typedef i32 (*transform_fn)(
     in u64 source "rdi",
     out u64 flags "rdx"
 ) -> "eax" [[abi("sysv_abi"), clobber("memory")]];
-~~~
+```
 
 The spellings in this example are target-dependent. A target may instead
 transport the ordinary result through any declared register, stack endpoint,
@@ -1320,10 +1320,10 @@ including the reason
 when supplied. An inactive branch neither evaluates nor diagnoses its
 `#require`. The directive emits no source tokens.
 
-~~~x
+```x
 #require $::has_feature($::feature::integer128), "requires 128-bit integers"
 #require $::has_abi("sysv_abi")
-~~~
+```
 
 A `$::feature::name` is an argument to `$::has_feature`, not by itself a
 Boolean preprocessing macro. Unknown or unavailable queried features return
@@ -1379,9 +1379,8 @@ C++ constructs, C++ namespace variants, single-entity `using`, and absolute
 
 `cpp` never executes Cross functions. After preprocessing, `cc` performs
 generic instantiation, constant evaluation, and explicit procedural expansion
-before generating code. Generated or instantiated Cross is subjected
-to the same lookup, type, ABI, standalone, and diagnostic rules as written
-source.
+before generating code. Generated or instantiated Cross is subject to the same
+lookup, type, ABI, standalone, and diagnostic rules as written source.
 
 ### Automatic and explicit evaluation
 
@@ -1408,8 +1407,8 @@ u64 lookup(in const u8 *runtime_text) {
 ```
 
 Failure of an opportunistic attempt is not an error and produces no speculative
-diagnostic. It simply leaves the runtime expression. Evaluation is mandatory
-in an enumerator, case label, fixed array bound, attribute constant,
+diagnostic; the runtime expression simply remains. Evaluation is mandatory in
+an enumerator, case label, fixed array bound, attribute constant,
 static-duration non-relocatable initializer, generic value argument,
 `$::static_assert`, and every other translation-time-only context.
 
@@ -1422,106 +1421,117 @@ The staging controls are:
 | `[[eval_only]]` on a function | Every call must evaluate; the function has no runtime symbol or address. |
 | `[[runtime_only]]` on a function | The evaluator never enters the function; direct calls remain runtime calls. |
 
-The two call intrinsics each require exactly one expression, evaluate to its
-type and value, and emit no call themselves. Their argument-count constraints
-apply in untaken branches and unevaluated operands. A `$::runtime` expression
-cannot have an opaque translation-only meta result, even when unevaluated.
-`$::runtime` is invalid where a translation-time-only context evaluates it,
-and its operand cannot evaluate `$::eval` or an eval-only call. Neither
-restriction applies to a well-typed occurrence in an unselected branch or
-inside an unevaluated operand such as a `sizeof` operand. `$::eval` may call
-ordinary or eval-only visible definitions but fails when it reaches a
-runtime-only call. Staging is not an optimization barrier: after
-`$::runtime` lowers its operand, ordinary runtime constant folding and inlining
-may still transform it. The attributes are mutually exclusive.
+The two intrinsics each take exactly one expression, have its type and value,
+and emit no call themselves; their argument-count constraints apply in untaken
+branches and unevaluated operands. `$::runtime` is invalid where a
+translation-time-only context evaluates it, cannot have an opaque meta result
+even when unevaluated, and its operand cannot evaluate `$::eval` or an eval-only
+call; a well-typed occurrence in an unselected branch or unevaluated operand is
+permitted. `$::eval` may call ordinary or eval-only visible definitions but
+fails when it reaches a runtime-only call. Staging is not an optimization
+barrier: after `$::runtime` lowers its operand, ordinary runtime constant
+folding and inlining may still transform it. The two attributes are mutually
+exclusive.
 
-An eval-only function must have a visible definition, use only `in`
-parameters, return a non-pointer, non-atomic, non-volatile value, and not have
-`global` linkage. Its name is valid only as the direct callee of a
-translation-time call; taking its address is invalid. A runtime-only function
-is otherwise an ordinary function and may have any supported linkage.
+An eval-only function has a visible definition, only `in` parameters, a
+non-pointer, non-atomic, non-volatile result, and no `global` linkage. Its name
+is valid only as the direct callee of a translation-time call; taking its
+address is invalid. A runtime-only function is otherwise ordinary and may have
+any supported linkage.
 
-The `in`-only signature restriction belongs to eval-only functions, not to
-ordinary stage-polymorphic functions. An evaluated ordinary call uses the normal
-abstract parameter-cell semantics for `in`, `out`, and `inout`: cells are
-distinct, `out` starts uninitialized, and normal return performs assignment
-conversion and left-to-right copy-out to the captured destinations. The ordinary
-return value is saved before copy-out. A destination used during translation
-must be translation-time automatic or allocated storage, including its permitted
-subobject views; runtime/static storage remains forbidden. Non-output-capable
-arguments follow the ordinary discarded-output temporary rule, with their
-specified argument evaluation and effects. Evaluation failure or a non-normal
-exit performs no copy-out. This does not relax eval-only/meta-helper signature
-restrictions or any other sandbox effect rule.
+An evaluated ordinary call uses the abstract parameter-cell semantics of
+“Functions and result-bearing parameters”: cells are distinct, `out` starts
+uninitialized, and normal return saves the ordinary result and then performs
+assignment conversion and left-to-right copy-out. A copy-out destination must
+be translation-time automatic or allocated storage, including its subobjects;
+a non-output-capable argument receives a discarded temporary. Evaluation
+failure or a non-normal exit performs no copy-out.
 
-Translation-time execution may:
+#### The translation-time sandbox
 
-- use target Cross scalar/aggregate values, local objects, pointers to
-  translation-time objects, structured control flow, recursion, and other
-  evaluable calls;
-- modify its own automatic objects and allocated translation-time buffers; and
-- call deterministic runtime-free intrinsics explicitly documented as
-  evaluator-capable.
+Translation-time execution uses target widths, layout, integer behavior, and
+floating formats, never host-language values. It may use scalar and aggregate
+values, local objects, pointers to translation-time objects, structured control
+flow, recursion, other evaluable calls, and deterministic runtime-free
+intrinsics documented as evaluator-capable, and it may modify its own automatic
+objects and allocated translation-time buffers. It cannot read or modify
+runtime or static state; escape a translation-time pointer; access volatile or
+atomic storage; use a machine instruction, patch site, runtime-only,
+unresolved, or indirect call, raw label, or explicitly located local; depend on
+emitted object addresses; or use any host service other than the declared
+`$::embed` file read.
 
-It cannot read or modify runtime/static state; escape a translation-time
-pointer; access volatile or atomic storage; use a machine instruction, patch
-site, runtime-only/unresolved/indirect call, raw label, or host service other
-than the declared `$::embed` file read; or depend on emitted object
-addresses. Evaluation uses target widths, layout, integer behavior, and
-floating formats, never host-language values.
-An indirect call may appear in a well-typed unselected branch or unevaluated
-operand. Its callee and argument types are still checked, but reaching the
-indirect call during translation-time execution is an error.
-The same separation of source legality from execution effects applies to
-ordinary eval-only helpers, procedural macros and syntax expanders. Every
-concrete body is source-checked, including uncalled definitions and untaken
-branches; a well-typed sandbox-forbidden operation is rejected only if execution
-reaches it. Inherently invalid types or storage, such as static storage for an
-opaque meta value, remain source errors. Automatic scalar/aggregate objects may
-carry ordinary storage hints and valid local attributes without acquiring a
-physical target location during evaluation. Reaching an explicitly located
-local declaration is forbidden.
-Unevaluated operands retain source constraints: object designators, const-cell
-writes, member/subscript/dereference operands, nominal record operations and
-conversions, opaque-value operations and conversions, meta-intrinsic argument
-types and counts, unquote operand types, and nested layout-query legality are
-checked.
-This does not execute meta operations to validate their values, such as a field
-name, child index, token spelling, or parsed source text.
+Source legality is separate from execution effects. Every concrete body is
+source-checked: uncalled definitions, untaken branches, and unevaluated
+operands keep every name, type, and constraint rule, including meta-intrinsic
+argument types and counts and unquote operand types. A well-typed
+sandbox-forbidden operation is an error only when execution reaches it;
+inherently invalid types or storage, such as static storage for an opaque meta
+value, are source errors. Source checking does not execute meta operations to
+validate their values, such as a field name, child index, token spelling, or
+parsed text.
 
-A source-constant check in a translation-only body can require the enclosing
-expansion's meta context, for example an explicit `$::eval` integer-zero proof
-that constructs quoted tokens. Definition-time checking still validates every
-expression's types and all context-independent constraints. If evaluating a
-value constraint actually needs an unavailable invocation context, that
-constraint is deferred, not accepted as a constant with an invented value.
-Each invocation checks the deferred constraint using its real expansion
-context before executing the body, including constraints in untaken branches.
-This includes later checks that need an earlier deferred inferred array extent;
-layout queries independent of that extent do not defer.
-An unselected expression that does not need the context does not defer a check.
-This does not expand the source-constant expression categories or make
-invocation-local runtime values available to source-constant probes. Quotation,
-parsing and name construction retain their ordinary helper-definition and
-invocation-context rules. Resource exhaustion remains an error, not deferral.
+A source constraint in a translation-only function whose constant depends on
+the invocation, such as an integer-zero proof over quoted tokens or an inferred
+array extent, is checked by each invocation in its real expansion context
+before the body executes, including in untaken branches; a constraint
+independent of the invocation is checked at definition, and an unavailable
+context never yields an invented constant. Block assertions in such a function
+instead execute when reached (see “Size, alignment, and translation checks”).
 
 Undefined behavior reached by mandatory evaluation is diagnosed. Diagnostics
 show the failing expression followed by the translation-time call chain.
-Recursion and loops are permitted. An implementation may impose documented,
-adjustable memory, recursion, and instruction budgets; exceeding a budget in a
-mandatory evaluation is diagnosed, while an opportunistic attempt may defer
-to runtime.
-The options `-feval-byte-limit=N` (bytes in one translation-time sequence or
-buffer), `-feval-memory-limit=N` (total translation-time memory of one
-evaluation), `-feval-step-limit=N` (evaluated instructions), and
-`-feval-depth-limit=N` (call depth) set those bounds for mandatory evaluation
-and procedural expansion. Their defaults are 16777216,
-67108864, 1000000, and 256. Logical token provenance metadata, original
-macro input, embedded file backing, mutable buffers, and constructed outputs
-count toward the memory bound without depending on host object sizes.
+Recursion and loops are permitted within documented, adjustable budgets:
+`-feval-byte-limit=N` (bytes in one sequence or buffer),
+`-feval-memory-limit=N` (total memory of one evaluation),
+`-feval-step-limit=N` (evaluated instructions), and `-feval-depth-limit=N`
+(call depth), with defaults 16777216, 67108864, 1000000, and 256. Token
+provenance, original macro input, embedded file backing, buffers, and
+constructed output count toward the memory bound without depending on host
+object sizes. Exceeding a budget in a mandatory evaluation or procedural
+expansion is an error; an opportunistic attempt may defer to runtime.
+`-fno-eval-calls` disables only opportunistic ordinary-call evaluation.
 
-`-fno-eval-calls` disables only opportunistic ordinary-call evaluation. It does
-not weaken any required context, `$::eval`, or eval-only call.
+### Contexts, hygiene, and identities
+
+Every token and syntax node carries an immutable lexical context: the name
+bindings, namespace and `using` imports, and syntax activations visible where
+it was written or constructed. Lookup of a name always uses the context its
+token carries, wherever the token is placed, and later declarations, imports,
+or activations never change an existing context.
+
+- **Definition context.** Identifiers written literally in a `$::quote` and
+  identifiers constructed by `$::meta::token` or `$::meta::parse` use the
+  definition context of the executing macro, expander, or helper at the
+  construction site, including a helper's block-scope typedefs and tags: a
+  quoted name bound to one denotes that type wherever the output is placed.
+- **Call-site context.** Tokens copied or unquoted from an invocation's input
+  keep the context they were captured with. `$::meta::call_site(identifier)`
+  takes a one-identifier token value and returns a token with the same
+  spelling, span, and identity whose lookup uses the current invocation's
+  call-site context.
+- **Fresh identity.** `$::meta::gensym(prefix)` takes a translation-time string
+  and returns a one-identifier token with a fresh private identity shared by its
+  copies: declarations and references spelled with that token bind to each
+  other and collide with nothing else, even when prefixes or visible spellings
+  match. The visible spelling is `prefix` with each character that cannot
+  appear in an identifier replaced by `_`; an empty result becomes `_`, and `_`
+  is prepended to a result that starts with a digit or is a keyword.
+- **Construction is not copying.** A constructed token receives a new identity
+  and the definition context; text cannot recover a private identity or an
+  earlier binding. A copied token keeps its identity, context, and span.
+  Constructed tokens default to the enclosing invocation's span; an explicit
+  span changes diagnostics only.
+- **Binders.** When generated or spliced source is first parsed, its
+  declarations bind in the destination scope and bind that fragment's own uses
+  of them; uses that already carry a context keep it, and unrelated destination
+  declarations never capture a generated use. Once parsed, bindings are fixed
+  through copying, token projection, and relocation.
+- **Expansion identity.** Every expansion receives a fresh identity. A
+  `$::patch` expression copied from input keeps its identity; one constructed
+  by an expansion receives an identity derived from that expansion and its
+  output position. Textually including a file in two primary source units
+  creates distinct source-unit identities.
 
 ### Generic functions and exact inference
 
@@ -1529,7 +1539,7 @@ A generic function places type and value parameters after its declared name.
 A bare identifier declares a type parameter; a typed identifier declares a
 value parameter. The parameter list is nonempty and has no trailing comma:
 
-~~~x
+```x
 static T choose<T>(in bool first, in T left, in T right) {
     return first ? left : right;
 }
@@ -1541,138 +1551,104 @@ static T add_count<T, uptr N>(in T value) {
 
 u32 a = choose<u32>(1 == 1, 10u32, 20u32);
 u64 b = add_count<u64, 4>(7u64);
-~~~
+```
 
-The generic parameter names are in scope throughout the complete declared
-function type and definition, including the result type before `<...>`. This
-does not make undeclared ordinary type names valid. `[[generic(T, uptr N)]]` on
-a direct function declaration is an equivalent spelling; it cannot be combined
-with an angle-bracket parameter list on the same declaration. The angle form is
-canonical.
+The generic parameters are in scope throughout the complete declared function
+type and definition, including the result type before the name; this does not
+make undeclared ordinary type names valid. In a comma-separated declaration,
+each declarator has its own generic scope: shared declaration specifiers are
+interpreted independently for each declarator, and one declarator's generic
+parameters are not visible in its siblings.
 
-In a comma-separated declaration, each declarator has its own generic scope.
-Shared declaration specifiers are interpreted independently in that scope;
-generic parameters of one declarator are not visible in its siblings. For
-example, with an outer `typedef u8 T;`, `T first<T>(in T x), second(in T x);`
-declares a generic `first` and a nongeneric `second` whose result and parameter
-are `u8`. Reversing the declarator order does not change these interfaces.
-A shared `generic(...)` attribute supplies independent generic bindings for
-each function declarator. Shared macro/custom-syntax input still expands once
-in source order, not once per semantic interpretation. A previously parsed
-type node retains its captured binding; this rule does not rebind that node.
+A generic redeclaration matches type parameters by position, not by name, and
+has the same surrounding types and complete callable contract. An array or
+vector extent that depends on generic parameters is compared for each used
+instance after substitution, so `N + N` and `2uptr * N` agree when their
+evaluated extents agree; an omitted extent is incomplete, not a dependent
+wildcard.
 
-Generic redeclarations compare type parameters by their positions, not their
-names, and require matching surrounding types and complete callable contracts.
-When an array or vector extent remains dependent, its compatibility is checked
-for each used instance after substituting that instance's arguments. Different
-bound expressions may therefore agree: `N + N` and `2uptr * N` describe the same
-extent for an instance when their evaluated positive extents match. An omitted
-extent is still incomplete, not a dependent wildcard. Each declaration's
-retained lookup applies to its bound; ordinary parameter cells correspond by
-position. An extent requiring a translation-only invocation context is checked
-for each invocation, without caching that invocation's layout on the generic
-declaration.
+Record, union, and enumeration definitions in a generic function's header
+belong to that function: their tags and enumerators are visible after their
+declaration in the header and in the body, do not enter the enclosing
+namespace, and each instance owns distinct nominal types even when their
+layouts do not depend on generic arguments. A reference without a new
+definition selects an already visible outer tag. A redeclaration repeats each
+header definition with the same kind, tag, members or enumerators, types, and
+attributes, in the same order, and then denotes the same per-instance types.
 
-Record, union, and enumeration definitions introduced in a generic function
-header belong to that function, as do anonymous definitions there. Newly
-declared tag names and enumerators are visible after their declarations in the
-header and in the function body, but do not enter the enclosing namespace.
-Each concrete function instance owns distinct nominal types, even when their
-layouts do not depend on generic arguments. A tag reference without a new
-definition continues to select an already visible outer tag; it does not move
-that existing type into the generic function. Copies and separately composed
-headers and bodies preserve this ownership and their captured name bindings.
-A redeclaration of a generic function whose header defines a record, union,
-or enumeration repeats each such definition with the same kind, tag, members or
-enumerators, types, and attributes, in the same order; the declarations then
-denote the same per-instance types. Any other difference is an error.
+A value parameter has integer, enumeration, `bool`, `label`, or pointer type,
+and its argument is a representable translation-time constant. Value
+parameters are never deduced. Type parameters may be deduced at a direct call;
+an explicit application supplies all arguments, or an initial sequence of type
+arguments with the rest deduced. A missing value argument, an undeduced type
+argument, or a conflicting deduction is an error.
 
-A value-parameter type shall be an integer, enumeration, `bool`, `label`, or
-pointer type. Its argument shall be a representable translation-time constant.
-Value parameters are never deduced: every value parameter needs
-an explicit argument. Generic type parameters may be deduced at a direct
-call. An explicit application may supply all arguments, or an initial sequence
-of type arguments with the remaining type arguments deduced. A missing value
-argument, an undeduced type argument, or a conflicting deduction is an error.
+Deduction first resolves the named generic entity, applies the ordinary
+array/function parameter adjustments, and obtains each fixed actual's type: for
+an `out` or `inout` argument the designator's type, or the expression's type
+when a discarded-output temporary is used, without reading an `out` value. The
+adjusted formal and actual types are then matched structurally: every
+occurrence of an unbound type parameter must yield the same canonical type,
+retaining nominal enumeration and label identity, address spaces, pointer
+qualifications, and complete stable callable interfaces; top-level `const` on
+an `in` cell is ignored. No conversion chooses a deduction. After all arguments
+are fixed, ordinary call conversion and mode checks apply, and an explicitly
+bound parameter may accept such a conversion. Deduction uses neither an
+expected result type nor overload ranking, specialization ranking,
+argument-dependent lookup, default generic arguments, best-common-type search,
+or implicit selection of a default-profile function-pointer ABI. A callback or
+function pointer deduced with a manual or registered stable interface keeps
+that interface; an unavailable adapter is diagnosed after deduction.
 
-For deduction, first resolve the named generic entity, then apply the ordinary
-array/function parameter adjustments and obtain each fixed actual's type.
-For an `out` or `inout` argument this is the designator's type, or the
-expression's type when a discarded-output temporary is used; deduction does
-not read an `out` value. Match the adjusted formal and actual types
-structurally. Every occurrence of an unbound type parameter must yield the
-same canonical type, retaining nominal enum/label identity, address spaces,
-pointer qualifications, and complete stable callable interfaces. Top-level
-`const` on an `in` cell is ignored as stated under Function types.
-No conversion chooses a deduction; after all arguments are fixed,
-ordinary call conversion and mode checks apply. An explicitly bound parameter
-may accept such a conversion without causing a deduction conflict.
-
-Deduction uses neither an expected result type nor overload ranking,
-specialization ranking, argument-dependent lookup, default generic arguments,
-best-common-type search, or implicit selection of a default-profile function
-pointer ABI. A callback or function pointer inferred with a manual or
-registered stable interface keeps its actual ABI, output endpoints, result
-transport, clobbers, and cleanup rule. Any unavailable adapter is diagnosed
-after deduction.
-
-~~~x
+```text
 u64 left, right;
 u64 selected = choose(1 == 1, left, right); // T = u64
 u32 small;
 choose(1 == 1, small, right);               // conflicting T deductions
-~~~
+```
 
 After lookup selects a generic entity, `name<...>` is a generic application
-where the core grammar permits a function designator. Otherwise `<` retains
-its ordinary comparison meaning. A selected generic commits to parsing its
-argument list; invalid arguments do not trigger a fallback to comparisons.
-The explicit `name::<...>` form is always unambiguous. A top-level
-`>` ends a generic argument list; nested `>>` closes two lists. Comparisons
-or shifts inside a value argument must be parenthesized so they do not act as
-delimiters. This rule is syntactic and independent of whitespace.
+wherever the core grammar permits a function designator; otherwise `<` keeps
+its comparison meaning. A selected generic commits to parsing its argument
+list. `name::<...>` is always a generic application. A top-level `>` ends an
+argument list and `>>` closes two; comparisons or shifts inside a value
+argument must be parenthesized. This rule is syntactic and independent of
+whitespace.
 
 Each used argument list creates one monomorphized instance after substitution
-and semantic checking. Declaration-time `$::static_assert` and ordinary
-constraints in the substituted body diagnose invalid instances; assertions in
-translation-only bodies retain their invocation-time rule after substitution.
-Recursive instantiation of the
-same argument list denotes the in-progress instance; unbounded creation of new
-instances is diagnosed.
+and semantic checking; two identical normalized argument lists denote the same
+instance. `$::static_assert` and the ordinary constraints of the substituted
+body diagnose invalid instances. Recursive instantiation of the same argument
+list denotes the in-progress instance; unbounded creation of new instances is
+diagnosed.
 
-A generic declaration itself has no runtime address, link symbol, or ABI.
-Taking its address without an argument list is invalid. An instantiated
-function is an ordinary function and may have its address taken. Its definition
-shall be visible in the compilation group unless an explicit compatible
-instance declaration is provided. Two identical normalized argument lists
-denote the same instance.
+A generic declaration has no runtime address, link symbol, or ABI, and its
+address cannot be taken without an argument list. An instance is an ordinary
+function with the linkage of its declaration; its address may be taken, and
+its definition must be visible in the compilation group unless a compatible
+instance declaration is provided.
 
-An instance without `link_name` is passed to the `generic` rule of the selected
-mangling model (see [models.md](models.md#mangling-entries)), which receives the
-result of the model's `entity` rule and the ordered, typed generic-argument
-descriptors after explicit arguments and inference have been normalized. Surface
-spelling does not affect instance identity or its link name. The shipped `cross`
-mangling model produces the qualified source name followed by the readable
-source argument list, for example `mod::choose::<u32>`. Assembly syntax quotes
-that name when required; the quote characters are not part of the object symbol.
-
-The shipped `simple` mangling model uses a compact spelling: the
-ordinary `_XN` path encoding followed by `G`, the decimal argument count, and
-for each argument `_tLspelling` for a type or `_vLspelling` for a value. `L` is
-the decimal UTF-8 byte length of the compiler-provided canonical spelling. For
-example, `mod::choose::<u32>` begins `_XN3mod6chooseG1_t3u32`. These names have
-no compiler-internal meaning; both shipped mangling models use the same rule
-language as user-defined ones.
-
-Mangling model names and rules are unversioned data and have no
-compiler-internal meaning. A mangling model shared as an external ABI must pin
-its complete rules and the structural descriptor grammar it consumes. An
-externally consumed generic instance may use an explicit `link_name` instead.
+An instance without `link_name` is named by the `generic` rule of the selected
+mangling model (see [models.md](models.md#mangling-entries)), which receives
+the result of the model's `entity` rule and the ordered, typed generic-argument
+descriptors after explicit arguments and deduction have been normalized;
+surface spelling does not affect instance identity or its link name. The
+shipped `cross` model produces the qualified source name followed by the
+readable argument list, for example `mod::choose::<u32>`; assembly syntax
+quotes that name when required, and the quotes are not part of the symbol. The
+shipped `simple` model uses the `_XN` path encoding followed by `G`, the
+decimal argument count, and `_tLspelling` for each type or `_vLspelling` for
+each value argument, where `L` is the decimal UTF-8 byte length of the
+canonical spelling: `mod::choose::<u32>` begins `_XN3mod6chooseG1_t3u32`.
+Mangling model names and rules are unversioned data with no compiler-internal
+meaning. A model shared as an external ABI must pin its complete rules and the
+descriptor grammar it consumes; an externally consumed instance may use an
+explicit `link_name` instead.
 
 ### Procedural token macros
 
-Procedural macros generate source at one obvious splice point. A declaration
-has one token-tree input and returns tokens; callers use `name!`:
+A procedural macro generates source at one visible splice point. It has one
+token-tree input and returns tokens; callers write `name!`:
 
 ```x
 [[macro]]
@@ -1700,258 +1676,169 @@ checked_item! {
 }
 ```
 
-`[[macro]]` implies eval-only behavior. The function is `static`, has
+`[[macro]]` implies `eval_only`. The function is `static`, nongeneric, has
 exactly one `in $::meta::tokens` parameter, returns `$::meta::tokens`, and has
-no runtime symbol or address. The meta types `$::meta::tokens`,
-`$::meta::span`, and `$::meta::context` exist only during translation and have
-no runtime size, layout, address, or ABI.
+no runtime symbol or address. The meta types below `$::meta` (`tokens`, `span`,
+`context`, `syntax_match`, `syntax`, `bytes`, and `buffer`) exist only during
+translation and have no runtime size, layout, address, or ABI. Any function
+with one of them in its signature is a translation-only helper: it is `static`
+and implicitly `eval_only`, with only `in` parameters and no runtime symbol or
+address. Helpers are called directly, may recurse within the evaluation
+budgets, and may hold meta values in automatic cells and pass or copy them by
+value; pointers, arrays, records, and runtime callable types containing meta
+values have no representation, and no runtime or static storage may hold one.
 
-Macro and syntax-expander co-attributes are classified by their meaning.
-Valid `always_inline`, `noinline`, `hot`, `cold`, `no_stack_protector`, and
-`no_sanitize` hints are accepted; they neither create runtime code nor bypass
-mandatory translation-time execution. Their ordinary argument and conflict
-rules still apply. Redundant `eval_only` is permitted. Semantic contracts such
-as `noreturn` remain binding: reaching a normal return or falling through such
-a body during translation-time execution is an error. An uncalled body or
-unevaluated call does not by itself violate that execution contract.
-Attributes requiring an emitted symbol, physical ABI transport, or machine
-entry/exit machinery are invalid on expansion functions. These include `abi`,
-`alias`, `aligned`, `clobber`, `interrupt`, `link_name`, `naked`, `raw_inline`,
-`retain`, `returns_twice`, `section`, `stack_cleanup`, `used`, `variadic`,
-`visibility`, `weak`, and `weakref`. Type-only attributes and attributes for
-other declaration roles do not become expansion-function attributes.
+Expansion functions accept the hints `always_inline`, `noinline`, `hot`,
+`cold`, `no_stack_protector`, and `no_sanitize`, and redundant `eval_only`,
+under their ordinary argument and conflict rules; they create no runtime code.
+`noreturn` remains binding: reaching a normal return or fallthrough during
+evaluation is an error. Attributes that require an emitted symbol, physical
+ABI transport, or machine entry/exit machinery (`abi`, `alias`, `aligned`,
+`clobber`, `interrupt`, `link_name`, `naked`, `raw_inline`, `retain`,
+`returns_twice`, `section`, `stack_cleanup`, `used`, `variadic`, `visibility`,
+`weak`, and `weakref`) are invalid on them.
 
-Ordinary helper functions may take or return translation-only meta values.
-A direct meta type (`tokens`, `syntax_match`, `syntax`, `span`, `context`,
-`bytes`, or `buffer` in `$::meta`) in a function's signature requires `static`
-linkage and implies `eval_only`, with only `in` parameters and no runtime
-symbol or address. Such helpers use ordinary direct calls and may recurse
-within the evaluation budgets. Meta values remain opaque: this rule does not
-give pointers, arrays, records, or runtime callable types containing them a
-representation. Helpers may use automatic meta cells and pass/copy them by
-value; they cannot introduce runtime or static storage for those values.
+An invocation is a qualified macro name, `!`, and one balanced `(...)`, `[...]`,
+or `{...}` token tree; the delimiters group the input and are not part of it.
+The result replaces the complete invocation as a token sequence in the
+surrounding source, without an implicit grammar boundary, scope, or
+parentheses: it may be empty, contain several items, or supply operators and
+other fragments that compose with adjacent tokens, so output `1 + 2` followed
+by caller tokens `* 3` means `1 + 2 * 3`. An invocation may also supply a
+declarator fragment such as pointer parts, the declared name, an array or
+function suffix, or result-location tokens. Token identities, spans, and
+contexts are retained; splicing never pastes spellings. The result may contain
+further invocations. Expansion order is outermost invocation first, then source
+order; cyclic or nonterminating expansion is diagnosed. Macros cannot intercept
+an ordinary operator, call, or type outside an explicit `name!` boundary; a
+framework defines a private sublanguage inside an explicit token tree or
+declares a syntax prefix under the rules below.
 
-An invocation is a qualified macro name, `!`, and one balanced `(...)`,
-`[...]`, or `{...}` token tree. The delimiters group the input and are not part
-of it. The result replaces the complete invocation as a token sequence in the
-surrounding source, without an implicit grammar boundary, scope, or parentheses.
-It may be empty, contain multiple block items, or supply operators and other
-grammar fragments that compose with adjacent tokens. For example, output
-`1 + 2` followed by caller tokens `* 3` means `1 + 2 * 3`. Token identities,
-spans, and hygiene are retained; textual splicing does not paste token
-spellings. The result may contain more explicit invocations. In contrast, a
-custom-syntax replacement or a structured syntax-node splice remains a bounded
-subtree; token macros inside it cannot escape that enclosing boundary.
-
-`$::quote { ... }` constructs tokens written naturally as Cross source.
-`$::unquote(tokens)` is valid only inside a quote and inserts a token value.
+`$::quote { ... }` constructs tokens written as Cross source, and
+`$::unquote(value)` inside a quote inserts a token value or a syntax node.
 Quotation does not splice by itself: there is no `$::emit`, `$::expand`, or
-attribute-macro facility. To transform a declaration or
-statement, put that complete source inside `name! { ... }`.
+attribute-macro facility. To transform a declaration or statement, put that
+complete source inside `name! { ... }`.
 
-Procedural token macros do not perform ambient pattern matching or globally
-replace operators, calls, or types. A framework can define a private
-sublanguage inside an explicit token tree or declare a lexically activated
-syntax prefix under the rules below. Ordinary code outside either visible
-boundary retains the fixed Cross grammar.
-
-Required meta operations below `$::meta::` inspect token kind/spelling,
-delimiter children, and source span; construct identifiers, literals,
-punctuation, and groups; concatenate/slice token sequences; copy an input token;
-parse an explicit UTF-8 string; and emit an error, warning, or note at a span.
-`$::meta::concat` and `$::meta::parse` are the minimum low-level constructors;
-`$::has_intrinsic` reports every additional operation separately.
-
-The following operations are translation-only. Here `one` is a `$::meta::tokens`
-value containing exactly one complete top-level token-tree element; a balanced
-group or structured syntax-node splice counts as one. Empty and multi-element
+The `$::meta` token operations are translation-only. `one` is a
+`$::meta::tokens` value with exactly one top-level element; a balanced group or
+a structured syntax-node splice counts as one, and empty or multi-element
 values are errors where `one` is required. Inspection never executes an
-expansion or reparses a structured splice.
+expansion or reparses a structured splice. `concat` and `parse` are the
+minimum constructors; `$::has_intrinsic` reports every other operation
+separately.
 
 | Operation | Result and contract |
 | --- | --- |
+| `$::meta::len(tokens)`, `at(tokens, index)`, `slice(tokens, offset, length)`, `concat(tokens, tokens)` | Count, select, slice, and join top-level elements; `at` returns a one-element `tokens` value. |
 | `$::meta::is_kind(one, kind)` | `bool` testing the element's lexical category. This overload does not change syntax-node `is_kind`. |
 | `$::meta::spelling(one)` | Immutable `$::meta::bytes` containing a lexical leaf's exact UTF-8 spelling, without a terminator or literal decoding. Groups and structured splices are errors. |
-| `$::meta::children(one)` | `$::meta::tokens` containing a balanced group's contents without its delimiters. Nongroups are errors; children retain identities, spans, contexts and structured splices. |
-| `$::meta::delimiter(one)` | A translation-time string: `"()"`, `"[]"`, `"{}"` or `"[[]]"`. Nongroups are errors. |
+| `$::meta::children(one)` | `$::meta::tokens` containing a balanced group's contents without its delimiters. Nongroups are errors; children retain identities, spans, contexts, and structured splices. |
+| `$::meta::delimiter(one)` | A translation-time string: `"()"`, `"[]"`, `"{}"`, or `"[[]]"`. Nongroups are errors. |
 | `$::meta::span(one)` | An opaque `$::meta::span`, including a group's delimiters or a structured splice's retained node span. |
-| `$::meta::token(kind, text[, span])` | One lexical leaf, validated against `kind`. `text` is an explicit translation-time string or immutable bytes value. Group delimiters and structured splices cannot be forged. |
+| `$::meta::token(kind, text[, span])` | One lexical leaf, validated against `kind`. `text` is a translation-time string or immutable bytes value. Group delimiters and structured splices cannot be forged. |
 | `$::meta::group(delimiters, contents[, span])` | One balanced group around `$::meta::tokens` contents, using one of the four delimiter strings above. Contents retain their provenance and grouping. |
-| `$::meta::error(span, message)`, `warning(span, message)`, `note(span, message)` | The same semantics as the corresponding `$::syntax` diagnostics: return `void`; an error stops expansion, while warnings and notes do not. The message is a translation-time string. |
+| `$::meta::parse(text)` | Tokens lexed from a translation-time string or a complete immutable bytes value read as UTF-8 source. |
+| `$::meta::error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; an error stops the expansion, while warnings and notes do not. |
 
-`kind` is a translation-time string from `"identifier"`, `"builtin"`,
-`"integer"`, `"floating"`, `"character"`, `"string"`, `"punctuation"`,
-`"group"`, and `"splice"`. An unknown category is an error; a recognized
-category different from the element's category yields false. The `token`
-constructor accepts only the seven leaf categories, not `"group"` or `"splice"`.
-Word-shaped keywords are lexical identifiers; this does not make them legal
-declaration names. `"builtin"` denotes a `$::`-qualified lexical name.
-Contextual grammar classification is not a token property. A `token`
-constructor's text must spell exactly one leaf of the requested
-kind, without leading/trailing whitespace or comments. Delimiter punctuators
-are constructed only through `group`; its contents must already be a complete
-balanced token sequence. To inspect a splice's projected leaves, explicitly
-project its syntax node with `$::meta::tokens(node)` first; group extraction
-does not flatten it.
+`kind` is one of `"identifier"`, `"builtin"`, `"integer"`, `"floating"`,
+`"character"`, `"string"`, `"punctuation"`, `"group"`, and `"splice"`; an
+unknown category is an error, and a recognized category different from the
+element's yields false. Keywords are lexical identifiers, which does not make
+them legal declaration names; `"builtin"` denotes a `$::`-qualified name; grammar
+classification is not a token property. `token` accepts only the seven leaf
+categories and text that spells exactly one leaf of that kind without
+surrounding whitespace or comments; delimiters are constructed only through
+`group`, whose contents must already be a balanced sequence. `parse` rejects
+zero bytes, invalid UTF-8, invalid lexical input, and unbalanced groups; empty
+input yields an empty sequence, and no implicit bytes/string conversion exists.
+Spelling is public lexical text and never carries private identity; formatting
+a literal value is ordinary helper code or quotation, not a conversion by
+`token`. To inspect a splice's leaves, project its node with
+`$::meta::tokens(node)` first; group extraction does not flatten it. Counts and
+indices use target `uptr` under the index rules of “Embedded assets and
+translation-time bytes”, and these operations count against the evaluation
+budgets.
 
-`$::meta::parse(bytes)` is an exact overload alongside `$::meta::parse(string)`.
-It reads the complete immutable byte view as UTF-8 source, with no NUL
-truncation, implicit bytes/string conversion, or ambient I/O. Both forms reject
-zero bytes, invalid UTF-8, invalid lexical input and unbalanced groups. Empty
-input is an empty token sequence. Spelling is public lexical text, never private
-fresh-name identity bits. Literal-value formatting uses ordinary helper code or
-quotation, not an implicit conversion by `token`.
+`$::meta::tokens` and `$::meta::span` name both a type and an operation. Where
+the grammar permits either a type or an expression, either name immediately
+followed by `(` is the operation call, including in expression statements,
+parenthesized and cast probes, layout-query operands, and generic arguments; in
+a position that requires a type, and in a named declaration, the name denotes
+the type, so `$::meta::span saved;` declares a span and `($::meta::span)value`
+is a cast. Parenthesizing the whole call does not make it a type name.
 
-Reconstruction is construction, not copying. `token`, `parse` and new group
-delimiters receive new token identities and the executing helper/expander's
-definition context; text cannot recover a previous private identity or binding.
-The constructors use the same output-position identity rule as quotation;
-copying an input token whose lexical identity is already fixed preserves it.
-An omitted constructor span uses the enclosing invocation span. An explicit
-span retains both source anchors and changes only diagnostic provenance, not
-lookup or identity. Copied group
-contents retain their own provenance. These operations check target `uptr`
-lengths where applicable and count against the step, byte, memory, and depth
-limits (`-feval-*-limit`). Tokens have no runtime representation.
-
-`$::meta::tokens` and `$::meta::span` name both a meta type and an intrinsic.
-Where the grammar permits either a type or an expression, either name
-immediately followed by `(` selects the intrinsic call. This includes expression
-statements, parenthesized/cast probes, layout-query operands and
-generic-argument probes. In a position that requires a type, and in a named
-declaration, the name denotes the type; `$::meta::span saved;` declares a span
-and `($::meta::span)value` is a cast. Parenthesizing the entire call does not
-turn it into a type name.
-
-Identifiers written literally in a quote or constructed by `$::meta::parse`
-use the executing macro or syntax-expander function's definition context.
-When executed inside an ordinary helper, quotation and string/byte token parsing
-instead use that helper's definition context at the construction site, including
-the imports and syntax activations lexically visible there. That context also
-includes the helper's block-scope typedefs and tags: a quoted name bound to one
-denotes that type wherever the generated code is placed. Later imports or
-activations do not retroactively change a constructed token's context. The
-enclosing expansion still
-supplies the invocation context used by `call_site`, the expansion identity
-used by `gensym`, and the default source span of newly constructed tokens.
-Tokens copied or unquoted from the input retain their call-site context.
-`$::meta::call_site(identifier)` requires a token value containing exactly one
-identifier. Its result is a one-identifier token value with the same spelling,
-source span, and token identity, but lookup uses the current invocation's
-call-site context instead of any previously bound name.
-`$::meta::gensym(prefix)` requires a translation-time string and returns a
-one-identifier token value carrying a fresh, opaque private identity. Its
-visible spelling is the prefix with each character that cannot appear in an
-identifier replaced by `_`; an empty result becomes `_`, and `_` is prepended to
-a result that starts with a digit or is a keyword. Copies of that token share
-the identity for declarations and references; distinct calls never collide even
-when their prefixes or visible spellings match.
-Expansion output retains supplied spans; newly constructed tokens default to
-the invocation span.
-
-Every procedural expansion receives a fresh expansion identity. A lexical
-`$::patch` expression copied from the input retains its input identity; a patch
-expression newly constructed by the expansion receives an identity derived
-from that expansion and its output position. Textually including a header in
-two primary source units likewise creates distinct source-unit patch
-identities.
-
-Macro execution uses the same deterministic sandbox and adjustable resource
-budgets as mandatory evaluation. Requested dependencies must arrive as
-explicit tokens or declared command-line inputs already visible to the
-compilation. Expansion order is outermost invocation first and then source
-order. Cyclic or nonterminating expansion is diagnosed.
-An explicit procedural invocation may supply a declarator token fragment,
-including pointer parts, the declared name, an array or function suffix, or
-result-location tokens. A parsed outer capture does not execute that nested
-invocation merely to classify the declarator: if its structure depends on the
-fragment, the relevant bounded capture is deferred until the outer owner has
-expanded and the capture survives.
+A parsed outer capture does not execute a nested invocation merely to classify
+a declarator: when the declarator's structure depends on the fragment, the
+bounded capture is deferred until the owner has expanded, as described under
+“Patterns and captures”.
 
 A diagnostic in generated source first points to the most specific generated
-token, then prints an expansion chain containing the invocation and macro
-definition. This chain is part of the diagnostic contract, not optional debug
-output.
-
-Procedural token macros cannot globally intercept an ordinary operator, call, or
-type outside an explicit `name!` boundary.
+token, then prints the expansion chain of invocations and definitions; the
+chain is part of the diagnostic contract.
 
 ### Embedded assets and translation-time bytes
 
-`$::embed("path")` names one external input file and yields
-`$::meta::bytes` during translation. Ordinary Cross functions may inspect
-or transform that value before it initializes an eligible static byte array:
+`$::embed("path")` names one external input file and yields `$::meta::bytes`
+during translation. Ordinary Cross functions may inspect or transform that
+value before it initializes an eligible static byte array:
 
-~~~x
+```x
+static $::meta::bytes prepare_asset(in $::meta::bytes source) {
+    return source; // a real transform would compress or validate the bytes
+}
+
 static const u8 logo[] =
     prepare_asset($::embed("assets/logo.png"));
-~~~
+```
 
 This operation is the only core exception to translation-time code's lack of
-host-file access. The file is read byte-for-byte. It is not Cross source,
-is never preprocessed or decoded, and receives no implicit terminator.
-Translation-time code receives bytes, not a resolved host path or a general
-file handle. Directory enumeration, globs, recursive trees, URLs, and implicit
+host-file access. The file is read byte-for-byte; it is not Cross source, is
+never preprocessed or decoded, and receives no implicit terminator.
+Translation-time code receives bytes, not a resolved host path or a file
+handle. Directory enumeration, globs, recursive trees, URLs, and implicit
 decompression have no `$::embed` form.
 
-After source-macro expansion, an embed expression has exactly
-`$::embed(string_literal)`: one final string-literal token, not an expression
-or a sequence of adjacent literals. A source macro may supply that token.
-The operation has type `$::meta::bytes` and is mandatory evaluation; it cannot
-be enclosed by `$::runtime`, lowered to a call, or used through a runtime
-function pointer. Inactive preprocessing branches create no embed operation
-and no asset dependency.
+After source-macro expansion, an embed expression is exactly
+`$::embed(string_literal)`: one final string-literal token, which a source
+macro may supply, not an expression or adjacent literals. The operation has
+type `$::meta::bytes` and is mandatory evaluation: it cannot be enclosed by
+`$::runtime`, lowered to a call, or used through a runtime function pointer.
+An inactive preprocessing branch creates no operation and no dependency.
 
-A relative path uses the preprocessor's quoted-include search order: the
-directory of the expression's logical source location, then explicit `-I`
-directories, then explicit `-isystem` directories, each in order. An absolute
-written path names one candidate directly. There are no implicit asset
-directories. These options configure preprocessing lookup, not evaluator
-file I/O or compiler-model search paths. Search directories are lookup bases,
-not a security confinement boundary. `$::embed` grants authority only to the
-file selected by its written path under this order. A build requiring a
-narrower filesystem sandbox must provide one externally. Resolve symbolic
-links and normalize the selected path for dependency identity; diagnostics
-show the written path and logical source location. `$::has_include("path")`
-uses the same search environment to test availability.
-
-Only a readable regular file is accepted. `cpp` recognizes completed embed
-forms after source-macro expansion. It discovers every well-formed occurrence
-in active preprocessed source before procedural or syntax expansion, including
-one in a later-discarded invocation input. Standalone `cpp` does not run
-expanders, so its dependency set can include files that a later expansion
-discards. When dependency output is requested, it validates a selected file even
-if later expansion discards the occurrence. Tokens inside a `$::quote` output
-template or a syntax definition's pattern are not operations merely because
-their spelling resembles `$::embed`; copying them into generated output does
-not grant a dependency identity.
-
-In `-M`/`-MM`/`-MD`/`-MMD` output, selected files use the same target spelling
-and escaping as include dependencies. A missing or nonregular file is a
+A relative path uses the quoted-include search order: the directory of the
+expression's logical source location, then `-I` directories, then `-isystem`
+directories, each in order; an absolute path names one candidate. There are no
+implicit asset directories, and these options configure lookup, not evaluator
+I/O or model search paths. The directories are lookup bases, not a confinement
+boundary: `$::embed` grants authority only to the file its written path
+selects, and a build that needs a narrower sandbox provides one externally.
+The selected path is normalized with symbolic links resolved for dependency
+identity; diagnostics show the written path and logical location.
+`$::has_include("path")` tests availability under the same environment. Only a
+readable regular file is accepted; a missing or nonregular file is a
 preprocessing error when dependency output is requested and a translation
-error otherwise. `-E` preserves the expression and records dependencies when
-requested; `cpp` does not read or substitute asset bytes. Integrated `cc`
-retains the preprocessor's selected path and dependency identity, then reads
-the bytes only for mandatory translation-time evaluation.
+error otherwise.
 
-Each discovered occurrence has an immutable dependency identity associated
-with its complete expression and logical origin. A procedural or syntax
-expander may copy such an expression, including multiple copies; each copy
-retains the identity and the same selected file snapshot. Constructing its
-spelling anew, changing its path, or producing an embed expression without
-that identity is forbidden generated output. An independently supplied
-preprocessed `.i` file is treated as a new primary source for dependency
-discovery before expansion.
+`cpp` recognizes completed embed forms after source-macro expansion and before
+procedural or syntax expansion, so its dependency set, emitted with include
+dependencies in `-M`, `-MM`, `-MD`, and `-MMD` output using the same target
+spelling and escaping, can include a file that a later expansion discards.
+`-E` preserves the expression; `cpp` never reads or substitutes asset bytes.
+Integrated `cc` keeps the preprocessor's selected path and reads the bytes only
+for mandatory evaluation. Each occurrence has an immutable dependency identity
+tied to its expression and logical origin: an expander may copy the expression,
+and every copy keeps the identity and the same file snapshot, but constructing
+an embed expression anew, changing its path, or emitting one without that
+identity is forbidden generated output. Tokens inside a quote template or a
+syntax pattern are not operations merely because they spell `$::embed`. A
+separately supplied `.i` file is a new primary source for discovery.
 
 `$::meta::bytes` is an immutable owned byte sequence; `$::meta::buffer` is
-mutable fixed-capacity translation-time storage. They have no runtime
-size, layout, address, symbol, or ABI. Neither may enter runtime storage,
-runtime calls, relocations, patch values, or integer representations.
-A function with either type in its signature is `static` and implicitly
-`eval_only`, with no runtime address or symbol. Its parameters use `in` as
-other eval-only parameters do. Ordinary runtime-capable functions may still
-process translation-time byte pointers when their complete evaluated call
-path has permitted effects.
+mutable fixed-capacity translation-time storage. Neither may enter runtime
+storage, runtime calls, relocations, patch values, or integer representations.
+Ordinary runtime-capable functions may process translation-time byte pointers
+when their complete evaluated call path has permitted effects.
 
 The `$::meta` sequence operations are:
 
@@ -1967,65 +1854,56 @@ The `$::meta` sequence operations are:
 | `cap(buffer)` | Capacity as target `uptr`. |
 | `freeze(buffer, length)` | Consume its initialized prefix as `bytes`. |
 
-`len`, `at`, `slice`, and `concat` also have exact-type overloads for
-`$::meta::tokens`. Token operations count and select top-level token-tree
-elements; `at(tokens,index)` returns one-element `tokens`.
-No mixed tokens/bytes operation is implicit.
+`len`, `at`, `slice`, and `concat` are exact-type overloads shared with
+`$::meta::tokens`; no mixed tokens/bytes operation is implicit. Length and
+capacity queries return target `uptr`, and a count that does not fit is an
+error, not a wrapped value. An index is a nonnegative integer within the
+sequence's bounds; a negative signed value is not reinterpreted as unsigned.
 
-Length and capacity queries return target `uptr`; a count that is not
-representable in that type is a translation error, not a wrapped value.
-Sequence indices must be nonnegative integers within the selected sequence's
-bounds. A negative signed integer is not an index formed from its unsigned
-representation.
+A `buffer` value is a handle to one allocation: copying or passing it does not
+duplicate the allocation. `freeze` consumes the allocation exactly once,
+requires `length <= cap` with every byte of the prefix assigned, and
+invalidates all aliased handles and derived pointers; reads of unassigned
+bytes, use after freeze, and a second freeze are errors. The returned bytes own
+their prefix independently. `alloc(0)` is valid, but its data pointer cannot be
+dereferenced.
 
-Copying or passing a `buffer` value copies a handle to one allocation;
-it does not duplicate the allocation. `freeze` consumes that allocation
-exactly once, requires `length <= cap` and every byte of its prefix assigned,
-and invalidates all aliased handles and derived pointers. Reads of
-unassigned bytes, use after freeze, and a second freeze are errors. The
-returned immutable bytes own their prefix independently. `alloc(0)` is valid,
-but its data pointer cannot be dereferenced.
-
-Immutable byte backing storage, including temporaries and slices, stays live
-for the complete containing mandatory evaluation. A data pointer may travel
-through ordinary evaluated calls within that evaluation and may form a
-one-past pointer, but cannot be dereferenced outside its view's bounds or
-escape after evaluation ends. Buffer views remain live until freeze and are
-bounded by capacity. Accesses through other object-pointer types obey target
-alignment, effective-type, width, and endianness rules; no host pointer bits
-or host layout are observable. File length, capacity, and materialized size
-must fit target `uptr`. Meta pointers cannot be cast to integers even where
-ordinary Cross object pointers can.
-When a pointer to translation-time storage is stored in a local object or a
-translation-time buffer, its representation is opaque. Typed pointer loads,
-stores, and containing-object value copies preserve its backing identity,
-bounded view, and lifetime; they do not expose numeric address bits. Inspecting
-that representation through byte or non-pointer scalar lvalues, or freezing
-it as bytes, is invalid. A byte overwrite invalidates the opaque value; a later
-pointer load requires a completely initialized replacement representation.
-No pointer to translation-time storage may escape into runtime storage inside
-a containing aggregate result. Symbolic addresses of runtime entities may
-instead be transported as target/object-format relocations without inspecting
-their emitted addresses.
-Each newly allocated mutable buffer and newly owned immutable byte backing
-has a virtual base aligned for every scalar object type supported by the
-selected target. A slice retains its offset in that backing: a typed access
-through the slice must satisfy the pointee type's target alignment at its
-absolute backing offset. Forming a cast pointer does not itself access the
-storage. Scalar pointer arithmetic scales by the selected target size of its
-pointee and remains bounded by the original view. Non-byte writes to raw
-buffers acquire effective type as in the ordinary storage rules; byte writes
-do not erase it. Target byte order, not host byte order, determines scalar
-representation in byte storage. For pointer ordering and subtraction, one
-bounded view is the array object: the pointers must retain that same view
-and compatible pointee types. Equality compares backing identity and absolute
-backing offset, including between different views of one backing.
-Conversion through `void *` preserves the backing and view; the opaque pointer
-cannot be dereferenced or advanced until converted to a complete object type.
+Translation-time storage is modeled as target objects. Immutable byte backing,
+including temporaries and slices, stays live for the complete containing
+mandatory evaluation; buffer storage is live until frozen and bounded by its
+capacity. One bounded view is the array object for pointer arithmetic,
+ordering, and subtraction: a pointer may travel through evaluated calls, form a
+one-past pointer, and compare equal to another pointer with the same backing
+and absolute offset, but cannot be dereferenced outside its view or used after
+the evaluation ends. Accesses through other object-pointer types obey target
+alignment at the absolute backing offset (every fresh backing is aligned for
+every scalar type the target supports), effective-type, width, and byte-order
+rules; non-byte writes acquire effective type as in ordinary raw storage, and
+byte writes do not erase it. Conversion through `void *` preserves backing and
+view. Pointers into translation-time storage are opaque capabilities: they
+cannot be cast to integers, inspected or overwritten through byte or
+non-pointer lvalues, frozen as bytes, or placed in runtime storage, including
+inside an aggregate result. Typed pointer loads, stores, and containing-object
+copies preserve them; a byte overwrite invalidates the stored value until a
+complete replacement is stored. Symbolic addresses of runtime entities are
+transported as relocations instead, without inspecting emitted addresses.
 
 Processing is ordinary Cross evaluation, not a callback registry:
 
-~~~x
+```x
+namespace codec {
+    uptr max_size(in uptr source_size) { return source_size; }
+
+    uptr encode(in const u8 *source, in uptr source_size,
+                in u8 *destination, in uptr capacity) {
+        uptr count = source_size < capacity ? source_size : capacity;
+        for (uptr i = 0; i < count; ++i) {
+            destination[i] = source[i];
+        }
+        return count;
+    }
+}
+
 static $::meta::bytes compress_asset(in $::meta::bytes source) {
     uptr size = $::meta::len(source);
     $::meta::buffer output = $::meta::alloc(codec::max_size(size));
@@ -2034,52 +1912,53 @@ static $::meta::bytes compress_asset(in $::meta::bytes source) {
         $::meta::data(output), $::meta::cap(output));
     return $::meta::freeze(output, written);
 }
-~~~
 
-The codec may also be called at runtime with ordinary runtime pointers.
-It cannot acquire ambient host I/O during translation. A transform may return
-its input unchanged, an empty value, or a differently sized result.
+static const u8 packed_logo[] = compress_asset($::embed("assets/logo.bin"));
+```
+
+The codec may also be called at runtime with ordinary runtime pointers. It
+cannot acquire ambient host I/O during translation. A transform may return its
+input unchanged, an empty value, or a differently sized result.
 
 One `$::meta::bytes` expression may initialize a static-duration array whose
-element type is `u8` or `const u8`, including a block-scope `static` array.
-An omitted first bound is inferred from the final byte count; an explicit
-bound must equal that count. Empty bytes cannot initialize an array, because
-array bounds must be positive. The object is writable only when declared
-`u8[]`. Ordinary linkage, alignment, section, visibility, retention, and
-address-space rules apply; `noinit` and another initializer are incompatible.
-`sizeof` the object is its final byte count. Materialization emits no runtime
-code or helper; a block static is initialized during translation, not on first
-runtime entry. Its initializer cannot depend on runtime parameters or automatic
-local values; unevaluated queries of their fixed types remain permitted.
-Ordinary restrictions on reaching static storage during translation-time
-function execution still apply. No implicit conversion permits a meta value to
-initialize a pointer, scalar, record, runtime slice, or other object.
+element type is `u8` or `const u8`, including a block-scope `static` array. An
+omitted first bound is inferred from the final byte count; an explicit bound
+must equal that count. Empty bytes cannot initialize an array, because array
+bounds must be positive. The object is writable only when declared `u8[]`.
+Ordinary linkage, alignment, section, visibility, retention, and address-space
+rules apply; `noinit` and another initializer are incompatible. `sizeof` the
+object is its final byte count. Materialization emits no runtime code or
+helper; a block static is initialized during translation, not on first
+runtime entry, so its initializer cannot depend on runtime parameters or
+automatic local values, although unevaluated queries of their fixed types are
+permitted. No implicit conversion permits a meta value to initialize a pointer,
+scalar, record, runtime slice, or other object.
 
-An implementation may cache evaluated transforms only when it can validate
-the ordered path search, selected normalized path and file contents, the
-complete evaluated call graph and source constants, explicit arguments,
-queried target facts, language/model/evaluator options, and resource limits.
-A newly appearing file earlier in search order invalidates a previous
-selection. One translation uses a consistent snapshot of each selected file.
-A cache hit reproduces output, diagnostics, and resource accounting as if
-evaluation ran. Input size, meta memory, evaluator work/depth, and output
-are bounded; exhaustion is a diagnostic, never runtime fallback. A reported
-failure identifies the embed expression and evaluated call chain.
+An implementation may cache evaluated transforms only when it can validate the
+ordered path search, selected normalized path and file contents, the complete
+evaluated call graph and source constants, explicit arguments, queried target
+facts, language, model, and evaluator options, and resource limits. A newly
+appearing file earlier in search order invalidates a previous selection; one
+translation uses a consistent snapshot of each selected file. A cache hit
+reproduces output, diagnostics, and resource accounting as if evaluation ran.
+Input size, meta memory, evaluator work and depth, and output are bounded;
+exhaustion is a diagnostic, never runtime fallback. A reported failure
+identifies the embed expression and the evaluated call chain.
 
 ### User-defined syntax extensions
 
-A library may declare an item, statement, or expression syntax prefix and
-an ordinary translation-time Cross function that expands one matched use to
+A library may declare an item, statement, or expression syntax prefix and an
+ordinary translation-time Cross function that expands one matched use to
 Cross. An extension is inactive until a lexical `syntax` activation selects
-it. Recognition occurs in `cc` after preprocessing. Runtime facilities
-needed by an extension remain ordinary explicit Cross declarations or calls;
-names such as `async`, `go`, `try`, and `catch` have no compiler-owned
-runtime meaning.
+it. Recognition occurs in `cc` after preprocessing. Runtime facilities needed
+by an extension remain ordinary explicit Cross declarations or calls; names
+such as `async`, `go`, `try`, and `catch` have no compiler-owned runtime
+meaning.
 
 `syntax` is a reserved keyword. Definitions, activations, and regions are
-visible source constructs. Syntax entities inhabit a namespace separate
-from ordinary types, values, labels, and procedural macros. A declaration
-has an unqualified nonreserved entity name and one of five kinds:
+visible source constructs. Syntax entities inhabit a namespace separate from
+ordinary types, values, labels, and procedural macros. A declaration has an
+unqualified nonreserved entity name and one of five kinds:
 
 | Kind | Match and replacement |
 | --- | --- |
@@ -2089,11 +1968,11 @@ has an unqualified nonreserved entity name and one of five kinds:
 | `rule` | Define reusable pattern fields; create no invocation prefix. |
 | `bundle` | Name one or more activations; create no invocation prefix. |
 
-The five kind words are contextual only after the declaration colon. A
-prefix is one ordinary nonreserved identifier, never punctuation, a qualified
-path, a core keyword, or a `$::` built-in.
+The five kind words are contextual only after the declaration colon. A prefix
+is one ordinary nonreserved identifier, never punctuation, a qualified path, a
+core keyword, or a `$::` built-in.
 
-~~~x
+```x
 namespace flow {
     [[syntax_expander]]
     static $::meta::tokens expand_unless(
@@ -2118,38 +1997,17 @@ void perform(in bool ready) {
     syntax flow::unless;
     unless (ready) return;
 }
-~~~
+```
 
 An expander is `static`, nongeneric, nonvariadic, has exactly one
-`in $::meta::syntax_match` parameter, and returns `$::meta::tokens`.
-`[[syntax_expander]]` implies `eval_only`; it has no runtime symbol or
-address and cannot fall back to runtime execution. The expander and every
-transitively used rule must be visible when its definition is activated.
-`rule` has one `match` clause without `prefix` or `expand`. `bundle` has
-one or more `use` clauses. Other kinds have one `prefix`, one `match`,
-and one `expand` clause, in that order. Duplicate or missing clauses are
-errors.
+`in $::meta::syntax_match` parameter, and returns `$::meta::tokens`;
+`[[syntax_expander]]` implies `eval_only`, so it has no runtime symbol or
+address and cannot fall back to runtime execution. A definition of kind `item`,
+`statement`, or `expression` has one `prefix`, one `match`, and one `expand`
+clause, in that order; `rule` has one `match` clause; `bundle` has one or more
+`use` clauses. Duplicate or missing clauses are errors.
 
-Syntax validation has two phases. Declaration checks the local grammar,
-clause order, terminal and delimiter shape, duplicate fields and choice tags,
-and progress or fence conflicts provable without resolving rule names. All
-rule references remain opaque in this phase, even when a same-spelled rule
-is already visible. Declaration requires neither the expander nor referenced
-rules to be visible and does not freeze their lookup identities.
-
-Activation resolves the selected definitions, bundles, expanders and all
-transitive rules in their retained definition namespace and import scopes.
-It validates the complete graph, including left recursion, nullable cycles,
-rule-dependent progress, repetition continuations and expression/type fences,
-before committing any prefix binding or rule/expander identity. Unused
-definitions still receive local checks, but unresolved names and rule-graph
-errors are diagnosed only when activation needs that graph. Forward references
-and productive mutual recursion are permitted. A successful first activation
-fixes rule and expander identities; later closer declarations do not retarget
-them. A failed activation freezes no identities and cannot poison a later
-valid activation.
-
-~~~text
+```text
 syntax_declaration =
     "syntax" identifier ":" syntax_kind "{" syntax_body "}" ;
 syntax_kind =
@@ -2165,68 +2023,70 @@ syntax_activation =
 syntax_region =
     "syntax" "(" activation_entry { "," activation_entry } ")"
     "{" { external_item } "}" ;
-~~~
+```
 
-The body alternative is selected by kind; the alternatives are not
-interchangeable. `as` replaces one definition's installed prefix but
-cannot rename a bundle. A bundle may refer to definitions or other bundles,
-not to rules. Cyclic bundle graphs are errors. One activation directive
-resolves, validates and installs its fully flattened entries atomically; any
-error installs none and commits no staged rule or expander identity. Previously
-successful bindings remain unchanged. Lists are nonempty and have no trailing
-comma.
+#### Activation and scope
 
-An unqualified syntax entity is sought in enclosing non-global namespaces
-from nearest outward, then active `using` imports from nearest lexical scope
-outward, then the global syntax namespace. Multiple candidates at one tier
-are ambiguous. A qualified activation denotes one complete global syntax
-path, without a leading `::`. Resolution produces a stable syntax-entity
-identity before the binding is installed.
+A declaration is checked locally when parsed: clause order, terminal and
+delimiter shape, duplicate fields and choice tags, and progress or fence
+conflicts provable without resolving rule names. Rule references stay opaque
+until activation, which resolves the selected definitions, bundles, expanders,
+and all transitive rules in their definition namespaces and import scopes and
+validates the complete graph (left recursion, nullable cycles, rule-dependent
+progress, repetition continuations, and expression and type fences) before
+committing any binding. Forward references and productive mutual recursion are
+permitted; unresolved names and rule-graph errors are diagnosed only when an
+activation needs the graph. A successful activation fixes the rule and
+expander identities, which later declarations do not retarget; a failed
+activation installs nothing and does not prevent a later valid activation.
+
+`as` replaces one definition's installed prefix; a bundle cannot be renamed. A
+bundle may refer to definitions and other bundles, not to rules; cyclic bundle
+graphs are errors. One directive resolves, validates, and installs its
+flattened entries atomically: any error installs none and leaves earlier
+bindings unchanged. Lists are nonempty and have no trailing comma.
+
+An unqualified syntax entity is sought in enclosing non-global namespaces from
+nearest outward, then active `using` imports from nearest scope outward, then
+the global syntax namespace; multiple candidates at one tier are ambiguous. A
+qualified activation names one complete global syntax path without a leading
+`::`. Resolution produces a stable entity identity before the binding is
+installed.
 
 An activation takes effect after its semicolon until the enclosing file,
-namespace body, or compound block ends. Nested scopes inherit it, then
-restore the outer environment when closed. Reopening a namespace does not
-restore a prior body's activations. Textual includes inherit the include-site
-environment; primary inputs have independent environments. A
-`syntax (...) { ... }` region is allowed only at item position and is a
-transparent declaration group: it creates no namespace, runtime scope, or
-initialization sequence. Its declared names belong to the enclosing destination
-scope, while syntax activations and `using` imports established in the region
-are restored to the outer environment when the region closes. Block activation
-does not permit nested function definitions.
+namespace body, or compound block ends. Nested scopes inherit it and restore
+the outer environment when closed; reopening a namespace does not restore an
+earlier body's activations; textual includes inherit the include-site
+environment; primary inputs are independent. A `syntax (...) { ... }` region is
+allowed only at item position and is a transparent declaration group: its
+declarations belong to the enclosing scope, while activations and imports
+established inside it end with it. Block activation does not permit nested
+function definitions.
 
-At an applicable position, an active prefix commits to its installed
-grammar. Failure is a syntax-match error; ordinary identifier parsing is not
-retried. An existing `name!` invocation, `name::member` path, or
-`name:` label takes precedence. Item prefixes form one dispatch family;
-statement and expression prefixes share another. Two distinct bindings
-cannot claim the same prefix in one family, including across inherited
-scopes; an explicit alias can resolve the conflict. Repeating the same
-binding is harmless.
+At an applicable position, an active prefix commits to its grammar: failure is
+a syntax-match error, and ordinary identifier parsing is not retried. An
+existing `name!` invocation, `name::member` path, or `name:` label takes
+precedence. Item prefixes form one dispatch family; statement and expression
+prefixes share another. Two distinct bindings cannot claim one prefix in a
+family, including across inherited scopes; an alias resolves the conflict, and
+repeating the same binding is harmless. Where the grammar permits either a type
+name or an expression (cast and parenthesized probes, `sizeof` and `$::alignof`
+operands, generic arguments, and declaration/expression-statement
+classification), an active expression prefix takes precedence over type-name
+classification, including typedef and generic-parameter names; a qualified
+name keeps the qualified-name precedence; a position that requires a type does
+not dispatch expression syntax; statement prefixes never override type probes.
 
-Where core grammar permits either a type name or an expression, an active
-expression prefix takes precedence over type-name classification, including
-typedef and generic-parameter names. This applies to
-cast/parenthesized-expression and `sizeof`/`$::alignof` probes, generic
-arguments, and declaration/expression-statement classification. For example, if
-expression syntax with prefix `T` matches `"*"`, `sizeof(T *)` applies `sizeof`
-to that syntax's expression result even when `T` is a visible type. A qualified
-name such as `Types::T` retains the qualified-name precedence above. A grammar
-position requiring a type, with no expression alternative (such as a parameter's
-declared type), does not dispatch expression syntax. Statement-only prefixes do
-not override type probes.
-
-Only preprocessed source may introduce definitions, rules, bundles,
-activations, and regions. Source macros finish before syntax recognition and
-their resulting tokens count as preprocessed source. Procedural macro or
-syntax-expander output may not introduce syntax registration, and
-`$::meta::parse` cannot mutate the activation environment.
+Only preprocessed source introduces definitions, rules, bundles, activations,
+and regions: source macros finish before recognition and their output counts
+as preprocessed source, while expander or macro output cannot register syntax
+and `$::meta::parse` cannot change the activation environment.
 
 #### Patterns and captures
 
 A pattern starts immediately after its active prefix. Its grammar is:
 
-~~~text
+```text
 pattern = element { element } ;
 element = string_literal | capture | rule_reference ;
 capture = identifier ":" capture_spec ;
@@ -2245,7 +2105,7 @@ capture_spec =
     | "separated1" "(" pattern "," string_literal ")"
     | "choice" "(" alternative { "|" alternative } ")" ;
 alternative = identifier ":" "(" pattern ")" ;
-~~~
+```
 
 | Capture | Meaning |
 | --- | --- |
@@ -2259,152 +2119,116 @@ alternative = identifier ":" "(" pattern ")" ;
 | `rule(name)` | One reusable rule's child record. |
 | `optional`, `repeat0/1`, `separated0/1`, `choice` | Nested child records, with a choice's selected tag. |
 
-`function` aliases `function_raw`. Raw groups are opaque to the core
-parser and can contain a library-owned sublanguage. A raw-group capture accepts
-either written delimiters or a structured splice of a `group` node with matching
-retained delimiters: `paren` accepts `()`, `bracket` accepts `[]`, `block`
-accepts `{}`, and `group` accepts those plus `[[]]`. The latter consumes one
-structured input element and retains the original group node. Its primitive
-capture exposes the delimiter/content tokens with nested splice boundaries
-intact; its capture span is the original group's span. The whole matched input
-still retains the whole-group splice. Quoted delimiter terminals do not
-implicitly open a structured group; explicit textual projection is required for
-matching its interior as separate pattern elements. A named rule reference
+`function` aliases `function_raw`. Raw groups are opaque to the core parser and
+may contain a library-owned sublanguage. A raw-group capture accepts written
+delimiters or a structured splice of a `group` node with matching delimiters
+(`paren` `()`, `bracket` `[]`, `block` `{}`, and `group` any of those or
+`[[]]`): the splice is consumed as one element, and the capture exposes its
+tokens with nested splice boundaries intact and the original group's span.
+Quoted delimiter terminals do not open a structured group; project it
+explicitly to match its interior as separate elements. A named rule reference
 exposes its fields as one child record; an unnamed reference consumes input
-without exposing its fields. Field names are unique within a record.
-Separators are one token and cannot be group delimiters: each repeated body
-is independently balanced. Trailing separators are not accepted.
+without exposing them. Field names are unique within a record. A separator is
+one token, never a delimiter; each repeated body is independently balanced,
+and trailing separators are not accepted.
 
-A quoted terminal matches one existing token by kind and spelling. Quoted
-delimiters may enter a balanced token group, but the corresponding pattern
-alternative must balance and exhaust it. The whole invocation and its
-enclosing group must match. There is no longest-match or declaration-order
-priority: if two complete derivations succeed, including derivations that
-consume different lengths, the invocation is ambiguous.
+Matching is deterministic and executes no user code:
 
-Optional, repeated, separated, and recursive bodies must consume input
-when selected. Left recursion, nullable cycles, and a repetition whose
-possible starts conflict with its continuation after nullable elements
-are rejected during declaration when locally provable without rule lookup,
-and otherwise during activation of the complete rule graph. Once a repeated
-element or separator
-begins, malformed input is an error rather than the end of the repetition.
-This commitment invalidates that candidate derivation, not an independent
-choice or optional alternative. Other complete derivations remain eligible;
-multiple surviving complete derivations are still ambiguous. Exhausting a
-resource bound is an error for the invocation, not a failed alternative. This
-includes limits reached while recognizing a nested invocation inside a parsed
-capture or a non-executing boundary probe; a successful independent alternative
-cannot hide the failure or cause the owner to execute.
-`expr` and `type` are fenced by `;`, `,`, or their matched closing
-delimiter; `$::meta::parse` may instead end at its explicit input
-boundary. A fence may be supplied by an enclosing pattern, a rule reference,
-or a combinator; every possible continuation must satisfy the fence rule.
-Other parsed captures consume one complete core unit.
-When a declaration or name-dependent statement's shape is deferred, boundary
-recognition must not skip a possible body to find a semicolon in following
-source. Written inline tag definitions, macro input groups, quotation and
-initializers retain their independent boundaries. Expression syntax in a known
-expression or initializer position retains its own matched input, including
-interior punctuation and braces. An expression prefix that could instead be a
-declarator name cannot by itself prove ownership of a following body. If opaque
-output leaves the complete unit's boundary ambiguous, use a raw bounded capture
-instead.
-`tokens_until(";")` must be followed immediately by terminal `";"`
-and stops only outside balanced groups. A pattern such as
-`value:expr "+" other:expr` cannot inject infix precedence and is invalid.
-Rule depth, matching work, and output are bounded.
-Identical token spelling with different retained lookup contexts or private
-identifier bindings does not by itself establish a recursive expansion cycle.
+1. A quoted terminal matches one token by kind and spelling. Quoted delimiters
+   may enter a balanced group, but the alternative must balance and exhaust it.
+   The whole invocation and its enclosing group must match.
+2. There is no longest-match or declaration-order priority: if two complete
+   derivations succeed, even of different lengths, the invocation is ambiguous.
+3. Optional, repeated, separated, and recursive bodies must consume input when
+   selected. Left recursion, nullable cycles, and a repetition whose possible
+   starts conflict with its continuation after nullable elements are rejected
+   at declaration when locally provable and otherwise at activation.
+4. Once a repeated element or separator begins, malformed input is an error for
+   that derivation rather than the end of the repetition; independent
+   alternatives remain eligible, and several surviving derivations are still
+   ambiguous.
+5. `expr` and `type` are fenced by `;`, `,`, or their matched closing
+   delimiter, whether the fence comes from the enclosing pattern, a rule, or a
+   combinator, and every possible continuation must satisfy it; a fragment
+   parsed by `$::meta::parse` may instead end at its input boundary. Other
+   parsed captures consume one complete core unit.
+6. `tokens_until(";")` is followed immediately by the terminal `";"` and stops
+   only outside balanced groups. A pattern such as `value:expr "+" other:expr`
+   cannot inject infix precedence and is invalid.
+7. Rule depth, matching work, and output are bounded. Exhausting a bound is an
+   error for the invocation, not a failed alternative, including a bound
+   reached inside a nested invocation or a boundary probe; a successful
+   independent alternative cannot hide it.
+
+Identical spelling with different carried contexts or private identities does
+not by itself make a recursive expansion cycle.
 
 Parsed captures preserve nested procedural and syntax invocations as opaque
-nodes without executing them. If recognition of a core statement, expression,
-type, declaration, or function capture depends on a nested invocation, the
-public tree contains a category-tagged deferred node with its complete bounded
-tokens and context. A deferred node is opaque to child traversal; it may be
-copied or replaced as one node. After the owning extension has expanded and
-remaining nested invocations have expanded, the compiler reparses that node
-in its preserved lexical environment. If even the capture boundary cannot be
-determined without executing nested code, the match is invalid and the author
-must capture a raw bounded group instead. For a function capture, an
-independently bounded parameter, attribute, angle-generic, dependent
-result-array suffix, or inline tag-definition group may
-remain opaque while the enclosing declarator is classified. Parentheses in a
-macro invocation are not evidence of a function declarator; a function-pointer
-object cannot match a direct-function category. If an opaque fragment prevents
-that distinction, recognition fails instead of guessing from delimiters.
-The same header recognition applies to `function`/`function_raw`; their brace
-bodies remain opaque and are never parsed to validate the header.
-In a function header, a later procedural fragment can introduce generic
-parameters whose scope includes earlier parts of that same header. A parsed
-expression or type capture whose classification depends on those pending
-bindings is deferred rather than causing the later fragment to execute ahead
-of its owner. Reparse uses the completed generic bindings of the original
-header together with the capture's retained lexical context. Copying the node
-elsewhere does not substitute the destination header's generic bindings or
-expose unrelated later ordinary declarations. If a boundary cannot be proved,
-the match is invalid and the pattern must use a raw bounded capture.
-For a deferred expression, type, statement, or declaration, declarations
-introduced by earlier surviving expansions in its original captured lexical
-block are visible at reparse. Copying that block preserves its lexical identity;
-moving the expression into a different block does not make that block's
-same-spelled declarations visible. An original-block declaration after the
-captured expression is not made visible merely because an expansion emits it
-before the expression's new destination position.
-When surviving composition unambiguously associates a deferred use with one
-copy of its original block, value, alias and tag lookup consistently use that
-copy's earlier declarations. A declaration omitted from that copy is not
-supplied by another copy of the same original block.
-If several surviving copies are equally close in the retained lexical
-association, lookup is ambiguous only for a name that requires earlier
-declarations from those copies. Such a use is diagnosed instead of selecting
-the first or most recent copy. Already-captured bindings and names whose
-lookup does not depend on those copies remain usable. A use can remain inside
-the selected copy, or retain an already-bound syntax node, to avoid this
-ambiguity. Value/alias lookup and the separate tag lookup domain follow the
-same association rule.
-An unresolved `struct` or `union` type use introduces its implicit forward tag
-in that use's retained source lookup scope. Moving the use does not merge the
-tag with a same-spelled destination tag or introduce a destination binding.
-Repeated uses in the same retained scope refer to the same forward tag. This
-rule also applies after explicit token projection. Explicit tag declarations
-and definitions remain declarations: when spliced, their binders belong to the
-destination scope as specified below.
+nodes without executing them. When recognizing a core capture depends on a
+nested invocation, the public tree holds a category-tagged `deferred` node with
+the complete bounded tokens and their context; it is opaque to child traversal
+and may be copied or replaced as one node. After the owning extension and the
+remaining nested invocations have expanded, a surviving deferred node is
+reparsed in its carried lexical environment, with the completed generic
+bindings of its original header when it belongs to one; a procedural fragment
+later in a header may introduce generic parameters whose scope includes earlier
+parts of that header, and a capture that depends on them is deferred rather
+than executed ahead of its owner. Recognition may leave an independently
+bounded parameter, attribute, generic argument, dependent result suffix, or
+inline tag group opaque while classifying a declarator, but never guesses from
+delimiters: parentheses in a macro invocation are not evidence of a function
+declarator, a function-pointer object does not match a direct-function
+category, and when an opaque fragment leaves the boundary or the
+classification undecidable, the match is invalid and the pattern must use a
+raw bounded capture instead. Boundary recognition never skips a possible body
+to find a semicolon in later source; written inline tag definitions, macro
+input groups, quotation, and initializers keep their own boundaries; expression
+syntax in an expression or initializer position keeps its own matched input;
+an expression prefix that could be a declarator name does not by itself prove
+ownership of a following body. The brace body of `function`/`function_raw` is
+never parsed to validate the header. A nested invocation inside balanced
+attribute arguments does not by itself defer the containing statement or
+declaration; name-sensitive attributes that introduce bindings follow the
+header rules.
 
-#### Syntax values, quotation, and expansion
+Lookup for a reparsed deferred node follows the carried-context rule.
+Declarations introduced by earlier surviving expansions in its original block
+are visible to it; copying that block preserves the association, moving the
+node into another block does not make that block's declarations visible, and a
+declaration placed after the captured position is not made visible by an
+expansion that emits it earlier. When several surviving copies of the original
+block are equally associated with the node, a name that needs those copies'
+declarations is ambiguous and diagnosed rather than resolved to the first or
+latest copy; already captured bindings and names that do not depend on the
+copies remain usable, and a declaration omitted from the selected copy is not
+supplied by another. Value, alias, and tag lookup follow the same rule. An
+unresolved `struct` or `union` type use introduces its implicit forward tag in
+its carried scope, repeated uses in that scope share it, and moving the use
+neither merges the tag with a destination tag nor binds it there; explicit tag
+declarations and definitions are declarations and bind in the destination
+scope.
 
-`$::meta::syntax_match` and `$::meta::syntax` are translation-only
-values with no runtime layout, address, or ABI. A syntax node is an
-immutable concrete syntax tree, not the compiler's internal representation. Its
-published kinds are `token`, `group`, `core`, `extension`, `macro`,
-and `deferred`. Core nodes are named after the productions of the grammar
-summary. Extension and macro nodes remain opaque during normal traversal;
-an extension node retains its resolved definition identity, original input,
-context, span, and match record.
+#### Syntax values, the public tree, and expansion
 
-The public syntax tree is lossless. Each occurrence of a grammar-summary
-nonterminal has one `core` node named for that production. Its immediate
-children are the terminals and referenced nonterminal occurrences of the
-selected alternative in source order: terminals are `token` leaves, absent
-optionals contribute no child, and repetitions contribute their occurrences
-in order. Punctuation and written parentheses are retained as token leaves.
-A raw balanced token-tree capture is a `group` node with its opening and
-closing delimiter tokens and ordered contents. A structured splice within its
-contents is the original syntax node as one child, with that node's kind,
-identity, span and context; it is not a synthetic lexical token. Its subtree
-boundary survives copying and child replacement. Raw-group inspection never
-parses or expands the contents, and an opaque child remains opaque. Primitive
-token capture preserves structured splices; explicit `$::meta::tokens(group)`
-projects all contained nodes textually, including those splice children.
-Replacing an interior raw token with a core or opaque node introduces a subtree
-boundary; replacing an existing splice child preserves its boundary. The
-opening and closing children remain matching lexical delimiter tokens.
-`extension`, `macro`, and
-`deferred` nodes are opaque leaves for traversal even when they own bounded
-input; their dedicated accessors expose that input without recursively
-classifying it. Every node retains its source span and immutable lookup and
-activation context. The child's kind, production name, and position are
-part of the public schema.
+`$::meta::syntax_match` and `$::meta::syntax` are translation-only values. A
+syntax node is an immutable, lossless concrete syntax tree, not the compiler's
+internal representation. Its kinds are `token`, `group`, `core`, `extension`,
+`macro`, and `deferred`. Each occurrence of a grammar-summary nonterminal is
+one `core` node named for that production; its children are the terminals, as
+`token` leaves including punctuation and written parentheses, and the
+nonterminal occurrences of the selected alternative in source order; absent
+optionals contribute no child, and repetitions contribute their occurrences in
+order. A raw balanced capture is a `group` node with its delimiter tokens and
+ordered contents, inspected without parsing or expanding them; a structured
+splice inside it is the original node as one child, keeping its kind, identity,
+span, and context, and that boundary survives copying and child replacement
+(replacing an interior raw token with a core or opaque node introduces such a
+boundary; the delimiter children remain matching lexical tokens). `extension`,
+`macro`, and `deferred` nodes are opaque leaves for traversal; an extension node
+retains its resolved definition, input, context, span, and match record, and
+dedicated accessors expose bounded input without classifying it. Every node
+carries its span and lexical context, and a child's kind, production name, and
+position are part of the public schema.
 
 The `$::syntax::` operations are:
 
@@ -2415,184 +2239,116 @@ The `$::syntax::` operations are:
 | `node(match, field)` | One parsed syntax node, or a `group` tree for a raw balanced-group capture. |
 | `count(match, field)`, `at(match, field, index)` | Number of nested child records and one such record. |
 | `is_variant(record, label)` | Test the selected choice tag. |
-| `span(match)`, `capture_span(match, field)` | Original source spans. |
+| `span(match)`, `capture_span(match, field)` | Original source spans; an empty capture's span is anchored at its input boundary. |
 | `context(match_or_node)` | Immutable lexical name-binding, namespace/import, and syntax-activation context. |
-| `error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics. |
+| `error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; an error stops the current expansion, while warnings and notes do not fail translation. |
 
-An empty capture's span is anchored at its input boundary. Span values use
-the translation-only `$::meta::span` type. Diagnostic operations return `void`;
-an error stops the current expansion, while warnings and notes do not make
-translation fail.
+`context` returns an opaque `$::meta::context` value: it may be copied,
+assigned, or selected by a scalar conditional whose alternatives have that same
+type, cannot be inspected or converted as a scalar or emitted as tokens, and
+shares one immutable environment among its copies. For a complete extension
+match it is the context retained by the invocation prefix; captured fields and
+nested records retain their own input contexts.
 
-`context(match_or_node)` returns an opaque `$::meta::context` value. It may be
-copied, assigned, or selected by a scalar conditional whose two alternatives
-have that same type. It has no runtime size, layout, address, or ABI, cannot
-be inspected or converted as a scalar, and cannot be emitted as source tokens.
-For a complete extension match, this is the context retained by its invocation
-prefix. Captured fields and nested records retain their own input contexts;
-a differently contextualized field does not replace the whole-match context.
-Copies share the same immutable environment; later declarations, imports, or
-syntax activations do not change an existing context value.
+The `$::meta` public-tree operations are `parse(category, tokens, context)`,
+`tokens(node)`, `node_span(node)`, `is_kind(node, kind)`,
+`is_production(node, name)`, `child_count(node)`, `child(node, index)`,
+`replace_child(node, index, replacement)`, `is_extension(node, definition)`,
+and `extension_match(node)`. The parse categories are the translation-time
+strings `expr`, `stmt`, `type`, `declaration`, `function_header`,
+`function_decl`, and `function_def`; the other arguments are
+`$::meta::tokens` and `$::meta::context`. Parsing consumes the complete
+bounded input in the explicit context and cannot execute nested expansions or
+register syntax. Replacement is structurally validated. Invalid fields, tags,
+indices, categories, and replacement shapes are errors. Counts return target
+`uptr` and reject unrepresentable values; child, replacement, and record
+indices are nonnegative integers within bounds, whatever their integer type.
+For `is_extension`, `definition` is a translation-time string naming a syntax
+entity, resolved in the node's retained syntax lookup context; the operation
+compares that entity identity with the node's definition and returns `bool`
+(false for a non-extension node), and an invalid, ambiguous, or invisible name
+is an error rather than a false comparison.
 
-The `$::meta` public-tree operations are `parse(category,tokens,context)`,
-`tokens(node)`, `node_span(node)`, `is_kind(node,kind)`,
-`is_production(node,name)`, `child_count(node)`, `child(node,index)`,
-`replace_child(node,index,replacement)`, `is_extension(node,definition)`,
-and `extension_match(node)`. The parse categories are `expr`, `stmt`,
-`type`, `declaration`, `function_header`, `function_decl`, and
-`function_def`. The category is a translation-time string with one of these
-spellings; the other arguments are `$::meta::tokens` and `$::meta::context`.
-Parsing consumes the complete bounded input and cannot
-execute nested expansions or register syntax. Replacement is structurally
-validated. Invalid fields, tags, indices, categories, and replacement shapes
-are translation errors.
-`child_count` and `count` return target `uptr` and reject unrepresentable
-counts. Child, replacement and nested-record indices must be nonnegative
-integers within the corresponding child or record collection's bounds, including
-when the supplied integer type is narrower than `uptr`.
-For `is_extension(node,definition)`, `definition` is a translation-time string
-containing a qualified syntax name. It resolves in the node's retained syntax
-lookup context to a visible syntax entity; the operation compares that stable
-entity identity with the extension node's definition and returns `bool` (false
-for a non-extension node). An invalid, ambiguous, or invisible name is a
-translation error, not a false comparison.
+A `$::quote` value is a structured token sequence. A syntax node spliced with
+`$::unquote` stays indivisible and category-aware through quotation, copying,
+concatenation, and parsing: an expression node for `amount + 1` spliced before
+`* scale` means `(amount + 1) * scale`. `$::meta::tokens(node)` projects it
+to plain tokens and gives up that guarantee; an operation that cannot preserve
+a splice requires the explicit projection instead of flattening silently.
 
-`$::quote` produces a structured token-sequence value. Within a quote,
-`$::unquote` accepts tokens or a syntax node. A syntax-node splice remains
-indivisible and category-aware through quotation, copying, concatenation,
-and further parsing: an expression node for `amount + 1` spliced before
-`* scale` means `(amount + 1) * scale`. `$::meta::tokens(node)`
-explicitly projects its textual tokens and loses that root grouping guarantee.
-If an operation cannot preserve a structured splice, it must require this
-explicit projection rather than silently flattening it.
-A structured statement splice occupies exactly one statement in its destination
-block and follows ordinary lexical scope: a direct declaration statement binds
-in that block, but declarations inside a nested compound or loop scope do not
-leak into it. Identifier uses already present in the spliced node keep their
-original hygienic lookup context. The splice cannot attach to
-an outside `else` or introduce syntax registration. A `statement`-rooted splice
-keeps its original public-tree root; a directly spliced
-`unattributed_statement` subtree is preserved as the sole child of a new
-`statement` root. A directly spliced `compound_statement` subtree receives
-`statement` and `unattributed_statement` wrappers at statement position, but
-keeps its `compound_statement` root at a function-body position.
-A structured `declaration` splice occupies one complete core declaration at
-item scope, or one declaration statement in a destination block. Its declared
-names and tags bind in the destination scope, while identifier uses already
-inside the node retain their captured hygienic lookup. The declaration keeps
-its original public-tree root at item scope; in a block it is the sole child
-of a new `unattributed_statement` under a new `statement` root. The
-`declaration` parse category uses the declaration forms valid in its captured
-file or block context, including block-local storage specifiers, ordinary
-`using`, global-label declarations and `$::static_assert`. These special forms
-retain their respective `using_declaration`, `global_label_declaration` and
-`static_assert_declaration` roots. A spliced `using_declaration` at block scope
-is a block item, not a statement that may serve as an unbraced `if`/loop body;
-it retains its root as a direct `compound_statement` child. Global-label
-declarations remain item-scope declarations. Inspection neither performs an
-import nor evaluates an assertion in the destination program; ordinary effects
-and validation occur only when the declaration survives expansion. A deferred
-declaration is reparsed only if it survives the owning expansion. A settled
-declaration supplied as a structured splice still obeys the requested category's
-file/block grammar, including when parsed inside a statement. Checking its
-placement does not replace the identifier lookup retained by that node.
-A structured `function_definition` splice occupies one complete function
-definition at item scope. Its declared function name binds in the destination
-scope, while existing identifier uses retain captured lookup. A structured
-prototype is a `declaration` node; accepting it as `function_decl` requires
-direct-function classification, not merely a declaration root. Nested deferred
-nodes keep their own categories and contexts; they need not have the same
-category as their containing tree. Splicing does not drop generic assertions
-or change the destination source unit's linkage rules.
-A structured `function_header` splice may be followed by `;` to form a
-prototype or by a compound statement to form a definition. No textual
-projection is needed. The composed public root is respectively `declaration`
-or `function_definition`, with the original header node followed by the
-semicolon token or compound-statement node. Attribute specifiers may precede
-or follow the spliced header. They belong to the same function declaration
-and undergo ordinary attribute validation together with the header's own
-attributes; composition does not override conflicting attributes. They remain
-separate public children in written order. Parsing such a decorated splice as
-`function_header` yields a header root containing those attributes and the
-original header child; parsing a bare header splice preserves that node itself.
-Nested decoration preserves each retained child rather than flattening it.
-Header identifiers retain their
-captured lookup; the declared function binds in the destination scope and
-its parameter and generic declarations provide the normal body bindings.
-Body identifiers retain their own provenance. If the header is deferred,
-recognition may defer the complete composed unit without executing the header
-or body; a surviving reparse resolves the header before interpreting the body.
-A structured type splice denotes its complete captured type and composes with
-surrounding qualifiers and declarators as a type alias would. It does not
-redistribute pointer or array tokens into a neighboring declarator. Its public
-`type_specifier` wrapper retains the original type node as its sole child;
-explicit token projection remains available when textual composition is wanted.
+A spliced node occupies exactly one unit of its category at its destination
+and keeps its public-tree root; where the destination grammar needs wrapper
+productions (`statement` and `unattributed_statement` around a statement or a
+block declaration, `type_specifier` around a type, `primary_expression` around
+an expression, `declaration` or `function_definition` around a composed
+header), they are added around the retained node. In particular:
 
-Each token or structured fragment retains an immutable lexical name-binding,
-namespace/import, and syntax-activation environment. Literal identifiers and
-prefixes in a quote, and identifiers made by `$::meta::parse("...")`, use the
-definition context of the executing expander function. Input copied or
-unquoted from an invocation retains its original call-site context even when
-relocated.
-`$::meta::parse(category,tokens,context)` uses its explicit context.
-`$::meta::call_site` requests invocation-context lookup for one
-identifier token without changing its spelling, span, or identity;
-`$::meta::gensym` gives one identifier token a fresh opaque private identity
-shared by its copies. During the first parse of a previously unparsed fragment,
-declarations introduced by that fragment in a generated namespace bind its
-same-fragment uses in that namespace. This applies uniformly to quoted or
-constructed tokens, copied raw input, and fresh identifiers. Unrelated
-destination declarations do not capture those uses: free names keep their
-original definition/call-site lookup, and already parsed bindings remain fixed.
-Once captured as parsed syntax, the selected bindings are preserved through
-copying, token projection and relocation under the usual declaration-copy rules.
-Syntax aliases
-resolve to stable entity identities when activated. Newly constructed tokens
-default to the invocation span; copies retain their spans. The patch identity
-rules under “Procedural token macros” apply to copied and newly constructed
-`$::patch` expressions.
+- A statement splice occupies one statement of the destination block under
+  ordinary lexical scope: a direct declaration statement binds in that block,
+  declarations in a nested compound or loop scope do not leak, and the splice
+  cannot attach to an outside `else`. A spliced compound statement keeps its
+  `compound_statement` root at a function-body position.
+- A declaration splice occupies one complete declaration at item scope or one
+  declaration statement in a block, in the forms valid for its captured
+  context (block-local storage specifiers, `using`, global-label declarations,
+  and `$::static_assert`), keeping their `using_declaration`,
+  `global_label_declaration`, and `static_assert_declaration` roots. A spliced
+  `using` at block scope is a block item, never an unbraced `if` or loop body.
+  Inspection neither imports nor asserts; effects and validation apply when the
+  declaration survives expansion. A settled declaration still obeys the
+  requested category's file or block grammar, including when parsed inside a
+  statement.
+- A `function_definition` splice occupies one definition at item scope. A
+  `function_header` splice followed by `;` or by a compound statement composes a
+  `declaration` or `function_definition` root whose children are the header
+  node and the semicolon token or body node; attribute specifiers before or
+  after the header belong to that function, are validated together with the
+  header's own attributes without overriding conflicts, and stay separate
+  children in written order. A prototype is a `declaration` node, accepted as
+  `function_decl` only with a direct-function declarator. Parsing a decorated
+  header splice as `function_header` yields a header root whose children are
+  those attributes and the original header node; a bare header splice parses
+  to itself. If the header is deferred, the composed unit is deferred without
+  executing the header or body.
+- A type splice denotes its complete captured type and composes with
+  surrounding qualifiers and declarators like a type alias; it does not
+  redistribute pointer or array tokens into a neighboring declarator.
 
-The logical order is preprocessing, lexical activation/declaration parsing,
-recognition of one bounded invocation, execution of its owner expander,
-parsing of its replacement, expansion of remaining invocations outermost
-first and then in source order, and ordinary category/semantic validation.
-The owner expands before nested invocations in its input. Inspecting a
-public tree never executes it. Local-object and statement attributes, like
-function and type attributes, retain their balanced public grammar for
-inspection, discard or repair; their semantic placement, argument and conflict
-checks apply when the source survives expansion. Ordinary attribute arguments
-are balanced tokens, so a nested invocation there does not by itself require
-deferring its containing statement or declaration. Name-sensitive attributes
-that introduce bindings still follow the header-deferral rules above.
-Public statement recognition also preserves `case`/`default` grammar without
-requiring an enclosing switch or checking duplicate defaults. These are
-control-flow constraints on surviving source: an owner may discard the captured
-statement or supply its receiving switch, without changing captured name lookup.
-An object declaration with an omitted array bound also remains inspectable when
-its initializer does not yet complete the type. Initializer/completeness
-constraints apply to surviving source, not to discarded or repaired syntax.
-A custom-syntax replacement occupies only its matched
-subtree: it cannot consume adjacent source, attach to an outside `else`,
-or change syntax registration. Expression output remains a subtree. This
-boundary applies even when its output contains procedural token macros. A
-structured node containing a macro invocation likewise retains its category;
-explicit `$::meta::tokens(node)` projection is available when textual
-composition is intended instead.
+In every case the declared names and tags of a spliced node bind in the
+destination scope, while identifier uses already inside it keep their carried
+lookup (see “Contexts, hygiene, and identities”); a spliced header's
+parameters and generic declarations provide the normal body bindings. Nested
+deferred nodes keep their own categories and contexts. Splicing does not drop
+generic assertions or change the destination source unit's linkage rules.
 
-The procedural sandbox and its adjustable resource budgets also govern
-syntax matching, tree construction, expander execution, and replacement.
-Diagnostics identify the invocation, definition, rule, and expansion
-ancestry for definition, activation, match, ambiguity, meta-API, output,
-effect, or limit failures. Cyclic or nonterminating expansion is diagnosed.
+The logical order is preprocessing, lexical activation and declaration
+parsing, recognition of one bounded invocation, execution of its expander,
+parsing of its replacement, expansion of the remaining invocations outermost
+first and then in source order, and ordinary category and semantic validation.
+The owner expands before the nested invocations in its input, and inspecting a
+public tree never executes it. Attributes, `case`/`default` labels without an
+enclosing switch or with duplicate defaults, and object declarations whose
+omitted bound is not yet completed remain inspectable: their placement,
+control-flow, and completeness constraints apply to source that survives
+expansion, not to discarded or repaired syntax, and an owner may discard a
+captured statement or supply its receiving switch without changing captured
+lookup. A replacement occupies only its matched subtree: it cannot consume
+adjacent source, attach to an outside `else`, or register syntax, and
+expression output remains a subtree even when it contains token macros.
+
+The procedural sandbox and its budgets govern matching, tree construction,
+expander execution, and replacement. Diagnostics identify the invocation,
+definition, rule, and expansion ancestry for definition, activation, match,
+ambiguity, meta-API, output, effect, or limit failures. Cyclic or
+nonterminating expansion is diagnosed.
 
 This facility exposes syntax, not resolved types, binding identities,
-control-flow graphs, liveness, closure conversion, coroutine lowering,
-cleanup, or unwinding. A library that advertises exceptions, suspension,
-or structured cleanup must implement and validate its own supported
-subgrammar and runtime protocol, or reject unsupported input. Wrapping a
-statement can retarget `break`, `continue`, or `else`; outward
-`return`/`goto` can bypass generated cleanup; nonlocal transfer performs
-no automatic copy-out.
+control-flow graphs, liveness, closure conversion, coroutine lowering, cleanup,
+or unwinding. A library that advertises exceptions, suspension, or structured
+cleanup must implement and validate its own subgrammar and runtime protocol, or
+reject unsupported input. Wrapping a statement can retarget `break`,
+`continue`, or `else`; outward `return` or `goto` can bypass generated cleanup;
+nonlocal transfer performs no automatic copy-out.
 
 ## Declarations, definitions, and linkage
 
@@ -3883,7 +3639,6 @@ The following function and statement attributes are normative:
 | `raw_inline` | Permits mandatory inline-and-verify use from naked code. |
 | `eval_only` | Requires every direct call to evaluate and gives the function no runtime symbol/address. |
 | `runtime_only` | Prevents translation-time entry into the function. |
-| `generic(parameters...)` | Declares explicit type/value generic parameters. |
 | `macro` | Defines a one-token-tree procedural macro and implies `eval_only`. |
 | `syntax_expander` | Defines a one-match syntax expander and implies `eval_only`. |
 | `operator("token")` | Binds one exact unary or binary operator signature to this ordinary function. |
