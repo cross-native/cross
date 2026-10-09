@@ -184,6 +184,8 @@ may have `out` or `inout` parameters.
 
 ## Limits on all targets
 
+- Generic records and unions (`struct list<T>`) are specified but not
+  implemented; `$::feature::generic_types` is absent.
 - Function pointers can be converted to another ABI or other register
   locations only when the function is named directly; see
   [language.md](language.md#function-pointers).

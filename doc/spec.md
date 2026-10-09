@@ -317,7 +317,9 @@ lvalue. `volatile` and `restrict` have the contracts defined later.
 type, except that an alias declared with `aligned` is distinct for layout only,
 as described under alignment and packing.
 
-`struct`, `union`, and `enum` tags occupy a tag-name space. A structure stores
+`struct`, `union`, and `enum` tags occupy a tag-name space; a record or union
+tag may carry a generic parameter list (see “Generic records and unions”). A
+structure stores
 members in declaration order; a union overlays all members at offset zero.
 Members may be objects, arrays, records, or bit-fields, but not functions,
 incomplete objects, or variable-length arrays. A record is complete after its
@@ -709,7 +711,8 @@ desired.
 ### Enumerations
 
 Omitting a record, union, or enumeration tag name requires a definition body.
-Such a definition introduces a distinct nominal type without a lookup name.
+Such a definition introduces a distinct nominal type without a lookup name
+and cannot have a generic parameter list.
 Declarators sharing that definition share its type; a separate definition is
 distinct even if its members and representation are identical. A typedef may
 name the type. Omitting an enumeration's tag does not suppress its enumerator
@@ -1612,7 +1615,10 @@ expected result type nor overload ranking, specialization ranking,
 argument-dependent lookup, default generic arguments, best-common-type search,
 or implicit selection of a default-profile function-pointer ABI. A callback or
 function pointer deduced with a manual or registered stable interface keeps
-that interface; an unavailable adapter is diagnosed after deduction.
+that interface; an unavailable adapter is diagnosed after deduction. An
+actual whose type is an instance of a generic record binds the type parameters
+in the formal's argument list structurally, `T` to `u32` for a formal
+`struct list<T>` and an actual `struct list<u32>`.
 
 ```text
 u64 left, right;
@@ -1661,6 +1667,47 @@ Mangling model names and rules are unversioned data with no compiler-internal
 meaning. A model shared as an external ABI must pin its complete rules and the
 descriptor grammar it consumes; an externally consumed instance may use an
 explicit `link_name` instead.
+
+### Generic records and unions
+
+A record or union definition may place a generic parameter list after its
+tag. The parameter forms and constraints are those of generic functions, and
+the parameters are in scope in the member list. A forward declaration of a
+generic tag repeats the same parameter list. An anonymous definition and an
+enumeration cannot be generic.
+
+```text
+struct list<T> {
+    T *items;
+    uptr count;
+};
+
+static T first<T>(in struct list<T> values) {
+    return values.items[0];
+}
+
+global u32 use(in u32 *words, in uptr n) {
+    struct list<u32> list = { words, n };
+    return first(list);
+}
+```
+
+Every use of a generic tag names all of its arguments, as in `struct list<u32>`
+or `struct list<struct list<u8>>`; a type use has no deduction, default
+argument, or partial application. After a tag keyword, `name<...>` is always a
+generic type application. Each normalized argument list denotes one distinct
+nominal type: two spellings of the same canonical arguments denote the same
+type, and different argument lists denote unrelated types even when their
+layouts agree. An instance is laid out and classified like a written record
+with the substituted member types, is complete when its substituted member
+list is complete, and may refer to itself through a pointer as an ordinary
+record may. Attributes on the definition apply to every instance.
+
+A generic function may use a generic tag with its own parameters, as in
+`struct list<T>` above; substitution instantiates the record, and deduction
+binds the arguments structurally from an actual's type. The descriptor of an
+instance is the record's descriptor with its argument list spelled as in
+[models.md](models.md#type-spellings).
 
 ### Procedural token macros
 
@@ -3554,7 +3601,8 @@ model aliases resolve before testing; unknown features/extensions produce zero;
 `control_intrinsics`, `atomics`, `variadics`, `fixed_vectors`,
 `scalable_vectors`, `address_spaces`, `thread_local`, `integer128`,
 `binary128_storage`, `binary128_arithmetic`, `evaluation`,
-`automatic_evaluation`, `generics`, `procedural_macros`, `syntax_extensions`,
+`automatic_evaluation`, `generics`, `generic_types`, `procedural_macros`,
+`syntax_extensions`,
 `embedded_assets`, `patchable_values`, `patchable_operands`, `repeatable_patch`,
 `concurrent_patch`, `raw_inline`, `contextual_attributes`,
 `external_models`, and `operator_binding`, each below `$::feature::`.
@@ -4139,8 +4187,9 @@ scalar_type
     | "f32" | "f64" | "f80" | "f128" | "fptr" | "label" ;
 
 struct_or_union_specifier
-    = ("struct" | "union") [ qualified_name ] { attribute_specifier }
-      [ "{" { member_declaration } "}" ] ;
+    = ("struct" | "union")
+      [ qualified_name [ generic_parameter_list | generic_arguments ] ]
+      { attribute_specifier } [ "{" { member_declaration } "}" ] ;
 member_declaration
     = { attribute_specifier } declaration_specifiers
       [ member_declarator { "," member_declarator } ] ";" ;
@@ -4417,9 +4466,11 @@ selects source-unit linkage. `object_location` is valid only on a hard-bound
 `register` object.
 
 `generic_parameter_list` is valid only on a direct function declaration or
-definition. Its parameters are in scope for the preceding result type as
+definition and on the tag of a record or union definition or forward
+declaration. Its parameters are in scope for the preceding result type as
 specified under Generic functions. A `generic_arguments` form without `::`
-is selected only when lookup finds a generic entity. `syntax_invocation`
+is selected only when lookup finds a generic entity, and always after a tag
+keyword. `syntax_invocation`
 is determined by the active lexical syntax bindings and their bounded
 patterns; its output must satisfy the declared item, statement, or
 expression category.

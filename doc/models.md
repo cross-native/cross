@@ -767,7 +767,9 @@ follows:
   to `u128`, `iptr`, `uptr`, `f32`, `f64`, `f80`, `f128`, `fptr`, or
   `label`.
 - `struct`, `union`, or `enum`, a space, and the qualified name spell a
-  record or enumeration, as in `struct net::packet`.
+  record or enumeration, as in `struct net::packet`; an instance of a generic
+  record or union appends `<`, its argument spellings separated by `,`, and
+  `>`, as in `struct list<u32>`.
 - `P` followed by the pointee spells a pointer, as in `PKu8` for
   `const u8 *`. A pointer into address space `N` other than 0 is `PU`, `N`,
   `_`, and the pointee.
