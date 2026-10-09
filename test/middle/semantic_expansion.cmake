@@ -26,7 +26,7 @@ run_cc("${OUTPUT}.linux.o" -c -O2 -target x86_64-unknown-linux-gnu)
 
 file(READ "${ir_output}" ir)
 foreach(pattern
-        "Cross language 0.8"
+        "Cross language 0.9"
         "global i64 178998315"
         "global i64 33"
         "global i64 44"

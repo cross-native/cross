@@ -38,7 +38,8 @@ const std::vector<const TargetInfo*>& all_targets() {
 std::vector<std::string_view> language_features(const CompilerOptions& options) {
     std::vector<std::string_view> result{
         "runtime_free_intrinsics", "control_intrinsics", "evaluation",
-        "automatic_evaluation", "generics", "procedural_macros", "embedded_assets",
+        "automatic_evaluation", "generics", "procedural_macros", "syntax_extensions",
+        "embedded_assets",
         "patchable_values", "patchable_operands", "raw_inline",
         "contextual_attributes", "external_models", "operator_binding"};
     const auto* target = target_for_triple(options.target);

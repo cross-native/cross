@@ -75,7 +75,7 @@ public:
             return {};
         }
         std::ostringstream module;
-        module << "; Cross language 0.8\n"
+        module << "; Cross language 0.9\n"
                   "source_filename = \"cross compilation group\"\n"
                << "target triple = " << llvm_string(options_.target)
                << "\n\n";

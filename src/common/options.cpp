@@ -1038,7 +1038,7 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
 std::string_view default_target() { return CROSS_DEFAULT_TARGET; }
 
 void print_version() {
-    std::cout << "Cross toolchain 0.1.0 (language 0.8)\n"
+    std::cout << "Cross toolchain 0.1.0 (language 0.9)\n"
                  "Default target: " << default_target() << "\n"
                  "Copyright (C) 2026 Cross contributors\n"
                  "License GPLv3+: GNU GPL version 3 or later\n";

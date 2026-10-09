@@ -1369,7 +1369,7 @@ public:
             return {};
         }
         std::ostringstream out;
-        out << "/* Cross language 0.8: experimental GCC __GIMPLE bridge.\n"
+        out << "/* Cross language 0.9: experimental GCC __GIMPLE bridge.\n"
                "   Compile this file with GCC -fgimple. */\n\n";
         collect_required_types();
         types_.emit(out);

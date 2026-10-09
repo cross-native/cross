@@ -232,8 +232,8 @@ parses tokens as `"expr"`, `"stmt"`, `"type"`, `"declaration"`,
 invocations inside a capture stay unexpanded until the enclosing expansion
 finishes.
 
-`$::has_feature($::feature::syntax_extensions)` is still false because the
-facility is incomplete. Test individual operations with `$::has_intrinsic`.
+`$::has_feature($::feature::syntax_extensions)` reports the facility;
+`$::has_intrinsic` tests individual operations.
 
 ## Embedded files
 

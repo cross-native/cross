@@ -116,8 +116,8 @@ check(inspection pass [=[
 #if !$::has_intrinsic($::meta::spelling) || !$::has_intrinsic($::meta::children) || !$::has_intrinsic($::meta::delimiter) || !$::has_intrinsic($::meta::span) || !$::has_intrinsic($::meta::error) || !$::has_intrinsic($::meta::warning) || !$::has_intrinsic($::meta::note) || !$::has_intrinsic($::meta::token) || !$::has_intrinsic($::meta::group)
 #error missing implemented token API
 #endif
-#if $::has_feature($::feature::syntax_extensions)
-#error incomplete syntax feature was advertised
+#if !$::has_feature($::feature::syntax_extensions)
+#error the syntax feature must be advertised
 #endif
 [[macro]] static $::meta::tokens inspect(in $::meta::tokens input) {
     $::static_assert($::meta::is_kind($::quote { namespace }, "identifier"), "lexical keyword");

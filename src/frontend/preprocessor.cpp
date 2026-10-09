@@ -189,9 +189,9 @@ void Preprocessor::install_predefined_macros() {
     const auto pointer_bytes = abi && abi->address_bits != 0
                                    ? (abi->address_bits + 7U) / 8U
                                    : 8U;
-    macros_["$::language::version"].replacement = "800i64";
+    macros_["$::language::version"].replacement = "900i64";
     macros_["$::language::version_major"].replacement = "0";
-    macros_["$::language::version_minor"].replacement = "8";
+    macros_["$::language::version_minor"].replacement = "9";
     macros_["$::source::file"].replacement = "\"\"";
     macros_["$::source::line"].replacement = "0";
     macros_["$::target::triple"].replacement = '"' + options_.target + '"';

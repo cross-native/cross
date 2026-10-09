@@ -29,7 +29,7 @@ foreach(pattern
         "global i32 operator_attribute = 1;"
         "global i32 patch_repeatable = 0;"
         "global i32 patch_concurrent = 0;"
-        "global i64 language_version = 800i64;"
+        "global i64 language_version = 900i64;"
         "global i32 automatic_evaluation ="
         "global i32 atomic_feature = 1;"
         "global i32 variadic_feature = 1;"

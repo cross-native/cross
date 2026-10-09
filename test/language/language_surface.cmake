@@ -21,8 +21,8 @@ function(capture option output_name)
 endfunction()
 
 capture("--version" version)
-if(NOT version MATCHES "language 0\\.8")
-    message(FATAL_ERROR "version output does not identify Cross 0.8\n${version}")
+if(NOT version MATCHES "language 0\\.9")
+    message(FATAL_ERROR "version output does not identify Cross 0.9\n${version}")
 endif()
 
 capture("--print-keywords" keywords)

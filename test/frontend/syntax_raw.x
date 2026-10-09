@@ -4,8 +4,8 @@
 #if !$::has_attribute(syntax_expander) || !$::has_builtin($::syntax::capture) || !$::has_builtin($::syntax::is_variant) || !$::has_intrinsic($::syntax::is_variant) || !$::has_builtin($::syntax::node) || !$::has_intrinsic($::meta::child) || !$::has_builtin($::meta::is_extension) || !$::has_intrinsic($::meta::is_extension) || !$::has_builtin($::syntax::span) || !$::has_intrinsic($::syntax::capture_span) || !$::has_builtin($::meta::node_span) || !$::has_intrinsic($::syntax::warning) || !$::has_builtin($::syntax::error) || !$::has_builtin($::syntax::note)
 #error implemented syntax operations must be discoverable
 #endif
-#if $::has_feature($::feature::syntax_extensions)
-#error full public-tree syntax support is not implemented yet
+#if !$::has_feature($::feature::syntax_extensions)
+#error the syntax feature must be advertised
 #endif
 #if !$::has_builtin($::meta::replace_child) || !$::has_intrinsic($::meta::replace_child)
 #error syntax child replacement must be discoverable
