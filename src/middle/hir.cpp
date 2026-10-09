@@ -378,7 +378,7 @@ public:
             }
             expression(expression, source->expression.get());
             expression(expression, source->condition.get());
-            expression(expression, source->increment.get());
+            for (const auto& increment : source->increments) expression(expression, increment.get());
             self(self, source->first.get());
             self(self, source->second.get());
             for (const auto& child : source->statements)
@@ -629,10 +629,8 @@ private:
             co_await finish_patch_sink_expression_async(*statement.condition,
                                          source_namespace);
         }
-        if (statement.increment) {
-            co_await finish_patch_sink_expression_async(*statement.increment,
-                                         source_namespace);
-        }
+        for (auto& increment : statement.increments)
+            co_await finish_patch_sink_expression_async(*increment, source_namespace);
         if (statement.first) {
             co_await finish_patch_sink_statement_async(*statement.first, source_namespace);
         }
@@ -663,6 +661,44 @@ private:
             const auto value = co_await evaluate_alignment_attribute_async(
                 program_, attribute, diagnostics_, queries.first, queries.second, subject, source_namespace);
             if (value) result = std::max(result, *value);
+        }
+        co_return result;
+    }
+
+    // The common address of an entity's address(N) declarations, if any.
+    ContinuationTask<std::optional<std::uint64_t>> fixed_address_async(
+        const std::vector<const Attribute*>& attributes, std::string_view source_namespace) {
+        std::optional<std::uint64_t> result;
+        for (const auto* attribute : attributes) {
+            if (resource_failed()) co_return result;
+            if (attribute->arguments.size() != 1 || !attribute->expression_argument) {
+                diagnostics_.error(attribute->location, "address requires one integer argument");
+                continue;
+            }
+            auto value = attribute->expression_argument->evaluated_integer;
+            if (!value) {
+                const auto queries = record_layout_queries(attribute->location);
+                LayoutServiceScope services(*this, attribute->location);
+                value = co_await evaluate_target_integer_constant_async(program_,
+                    *attribute->expression_argument, diagnostics_, queries.first, queries.second,
+                    source_namespace);
+                if (!value) continue;
+            }
+            const auto type = value->type;
+            const bool sized = type == BuiltinType::Iptr || type == BuiltinType::Uptr;
+            const auto bits = sized ? module_.address_bits : type_bits(builtin_type(type));
+            const bool negative = bits != 0 && bit(value->value, bits - 1) &&
+                (type == BuiltinType::I8 || type == BuiltinType::I16 || type == BuiltinType::I32 ||
+                 type == BuiltinType::I64 || type == BuiltinType::I128 || type == BuiltinType::Iptr);
+            if (value->value == UInt128{} || negative ||
+                !fits_unsigned(value->value, module_.address_bits)) {
+                diagnostics_.error(attribute->location,
+                    "address requires a positive integer constant that fits the target address width");
+            } else if (result && *result != value->value.low) {
+                diagnostics_.error(attribute->location, "conflicting address attributes");
+            } else {
+                result = value->value.low;
+            }
         }
         co_return result;
     }
@@ -780,7 +816,7 @@ private:
                             " does not take arguments");
                 }
             } else if (attribute.name != "aligned" &&
-                       !(definition && attribute.name == "may_alias")) {
+                       !(definition && (attribute.name == "may_alias" || attribute.name == "exhaustive"))) {
                 diagnostics_.error(
                     attribute.location,
                     "attribute '" + attribute.name + "' is not valid on " +
@@ -829,10 +865,14 @@ private:
                 for (const auto& attribute : declaration.attributes) {
                     diagnostics_.error(
                         attribute.location,
-                        "layout attribute '" + attribute.name +
+                        "attribute '" + attribute.name +
                             "' requires a complete record definition");
                 }
             }
+            if (declaration.is_union)
+                if (const auto* attribute = declaration.attribute("exhaustive"))
+                    diagnostics_.error(attribute->location,
+                                       "attribute 'exhaustive' is not valid on a union");
         }
     }
 
@@ -1675,6 +1715,20 @@ private:
             const auto* representative = function.definition
                                              ? function.definition
                                              : function.declarations.back();
+            std::vector<const Attribute*> address_attributes;
+            for (const auto* declaration : function.declarations)
+                if (const auto* attribute = declaration->attribute("address")) {
+                    address_attributes.push_back(attribute);
+                    if (declaration->definition())
+                        diagnostics_.error(attribute->location,
+                            "address requires a function declaration without a body");
+                }
+            function.fixed_address = co_await fixed_address_async(
+                address_attributes, representative->source_namespace);
+            if (function.fixed_address && function.definition &&
+                !function.definition->attribute("address"))
+                diagnostics_.error(function.definition->location,
+                    "function '" + representative->name + "' has a fixed address and cannot also be defined");
             function.location = representative->location;
             function.source_unit = representative->source_unit;
             function.linkage = representative->linkage;
@@ -2192,6 +2246,15 @@ private:
         }
     }
 
+    bool completes_array(TypeId complete, TypeId incomplete) {
+        const auto& left = module_.type(complete);
+        const auto& right = module_.type(incomplete);
+        return left.kind == Type::Kind::Array && right.kind == Type::Kind::Array &&
+            left.lanes != 0 && right.lanes == 0 && left.element && right.element &&
+            left.is_const == right.is_const && left.is_volatile == right.is_volatile &&
+            module_.without_may_alias(*left.element) == module_.without_may_alias(*right.element);
+    }
+
     Object make_object(const ObjectDecl& declaration, bool allow_inferred_bounds) {
         Object object;
         object.id = {static_cast<std::uint32_t>(module_.objects.size())};
@@ -2204,9 +2267,12 @@ private:
         // materialization elsewhere in the input. Keep that array's identity
         // and element type without inventing an extent. Layout queries still
         // return unavailable, and final HIR requires the completed bound.
-        const bool pending_bound = allow_inferred_bounds && declaration.initializer &&
-            declaration.type && declaration.type->kind == cross::Type::Kind::Array &&
+        // An incomplete array declaration has no extent until a definition.
+        const bool omitted_bound = declaration.type && declaration.type->kind == cross::Type::Kind::Array &&
             declaration.type->lanes == 0 && !declaration.type->array_bound;
+        const bool pending_bound = omitted_bound &&
+            (allow_inferred_bounds || !declaration.initializer) &&
+            (declaration.initializer || declaration.linkage == Linkage::Group);
         validate_atomic_type(object.type, declaration.location, pending_bound);
         (void)complete_object_type(object.type, declaration.location);
         return object;
@@ -2224,9 +2290,13 @@ private:
                 module_.objects.push_back(make_object(*source, allow_inferred_bounds));
             } else {
                 id = found->second;
-                // A may_alias typedef denotes the same type.
-                if (module_.without_may_alias(module_.objects[id.value].type) !=
-                    module_.without_may_alias(intern_type(source->type))) {
+                auto& canonical_type = module_.objects[id.value].type;
+                const auto type = intern_type(source->type);
+                // A may_alias typedef denotes the same type, and a complete
+                // array completes an incomplete array declaration.
+                if (completes_array(type, canonical_type)) canonical_type = type;
+                else if (!completes_array(canonical_type, type) &&
+                         module_.without_may_alias(canonical_type) != module_.without_may_alias(type)) {
                     diagnostics_.error(source->location,
                                        "incompatible redeclaration of object '" + source->name + "'");
                 }
@@ -2298,6 +2368,24 @@ private:
                 object.visibility);
             object.is_thread_local =
                 object_attribute(*representative, "thread_local") != nullptr;
+            std::vector<const Attribute*> address_attributes;
+            for (const auto* declaration : object.declarations)
+                if (const auto* attribute = object_attribute(*declaration, "address")) {
+                    address_attributes.push_back(attribute);
+                    if (declaration == object.definition)
+                        diagnostics_.error(attribute->location,
+                            "address requires an object declaration that is not a definition");
+                }
+            object.fixed_address = co_await fixed_address_async(
+                address_attributes, source_namespace(object.source_name));
+            if (object.fixed_address) {
+                if (object.definition && !object_attribute(*object.definition, "address"))
+                    diagnostics_.error(object.definition->location,
+                        "object '" + object.source_name + "' has a fixed address and cannot also be defined");
+                if (object.alias_target || object.weakref_target || object.is_thread_local)
+                    diagnostics_.error(address_attributes.front()->location,
+                        "address cannot be combined with alias, weakref, or thread_local");
+            }
             object.tls_model = decode_attribute_string(
                 object_attribute(*representative, "tls_model"));
         }

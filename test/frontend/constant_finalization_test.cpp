@@ -81,7 +81,7 @@ struct Cleanup {
             if (!node) continue;
             release_expression(node->expression);
             release_expression(node->condition);
-            release_expression(node->increment);
+            for (auto& increment : node->increments) release_expression(increment);
             if (node->declaration) {
                 release_expression(node->declaration->initializer);
                 release_expression(node->declaration->dynamic_array_bound);

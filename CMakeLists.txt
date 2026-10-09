@@ -3950,6 +3950,55 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_function_pointer_adapter PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.calls;opt.O2")
+    add_test(NAME cross_forms_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/forms-errors
+                -P "${CMAKE_SOURCE_DIR}/test/language/forms_errors.cmake")
+    set_tests_properties(cross_forms_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.semantics;feature.attributes;feature.abi")
+    foreach(forms_level O0 O2)
+        add_test(NAME cross_runtime_native_forms_${forms_level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/forms.x
+                    -DEXTRA_SOURCES=${CMAKE_SOURCE_DIR}/test/language/forms_table.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-forms-${forms_level}
+                    -DENTRY=forms_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${forms_level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_forms_${forms_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.semantics;feature.attributes;opt.${forms_level}")
+    endforeach()
+    foreach(forms_case "vr4300;b;big;O2" "r3000;l;little;O0")
+        list(GET forms_case 0 forms_cpu)
+        list(GET forms_case 1 forms_endian)
+        list(GET forms_case 2 forms_order)
+        list(GET forms_case 3 forms_level)
+        set(name cross_forms_mips_${forms_cpu}_${forms_endian}_${forms_level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/forms.x
+            -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/language/forms_table.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/language/forms_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/forms-mips-${forms_cpu}-${forms_endian}-${forms_level}
+            -DMIPS_CPUS=${forms_cpu} -DMIPS_ENDIANS=${forms_endian} -DMIPS_SINGLE_CASE=ON
+            -DEXPECTED=P -DCC_FLAGS=-${forms_level}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.semantics;feature.attributes;profile.o32;isa.${forms_cpu};endian.${forms_order};opt.${forms_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_forms_mips64
+        COMMAND $<TARGET_FILE:cross_cc> -S -O2 -mprofile=mips64-n64
+                "${CMAKE_SOURCE_DIR}/test/language/forms.x"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/forms-mips64.s")
+    set_tests_properties(cross_forms_mips64 PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.semantics;opt.O2")
     add_test(NAME cross_runtime_native_addresses
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -280,6 +280,9 @@ struct Expr {
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
         Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
+        // `$::offsetof`: the record in `type`; its member designator is the
+        // designator list of one initializer entry without a value.
+        Offsetof,
         AggregateInitializer, Address, Quote, ByteSequence,
         // Internal result of successfully evaluating a void expression.
         // It has no scalar bits and no source-token spelling.
@@ -412,7 +415,8 @@ struct Statement {
     std::unique_ptr<VariableDecl> declaration;
     std::unique_ptr<Expr> expression;
     std::unique_ptr<Expr> condition;
-    std::unique_ptr<Expr> increment;
+    // The increment clause of a for statement, evaluated left to right.
+    std::vector<std::unique_ptr<Expr>> increments;
     std::unique_ptr<Statement> first;
     std::unique_ptr<Statement> second;
     std::string assertion_message;

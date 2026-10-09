@@ -38,8 +38,8 @@ namespace cross {
 
 std::span<const std::string_view> core_attribute_names() {
     static constexpr std::string_view names[] = {
-        "abi", "address_space", "alias", "aligned", "always_inline",
-        "atomic", "clobber", "cold", "eval_only", "ext_vector_type",
+        "abi", "address", "address_space", "alias", "aligned", "always_inline",
+        "atomic", "clobber", "cold", "eval_only", "exhaustive", "ext_vector_type",
         "hot", "interrupt", "link_name", "macro", "may_alias",
         "musttail", "naked", "no_sanitize", "no_stack_protector", "noinit",
         "noinline", "noreturn", "operator", "packed", "raw_inline",
@@ -139,7 +139,7 @@ std::optional<std::string> attribute_argument_error(const Attribute& attribute) 
     // context, target or ABI. Validate before translation-only erasure as
     // well as at ordinary source entry; HIR cannot check an erased helper.
     static constexpr std::string_view argument_free[] = {
-        "always_inline", "atomic", "cold", "eval_only", "hot", "macro", "may_alias", "musttail",
+        "always_inline", "atomic", "cold", "eval_only", "exhaustive", "hot", "macro", "may_alias", "musttail",
         "naked", "no_stack_protector", "noinit", "noinline", "noreturn", "packed",
         "raw_inline", "retain", "returns_twice", "runtime_only", "syntax_expander",
         "thread_local", "used", "weak",
@@ -161,7 +161,8 @@ std::optional<std::string> function_attribute_error(const Attribute& attribute) 
     }
     if (attribute.name == "packed" || attribute.name == "underlying" ||
         attribute.name == "noinit" || attribute.name == "thread_local" ||
-        attribute.name == "tls_model" || attribute.name == "musttail")
+        attribute.name == "tls_model" || attribute.name == "musttail" ||
+        attribute.name == "exhaustive")
         return "attribute '" + attribute.name + "' is not valid on a function";
     return {};
 }
@@ -227,7 +228,7 @@ bool validate_attribute_names(const Program& program,
                 diagnostics.error(attribute.location, *error);
             } else if (subject == Subject::Object &&
                        (attribute.name == "packed" || attribute.name == "underlying" ||
-                        attribute.name == "may_alias")) {
+                        attribute.name == "may_alias" || attribute.name == "exhaustive")) {
                 diagnostics.error(attribute.location,
                     "attribute '" + attribute.name + "' is not valid on an object");
             }
@@ -682,7 +683,7 @@ std::unique_ptr<Statement> clone_statement(
             if (node.declaration) copy.declaration = clone_variable(*node.declaration, types, values);
             if (node.expression) copy.expression = clone_expr(*node.expression, types, values);
             if (node.condition) copy.condition = clone_expr(*node.condition, types, values);
-            if (node.increment) copy.increment = clone_expr(*node.increment, types, values);
+            for (const auto& increment : node.increments) copy.increments.push_back(clone_expr(*increment, types, values));
             frame.phase = Phase::First;
             break;
         case Phase::First:
@@ -2105,10 +2106,9 @@ EvaluationTask<void> rewrite_generic_statement_async(
         co_await rewrite_generic_expr_async(statement.condition, caller, program, diagnostics,
                              state, mangling);
     }
-    if (statement.increment) {
-        co_await rewrite_generic_expr_async(statement.increment, caller, program, diagnostics,
+    for (auto& increment : statement.increments)
+        co_await rewrite_generic_expr_async(increment, caller, program, diagnostics,
                              state, mangling);
-    }
     if (statement.first && statement.kind != Statement::Kind::For) {
         co_await rewrite_generic_statement_async(*statement.first, caller, program, diagnostics,
                                   state, mangling);
@@ -2877,7 +2877,7 @@ private:
         }
         rewrite(statement.expression);
         rewrite(statement.condition);
-        rewrite(statement.increment);
+        for (auto& increment : statement.increments) rewrite(increment);
         if (statement.first && statement.kind != Statement::Kind::For)
             rewrite(*statement.first);
         for (auto& child : statement.statements) rewrite(*child);
@@ -3064,6 +3064,7 @@ private:
             return expression.type;
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
+        case Expr::Kind::Offsetof:
             return builtin_type(BuiltinType::Uptr);
         case Expr::Kind::Unary: {
             const auto operand = expression.left ? type_of(*expression.left)
@@ -3458,7 +3459,7 @@ private:
                     ? caller_->return_type
                     : TypePtr{});
         rewrite(statement.condition);
-        rewrite(statement.increment);
+        for (auto& increment : statement.increments) rewrite(increment);
         if (statement.first) rewrite(*statement.first);
         for (auto& child : statement.statements) rewrite(*child);
         if (statement.second) rewrite(*statement.second);
@@ -3524,13 +3525,18 @@ const ObjectDecl* resolve_object(const Program& program,
     const auto selected = value_namespace(program, caller, name);
     if (!selected) return nullptr;
     const auto unit = lookup_source_unit(name, caller);
+    // A definition in the group, which completes an incomplete array
+    // declaration, takes precedence over forward declarations.
+    const auto definition = [](const ObjectDecl& object) {
+        return object.initializer || object.linkage != Linkage::Group;
+    };
     const auto exact = [&](std::string_view qualified) -> const ObjectDecl* {
         const ObjectDecl* shared{};
         for (const auto& candidate : program.objects) {
             if (candidate->name != qualified) continue;
             if (candidate->linkage == Linkage::Static) {
                 if (unit.empty() || candidate->source_unit == unit) return candidate.get();
-            } else if (!shared) shared = candidate.get();
+            } else if (!shared || (!definition(*shared) && definition(*candidate))) shared = candidate.get();
         }
         return shared;
     };
@@ -4189,6 +4195,7 @@ TypePtr infer_generic_actual_step(const Expr& expression,
         return adjusted(expression.type);
     case Expr::Kind::Sizeof:
     case Expr::Kind::Alignof:
+    case Expr::Kind::Offsetof:
         return builtin_type(BuiltinType::Uptr);
     case Expr::Kind::Assign:
         return expression.left
@@ -4424,6 +4431,48 @@ struct SourceExpressionIssue {
     SourceLocation location;
     std::string message;
 };
+
+// One step of a $::offsetof designator over source member shapes. Callers
+// resolve layout and index values; `record` retains the member's owner.
+struct OffsetofStep {
+    const Expr::InitializerDesignator* designator{};
+    TypePtr owner;
+    std::shared_ptr<const RecordDecl> record;
+    const RecordMemberDecl* member{};
+};
+
+std::optional<SourceExpressionIssue> source_offsetof_error(const Expr& node, const Program& program,
+                                                          std::vector<OffsetofStep>* steps = nullptr) {
+    auto type = node.type;
+    if (!type || type->kind == Type::Kind::Generic) return {};
+    if (type->kind != Type::Kind::Record || !program.record_definition(type->nominal_key()))
+        return SourceExpressionIssue{node.location, "$::offsetof requires a complete record type"};
+    for (const auto& designator : node.initializer_entries.front().designators) {
+        if (!type || type->kind == Type::Kind::Generic) return {};
+        OffsetofStep step{&designator, type, {}, nullptr};
+        if (designator.kind == Expr::InitializerDesignator::Kind::Index) {
+            if (type->kind != Type::Kind::Array)
+                return SourceExpressionIssue{designator.location, "$::offsetof index requires an array member"};
+            type = type->element;
+        } else {
+            step.record = type->kind == Type::Kind::Record
+                ? program.record_definition(type->nominal_key()) : nullptr;
+            if (!step.record)
+                return SourceExpressionIssue{designator.location, "$::offsetof member designator requires a record"};
+            const auto member = std::find_if(step.record->members.begin(), step.record->members.end(),
+                [&](const RecordMemberDecl& candidate) { return candidate.member_name() == designator.member_name(); });
+            if (member == step.record->members.end())
+                return SourceExpressionIssue{designator.location,
+                    "record has no member named '" + designator.member + "'"};
+            if (member->bit_width)
+                return SourceExpressionIssue{designator.location, "$::offsetof cannot be applied to a bit-field"};
+            step.member = &*member;
+            type = member->type;
+        }
+        if (steps) steps->push_back(std::move(step));
+    }
+    return {};
+}
 
 // A designator need not read its object. In particular, &*p can preserve an
 // incomplete record pointer, whereas an ordinary value use must know the
@@ -4835,10 +4884,12 @@ const char* source_conversion_error(const TypePtr& source, const TypePtr& destin
     // pointer value must keep its complete stable interface. A known
     // non-variadic function designator can instead use an adapter when only
     // its interface differs; no adapter is inferred for an indirect value.
+    // An explicit cast reinterprets any function pointer as another.
     if (source_pointer && destination_pointer && source->pointee && destination->pointee &&
         source->pointee->kind == Type::Kind::Function &&
         destination->pointee->kind == Type::Kind::Function) {
-        if (compare_pointee(source->pointee, destination->pointee) != PointeeCompatibility::Incompatible) return nullptr;
+        if (conversion == SourceConversion::Explicit ||
+            compare_pointee(source->pointee, destination->pointee) != PointeeCompatibility::Incompatible) return nullptr;
         const bool variadic = source->pointee->function && source->pointee->function->variadic;
         if (const auto differences = callable_interface_differences(source->pointee, destination->pointee);
             differences && !(direct_function && variadic))
@@ -6254,6 +6305,8 @@ private:
             if (const auto* reason = source_layout_query_error(node, queried, program_,
                          [&](const Expr& operand) { return type(operand, false); }))
                 error(node.location, reason);
+        } else if (node.kind == Expr::Kind::Offsetof) {
+            if (const auto issue = source_offsetof_error(node, program_)) error(issue->location, issue->message);
         } else if (node.kind == Expr::Kind::Cast && node.left) {
             conversion(*node.left, node.type, "cast", SourceConversion::Explicit);
         } else if (node.kind == Expr::Kind::Assign && node.left && node.right) {
@@ -6571,7 +6624,7 @@ private:
                 error(node.condition->location, node.kind == Statement::Kind::Switch
                     ? "switch condition must have an integer type" : "condition must be scalar");
         }
-        if (node.increment) co_await expression_async(*node.increment);
+        for (const auto& increment : node.increments) co_await expression_async(*increment);
         const bool loop = node.kind == Statement::Kind::While ||
             node.kind == Statement::Kind::DoWhile || node.kind == Statement::Kind::For;
         if (loop) ++loop_depth_;
@@ -7834,7 +7887,7 @@ public:
                 }
                 expression(statement.expression.get());
                 expression(statement.condition.get());
-                expression(statement.increment.get());
+                for (const auto& increment : statement.increments) expression(increment.get());
                 for (const auto& child : statement.statements) work.push_back({{}, {}, child.get()});
                 if (statement.first) work.push_back({{}, {}, statement.first.get()});
                 if (statement.second) work.push_back({{}, {}, statement.second.get()});
@@ -8577,6 +8630,47 @@ public:
             }
             co_return EvalValue{UInt128{*value},
                              builtin_type(BuiltinType::Uptr)};
+        }
+        case Expr::Kind::Offsetof: {
+            std::vector<OffsetofStep> steps;
+            if (const auto issue = source_offsetof_error(expression, program_, &steps)) {
+                fail(issue->location, issue->message);
+                co_return std::nullopt;
+            }
+            std::uint64_t offset{};
+            for (const auto& step : steps) {
+                std::optional<std::uint64_t> displacement;
+                if (step.member) {
+                    if (program_.evaluation_member_layout)
+                        if (const auto layout = co_await program_.evaluation_member_layout.async(
+                                step.owner, step.designator->member_name()))
+                            displacement = layout->offset;
+                } else {
+                    const auto index = co_await this->expression_async(*step.designator->index);
+                    if (!index) co_return std::nullopt;
+                    if (!is_integer(index->type) || integer_negative(index->integer,
+                            evaluation_integer_type(index->type, program_.address_bits)) ||
+                        index->integer.high != 0 || index->integer.low >= step.owner->lanes) {
+                        fail(step.designator->location, "$::offsetof index is out of range");
+                        co_return std::nullopt;
+                    }
+                    const auto size = size_of_ ? co_await size_of_->async(step.owner->element)
+                                               : std::nullopt;
+                    if (size && (*size == 0 ||
+                                 index->integer.low <= std::numeric_limits<std::uint64_t>::max() / *size))
+                        displacement = index->integer.low * *size;
+                }
+                if (!displacement || *displacement > std::numeric_limits<std::uint64_t>::max() - offset) {
+                    fail(expression.location, "target layout is unavailable for this translation-time query");
+                    co_return std::nullopt;
+                }
+                offset += *displacement;
+            }
+            if (!fits_unsigned(UInt128{offset}, program_.address_bits)) {
+                fail(expression.location, "$::offsetof result is not representable as uptr");
+                co_return std::nullopt;
+            }
+            co_return EvalValue{UInt128{offset}, builtin_type(BuiltinType::Uptr)};
         }
         case Expr::Kind::Unary:
             co_return (co_await unary_async(expression));
@@ -9421,6 +9515,11 @@ private:
                 fail(node.location, "layout query has an unresolved expression type");
                 co_return false;
             }
+        } else if (node.kind == Expr::Kind::Offsetof) {
+            if (const auto issue = source_offsetof_error(node, program_)) {
+                fail(issue->location, issue->message);
+                co_return false;
+            }
         }
         if (!(co_await validate_control_intrinsic_async(node))) co_return false;
         if (!(co_await validate_atomic_intrinsic_async(node))) co_return false;
@@ -9543,6 +9642,16 @@ private:
                      "layout query has an unresolved expression type");
                 co_return false;
             }
+            co_return true;
+        }
+        if (node.kind == Expr::Kind::Offsetof) {
+            if (const auto issue = source_offsetof_error(node, program_)) {
+                fail(issue->location, issue->message);
+                co_return false;
+            }
+            for (const auto& designator : node.initializer_entries.front().designators)
+                if (designator.index && !(co_await validate_required_tree_async(*designator.index)))
+                    co_return false;
             co_return true;
         }
         if (node.kind == Expr::Kind::Name && is_label_type(expression_type(node)) &&
@@ -10189,6 +10298,7 @@ private:
             return expression.type;
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
+        case Expr::Kind::Offsetof:
             return builtin_type(BuiltinType::Uptr);
         case Expr::Kind::Assign:
             return type_of(*expression.left);
@@ -13821,8 +13931,9 @@ private:
         const Statement* body = is_for ? loop.second.get() : loop.first.get();
         if (!body) co_return {Flow::Failed};
         for (;;) {
-            if (after_body && is_for && loop.increment && !(co_await expression_async(*loop.increment)))
-                co_return {Flow::Failed};
+            if (after_body && is_for)
+                for (const auto& increment : loop.increments)
+                    if (!(co_await expression_async(*increment))) co_return {Flow::Failed};
             if ((after_body || loop.kind != Statement::Kind::DoWhile) && loop.condition) {
                 const auto condition = (co_await expression_async(*loop.condition));
                 if (!condition || !known_truth(*condition, loop.location)) co_return {Flow::Failed};
@@ -14237,6 +14348,7 @@ bool source_constant_candidate(const Expr& expression) {
         case Expr::Kind::Name:
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
+        case Expr::Kind::Offsetof:
             break;
         case Expr::Kind::Parenthesized:
         case Expr::Kind::Cast:
@@ -14560,7 +14672,7 @@ private:
         }
         rewrite(statement.expression);
         rewrite(statement.condition);
-        rewrite(statement.increment);
+        for (auto& increment : statement.increments) rewrite(increment);
         if (statement.first && statement.kind != Statement::Kind::For)
             rewrite(*statement.first);
         for (auto& child : statement.statements) rewrite(*child);
@@ -14586,6 +14698,7 @@ bool contains_layout_query(const Expr& expression) {
         pending.pop_back();
         if (!node) continue;
         if (node->kind == Expr::Kind::Sizeof || node->kind == Expr::Kind::Alignof ||
+            node->kind == Expr::Kind::Offsetof ||
             atomic_builtin(*node) == AtomicBuiltin::IsLockFree) return true;
         // LIFO insertion preserves the original source-order edge set, including
         // designator indices and generic actuals. This is a pure classification.
@@ -14615,6 +14728,7 @@ bool contains_relocation_candidate(const Expr& expression,
         if (!node) continue;
         // Unevaluated layout operands and already classified addresses are opaque.
         if (node->kind == Expr::Kind::Sizeof || node->kind == Expr::Kind::Alignof ||
+            node->kind == Expr::Kind::Offsetof ||
             atomic_builtin(*node) == AtomicBuiltin::IsLockFree) continue;
         if (node->kind == Expr::Kind::Address && node->evaluated_address) {
             if (node->evaluated_address->kind != AddressConstant::Kind::Absolute) return true;
@@ -14629,6 +14743,15 @@ bool contains_relocation_candidate(const Expr& expression,
                         return object->name == *selected && object->type &&
                                object->type->kind == Type::Kind::Array;
                     })) return true;
+        }
+        // A cast function designator is its code address, like `&function`.
+        if (node->kind == Expr::Kind::Cast && node->left) {
+            const auto* operand = node->left.get();
+            while (operand->kind == Expr::Kind::Parenthesized && operand->left) operand = operand->left.get();
+            const auto selected = operand->kind == Expr::Kind::Name
+                ? value_namespace(program, nullptr, *operand, source_namespace) : std::nullopt;
+            if (selected && std::any_of(program.functions.begin(), program.functions.end(),
+                    [&](const auto& function) { return function->name == *selected; })) return true;
         }
         for (auto argument = node->arguments.rbegin(); argument != node->arguments.rend(); ++argument)
             pending.push_back(argument->get());
@@ -14906,9 +15029,11 @@ EvaluationTask<void> fold_patch_initial_offsets_async(Statement& statement, Prog
     co_await fold_patch_initial_offsets_async(statement.condition, program, diagnostics,
         size_of, align_of, source_namespace, caller);
     if (stopped()) co_return;
-    co_await fold_patch_initial_offsets_async(statement.increment, program, diagnostics,
-        size_of, align_of, source_namespace, caller);
-    if (stopped()) co_return;
+    for (auto& increment : statement.increments) {
+        co_await fold_patch_initial_offsets_async(increment, program, diagnostics,
+            size_of, align_of, source_namespace, caller);
+        if (stopped()) co_return;
+    }
     if (statement.first) {
         co_await fold_patch_initial_offsets_async(*statement.first, program, diagnostics,
             size_of, align_of, source_namespace, caller);
@@ -15221,6 +15346,7 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
     const auto stopped = [&] { return program.evaluation_resource_errors != epoch; };
 
     if (expression->kind == Expr::Kind::Sizeof || expression->kind == Expr::Kind::Alignof ||
+        expression->kind == Expr::Kind::Offsetof ||
         atomic_builtin(*expression) == AtomicBuiltin::IsLockFree) {
         // Resolve known queries while translation-only declarations still
         // exist. Never rewrite/execute the unevaluated operand's calls. Local
@@ -15233,7 +15359,7 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
         if (caller) collect_function_types(*caller, query_scope);
         if (const auto value = co_await evaluator.required_integer_with_types_async(*expression, query_scope.local_types))
             replace_eval_value(expression, *value);
-        else if (stopped())
+        else if (stopped() || expression->kind == Expr::Kind::Offsetof)
             evaluator.diagnose(expression->location);
         co_return;
     }
@@ -15543,7 +15669,8 @@ void bind_label_conversions(std::unique_ptr<Expr>& root, const FunctionDecl* own
     while (!pending.empty()) {
         auto* node = pending.back();
         pending.pop_back();
-        if (!node || node->kind == Expr::Kind::Sizeof || node->kind == Expr::Kind::Alignof) continue;
+        if (!node || node->kind == Expr::Kind::Sizeof || node->kind == Expr::Kind::Alignof ||
+            node->kind == Expr::Kind::Offsetof) continue;
         if (node->kind == Expr::Kind::Cast && node->left && node->type &&
             node->type->kind == Type::Kind::Builtin && node->type->builtin == BuiltinType::Uptr) {
             auto* operand = &node->left;
@@ -15719,8 +15846,8 @@ EvaluationTask<void> rewrite_eval_statement_async(Statement& statement, Function
                           opportunistic);
         if (stopped()) co_return;
     }
-    if (statement.increment) {
-        co_await rewrite_eval_expr_async(statement.increment, caller, program, diagnostics,
+    for (auto& increment : statement.increments) {
+        co_await rewrite_eval_expr_async(increment, caller, program, diagnostics,
                           opportunistic);
         if (stopped()) co_return;
     }
@@ -15851,7 +15978,7 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
             if (visit == Visit::Expressions) {
                 check_expression(statement.expression.get());
                 check_expression(statement.condition.get());
-                check_expression(statement.increment.get());
+                for (const auto& increment : statement.increments) check_expression(increment.get());
                 continue;
             }
             const bool scoped = statement.kind == Statement::Kind::Compound ||
@@ -16115,9 +16242,8 @@ void collect_patch_expressions(const Statement& statement,
     if (statement.condition) {
         collect_patch_expressions(*statement.condition, patches);
     }
-    if (statement.increment) {
-        collect_patch_expressions(*statement.increment, patches);
-    }
+    for (const auto& increment : statement.increments)
+        collect_patch_expressions(*increment, patches);
     if (statement.first) collect_patch_expressions(*statement.first, patches);
     if (statement.second) collect_patch_expressions(*statement.second, patches);
 }
@@ -16189,10 +16315,8 @@ void resolve_raw_inline_statement(Statement& statement, FunctionDecl& caller,
         resolve_raw_inline_expr(statement.condition, caller, program,
                                 diagnostics);
     }
-    if (statement.increment) {
-        resolve_raw_inline_expr(statement.increment, caller, program,
-                                diagnostics);
-    }
+    for (auto& increment : statement.increments)
+        resolve_raw_inline_expr(increment, caller, program, diagnostics);
     if (statement.first) {
         resolve_raw_inline_statement(*statement.first, caller, program,
                                      diagnostics);
@@ -16402,7 +16526,7 @@ private:
         }
         rewrite(statement.expression);
         rewrite(statement.condition);
-        rewrite(statement.increment);
+        for (auto& increment : statement.increments) rewrite(increment);
         if (statement.first) rewrite(*statement.first);
         for (auto& child : statement.statements) rewrite(*child);
         if (statement.second) rewrite(*statement.second);
@@ -16874,7 +16998,7 @@ void discard_unreferenced_invocation_specializations(Program& program) {
             if (!statement) continue;
             expressions(statement->expression.get(), function);
             expressions(statement->condition.get(), function);
-            expressions(statement->increment.get(), function);
+            for (const auto& increment : statement->increments) expressions(increment.get(), function);
             if (statement->declaration) {
                 expressions(statement->declaration->initializer.get(), function);
                 expressions(statement->declaration->dynamic_array_bound.get(), function);

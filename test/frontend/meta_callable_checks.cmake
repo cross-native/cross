@@ -55,7 +55,6 @@ endforeach()
 reject_body(held_variadic "typedef u32 (*Variadic)(in u32, ...); Variadic source; Callback destination = source;")
 reject_body(held_pointer "Other source; Callback destination = source;")
 reject_body(assignment "Callback destination; destination = &bad_result;")
-reject_body(cast "(Callback)bad_result;")
 reject_body(call_argument "take(bad_result);")
 reject_body(copy_out "Callback destination; output(destination);")
 reject_body(nested_callback "Other *source; Callback *destination = source;")
@@ -65,7 +64,9 @@ reject_held(held_parameter_endpoint "parameter endpoints" "typedef u32 (*A)(in u
 reject_held(held_cleanup "stack cleanup" "typedef u32 (*A)(in u32) [[stack_cleanup(\"caller\")]]; typedef u32 (*B)(in u32) [[stack_cleanup(\"callee\")]]; A source; B destination = source;")
 reject_held(held_clobbers "clobbers" "typedef u32 (*A)(in u32) [[clobber(\"r8\")]]; typedef u32 (*B)(in u32) [[clobber(\"r9\")]]; A source; B destination = source;")
 reject_held(held_interface "ABI, parameter endpoints, and result location" "typedef u64 (*A)(in u32 \"r8d\") -> \"r9\" [[abi(\"sysv_abi\")]]; typedef u64 (*B)(in u32) [[abi(\"ms_abi\")]]; A source; B destination = source;")
-reject_held(held_cast "result location" "typedef u64 (*A)(in u32) -> \"r8\"; typedef u64 (*B)(in u32); A source; (B)source;")
+# An explicit cast reinterprets a function pointer of any type, held or named.
+check(cast accept "static $::meta::tokens helper(in $::meta::tokens input) { if (0u32) { Callback callback = (Callback)bad_result; } return input; }\nglobal u32 entry() { Callback callback = (Callback)bad_result; return 9u32; }")
+check(held_cast accept "typedef u64 (*A)(in u32) -> \"r8\";\ntypedef u64 (*B)(in u32);\nglobal B entry(in A source) { return (B)source; }")
 # Interfaces that are identical after canonicalization need no adapter.
 check(held_canonical accept "typedef u32 (*A)(in u32 value \"auto\") -> \"auto\" [[stack_cleanup(\"caller\"), clobber(\"r8\", \"r9\")]];\ntypedef u32 (*B)(in u32 value) [[clobber(\"r9\", \"r8\")]];\nglobal B entry(in A source) { B destination = source; return destination; }")
 # A named function converts to another interface through an adapter in
@@ -75,7 +76,7 @@ check(adapt_to_manual accept "typedef u32 (*Manual)(in u32 value \"r10d\") -> \"
 set(pointer "pointer conversion discards qualifiers or uses incompatible pointee types")
 check(direct_variadic "${pointer}" "static u32 variadic(in u32 value, ...); static $::meta::tokens helper(in $::meta::tokens input) { Callback destination = variadic; return input; }\nglobal u32 entry() { return 9u32; }")
 check(return "${pointer}" "static Callback helper(in $::meta::tokens input) { return bad_result; }\nglobal u32 entry() { return 9u32; }")
-check(required_unevaluated "${pointer}" "global uptr size = sizeof((Callback)bad_result);")
+check(required_unevaluated accept "global uptr size = sizeof((Callback)bad_result);")
 check(direct_macro "${pointer}" "[[macro]] static $::meta::tokens apply(in $::meta::tokens input) { if (0u32) { Callback value = bad_result; } return input; }\nglobal u32 entry() { return apply!(9u32); }")
 check(generic "${pointer}" [=[
 static $::meta::tokens helper<T>(in T source, in $::meta::tokens input) { if (0u32) { Callback value = source; } return input; }

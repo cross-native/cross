@@ -153,7 +153,7 @@ std::optional<AssumptionViolation> assumption_violation(
             for (auto type = node->type; type && type->kind == Type::Kind::Array; type = type->element)
                 if (!type->lanes) push(type->array_bound.get());
             break;
-        case Expr::Kind::Alignof: break;
+        case Expr::Kind::Alignof: case Expr::Kind::Offsetof: break;
         case Expr::Kind::Unary:
             if (node->text == "&") push(node->left.get(), false);
             else if (node->text == "*" || node->text == "+" || node->text == "-" ||

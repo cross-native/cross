@@ -869,7 +869,7 @@ void Parser::bind_label_references(Statement& root, bool complete_function) {
                 .push_back(statement->label_binding);
         expressions.push_back(statement->expression.get());
         expressions.push_back(statement->condition.get());
-        expressions.push_back(statement->increment.get());
+        for (const auto& increment : statement->increments) expressions.push_back(increment.get());
         if (statement->declaration) {
             expressions.push_back(statement->declaration->initializer.get());
             expressions.push_back(statement->declaration->dynamic_array_bound.get());

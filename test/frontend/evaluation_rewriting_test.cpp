@@ -95,7 +95,7 @@ struct Cleanup {
             if (!node) continue;
             expression(node->expression);
             expression(node->condition);
-            expression(node->increment);
+            for (auto& increment : node->increments) expression(increment);
             if (node->declaration) {
                 expression(node->declaration->initializer);
                 expression(node->declaration->dynamic_array_bound);
@@ -462,7 +462,7 @@ void statement_copies() {
         root.global_label = true;
         root.assertion_message = "retained message";
         root.condition = integer();
-        root.increment = integer();
+        root.increments.push_back(integer());
         root.attributes.emplace_back();
         auto& attribute = root.attributes.back();
         attribute.name = "align";
@@ -528,7 +528,9 @@ void statement_copies() {
             attributes(a->attributes, b->attributes);
             expression(a->expression, b->expression);
             expression(a->condition, b->condition);
-            expression(a->increment, b->increment);
+            require(a->increments.size() == b->increments.size(), "statement copy changed increments");
+            for (std::size_t index = 0; index < a->increments.size(); ++index)
+                expression(a->increments[index], b->increments[index]);
             require(bool(a->declaration) == bool(b->declaration), "statement copy changed declaration presence");
             if (a->declaration) {
                 const auto& av = *a->declaration;

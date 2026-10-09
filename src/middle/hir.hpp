@@ -183,6 +183,8 @@ struct Function {
     bool mergeable{};
     std::optional<std::string> alias_target;
     std::optional<std::string> weakref_target;
+    // An address(N) entity has no symbol; references use this address.
+    std::optional<std::uint64_t> fixed_address;
     FunctionTemperature temperature{FunctionTemperature::Normal};
     bool used{};
     bool retain{};
@@ -226,6 +228,8 @@ struct Object {
     bool weak{};
     std::optional<std::string> alias_target;
     std::optional<std::string> weakref_target;
+    // An address(N) entity has no symbol; references use this address.
+    std::optional<std::uint64_t> fixed_address;
     bool is_thread_local{};
     std::string tls_model;
     std::vector<const ObjectDecl*> declarations;

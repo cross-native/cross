@@ -257,7 +257,7 @@ int main() {
             }
             expressions(expressions, statement.expression);
             expressions(expressions, statement.condition);
-            expressions(expressions, statement.increment);
+            for (const auto& increment : statement.increments) expressions(expressions, increment);
             if (statement.first) self(self, *statement.first);
             if (statement.second) self(self, *statement.second);
             for (const auto& child : statement.statements) self(self, *child);

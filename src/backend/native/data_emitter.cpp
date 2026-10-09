@@ -512,7 +512,7 @@ private:
         const auto& entity = module_.hir().object(object.source);
         const auto name = assembly_symbol(format_, entity.link_symbol);
         if (object.initializer == data::InitializerKind::Declaration) {
-            if (entity.alias_target) return;
+            if (entity.alias_target || entity.fixed_address) return;
             out_ << ".extern " << name << '\n';
             std::string symbol_error;
             const auto directives = assembly_symbol_directives(

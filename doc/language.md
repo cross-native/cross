@@ -98,6 +98,25 @@ struct counters {
 };
 
 $::static_assert(sizeof(struct counters) == 128uptr, "one line per counter");
+$::static_assert($::offsetof(struct counters, misses) == 64uptr, "second line");
+```
+
+`$::offsetof(type, member)` is a member's byte offset as a compile-time
+`uptr`; the member may be followed by `.member` and `[index]` steps, as in
+`$::offsetof(struct frame, lanes[2].low)`. It cannot name a bit-field.
+
+`[[exhaustive]]` on a structure definition requires every brace initializer of
+the structure to initialize each member, by position or designator, so adding
+a member finds every initializer to update:
+
+```x
+struct version [[exhaustive]] {
+    u16 major;
+    u16 minor;
+};
+
+global struct version current = { .major = 1, .minor = 4 };
+// { .major = 2 } is an error: member 'minor' is not named
 ```
 
 `[[may_alias]]` exempts a type from the effective-type aliasing rules, which
@@ -135,6 +154,22 @@ global u32 exported = 7;        // exported definition
 
 u32 helper(u32 x) {             // shared with the other inputs of this command
     return x + hidden;
+}
+```
+
+A declaration without `static`, `global`, or an initializer may omit an
+array's first bound, as a header declares a table defined elsewhere. Such an
+array can be indexed and decays to a pointer, but `sizeof` needs a definition
+of the object in the same compilation to complete it; without one, the
+declaration refers to an external symbol:
+
+```x
+u32 primes[];                          // usually from a header
+
+global u32 primes[] = {2, 3, 5, 7};    // completes the type
+
+global uptr prime_count() {
+    return sizeof(primes) / sizeof(primes[0]);
 }
 ```
 
@@ -206,11 +241,13 @@ Statements are C99's. The differences in expressions:
 
 - Operands, arguments, and both sides of an assignment are evaluated left to
   right. Nothing is unsequenced.
-- There is no comma operator. Commas only separate declarators, arguments, and
-  initializers, so `for (u32 i = 0, n = 10; i < n; ++i)` is valid but
-  `i = 0, j = 1` is not.
+- There is no comma operator. Commas separate declarators, arguments,
+  initializers, and the expressions of a `for` loop's first and last clauses,
+  which run left to right: `for (i = 0, j = n; i < j; ++i, --j)` is valid, but
+  `i = 0, j = 1;` as a statement is not.
 - Pointer comparisons with integer constant zero, conversions through
-  `void *`, and casts follow C. Function pointers and `void *` do not convert.
+  `void *`, and casts follow C. Function pointers and `void *` do not convert;
+  see [Function pointers](#function-pointers) for their casts.
 - `$::assume(condition)` and `$::unreachable()` state facts the optimizer may
   use; neither adds a check.
 
@@ -428,6 +465,19 @@ Under a platform ABI, `in` parameters are passed by value and `out` and
 All declarations of a function select the same ABI; an alias such as `linux`
 for `sysv_abi` names the same one.
 
+Attributes followed by braces form an attribute region: they apply to each
+declaration and definition inside for which they are valid, and an attribute
+written on a declaration takes precedence. Regions nest and create no scope:
+
+```x
+[[abi("sysv_abi")]] {
+    i32 c_close(in i32 fd);
+    typedef i32 (*c_compare)(in const void *left, in const void *right);
+    global i32 c_twice(in i32 value) { return value * 2; }
+    global i32 c_win(in i32 value) [[abi("ms_abi")]] { return value; }
+}
+```
+
 Parameters and results can also be pinned to registers, which is useful for
 assembly interfaces (x86-64):
 
@@ -483,9 +533,31 @@ global hash_fn hasher() {
 ```
 
 Parameter types, modes, and result must match exactly, and an existing
-function-pointer value is never converted to another interface. A conditional
-never selects a wrapper either: both of its function-pointer operands must
-already have the same interface.
+function-pointer value is never implicitly converted to another interface. A
+conditional never selects a wrapper either: both of its function-pointer
+operands must already have the same interface.
+
+An explicit cast reinterprets a function pointer as any other function-pointer
+type, with no wrapper; calling through it with an interface that differs from
+the function's own is undefined. A cast to `uptr` gives the code address, also
+in a static initializer, and a cast back from `uptr` restores the pointer:
+
+```x
+typedef void (*handler)();
+typedef u32 (*counter)(in u32 x);
+
+static u32 next(in u32 x) {
+    return x + 1;
+}
+
+global handler table[1] = { (handler)next };   // a type-erased entry
+global uptr entry_point = (uptr)next;         // the code address
+
+global u32 call_entry(in u32 x) {
+    counter typed = (counter)table[0];        // recover the original type
+    return typed(x) + ((counter)entry_point)(x);
+}
+```
 
 ### Machine code
 
@@ -518,6 +590,24 @@ creates a value that a loader can rewrite after linking.
 | `thread_local`, `tls_model("model")` | Thread-local storage. |
 | `noinit` | Leave a static object uninitialized. |
 | `aligned(N)` | On a function definition, its entry alignment. |
+| `address(N)` | Place a declared object or function at the fixed address `N`; no storage or symbol is emitted. |
+
+A memory-mapped device is an object at a fixed address (the register layout
+here is illustrative):
+
+```x
+struct uart {
+    volatile u32 data;
+    volatile u32 status;
+};
+
+struct uart console [[address(0x10000000)]];
+
+global void put(in u8 byte) {
+    while ((console.status & 1) == 0) {}
+    console.data = byte;
+}
+```
 
 `cc --print-attributes` lists every attribute, and [targets.md](targets.md)
 describes which object formats support each one.

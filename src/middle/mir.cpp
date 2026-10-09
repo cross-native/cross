@@ -433,6 +433,8 @@ bool eligible_expression(const Expr& expression) {
     case Expr::Kind::VoidValue: return true;
     case Expr::Kind::Quote: return false;
     case Expr::Kind::ByteSequence: return false;
+    // Semantic expansion folds every offsetof query.
+    case Expr::Kind::Offsetof: return false;
     case Expr::Kind::Address:
         return expression.type && expression.evaluated_address;
     case Expr::Kind::Integer:
@@ -637,7 +639,8 @@ bool eligible_statement(const Statement& statement) {
     case Statement::Kind::For:
         return statement.first && eligible_statement(*statement.first) &&
                (!statement.condition || eligible_expression(*statement.condition)) &&
-               (!statement.increment || eligible_expression(*statement.increment)) &&
+               std::all_of(statement.increments.begin(), statement.increments.end(),
+                           [](const auto& increment) { return eligible_expression(*increment); }) &&
                statement.second && eligible_statement(*statement.second);
     case Statement::Kind::Break:
     case Statement::Kind::Continue:
@@ -694,9 +697,8 @@ void collect_address_taken_names(const Statement& statement,
     if (statement.condition) {
         collect_address_taken_names(*statement.condition, names);
     }
-    if (statement.increment) {
-        collect_address_taken_names(*statement.increment, names);
-    }
+    for (const auto& increment : statement.increments)
+        collect_address_taken_names(*increment, names);
     for (const auto& child : statement.statements) {
         collect_address_taken_names(*child, names);
     }
@@ -739,7 +741,7 @@ void collect_modified_names(const Statement& statement, NameSet& names) {
     }
     if (statement.expression) collect_modified_names(*statement.expression, names);
     if (statement.condition) collect_modified_names(*statement.condition, names);
-    if (statement.increment) collect_modified_names(*statement.increment, names);
+    for (const auto& increment : statement.increments) collect_modified_names(*increment, names);
     for (const auto& child : statement.statements)
         collect_modified_names(*child, names);
     if (statement.first) collect_modified_names(*statement.first, names);
@@ -1367,7 +1369,7 @@ private:
         }
         if (statement.expression) collect_copyout_names(*statement.expression);
         if (statement.condition) collect_copyout_names(*statement.condition);
-        if (statement.increment) collect_copyout_names(*statement.increment);
+        for (const auto& increment : statement.increments) collect_copyout_names(*increment);
         for (const auto& child : statement.statements)
             collect_copyout_names(*child);
         if (statement.first) collect_copyout_names(*statement.first);
@@ -1454,6 +1456,8 @@ private:
 
     std::optional<ValueId> function_address(const hir::Function& function,
                                             SourceLocation location) {
+        if (function.fixed_address)
+            return constant(UInt128{*function.fixed_address}, function_pointer_type(function), location);
         hir::stabilize_function_address(hir_, function.id);
         const auto id = function.id;
         const auto type = function_pointer_type(function);
@@ -1508,6 +1512,8 @@ private:
 
     ValueId global_address(const hir::Object& object,
                            SourceLocation location) {
+        if (object.fixed_address)
+            return constant(UInt128{*object.fixed_address}, hir_.pointer_to(object.type), location);
         const auto value = add_value(ValueKind::GlobalAddress,
                                      hir_.pointer_to(object.type), location);
         current_.values[value.value].object = object.id;
@@ -2098,6 +2104,8 @@ private:
     }
 
     ValueId load_global(const hir::Object& object, SourceLocation location) {
+        if (object.fixed_address)
+            return *load_pointer(global_address(object, location), location);
         if (atomic_object_type(hir_, object.type)) {
             return atomic_operation(
                 AtomicOperation::Load, hir_.unqualified(object.type),
@@ -2114,6 +2122,8 @@ private:
 
     ValueId store_global(const hir::Object& object, ValueId source,
                          SourceLocation location) {
+        if (object.fixed_address)
+            return *store_pointer(global_address(object, location), source, location);
         if (atomic_object_type(hir_, object.type)) {
             const auto value_type = hir_.unqualified(object.type);
             source = cast(source, value_type, location);
@@ -2902,6 +2912,7 @@ private:
                        : std::nullopt;
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
+        case Expr::Kind::Offsetof:
             return hir_.builtin(BuiltinType::Uptr);
         case Expr::Kind::Unary:
             if (expression.text == "++" || expression.text == "--" ||
@@ -3513,6 +3524,10 @@ private:
             diagnostics_.error(expression.location,
                 "materialized bytes cannot enter runtime lowering");
             co_return std::nullopt;
+        case Expr::Kind::Offsetof:
+            diagnostics_.error(expression.location,
+                "$::offsetof was not resolved before runtime lowering");
+            co_return std::nullopt;
         case Expr::Kind::Address: {
             if (!expression.type || !expression.evaluated_address) break;
             const auto type = hir_.intern_type(expression.type);
@@ -3641,13 +3656,17 @@ private:
                 const auto& source_pointer_type = hir_.type(source_type);
                 const auto& destination_pointer_type =
                     hir_.type(destination_type);
+                // An explicit cast reinterprets one function pointer as another.
+                const bool functions = source_pointer_type.pointee && destination_pointer_type.pointee &&
+                    hir_.type(*source_pointer_type.pointee).kind == hir::Type::Kind::Function &&
+                    hir_.type(*destination_pointer_type.pointee).kind == hir::Type::Kind::Function;
                 if (!source_pointer_type.pointee ||
                     !destination_pointer_type.pointee ||
                     source_pointer_type.address_space !=
                         destination_pointer_type.address_space ||
-                    !compatible_pointer_conversion(
+                    (!functions && !compatible_pointer_conversion(
                         *source_pointer_type.pointee,
-                        *destination_pointer_type.pointee)) {
+                        *destination_pointer_type.pointee))) {
                     diagnostics_.error(
                         expression.location,
                         "explicit pointer conversion discards qualifiers or "
@@ -3844,10 +3863,7 @@ private:
                 if (name) {
                     if (const auto* object = resolve_object(*expression.left);
                         object && global_object(*object)) {
-                        result = add_value(ValueKind::GlobalAddress,
-                                           hir_.pointer_to(object->type),
-                                           expression.location);
-                        current_.values[result->value].object = object->id;
+                        result = global_address(*object, expression.location);
                     } else if (const auto* function = resolve_function(*expression.left)) {
                         result =
                             function_address(*function, expression.location);
@@ -5290,6 +5306,7 @@ private:
             co_return co_await lower_indirect_call_async(expression);
         const auto* callee = resolve_function(*expression.left);
         if (!callee || !callable(*callee)) co_return std::nullopt;
+        if (callee->fixed_address) co_return co_await lower_indirect_call_async(expression);
         co_return co_await lower_resolved_call_async(
             expression, *hir::call_signature(hir_, callee->id, {}), callee);
     }
@@ -6538,10 +6555,12 @@ private:
         }
 
         enter(increment);
-        if (statement.increment && !lower_expression(*statement.increment)) {
-            failed_ = true;
-            scopes_.pop_back();
-            return;
+        for (const auto& expression : statement.increments) {
+            if (current_block_ && !lower_expression(*expression)) {
+                failed_ = true;
+                scopes_.pop_back();
+                return;
+            }
         }
         if (current_block_) {
             terminate(TerminatorKind::Branch, statement.location, std::nullopt, {test});

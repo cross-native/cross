@@ -2580,10 +2580,11 @@ private:
                                       parameter)) return true;
         }
         for (const auto* expression : {statement.expression.get(),
-                                       statement.condition.get(),
-                                       statement.increment.get()})
+                                       statement.condition.get()})
             if (expression && raw_parameter_written(*expression, parameter))
                 return true;
+        for (const auto& increment : statement.increments)
+            if (raw_parameter_written(*increment, parameter)) return true;
         for (const auto& child : statement.statements)
             if (raw_parameter_written(*child, parameter)) return true;
         return (statement.first && raw_parameter_written(*statement.first, parameter)) ||
@@ -3608,7 +3609,7 @@ private:
         loops_.pop_back();
         if (current_block_) (void)terminate_jump(increment, statement.location);
         enter_block(increment);
-        if (statement.increment) lower_expression_statement(*statement.increment);
+        for (const auto& expression : statement.increments) lower_expression_statement(*expression);
         if (current_block_) (void)terminate_jump(test, statement.location);
         enter_block(end);
     }

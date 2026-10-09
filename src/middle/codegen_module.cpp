@@ -56,7 +56,8 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             valid = false;
         }
         const auto& entity = module.hir().object(object.source);
-        if (entity.type != object.type || object.size == 0 ||
+        if (entity.type != object.type ||
+            (object.size == 0 && object.initializer != data::InitializerKind::Declaration) ||
             object.alignment == 0 ||
             (object.alignment & (object.alignment - 1)) != 0) {
             diagnostics.error(object.location,

@@ -198,16 +198,15 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 
 ## Limits on all targets
 
-- Specified but not implemented yet: incomplete array declarations, expression
-  lists in `for` clauses, `$::offsetof`, the floating intrinsics, `exhaustive`,
-  `address`, attribute regions, explicit casts between function-pointer types
-  and to `uptr`, `-fwrapv`, `-fzero-init-in-data`, `-fbounds-trap`, `-MP`,
-  `-ffile-prefix-map`, the generic budget options, `debug` entries and `-g`,
-  and the profile floating-environment properties.
+- Specified but not implemented yet: the floating intrinsics, `-fwrapv`,
+  `-fzero-init-in-data`, `-fbounds-trap`, `-MP`, `-ffile-prefix-map`, the
+  generic budget options, `debug` entries and `-g`, and the profile
+  floating-environment properties.
 - Generic records and unions (`struct list<T>`) are specified but not
   implemented; `$::feature::generic_types` is absent.
-- Function pointers can be converted to another ABI or other register
-  locations only when the function is named directly; see
+- A function is wrapped for another ABI or other register locations only
+  when it is named directly; an explicit cast of a function-pointer value
+  reinterprets it without a wrapper; see
   [language.md](language.md#function-pointers).
 - `-emit-gimple` rejects what GCC's `__GIMPLE` input cannot express or the
   serializer does not encode, among them aggregate static initializers,

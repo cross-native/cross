@@ -670,6 +670,27 @@ private:
     // Namespace and transparent item scopes are separate from local-value
     // scope indices, which are also used for deferred declaration replay.
     std::vector<TokenRegion> import_regions_;
+    // Attribute regions enclosing the current external item, outermost first.
+    // Child parsers share them, so an application anywhere marks its use.
+    struct AttributeRegion {
+        std::vector<Attribute> attributes;
+        std::vector<bool> applied;
+    };
+    std::vector<std::shared_ptr<AttributeRegion>> attribute_regions_;
+    enum class RegionSubject { Function, Object, Typedef, Record, Enumeration };
+    struct RegionTarget {
+        RegionSubject subject;
+        bool definition{};
+        bool initializer{};
+        Linkage linkage{Linkage::Group};
+        const FunctionType* callable{};
+        bool is_union{};
+    };
+    // Adds the enclosing regions' attributes valid for the target as leading
+    // attributes, unless the declaration already has one of the same name.
+    void apply_region_attributes(std::vector<Attribute>& attributes, const RegionTarget& target);
+    EvaluationTask<void> parse_attribute_region_async(Program& program, std::string name_space,
+                                                      std::vector<Attribute> attributes);
     // First-parse namespace introductions are separate from the retained
     // definition/call-site lookup. Copy-on-write keeps capture probes and
     // immutable environments from publishing declarations into their owner.

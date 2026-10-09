@@ -540,6 +540,8 @@ const auto& public_tree_rules() {
         const auto attrs = repeated(reference(P::AttributeSpecifier));
         const auto suffix = choice({reference(P::ArraySuffix), reference(P::FunctionSuffix)});
         const auto qualified = sequence({id, repeated(sequence({terminal("::"), id}))});
+        const auto expressions = sequence({reference(P::Expression),
+            repeated(sequence({terminal(","), reference(P::Expression)}))});
         const auto declaration = [&](bool semicolon) {
             auto rule = sequence({attrs, reference(P::DeclarationSpecifiers),
                 optional(reference(P::InitDeclaratorList)), attrs});
@@ -649,7 +651,7 @@ const auto& public_tree_rules() {
             sequence({terminal("do"), reference(P::Statement), terminal("while"), terminal("("),
                 reference(P::Expression), terminal(")"), terminal(";")}),
             sequence({terminal("for"), terminal("("), reference(P::ForInitializer), terminal(";"),
-                optional(reference(P::Expression)), terminal(";"), optional(reference(P::Expression)),
+                optional(reference(P::Expression)), terminal(";"), optional(expressions),
                 terminal(")"), reference(P::Statement)})}));
         set(P::JumpStatement, choice({sequence({terminals({"break", "continue"}), terminal(";")}),
             sequence({terminal("return"), optional(reference(P::Expression)), terminal(";")}),
@@ -657,7 +659,7 @@ const auto& public_tree_rules() {
         set(P::ExpressionStatement, sequence({optional(reference(P::Expression)), terminal(";")}));
         set(P::StaticAssertDeclaration, sequence({terminal("$::static_assert"), terminal("("),
             reference(P::ConstantExpression), terminal(","), string, terminal(")"), terminal(";")}));
-        set(P::ForInitializer, choice({sequence({}), reference(P::Expression), reference(P::DeclarationWithoutFinalSemicolon)}));
+        set(P::ForInitializer, choice({sequence({}), expressions, reference(P::DeclarationWithoutFinalSemicolon)}));
         set(P::Initializer, choice({reference(P::AssignmentExpression), sequence({terminal("{"),
             optional(sequence({reference(P::InitializerEntry),
                 repeated(sequence({terminal(","), reference(P::InitializerEntry)})), optional(terminal(","))})), terminal("}")})}));
@@ -698,6 +700,8 @@ const auto& public_tree_rules() {
             sequence({terminal("("), reference(P::Expression), terminal(")")}),
             sequence({terminal("$::alignof"), terminal("("),
                 choice({reference(P::TypeName), reference(P::Expression)}), terminal(")")}),
+            sequence({terminal("$::offsetof"), terminal("("), reference(P::TypeName), terminal(","),
+                id, repeated(reference(P::Designator)), terminal(")")}),
             sequence({terminal("$::atomic_is_lock_free"), terminal("("),
                 choice({reference(P::TypeName), reference(P::ArgumentList)}), terminal(")")}),
             reference(P::EmbedExpression), reference(P::QuoteExpression), opaque(P::PrimaryExpression)}));

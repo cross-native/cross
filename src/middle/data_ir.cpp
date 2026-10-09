@@ -38,7 +38,7 @@ bool supported_attribute(std::string_view name) {
            name == "noinit" || name == "retain" || name == "used" ||
            name == "weak" || name == "visibility" ||
            name == "alias" || name == "weakref" ||
-           name == "thread_local" || name == "tls_model";
+           name == "thread_local" || name == "tls_model" || name == "address";
 }
 
 bool marker_attribute(const ObjectDecl& object, std::string_view name,
@@ -768,6 +768,8 @@ ContinuationTask<std::optional<AddressValue>> address_value_async(
                      module, *value->pointee,
                      expression.type->pointee)) ||
                 (value->cast_pointee &&
+                 !(value->cast_pointee->kind == Type::Kind::Function &&
+                   expression.type->pointee->kind == Type::Kind::Function) &&
                  !compatible_pointee(value->cast_pointee,
                                       expression.type->pointee))) {
                 co_return std::nullopt;
@@ -879,8 +881,13 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
         const auto expected_function =
             type.kind == hir::Type::Kind::Pointer && type.pointee &&
             module.type(*type.pointee).kind == hir::Type::Kind::Function;
-        if (expected_function ||
-            result.address->kind == AddressKind::Function) {
+        // An explicit cast reinterprets the function's own address.
+        const Expr* written = &expression;
+        while (written->kind == Expr::Kind::Parenthesized && written->left) written = written->left.get();
+        const bool reinterpreted = expected_function && written->kind == Expr::Kind::Cast &&
+            result.address->kind == AddressKind::Function;
+        if (!reinterpreted && (expected_function ||
+            result.address->kind == AddressKind::Function)) {
             const auto actual =
                 hir::call_signature(module, result.address->function, {});
             if (!expected_function ||
@@ -1054,6 +1061,34 @@ bool append_image_relocations(Object& result, const Expr& expression,
                                       static_cast<unsigned>(relocation.length), *address});
     }
     return true;
+}
+
+// An address(N) entity has no symbol: a static reference to it is the
+// integer address itself.
+std::optional<std::uint64_t> fixed_address(const hir::Module& module,
+                                           const AddressConstant& address) {
+    if (address.kind == AddressKind::Object && address.object)
+        return module.object(*address.object).fixed_address;
+    if (address.kind == AddressKind::Function && address.function)
+        return module.function(*address.function).fixed_address;
+    return std::nullopt;
+}
+
+void resolve_fixed_addresses(Object& object, const hir::Module& module, ByteOrder order) {
+    if (object.address)
+        if (const auto base = fixed_address(module, *object.address)) {
+            object.initializer = InitializerKind::Integer;
+            object.bits = mask_to(UInt128{*base + static_cast<std::uint64_t>(object.address->addend)},
+                                  module.address_bits);
+            object.address.reset();
+        }
+    std::erase_if(object.relocations, [&](const Relocation& relocation) {
+        const auto base = fixed_address(module, relocation.address);
+        if (base)
+            store_bits(object.bytes, relocation.offset, relocation.size,
+                       UInt128{*base + static_cast<std::uint64_t>(relocation.address.addend)}, order);
+        return base.has_value();
+    });
 }
 
 bool lower_initializer(Object& result, const hir::Module& module,
@@ -1376,7 +1411,7 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
                 continue;
             }
             if (node.kind == Expr::Kind::Call || node.kind == Expr::Kind::Sizeof ||
-                node.kind == Expr::Kind::Alignof) continue;
+                node.kind == Expr::Kind::Alignof || node.kind == Expr::Kind::Offsetof) continue;
             if (node.third) pending.push_back(node.third.get());
             if (node.right) pending.push_back(node.right.get());
             if (node.left) pending.push_back(node.left.get());
@@ -1501,7 +1536,7 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
     if (!(co_await fold(fold, expression)) || program.evaluation_resource_errors != initial_resources) co_return false;
 
     const auto check_conversion = [&](const TypePtr& from, const TypePtr& to,
-                                      SourceLocation location) {
+                                      SourceLocation location, bool explicit_cast = false) {
         if (!from || from->kind != Type::Kind::Pointer || !to ||
             to->kind != Type::Kind::Pointer) return true;
         if (from->address_space != to->address_space)
@@ -1509,8 +1544,9 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
         const bool from_function = from->pointee->kind == Type::Kind::Function;
         const bool to_function = to->pointee->kind == Type::Kind::Function;
         if (from_function || to_function) {
+            // An explicit cast reinterprets one function pointer as another.
             if (!from_function || !to_function ||
-                module.intern_type(from) != module.intern_type(to))
+                (!explicit_cast && module.intern_type(from) != module.intern_type(to)))
                 return reject(location, "generic pointer argument has an incompatible function type");
         } else if (!compatible_static_pointee(module, module.intern_type(from->pointee),
                                                to->pointee)) {
@@ -1529,7 +1565,7 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
             const auto& node = *pending.back();
             pending.pop_back();
             if (node.kind == Expr::Kind::Cast && node.left &&
-                !check_conversion(unparen(node.left.get())->type, node.type, node.location))
+                !check_conversion(unparen(node.left.get())->type, node.type, node.location, true))
                 return false;
             if (node.third) pending.push_back(node.third.get());
             if (node.right) pending.push_back(node.right.get());
@@ -1566,7 +1602,11 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
                  index < signature.parameters.size(); ++index)
                 actual->parameters[index].physical_location =
                     signature.parameters[index].physical_location;
-            if (!hir::same_interface(module, *actual, signature) || value->address.addend != 0)
+            // A direct designator must match the destination interface; a typed
+            // pointer value, such as an explicit cast, was checked above.
+            const bool designator = !unparen(expression.get())->type;
+            if ((designator && !hir::same_interface(module, *actual, signature)) ||
+                value->address.addend != 0)
                 co_return reject(expression->location, "generic pointer argument has an incompatible function signature");
             normalized.kind = cross::AddressConstant::Kind::Function;
             normalized.function = function.definition ? function.definition
@@ -1688,7 +1728,8 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
         object.location = declaration->location;
         object.type = entity.type;
         object.size = type_size(hir_module, entity.type, subtarget);
-        if (object.size == 0) {
+        // An imported incomplete array has no storage of its own.
+        if (object.size == 0 && entity.definition) {
             diagnostics.error(declaration->location,
                               "object has incomplete storage type");
         }
@@ -1755,6 +1796,7 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
             (void)lower_initializer(object, hir_module, entity, *declaration,
                                     subtarget, diagnostics);
         }
+        resolve_fixed_addresses(object, hir_module, result.byte_order);
         result.object_indices.emplace(entity.id.value, result.objects.size());
         const auto stabilize = [&](const AddressConstant& address) {
             if (address.kind == AddressKind::Label && address.label)

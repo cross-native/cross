@@ -277,6 +277,13 @@ private:
         const bool is_union = aggregate_type.kind == hir::Type::Kind::Record &&
                               aggregate_type.record &&
                               module_.record(*aggregate_type.record).is_union;
+        // An exhaustive record's list must name each member directly.
+        const hir::Record* exhaustive{};
+        if (aggregate_type.kind == hir::Type::Kind::Record && aggregate_type.record && !is_union) {
+            const auto& record = module_.record(*aggregate_type.record);
+            if (record.definition && record.definition->attribute("exhaustive")) exhaustive = &record;
+        }
+        std::vector<bool> named(exhaustive ? exhaustive->members.size() : 0);
         Position cursor{std::uint64_t{0}};
         bool union_entry{};
         for (const auto& entry : source.initializer_entries) {
@@ -299,6 +306,8 @@ private:
                                       entry.designators.front());
             }
             if (!selection) continue;
+            if (exhaustive)
+                if (const auto index = concrete(selection->path[path.size()])) named[*index] = true;
             cursor = is_union ? Position{std::uint64_t{1}} : next_position(selection->direct_index);
             union_entry = true;
             for (std::size_t index = 1;
@@ -328,6 +337,13 @@ private:
                 {entry.value.get(), selection->type, *selection->offset,
                  offset_alignment(natural, *selection->offset),
                  selection->bit_width, selection->bit_offset});
+        }
+        for (std::size_t index = 0; index < named.size(); ++index) {
+            const auto& member = exhaustive->members[index];
+            if (named[index] || member.name.empty()) continue;
+            error(source.location, "initializer of exhaustive record '" + exhaustive->source_name +
+                "' does not name member '" + member.name + "'");
+            break;
         }
     }
 

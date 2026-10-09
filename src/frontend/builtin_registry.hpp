@@ -26,6 +26,7 @@ inline std::span<const CoreBuiltinEntry> core_expression_builtins() {
         {"$::unreachable", K::Intrinsic, "intrinsic"},
         {"$::trap", K::Intrinsic, "intrinsic"},
         {"$::alignof", K::Intrinsic, "intrinsic"},
+        {"$::offsetof", K::Intrinsic, "intrinsic"},
         {"$::static_assert", K::Intrinsic, "intrinsic"},
         {"$::patch", K::Intrinsic, "code-generation intrinsic"},
         {"$::eval", K::Intrinsic, "translation-time requirement"},

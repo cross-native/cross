@@ -18,6 +18,13 @@
 namespace cross {
 namespace {
 
+// The function type of a function, or of a pointer to or array of pointers to one.
+const FunctionType* callable_signature(TypePtr type) {
+    while (type && (type->kind == Type::Kind::Pointer || type->kind == Type::Kind::Array))
+        type = type->kind == Type::Kind::Pointer ? type->pointee : type->element;
+    return type && type->kind == Type::Kind::Function ? type->function.get() : nullptr;
+}
+
 TokenIdentity deferred_position(const SyntaxNode& node) {
     return node.kind == SyntaxNode::Kind::Deferred && !node.tokens.empty()
         ? node.tokens.front().origin.identity : TokenIdentity{};
@@ -659,6 +666,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->forward_tags_ = forward_tags_;
     child->scope_import_events_ = scope_import_events_;
     child->import_regions_ = import_regions_;
+    child->attribute_regions_ = attribute_regions_;
     child->fragment_namespaces_ = fragment_namespaces_;
     child->fragment_namespace_placements_ = fragment_namespace_placements_;
     child->active_namespace_ = active_namespace_;
@@ -2424,7 +2432,8 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                     }
                     (co_await expect_async(")", "after variadic state bindings"));
                 } else if (mode == AttributeParseMode::Semantic && !parsing_public_fragment_ &&
-                           (attribute.name == "aligned" || is_vector_type_attribute(attribute.name))) {
+                           (attribute.name == "aligned" || attribute.name == "address" ||
+                            is_vector_type_attribute(attribute.name))) {
                     for (;;) {
                         const auto next_token = co_await current_async();
                         if (next_token.is(")") || next_token.kind == TokenKind::End) break;
@@ -4786,6 +4795,8 @@ EvaluationTask<void> Parser::parse_typedef_async(std::string name_space,
         auto trailing = co_await parse_attributes_async();
         item_attributes.insert(item_attributes.end(),
             std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
+        apply_region_attributes(item_attributes, {RegionSubject::Typedef, false, false,
+            Linkage::Group, callable_signature(type)});
         auto definition = register_typedef(name_location, std::move(*name), std::move(type), item_attributes);
         remember_alias_binding(name_index, spelling, std::move(definition), true);
     } while ((co_await consume_async(",")));
@@ -5277,6 +5288,105 @@ EvaluationTask<void> Parser::parse_external_async(Program& program, std::string 
 }
 
 
+void Parser::apply_region_attributes(std::vector<Attribute>& attributes, const RegionTarget& target) {
+    if (attribute_regions_.empty() || !local_scopes_.empty() || parsing_public_fragment_ ||
+        preparing_header_) return;
+    const auto valid = [&](std::string_view name) {
+        const auto among = [&](std::initializer_list<std::string_view> names) {
+            return std::find(names.begin(), names.end(), name) != names.end();
+        };
+        const bool global = target.linkage == Linkage::Global;
+        switch (target.subject) {
+        case RegionSubject::Function:
+            if (among({"abi", "clobber", "stack_cleanup", "always_inline", "noinline", "hot",
+                       "cold", "noreturn", "returns_twice", "interrupt", "naked", "raw_inline",
+                       "runtime_only", "no_stack_protector", "no_sanitize", "section",
+                       "link_name"})) return true;
+            if (among({"aligned", "used", "retain"})) return target.definition;
+            if (name == "eval_only") return target.definition && !global;
+            if (name == "weak") return target.definition && global;
+            if (name == "visibility") return global;
+            if (name == "alias") return !target.definition && global;
+            return among({"weakref", "address"}) && !target.definition;
+        case RegionSubject::Object:
+            if (among({"abi", "clobber", "stack_cleanup"})) return target.callable != nullptr;
+            if (among({"aligned", "atomic", "section", "link_name", "thread_local",
+                       "tls_model"})) return true;
+            if (among({"used", "retain"})) return target.definition;
+            if (name == "noinit") return target.definition && !target.initializer;
+            if (name == "weak") return target.definition && global;
+            if (name == "visibility") return global;
+            if (name == "alias") return !target.initializer && global;
+            if (name == "weakref") return !target.initializer;
+            return name == "address" && !target.definition;
+        case RegionSubject::Typedef:
+            if (among({"abi", "clobber", "stack_cleanup"})) return target.callable != nullptr;
+            return among({"aligned", "may_alias", "atomic", "address_space", "vector_size",
+                          "ext_vector_type", "scalable_vector"});
+        case RegionSubject::Record:
+            if (!target.definition) return false;
+            if (name == "exhaustive") return !target.is_union;
+            return among({"packed", "aligned", "may_alias"});
+        case RegionSubject::Enumeration:
+            return name == "underlying";
+        }
+        return false;
+    };
+    std::vector<Attribute> leading;
+    // A callable attribute written in a declarator is already on its type.
+    const auto named = [&](std::string_view name) {
+        const auto in = [&](const std::vector<Attribute>& list) {
+            return std::any_of(list.begin(), list.end(),
+                [&](const Attribute& attribute) { return attribute.name == name; });
+        };
+        const auto* signature = target.callable;
+        return in(attributes) || in(leading) ||
+            (signature && ((name == "abi" && !signature->abi.empty()) ||
+                           (name == "clobber" && !signature->clobbers.empty()) ||
+                           (name == "stack_cleanup" && signature->stack_cleanup)));
+    };
+    // Inner regions take precedence over outer ones.
+    for (auto region = attribute_regions_.rbegin(); region != attribute_regions_.rend(); ++region) {
+        for (std::size_t index = 0; index < (*region)->attributes.size(); ++index) {
+            const auto& attribute = (*region)->attributes[index];
+            if (!valid(attribute.name)) continue;
+            (*region)->applied[index] = true;
+            if (!named(attribute.name)) leading.push_back(attribute);
+        }
+    }
+    attributes.insert(attributes.begin(), leading.begin(), leading.end());
+}
+
+EvaluationTask<void> Parser::parse_attribute_region_async(Program& program, std::string name_space,
+                                                         std::vector<Attribute> attributes) {
+    auto region = std::make_shared<AttributeRegion>();
+    region->applied.assign(attributes.size(), false);
+    region->attributes = std::move(attributes);
+    struct RegionRestore {
+        std::vector<std::shared_ptr<AttributeRegion>>& regions;
+        std::size_t depth;
+        ~RegionRestore() { regions.resize(depth); }
+    } restore{attribute_regions_, attribute_regions_.size()};
+    attribute_regions_.push_back(region);
+    (co_await consume_async("{"));
+    for (;;) {
+        const auto next_token = co_await current_async();
+        if (next_token.is("}") || next_token.kind == TokenKind::End) break;
+        const auto before = index_;
+        co_await parse_external_async(program, name_space);
+        if (before == index_) ++index_;
+    }
+    (co_await expect_async("}", "after attribute region"));
+    for (std::size_t index = 0; index < region->attributes.size(); ++index) {
+        const auto& attribute = region->attributes[index];
+        if (!is_known_attribute(attribute.name))
+            diagnostics_.error(attribute.location, "unknown attribute '" + attribute.name + "'");
+        else if (!region->applied[index])
+            diagnostics_.error(attribute.location, "attribute '" + attribute.name +
+                "' of this region is valid for none of its declarations");
+    }
+}
+
 void Parser::parse_external(Program& program, const std::string& name_space) {
     parse_external_async(program, name_space).run();
 }
@@ -5430,6 +5540,15 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
     retaining_shared_specifiers_ = true;
     auto attributes = co_await parse_attributes_async();
     retaining_shared_specifiers_ = shared_specifiers_restore.previous;
+    if (!attributes.empty() && (co_await current_async()).is("{")) {
+        if (parsing_public_fragment_) {
+            (co_await error_here_async("parsed declaration requires a direct core declaration"));
+            synchronize_external();
+            co_return;
+        }
+        co_await parse_attribute_region_async(program, name_space, std::move(attributes));
+        co_return;
+    }
     if ((co_await current_async()).is("$::static_assert")) {
         if (!attributes.empty()) (co_await error_here_async("attributes are not valid on $::static_assert"));
         (void)co_await parse_static_assertion_async();
@@ -5678,6 +5797,9 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
             const bool compound_start = (co_await current_async()).is("{") ||
                 ((co_await current_async()).kind == TokenKind::StructuredSplice && (co_await current_async()).splice &&
                  syntax_compound_node(*(co_await current_async()).splice));
+            if (function)
+                apply_region_attributes(function->attributes,
+                    {RegionSubject::Function, compound_start, false, linkage});
             if (function && (parsing_public_function_header_ || compound_start)) {
                 prototype_frame.finish();
                 if (parsing_public_function_header_ && generic_header)
@@ -5740,6 +5862,9 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
             auto trailing = co_await parse_attributes_async();
             item_attributes.insert(item_attributes.end(),
                 std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
+            const bool initialized = (co_await current_async()).is("=");
+            apply_region_attributes(item_attributes, {RegionSubject::Object,
+                initialized || linkage != Linkage::Group, initialized, linkage, callable_signature(type)});
             apply_callable_attributes(type, item_attributes);
             if (inline_hint)
                 diagnostics_.error(location, "'inline' is valid only on a function");
@@ -5968,6 +6093,7 @@ EvaluationTask<void> Parser::parse_enum_declaration_async(Program& program,
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
                       std::make_move_iterator(trailing.end()));
+    apply_region_attributes(attributes, {RegionSubject::Enumeration, true});
 
     EnumDecl declaration;
     const auto underlying = enum_underlying(attributes, declaration.captured_type_errors);
@@ -6133,6 +6259,8 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
                       std::make_move_iterator(trailing.end()));
+    apply_region_attributes(attributes, {RegionSubject::Record, (co_await current_async()).is("{"),
+        false, Linkage::Group, nullptr, is_union});
 
     auto [tag, inserted] = record_types_.emplace(
         *name, RecordTag{is_union, false});
@@ -6662,11 +6790,13 @@ EvaluationTask<std::unique_ptr<ObjectDecl>> Parser::parse_object_async(
         object->type->lanes = static_cast<std::uint32_t>(
             object->initializer->string_value.size() + 1);
     }
+    // Without an initializer, only a forward declaration may leave the bound
+    // incomplete; a definition in the group completes it.
     if (!parsing_public_fragment_ && object->type && object->type->kind == Type::Kind::Array &&
         object->type->lanes == 0 && !object->type->array_bound &&
-        !object->initializer) {
+        !object->initializer && linkage != Linkage::Group) {
         diagnostics_.error(location,
-                           "an omitted array bound requires an initializer");
+                           "an object definition with an omitted array bound requires an initializer");
     }
     if (consume_semicolon) (co_await expect_async(";"));
     co_return object;
@@ -7424,6 +7554,21 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
         scope_origins_.push_back(token_origin((co_await current_async()).location).identity);
         scope_ends_.push_back(source_end);
         (co_await expect_async("("));
+        // An expression list initializer is an ordered group without a scope.
+        const auto expression_list_async = [&]() -> StatementTask {
+            auto list = std::make_unique<Statement>();
+            list->kind = Statement::Kind::DeclarationList;
+            list->location = (co_await current_async()).location;
+            do {
+                auto item = std::make_unique<Statement>();
+                item->kind = Statement::Kind::Expression;
+                item->location = (co_await current_async()).location;
+                item->expression = co_await parse_expression_async();
+                list->statements.push_back(std::move(item));
+            } while ((co_await consume_async(",")));
+            if (list->statements.size() == 1) co_return std::move(list->statements.front());
+            co_return list;
+        };
         {
             ProductionScope initializer(*this, SyntaxProduction::ForInitializer);
             if ((co_await current_async()).is(";")) {
@@ -7444,22 +7589,19 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
                         diagnostics_.error(attribute.location,
                             "attribute '" + attribute.name + "' is not valid on a for initializer");
                     }
-                    statement->first = std::make_unique<Statement>();
-                    statement->first->kind = Statement::Kind::Expression;
-                    statement->first->location = (co_await current_async()).location;
-                    statement->first->expression = co_await parse_expression_async();
+                    statement->first = co_await expression_list_async();
                 }
             } else {
-                statement->first = std::make_unique<Statement>();
-                statement->first->kind = Statement::Kind::Expression;
-                statement->first->location = (co_await current_async()).location;
-                statement->first->expression = co_await parse_expression_async();
+                statement->first = co_await expression_list_async();
             }
         }
         (co_await expect_async(";"));
         if (!(co_await current_async()).is(";")) statement->condition = co_await parse_expression_async();
         (co_await expect_async(";"));
-        if (!(co_await current_async()).is(")")) statement->increment = co_await parse_expression_async();
+        if (!(co_await current_async()).is(")")) {
+            do statement->increments.push_back(co_await parse_expression_async());
+            while ((co_await consume_async(",")));
+        }
         (co_await expect_async(")"));
         statement->second = co_await parse_statement_async();
         local_scopes_.pop_back();
@@ -8287,6 +8429,51 @@ Parser::ExpressionTask Parser::parse_primary_async() {
             result->left = co_await parse_expression_async();
         }
         (co_await expect_async(")", "after alignof operand"));
+        co_return result;
+    }
+    if ((co_await current_async()).is("$::offsetof") && (co_await current_async(1)).is("(")) {
+        index_ += 2;
+        auto result = std::make_unique<Expr>();
+        result->kind = Expr::Kind::Offsetof;
+        result->location = item.location;
+        const bool previous = parsing_generic_argument_;
+        parsing_generic_argument_ = false;
+        {
+            ProductionScope type_name(*this, SyntaxProduction::TypeName);
+            result->type = co_await parse_type_async();
+            std::optional<std::string> name;
+            result->type = co_await parse_declarator_async(std::move(result->type), name, DeclaratorContext::TypeName);
+            if (name) diagnostics_.error(item.location, "an offsetof type name cannot declare an object");
+        }
+        (co_await expect_async(",", "after offsetof type"));
+        auto& entry = result->initializer_entries.emplace_back();
+        entry.location = (co_await current_async()).location;
+        for (bool first = true;; first = false) {
+            const auto step = co_await current_async();
+            if (!first && !step.is(".") && !step.is("[")) break;
+            std::optional<ProductionScope> designator_production;
+            if (!first) designator_production.emplace(*this, SyntaxProduction::Designator);
+            Expr::InitializerDesignator designator;
+            designator.location = step.location;
+            if (!first && (co_await consume_async("["))) {
+                designator.kind = Expr::InitializerDesignator::Kind::Index;
+                designator.index = co_await parse_constant_expression_async();
+                (co_await expect_async("]", "after offsetof index"));
+            } else {
+                if (!first) (co_await consume_async("."));
+                const auto member = (co_await consume_kind_async(TokenKind::Identifier));
+                if (!member) {
+                    (co_await error_here_async("expected member name in offsetof designator"));
+                    break;
+                }
+                designator.location = member->location;
+                designator.member = member->text;
+                designator.member_fresh = token_origin(member->location).fresh;
+            }
+            entry.designators.push_back(std::move(designator));
+        }
+        (co_await expect_async(")", "after offsetof designator"));
+        parsing_generic_argument_ = previous;
         co_return result;
     }
     if ((co_await consume_async("("))) {

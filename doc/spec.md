@@ -361,9 +361,10 @@ a brace-enclosed, comma-separated list. Entries initialize successive members
 or elements; `.member = value` and `[constant_index] = value` select a
 destination and reset the successive position after it. A nested brace list
 initializes a nested aggregate. Missing members/elements and padding are zero
-initialized, except that an initializer of a record declared `exhaustive`
-must name every member. Excess entries, duplicate designators, invalid member
-names, and out-of-range indices are errors.
+initialized, except that a brace initializer of a structure declared
+`exhaustive` must initialize each named member, by position or by designator.
+Excess entries, duplicate designators, invalid member names, and out-of-range
+indices are errors.
 
 For an automatic variable-length array, the bound is evaluated once before
 initialization. The runtime bound must include every explicitly initialized
@@ -2968,9 +2969,10 @@ A function pointer always has a stable interface. Taking a dynamic function's
 address creates a private registered-ABI adapter unless it already has a
 complete stable manual ABI. Converting a named function to a pointer type
 whose interface differs from the function's own likewise creates an adapter
-when the target can synthesize one; converting one function pointer to
-another function-pointer type with a different interface is an error.
-Indirect calls use the pointed-to modes/ABI
+when the target can synthesize one; an implicit conversion of one function
+pointer to another function-pointer type with a different interface is an
+error, and an explicit cast reinterprets the pointer. Indirect calls use the
+pointed-to modes/ABI
 and never infer a dynamic ABI. Adapters may bridge function-selectable ABIs,
 but never incompatible data models without an explicit target marshaling
 contract.
@@ -3705,7 +3707,12 @@ placement.
 
 An attribute region, one or more attribute specifiers followed by a braced
 group of external items, applies its attributes to each declaration and
-definition in the group for which they are valid, as leading attributes; an
+definition in the group for which they are valid, as leading attributes: an
+attribute is valid for a declaration when its subject matches, so function
+attributes apply to functions (`abi`, `clobber`, and `stack_cleanup` also to
+typedefs and objects of function or function-pointer type), symbol attributes
+as the declaration's definition status and linkage allow, layout attributes
+to typedefs and record definitions, and `underlying` to enumerations. An
 attribute written on a declaration inside takes precedence over a region
 attribute of the same name, regions nest, and a region attribute valid for
 none of the region's declarations is an error. Like a `syntax` region, an
@@ -3747,8 +3754,8 @@ The following object, type, and symbol attributes are normative:
 | `alias("name")` | Defines the entity as an alias of a compatible definition with that link name. |
 | `visibility("kind")` | Selects `default`, `hidden`, `protected`, or `internal` visibility when supported. |
 | `noinit` | Places an uninitialized static-duration object in non-zeroed storage. |
-| `address(N)` | On a declaration without an initializer or body: the entity is at the fixed address `N`; no storage is emitted and references use that address. |
-| `exhaustive` | On a record definition: a brace initializer of the record must name every member. |
+| `address(N)` | On a declaration without an initializer or body: the entity is at the fixed address `N`, a nonzero `uptr` value; it has no link symbol, no storage is emitted, and references use that address. A definition of it in the group, or `alias`, `weakref`, or `thread_local` with it, is an error. |
+| `exhaustive` | On a structure definition: a brace initializer of the structure must initialize each named member. |
 | `thread_local` | Gives a static-duration object thread-local storage. |
 | `tls_model("model")` | Selects a target TLS model for a thread-local entity. |
 | `link_name("name")` | Replaces the default link name of a global function, object, or label. |
