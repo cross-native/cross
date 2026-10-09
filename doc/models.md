@@ -272,7 +272,10 @@ for the whole register it belongs to (`xmm0` covers `ymm0` and `zmm0`, and
 `eax` covers `rax`), or `memory` or `flags`, which stand for memory and the
 condition flags. When a function's own ABI preserves storage that a callee's
 ABI may change, the compiler saves and restores that storage in the calling
-function.
+function. Of a general register that the list omits, a call preserves only as
+many low bits as the `register_bits` of the entry's narrowest `"integer"`
+bank: on a MIPS CPU with 64-bit registers, a call under `o32` or `cross32`
+may change the upper 32 bits of `s0`-`s7`.
 
 `elf_abi_tag` sets the ELF ABI tag of objects compiled with the entry as
 their ABI (`-mabi` or the profile's `abi`); without it, objects get the tag

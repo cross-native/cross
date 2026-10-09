@@ -1668,6 +1668,27 @@ private:
         return classify_managed_interface(hir_, entity, subtarget_, abi);
     }
 
+    // A call preserves only as many low bits of the GPRs it does not clobber
+    // as its ABI's narrowest integer bank has: 32 under o32 and cross32, even
+    // on a MIPS III CPU whose GPRs have 64.
+    unsigned call_preserved_gpr_bits(const machine::Instruction& call) const {
+        if (!subtarget_.has_feature(Feature::Mips3)) return 32U;
+        unsigned bits = 64U;
+        const auto signature = hir::call_signature(
+            hir_, call.direct_callee, call.call_signature);
+        const auto* abi = call.direct_callee
+            ? managed_abi_model(hir_, hir_.function(*call.direct_callee),
+                                subtarget_, options_)
+            : signature ? abi_model(signature->abi) : nullptr;
+        if (!abi) return bits;
+        for (const auto& bank : abi->banks) {
+            if (bank.register_class == "integer") {
+                bits = std::min(bits, bank.register_bits);
+            }
+        }
+        return bits;
+    }
+
     bool allocate_registers(machine::Function& function) {
         const auto& entity = hir_.function(function.source);
         if (!options_.register_allocation) {
@@ -2084,12 +2105,19 @@ private:
                     }
                 }
                 if (item->kind == machine::InstructionKind::Call) {
+                    const auto preserved_bits = call_preserved_gpr_bits(*item);
                     for (const auto id : live) {
                         if (id >= count) continue;
                         for (const auto& clobber : item->clobbers) {
                             if (clobber.kind ==
                                 machine::RegisterKind::Physical) {
                                 forbidden_colors[id].insert(clobber.id);
+                            }
+                        }
+                        // The call may change the upper bits of every GPR.
+                        if (function.virtual_registers[id].bits > preserved_bits) {
+                            for (std::uint32_t gpr = 1; gpr < fpr_physical_base; ++gpr) {
+                                forbidden_colors[id].insert(gpr);
                             }
                         }
                     }
@@ -2487,6 +2515,7 @@ private:
                     }
                 }
                 if (item->kind == machine::InstructionKind::Call) {
+                    const auto preserved_bits = call_preserved_gpr_bits(*item);
                     std::vector<std::uint32_t> ids(live.begin(), live.end());
                     std::sort(ids.begin(), ids.end());
                     for (const auto id : ids) {
@@ -2496,13 +2525,16 @@ private:
                         }
                         const auto color =
                             *function.virtual_register_assignments[id];
-                        const bool clobbered = std::any_of(
-                            item->clobbers.begin(), item->clobbers.end(),
-                            [&](const machine::Register& clobber) {
-                                return clobber.kind ==
-                                           machine::RegisterKind::Physical &&
-                                       clobber.id == color.value;
-                            });
+                        const bool clobbered =
+                            std::any_of(
+                                item->clobbers.begin(), item->clobbers.end(),
+                                [&](const machine::Register& clobber) {
+                                    return clobber.kind ==
+                                               machine::RegisterKind::Physical &&
+                                           clobber.id == color.value;
+                                }) ||
+                            (color.value < fpr_physical_base &&
+                             function.virtual_registers[id].bits > preserved_bits);
                         if (!clobbered) continue;
                         item->live_across_call.push_back(
                             machine::Register::virtual_register(

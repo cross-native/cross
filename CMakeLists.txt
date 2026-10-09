@@ -1616,6 +1616,34 @@ if(BUILD_TESTING)
                 LABELS "check.runtime;arch.mips;backend.native;feature.abi;profile.n64;endian.${cross_n64_endian};opt.${cross_n64_level}")
         endforeach()
     endforeach()
+    # A call under a 32-bit-register ABI preserves only the low halves of the
+    # VR4300 s registers.
+    add_test(NAME cross_mips_preserved_width_assembly COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-preserved-width
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.cmake")
+    set_tests_properties(cross_mips_preserved_width_assembly PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.abi;feature.register_allocation;opt.O2")
+    foreach(abi o32 cross32)
+        foreach(endian big little)
+            string(SUBSTRING ${endian} 0 1 endian_letter)
+            foreach(level O0 O2)
+                set(name cross_mips_preserved_width_${abi}_${endian_letter}_${level})
+                add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-preserved-width-${abi}-${endian_letter}-${level}
+                    -DMIPS_CPUS=vr4300 -DMIPS_ENDIANS=${endian_letter}
+                    -DMIPS_SINGLE_CASE=ON -DEXPECTED=P "-DCC_FLAGS=-mabi=${abi};-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+                set_tests_properties(${name} PROPERTIES
+                    LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.register_allocation;profile.${abi};isa.vr4300;endian.${endian};opt.${level}"
+                    SKIP_REGULAR_EXPRESSION "skipping MIPS")
+            endforeach()
+        endforeach()
+    endforeach()
     add_test(NAME cross_model_mips_abi_properties
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

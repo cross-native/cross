@@ -124,7 +124,10 @@ ABIs:
 `cross` and `cross_abi` name `cross-n64` on `mips64` and `mips64el` triples
 and `cross32` on the others. The Cross ABIs are not compatible with the C
 ABIs. Across calls, `cross32`, `cross64`, and `cross-n64` preserve `s0`–`s7`,
-`sp`, and `fp`. Select `o32`, `n64`, or `eabi32` at C boundaries, per
+`sp`, and `fp`. Under `cross32`, `o32`, and `eabi32`, whose integer registers
+have 32 bits, a call preserves only the low 32 bits of `s0`–`s7`, also on a
+CPU with 64-bit registers; under `cross64`, `cross-n64`, and `n64` it
+preserves all 64 bits. Select `o32`, `n64`, or `eabi32` at C boundaries, per
 declaration with `[[abi("n64")]]` or for the whole compilation with
 `-mabi=n64`.
 
