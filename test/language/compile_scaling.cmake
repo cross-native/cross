@@ -37,7 +37,9 @@ foreach(index RANGE 1 8000)
     string(APPEND temporaries "    u32 v${index} = v${previous} + ${index}u32;\n")
 endforeach()
 set(prologue "global u32 f(in u32 x) {\n    u32 y = 0u32;\n")
-compile(sequential_ifs -O0 "${prologue}${branches}    return y;\n}\n")
+# At -O0 every join keeps its phi copies; emitting and verifying them must not
+# rescan the function's blocks or stack slots per edge.
+compile(sequential_ifs -O0 "${prologue}${branches}${branches}    return y;\n}\n")
 compile(sequential_ifs -O2 "${prologue}${branches}    return y;\n}\n")
 compile(large_switch -O2
     "${prologue}    switch (x) {\n${cases}    default: break;\n    }\n    return y;\n}\n")

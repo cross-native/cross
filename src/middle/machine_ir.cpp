@@ -9,6 +9,7 @@
 #include <bit>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace cross::machine {
@@ -18,6 +19,8 @@ bool fail(Diagnostics& diagnostics, SourceLocation location, std::string_view me
     diagnostics.error(location, message);
     return false;
 }
+
+using BlockIndex = std::unordered_map<std::uint32_t, const Block*>;
 
 bool contains(const std::vector<BlockId>& ids, BlockId wanted) {
     return std::any_of(ids.begin(), ids.end(), [wanted](BlockId id) { return id == wanted; });
@@ -83,7 +86,7 @@ bool verify_register(const Register& reg, const Function& function,
 }
 
 bool verify_instruction(const Instruction& instruction, const Function& function,
-                        const std::vector<BlockId>& block_ids,
+                        const BlockIndex& blocks_by_id,
                         std::unordered_set<std::uint32_t>& defined_virtuals,
                         Diagnostics& diagnostics) {
     bool ok = true;
@@ -134,7 +137,7 @@ bool verify_instruction(const Instruction& instruction, const Function& function
                 ok = fail(diagnostics, instruction.location, "machine symbol operand has an empty name");
             }
         } else if (const auto* block = std::get_if<BlockOperand>(&operand)) {
-            if (!contains(block_ids, block->target)) {
+            if (!blocks_by_id.contains(block->target.value)) {
                 ok = fail(diagnostics, instruction.location, "machine instruction targets an unknown block");
             }
         } else if (const auto* stack = std::get_if<StackSlotOperand>(&operand)) {
@@ -295,21 +298,19 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
                   "machine function has no resolved ABI identity");
     }
 
-    std::vector<BlockId> block_ids;
-    block_ids.reserve(function.blocks.size());
-    std::unordered_set<std::uint32_t> unique_blocks;
+    BlockIndex blocks_by_id;
+    blocks_by_id.reserve(function.blocks.size());
     for (const Block& block : function.blocks) {
-        block_ids.push_back(block.id);
-        if (!unique_blocks.insert(block.id.value).second) {
+        if (!blocks_by_id.emplace(block.id.value, &block).second) {
             ok = fail(diagnostics, block.location, "machine function contains duplicate block IDs");
         }
     }
-    if (!contains(block_ids, function.entry)) {
+    if (!blocks_by_id.contains(function.entry.value)) {
         ok = fail(diagnostics, function.location, "machine function entry block does not exist");
     }
     std::unordered_set<std::uint32_t> local_labels;
     for (const auto& label : function.labels) {
-        if (!contains(block_ids, label.block) ||
+        if (!blocks_by_id.contains(label.block.value) ||
             !local_labels.insert(label.label.value).second) {
             ok = fail(diagnostics, function.location,
                       "machine local-label map is invalid");
@@ -320,7 +321,7 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
     }
     std::unordered_set<std::uint32_t> layout_blocks;
     for (BlockId id : function.layout) {
-        if (!contains(block_ids, id) || !layout_blocks.insert(id.value).second) {
+        if (!blocks_by_id.contains(id.value) || !layout_blocks.insert(id.value).second) {
             ok = fail(diagnostics, function.location,
                       "machine function layout contains an unknown or duplicate block");
         }
@@ -481,7 +482,7 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
                 ok = fail(diagnostics, instruction.location,
                           "machine instruction follows a block terminator");
             }
-            ok = verify_instruction(instruction, function, block_ids, defined_virtuals,
+            ok = verify_instruction(instruction, function, blocks_by_id, defined_virtuals,
                                     diagnostics) && ok;
             saw_terminator = is_terminator(instruction.kind);
         }
@@ -490,12 +491,12 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
                       "machine block with successors must end in an explicit terminator");
         }
         for (BlockId successor : block.successors) {
-            if (!contains(block_ids, successor)) {
+            if (!blocks_by_id.contains(successor.value)) {
                 ok = fail(diagnostics, block.location, "machine block has an unknown successor");
             }
         }
         for (BlockId predecessor : block.predecessors) {
-            if (!contains(block_ids, predecessor)) {
+            if (!blocks_by_id.contains(predecessor.value)) {
                 ok = fail(diagnostics, block.location, "machine block has an unknown predecessor");
             }
         }
@@ -522,23 +523,17 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
 
     for (const Block& block : function.blocks) {
         for (BlockId successor : block.successors) {
-            const auto successor_it = std::find_if(function.blocks.begin(), function.blocks.end(),
-                                                   [successor](const Block& candidate) {
-                                                       return candidate.id == successor;
-                                                   });
-            if (successor_it != function.blocks.end() &&
-                !contains(successor_it->predecessors, block.id)) {
+            const auto successor_it = blocks_by_id.find(successor.value);
+            if (successor_it != blocks_by_id.end() &&
+                !contains(successor_it->second->predecessors, block.id)) {
                 ok = fail(diagnostics, block.location,
                           "machine CFG successor is missing its reciprocal predecessor");
             }
         }
         for (BlockId predecessor : block.predecessors) {
-            const auto predecessor_it = std::find_if(function.blocks.begin(), function.blocks.end(),
-                                                     [predecessor](const Block& candidate) {
-                                                         return candidate.id == predecessor;
-                                                     });
-            if (predecessor_it != function.blocks.end() &&
-                !contains(predecessor_it->successors, block.id)) {
+            const auto predecessor_it = blocks_by_id.find(predecessor.value);
+            if (predecessor_it != blocks_by_id.end() &&
+                !contains(predecessor_it->second->successors, block.id)) {
                 ok = fail(diagnostics, block.location,
                           "machine CFG predecessor is missing its reciprocal successor");
             }
@@ -548,7 +543,7 @@ bool verify(const Function& function, Diagnostics& diagnostics) {
         for (const auto* instructions : {&function.frame.program->prologue,
                                          &function.frame.program->epilogue}) {
             for (const auto& instruction : *instructions) {
-                ok = verify_instruction(instruction, function, block_ids, defined_virtuals,
+                ok = verify_instruction(instruction, function, blocks_by_id, defined_virtuals,
                                         diagnostics) && ok;
             }
         }

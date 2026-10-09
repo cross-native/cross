@@ -10641,14 +10641,9 @@ private:
                std::to_string(next_label_++);
     }
 
-    const machine::Block& block(const machine::Function& function,
+    const machine::Block& block(const machine::Function&,
                                 machine::BlockId id) const {
-        const auto found = std::find_if(
-            function.blocks.begin(), function.blocks.end(),
-            [id](const machine::Block& candidate) {
-                return candidate.id == id;
-            });
-        return *found;
+        return *blocks_by_id_[id.value];
     }
 
     bool has_calls(const machine::Function& function) const {
@@ -21389,7 +21384,7 @@ private:
             bool vector{};
             bool source_temporary{};
         };
-        const CopyLocations location_key(function);
+        const auto& location_key = *copy_locations_;
         std::vector<Copy> copies;
         for (const auto& value : destination.instructions) {
             if (value.kind != machine::InstructionKind::Target ||
@@ -21416,7 +21411,7 @@ private:
             }
         }
         if (copies.empty()) return;
-        const auto temporaries = edge_offsets(function);
+        const auto& temporaries = edge_temporaries_;
         const auto require_wide_temporary = [&]() -> std::optional<std::int32_t> {
             if (!temporaries.empty()) return temporaries.front();
             diagnostics_.error(destination.location,
@@ -22978,6 +22973,14 @@ private:
 
     void emit_function(machine::Function& function) {
         active_function_ = &function;
+        std::uint32_t block_limit = 0;
+        for (const auto& candidate : function.blocks) {
+            block_limit = std::max(block_limit, candidate.id.value + 1);
+        }
+        blocks_by_id_.assign(block_limit, nullptr);
+        for (const auto& candidate : function.blocks) {
+            blocks_by_id_[candidate.id.value] = &candidate;
+        }
         frame_active_ = true;
         spill_homes_.assign(function.virtual_registers.size(),
                             std::numeric_limits<std::size_t>::max());
@@ -23401,6 +23404,8 @@ private:
         emit_variadic_prologue(function, entity);
         save_hard_registers(function, "$hard.abi.");
 
+        copy_locations_.emplace(function);
+        edge_temporaries_ = edge_offsets(function);
         deferred_edge_stubs_.clear();
         for (std::size_t index = 0; index < function.layout.size(); ++index) {
             const auto next = index + 1 < function.layout.size()
@@ -23466,6 +23471,11 @@ private:
     const machine::Function* active_function_{};
     // Index of each virtual register's first spill home in the active function.
     std::vector<std::size_t> spill_homes_;
+    // Blocks by id, storage locations, and parallel-copy temporaries of the
+    // active function.
+    std::vector<const machine::Block*> blocks_by_id_;
+    std::optional<CopyLocations> copy_locations_;
+    std::vector<std::int32_t> edge_temporaries_;
     std::unordered_map<const machine::Instruction*,
                        const machine::Instruction*> fused_adds_;
     std::unordered_set<const machine::Instruction*>
