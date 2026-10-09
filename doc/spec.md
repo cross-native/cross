@@ -729,20 +729,18 @@ zero-width effects are target ABI facts.
 
 Layout and aggregate passing are target properties. `sizeof` returns `uptr`;
 `$::alignof` returns an unevaluated `uptr`; `aligned` requests minimum
-alignment. `$::static_assert(constant, string);` requires a nonzero scalar
-constant and emits no code. In a translation-only function (an explicit
-`eval_only` function, procedural macro, syntax expander, or implicit meta
-helper), a block assertion evaluates when execution reaches it, using that
-invocation's parameters, initialized locals and substituted generic arguments.
-Each reached execution checks it anew, including loop iterations and recursive
-calls. An uncalled body or untaken assertion does not evaluate its condition;
-ordinary name, type and source-validity constraints still apply. Its evaluation
-shares the invocation's resource limits and has no runtime effect.
-File/namespace assertions and assertions in ordinary functions remain
-declaration-time checks: ordinary-function parameter/local values are
-unavailable, and untaken branches or an unused concrete function do not suppress
-the check. Generic ordinary-function assertions are checked for each
-instantiated body. Atomic and thread-local facilities are attributes;
+alignment. `$::static_assert(constant, string);` requires a nonzero scalar constant and
+emits no code. At file or namespace scope and in an ordinary function it is a
+declaration-time check: parameter and local values are unavailable, untaken
+branches and unused functions do not suppress it, and a generic function's
+assertions are checked for each instance. In a translation-only function (an
+explicit `eval_only` function, procedural macro, syntax expander, or implicit
+meta helper) it is instead a statement that executes each time it is reached,
+with that invocation's parameters, locals, and generic arguments, under the
+invocation's resource limits; an unreached assertion keeps its name and type
+constraints but is not evaluated.
+
+Atomic and thread-local facilities are attributes;
 generic selection and underscore-prefixed compatibility aliases do not exist.
 
 ### Function types
@@ -3544,14 +3542,14 @@ target is unambiguous. `[[...]]` is an isolated grammar context, so its names
 are compiler attributes without a `$::` root. `[[$::name]]` is invalid and
 receives no compatibility interpretation.
 
-A leading attribute with multiple valid subjects is ambiguous and requires an
-explicit placement; it is never implicitly applied to both subjects. For an
-inline record definition followed by an object, typedef, member or function
-definition, a leading `aligned` could describe either the record or the declared
-entity. Inside a record member declaration, leading `packed` likewise could
-describe either the inline nested record or the containing member. Put record
-layout attributes after the tag name (or after `struct`/`union` for an anonymous
-definition), before `{`, and entity layout attributes after the declarator:
+A leading attribute applies to the one subject of the declaration that can
+carry it. When an inline record or enumeration definition and a declared
+entity could both carry it, for example `aligned` on an inline record
+followed by an object, typedef, member, or function definition, or `packed`
+on an inline nested record inside a member declaration, the placement is
+ambiguous and is an error; it is never applied to both. Put type layout
+attributes after the tag name (after `struct`/`union` for an anonymous
+definition), before `{`, and entity attributes after the declarator:
 
 ```x
 struct Record [[aligned(16)]] { u8 byte; } object;
@@ -3559,19 +3557,10 @@ struct Small { u8 byte; } separately_aligned [[aligned(16)]];
 struct Outer { struct Inner { u8 byte; u32 word; } member [[packed]]; };
 ```
 
-Unambiguous leading forms remain valid. A tag-only declaration attributes the
-tag; leading `packed` on an inline record with an object, typedef, function or
-parameter declarator attributes only the complete record, since those entities
-cannot themselves be packed. Leading `aligned` on an inline record in a
-parameter declaration likewise attributes only the record, not the parameter
-cell. Leading `underlying` on an inline enumeration attributes only that
-enumeration. An inline record in a declaration containing only function
-prototypes likewise owns leading `aligned`: a prototype has no function-entry
-alignment target. A mixed declarator list containing an object still makes that
-leading placement ambiguous. An explicit entity-side placement never falls back
-to an inline type when invalid for the entity. Capture/inspection preserves the
-written attribute placement; these ownership constraints are checked when the
-declaration survives into source.
+An explicit entity-side placement never falls back to the inline type when it
+is invalid for the entity. These ownership constraints are checked when the
+declaration survives expansion; captured syntax preserves the written
+placement.
 
 Core attributes use one identifier, for example `[[interrupt("irq")]]`. A target
 may define qualified contextual names. Unknown attributes are errors.
