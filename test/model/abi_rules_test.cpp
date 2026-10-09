@@ -299,12 +299,22 @@ bool validate_shipped_abis() {
             !register_is(layout->arguments[0], 1, "a1") ||
             !register_is(layout->arguments[1], 0, "a2") ||
             !register_is(layout->arguments[1], 1, "a3") ||
-            !register_is(layout->arguments[2], 0, "s0")) {
+            !register_is(layout->arguments[2], 0, "t0")) {
             return false;
         }
     }
     if (!register_is(mips_cross_result, 0, "v0") ||
         !register_is(mips_cross_result, 1, "v1")) {
+        return false;
+    }
+    // The preserved s0-s7 follow every volatile argument register.
+    std::array<AbiValue, 15> mips_cross_words;
+    mips_cross_words.fill(o32_i32);
+    const auto mips_cross_spread = classify_call_arguments(
+        *mips_cross32, mips_cross_words, mips1_cross_features);
+    if (!mips_cross_spread ||
+        !register_is(mips_cross_spread.layout.arguments[13], 0, "t9") ||
+        !register_is(mips_cross_spread.layout.arguments[14], 0, "s0")) {
         return false;
     }
 

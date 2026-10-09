@@ -27,8 +27,12 @@ execute_process(
     OUTPUT_VARIABLE caller_stdout
     ERROR_VARIABLE caller_stderr
 )
+# Win64 also preserves RSI, RDI, and XMM6-XMM15, which the Cross ABI lets a
+# callee change. SysV preserves the same GPRs as Cross and no SIMD storage,
+# so a SysV caller needs no bridge.
 execute_process(
-    COMMAND "${CC}" -S -O2 -funwind-tables -fno-eval-calls "-mabi=${HOST_ABI}"
+    COMMAND "${CC}" -S -O2 -funwind-tables -fno-eval-calls
+            -target x86_64-w64-windows-gnu -mabi=ms_abi
             "${CALLER_SOURCE}" -o "${OUTPUT}.caller.s"
     RESULT_VARIABLE caller_assembly_status
     OUTPUT_VARIABLE caller_assembly_stdout
@@ -46,20 +50,14 @@ if(NOT caller_assembly_status EQUAL 0)
         "${caller_assembly_stdout}\n${caller_assembly_stderr}")
 endif()
 file(READ "${OUTPUT}.caller.s" caller_assembly)
-if(WIN32)
-    if(NOT caller_assembly MATCHES "[.]seh_savereg %rbx" OR
-       NOT caller_assembly MATCHES "[.]seh_savexmm %xmm6")
+foreach(pattern "[.]seh_(savereg|pushreg) %rsi" "[.]seh_(savereg|pushreg) %rdi"
+                "[.]seh_savexmm %xmm6," "[.]seh_savexmm %xmm15,")
+    if(NOT caller_assembly MATCHES "${pattern}")
         message(FATAL_ERROR
             "MS-to-Cross bridge did not preserve the stronger caller "
-            "contract\n${caller_assembly}")
+            "contract ('${pattern}')\n${caller_assembly}")
     endif()
-else()
-    if(NOT caller_assembly MATCHES "[.]cfi_offset %rbx")
-        message(FATAL_ERROR
-            "SysV-to-Cross bridge did not preserve the stronger caller "
-            "contract\n${caller_assembly}")
-    endif()
-endif()
+endforeach()
 
 execute_process(
     COMMAND "${HOST_CXX}" -DCROSS_ENTRY=cross_link_entry "${RUNNER}"

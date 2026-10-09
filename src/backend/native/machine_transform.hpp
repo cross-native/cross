@@ -4,6 +4,7 @@
 
 #include "middle/machine_ir.hpp"
 
+#include <cstddef>
 #include <functional>
 #include <optional>
 
@@ -43,6 +44,13 @@ eliminate_redundant_loads(machine::Function& function,
 [[nodiscard]] bool eliminate_dead_definitions(
     machine::Function& function,
     const MachineRegisterPredicate& definition_is_observable = {});
+
+// Moves every instruction `is_capture` accepts to the start of the entry
+// block, keeping their order, so no other entry code can overwrite an
+// incoming register before its capture. Returns how many were moved; they
+// form the entry block's prefix.
+std::size_t hoist_entry_captures(machine::Function& function,
+                                 const MachineInstructionPredicate& is_capture);
 
 // Selection commonly gives every virtual register a conservative fallback
 // home before target-independent cleanup has removed copies and dead values.

@@ -200,6 +200,32 @@ bool spill_elision_test() {
     return ok;
 }
 
+bool entry_capture_test() {
+    auto function = function_with_registers(4);
+    auto first = target(20, {reg(0)}, {});
+    auto copy_in = target(21, {reg(1)}, {reg(0)});
+    auto second = target(20, {reg(2)}, {});
+    auto store = target(22, {}, {reg(1), reg(2)});
+    function.blocks[0].instructions = {first, copy_in, second, store};
+
+    bool ok = true;
+    ok &= expect(native::hoist_entry_captures(
+                     function,
+                     [](const machine::Instruction& instruction) {
+                         return instruction.opcode ==
+                                machine::TargetOpcodeId{20};
+                     }) == 2,
+                 "both captures should be hoisted");
+    const auto& instructions = function.blocks[0].instructions;
+    ok &= expect(instructions.size() == 4 &&
+                     instructions[0].defs.front() == reg(0) &&
+                     instructions[1].defs.front() == reg(2) &&
+                     instructions[2].defs.front() == reg(1) &&
+                     instructions[3].defs.empty(),
+                 "captures must precede other entry code in their order");
+    return ok;
+}
+
 machine::Function canonical_loop_function() {
     machine::Function function;
     function.entry = {0};
@@ -248,6 +274,7 @@ int main() {
     ok &= load_elimination_test();
     ok &= dead_definition_test();
     ok &= spill_elision_test();
+    ok &= entry_capture_test();
     ok &= block_layout_test();
     return ok ? 0 : 1;
 }

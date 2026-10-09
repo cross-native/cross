@@ -263,13 +263,13 @@ abi "cross" {
     variadic_va_list_bytes = 24;
     variadic_va_list_alignment = 8;
 
-    # Cross preserves only compiler-owned RSP/RBP. Every other GPR and SIMD
-    # storage is caller-clobbered, giving the allocator the same freedom on
-    # ELF, COFF, and Mach-O. A caller with a stronger registered contract
-    # inserts an unwind-described bridge save around calls into this ABI.
+    # Callees preserve RBX, R12-R15, and the compiler-owned RSP/RBP on ELF,
+    # COFF, and Mach-O alike; other GPRs and all SIMD, mask, and x87 storage
+    # are caller-clobbered. A caller with a stronger registered contract saves
+    # the difference in unwind-described frame slots.
     call_clobbers = [
-        "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
-        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "rax", "rcx", "rdx", "rsi", "rdi",
+        "r8", "r9", "r10", "r11",
         "zmm0", "zmm1", "zmm2", "zmm3", "zmm4", "zmm5",
         "zmm6", "zmm7", "zmm8", "zmm9", "zmm10", "zmm11",
         "zmm12", "zmm13", "zmm14", "zmm15",

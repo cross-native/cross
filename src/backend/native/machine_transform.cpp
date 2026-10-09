@@ -4,6 +4,7 @@
 #include "backend/native/machine_transform.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -570,6 +571,34 @@ bool fuse_division_results(machine::Function& function,
         block.instructions = std::move(kept);
     }
     return changed;
+}
+
+std::size_t hoist_entry_captures(machine::Function& function,
+                                 const MachineInstructionPredicate& is_capture) {
+    const auto entry = std::find_if(
+        function.blocks.begin(), function.blocks.end(),
+        [&](const machine::Block& block) {
+            return block.id == function.entry;
+        });
+    if (entry == function.blocks.end()) return 0;
+    std::vector<machine::Instruction> captures;
+    for (auto& block : function.blocks) {
+        auto write = block.instructions.begin();
+        for (auto read = block.instructions.begin();
+             read != block.instructions.end(); ++read) {
+            if (is_capture(*read)) {
+                captures.push_back(std::move(*read));
+            } else {
+                if (write != read) *write = std::move(*read);
+                ++write;
+            }
+        }
+        block.instructions.erase(write, block.instructions.end());
+    }
+    entry->instructions.insert(entry->instructions.begin(),
+                               std::make_move_iterator(captures.begin()),
+                               std::make_move_iterator(captures.end()));
+    return captures.size();
 }
 
 bool elide_unused_virtual_spill_slots(machine::Function& function) {

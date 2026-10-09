@@ -52,6 +52,17 @@ foreach(endian IN LISTS MIPS_ENDIANS)
         if(NOT s EQUAL 0)
             message(FATAL_ERROR "MIPS compile failed")
         endif()
+        set(objects "${out}.o")
+        # An optional second unit, compiled by its own cc invocation.
+        if(DEFINED CALLEE_SOURCE AND NOT "${CALLEE_SOURCE}" STREQUAL "")
+            execute_process(COMMAND "${CC}" -target ${arch}-unknown-elf -march=${cpu} -mabi=o32
+                -O2 ${CC_FLAGS} ${CALLEE_FLAGS} -c "${CALLEE_SOURCE}" -o "${out}.callee.o"
+                RESULT_VARIABLE s)
+            if(NOT s EQUAL 0)
+                message(FATAL_ERROR "MIPS callee compile failed")
+            endif()
+            list(APPEND objects "${out}.callee.o")
+        endif()
         execute_process(COMMAND "${LLVM_MC}" --filetype=obj --triple=${arch}-unknown-elf
             --mcpu=mips3 --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${out}.start.o"
             RESULT_VARIABLE s)
@@ -59,7 +70,7 @@ foreach(endian IN LISTS MIPS_ENDIANS)
             message(FATAL_ERROR "MIPS startup assembly failed (${cpu}/${endian})")
         endif()
         execute_process(COMMAND "${LLD}" -m elf32${endian}tsmip -T "${ROOT}/test/target/mips/bare.ld"
-            "${out}.start.o" "${out}.o" -o "${out}.elf32" RESULT_VARIABLE s)
+            "${out}.start.o" ${objects} -o "${out}.elf32" RESULT_VARIABLE s)
         if(NOT s EQUAL 0)
             message(FATAL_ERROR "MIPS link failed")
         endif()

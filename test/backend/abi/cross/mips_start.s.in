@@ -1,0 +1,236 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Calls the Cross-ABI functions of mips_callee.x and mips_caller.x with a
+# canary in s0-s7 and fp, which the Cross ABI preserves, then checks each
+# result and the canaries. Arguments use a0-a3, t0-t9, then s0-s7; results
+# use v0. Prints P on success, or F and a letter naming the failed check.
+# The s-register canaries are 64-bit values when @WIDE@ is 1; fp holds an
+# address. Expected values come from an independent C reference.
+
+        .set noreorder
+        .set noat
+        .set mips3
+
+        .macro LOAD32 reg, value
+        lui \reg, ((\value) >> 16) & 0xffff
+        ori \reg, \reg, (\value) & 0xffff
+        .endm
+
+        .macro CANARY reg, value
+        .if @WIDE@
+        dli \reg, (0x0123456700000000 | (\value))
+        .else
+        LOAD32 \reg, \value
+        .endif
+        .endm
+
+        # Compares the low word of v0, sign-extended, with an expected value.
+        .macro EXPECT expected
+        sll $v0, $v0, 0
+        LOAD32 $t0, \expected
+        bne $v0, $t0, fail
+        nop
+        .endm
+
+        .macro CALL function
+        addiu $k1, $k1, 1
+        jal set_canaries
+        nop
+        jal \function
+        nop
+        .endm
+
+        .section .text.boot,"ax",@progbits
+        .globl _start
+_start:
+        lui $sp, 0x8080
+        addiu $sp, $sp, -64
+        move $k1, $zero
+
+        li $a0, 7
+        li $a1, 12345
+        CALL cross_lanes
+        EXPECT 0xce8b49c8
+        jal check_canaries
+        nop
+
+        li $a0, 0
+        li $a1, 99
+        CALL cross_lanes
+        EXPECT 0x153
+        jal check_canaries
+        nop
+
+        li $a0, 15
+        CALL cross_fib
+        EXPECT 0x262
+        jal check_canaries
+        nop
+
+        li $a0, 3
+        li $a1, 77
+        CALL cross_keep
+        EXPECT 0xceed8c6d
+        jal check_canaries
+        nop
+
+        # Sixteen arguments; the callee returns s0 and s1 unchanged.
+        addiu $k1, $k1, 1
+        jal set_canaries
+        nop
+        li $a0, 1
+        li $a1, 2
+        li $a2, 3
+        li $a3, 4
+        li $t0, 5
+        li $t1, 6
+        li $t2, 7
+        li $t3, 8
+        li $t4, 9
+        li $t5, 10
+        li $t6, 11
+        li $t7, 12
+        li $t8, 13
+        li $t9, 14
+        li $s0, 15
+        li $s1, 16
+        jal cross_wide
+        nop
+        EXPECT 0x5d8
+        li $t0, 15
+        bne $s0, $t0, fail
+        nop
+        li $t0, 16
+        bne $s1, $t0, fail
+        nop
+        CANARY $s0, 0x8a5a0110
+        CANARY $s1, 0x8a5a0221
+        jal check_canaries
+        nop
+
+        li $a0, 5
+        li $a1, 9
+        CALL cross_drive
+        EXPECT 0x7b2fac83
+        jal check_canaries
+        nop
+
+        li $a0, 0
+        li $a1, 9
+        CALL cross_drive
+        EXPECT 0x5b1da
+        jal check_canaries
+        nop
+
+        li $a0, 21
+        CALL cross_drive_wide
+        EXPECT 0x39c94081
+        jal check_canaries
+        nop
+
+        li $a0, 33
+        CALL cross_drive64
+        EXPECT 0xd0341810
+        jal check_canaries
+        nop
+
+        li $a0, 45
+        CALL cross_drive_inout
+        EXPECT 0x75
+        jal check_canaries
+        nop
+
+        LOAD32 $t0, 0xbf000900
+        li $t1, 80
+        sb $t1, 0($t0)
+        b report
+        nop
+fail:
+        LOAD32 $t0, 0xbf000900
+        li $t1, 70
+        sb $t1, 0($t0)
+        addiu $t1, $k1, 64
+        sb $t1, 0($t0)
+report:
+        li $t1, 10
+        sb $t1, 0($t0)
+        move $a0, $zero
+        addiu $v0, $zero, 1
+        addiu $t9, $zero, 1
+        .word 0x7000007f
+halt:
+        b halt
+        nop
+
+set_canaries:
+        CANARY $s0, 0x8a5a0110
+        CANARY $s1, 0x8a5a0221
+        CANARY $s2, 0x8a5a0332
+        CANARY $s3, 0x8a5a0443
+        CANARY $s4, 0x8a5a0554
+        CANARY $s5, 0x8a5a0665
+        CANARY $s6, 0x8a5a0776
+        CANARY $s7, 0x8a5a0887
+        LOAD32 $fp, 0x8a5a0998
+        jr $ra
+        nop
+
+check_canaries:
+        CANARY $t0, 0x8a5a0110
+        bne $s0, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0221
+        bne $s1, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0332
+        bne $s2, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0443
+        bne $s3, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0554
+        bne $s4, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0665
+        bne $s5, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0776
+        bne $s6, $t0, fail
+        nop
+        CANARY $t0, 0x8a5a0887
+        bne $s7, $t0, fail
+        nop
+        LOAD32 $t0, 0x8a5a0998
+        bne $fp, $t0, fail
+        nop
+        jr $ra
+        nop
+
+        .globl cross_clobber
+# u32 cross_clobber(u32 value) returns 2 * value + 1 after changing every
+# register the Cross ABI lets a callee change except k0, k1, sp, and ra.
+cross_clobber:
+        sll $v0, $a0, 1
+        addiu $v0, $v0, 1
+        LOAD32 $at, 0x5a5a5a5a
+        mthi $at
+        mtlo $at
+        move $v1, $at
+        move $a0, $at
+        move $a1, $at
+        move $a2, $at
+        move $a3, $at
+        move $t0, $at
+        move $t1, $at
+        move $t2, $at
+        move $t3, $at
+        move $t4, $at
+        move $t5, $at
+        move $t6, $at
+        move $t7, $at
+        move $t8, $at
+        move $t9, $at
+        move $gp, $at
+        jr $ra
+        nop

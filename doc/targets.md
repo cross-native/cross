@@ -56,8 +56,10 @@ profiles select the first two triples. ABIs:
 | `sysv_abi` | `linux` | The System V AMD64 C ABI. |
 | `ms_abi` | `ms`, `win64`, `windows` | The Microsoft x64 C ABI. |
 
-The Cross ABI is not compatible with either C ABI; it preserves only the stack
-and frame registers across calls. Use `sysv_abi` or `ms_abi` at C boundaries.
+The Cross ABI is not compatible with either C ABI. Across calls it preserves
+`rbx`, `r12`–`r15`, and the stack and frame registers; every other general
+register and all SIMD, mask, and x87 state may change. Use `sysv_abi` or
+`ms_abi` at C boundaries.
 
 Target options:
 
@@ -121,10 +123,10 @@ ABIs:
 
 `cross` and `cross_abi` name `cross-n64` on `mips64` and `mips64el` triples
 and `cross32` on the others. The Cross ABIs are not compatible with the C
-ABIs. Across calls, `cross32` preserves only `sp` and `fp`, while `cross64`
-and `cross-n64` also preserve `s0`–`s7`. Select `o32`, `n64`, or `eabi32` at
-C boundaries, per declaration with `[[abi("n64")]]` or for the whole
-compilation with `-mabi=n64`.
+ABIs. Across calls, `cross32`, `cross64`, and `cross-n64` preserve `s0`–`s7`,
+`sp`, and `fp`. Select `o32`, `n64`, or `eabi32` at C boundaries, per
+declaration with `[[abi("n64")]]` or for the whole compilation with
+`-mabi=n64`.
 
 `-march=` accepts `generic`, `mips1`, `r2000`, `r3000`, `mips2`, `r6000`,
 `allegrex`, `mips3`, `r4000`, `r4400`, `r4600`, `vr4300`, `mips4`, `mips5`,

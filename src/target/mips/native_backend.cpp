@@ -54,6 +54,7 @@ AssemblySymbolVisibility assembly_visibility(
 }
 
 enum class LoweringPass : std::uint16_t {
+    HoistParameterCaptures,
     PropagateCopies,
     FoldBoundaryProjections,
     SelectIntegerImmediates,
@@ -4028,6 +4029,21 @@ private:
     void optimize_machine_function() {
         native::MachineFunctionPassManager passes;
         using Stage = native::MachineStage;
+        // Entry code such as an `inout` copy-in may use t-register scratches
+        // that carry later arguments, so every capture comes first.
+        passes.add(
+            {{LoweringPass::HoistParameterCaptures}, Stage::Legalization,
+             "hoist-parameter-captures"},
+            [](machine::Function& function) {
+                return native::hoist_entry_captures(
+                           function, [](const machine::Instruction& value) {
+                               const auto opcode = decode_opcode(value.opcode);
+                               return value.kind ==
+                                          machine::InstructionKind::Target &&
+                                      (opcode == Opcode::Parameter ||
+                                       opcode == Opcode::Fparameter);
+                           }) != 0;
+            });
         passes.add(
             {{LoweringPass::PropagateCopies}, Stage::Canonicalization,
              "propagate-copies"},

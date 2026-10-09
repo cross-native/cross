@@ -3473,6 +3473,35 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/abi/cross/separate_compilation.cmake")
     set_tests_properties(cross_cross_abi_separate_compilation PROPERTIES
         LABELS "check.compile;arch.x86_64;backend.native;feature.abi")
+    # Registers the Cross ABI preserves survive separately compiled calls.
+    foreach(level O0 O1 O2 O3 Os Oz)
+        add_test(NAME cross_cross_abi_preserved_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DLEVEL=${level}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cross-abi-preserved-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/backend/abi/cross/preserved.cmake")
+        set_tests_properties(cross_cross_abi_preserved_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.frame;opt.${level}")
+    endforeach()
+    # Each MIPS registration owns one ABI, CPU, and byte order.
+    foreach(abi_cpu cross32:r3000 cross32:vr4300 cross64:vr4300)
+        string(REPLACE ":" ";" abi_cpu "${abi_cpu}")
+        list(GET abi_cpu 0 abi)
+        list(GET abi_cpu 1 cpu)
+        foreach(endian big little)
+            string(SUBSTRING ${endian} 0 1 endian_letter)
+            set(name cross_cross_abi_preserved_mips_${abi}_${cpu}_${endian_letter})
+            add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DABI=${abi}
+                -DMIPS_CPUS=${cpu} -DMIPS_ENDIANS=${endian_letter}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cross-abi-preserved-mips-${abi}-${cpu}-${endian_letter}
+                -P "${CMAKE_SOURCE_DIR}/test/backend/abi/cross/mips_preserved.cmake")
+            set_tests_properties(${name} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.frame;profile.${abi};isa.${cpu};endian.${endian}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     add_test(NAME cross_manual_register_abi
         COMMAND $<TARGET_FILE:cross_cc> -S -O0
                 "${CMAKE_SOURCE_DIR}/test/backend/abi/manual_register_abi.x"

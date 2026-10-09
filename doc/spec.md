@@ -2990,16 +2990,17 @@ registered interface rather than a dynamic ABI, but independently produced
 callers and definitions must use the same ABI model, target features that affect
 ABI rules, and data model.
 
-The shipped x86-64 Cross entry preserves only compiler-owned stack/frame
-state; its other GPR, SIMD, mask, and x87 resources are caller-clobbered. This
-is a model property, not a universal Cross rule. When a function with a
-stronger registered contract calls such an entry, the caller preserves the
-difference with ordinary target save/unwind machinery.
+The shipped x86-64 Cross entry preserves RBX, R12-R15, and compiler-owned
+stack/frame state; its other GPR, SIMD, mask, and x87 resources are
+caller-clobbered. This is a model property, not a universal Cross rule. When a
+function with a stronger registered contract calls such an entry, the caller
+preserves the difference with ordinary target save/unwind machinery.
 
 For a MIPS ELF32/address32 data model, the shipped `cross32` entry (aliased as
-`cross`) always uses 32-bit integer carriers, independent of the selected ISA.
-The separate `cross64` entry requires MIPS III or later and uses 64-bit GPR
-carriers without changing pointer width, aggregate layout, or object class.
+`cross`) always uses 32-bit integer carriers, independent of the selected ISA,
+and preserves `s0`-`s7`. The separate `cross64` entry requires MIPS III or
+later and uses 64-bit GPR carriers without changing pointer width, aggregate
+layout, or object class.
 Selecting a wider ISA never mutates an already selected registered contract;
 the compiler may nevertheless choose 64-bit carriers for a dynamic local
 interface. For the MIPS ELF64/address64 data model, the shipped `cross-n64`

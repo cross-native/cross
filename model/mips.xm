@@ -28,7 +28,6 @@ abi "cross32" {
     call_clobbers = [
         "at", "v0", "v1", "a0", "a1", "a2", "a3",
         "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
         "t8", "t9", "gp", "ra", "hi", "lo",
         "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
         "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
@@ -45,11 +44,12 @@ abi "cross32" {
         # argument widths with -march would make separately compiled objects
         # incompatible.
         register_bits = 32;
+        # Volatile channels come first so ordinary calls leave s0-s7 intact.
         arguments = [
             "a0", "a1", "a2", "a3",
-            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
             "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-            "t8", "t9"
+            "t8", "t9",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"
         ];
         results = ["v0", "v1", "a0", "a1"];
     }

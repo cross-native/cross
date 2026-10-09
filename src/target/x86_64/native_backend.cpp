@@ -1317,6 +1317,8 @@ private:
                 Opcode::VariadicState, value.location);
             instruction.variadic_state = value.variadic_state;
             instruction.defs.push_back(reg(value.id));
+            // The emitter materializes every state through RAX.
+            append_fixed_clobber(instruction, "rax", machine::i64);
             return instruction;
         }
         if (value.kind == ValueKind::LabelAddress) {
@@ -2210,31 +2212,19 @@ private:
     }
 
     void hoist_parameter_captures() {
+        const auto count =
+            native::hoist_entry_captures(current_, parameter_instruction);
+        if (count == 0) return;
         const auto entry = std::find_if(
             current_.blocks.begin(), current_.blocks.end(),
             [&](const machine::Block& block) {
                 return block.id == current_.entry;
             });
-        if (entry == current_.blocks.end()) return;
-
-        std::vector<machine::Instruction> captures;
-        for (auto& block : current_.blocks) {
-            auto write = block.instructions.begin();
-            for (auto read = block.instructions.begin();
-                 read != block.instructions.end(); ++read) {
-                if (parameter_instruction(*read)) {
-                    captures.push_back(std::move(*read));
-                } else {
-                    if (write != read) *write = std::move(*read);
-                    ++write;
-                }
-            }
-            block.instructions.erase(write, block.instructions.end());
-        }
+        const auto captures = entry->instructions.begin();
         const auto capture_plan = parameter_storage_plan(
             hir_, current_.source, dynamic_plans_, subtarget_);
         std::stable_sort(
-            captures.begin(), captures.end(),
+            captures, captures + static_cast<std::ptrdiff_t>(count),
             [&](const machine::Instruction& left,
                 const machine::Instruction& right) {
                 const auto left_index = static_cast<std::size_t>(
@@ -2254,10 +2244,6 @@ private:
                 }
                 return left_index < right_index;
             });
-        entry->instructions.insert(
-            entry->instructions.begin(),
-            std::make_move_iterator(captures.begin()),
-            std::make_move_iterator(captures.end()));
     }
 
     // A parameter that crosses calls only below one branch of the entry
