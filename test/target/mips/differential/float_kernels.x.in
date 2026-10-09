@@ -178,10 +178,10 @@ global u32 k_f_neg_abs(in u32 a, in u32 b, in u32 c) {
     f32 y = sb;
     y = y * 0.5f32;
     f32 k = -y;
-    i32 in = n;
+    i32 value = n;
     i32 im = m;
     i32 ik = k;
-    u32 uin = in;
+    u32 uin = value;
     u32 uim = im;
     u32 uik = ik;
     return uin + uim * 3u32 + uik * 5u32 + c;
