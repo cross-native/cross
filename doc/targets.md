@@ -87,11 +87,12 @@ Disabling a feature also disables the features that depend on it, so
 atomics, thread-local storage, and variadic functions are supported, but a
 variadic function or function pointer cannot use register or stack locations.
 
-A `[[musttail]]` call cannot target a variadic function and passes every
-argument in a register. With automatic locations, each argument must be an
-integer or a pointer and the result must fit in one register. A function with
-register or stack locations can tail-call only another such function or
-function pointer, and neither may have `out` or `inout` parameters.
+A `[[musttail]]` call cannot target a variadic function or leave a function
+that binds variadic state, and passes every argument in a register. With
+automatic locations, each argument must be an integer or a pointer and the
+result must fit in one register. A function with register or stack locations
+can tail-call only another such function or function pointer, and neither may
+have `out` or `inout` parameters.
 
 `[[naked]]` functions can inline `[[raw_inline]]` functions whose locals,
 control flow, pointer accesses, and integer, `f32`, and `f64` operations fit
@@ -175,12 +176,25 @@ call a software floating-point library.
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 hard-float `f32` and `f64`, structures and unions by value under every ABI,
 function pointers, variable-length arrays, computed goto, `$::patch` values,
-and LL/SC atomics. Not supported: vectors, integers wider than 64 bits,
-variadic function definitions, manual register locations, machine-instruction
-built-ins, position-independent code (`-mabicalls`), thread-local storage,
-MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when used. A
-`[[musttail]]` call passes every argument in a register, and neither function
-may have `out` or `inout` parameters.
+LL/SC atomics, and variadic functions. Not supported: vectors, integers wider
+than 64 bits, manual register locations, machine-instruction built-ins,
+position-independent code (`-mabicalls`), thread-local storage, MIPS16,
+microMIPS, and the Allegrex VFPU. They are diagnosed when used. A
+`[[musttail]]` call passes every argument in a register, cannot target a
+variadic function or leave a function that binds variadic state, and neither
+function may have `out` or `inout` parameters.
+
+A variadic definition reads its unnamed arguments through the states of its
+ABI. Under `o32`, `arg_area` (`void *`) is the C `va_start` address: the
+definition stores `a0`–`a3` in the 16 bytes that the caller reserves for them,
+so the unnamed arguments form one sequence of 4-byte slots in which `f64` and
+`i64` values start at a multiple of 8, and the pointer may be passed to a C
+function that takes a `va_list`. Under `cross32`, `cross64`, and `cross-n64`,
+`gp_arg_area` and `fp_arg_area` point at the saved integer and floating
+argument registers that follow the named arguments and `overflow_arg_area` at
+the stack arguments that follow them; `n64` has `gp_arg_area` for its one
+sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
+`arg_area` reaches only the unnamed arguments passed on the stack.
 
 ## Limits on all targets
 

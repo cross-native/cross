@@ -49,6 +49,27 @@ static i32 ms_shadow_overlap(in u64 tag, ...) {
     return arguments[1] == 17u64;
 }
 
+// The worker's callee reuses the stack below the worker's frame, where a
+// sibling call from forward_state would already have freed the register-save
+// area that the state addresses.
+[[abi("sysv_abi"), noinline]]
+static u64 clobber_stack(in u64 seed) {
+    volatile u64 cells[64];
+    for (u32 index = 0u32; index < 64u32; index += 1u32) cells[index] = seed;
+    return cells[0];
+}
+
+[[abi("sysv_abi"), noinline]]
+static u64 read_state(in u64 *arguments) {
+    u64 noise = clobber_stack(0x5a5a5a5a5a5a5a5au64);
+    return arguments[0] + (noise >> 63);
+}
+
+[[abi("sysv_abi"), noinline, variadic(u64 *arguments "gp_arg_area")]]
+static u64 forward_state(in u64 tag, ...) {
+    return read_state(arguments);
+}
+
 global i32 variadic_sysv_entry() {
     return sysv_registers(0u64, 7u8, 2.5f32) +
            sysv_overflow(0u64, 1u64, 2u64, 3u64, 4u64,
@@ -68,5 +89,6 @@ global i32 variadic_ms_entry() {
 
 global i32 variadic_entry() {
     if (fresh_registers(0u64, 21u64) != 21u64) return 0;
+    if (forward_state(0u64, 21u64) != 21u64) return 0;
     return variadic_sysv_entry() + variadic_ms_entry();
 }

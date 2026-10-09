@@ -1764,6 +1764,74 @@ if(BUILD_TESTING)
             endforeach()
         endforeach()
     endforeach()
+    # Variadic calls and definitions: o32 and cross32 on MIPS III and MIPS I
+    # CPUs, o32 interoperation with a Clang-compiled C reference, and
+    # cross-n64 on MIPS64.
+    add_test(NAME cross_mips_variadic_assembly COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_assembly.x
+        -DMODEL=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_count.xm
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-assembly
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/variadic_assembly.cmake")
+    set_tests_properties(cross_mips_variadic_assembly PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.variadic;feature.abi;opt.O2")
+    foreach(cpu vr4300 r3000)
+        foreach(endian big little)
+            string(SUBSTRING ${endian} 0 1 endian_letter)
+            foreach(level O0 O2)
+                set(variadic_case ${cpu}_${endian_letter}_${level})
+                set(variadic_labels "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;isa.${cpu};endian.${endian};opt.${level}")
+                set(variadic_runs o32 cross32)
+                if(level STREQUAL "O2")
+                    list(APPEND variadic_runs o32_c)
+                endif()
+                foreach(run IN LISTS variadic_runs)
+                    set(variadic_sources
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_o32.x)
+                    set(variadic_flags "-DCC_FLAGS=-${level}")
+                    set(variadic_profile o32)
+                    if(run STREQUAL "o32_c")
+                        list(APPEND variadic_sources
+                            -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_o32_c.x
+                            -DREFERENCE_C=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_o32.c)
+                    elseif(run STREQUAL "cross32")
+                        set(variadic_sources
+                            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_cross.x)
+                        set(variadic_flags "-DCC_FLAGS=-mabi=cross32;-DGP=u32;-${level}")
+                        set(variadic_profile cross32)
+                    endif()
+                    set(name cross_mips_variadic_${run}_${variadic_case})
+                    add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        ${variadic_sources}
+                        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_start.s
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-${run}-${variadic_case}
+                        -DMIPS_CPUS=${cpu} -DMIPS_ENDIANS=${endian_letter}
+                        -DMIPS_SINGLE_CASE=ON -DEXPECTED=P "${variadic_flags}"
+                        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+                    set_tests_properties(${name} PROPERTIES
+                        LABELS "${variadic_labels};profile.${variadic_profile}"
+                        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+                endforeach()
+            endforeach()
+        endforeach()
+    endforeach()
+    foreach(endian big little)
+        foreach(level O0 O2)
+            set(name cross_mips_variadic_cross_n64_${endian}_${level})
+            add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_cross.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_n64_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DMIPS64_ABI=default -DN64_ENDIAN=${endian}
+                "-DEXTRA_FLAGS=-DGP=u64 -${level}"
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-cross-n64-${endian}-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(${name} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;profile.n64;endian.${endian};opt.${level}")
+        endforeach()
+    endforeach()
     add_test(NAME cross_model_mips_abi_properties
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

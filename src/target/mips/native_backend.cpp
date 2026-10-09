@@ -347,6 +347,18 @@ const AbiEntry* abi_model(AbiId id) {
     return abi && abi->architecture == "mips" ? abi : nullptr;
 }
 
+const AbiRegisterBank* abi_bank(const AbiEntry& abi, std::string_view name) {
+    const auto found = std::find_if(
+        abi.banks.begin(), abi.banks.end(),
+        [&](const AbiRegisterBank& bank) { return bank.canonical_name == name; });
+    return found == abi.banks.end() ? nullptr : &*found;
+}
+
+// Only a definition with [[variadic(...)]] bindings stores incoming registers.
+bool binds_variadic_state(const hir::Function& entity) {
+    return entity.variadic && !entity.variadic_bindings.empty();
+}
+
 std::optional<SignatureLayout> classify_managed_interface(
     const hir::Module& module, const hir::Function& entity,
     const Subtarget& subtarget, const AbiEntry& abi) {
@@ -825,6 +837,27 @@ private:
             current_.stack_slots.push_back(std::move(mark));
         }
 
+        const auto& entity = hir_.function(source.source);
+        const auto* abi = abi_model(entity.abi);
+        if (binds_variadic_state(entity) && abi &&
+            variadic_save_area_size(*abi) != 0) {
+            machine::StackSlot save;
+            save.id = {static_cast<std::uint32_t>(current_.stack_slots.size())};
+            save.kind = machine::StackSlotKind::Local;
+            save.size = static_cast<std::uint32_t>(variadic_save_area_size(*abi));
+            // Each register is stored with its natural alignment.
+            save.alignment = abi->variadic_save_alignment;
+            for (const auto& name : abi->variadic_save_banks) {
+                if (const auto* bank = abi_bank(*abi, name)) {
+                    save.alignment =
+                        std::max(save.alignment, bank->register_bits / 8U);
+                }
+            }
+            save.location = source.location;
+            save.name = "$variadic.save";
+            current_.stack_slots.push_back(std::move(save));
+        }
+
         for (std::size_t index = 0;
              index < current_.virtual_registers.size(); ++index) {
             const auto mode = current_.virtual_registers[index];
@@ -1096,7 +1129,6 @@ private:
                                              value.location);
             result.variadic_state = value.variadic_state;
             result.defs.push_back(reg(value.id));
-            unsupported(value, "variadic state materialization");
             return result;
         }
         if (value.kind == ValueKind::LifetimeStart ||
@@ -1399,6 +1431,10 @@ private:
                          classified.layout.call.arguments) {
                         append_pieces(assignment.pieces);
                         append_pieces(assignment.shadows);
+                    }
+                    for (const auto& hidden :
+                         classified.layout.call.implicit_register_values) {
+                        append_clobbers({hidden.reg});
                     }
                     for (const auto& assignment : classified.layout.results) {
                         append_pieces(assignment.pieces);
@@ -4251,6 +4287,7 @@ private:
             options_.unwind_model != UnwindModel::None ||
             options_.unwind_tables || options_.asynchronous_unwind_tables ||
             function.frame.elide_incoming_saves ||
+            binds_variadic_state(entity) ||
             std::any_of(entity.parameters.begin(), entity.parameters.end(),
                         [](const hir::Parameter& parameter) {
                             return parameter.mode != ParameterMode::In;
@@ -5575,6 +5612,121 @@ private:
         }
     }
 
+    // Caller-relative offsets into the incoming stack arguments.
+    std::int64_t incoming_offset(std::size_t offset) const {
+        return static_cast<std::int64_t>(
+            frame_size_ + active_signature_->abi->return_address_bytes +
+            offset);
+    }
+
+    void store_variadic_register(const AbiRegisterBank& bank,
+                                 std::string_view reg,
+                                 const std::string& address) {
+        if (!fpr(reg)) {
+            store_integer_memory(reg, address, bank.register_bits);
+            return;
+        }
+        // Without an FPU no argument travels in a floating register; a
+        // single-precision FPU holds 32 bits of each.
+        if (!subtarget_.has_feature(Feature::HardFloat)) return;
+        instruction(bank.register_bits > 32 &&
+                            !subtarget_.has_feature(Feature::SingleFloat)
+                        ? "sdc1"
+                        : "swc1",
+                    reg_name(reg) + "," + address);
+    }
+
+    // A definition that binds variadic state stores the incoming argument
+    // registers its ABI model names before any body code runs: the home bank
+    // into the caller's area and the save banks into $variadic.save.
+    void emit_variadic_prologue(const machine::Function& function) {
+        const auto& entity = hir_.function(function.source);
+        if (!binds_variadic_state(entity)) return;
+        const auto& abi = *active_signature_->abi;
+        if (const auto* bank = abi_bank(abi, abi.variadic_home_bank)) {
+            for (std::size_t index = 0; index < bank->arguments.size();
+                 ++index) {
+                store_variadic_register(
+                    *bank, bank->arguments[index],
+                    save_memory(incoming_offset(
+                        abi.variadic_home_base +
+                        index * abi.variadic_home_stride)));
+            }
+        }
+        if (abi.variadic_save_banks.empty()) return;
+        const auto* save = named_slot(function, "$variadic.save");
+        if (!save || !save->frame_offset) {
+            diagnostics_.error(function.location,
+                               "MIPS variadic register-save area has no frame slot");
+            return;
+        }
+        for (const auto& name : abi.variadic_save_banks) {
+            const auto* bank = abi_bank(abi, name);
+            if (!bank) continue;
+            const auto bytes = std::max(1U, bank->register_bits / 8U);
+            const auto base = variadic_save_bank_offset(abi, name);
+            if (base % bytes != 0) {
+                diagnostics_.error(
+                    function.location,
+                    "MIPS variadic save bank '" + name +
+                        "' is not aligned to its register width");
+                return;
+            }
+            for (std::size_t index = 0; index < bank->arguments.size();
+                 ++index) {
+                store_variadic_register(
+                    *bank, bank->arguments[index],
+                    memory(*save->frame_offset +
+                           static_cast<std::int64_t>(base + index * bytes)));
+            }
+        }
+    }
+
+    void emit_variadic_state(const machine::Function& function,
+                             const machine::Instruction& value) {
+        const auto& abi = *active_signature_->abi;
+        if (value.variadic_state.value >= abi.variadic_states.size() ||
+            value.defs.empty()) {
+            diagnostics_.error(value.location,
+                               "MIPS variadic state has no ABI model state");
+            return;
+        }
+        const auto& layout = active_signature_->layout.call;
+        const auto resolved = variadic_state_value(
+            abi.variadic_states[value.variadic_state.value],
+            layout.named_cursors, layout.variadic_stack_offset);
+        const auto target = value.defs.front();
+        const auto destination = output_gpr(function, target, "t0");
+        if (resolved.base == VariadicStateBase::None) {
+            instruction(target.mode.bits > 32 ? "dli" : "li",
+                        reg_name(destination) + "," +
+                            std::to_string(resolved.offset));
+        } else {
+            std::string_view base = frame_base();
+            std::int64_t offset{};
+            if (resolved.base == VariadicStateBase::IncomingArguments) {
+                // Incoming arguments keep their distance from $sp in a
+                // realigned frame.
+                if (realignment_) base = "sp";
+                offset = incoming_offset(resolved.offset);
+            } else {
+                const auto* save = named_slot(function, "$variadic.save");
+                if (!save || !save->frame_offset) {
+                    diagnostics_.error(
+                        value.location,
+                        "MIPS variadic register-save area has no frame slot");
+                    return;
+                }
+                offset = *save->frame_offset +
+                         static_cast<std::int64_t>(resolved.offset);
+            }
+            instruction(address_add_immediate(),
+                        reg_name(destination) + "," + reg_name(base) + "," +
+                            std::to_string(offset));
+        }
+        commit_gpr(function, target, destination, value.location);
+    }
+
     void emit_callee_saves(const machine::Function& function, bool cfi) {
         for (const auto physical : function.callee_saved_registers) {
             const auto integer_name = gpr_name(physical);
@@ -5720,6 +5872,7 @@ private:
             function.frame.elide_incoming_saves ||
             function.frame.program->prologue.empty() ||
             returns_twice_or_interrupt(entity) ||
+            binds_variadic_state(entity) ||
             std::any_of(entity.parameters.begin(), entity.parameters.end(),
                         [](const hir::Parameter& parameter) {
                             return parameter.mode != ParameterMode::In;
@@ -6718,6 +6871,27 @@ private:
             store_fvreg(function, target, "f0", value.location);
             return;
         }
+        // A stack piece that holds the whole value is a copy of its memory
+        // image, which a 32-bit CPU cannot move through one GPR.
+        if (is_floating(hir_, parameter.type) &&
+            assignment.pieces.size() == 1 &&
+            assignment.pieces.front().location.kind == LocationKind::Stack &&
+            assignment.pieces.front().value_bits == target.mode.bits) {
+            const auto incoming =
+                incoming_offset(assignment.pieces.front().location.stack_offset);
+            if (const auto destination = assigned_fpr(function, target)) {
+                instruction(target.mode.bits <= 32 ? "lwc1" : "ldc1",
+                            reg_name(*destination) + "," +
+                                save_memory(incoming));
+                return;
+            }
+            const auto offset = vreg_offset(function, target, value.location);
+            for (std::int64_t word = 0; word * 32 < target.mode.bits; ++word) {
+                instruction("lw", "$at," + save_memory(incoming + word * 4));
+                instruction("sw", "$at," + memory(offset + word * 4));
+            }
+            return;
+        }
         const auto bits = type_bits(hir_, parameter.type);
         if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
             assemble_incoming_pair(function, assignment.pieces,
@@ -6840,6 +7014,28 @@ private:
         if (piece.location.kind == LocationKind::Register &&
             fpr(piece.location.reg)) {
             load_fvreg(function, source, piece.location.reg, location);
+            return;
+        }
+        // A stack piece that holds the whole value is a copy of its memory
+        // image, which a 32-bit CPU cannot move through one GPR.
+        if (piece.location.kind == LocationKind::Stack &&
+            piece.value_bit_offset == 0 &&
+            piece.value_bits == source.mode.bits) {
+            const auto stack_offset =
+                static_cast<std::int64_t>(piece.location.stack_offset);
+            if (const auto assigned = assigned_fpr(function, source)) {
+                instruction(source.mode.bits > 32 ? "sdc1" : "swc1",
+                            reg_name(*assigned) + "," +
+                                memory(stack_offset, "sp"));
+                return;
+            }
+            const auto offset = vreg_offset(function, source, location);
+            for (std::int64_t word = 0; word * 32 < source.mode.bits;
+                 ++word) {
+                instruction("lw", "$at," + memory(offset + word * 4));
+                instruction("sw",
+                            "$at," + memory(stack_offset + word * 4, "sp"));
+            }
             return;
         }
         // Soft-float and the o32 "integer seen" rule transport floating bits
@@ -7085,7 +7281,9 @@ private:
         }
         const auto& caller = hir_.function(function.source);
         const auto& callee = hir_.function(*call.direct_callee);
-        if (callee.variadic ||
+        // Variadic state may address this frame or the incoming argument
+        // area, which a sibling callee may reuse.
+        if (callee.variadic || binds_variadic_state(caller) ||
             std::any_of(caller.parameters.begin(), caller.parameters.end(),
                         [](const hir::Parameter& parameter) {
                             return parameter.mode != ParameterMode::In;
@@ -7302,6 +7500,18 @@ private:
                         call.location);
                 }
             }
+        }
+        for (const auto& hidden :
+             signature->layout.call.implicit_register_values) {
+            if (!gpr_id(hidden.reg)) {
+                diagnostics_.error(
+                    call.location,
+                    "MIPS variadic count register '" + hidden.reg +
+                        "' is not a general register");
+                continue;
+            }
+            instruction("li", reg_name(hidden.reg) + "," +
+                                  std::to_string(hidden.value));
         }
         const auto* callee_symbol =
             std::get_if<machine::SymbolOperand>(&call.operands.front());
@@ -10134,7 +10344,11 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         emit_dynamic_stack(function, value);
         return;
     }
-    if (opcode == Opcode::VariadicState || opcode == Opcode::Invalid) {
+    if (opcode == Opcode::VariadicState) {
+        emit_variadic_state(function, value);
+        return;
+    }
+    if (opcode == Opcode::Invalid) {
         diagnostics_.error(value.location,
                            "unsupported operation reached the MIPS assembly emitter");
         return;
@@ -10846,6 +11060,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // Entry homes run before a shrink-wrapped prologue.
     frame_active_ = !function.frame.prologue_block;
     emit_parameter_homes(function);
+    emit_variadic_prologue(function);
     epilogue_label_ = ".Lcross.mips." +
                       std::to_string(function.source.value) + ".return";
     plan_successor_delay_slots(function);

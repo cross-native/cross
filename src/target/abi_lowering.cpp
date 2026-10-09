@@ -496,6 +496,11 @@ bool allocate_partial_stack_piece(
     const AbiEntry& abi, const PieceRequest& request,
     std::size_t cursor, AllocationState& state,
     ArgumentAssignment& assignment) {
+    // A piece wider than a slot keeps its whole carrier; in a packed area
+    // it is also aligned like that carrier.
+    const auto bytes = std::max<std::size_t>(
+        abi.stack_slot_bytes, (request.carrier_bits + 7U) / 8U);
+    std::size_t alignment = abi.stack_slot_bytes;
     std::size_t offset{};
     if (abi.stack_layout == AbiStackLayout::Slots) {
         if (cursor >
@@ -507,26 +512,25 @@ bool allocate_partial_stack_piece(
         offset = std::max<std::size_t>(
             offset, abi.argument_stack_base);
         std::size_t end{};
-        if (!checked_add(offset, abi.stack_slot_bytes, end)) {
+        if (!checked_add(offset, bytes, end)) {
             return false;
         }
         state.stack_cursor = std::max(state.stack_cursor, end);
         state.high_water = std::max(state.high_water, end);
     } else {
-        if (!checked_align(state.stack_cursor, abi.stack_slot_bytes,
-                           offset) ||
-            !checked_add(offset, abi.stack_slot_bytes,
-                         state.stack_cursor)) {
+        alignment = std::max<std::size_t>(
+            alignment, std::min<std::size_t>(bytes, abi.stack_alignment));
+        if (!checked_align(state.stack_cursor, alignment, offset) ||
+            !checked_add(offset, bytes, state.stack_cursor)) {
             return false;
         }
         state.high_water =
             std::max(state.high_water, state.stack_cursor);
     }
     assignment.pieces.push_back(stack_piece(offset, request));
-    assignment.stack_size += abi.stack_slot_bytes;
+    assignment.stack_size += bytes;
     assignment.stack_alignment =
-        std::max<std::size_t>(assignment.stack_alignment,
-                              abi.stack_slot_bytes);
+        std::max(assignment.stack_alignment, alignment);
     return true;
 }
 
@@ -1176,6 +1180,46 @@ std::size_t abi_cursor_count(std::span<const AbiCursorUsage> cursors,
             return value.cursor == cursor;
         });
     return found == cursors.end() ? 0 : found->count;
+}
+
+std::size_t variadic_save_bank_offset(const AbiEntry& abi,
+                                      std::string_view bank) {
+    std::size_t offset{};
+    for (const auto& name : abi.variadic_save_banks) {
+        const auto* entry = find_bank(abi, name);
+        if (!entry) continue;
+        if (name == bank) return offset;
+        offset += entry->arguments.size() *
+                  std::max<unsigned>(1, entry->register_bits / 8U);
+    }
+    return offset;
+}
+
+std::size_t variadic_save_area_size(const AbiEntry& abi) {
+    return variadic_save_bank_offset(abi, {});
+}
+
+VariadicStateValue variadic_state_value(
+    const AbiVariadicState& state,
+    std::span<const AbiCursorUsage> named_cursors,
+    std::size_t variadic_stack_offset) {
+    const auto displacement =
+        static_cast<std::size_t>(state.base) +
+        abi_cursor_count(named_cursors, state.cursor) * state.stride;
+    switch (state.kind) {
+    case AbiVariadicStateKind::CursorOffset:
+        return {VariadicStateBase::None, displacement};
+    case AbiVariadicStateKind::CursorAddress:
+        return {VariadicStateBase::IncomingArguments, displacement};
+    case AbiVariadicStateKind::RegisterSaveAddress:
+        return {VariadicStateBase::SaveArea, displacement};
+    case AbiVariadicStateKind::StackAddress:
+        break;
+    }
+    const auto alignment = static_cast<std::size_t>(state.alignment);
+    return {VariadicStateBase::IncomingArguments,
+            ((variadic_stack_offset + alignment - 1U) & ~(alignment - 1U)) +
+                state.base};
 }
 
 } // namespace cross

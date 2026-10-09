@@ -18,6 +18,19 @@ if(NOT LLVM_MC OR NOT LLVM_OBJCOPY OR NOT LLD)
     message(STATUS "skipping MIPS semantic test: LLVM/QEMU tools are required")
     return()
 endif()
+# An optional C unit, compiled by Clang, is the independent reference of an
+# interoperation test.
+if(DEFINED REFERENCE_C AND NOT "${REFERENCE_C}" STREQUAL "")
+    find_program(CLANG NAMES clang)
+    if(CLANG)
+        execute_process(COMMAND "${CLANG}" --print-targets
+            OUTPUT_VARIABLE clang_targets ERROR_QUIET)
+    endif()
+    if(NOT CLANG OR NOT clang_targets MATCHES "mips")
+        message(STATUS "skipping MIPS semantic test: Clang with the MIPS target is required")
+        return()
+    endif()
+endif()
 get_filename_component(ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 if(NOT DEFINED MIPS_CPUS)
     set(MIPS_CPUS vr4300 r3000)
@@ -62,6 +75,17 @@ foreach(endian IN LISTS MIPS_ENDIANS)
                 message(FATAL_ERROR "MIPS callee compile failed")
             endif()
             list(APPEND objects "${out}.callee.o")
+        endif()
+        if(DEFINED REFERENCE_C AND NOT "${REFERENCE_C}" STREQUAL "")
+            # MIPS II is the oldest ISA whose f64 accesses Clang lowers; -G0
+            # keeps data out of the $gp area, which the startups do not set.
+            execute_process(COMMAND "${CLANG}" --target=${arch}-unknown-elf -march=mips2
+                -mabi=32 -mno-abicalls -fno-pic -G0 -ffreestanding -O2 -c "${REFERENCE_C}"
+                -o "${out}.reference.o" RESULT_VARIABLE s)
+            if(NOT s EQUAL 0)
+                message(FATAL_ERROR "MIPS C reference compile failed")
+            endif()
+            list(APPEND objects "${out}.reference.o")
         endif()
         execute_process(COMMAND "${LLVM_MC}" --filetype=obj --triple=${arch}-unknown-elf
             --mcpu=mips3 --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${out}.start.o"

@@ -349,11 +349,6 @@ public:
                     function.location,
                     "raw/naked MIPS functions await the architecture instruction registry");
             }
-            if (function.variadic || !function.variadic_bindings.empty()) {
-                diagnostics.error(
-                    function.location,
-                    "MIPS variadic state lowering is not implemented in the first o32 slice");
-            }
             if (function.result_location) {
                 diagnostics.error(
                     function.location,

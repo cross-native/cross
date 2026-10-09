@@ -171,23 +171,6 @@ const AbiRegisterBank* abi_bank(const AbiEntry& abi,
     return found == abi.banks.end() ? nullptr : &*found;
 }
 
-std::size_t variadic_save_bank_offset(const AbiEntry& abi,
-                                      std::string_view sought) {
-    std::size_t offset{};
-    for (const auto& name : abi.variadic_save_banks) {
-        const auto* bank = abi_bank(abi, name);
-        if (!bank) continue;
-        if (name == sought) return offset;
-        const auto bytes = std::max<unsigned>(1, bank->register_bits / 8U);
-        offset += bank->arguments.size() * bytes;
-    }
-    return offset;
-}
-
-std::size_t variadic_save_area_size(const AbiEntry& abi) {
-    return variadic_save_bank_offset(abi, {});
-}
-
 bool is_void(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
     return type.kind == hir::Type::Kind::Builtin &&
@@ -17657,27 +17640,20 @@ private:
                                "variadic state cannot classify the fixed prefix");
             return;
         }
-        const auto cursor = abi_cursor_count(
-            fixed.named_cursors, state->cursor);
-        const auto displacement = static_cast<std::size_t>(state->base) +
-                                  cursor * state->stride;
+        const auto resolved = variadic_state_value(
+            *state, fixed.named_cursors, fixed.variadic_stack_offset);
         const auto target = value.defs.front();
-        if (state->kind == AbiVariadicStateKind::CursorOffset) {
+        if (resolved.base == VariadicStateBase::None) {
             instruction(
                 "mov" + std::string(1, suffix(target.mode.bits)),
-                "$" + std::to_string(displacement) + ", " +
+                "$" + std::to_string(resolved.offset) + ", " +
                     register_name("rax", target.mode.bits));
             store(function, target, "rax");
             return;
         }
         std::string address;
-        if (state->kind == AbiVariadicStateKind::StackAddress) {
-            const auto stack_offset =
-                (fixed.variadic_stack_offset + state->alignment - 1U) &
-                ~(static_cast<std::size_t>(state->alignment) - 1U);
-            address = incoming_memory(stack_offset + state->base);
-        } else if (state->kind == AbiVariadicStateKind::CursorAddress) {
-            address = incoming_memory(displacement);
+        if (resolved.base == VariadicStateBase::IncomingArguments) {
+            address = incoming_memory(resolved.offset);
         } else {
             const auto save = named_slot_offset(function, "$variadic.save");
             if (!save) {
@@ -17687,7 +17663,7 @@ private:
                 return;
             }
             address = memory(
-                *save + static_cast<std::int32_t>(displacement));
+                *save + static_cast<std::int32_t>(resolved.offset));
         }
         instruction("leaq", address + ", %rax");
         store(function, target, "rax");
@@ -21479,6 +21455,10 @@ private:
         const auto* callee_plan = dynamic_plans_.find(callee.id);
         if (callee.variadic) {
             return "the callee is variadic";
+        }
+        if (caller.variadic && !caller.variadic_bindings.empty()) {
+            return "the caller's variadic state addresses its frame or "
+                   "incoming arguments";
         }
         if (!hard_register_views(function).empty()) {
             return "hard-register values require restoration after the call";

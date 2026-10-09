@@ -244,6 +244,35 @@ ClassificationResult classify_variadic_call_arguments(
 std::size_t abi_cursor_count(std::span<const AbiCursorUsage> cursors,
                              std::string_view cursor);
 
+// The area of `variadic_save_banks` holds the banks in list order with one
+// `register_bits` slot per argument register. The offset of a bank not in the
+// list is the size of the area.
+std::size_t variadic_save_bank_offset(const AbiEntry& abi,
+                                      std::string_view bank);
+std::size_t variadic_save_area_size(const AbiEntry& abi);
+
+enum class VariadicStateBase {
+    // The value itself (`cursor_offset`).
+    None,
+    // An offset into the incoming stack arguments, measured like a caller
+    // stack Location.
+    IncomingArguments,
+    // An offset into the area of `variadic_save_banks`.
+    SaveArea,
+};
+
+struct VariadicStateValue {
+    VariadicStateBase base{VariadicStateBase::None};
+    std::size_t offset{};
+};
+
+// Resolves a `variadic_state` of a definition from the classification of
+// its named prefix.
+VariadicStateValue variadic_state_value(
+    const AbiVariadicState& state,
+    std::span<const AbiCursorUsage> named_cursors,
+    std::size_t variadic_stack_offset);
+
 constexpr std::size_t callee_stack_offset(const ValuePiece& piece,
                                           const AbiEntry& abi) {
     return piece.location.stack_offset + abi.return_address_bytes;

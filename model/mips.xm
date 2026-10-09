@@ -22,7 +22,7 @@ abi "cross32" {
     stack_order = ["arguments"];
     variadic_supported = true;
     variadic_save_banks = ["integer", "floating"];
-    variadic_save_alignment = 4;
+    variadic_save_alignment = 8;
     variadic_va_list_bytes = 16;
     variadic_va_list_alignment = 4;
     call_clobbers = [
@@ -80,6 +80,7 @@ abi "cross32" {
         type = "f64*";
         kind = "register_save_address";
         cursor = "floating";
+        base = 88;
         stride = 8;
     }
 
@@ -234,6 +235,7 @@ abi "cross64" {
         type = "f64*";
         kind = "register_save_address";
         cursor = "floating";
+        base = 176;
         stride = 8;
     }
 
@@ -399,6 +401,7 @@ abi "cross-n64" {
         type = "f64*";
         kind = "register_save_address";
         cursor = "floating";
+        base = 176;
         stride = 8;
     }
 
@@ -518,8 +521,6 @@ abi "o32" {
     return_address_bytes = 0;
     stack_order = ["arguments"];
     variadic_supported = true;
-    variadic_save_banks = ["integer"];
-    variadic_save_alignment = 4;
     variadic_home_bank = "integer";
     variadic_home_base = 0;
     variadic_home_stride = 4;
@@ -563,7 +564,9 @@ abi "o32" {
 
     variadic_state "arg_area" {
         type = "void*";
-        kind = "stack_address";
+        kind = "cursor_address";
+        cursor = "argument-slot";
+        stride = 4;
     }
 
     rule "zero" {
