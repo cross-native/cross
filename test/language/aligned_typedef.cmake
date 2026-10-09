@@ -106,13 +106,21 @@ if(ARCH STREQUAL "x86_64")
 typedef wide_u32 lanes [[vector_size(16)]];
 \$::static_assert(sizeof(v4) == 64uptr && \$::alignof(v4) == 64uptr, \"vector request\");
 \$::static_assert(sizeof(lanes) == 16uptr && \$::alignof(lanes) == 16uptr, \"lane values\");\n" ${x86})
+    # The debugging serializers pad the base type to the requested layout.
     if(LLVM_TEXT)
-        compile(llvm "LLVM debug serialization does not encode typedef alignment"
-            "${wide}global wide_u32 object;\n" ${x86} -emit-llvm)
+        compile(llvm "" "${wide}global wide_u32 object;\n" ${x86} -emit-llvm)
+        file(READ "${OUTPUT}/llvm.s" text)
+        if(NOT text MATCHES "<\\{ i32, \\[12 x i8\\] \\}> zeroinitializer, align 16")
+            message(FATAL_ERROR "LLVM text lost the padded storage\n${text}")
+        endif()
     endif()
     if(GIMPLE_TEXT)
-        compile(gimple "GIMPLE serialization does not encode typedef alignment"
-            "${wide}global u32 f() { wide_u32 local = 1u32; return local; }\n" ${x86} -emit-gimple)
+        compile(gimple "" "${wide}global u32 f() { wide_u32 local = 1u32; return local; }\n"
+            ${x86} -emit-gimple)
+        file(READ "${OUTPUT}/gimple.s" text)
+        if(NOT text MATCHES "aligned\\(16\\)\\)\\) cross_storage_[0-9]+ { cross_t[0-9]+ value; unsigned char padding\\[12\\]; }")
+            message(FATAL_ERROR "GIMPLE text lost the padded storage\n${text}")
+        endif()
     endif()
 else()
     compile(realigned_vla "MIPS cannot realign a frame that also has a variable-length allocation"

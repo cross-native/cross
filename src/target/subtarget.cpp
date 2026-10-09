@@ -63,6 +63,20 @@ unsigned Subtarget::integer_constant_materialization_cost(
                : 1U;
 }
 
+std::optional<unsigned> Subtarget::integer_division_cost(
+    const IntegerOperationCostQuery& query) const {
+    if (!target_ || !target_->cost_model.integer_division) return std::nullopt;
+    return target_->cost_model.integer_division(*this, query);
+}
+
+std::optional<unsigned> Subtarget::integer_multiply_high_cost(
+    const IntegerOperationCostQuery& query) const {
+    if (!target_ || !target_->cost_model.integer_multiply_high) {
+        return std::nullopt;
+    }
+    return target_->cost_model.integer_multiply_high(*this, query);
+}
+
 std::optional<TargetFeatureId> Subtarget::feature_id(
     std::string_view name) const {
     if (!table_) return std::nullopt;

@@ -767,6 +767,26 @@ bool contains_dynamic_array(const Statement& statement) {
            (statement.second && contains_dynamic_array(*statement.second));
 }
 
+// Whether control can enter the statement other than at its start: through a
+// label, or through a case/default label of an enclosing switch. A nested
+// switch's own case labels are entered only through that switch.
+bool contains_entry_label(const Statement& statement,
+                          bool nested_switch = false) {
+    if (statement.kind == Statement::Kind::Label) return true;
+    if (!nested_switch && (statement.kind == Statement::Kind::Case ||
+                           statement.kind == Statement::Kind::Default)) {
+        return true;
+    }
+    nested_switch |= statement.kind == Statement::Kind::Switch;
+    for (const auto& child : statement.statements) {
+        if (contains_entry_label(*child, nested_switch)) return true;
+    }
+    return (statement.first &&
+            contains_entry_label(*statement.first, nested_switch)) ||
+           (statement.second &&
+            contains_entry_label(*statement.second, nested_switch));
+}
+
 enum class CallTypeUse { Result, Input, Output, Variadic };
 
 bool supported_call_type(const hir::Module& module, hir::TypeId type,
@@ -955,8 +975,11 @@ private:
                     label->id.value,
                     ControlPoint{scope_depth, dynamic_arrays});
             }
-        } else if (statement.kind == Statement::Kind::Goto) {
-            goto_control_points_.emplace(
+        } else if (statement.kind == Statement::Kind::Goto ||
+                   statement.kind == Statement::Kind::Switch ||
+                   statement.kind == Statement::Kind::Case ||
+                   statement.kind == Statement::Kind::Default) {
+            statement_control_points_.emplace(
                 &statement, ControlPoint{scope_depth, dynamic_arrays});
         }
         if (statement.declaration &&
@@ -975,9 +998,9 @@ private:
 
     bool supports_direct_vla_transition(const Statement& statement,
                                         hir::LabelId target) const {
-        const auto source = goto_control_points_.find(&statement);
+        const auto source = statement_control_points_.find(&statement);
         const auto destination = label_control_points_.find(target.value);
-        if (source == goto_control_points_.end() ||
+        if (source == statement_control_points_.end() ||
             destination == label_control_points_.end() ||
             destination->second.scope_depth > source->second.scope_depth) {
             return false;
@@ -998,7 +1021,7 @@ private:
         parameter_values_.clear();
         label_blocks_.clear();
         label_control_points_.clear();
-        goto_control_points_.clear();
+        statement_control_points_.clear();
         case_blocks_.clear();
         scopes_.clear();
         loops_.clear();
@@ -5837,7 +5860,10 @@ private:
                     child->kind != Statement::Kind::Case &&
                     child->kind != Statement::Kind::Default &&
                     child->kind != Statement::Kind::Compound) {
-                    continue;
+                    if (!contains_entry_label(*child)) continue;
+                    // Lower an unreachable head so a nested label or case
+                    // keeps its body; pruning removes the head again.
+                    enter(new_block(child->location));
                 }
                 lower_statement(*child);
             }
@@ -6326,12 +6352,26 @@ private:
         }
     }
 
-    void lower_switch(const Statement& statement) {
-        if (contains_dynamic_array(*statement.first)) {
-            diagnostics_.error(statement.location, "switch bodies with variable-length arrays are not lowerable yet");
-            failed_ = true;
-            return;
+    // The variable-length array whose scope a jump from the switch to `label`
+    // would enter, if any.
+    const Statement* entered_dynamic_array(const Statement& switch_statement,
+                                           const Statement& label) const {
+        const auto source = statement_control_points_.find(&switch_statement);
+        const auto destination = statement_control_points_.find(&label);
+        if (source == statement_control_points_.end() ||
+            destination == statement_control_points_.end()) {
+            return nullptr;
         }
+        const auto& active = source->second.dynamic_arrays;
+        for (const auto& array : destination->second.dynamic_arrays) {
+            if (std::find(active.begin(), active.end(), array) == active.end()) {
+                return array.declaration;
+            }
+        }
+        return nullptr;
+    }
+
+    void lower_switch(const Statement& statement) {
         auto selector = lower_expression(*statement.condition);
         if (!selector || !integer_type(hir_, current_.values[selector->value].type)) {
             diagnostics_.error(statement.location, "switch requires an integer or enumeration selector");
@@ -6343,19 +6383,22 @@ private:
         const auto end = new_block(statement.location);
         auto fallback = end;
         std::vector<std::pair<UInt128, BlockId>> cases;
-        const auto collect = [&](const auto& self, const Statement& node, bool nested_control) -> void {
+        const auto collect = [&](const auto& self, const Statement& node) -> void {
             if (node.kind == Statement::Kind::Switch) return;
             if (node.kind == Statement::Kind::Case || node.kind == Statement::Kind::Default) {
-                if (nested_control) {
-                    diagnostics_.error(node.location, "case/default inside another control statement is not lowerable yet");
+                if (const auto* array = entered_dynamic_array(statement, node)) {
+                    diagnostics_.error(
+                        node.location,
+                        std::string(node.kind == Statement::Kind::Case ? "case" : "default") +
+                            " label would enter the scope of variable-length array '" +
+                            array->declaration->name + "'");
                     failed_ = true;
-                    return;
                 }
                 const auto block = new_block(node.location);
                 case_blocks_.emplace(&node, block);
                 if (node.kind == Statement::Kind::Default) {
                     fallback = block;
-                    if (node.first) self(self, *node.first, false);
+                    if (node.first) self(self, *node.first);
                     return;
                 }
                 const auto parsed = patch_initial(*node.expression, hir_.address_bits);
@@ -6377,16 +6420,14 @@ private:
                     failed_ = true;
                 }
                 cases.emplace_back(value, block);
-                if (node.first) self(self, *node.first, false);
+                if (node.first) self(self, *node.first);
                 return;
             }
-            nested_control |= node.kind != Statement::Kind::Compound &&
-                              node.kind != Statement::Kind::DeclarationList;
-            for (const auto& child : node.statements) self(self, *child, nested_control);
-            if (node.first) self(self, *node.first, nested_control);
-            if (node.second) self(self, *node.second, nested_control);
+            for (const auto& child : node.statements) self(self, *child);
+            if (node.first) self(self, *node.first);
+            if (node.second) self(self, *node.second);
         };
-        collect(collect, *statement.first, false);
+        collect(collect, *statement.first);
         if (failed_) return;
         const auto bound = unsigned_upper_bound_at_exit(current_, *selector, *current_block_);
         if (bound && bound->high == 0 && bound->low <= cases.size()) {
@@ -6564,7 +6605,7 @@ private:
     NameSet local_names_;
     std::unordered_map<std::uint32_t, BlockId> label_blocks_;
     std::unordered_map<std::uint32_t, ControlPoint> label_control_points_;
-    std::unordered_map<const Statement*, ControlPoint> goto_control_points_;
+    std::unordered_map<const Statement*, ControlPoint> statement_control_points_;
     std::unordered_map<const Statement*, BlockId> case_blocks_;
     std::vector<Scope> scopes_;
     std::unordered_map<const Expr*, std::optional<hir::TypeId>> inferred_types_;
@@ -9744,6 +9785,523 @@ bool reduce_constant_multiplications(ManagedFunction& function,
         }
         block.values = std::move(rewritten);
     }
+    remove_replaced_values(function, removed);
+    return changed;
+}
+
+// Division and remainder by an integer constant through a fixed-point
+// reciprocal: Granlund and Montgomery, "Division by Invariant Integers using
+// Multiplication" (PLDI 1994), with GCC's choice of the smallest multiplier.
+unsigned bit_width(UInt128 value) {
+    return value.high != 0
+        ? 64U + static_cast<unsigned>(std::bit_width(value.high))
+        : static_cast<unsigned>(std::bit_width(value.low));
+}
+
+unsigned trailing_zeros(UInt128 value) {
+    return value.low != 0
+        ? static_cast<unsigned>(std::countr_zero(value.low))
+        : 64U + static_cast<unsigned>(std::countr_zero(value.high));
+}
+
+bool power_of_two(UInt128 value) {
+    return bit_width(value) == trailing_zeros(value) + 1U;
+}
+
+struct Reciprocal {
+    UInt128 multiplier;
+    unsigned shift{};
+};
+
+// The multiplier m < 2^(bits + 1) and the shift s with
+// floor(x / divisor) == floor(m * x / 2^(bits + s)) for 0 <= x < 2^precision.
+// Requires 1 < divisor < 2^bits, 0 < precision <= bits, and
+// bits + ceil(log2(divisor)) < 128.
+Reciprocal choose_reciprocal(UInt128 divisor, unsigned bits,
+                             unsigned precision) {
+    const auto log = bit_width(subtract(divisor, UInt128{1}));
+    const auto scale = shift_left(UInt128{1}, bits + log);
+    auto low = divide(scale, divisor).first;
+    auto high = divide(add(scale, shift_left(UInt128{1},
+                                              bits + log - precision)),
+                       divisor).first;
+    auto shift = log;
+    for (; shift > 0; --shift) {
+        const auto next_low = shift_right(low, 1);
+        const auto next_high = shift_right(high, 1);
+        if (!(next_low < next_high)) break;
+        low = next_low;
+        high = next_high;
+    }
+    return {high, shift};
+}
+
+struct ConstantDivision {
+    ValueId dividend;
+    // The divisor's bit pattern at the operation width.
+    UInt128 divisor;
+    unsigned bits{};
+    // The dividend is below 2^precision; less than `bits` proves it
+    // nonnegative.
+    unsigned precision{};
+    bool is_signed{};
+    // The target selects these multiply-high operations at this width.
+    bool unsigned_multiply_high{};
+    bool signed_multiply_high{};
+};
+
+// Builds a replacement sequence before a division, or only counts its
+// operations and materialized constants when it has no function.
+class DivisionSequence {
+public:
+    DivisionSequence(ManagedFunction* function, std::vector<ValueId>* values,
+                     const ManagedValue& division, unsigned bits,
+                     hir::TypeId boolean, const Subtarget& subtarget,
+                     bool is_signed)
+        : function_(function), values_(values),
+          location_(division.location), type_(division.type), bits_(bits),
+          boolean_(boolean), subtarget_(subtarget), is_signed_(is_signed) {}
+
+    unsigned multiplies{};
+    unsigned operations{};
+    unsigned constant_cost{};
+
+    // Shift amounts and other small literals are instruction immediates on
+    // every target and are not priced.
+    ValueId constant(UInt128 value, bool materialized = true) {
+        value = mask_to(value, bits_);
+        if (materialized) {
+            constant_cost += subtarget_.integer_constant_materialization_cost(
+                {bits_, value.low, value.high, is_signed_});
+        }
+        ManagedValue result;
+        result.kind = ValueKind::ConstantInteger;
+        result.integer = value.low;
+        result.integer_high = value.high;
+        return append(std::move(result), type_);
+    }
+
+    ValueId binary(BinaryOperation operation, ValueId left, ValueId right) {
+        if (operation == BinaryOperation::Multiply ||
+            operation == BinaryOperation::UnsignedMultiplyHigh ||
+            operation == BinaryOperation::SignedMultiplyHigh) {
+            ++multiplies;
+        } else {
+            ++operations;
+        }
+        ManagedValue result;
+        result.kind = ValueKind::Binary;
+        result.binary = operation;
+        result.operands = {left, right};
+        return append(std::move(result), operation >= BinaryOperation::Equal
+                                             ? boolean_
+                                             : type_);
+    }
+
+    ValueId shift(BinaryOperation operation, ValueId value, unsigned amount) {
+        if (amount == 0) return value;
+        return binary(operation, value, constant(amount, false));
+    }
+
+    ValueId negate(ValueId value) {
+        ++operations;
+        ManagedValue result;
+        result.kind = ValueKind::Unary;
+        result.unary = UnaryOperation::Negate;
+        result.operands = {value};
+        return append(std::move(result), type_);
+    }
+
+    ValueId widen(ValueId truth) {
+        ++operations;
+        ManagedValue result;
+        result.kind = ValueKind::Cast;
+        result.cast = CastOperation::ZeroExtend;
+        result.operands = {truth};
+        return append(std::move(result), type_);
+    }
+
+private:
+    ValueId append(ManagedValue value, hir::TypeId type) {
+        if (!function_) return {};
+        const ValueId id{static_cast<std::uint32_t>(function_->values.size())};
+        value.id = id;
+        value.location = location_;
+        value.type = type;
+        function_->values.push_back(std::move(value));
+        values_->push_back(id);
+        return id;
+    }
+
+    ManagedFunction* function_;
+    std::vector<ValueId>* values_;
+    SourceLocation location_;
+    hir::TypeId type_;
+    unsigned bits_;
+    hir::TypeId boolean_;
+    const Subtarget& subtarget_;
+    bool is_signed_;
+};
+
+// floor(dividend / magnitude) for a nonnegative dividend.
+std::optional<ValueId> unsigned_quotient(DivisionSequence& sequence,
+                                         const ConstantDivision& division,
+                                         UInt128 magnitude) {
+    const auto x = division.dividend;
+    const auto bits = division.bits;
+    const auto precision = division.precision;
+    if (magnitude == UInt128{1}) return x;
+    if (bit_width(magnitude) > precision) {
+        return sequence.constant({}, false);
+    }
+    if (power_of_two(magnitude)) {
+        return sequence.shift(BinaryOperation::ShiftRightLogical, x,
+                              trailing_zeros(magnitude));
+    }
+    if (bit_width(magnitude) == bits) {
+        // Above 2^(bits-1) the quotient is zero or one.
+        return sequence.widen(sequence.binary(
+            BinaryOperation::UnsignedGreaterEqual, x,
+            sequence.constant(magnitude)));
+    }
+    const auto log = bit_width(subtract(magnitude, UInt128{1}));
+    if (precision < bits && precision + log < 128) {
+        // A narrow dividend admits an ordinary multiply whose full product
+        // still fits the operation width.
+        const auto reciprocal = choose_reciprocal(magnitude, precision,
+                                                  precision);
+        if (bit_width(reciprocal.multiplier) + precision <= bits &&
+            precision + reciprocal.shift < bits) {
+            return sequence.shift(
+                BinaryOperation::ShiftRightLogical,
+                sequence.binary(BinaryOperation::Multiply, x,
+                                sequence.constant(reciprocal.multiplier)),
+                precision + reciprocal.shift);
+        }
+    }
+    if (!division.unsigned_multiply_high || bits + log >= 128) {
+        return std::nullopt;
+    }
+    auto reciprocal = choose_reciprocal(magnitude, bits, precision);
+    if (bit_width(reciprocal.multiplier) <= bits) {
+        return sequence.shift(
+            BinaryOperation::ShiftRightLogical,
+            sequence.binary(BinaryOperation::UnsignedMultiplyHigh, x,
+                            sequence.constant(reciprocal.multiplier)),
+            reciprocal.shift);
+    }
+    if (const auto zeros = trailing_zeros(magnitude); zeros != 0) {
+        // Dividing out the even factor first leaves a narrower dividend
+        // whose multiplier fits the operation width.
+        reciprocal = choose_reciprocal(shift_right(magnitude, zeros), bits,
+                                       precision - zeros);
+        if (bit_width(reciprocal.multiplier) > bits) return std::nullopt;
+        const auto shifted = sequence.shift(
+            BinaryOperation::ShiftRightLogical, x, zeros);
+        return sequence.shift(
+            BinaryOperation::ShiftRightLogical,
+            sequence.binary(BinaryOperation::UnsignedMultiplyHigh, shifted,
+                            sequence.constant(reciprocal.multiplier)),
+            reciprocal.shift);
+    }
+    if (reciprocal.shift == 0) return std::nullopt;
+    // The multiplier needs bits + 1 bits: add its implicit top bit back as
+    // the dividend through an overflow-free average.
+    const auto high = sequence.binary(
+        BinaryOperation::UnsignedMultiplyHigh, x,
+        sequence.constant(reciprocal.multiplier));
+    const auto half = sequence.shift(
+        BinaryOperation::ShiftRightLogical,
+        sequence.binary(BinaryOperation::Subtract, x, high), 1);
+    return sequence.shift(BinaryOperation::ShiftRightLogical,
+                          sequence.binary(BinaryOperation::Add, half, high),
+                          reciprocal.shift - 1);
+}
+
+std::optional<ValueId> unsigned_remainder(DivisionSequence& sequence,
+                                          const ConstantDivision& division,
+                                          UInt128 magnitude) {
+    const auto x = division.dividend;
+    const auto bits = division.bits;
+    if (magnitude == UInt128{1}) return sequence.constant({}, false);
+    if (bit_width(magnitude) > division.precision) return x;
+    if (power_of_two(magnitude)) {
+        return sequence.binary(
+            BinaryOperation::BitAnd, x,
+            sequence.constant(subtract(magnitude, UInt128{1})));
+    }
+    if (bit_width(magnitude) == bits) {
+        const auto divisor = sequence.constant(magnitude);
+        const auto quotient = sequence.widen(sequence.binary(
+            BinaryOperation::UnsignedGreaterEqual, x, divisor));
+        return sequence.binary(
+            BinaryOperation::Subtract, x,
+            sequence.binary(BinaryOperation::BitAnd,
+                            sequence.negate(quotient), divisor));
+    }
+    const auto quotient = unsigned_quotient(sequence, division, magnitude);
+    if (!quotient) return std::nullopt;
+    return sequence.binary(
+        BinaryOperation::Subtract, x,
+        sequence.binary(BinaryOperation::Multiply, *quotient,
+                        sequence.constant(magnitude)));
+}
+
+// 2^power - 1 for a negative dividend and zero otherwise, so that the
+// arithmetic shift by `power` rounds toward zero.
+ValueId rounding_bias(DivisionSequence& sequence, ValueId x, unsigned bits,
+                      unsigned power) {
+    if (power == 1) {
+        return sequence.shift(BinaryOperation::ShiftRightLogical, x,
+                              bits - 1);
+    }
+    return sequence.shift(
+        BinaryOperation::ShiftRightLogical,
+        sequence.shift(BinaryOperation::ShiftRightArithmetic, x, bits - 1),
+        bits - power);
+}
+
+UInt128 signed_magnitude(const ConstantDivision& division) {
+    return bit(division.divisor, division.bits - 1)
+        ? mask_to(negate(division.divisor), division.bits)
+        : division.divisor;
+}
+
+std::optional<ValueId> signed_quotient(DivisionSequence& sequence,
+                                       const ConstantDivision& division) {
+    const auto x = division.dividend;
+    const auto bits = division.bits;
+    const bool negative = bit(division.divisor, bits - 1);
+    const auto magnitude = signed_magnitude(division);
+    if (division.precision < bits) {
+        const auto quotient = unsigned_quotient(sequence, division, magnitude);
+        if (!quotient || !negative) return quotient;
+        return sequence.negate(*quotient);
+    }
+    if (magnitude == UInt128{1}) return negative ? sequence.negate(x) : x;
+    if (power_of_two(magnitude)) {
+        const auto power = trailing_zeros(magnitude);
+        if (power + 1 == bits) {
+            // Only the most negative value itself has a nonzero quotient.
+            return sequence.widen(sequence.binary(
+                BinaryOperation::Equal, x,
+                sequence.constant(division.divisor)));
+        }
+        const auto quotient = sequence.shift(
+            BinaryOperation::ShiftRightArithmetic,
+            sequence.binary(BinaryOperation::Add, x,
+                            rounding_bias(sequence, x, bits, power)),
+            power);
+        return negative ? sequence.negate(quotient) : quotient;
+    }
+    if (!division.signed_multiply_high || bits > 64) return std::nullopt;
+    const auto reciprocal = choose_reciprocal(magnitude, bits, bits - 1);
+    if (bit_width(reciprocal.multiplier) > bits) return std::nullopt;
+    auto product = sequence.binary(
+        BinaryOperation::SignedMultiplyHigh, x,
+        sequence.constant(reciprocal.multiplier));
+    // A multiplier with its top bit set reads as m - 2^bits.
+    if (bit(reciprocal.multiplier, bits - 1)) {
+        product = sequence.binary(BinaryOperation::Add, product, x);
+    }
+    const auto shifted = sequence.shift(BinaryOperation::ShiftRightArithmetic,
+                                        product, reciprocal.shift);
+    const auto sign = sequence.shift(BinaryOperation::ShiftRightArithmetic,
+                                     x, bits - 1);
+    return negative
+        ? sequence.binary(BinaryOperation::Subtract, sign, shifted)
+        : sequence.binary(BinaryOperation::Subtract, shifted, sign);
+}
+
+std::optional<ValueId> signed_remainder(DivisionSequence& sequence,
+                                        const ConstantDivision& division) {
+    const auto x = division.dividend;
+    const auto bits = division.bits;
+    const auto magnitude = signed_magnitude(division);
+    // The remainder takes the dividend's sign, so only |divisor| matters.
+    if (division.precision < bits) {
+        return unsigned_remainder(sequence, division, magnitude);
+    }
+    if (magnitude == UInt128{1}) return sequence.constant({}, false);
+    if (power_of_two(magnitude)) {
+        const auto power = trailing_zeros(magnitude);
+        if (power + 1 == bits) {
+            const auto quotient = sequence.widen(sequence.binary(
+                BinaryOperation::Equal, x,
+                sequence.constant(division.divisor)));
+            return sequence.binary(
+                BinaryOperation::BitAnd, x,
+                sequence.binary(BinaryOperation::Subtract, quotient,
+                                sequence.constant(UInt128{1}, false)));
+        }
+        const auto rounded = sequence.binary(
+            BinaryOperation::Add, x, rounding_bias(sequence, x, bits, power));
+        return sequence.binary(
+            BinaryOperation::Subtract, x,
+            sequence.binary(BinaryOperation::BitAnd, rounded,
+                            sequence.constant(negate(magnitude))));
+    }
+    const auto quotient = signed_quotient(sequence, division);
+    if (!quotient) return std::nullopt;
+    return sequence.binary(
+        BinaryOperation::Subtract, x,
+        sequence.binary(BinaryOperation::Multiply, *quotient,
+                        sequence.constant(division.divisor)));
+}
+
+// An upper bound on the significant bits of an integer value: a zero
+// extension, a constant mask, or a constant logical right shift clears the
+// high bits.
+unsigned significant_bits(const ManagedFunction& function,
+                          const hir::Module& hir_module, ValueId id,
+                          unsigned bits) {
+    const auto& value = function.values[id.value];
+    if (value.kind == ValueKind::Cast &&
+        value.cast == CastOperation::ZeroExtend &&
+        value.operands.size() == 1) {
+        const auto source = type_bits(
+            hir_module, function.values[value.operands.front().value].type);
+        if (source != 0) return std::min(source, bits);
+    }
+    if (value.kind != ValueKind::Binary || value.operands.size() != 2) {
+        return bits;
+    }
+    if (value.binary == BinaryOperation::BitAnd) {
+        for (const auto operand : value.operands) {
+            if (const auto mask =
+                    folded_integer_constant(function, hir_module, operand)) {
+                return std::min(bits, bit_width(mask_to(*mask, bits)));
+            }
+        }
+    }
+    if (value.binary == BinaryOperation::ShiftRightLogical) {
+        const auto amount = folded_integer_constant(function, hir_module,
+                                                    value.operands[1]);
+        if (amount && amount->high == 0 && amount->low < bits) {
+            return bits - static_cast<unsigned>(amount->low);
+        }
+    }
+    return bits;
+}
+
+// A size objective admits at most one simple operation, which no divide
+// sequence undercuts. A speed objective compares the target's latencies,
+// charging materialized constants by the RISC weight of the cost blend.
+bool profitable_division_sequence(const DivisionSequence& sequence,
+                                  const ConstantDivision& division,
+                                  const Subtarget& subtarget,
+                                  const CompilerOptions& options) {
+    if (options.optimize_for == OptimizationGoal::Size ||
+        options.optimize_for == OptimizationGoal::MinimumSize) {
+        return sequence.multiplies == 0 && sequence.operations <= 1;
+    }
+    const IntegerOperationCostQuery query{division.bits, division.is_signed};
+    // A width without a divide instruction is a software loop.
+    const auto divide = subtarget.integer_division_cost(query);
+    if (!divide) return true;
+    const auto multiply = subtarget.integer_multiply_high_cost(query);
+    if (sequence.multiplies != 0 && !multiply) return false;
+    const auto risc_weight = 100U - std::min(options.risc_cisc_balance, 100U);
+    const auto replacement =
+        (sequence.multiplies * multiply.value_or(0) + sequence.operations) *
+            100U +
+        sequence.constant_cost * risc_weight;
+    const auto original =
+        *divide * 100U +
+        subtarget.integer_constant_materialization_cost(
+            {division.bits, division.divisor.low, division.divisor.high,
+             division.is_signed}) *
+            risc_weight;
+    return replacement < original;
+}
+
+bool reduce_constant_divisions(ManagedFunction& function,
+                               const hir::Module& hir_module,
+                               const Subtarget& subtarget,
+                               const CompilerOptions& options) {
+    const auto boolean = hir_module.builtin(BuiltinType::Bool);
+    if (!boolean) return false;
+    bool changed = false;
+    std::unordered_set<std::uint32_t> removed;
+    ValueReplacements replacements;
+    for (auto& block : function.blocks) {
+        std::vector<ValueId> rewritten;
+        rewritten.reserve(block.values.size());
+        for (const auto id : block.values) {
+            const auto& candidate = function.values[id.value];
+            const bool quotient =
+                candidate.binary == BinaryOperation::SignedDivide ||
+                candidate.binary == BinaryOperation::UnsignedDivide;
+            const bool is_signed =
+                candidate.binary == BinaryOperation::SignedDivide ||
+                candidate.binary == BinaryOperation::SignedRemainder;
+            const auto bits = type_bits(hir_module, candidate.type);
+            if (candidate.kind != ValueKind::Binary ||
+                candidate.operands.size() != 2 ||
+                (!quotient &&
+                 candidate.binary != BinaryOperation::SignedRemainder &&
+                 candidate.binary != BinaryOperation::UnsignedRemainder) ||
+                !integer_type(hir_module, candidate.type) || bits < 32 ||
+                type_bits(hir_module,
+                          function.values[candidate.operands[0].value]
+                              .type) != bits) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto divisor = folded_integer_constant(
+                function, hir_module, candidate.operands[1]);
+            if (!divisor || mask_to(*divisor, bits) == UInt128{}) {
+                rewritten.push_back(id);
+                continue;
+            }
+            // Appending the sequence below invalidates `candidate`.
+            const auto source = candidate;
+            const ConstantDivision division{
+                source.operands[0], mask_to(*divisor, bits), bits,
+                significant_bits(function, hir_module, source.operands[0],
+                                 bits),
+                is_signed,
+                subtarget.integer_multiply_high_cost({bits, false}).has_value(),
+                subtarget.integer_multiply_high_cost({bits, true}).has_value()};
+            const auto build = [&](DivisionSequence& sequence) {
+                if (is_signed) {
+                    return quotient ? signed_quotient(sequence, division)
+                                    : signed_remainder(sequence, division);
+                }
+                return quotient
+                    ? unsigned_quotient(sequence, division, division.divisor)
+                    : unsigned_remainder(sequence, division, division.divisor);
+            };
+            DivisionSequence estimate(nullptr, nullptr, source, bits,
+                                      *boolean, subtarget, is_signed);
+            if (!build(estimate) ||
+                !profitable_division_sequence(estimate, division, subtarget,
+                                              options)) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto first = function.values.size();
+            DivisionSequence sequence(&function, &rewritten, source, bits,
+                                      *boolean, subtarget, is_signed);
+            const auto result = *build(sequence);
+            if (result.value >= first &&
+                result.value + 1 == function.values.size()) {
+                // The last new operation takes over the division's identity.
+                auto final_value = std::move(function.values.back());
+                function.values.pop_back();
+                rewritten.pop_back();
+                final_value.id = id;
+                function.values[id.value] = std::move(final_value);
+                rewritten.push_back(id);
+            } else {
+                replacements.add(id, result);
+                removed.insert(id.value);
+            }
+            changed = true;
+        }
+        block.values = std::move(rewritten);
+    }
+    replacements.apply(function);
     remove_replaced_values(function, removed);
     return changed;
 }
@@ -16159,6 +16717,20 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 vectorize_slp(function, hir_module, subtarget, options);
                 return PassResult::changed_values();
+            });
+    }
+    // After vectorization, so loop shapes keep their divisions; before LICM,
+    // which hoists a reciprocal's materialization, value numbering, which
+    // shares the quotient of a division and a remainder, and SLSR, which
+    // rewrites the remainder's constant multiply.
+    if (options.div_by_constant) {
+        pipeline.add(
+            PassId::DivisionByConstant,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return reduce_constant_divisions(function, hir_module,
+                                                 subtarget, options)
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
             });
     }
     if (options.move_loop_invariants) {

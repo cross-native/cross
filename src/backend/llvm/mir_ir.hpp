@@ -15,6 +15,13 @@ inline std::string llvm_label_name(hir::LabelId label) {
     return "cross.label." + std::to_string(label.value);
 }
 
+struct TargetInfo;
+
+// The LLVM type of an object, array element, or pointee of `type`, including
+// the tail padding of a typedef's alignment request.
+std::string llvm_storage_type(const hir::Module& hir_module,
+                              const TargetInfo* target, hir::TypeId type);
+
 std::string emit_managed_mir_function(const hir::Module& hir_module,
                                       const mir::ManagedFunction& function,
                                       const CompilerOptions& options,

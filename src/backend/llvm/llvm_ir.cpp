@@ -139,6 +139,10 @@ private:
         return "void";
     }
 
+    std::string storage_type(hir::TypeId id) const {
+        return llvm_storage_type(hir_, target_for_triple(options_.target), id);
+    }
+
     std::string abi_prefix(const hir::Function& function) const {
         const auto* target = target_for_triple(options_.target);
         const auto* abi = target ? find_abi(*target, function.abi) : nullptr;
@@ -436,7 +440,7 @@ private:
             if (raw_assembly_.owns(object.source)) {
                 module << symbol << " = external "
                        << llvm_visibility(entity.visibility) << tls << storage
-                       << ir_type(object.type) << ", align "
+                       << storage_type(object.type) << ", align "
                        << object.alignment << '\n';
                 emitted = true;
                 continue;
@@ -446,22 +450,23 @@ private:
                        << (entity.weakref_target ? "extern_weak "
                                                  : "external ")
                        << llvm_visibility(entity.visibility) << tls << storage
-                       << ir_type(object.type) << ", align "
+                       << storage_type(object.type) << ", align "
                        << object.alignment << '\n';
                 emitted = true;
                 continue;
             }
-            const auto storage_type =
+            // Data IR spells a padded object's initializer as its bytes.
+            const auto object_type =
                 object.initializer == data::InitializerKind::Aggregate
                     ? aggregate_ir_type(object)
-                    : ir_type(object.type);
+                    : storage_type(object.type);
             module << symbol << " = "
                    << (entity.weak
                            ? "weak "
                            : entity.linkage == Linkage::Global ? ""
                                                                : "internal ")
                    << llvm_visibility(entity.visibility)
-                   << tls << storage << storage_type << ' '
+                   << tls << storage << object_type << ' '
                    << initializer(object);
             if (entity.section) {
                 module << ", section " << llvm_string(*entity.section);
@@ -618,10 +623,6 @@ LlvmTextSerializer::LlvmTextSerializer(const CompilerOptions& options,
     : options_(options), diagnostics_(diagnostics) {}
 
 std::string LlvmTextSerializer::serialize(const codegen::ModuleView& module) {
-    if (const auto location = codegen::requested_alignment_location(module)) {
-        diagnostics_.error(*location, "LLVM debug serialization does not encode typedef alignment");
-        return {};
-    }
     return ModuleEmitter(options_, diagnostics_, module).run();
 }
 

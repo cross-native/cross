@@ -130,6 +130,25 @@ unsigned mips64_constant_materialization_cost(std::uint64_t value) {
     return cost;
 }
 
+// DIV/DIVU and MULT/MULTU at the word width, their D forms from MIPS III.
+// Before MIPS III a doubleword quotient is a pair-legalized software loop.
+std::optional<unsigned> integer_division_cost(
+    const Subtarget& subtarget, const IntegerOperationCostQuery& query) {
+    if (query.bits == 32) return 35U;
+    if (query.bits == 64 && subtarget.has_feature(mips::Feature::Mips3)) {
+        return 69U;
+    }
+    return std::nullopt;
+}
+
+std::optional<unsigned> integer_multiply_high_cost(
+    const Subtarget& subtarget, const IntegerOperationCostQuery& query) {
+    const bool mips3 = subtarget.has_feature(mips::Feature::Mips3);
+    if (query.bits == 32) return mips3 ? 6U : 12U;
+    if (query.bits == 64 && mips3) return 9U;
+    return std::nullopt;
+}
+
 unsigned integer_constant_materialization_cost(
     const Subtarget& subtarget, const IntegerConstantCostQuery& query) {
     if (query.bits == 0) return 1;
@@ -331,7 +350,8 @@ TargetInfo make_target(ByteOrder order,
         {},
         target_options(),
         &subtargets,
-        {integer_constant_materialization_cost},
+        {integer_constant_materialization_cost, integer_division_cost,
+         integer_multiply_high_cost},
         {{0, 0, 0, 0, true, true, true, true, false, true, true}},
         {},
         {{"atomics", "m.llsc"}},

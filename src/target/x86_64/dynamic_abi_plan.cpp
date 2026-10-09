@@ -165,6 +165,8 @@ bool has_precise_straight_line_scalar_clobbers(
             case mir::BinaryOperation::UnsignedDivide:
             case mir::BinaryOperation::SignedRemainder:
             case mir::BinaryOperation::UnsignedRemainder:
+            case mir::BinaryOperation::UnsignedMultiplyHigh:
+            case mir::BinaryOperation::SignedMultiplyHigh:
                 return false;
             }
             break;

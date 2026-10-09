@@ -587,7 +587,9 @@ Each case is a distinct representable translation-time constant; at most one
 the invocation is computed, and checked against the other cases, each time the
 switch executes. Control transfers to the selected label and then proceeds
 normally until another transfer. A case/default label belongs to the nearest
-enclosing switch.
+enclosing switch. A switch shall not transfer control into the scope of a
+variably modified object: when a case or default label lies in such a scope,
+the switch statement lies in it too.
 
 The selector is evaluated once. If no case matches, control enters `default`,
 or leaves the switch if no default exists. These semantics apply at every

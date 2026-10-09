@@ -76,6 +76,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-funwind-tables` | Emit unwind tables (CFI or SEH). No unwinder is linked. |
 | `-fno-inline-functions` | Disable discretionary inlining; `[[always_inline]]` still applies. |
 | `-fno-shrink-wrap` | Set up the stack frame and save preserved registers at function entry, not only on the paths that need them (the default from `-O1`). |
+| `-fno-div-by-constant` | Keep the divide instruction for division and remainder by a constant. From `-Og`, such a divide becomes a multiplication by a fixed-point reciprocal with shifts and adds when the target prices that sequence lower; `-Os` and `-Oz` replace only a divide that a single shift or mask performs. |
 | `-fno-eval-calls` | Stop evaluating ordinary calls during compilation; required evaluation still happens. |
 | `-feval-step-limit=N`, `-feval-depth-limit=N`, `-feval-memory-limit=N`, `-feval-byte-limit=N` | Limits for compile-time evaluation and macro expansion. |
 

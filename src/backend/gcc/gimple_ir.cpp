@@ -36,6 +36,10 @@ std::string c_string(std::string_view text) {
     return out.str();
 }
 
+std::string indirect_call_helper(hir::TypeId signature) {
+    return "cross_gimple_call_" + std::to_string(signature.value);
+}
+
 std::string function_identifier(hir::FunctionId id) {
     return "cross_function_" + std::to_string(id.value);
 }
@@ -61,6 +65,7 @@ IntegerDomain integer_domain(mir::BinaryOperation operation) {
     switch (operation) {
     case BinaryOperation::SignedDivide:
     case BinaryOperation::SignedRemainder:
+    case BinaryOperation::SignedMultiplyHigh:
     case BinaryOperation::ShiftRightArithmetic:
     case BinaryOperation::SignedLess:
     case BinaryOperation::SignedLessEqual:
@@ -68,6 +73,7 @@ IntegerDomain integer_domain(mir::BinaryOperation operation) {
     case BinaryOperation::SignedGreaterEqual: return IntegerDomain::Signed;
     case BinaryOperation::UnsignedDivide:
     case BinaryOperation::UnsignedRemainder:
+    case BinaryOperation::UnsignedMultiplyHigh:
     case BinaryOperation::ShiftRightLogical:
     case BinaryOperation::UnsignedLess:
     case BinaryOperation::UnsignedLessEqual:
@@ -100,6 +106,8 @@ std::string binary_operator(mir::BinaryOperation operation) {
     case BinaryOperation::ShiftRightLogical: return ">>";
     case BinaryOperation::RotateLeft:
     case BinaryOperation::RotateRight: return "|";
+    case BinaryOperation::UnsignedMultiplyHigh:
+    case BinaryOperation::SignedMultiplyHigh: return "__MULT_HIGHPART";
     case BinaryOperation::Equal: return "==";
     case BinaryOperation::NotEqual: return "!=";
     case BinaryOperation::SignedLess:
@@ -146,8 +154,9 @@ std::string_view visibility_name(hir::SymbolVisibility visibility) {
 
 class TypeEmitter {
 public:
-    TypeEmitter(const hir::Module& hir_module, Diagnostics& diagnostics)
-        : hir_(hir_module), diagnostics_(diagnostics),
+    TypeEmitter(const hir::Module& hir_module, const TargetInfo* target,
+                Diagnostics& diagnostics)
+        : hir_(hir_module), target_(target), diagnostics_(diagnostics),
           emitted_(hir_module.types.size()), active_(hir_module.types.size()),
           required_(hir_module.types.size()) {}
 
@@ -197,6 +206,40 @@ public:
 
     unsigned bytes(hir::TypeId id) const {
         return std::max(1U, (bits(id) + 7U) / 8U);
+    }
+
+    // The distance between array elements, including the padding of a
+    // typedef's alignment request.
+    std::uint64_t stride(hir::TypeId id) const {
+        if (target_) {
+            if (const auto size = hir::layout_size(hir_, id, *target_)) {
+                return *size;
+            }
+        }
+        return bytes(id);
+    }
+
+    // A typedef's alignment request pads an object beyond its value, whose
+    // type keeps the base spelling; such an object is a packed structure
+    // that leads with the value.
+    std::uint64_t padding(hir::TypeId id) const {
+        if (!target_ || hir_.type(id).alignment == 0) return 0;
+        const auto layout = hir::layout_size(hir_, id, *target_);
+        const auto natural = hir::natural_size(hir_, id, *target_);
+        return layout && natural && *layout > *natural ? *layout - *natural
+                                                       : 0;
+    }
+
+    std::string calling_attribute(AbiId abi) const {
+        const auto* entry = target_ ? find_abi(*target_, abi) : nullptr;
+        if (!entry || entry->gcc_calling_attribute.empty()) return {};
+        return " __attribute__((" + entry->gcc_calling_attribute + "))";
+    }
+
+    std::string storage_name(hir::TypeId id) const {
+        return padding(id) != 0
+            ? "struct cross_storage_" + std::to_string(id.value)
+            : name(id);
     }
 
     bool is_void(hir::TypeId id) const {
@@ -265,24 +308,25 @@ public:
         required_.at(id.value) = true;
     }
 
+    // Records are opaque bytes, so their definitions precede the typedefs
+    // and arrays of them.
     void emit(std::ostringstream& out) {
         out << "typedef __SIZE_TYPE__ cross_gimple_size;\n";
         for (const auto& record : hir_.records) {
-            out << "struct cross_record_" << record.id.value << ";\n";
-        }
-        if (!hir_.records.empty()) out << '\n';
-        for (std::uint32_t id = 0; id < hir_.types.size(); ++id) {
-            if (!required_[id]) continue;
-            emit_one({id}, out);
-        }
-        for (const auto& record : hir_.records) {
-            if (!record.complete) continue;
+            if (!record.complete) {
+                out << "struct cross_record_" << record.id.value << ";\n";
+                continue;
+            }
             out << "struct __attribute__((packed, aligned("
                 << std::max(1U, record.alignment) << "))) cross_record_"
                 << record.id.value << " { unsigned char bytes["
                 << std::max<std::uint64_t>(1, record.size) << "]; };\n";
         }
         if (!hir_.records.empty()) out << '\n';
+        for (std::uint32_t id = 0; id < hir_.types.size(); ++id) {
+            if (!required_[id]) continue;
+            emit_one({id}, out);
+        }
     }
 
 private:
@@ -350,11 +394,33 @@ private:
         active_[id.value] = true;
         const auto& type = hir_.type(id);
         switch (type.kind) {
-        case hir::Type::Kind::Function:
-            diagnostics_.command_error("GCC GIMPLE serialization of "
-                                       "function-pointer interfaces is not "
-                                       "implemented");
+        case hir::Type::Kind::Function: {
+            if (!type.function) {
+                diagnostics_.command_error("GIMPLE type serialization found a "
+                                           "function type without a signature");
+                break;
+            }
+            const auto& signature = *type.function;
+            emit_one(signature.result_type, out);
+            for (const auto& parameter : signature.parameters) {
+                emit_one(parameter.type, out);
+            }
+            out << "typedef " << name(signature.result_type) << ' ' << name(id)
+                << '(';
+            for (std::size_t index = 0; index < signature.parameters.size();
+                 ++index) {
+                if (index != 0) out << ", ";
+                out << name(signature.parameters[index].type);
+                if (parameter_cell(signature.parameters[index])) out << " *";
+            }
+            if (signature.variadic) {
+                out << (signature.parameters.empty() ? "..." : ", ...");
+            } else if (signature.parameters.empty()) {
+                out << "void";
+            }
+            out << ')' << calling_attribute(signature.abi) << ";\n";
             break;
+        }
         case hir::Type::Kind::Builtin:
             out << "typedef " << qualifiers(type) << builtin(type) << ' '
                 << name(id) << attributes(type) << ";\n";
@@ -406,8 +472,8 @@ private:
                 break;
             }
             emit_one(*type.element, out);
-            out << "typedef " << name(*type.element) << ' ' << name(id) << '['
-                << type.lanes << ']' << attributes(type) << ";\n";
+            out << "typedef " << storage_name(*type.element) << ' ' << name(id)
+                << '[' << type.lanes << ']' << attributes(type) << ";\n";
             break;
         case hir::Type::Kind::Record:
             if (!type.record) {
@@ -419,11 +485,18 @@ private:
                 << name(id) << attributes(type) << ";\n";
             break;
         }
+        if (const auto pad = padding(id); pad != 0) {
+            out << "struct __attribute__((packed, aligned("
+                << hir::layout_alignment(hir_, id, *target_).value_or(1)
+                << "))) cross_storage_" << id.value << " { " << name(id)
+                << " value; unsigned char padding[" << pad << "]; };\n";
+        }
         active_[id.value] = false;
         emitted_[id.value] = true;
     }
 
     const hir::Module& hir_;
+    const TargetInfo* target_;
     Diagnostics& diagnostics_;
     std::vector<bool> emitted_;
     std::vector<bool> active_;
@@ -453,14 +526,20 @@ public:
           types_(types), start_(start),
           entity_(hir_module.function(function.source)),
           auxiliary_(function.values.size()),
+          temporaries_(function.values.size()),
           integer_temporaries_(function.values.size()),
           next_version_(static_cast<unsigned>(function.values.size() + 1)) {
         for (const auto& value : function_.values) {
             if ((value.kind == mir::ValueKind::Binary &&
                  comparison(value.binary)) ||
                 value.kind == mir::ValueKind::Select ||
-                value.kind == mir::ValueKind::IndexedAddress) {
+                value.kind == mir::ValueKind::IndexedAddress ||
+                converts_address_constant(value)) {
                 auxiliary_[value.id.value] = next_version_++;
+            }
+            for (const auto* type : temporary_types(value)) {
+                temporaries_[value.id.value].push_back(
+                    {type, next_version_++});
             }
             if (value.kind != mir::ValueKind::Binary ||
                 value.operands.size() != 2) {
@@ -521,6 +600,72 @@ private:
                                bool default_definition = false) const {
         return main_base(id) + '_' + std::to_string(id.value + 1) +
                (default_definition ? "(D)" : "");
+    }
+
+    // Address arithmetic is in GCC's size type. A constant index is spelled
+    // there directly; another index converts first.
+    bool size_index(mir::ValueId id) const {
+        const auto& index = function_.values.at(id.value);
+        if (index.kind == mir::ValueKind::ConstantInteger) return true;
+        const auto& type = hir_.type(index.type);
+        return type.kind == hir::Type::Kind::Builtin &&
+               (type.builtin == BuiltinType::Uptr ||
+                type.builtin == (hir_.address_bits == 32 ? BuiltinType::U32
+                                                         : BuiltinType::U64));
+    }
+
+    std::uint64_t sign_extended(const mir::ManagedValue& constant) const {
+        const auto bits = types_.bits(constant.type);
+        const auto& type = hir_.type(constant.type);
+        const bool is_signed = type.builtin == BuiltinType::I8 ||
+            type.builtin == BuiltinType::I16 ||
+            type.builtin == BuiltinType::I32 ||
+            type.builtin == BuiltinType::Iptr;
+        if (!is_signed || bits >= 64 ||
+            ((constant.integer >> (bits - 1U)) & 1U) == 0) {
+            return constant.integer;
+        }
+        return constant.integer | (~std::uint64_t{} << bits);
+    }
+
+    struct Temporary {
+        const char* type;
+        unsigned version{};
+    };
+
+    // Statement temporaries beyond a value's result: an index converted to
+    // GCC's size type, and the `void *` and sizes of the stack builtins.
+    std::vector<const char*> temporary_types(
+        const mir::ManagedValue& value) const {
+        switch (value.kind) {
+        case mir::ValueKind::IndexedAddress:
+            if (size_index(value.operands.at(1))) return {};
+            return {"cross_gimple_size"};
+        case mir::ValueKind::DynamicStackSave:
+        case mir::ValueKind::DynamicStackRestore: return {"void *"};
+        case mir::ValueKind::DynamicAlloca:
+            return {"cross_gimple_size", "cross_gimple_size", "void *"};
+        default: return {};
+        }
+    }
+
+    std::string temporary_base(mir::ValueId id, std::size_t index) const {
+        return "cross_temporary_" + std::to_string(id.value) + '_' +
+               std::to_string(index);
+    }
+
+    std::string temporary(mir::ValueId id, std::size_t index) const {
+        return temporary_base(id, index) + '_' +
+               std::to_string(temporaries_.at(id.value).at(index).version);
+    }
+
+    // GCC's GIMPLE parser converts an address only from an SSA name.
+    bool converts_address_constant(const mir::ManagedValue& value) const {
+        if (value.kind != mir::ValueKind::Cast) return false;
+        const auto kind = function_.values.at(value.operands.front().value).kind;
+        return kind == mir::ValueKind::SlotAddress ||
+               kind == mir::ValueKind::GlobalAddress ||
+               kind == mir::ValueKind::FunctionAddress;
     }
 
     std::string auxiliary_base(mir::ValueId id) const {
@@ -614,6 +759,9 @@ private:
         if (value.kind == mir::ValueKind::GlobalAddress && value.object) {
             return '&' + object_identifier(*value.object);
         }
+        if (value.kind == mir::ValueKind::FunctionAddress && value.callee) {
+            return '&' + function_identifier(*value.callee);
+        }
         if (value.kind == mir::ValueKind::LabelAddress) {
             diagnostics_.error(value.location,
                                "GCC's __GIMPLE parser cannot represent a Cross "
@@ -632,7 +780,8 @@ private:
         case ValueKind::ConstantInteger:
         case ValueKind::LabelAddress:
         case ValueKind::SlotAddress:
-        case ValueKind::GlobalAddress: return false;
+        case ValueKind::GlobalAddress:
+        case ValueKind::FunctionAddress: return false;
         case ValueKind::Parameter:
             return parameter_cell(entity_.parameters.at(value.parameter_index)) &&
                    !transport_pointer(entity_.parameters.at(value.parameter_index));
@@ -665,14 +814,18 @@ private:
 
     void emit_declarations() {
         for (const auto& slot : function_.slots) {
+            // GCC's GIMPLE parser takes attributes of a local only before
+            // its type.
+            const auto alignment = std::max(
+                slot.minimum_alignment,
+                hir::requested_alignment(hir_, slot.type));
             out_ << "  ";
+            if (alignment > 1) {
+                out_ << "__attribute__((aligned(" << alignment << "))) ";
+            }
             if (slot.is_volatile) out_ << "volatile ";
-            out_ << types_.name(slot.type) << ' ' << slot_name(slot.id)
-                 << (slot.minimum_alignment > 1
-                         ? " __attribute__((aligned(" +
-                               std::to_string(slot.minimum_alignment) + ")))"
-                         : "")
-                 << ";\n";
+            out_ << types_.storage_name(slot.type) << ' '
+                 << slot_name(slot.id) << ";\n";
         }
         for (const auto& value : function_.values) {
             if (needs_result(value)) {
@@ -683,6 +836,11 @@ private:
             out_ << "  ";
             if (value.kind == mir::ValueKind::IndexedAddress) {
                 out_ << "cross_gimple_size ";
+            } else if (value.kind == mir::ValueKind::Cast) {
+                out_ << types_.name(
+                            function_.values.at(value.operands.front().value)
+                                .type)
+                     << ' ';
             } else {
                 const auto condition_type =
                     value.kind == mir::ValueKind::Select
@@ -701,6 +859,13 @@ private:
                      << ' ';
             }
             out_ << auxiliary_base(value.id) << ";\n";
+        }
+        for (const auto& value : function_.values) {
+            const auto& temporaries = temporaries_.at(value.id.value);
+            for (std::size_t index = 0; index < temporaries.size(); ++index) {
+                out_ << "  " << temporaries[index].type << ' '
+                     << temporary_base(value.id, index) << ";\n";
+            }
         }
         for (const auto& value : function_.values) {
             const auto& temporary = integer_temporaries_.at(value.id.value);
@@ -755,7 +920,7 @@ private:
         const auto element = pointer.pointee.value_or(value.type);
         return reference(base) + " + " + reference(index) +
                " * _Literal (cross_gimple_size) " +
-               std::to_string(types_.bytes(element));
+               std::to_string(types_.stride(element));
     }
 
     void emit_phi(const mir::ManagedValue& value) {
@@ -888,6 +1053,7 @@ private:
             value.kind == ValueKind::LabelAddress ||
             value.kind == ValueKind::SlotAddress ||
             value.kind == ValueKind::GlobalAddress ||
+            value.kind == ValueKind::FunctionAddress ||
             value.kind == ValueKind::Phi) {
             return;
         }
@@ -901,9 +1067,23 @@ private:
             const auto& pointer =
                 hir_.type(function_.values.at(base.value).type);
             const auto element = pointer.pointee.value_or(value.type);
-            out_ << "  " << auxiliary_reference(value.id) << " = "
-                 << reference(index) << " * _Literal (cross_gimple_size) "
-                 << types_.bytes(element) << ";\n"
+            auto offset = reference(index);
+            if (!temporaries_.at(value.id.value).empty()) {
+                offset = temporary(value.id, 0);
+                out_ << "  " << offset << " = (cross_gimple_size) "
+                     << reference(index) << ";\n";
+            } else if (const auto& constant = function_.values.at(index.value);
+                       constant.kind == ValueKind::ConstantInteger) {
+                const auto mask = hir_.address_bits >= 64
+                    ? ~std::uint64_t{}
+                    : (std::uint64_t{1} << hir_.address_bits) - 1U;
+                offset = "_Literal (cross_gimple_size) " +
+                         std::to_string(sign_extended(constant) & mask) +
+                         "ULL";
+            }
+            out_ << "  " << auxiliary_reference(value.id) << " = " << offset
+                 << " * _Literal (cross_gimple_size) "
+                 << types_.stride(element) << ";\n"
                  << "  " << reference(value.id) << " = " << reference(base)
                  << " + " << auxiliary_reference(value.id) << ";\n";
             return;
@@ -915,13 +1095,34 @@ private:
                 "variadic ABI cursor");
             return;
         }
-        if (value.kind == ValueKind::DynamicStackSave ||
-            value.kind == ValueKind::DynamicAlloca ||
-            value.kind == ValueKind::DynamicStackRestore) {
-            diagnostics_.error(
-                value.location,
-                "GCC GIMPLE serialization does not yet model dynamic "
-                "Cross stack scopes");
+        if (value.kind == ValueKind::DynamicStackSave) {
+            const auto mark = temporary(value.id, 0);
+            out_ << "  " << mark << " = __builtin_stack_save ();\n"
+                 << "  " << reference(value.id) << " = ("
+                 << types_.name(value.type) << ") " << mark << ";\n";
+            return;
+        }
+        if (value.kind == ValueKind::DynamicAlloca) {
+            const auto count = temporary(value.id, 0);
+            const auto bytes = temporary(value.id, 1);
+            const auto storage = temporary(value.id, 2);
+            out_ << "  " << count << " = (cross_gimple_size) "
+                 << reference(value.operands.front()) << ";\n"
+                 << "  " << bytes << " = " << count
+                 << " * _Literal (cross_gimple_size) " << value.integer
+                 << ";\n"
+                 << "  " << storage << " = __builtin_alloca_with_align ("
+                 << bytes << ", _Literal (cross_gimple_size) "
+                 << value.integer_high * 8U << ");\n"
+                 << "  " << reference(value.id) << " = ("
+                 << types_.name(value.type) << ") " << storage << ";\n";
+            return;
+        }
+        if (value.kind == ValueKind::DynamicStackRestore) {
+            const auto mark = temporary(value.id, 0);
+            out_ << "  " << mark << " = (void *) "
+                 << reference(value.operands.front()) << ";\n"
+                 << "  __builtin_stack_restore (" << mark << ");\n";
             return;
         }
         if (value.kind == ValueKind::Splat) {
@@ -1050,10 +1251,12 @@ private:
                     value.location,
                     "GCC GIMPLE serialization cannot guarantee a Cross musttail transfer");
             }
-            if (!value.callee) {
+            if (!value.callee &&
+                (!value.call_signature || value.operands.empty() ||
+                 hir_.type(*value.call_signature).function->variadic)) {
                 diagnostics_.error(
                     value.location,
-                    "GCC GIMPLE serialization of indirect calls is "
+                    "GCC GIMPLE serialization of indirect variadic calls is "
                     "not implemented");
                 return;
             }
@@ -1061,7 +1264,13 @@ private:
             if (!types_.is_void(value.type)) {
                 out_ << reference(value.id) << " = ";
             }
-            out_ << function_identifier(*value.callee) << " (";
+            if (value.callee) {
+                out_ << function_identifier(*value.callee) << " (";
+            } else {
+                out_ << indirect_call_helper(*value.call_signature) << " ("
+                     << reference(value.operands.front())
+                     << (value.call_arguments.empty() ? "" : ", ");
+            }
             for (std::size_t index = 0; index < value.call_arguments.size();
                  ++index) {
                 if (index != 0) out_ << ", ";
@@ -1131,14 +1340,18 @@ private:
             return;
         }
         if (value.kind == ValueKind::Cast) {
-            const auto operand = value.operands.front();
+            auto operand = reference(value.operands.front());
+            if (auxiliary_.at(value.id.value)) {
+                out_ << "  " << auxiliary_reference(value.id) << " = "
+                     << operand << ";\n";
+                operand = auxiliary_reference(value.id);
+            }
             out_ << "  " << reference(value.id) << " = ";
             if (value.cast == mir::CastOperation::Reinterpret) {
                 out_ << "__VIEW_CONVERT <" << types_.name(value.type) << ">("
-                     << reference(operand) << ')';
+                     << operand << ')';
             } else {
-                out_ << '(' << types_.name(value.type) << ") "
-                     << reference(operand);
+                out_ << '(' << types_.name(value.type) << ") " << operand;
             }
             out_ << ";\n";
             return;
@@ -1342,6 +1555,7 @@ private:
     GimpleStart start_;
     const hir::Function& entity_;
     std::vector<unsigned> auxiliary_;
+    std::vector<std::vector<Temporary>> temporaries_;
     std::vector<std::optional<IntegerDomainTemporary>> integer_temporaries_;
     unsigned next_version_;
     std::vector<CopyoutTemporary> copyouts_;
@@ -1354,7 +1568,8 @@ public:
                   const codegen::ModuleView& module, GimpleStart start)
         : options_(options), diagnostics_(diagnostics), hir_(module.hir()),
           data_(module.data()), managed_(module.managed()),
-          raw_assembly_(module.raw_assembly()), types_(hir_, diagnostics),
+          raw_assembly_(module.raw_assembly()),
+          types_(hir_, target_for_triple(options.target), diagnostics),
           start_(start) {}
 
     std::string run() {
@@ -1375,6 +1590,7 @@ public:
         types_.emit(out);
         emit_rotate_helpers(out);
         emit_floating_division_helpers(out);
+        emit_indirect_call_helpers(out);
         emit_function_declarations(out);
         emit_object_declarations(out);
         emit_object_definitions(out);
@@ -1422,6 +1638,9 @@ private:
             }
             for (const auto& value : function.values) {
                 types_.require(value.type);
+                if (value.call_signature) {
+                    types_.require(*value.call_signature);
+                }
                 for (const auto& argument : value.call_arguments) {
                     types_.require(argument.type);
                 }
@@ -1486,6 +1705,48 @@ private:
             if (entry.right) emit("rotr", false);
         }
         if (!used.empty()) out << '\n';
+    }
+
+    void emit_indirect_call_helpers(std::ostringstream& out) const {
+        std::vector<hir::TypeId> signatures;
+        for (const auto& function : managed_.functions) {
+            for (const auto& value : function.values) {
+                if (value.kind != mir::ValueKind::Call || value.callee ||
+                    !value.call_signature ||
+                    hir_.type(*value.call_signature).function->variadic ||
+                    std::find(signatures.begin(), signatures.end(),
+                              *value.call_signature) != signatures.end()) {
+                    continue;
+                }
+                signatures.push_back(*value.call_signature);
+            }
+        }
+        std::sort(signatures.begin(), signatures.end(),
+                  [](hir::TypeId left, hir::TypeId right) {
+                      return left.value < right.value;
+                  });
+        for (const auto id : signatures) {
+            const auto& signature = *hir_.type(id).function;
+            const bool result = !types_.is_void(signature.result_type);
+            out << "static __attribute__((always_inline, artificial)) inline "
+                << types_.name(signature.result_type) << ' '
+                << indirect_call_helper(id) << '(' << types_.name(id)
+                << " *target";
+            for (std::size_t index = 0; index < signature.parameters.size();
+                 ++index) {
+                out << ", " << types_.name(signature.parameters[index].type)
+                    << (parameter_cell(signature.parameters[index]) ? " *"
+                                                                    : "")
+                    << " arg" << index;
+            }
+            out << ") { " << (result ? "return " : "") << "target(";
+            for (std::size_t index = 0; index < signature.parameters.size();
+                 ++index) {
+                out << (index == 0 ? "" : ", ") << "arg" << index;
+            }
+            out << "); }\n";
+        }
+        if (!signatures.empty()) out << '\n';
     }
 
     void emit_floating_division_helpers(std::ostringstream& out) const {
@@ -1673,7 +1934,7 @@ private:
             out << object_prefix(
                        object, entity, true,
                        raw_assembly_.owns(object.source))
-                << types_.name(object.type) << ' '
+                << types_.storage_name(object.type) << ' '
                 << object_identifier(object.source) << " __asm__("
                 << c_string(entity.link_symbol) << ')'
                 << object_attributes(object, entity) << ";\n";
@@ -1778,7 +2039,7 @@ private:
             }
             const auto& entity = hir_.object(object.source);
             out << object_prefix(object, entity, false)
-                << types_.name(object.type) << ' '
+                << types_.storage_name(object.type) << ' '
                 << object_identifier(object.source)
                 << object_attributes(object, entity);
             const auto value = initializer(object);
@@ -1807,10 +2068,6 @@ GimpleTextSerializer::GimpleTextSerializer(const CompilerOptions& options,
 }
 
 std::string GimpleTextSerializer::serialize(const codegen::ModuleView& module) {
-    if (const auto location = codegen::requested_alignment_location(module)) {
-        diagnostics_.error(*location, "GIMPLE serialization does not encode typedef alignment");
-        return {};
-    }
     return ModuleEmitter(options_, diagnostics_, module, start_).run();
 }
 

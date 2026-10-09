@@ -1409,6 +1409,29 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/language/switch/errors.cmake")
     set_tests_properties(cross_switch_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;feature.control")
+    foreach(level O0 O2 O3 Os)
+        add_test(NAME cross_switch_nested_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/switch/nested.x
+            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/switch-nested-${level}
+            -DENTRY=switch_nested_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_switch_nested_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.control;opt.${level}")
+    endforeach()
+    foreach(level O0 O2)
+        add_test(NAME cross_switch_nested_mips_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/switch/nested.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/language/switch/mips_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/switch-nested-mips-${level}
+            -DEXPECTED=P -DCC_FLAGS=-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_switch_nested_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.control;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     add_test(NAME cross_noreturn_frames COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/noreturn/noreturn.x
@@ -1976,6 +1999,50 @@ if(BUILD_TESTING)
                         -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_may_alias.cmake")
             set_tests_properties(cross_gcc_gimple_may_alias PROPERTIES
                 LABELS "check.runtime;arch.x86_64;backend.gcc;feature.attributes;opt.O2;opt.O3")
+            add_test(NAME cross_gcc_gimple_division
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_division.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_division_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-division
+                        "-DLEVELS=O2;O3" -DEXPECTED=0 -DPATTERN=__MULT_HIGHPART
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+            set_tests_properties(cross_gcc_gimple_division PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.gcc;middle;feature.optimization;opt.O2;opt.O3")
+            add_test(NAME cross_gcc_gimple_aligned_typedef
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_aligned_typedef.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_aligned_typedef_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-aligned-typedef
+                        -DEXPECTED=1 -DPATTERN=cross_storage_
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+            set_tests_properties(cross_gcc_gimple_aligned_typedef PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.gcc;feature.layout;opt.O0;opt.O2")
+            add_test(NAME cross_gcc_gimple_indirect
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_indirect.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_indirect_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-indirect
+                        -DEXPECTED=0 -DPATTERN=cross_gimple_call_
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+            set_tests_properties(cross_gcc_gimple_indirect PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.gcc;feature.calls;feature.abi;opt.O0;opt.O2")
+            add_test(NAME cross_gcc_gimple_vla
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_vla.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_vla_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-vla
+                        -DEXPECTED=0 -DPATTERN=__builtin_alloca_with_align
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+            set_tests_properties(cross_gcc_gimple_vla PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.gcc;feature.array;feature.frame;opt.O0;opt.O2")
         endif()
     endif()
     add_test(NAME cross_namespace
@@ -2320,6 +2387,68 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/optimization_flags.cmake")
     set_tests_properties(cross_optimization_flags PROPERTIES
         LABELS "check.compile;arch.x86_64;middle;feature.optimization")
+    add_test(NAME cross_division_by_constant_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/division_by_constant.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/division-by-constant
+                -P "${CMAKE_SOURCE_DIR}/test/middle/division_by_constant.cmake")
+    set_tests_properties(cross_division_by_constant_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization")
+    foreach(division_mode O0 O2 O3 Os O0-enabled O2-disabled)
+        if(division_mode STREQUAL "O0-enabled")
+            set(division_flags "-O0;-fdiv-by-constant")
+            set(division_level O0)
+        elseif(division_mode STREQUAL "O2-disabled")
+            set(division_flags "-O2;-fno-div-by-constant")
+            set(division_level O2)
+        else()
+            set(division_flags "-${division_mode}")
+            set(division_level ${division_mode})
+        endif()
+        add_test(NAME cross_runtime_division_by_constant_${division_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/division_by_constant.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-division-${division_mode}
+                -DENTRY=division_entry -DEXPECTED=0
+                "-DCC_FLAGS=${division_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_division_by_constant_${division_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${division_level}")
+    endforeach()
+    foreach(division_mode O2 Os O0-enabled)
+        if(division_mode STREQUAL "O0-enabled")
+            set(division_flags "-O0;-fdiv-by-constant")
+            set(division_level O0)
+        else()
+            set(division_flags "-${division_mode}")
+            set(division_level ${division_mode})
+        endif()
+        add_test(NAME cross_runtime_division_by_constant_mips_${division_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/division_by_constant.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/division_by_constant_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-division-mips-${division_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${division_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_division_by_constant_mips_${division_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;opt.${division_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_runtime_division_by_constant_llvm
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCC_FLAGS=-O2
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/division_by_constant.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-division-llvm.ll
+                -DENTRY=division_entry
+                -DEXPECTED=0
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+    set_tests_properties(cross_runtime_division_by_constant_llvm PROPERTIES
+        LABELS "check.runtime;arch.x86_64;backend.llvm;middle;feature.optimization;opt.O2")
     add_test(NAME cross_x86_64_feature_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2527,6 +2656,17 @@ if(BUILD_TESTING)
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_aligned_typedef_${level} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.layout;feature.frame;feature.records;feature.evaluation;opt.${level}")
+        add_test(NAME cross_runtime_aligned_typedef_llvm_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DCC_FLAGS=-${level}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aligned_typedef.x
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aligned-typedef-llvm-${level}.ll
+                    -DENTRY=aligned_typedef_entry
+                    -DEXPECTED=1
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+        set_tests_properties(cross_runtime_aligned_typedef_llvm_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.llvm;feature.layout;feature.records;opt.${level}")
         # o32 on R3000 and VR4300 in both byte orders, then n64 in each.
         add_test(NAME cross_mips_aligned_typedef_o32_${level}
             COMMAND "${CMAKE_COMMAND}"

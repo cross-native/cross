@@ -1073,18 +1073,27 @@ bool lower_initializer(Object& result, const hir::Module& module,
         result.bytes.assign(expression.string_value.begin(), expression.string_value.end());
         return append_image_relocations(result, expression, 0, module, entity, subtarget, diagnostics);
     }
+    // A typedef's alignment request can pad each u8 element; its byte
+    // starts the element's storage.
+    const auto place_bytes = [&](std::string_view text) {
+        const auto stride = result.size / std::max<std::uint64_t>(type.lanes, 1);
+        result.initializer = stride == 1 ? InitializerKind::Bytes
+                                         : InitializerKind::Aggregate;
+        result.bytes.assign(result.size, 0);
+        for (std::size_t index = 0; index < text.size(); ++index) {
+            result.bytes[index * stride] = static_cast<std::uint8_t>(text[index]);
+        }
+    };
     if (type.kind == hir::Type::Kind::Array && type.element &&
         module.type(*type.element).kind == hir::Type::Kind::Builtin &&
         module.type(*type.element).builtin == BuiltinType::U8 &&
         expression.kind == Expr::Kind::ByteSequence) {
-        if (expression.string_value.size() != result.size) {
+        if (expression.string_value.size() != type.lanes) {
             diagnostics.error(expression.location,
                               "materialized byte count does not match the u8 array bound");
             return false;
         }
-        result.initializer = InitializerKind::Bytes;
-        result.bytes.assign(expression.string_value.begin(),
-                            expression.string_value.end());
+        place_bytes(expression.string_value);
         return true;
     }
     if (type.kind == hir::Type::Kind::Array && type.element &&
@@ -1092,15 +1101,12 @@ bool lower_initializer(Object& result, const hir::Module& module,
         module.type(*type.element).builtin == BuiltinType::U8 &&
         expression.kind == Expr::Kind::String) {
         const auto required = expression.string_value.size() + 1;
-        if (required > result.size) {
+        if (required > type.lanes) {
             diagnostics.error(expression.location,
                               "string initializer does not fit in the u8 array");
             return false;
         }
-        result.initializer = InitializerKind::Bytes;
-        result.bytes.assign(result.size, 0);
-        std::copy(expression.string_value.begin(),
-                  expression.string_value.end(), result.bytes.begin());
+        place_bytes(expression.string_value);
         return true;
     }
     if (type.kind != hir::Type::Kind::Array &&

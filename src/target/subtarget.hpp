@@ -95,6 +95,10 @@ public:
         TargetFeatureId feature) const;
     [[nodiscard]] unsigned integer_constant_materialization_cost(
         const IntegerConstantCostQuery& query) const;
+    [[nodiscard]] std::optional<unsigned> integer_division_cost(
+        const IntegerOperationCostQuery& query) const;
+    [[nodiscard]] std::optional<unsigned> integer_multiply_high_cost(
+        const IntegerOperationCostQuery& query) const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;
     }

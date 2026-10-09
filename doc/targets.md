@@ -184,14 +184,13 @@ may have `out` or `inout` parameters.
 
 ## Limits on all targets
 
-- `case` and `default` labels cannot be nested inside another statement of
-  the `switch` body (as in Duff's device), and a `switch` body cannot declare a
-  variable-length array.
 - Function pointers can be converted to another ABI or other register
   locations only when the function is named directly; see
   [language.md](language.md#function-pointers).
-- `-emit-llvm` and `-emit-gimple` reject code whose objects have a typedef type
-  that requests alignment.
+- `-emit-gimple` rejects what GCC's `__GIMPLE` input cannot express or the
+  serializer does not encode, among them aggregate static initializers,
+  variadic functions and calls through a variadic function pointer, label
+  addresses, `$::patch` values, and `[[musttail]]` calls.
 - On MIPS, a function that allocates a variable-length array cannot also have
   a local aligned beyond the stack alignment (8 bytes under o32 and EABI, 16
   under n64 and the Cross ABIs).

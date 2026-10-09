@@ -70,6 +70,20 @@ unsigned integer_constant_materialization_cost(
                : 1U;
 }
 
+// DIV/IDIV and the one-operand MUL/IMUL; wider values are expanded inline.
+std::optional<unsigned> integer_division_cost(
+    const Subtarget&, const IntegerOperationCostQuery& query) {
+    if (query.bits == 32) return 26U;
+    if (query.bits == 64) return 40U;
+    return std::nullopt;
+}
+
+std::optional<unsigned> integer_multiply_high_cost(
+    const Subtarget&, const IntegerOperationCostQuery& query) {
+    if (query.bits == 32 || query.bits == 64) return 3U;
+    return std::nullopt;
+}
+
 InstructionOperandEntry integer_register_operand(
     InstructionOperandRole role, unsigned bits) {
     return {role, true, false, bits, 0, false,
@@ -2795,7 +2809,8 @@ const TargetInfo target{
          "preferred maximum width for internal vector operations"},
     },
     &subtargets,
-    {integer_constant_materialization_cost},
+    {integer_constant_materialization_cost, integer_division_cost,
+     integer_multiply_high_cost},
     {{0, 0, 0, 0, true, true, true, true, false, true, true}},
     {{64, 64, "integer", {0}, {1, 2, 4, 8}, {"rsp"}, 32, "base"}},
     {{"integer128", {}}, {"binary128_storage", {}}, {"binary128_arithmetic", {}},

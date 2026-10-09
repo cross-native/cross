@@ -99,6 +99,10 @@ enum class BinaryOperation {
     SignedRemainder, UnsignedRemainder, BitAnd, BitOr, BitXor,
     ShiftLeft, ShiftRightArithmetic, ShiftRightLogical,
     RotateLeft, RotateRight,
+    // The high half of the double-width product of two same-width integer
+    // operands, both zero- or both sign-extended. Created only where the
+    // target's cost model reports a multiply-high at that width.
+    UnsignedMultiplyHigh, SignedMultiplyHigh,
     Equal, NotEqual, SignedLess, SignedLessEqual, SignedGreater,
     SignedGreaterEqual, UnsignedLess, UnsignedLessEqual,
     UnsignedGreater, UnsignedGreaterEqual,

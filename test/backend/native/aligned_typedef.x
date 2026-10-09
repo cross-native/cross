@@ -21,6 +21,7 @@ global wide_u32 initialized = 7u32;
 global wide_u32 initialized_table[3] = {1u32, 2u32, 3u32};
 global struct holder initialized_holder = {4u8, 5u32, 6u8};
 static line_u8 lines[2];
+global line_u8 text[3] = "ab";
 
 [[noinline]] static u32 opaque(in u32 value) { return value * 3u32 + 1u32; }
 
@@ -155,5 +156,7 @@ global i32 aligned_typedef_entry() {
         packed.value != 9u32 || wide != 9u64 || line != 3u8 || page != 11u16) return 14;
     if (evaluated_digest != 3216483216uptr || $::runtime(layout_digest()) != evaluated_digest)
         return 15;
+    if (text[0] != 97u8 || text[1] != 98u8 || text[2] != 0u8 ||
+        (uptr)&text[1] - (uptr)&text[0] != 64uptr) return 16;
     return 1;
 }

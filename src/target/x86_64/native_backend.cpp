@@ -478,6 +478,8 @@ machine::TargetOpcodeId binary_opcode(mir::BinaryOperation operation) {
     case BinaryOperation::ShiftRightLogical: return Opcode::ShrU;
     case BinaryOperation::RotateLeft: return Opcode::Rotl;
     case BinaryOperation::RotateRight: return Opcode::Rotr;
+    case BinaryOperation::UnsignedMultiplyHigh: return Opcode::Mulhu;
+    case BinaryOperation::SignedMultiplyHigh: return Opcode::Mulhs;
     case BinaryOperation::Equal: return Opcode::CmpEq;
     case BinaryOperation::NotEqual: return Opcode::CmpNe;
     case BinaryOperation::SignedLess: return Opcode::CmpSlt;
@@ -573,7 +575,9 @@ machine::TargetOpcodeId vector_binary_opcode(
     case BinaryOperation::ShiftRightArithmetic: return Opcode::VshrS;
     case BinaryOperation::ShiftRightLogical: return Opcode::VshrU;
     case BinaryOperation::RotateLeft:
-    case BinaryOperation::RotateRight: return Opcode::Invalid;
+    case BinaryOperation::RotateRight:
+    case BinaryOperation::UnsignedMultiplyHigh:
+    case BinaryOperation::SignedMultiplyHigh: return Opcode::Invalid;
     case BinaryOperation::Equal: return Opcode::VcmpEq;
     case BinaryOperation::NotEqual: return Opcode::VcmpNe;
     case BinaryOperation::SignedLess: return Opcode::VcmpSlt;
@@ -5339,7 +5343,9 @@ private:
             instruction.opcode == Opcode::Srem ||
             instruction.opcode == Opcode::Urem ||
             instruction.opcode == Opcode::Sdivrem ||
-            instruction.opcode == Opcode::Udivrem) {
+            instruction.opcode == Opcode::Udivrem ||
+            instruction.opcode == Opcode::Mulhs ||
+            instruction.opcode == Opcode::Mulhu) {
             return true;
         }
         return false;
@@ -6646,7 +6652,9 @@ private:
                         if (base == Opcode::Sdiv || base == Opcode::Udiv ||
                             base == Opcode::Srem || base == Opcode::Urem ||
                             base == Opcode::Sdivrem ||
-                            base == Opcode::Udivrem) {
+                            base == Opcode::Udivrem ||
+                            base == Opcode::Mulhs ||
+                            base == Opcode::Mulhu) {
                             return false;
                         }
                         return std::none_of(
@@ -6770,6 +6778,7 @@ private:
                     opcode == Opcode::Srem || opcode == Opcode::Urem ||
                     opcode == Opcode::Sdivrem ||
                     opcode == Opcode::Udivrem ||
+                    opcode == Opcode::Mulhs || opcode == Opcode::Mulhu ||
                     has_property(base, OpcodeProperty::Comparison)) {
                     return std::none_of(
                         instruction.defs.begin(), instruction.defs.end(),
@@ -7112,9 +7121,12 @@ private:
                     item->opcode == Opcode::Srem ||
                     item->opcode == Opcode::Urem ||
                     item->opcode == Opcode::Sdivrem ||
-                    item->opcode == Opcode::Udivrem;
+                    item->opcode == Opcode::Udivrem ||
+                    item->opcode == Opcode::Mulhs ||
+                    item->opcode == Opcode::Mulhu;
                 if (scalar_division && rax && rcx && rdx) {
-                    // DIV/IDIV consume RDX:RAX. An allocated divisor is used
+                    // DIV/IDIV and a multiply-high's one-operand MUL/IMUL use
+                    // RDX:RAX. An allocated divisor (multiplier) is used
                     // directly, so RCX remains available to values spanning
                     // the operation. Keep those values out of the two actual
                     // architectural endpoints while allowing the dying
@@ -7929,6 +7941,8 @@ private:
                                 instruction.opcode == Opcode::Urem ||
                                 instruction.opcode == Opcode::Sdivrem ||
                                 instruction.opcode == Opcode::Udivrem ||
+                                instruction.opcode == Opcode::Mulhs ||
+                                instruction.opcode == Opcode::Mulhu ||
                                 has_property(base,
                                              OpcodeProperty::Comparison) ||
                                 instruction.opcode == Opcode::Vphi ||
@@ -19077,7 +19091,9 @@ private:
         if (value.opcode == Opcode::Sdiv ||
             value.opcode == Opcode::Udiv ||
             value.opcode == Opcode::Srem ||
-            value.opcode == Opcode::Urem) {
+            value.opcode == Opcode::Urem ||
+            value.opcode == Opcode::Mulhs ||
+            value.opcode == Opcode::Mulhu) {
             if (bits < 32) {
                 diagnostics_.error(value.location,
                                    "x86 integer division was not promoted to "
@@ -19101,8 +19117,13 @@ private:
                 ? register_name(assigned_divisor->storage_name, bits)
                 : spilled_divisor ? memory(vreg_offset(function, right))
                                   : register_name("rcx", bits);
-            if (value.opcode == Opcode::Sdiv ||
-                value.opcode == Opcode::Srem) {
+            if (value.opcode == Opcode::Mulhs ||
+                value.opcode == Opcode::Mulhu) {
+                instruction((value.opcode == Opcode::Mulhs ? "imul" : "mul") +
+                                std::string(1, suffix(bits)),
+                            divisor);
+            } else if (value.opcode == Opcode::Sdiv ||
+                       value.opcode == Opcode::Srem) {
                 instruction(bits == 32 ? "cltd" : "cqto");
                 instruction("idiv" + std::string(1, suffix(bits)),
                             divisor);
@@ -19114,9 +19135,9 @@ private:
                             divisor);
             }
             store(function, target,
-                  value.opcode == Opcode::Srem ||
-                          value.opcode == Opcode::Urem
-                      ? "rdx" : "rax");
+                  value.opcode == Opcode::Sdiv ||
+                          value.opcode == Opcode::Udiv
+                      ? "rax" : "rdx");
             return;
         }
         if (value.opcode == Opcode::Rotl ||

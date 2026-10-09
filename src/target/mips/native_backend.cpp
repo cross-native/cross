@@ -452,6 +452,8 @@ machine::TargetOpcodeId integer_binary_opcode(
     case BinaryOperation::ShiftRightLogical: return Opcode::ShrU;
     case BinaryOperation::RotateLeft: return Opcode::Rotl;
     case BinaryOperation::RotateRight: return Opcode::Rotr;
+    case BinaryOperation::UnsignedMultiplyHigh: return Opcode::Mulhu;
+    case BinaryOperation::SignedMultiplyHigh: return Opcode::Mulhs;
     case BinaryOperation::Equal: return Opcode::CmpEq;
     case BinaryOperation::NotEqual: return Opcode::CmpNe;
     case BinaryOperation::SignedLess: return Opcode::CmpSlt;
@@ -3174,7 +3176,9 @@ private:
                        ? 20U
                        : 36U;
         case Opcode::Mul:
-        case Opcode::MulStart: return 8U;
+        case Opcode::MulStart:
+        case Opcode::Mulhs:
+        case Opcode::Mulhu: return 8U;
         case Opcode::Fmul:
             return instruction.defs.empty() ||
                            instruction.defs.front().mode.bits <= 32
@@ -3230,7 +3234,8 @@ private:
         return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
             opcode == Opcode::Udiv || opcode == Opcode::Srem ||
             opcode == Opcode::Urem || opcode == Opcode::Sdivrem ||
-            opcode == Opcode::Udivrem || opcode == Opcode::StackAllocate ||
+            opcode == Opcode::Udivrem || opcode == Opcode::Mulhs ||
+            opcode == Opcode::Mulhu || opcode == Opcode::StackAllocate ||
             indexed_operation_writes_hilo(instruction);
     }
 
@@ -8737,6 +8742,13 @@ void AssemblyEmitter::emit_integer_binary(
         instruction(wide ? "dmult" : "mult",
                     reg_name(left_gpr) + "," + reg_name(right_gpr));
         instruction("mflo", reg_name(target_gpr));
+        break;
+    case Opcode::Mulhs:
+    case Opcode::Mulhu:
+        instruction(opcode == Opcode::Mulhs ? (wide ? "dmult" : "mult")
+                                            : (wide ? "dmultu" : "multu"),
+                    reg_name(left_gpr) + "," + reg_name(right_gpr));
+        instruction("mfhi", reg_name(target_gpr));
         break;
     case Opcode::Sdiv:
     case Opcode::Srem:

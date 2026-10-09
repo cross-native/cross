@@ -414,11 +414,26 @@ struct IntegerConstantCostQuery {
     bool is_signed{};
 };
 
+struct IntegerOperationCostQuery {
+    unsigned bits{};
+    bool is_signed{};
+};
+
 struct TargetCostModel {
     using IntegerConstantMaterializationCost =
         unsigned (*)(const Subtarget&, const IntegerConstantCostQuery&);
+    // Latency in units of a simple integer ALU operation, or no value when
+    // the subtarget has no single instruction for the operation at that
+    // width.
+    using IntegerOperationCost = std::optional<unsigned> (*)(
+        const Subtarget&, const IntegerOperationCostQuery&);
 
     IntegerConstantMaterializationCost integer_constant_materialization{};
+    // A quotient or remainder.
+    IntegerOperationCost integer_division{};
+    // The high half of the double-width product. Its presence also makes
+    // the MIR multiply-high operations legal at that width.
+    IntegerOperationCost integer_multiply_high{};
 };
 
 // Direct typed instruction-memory addressing. These are encoding constraints,

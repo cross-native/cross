@@ -22,6 +22,7 @@ optimization "O0" {
     f.unroll-loops = false;
     f.tree-reassoc = false;
     f.tree-slsr = false;
+    f.div-by-constant = false;
     f.tree-loop-rotate = false;
     f.tree-loop-vectorize = false;
     f.tree-early-exit-vectorize = false;
@@ -62,6 +63,7 @@ optimization "Og" {
     inherits = "O0";
     f.tree-ccp = true;
     f.tree-bit-ccp = true;
+    f.div-by-constant = true;
     f.tree-cfg-cleanup = true;
     f.machine-combine = true;
     f.compare-branch-fusion = true;
@@ -73,6 +75,7 @@ optimization "O1" {
     f.optimize-for = "speed";
     f.tree-ccp = true;
     f.tree-bit-ccp = true;
+    f.div-by-constant = true;
     f.tree-copy-prop = true;
     f.tree-dce = true;
     f.tree-dse = true;

@@ -123,6 +123,23 @@ std::string ir_type(const hir::Module& module, hir::TypeId id) {
     return "void";
 }
 
+// An object, array element, or pointee. A typedef's alignment request pads
+// the storage beyond its value, which keeps the base type's spelling.
+std::string storage_ir_type(const hir::Module& module,
+                            const TargetInfo* target, hir::TypeId id) {
+    const auto& type = module.type(id);
+    auto spelling = type.kind == hir::Type::Kind::Array && type.element
+        ? "[" + std::to_string(type.lanes) + " x " +
+              storage_ir_type(module, target, *type.element) + "]"
+        : ir_type(module, id);
+    if (type.alignment == 0 || !target) return spelling;
+    const auto layout = hir::layout_size(module, id, *target);
+    const auto natural = hir::natural_size(module, id, *target);
+    if (!layout || !natural || *layout <= *natural) return spelling;
+    return "<{ " + spelling + ", [" + std::to_string(*layout - *natural) +
+           " x i8] }>";
+}
+
 bool comparison(mir::BinaryOperation operation) {
     return operation >= mir::BinaryOperation::Equal;
 }
@@ -145,6 +162,9 @@ std::string binary_name(mir::BinaryOperation operation) {
     case BinaryOperation::ShiftRightLogical: return "lshr";
     case BinaryOperation::RotateLeft: return "fshl";
     case BinaryOperation::RotateRight: return "fshr";
+    // The value emitter expands these through a double-width multiply.
+    case BinaryOperation::UnsignedMultiplyHigh:
+    case BinaryOperation::SignedMultiplyHigh: return "mul";
     case BinaryOperation::Equal: return "eq";
     case BinaryOperation::NotEqual: return "ne";
     case BinaryOperation::SignedLess: return "slt";
@@ -329,6 +349,7 @@ public:
             const CompilerOptions& options, Diagnostics& diagnostics)
         : hir_(hir_module), function_(function), options_(options),
           diagnostics_(diagnostics), entity_(hir_module.function(function.source)),
+          target_(target_for_triple(options.target)),
           references_(function.values.size()) {
         for (const auto& value : function.values) {
             if (value.kind == mir::ValueKind::Parameter) {
@@ -848,7 +869,8 @@ private:
             const auto index = value.operands[1];
             const auto& pointer = hir_.type(value.type);
             out_ << "  " << reference(value.id) << " = getelementptr "
-                 << ir_type(hir_, *pointer.pointee) << ", ptr "
+                 << storage_ir_type(hir_, target_, *pointer.pointee)
+                 << ", ptr "
                  << reference(base) << ", "
                  << ir_type(hir_, function_.values[index.value].type) << ' '
                  << reference(index) << '\n';
@@ -868,7 +890,7 @@ private:
             const auto bound = value.operands.front();
             const auto& pointer = hir_.type(value.type);
             out_ << "  " << reference(value.id) << " = alloca "
-                 << ir_type(hir_, *pointer.pointee) << ", "
+                 << storage_ir_type(hir_, target_, *pointer.pointee) << ", "
                  << ir_type(hir_, function_.values[bound.value].type) << ' '
                  << reference(bound) << ", align " << value.integer_high
                  << '\n';
@@ -999,7 +1021,8 @@ private:
             const auto address =
                 "%mir.addr." + std::to_string(value.id.value);
             out_ << "  " << address << " = getelementptr "
-                 << ir_type(hir_, address_element) << ", ptr "
+                 << storage_ir_type(hir_, target_, address_element)
+                 << ", ptr "
                  << reference(base)
                  << ", " << ir_type(hir_, function_.values[index.value].type)
                  << ' ' << reference(index) << '\n';
@@ -1308,6 +1331,26 @@ private:
                  << reference(right) << ")\n";
             return;
         }
+        if (value.binary == mir::BinaryOperation::UnsignedMultiplyHigh ||
+            value.binary == mir::BinaryOperation::SignedMultiplyHigh) {
+            const auto bits = abi_type_bits(hir_, operand_type_id);
+            const auto wide = integer_ir_type(bits * 2);
+            const auto extend =
+                value.binary == mir::BinaryOperation::SignedMultiplyHigh
+                    ? "sext" : "zext";
+            const auto name = "%mir.h" + std::to_string(value.id.value);
+            out_ << "  " << name << ".l = " << extend << ' ' << operand_type
+                 << ' ' << reference(left) << " to " << wide << '\n';
+            out_ << "  " << name << ".r = " << extend << ' ' << operand_type
+                 << ' ' << reference(right) << " to " << wide << '\n';
+            out_ << "  " << name << ".p = mul " << wide << ' ' << name
+                 << ".l, " << name << ".r\n";
+            out_ << "  " << name << ".h = lshr " << wide << ' ' << name
+                 << ".p, " << bits << '\n';
+            out_ << "  " << result << " = trunc " << wide << ' ' << name
+                 << ".h to " << operand_type << '\n';
+            return;
+        }
         if (comparison(value.binary)) {
             const auto predicate = "%mir.p" + std::to_string(value.id.value);
             if (is_floating(hir_, operand_type_id)) {
@@ -1420,9 +1463,10 @@ private:
             }
             for (const auto& slot : function_.slots) {
                 out_ << "  %mir.slot" << slot.id.value << " = alloca "
-                     << ir_type(hir_, slot.type) << ", align "
-                     << std::max(ir_alignment(hir_, slot.type),
-                                 slot.minimum_alignment)
+                     << storage_ir_type(hir_, target_, slot.type) << ", align "
+                     << std::max({ir_alignment(hir_, slot.type),
+                                  hir::requested_alignment(hir_, slot.type),
+                                  slot.minimum_alignment})
                      << '\n';
             }
         }
@@ -1483,6 +1527,7 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     const hir::Function& entity_;
+    const TargetInfo* target_;
     std::vector<std::string> references_;
     std::string active_label_;
     std::ostringstream out_;
@@ -1490,6 +1535,11 @@ private:
 };
 
 } // namespace
+
+std::string llvm_storage_type(const hir::Module& hir_module,
+                              const TargetInfo* target, hir::TypeId type) {
+    return storage_ir_type(hir_module, target, type);
+}
 
 std::string emit_managed_mir_function(const hir::Module& hir_module,
                                       const mir::ManagedFunction& function,

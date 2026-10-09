@@ -153,6 +153,7 @@ struct CompilerOptions {
     bool unroll_loops{};
     bool tree_reassoc{};
     bool tree_slsr{};
+    bool div_by_constant{};
     bool tree_loop_rotate{};
     bool tree_loop_vectorize{};
     bool tree_early_exit_vectorize{};

@@ -73,6 +73,7 @@ int main() {
                     o0->signed_zeros &&
                     !o0->machine_combine && !o0->machine_cse &&
                     !o0->tree_slsr && !o0->tree_loop_rotate &&
+                    !o0->div_by_constant &&
                     !o0->expensive_optimizations &&
                     !o0->register_allocation &&
                     o0->inline_unit_limit == 96,
@@ -80,7 +81,7 @@ int main() {
          ok;
 
     const auto og = parse({"cc", "-Og"});
-    ok = expect(og && og->tree_ccp && !og->tree_dce &&
+    ok = expect(og && og->tree_ccp && !og->tree_dce && og->div_by_constant &&
                     !og->inline_functions &&
                     og->machine_combine && !og->machine_dce &&
                     !og->machine_cse,
@@ -93,6 +94,7 @@ int main() {
                     o2->tree_tail_merge &&
                     o2->inline_functions && o2->tree_bit_ccp &&
                     o2->tree_reassoc && o2->tree_slsr &&
+                    o2->div_by_constant &&
                     o2->tree_loop_rotate && o2->ipa_ra &&
                     o2->ipa_pure_const &&
                     o2->private_abi && !o2->ipa_cp_clone &&
@@ -110,7 +112,7 @@ int main() {
         {"cc", "-fno-inline", "-fno-tree-dce", "-O3",
          "-fno-tree-dse", "-fno-tree-tail-merge", "-fno-ipa-ra",
          "-fno-ipa-pure-const", "-fno-tree-reassoc",
-         "-fno-tree-slsr", "-fno-tree-loop-rotate",
+         "-fno-tree-slsr", "-fno-tree-loop-rotate", "-fno-div-by-constant",
          "-fno-expensive-optimizations"});
     ok = expect(o3_override && o3_override->tree_ccp &&
                     o3_override->tree_bit_ccp &&
@@ -122,6 +124,7 @@ int main() {
                     !o3_override->ipa_pure_const &&
                     !o3_override->tree_reassoc &&
                     !o3_override->tree_slsr &&
+                    !o3_override->div_by_constant &&
                     !o3_override->tree_loop_rotate &&
                     o3_override->private_abi &&
                     o3_override->ipa_cp_clone &&
