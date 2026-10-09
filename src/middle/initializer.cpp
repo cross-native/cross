@@ -429,8 +429,12 @@ EvaluationInitializerTypePlan types_for_evaluation(
     const Expr& expression, const TypePtr& destination, const Program& program,
     hir::Module& layout, const TargetInfo& target, std::span<const Expr* const> deferred_indices) {
     // Work in an isolated registry: replacing physical members by source shape
-    // must not mutate a cached layout used by execution or emission.
-    auto shapes = layout;
+    // must not mutate a cached layout used by execution or emission. Only the
+    // destination's types are interned, so nothing else of the layout is copied.
+    hir::Module shapes;
+    shapes.address_bits = layout.address_bits;
+    shapes.default_abi = layout.default_abi;
+    shapes.abi_names = layout.abi_names;
     const auto source_types = source_types_for(destination, program, shapes, true);
     std::vector<hir::TypeId> pending_extents;
     for (const auto& [id, source] : source_types)

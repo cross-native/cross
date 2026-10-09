@@ -317,6 +317,18 @@ ContinuationTask<Module> build_required_layout_context_async(Program& program, c
                                      const TargetInfo& target, Diagnostics& diagnostics,
                                      TypePtr type,
                                      EvaluationLayoutKind kind = EvaluationLayoutKind::Complete);
+// Extends `seed`, a view built earlier for this Program and target; the record
+// table must not have changed since. In the seed's exact non-null evaluation
+// layout scope, a complete record keeps its layout while its definition owner
+// is unchanged; its members' owners are not resolved again. A seed from
+// another scope is discarded. `proofs` keeps structural checks across views.
+ContinuationTask<Module> build_required_layout_context_async(Program& program, const CompilerOptions& options,
+                                     const TargetInfo& target, Diagnostics& diagnostics,
+                                     TypePtr type, EvaluationLayoutKind kind,
+                                     Module seed, RecordSourceProofs& proofs);
+// layout_view_covers for such a view: a complete record whose owner matches
+// covers its members, which were completed with it in that view.
+bool extended_layout_view_covers(const Module& module, const Program& program, const TypePtr& type);
 bool validate_source_address_spaces(Program& program,
                                     const CompilerOptions& options,
                                     const TargetInfo& target,

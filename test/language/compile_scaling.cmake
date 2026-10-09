@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # Large functions compile in time roughly linear in their size. Record chains
-# must not rescan the source table per record or revalidate the chain for each
-# record laid out. Each case takes a second or two; the timeout catches a
-# return to that work.
+# must not rescan the source table per record, revalidate the chain for each
+# record laid out, or lay the chain out again for each layout query. Each case
+# takes a second or two; the timeout catches a return to that work.
 foreach(required CC OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} is required")
@@ -53,8 +53,9 @@ compile(nested_ifs -O2
     "global u32 f(in u32 x) {\n${nested_open}    x += 1u32;\n${nested_close}    return x;\n}\n")
 
 # Translation-time copies of a by-value record chain query the layout of each
-# level; every query checks the rest of the chain and every layout context
-# validates it. The local chain resolves through private evaluation views.
+# level; each query of the file-scope chain checks the rest of the chain, and
+# each layout context validates what it lays out. The local chain resolves
+# through private evaluation views.
 set(records "")
 set(local_records "")
 foreach(index RANGE 0 479)
@@ -121,3 +122,15 @@ endforeach()
 compile(layout_contexts -O0 "${unrelated_records}[[eval_only]] static uptr total_size() {\n\
     uptr total = 0uptr;\n${queried_locals}    return total;\n}\n\
 $::static_assert($::eval(total_size()) == 4501500uptr, \"layout contexts\");\n")
+
+# Evaluation prepares a chain of local records level by level, and each level
+# queries the layout of the rest of the chain. Each query extends the view the
+# previous one built instead of laying out that rest again.
+set(levels "")
+foreach(index RANGE 0 3999)
+    math(EXPR next "${index} + 1")
+    string(APPEND levels "    struct C${index} { struct C${next} child[1]; };\n")
+endforeach()
+compile(local_layout_chain -O0 "[[eval_only]] static uptr chain_size() {\n\
+${levels}    struct C4000 { uptr value; };\n    return sizeof(struct C0);\n}\n\
+$::static_assert($::eval(chain_size()) == sizeof(uptr), \"local layout chain\");\n")

@@ -160,10 +160,11 @@ std::string source_namespace(std::string_view name) {
                : std::string(name.substr(0, separator));
 }
 
-enum class LayoutViewCoverage { PendingAllowed, Complete };
+enum class LayoutViewCoverage { PendingAllowed, Complete, Closed };
 
 // Resolves each by-value record of the graph once per call, so a changed
-// provider, owner or completeness is always observed.
+// provider, owner or completeness is always observed. Closed stops at a
+// complete record: an extended view completed its members with it.
 bool layout_view_matches_records(const Module& module, const Program& program,
                                  const TypePtr& source, LayoutViewCoverage coverage) {
     if (module.address_bits != program.address_bits) return false;
@@ -188,8 +189,9 @@ bool layout_view_matches_records(const Module& module, const Program& program,
             if (cached) visited[cached->id.value] = true;
             auto definition = program.record_definition(key);
             if (!definition) return false;
-            if (coverage == LayoutViewCoverage::Complete && (!cached || !cached->complete)) return false;
+            if (coverage != LayoutViewCoverage::PendingAllowed && (!cached || !cached->complete)) return false;
             if (cached && cached->complete && cached->definition != definition.get()) return false;
+            if (coverage == LayoutViewCoverage::Closed) continue;
             for (const auto& member : definition->members) work.push_back(member.type.get());
             definitions.push_back(std::move(definition));
         }
@@ -201,8 +203,16 @@ bool layout_view_matches_records(const Module& module, const Program& program,
 class Builder {
 public:
     Builder(Program& program, const CompilerOptions& options,
-            const TargetInfo& target, Diagnostics& diagnostics)
-        : program_(program), options_(options), target_(target), diagnostics_(diagnostics) {
+            const TargetInfo& target, Diagnostics& diagnostics,
+            Module seed = {}, RecordSourceProofs* proofs = nullptr)
+        : program_(program), options_(options), target_(target), diagnostics_(diagnostics),
+          record_source_proofs_(proofs ? proofs : &own_record_source_proofs_) {
+        if (seed.evaluation_layout_scope && seed.evaluation_layout_scope == program_.evaluation_layout_scope) {
+            module_ = std::move(seed);
+            seeded_records_ = module_.records.size();
+            address_bytes_ = std::max(1U, (module_.address_bits + 7U) / 8U);
+            return;
+        }
         module_.evaluation_layout_scope = program_.evaluation_layout_scope;
         const auto* abi = find_abi(target_, options_.abi, options_.target);
         if (abi) module_.default_abi = abi->id;
@@ -945,6 +955,7 @@ private:
             co_return value ? std::optional<unsigned>{static_cast<unsigned>(*value)} : std::nullopt;
         }
         const auto record_id = *module_.type(id).record;
+        adopt_seed_record(record_id);
         if (module_.record(record_id).alignment_complete) co_return module_.record(record_id).alignment;
         const auto key = source->nominal_key();
         if (!alignment_active_.insert(key).second) {
@@ -962,7 +973,7 @@ private:
             co_return {};
         }
         if (const auto error = record_source_error(*definition, program_, program_.record_index,
-                &record_source_proofs_)) {
+                record_source_proofs_)) {
             diagnostics_.error(error->location, error->message);
             co_return {};
         }
@@ -1075,11 +1086,34 @@ private:
         co_return valid;
     }
 
+    // The first use of a seed record keeps its facts while its definition owner
+    // is unchanged, and makes it a shell again otherwise. Within one scope
+    // identity and one record table a nominal key's definition is fixed once its
+    // record is prepared (record views are never replaced), so the owners of a
+    // kept record's members are not resolved again.
+    void adopt_seed_record(RecordId id) {
+        if (id.value >= seeded_records_) return;
+        if (id.value >= layout_state_.size()) layout_state_.resize(module_.records.size());
+        auto& record = module_.record(id);
+        if (layout_state_[id.value] != 0 || (!record.complete && !record.alignment_complete)) return;
+        if (program_.record_definition(record.source_key).get() == record.definition) {
+            if (record.complete) layout_state_[id.value] = 2;
+            return;
+        }
+        Record shell;
+        shell.id = id;
+        shell.source_key = std::move(record.source_key);
+        shell.source_name = std::move(record.source_name);
+        shell.is_union = record.is_union;
+        record = std::move(shell);
+    }
+
     ContinuationTask<bool> layout_record_async(RecordId id, SourceLocation use_location) {
         if (resource_failed()) co_return false;
         if (id.value >= layout_state_.size()) {
             layout_state_.resize(module_.records.size());
         }
+        adopt_seed_record(id);
         if (layout_state_[id.value] == 2) co_return true;
         if (layout_state_[id.value] == 3) co_return false;
         if (layout_state_[id.value] == 1) {
@@ -1111,7 +1145,7 @@ private:
             co_return false;
         }
         if (const auto error = record_source_error(*record.definition, program_, program_.record_index,
-                &record_source_proofs_)) {
+                record_source_proofs_)) {
             diagnostics_.error(error->location, error->message);
             layout_state_[id.value] = 3;
             co_return false;
@@ -2489,7 +2523,11 @@ private:
     Diagnostics& diagnostics_;
     Module module_;
     // Spares nested layout the closure its enclosing layout just validated.
-    RecordSourceProofs record_source_proofs_;
+    // An extended view shares the proofs of the views before it.
+    RecordSourceProofs own_record_source_proofs_;
+    RecordSourceProofs* record_source_proofs_;
+    // Records below this ID come from the seed of an extended view.
+    std::size_t seeded_records_{};
     unsigned address_bytes_{8};
     std::vector<unsigned char> layout_state_;
     bool required_layout_query_{};
@@ -2933,6 +2971,10 @@ bool layout_view_covers(const Module& module, const Program& program, const Type
     return layout_view_matches_records(module, program, type, LayoutViewCoverage::Complete);
 }
 
+bool extended_layout_view_covers(const Module& module, const Program& program, const TypePtr& type) {
+    return layout_view_matches_records(module, program, type, LayoutViewCoverage::Closed);
+}
+
 Module build_required_layout_context(Program& program, const CompilerOptions& options,
                                      const TargetInfo& target, Diagnostics& diagnostics,
                                      const TypePtr& type, EvaluationLayoutKind kind) {
@@ -2943,6 +2985,14 @@ ContinuationTask<Module> build_required_layout_context_async(Program& program, c
                                      const TargetInfo& target, Diagnostics& diagnostics,
                                      TypePtr type, EvaluationLayoutKind kind) {
     Builder builder(program, options, target, diagnostics);
+    co_return co_await builder.required_layout_context_async(std::move(type), kind);
+}
+
+ContinuationTask<Module> build_required_layout_context_async(Program& program, const CompilerOptions& options,
+                                     const TargetInfo& target, Diagnostics& diagnostics,
+                                     TypePtr type, EvaluationLayoutKind kind,
+                                     Module seed, RecordSourceProofs& proofs) {
+    Builder builder(program, options, target, diagnostics, std::move(seed), &proofs);
     co_return co_await builder.required_layout_context_async(std::move(type), kind);
 }
 

@@ -157,19 +157,38 @@ void install_evaluation_layout_queries(Program& current, const TargetInfo* targe
     };
 }
 
+// The last demand-driven view, valid while the record table is unchanged. A
+// query it does not cover extends it in the same evaluation layout scope.
 struct CompletedEvaluationLayoutView {
     std::shared_ptr<hir::Module> layout;
+    // Proofs retain private views, so they last only as long as the view.
+    RecordSourceProofs proofs;
     const RecordDecl* records{};
     std::size_t count{};
 
     std::shared_ptr<hir::Module> find(const Program& program, const TypePtr& type) {
         if (records != program.records.data() || count != program.records.size()) layout.reset();
-        return layout && hir::layout_view_covers(*layout, program, type) ? layout : nullptr;
+        return layout && hir::extended_layout_view_covers(*layout, program, type) ? layout : nullptr;
     }
 
-    void retain(const Program& program, const TypePtr& type, const std::shared_ptr<hir::Module>& view) {
-        if (!hir::layout_view_covers(*view, program, type)) return;
-        layout = view;
+    // After a missed find: the view to extend if it has the current scope and
+    // no caller still reads it; otherwise the query starts a new view.
+    std::optional<hir::Module> seed(const Program& program) {
+        if (!layout || layout.use_count() != 1 || !layout->evaluation_layout_scope ||
+            layout->evaluation_layout_scope != program.evaluation_layout_scope) {
+            proofs = {};
+            return std::nullopt;
+        }
+        auto view = std::move(*layout);
+        layout.reset();
+        return view;
+    }
+
+    // An extension replaces the view it extends; a new view replaces the kept
+    // one only if it covers its query.
+    void retain(const Program& program, const TypePtr& type, std::shared_ptr<hir::Module> view, bool extended) {
+        if (!extended && !hir::layout_view_covers(*view, program, type)) return;
+        layout = std::move(view);
         records = program.records.data();
         count = program.records.size();
     }
@@ -197,10 +216,12 @@ void install_early_evaluation_layout(Program& program, const CompilerOptions& op
         if (const auto cached = completed->find(program, type)) co_return cached;
         std::ostringstream output;
         Diagnostics quiet(output);
-        auto layout = std::make_shared<hir::Module>(
-            co_await hir::build_required_layout_context_async(program, options, *target, quiet, type, kind));
+        auto seed = completed->seed(program);
+        const bool extended = seed.has_value();
+        auto layout = std::make_shared<hir::Module>(co_await hir::build_required_layout_context_async(
+            program, options, *target, quiet, type, kind, std::move(seed).value_or(hir::Module{}), completed->proofs));
         if (quiet.errors() != 0) co_return nullptr;
-        completed->retain(program, type, layout);
+        completed->retain(program, type, layout, extended);
         co_return layout;
     });
 }
@@ -1009,10 +1030,12 @@ int cc_main(int argc, char** argv) {
             if (const auto cached = completed->find(current, type)) co_return cached;
             std::ostringstream output;
             Diagnostics quiet(output);
-            auto required = std::make_shared<hir::Module>(
-                co_await hir::build_required_layout_context_async(current, options, *target, quiet, type, kind));
+            auto seed = completed->seed(current);
+            const bool extended = seed.has_value();
+            auto required = std::make_shared<hir::Module>(co_await hir::build_required_layout_context_async(
+                current, options, *target, quiet, type, kind, std::move(seed).value_or(hir::Module{}), completed->proofs));
             if (quiet.errors()) co_return nullptr;
-            completed->retain(current, type, required);
+            completed->retain(current, type, required, extended);
             co_return required;
         });
     };
