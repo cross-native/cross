@@ -1045,16 +1045,6 @@ ill-formed; an out-of-range runtime index has undefined behavior.
 Target-specific vector element types are advertised
 through feature queries rather than assumed by portable Cross code.
 
-Source-constant value checks, including fixed-vector index bounds and
-integer-zero-to-null conversions, include direct calls to visible ordinary
-helpers when their inputs are constant and sandboxed translation-time evaluation
-proves the result. This classification is independent of optional call folding
-and needs no purity attribute. Helper-local storage and effects permitted by the
-sandbox remain allowed; caller runtime values are never inputs to the proof.
-Runtime-dependent calls do not qualify merely because an optimizer might
-simplify them. The invocation-context deferral and resource-limit rules of
-“Automatic and explicit evaluation” apply.
-
 An address-space-qualified pointee type uses
 `[[address_space(N)]]`, where `N` is an address-space number from the target
 registry:
@@ -1408,7 +1398,12 @@ Failure of an opportunistic attempt is not an error and produces no speculative
 diagnostic; the runtime expression simply remains. Evaluation is mandatory in
 an enumerator, case label, fixed array bound, attribute constant,
 static-duration non-relocatable initializer, generic value argument,
-`$::static_assert`, and every other translation-time-only context.
+`$::static_assert`, and every other translation-time-only context. A
+source-constant check such as a fixed-vector index bound or an
+integer-zero-to-null conversion is also mandatory evaluation: it includes
+direct calls to visible ordinary helpers with constant inputs, independently
+of `-fno-eval-calls` and without a purity attribute, and never uses a
+caller's runtime values.
 
 The staging controls are:
 
@@ -2499,6 +2494,17 @@ modifying the cell is undefined. `out` is uninitialized, cannot be read before
 assignment, and must be assigned on every normal return. `out const T` and
 `inout const T` are invalid when `const` qualifies the parameter cell.
 Result-bearing mode is unrelated to `volatile`.
+
+Assignment of an `out` cell is proved on the function's control flow, per
+scalar leaf of the cell (a member, or an element selected by a
+translation-time index). A leaf is assigned by an assignment to it or to an
+enclosing object, by passing it or an enclosing object as an `out` argument,
+or by a store through a pointer the function derived from the cell's address
+without passing that pointer to a call or storing it in another object; a
+union is assigned by any member. Reading an unassigned leaf, including
+through such a pointer, and a normal return on a path where a leaf remains
+unassigned are errors. An address that escapes to a call or to storage
+neither assigns nor reads the cell.
 
 Function declarations and their callers must agree on the normalized
 mode and ABI contract across separate compilations.
