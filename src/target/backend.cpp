@@ -12,9 +12,10 @@ namespace cross {
 std::string TargetBackend::emit_managed_assembly(
     mir::ManagedModule& managed_module, hir::Module& hir_module,
     const Subtarget& subtarget, const CompilerOptions& options,
-    Diagnostics& diagnostics) const {
+    native::DebugInfo& debug, Diagnostics& diagnostics) const {
     return native::run_machine_pipeline(
-        *this, managed_module, hir_module, subtarget, options, diagnostics);
+        *this, managed_module, hir_module, subtarget, options, debug,
+        diagnostics);
 }
 
 const std::vector<const TargetBackend*>& all_target_backends() {

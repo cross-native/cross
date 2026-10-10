@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "target/x86_64/raw_backend.hpp"
 
+#include "backend/native/debug_info.hpp"
 #include "common/floating_semantics.hpp"
 #include "middle/data_ir.hpp"
 #include "middle/patch_sink.hpp"
@@ -3917,10 +3918,12 @@ public:
                        const hir::Module& hir_module,
                        const Subtarget& subtarget,
                        const CompilerOptions& options,
-                       Diagnostics& diagnostics)
+                       Diagnostics& diagnostics,
+                       native::DebugInfo* debug)
         : module_(module), managed_(managed_module), hir_(hir_module),
           options_(options), diagnostics_(diagnostics),
-          format_(subtarget.object_format()) {}
+          format_(subtarget.object_format()),
+          debug_(debug && debug->active() ? debug : nullptr) {}
 
     mir::AssemblyBundle run() {
         const auto managed_patch = first_managed_patch();
@@ -4111,6 +4114,7 @@ private:
                     << "; .type 32; .endef\n";
         }
         output_ << symbol << ":\n";
+        if (debug_) debug_->begin_function();
         for (std::size_t layout_index = 0;
              layout_index < function.layout.size(); ++layout_index) {
             const auto id = function.layout[layout_index];
@@ -4151,6 +4155,7 @@ private:
                 }
             }
         }
+        if (debug_) output_ << debug_->end_function(function.source, symbol, false) << ":\n";
         if (format_ == ObjectFormat::Elf) {
             output_ << ".size " << symbol << ", .-" << symbol << "\n";
         }
@@ -4165,6 +4170,7 @@ private:
 
     void emit_instruction(const mir::RawFunction& function,
                            const mir::Instruction& instruction) {
+        if (debug_) debug_->row(output_, instruction.location);
         output_ << '\t' << instruction.form->assembly_mnemonic;
         if (!instruction.operands.empty() ||
             !instruction.form->assembly_operand_prefix.empty()) {
@@ -4265,6 +4271,8 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    // Null without -g.
+    native::DebugInfo* debug_{};
     mir::AssemblyBundle bundle_;
     std::ostringstream output_;
     std::vector<PatchEmission> patches_;
@@ -4282,9 +4290,10 @@ mir::AssemblyBundle emit_raw_assembly(const mir::RawModule& mir_module,
                                       const hir::Module& hir_module,
                                       const Subtarget& subtarget,
                                       const CompilerOptions& options,
-                                      Diagnostics& diagnostics) {
+                                      Diagnostics& diagnostics,
+                                      native::DebugInfo* debug) {
     return RawAssemblyEmitter(mir_module, managed_module, hir_module,
-                              subtarget, options, diagnostics).run();
+                              subtarget, options, diagnostics, debug).run();
 }
 
 } // namespace cross::x86_64

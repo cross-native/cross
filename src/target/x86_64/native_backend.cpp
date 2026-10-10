@@ -4,6 +4,7 @@
 #include "target/x86_64/native_backend.hpp"
 #include "middle/mir_analysis.hpp"
 #include "middle/shrink_wrap.hpp"
+#include "backend/native/debug_info.hpp"
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
 #include "common/control_flow.hpp"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cstdint>
 #include <initializer_list>
 #include <iterator>
@@ -9949,12 +9951,14 @@ public:
                     const DynamicAbiPlans& dynamic_plans,
                     const Subtarget& subtarget,
                     const CompilerOptions& options,
-                    Diagnostics& diagnostics)
+                    Diagnostics& diagnostics,
+                    native::DebugInfo* debug = nullptr)
         : module_(module), hir_(hir_module), manual_plans_(manual_plans),
           dynamic_plans_(dynamic_plans), subtarget_(subtarget),
           options_(options),
           diagnostics_(diagnostics),
-          format_(subtarget.object_format()) {}
+          format_(subtarget.object_format()),
+          debug_(debug && debug->active() ? debug : nullptr) {}
 
     void prepare_frames() {
         if (unwind_enabled() || options_.unwind_model != UnwindModel::None) return;
@@ -10144,6 +10148,11 @@ private:
     }
 
     void emit_frame_instruction(const machine::Instruction& value) {
+        emit_frame_program_instruction(value);
+        if (cfi_) cfi_transition(after_frame_instruction(cfi_state_, value));
+    }
+
+    void emit_frame_program_instruction(const machine::Instruction& value) {
         const auto& effect = *value.frame_effect;
         const auto base = register_name(canonical_storage_view({effect.base.id})->storage_name, 64);
         switch (decode_opcode(value.opcode)) {
@@ -10182,8 +10191,140 @@ private:
             options_.asynchronous_unwind_tables;
     }
 
-    bool dwarf_cfi_enabled() const {
-        return unwind_enabled() && assembly_uses_dwarf_cfi(format_);
+    // Whether the active function's frame is described with .cfi directives.
+    bool dwarf_cfi_enabled() const { return cfi_; }
+
+    // The DWARF number of a general or SSE register.
+    static std::optional<unsigned> dwarf_register(std::string_view storage) {
+        static constexpr std::string_view general[] = {
+            "rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        };
+        for (unsigned index = 0; index < std::size(general); ++index)
+            if (storage == general[index]) return index;
+        if ((storage.starts_with("xmm") || storage.starts_with("ymm") ||
+             storage.starts_with("zmm")) && storage.size() > 3) {
+            unsigned number{};
+            const auto digits = storage.substr(3);
+            const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), number);
+            if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() && number < 16)
+                return 17 + number;
+        }
+        return std::nullopt;
+    }
+
+    // The CFA rule and the register saves that .cfi directives describe at
+    // a point of a function with a frame program.
+    struct CfiState {
+        std::string cfa_register{"rsp"};
+        std::int64_t cfa_offset{8};
+        // CFA minus RSP, and CFA minus the frame register once it is set.
+        std::int64_t stack_offset{8};
+        std::optional<std::pair<std::string, std::int64_t>> frame_register;
+        std::vector<std::pair<std::string, std::int64_t>> saves;
+    };
+
+    std::string cfi_register_name(machine::Register reg) const {
+        const auto* view = canonical_storage_view({reg.id});
+        return std::string(view->register_class == RegisterClass::simd
+                               ? view->name : view->storage_name);
+    }
+
+    // The state after `value`, one instruction of a frame program.
+    CfiState after_frame_instruction(CfiState state,
+                                     const machine::Instruction& value) const {
+        const auto& effect = *value.frame_effect;
+        const auto base = cfi_register_name(effect.base);
+        const auto distance = [&](const std::string& reg) {
+            return reg == base ? state.stack_offset : state.frame_register->second;
+        };
+        const auto forget = [&](const std::string& reg) {
+            std::erase_if(state.saves, [&](const auto& save) { return save.first == reg; });
+        };
+        switch (decode_opcode(value.opcode)) {
+        case Opcode::FrameAdjust:
+            state.stack_offset -= effect.stack_delta;
+            break;
+        case Opcode::FrameCopy: {
+            const auto destination = cfi_register_name(*effect.destination);
+            state.frame_register = std::pair{destination, state.stack_offset};
+            if (state.cfa_register == base) state.cfa_register = destination;
+            break;
+        }
+        case Opcode::FramePush:
+            state.stack_offset += 8;
+            state.saves.emplace_back(
+                cfi_register_name(effect.transfers.front().reg),
+                -state.stack_offset);
+            break;
+        case Opcode::FramePop: {
+            const auto reg = cfi_register_name(effect.transfers.front().reg);
+            forget(reg);
+            state.stack_offset -= 8;
+            if (state.cfa_register == reg) state.cfa_register = base;
+            if (state.frame_register && state.frame_register->first == reg)
+                state.frame_register.reset();
+            break;
+        }
+        case Opcode::FrameSave:
+            for (const auto& transfer : effect.transfers) {
+                const auto reg = cfi_register_name(transfer.reg);
+                forget(reg);
+                state.saves.emplace_back(reg, transfer.offset - distance(base));
+            }
+            break;
+        case Opcode::FrameRestore:
+            for (const auto& transfer : effect.transfers)
+                forget(cfi_register_name(transfer.reg));
+            break;
+        default:
+            break;
+        }
+        state.cfa_offset = state.cfa_register == base
+            ? state.stack_offset : distance(state.cfa_register);
+        return state;
+    }
+
+    // Prints the directives that change the described state to `target`.
+    void cfi_transition(const CfiState& target) {
+        if (target.cfa_register != cfi_state_.cfa_register &&
+            target.cfa_offset != cfi_state_.cfa_offset) {
+            output_ << ".cfi_def_cfa %" << target.cfa_register << ", "
+                    << target.cfa_offset << '\n';
+        } else if (target.cfa_register != cfi_state_.cfa_register) {
+            output_ << ".cfi_def_cfa_register %" << target.cfa_register << '\n';
+        } else if (target.cfa_offset != cfi_state_.cfa_offset) {
+            output_ << ".cfi_def_cfa_offset " << target.cfa_offset << '\n';
+        }
+        for (const auto& save : target.saves) {
+            if (std::find(cfi_state_.saves.begin(), cfi_state_.saves.end(),
+                          save) == cfi_state_.saves.end()) {
+                output_ << ".cfi_offset %" << save.first << ", "
+                        << save.second << '\n';
+            }
+        }
+        for (const auto& save : cfi_state_.saves) {
+            if (std::none_of(target.saves.begin(), target.saves.end(),
+                             [&](const auto& kept) { return kept.first == save.first; })) {
+                output_ << ".cfi_restore %" << save.first << '\n';
+            }
+        }
+        cfi_state_ = target;
+    }
+
+    // A frame-program function describes each block with the entry state
+    // or, once its prologue has run, the body state.
+    void cfi_enter_block(const machine::Function& function, machine::BlockId id) {
+        if (!cfi_ || !function.frame.program) return;
+        cfi_transition(framed_[id.value] && function.frame.prologue_block != id
+                           ? cfi_body_ : CfiState{});
+    }
+
+    // Legacy frames describe each exit between .cfi_remember_state and
+    // .cfi_restore_state; this ends that region after the leaving transfer.
+    void finish_frame_exit() {
+        if (cfi_exit_) output_ << ".cfi_restore_state\n";
+        cfi_exit_ = false;
     }
 
     struct FloatLiteral {
@@ -10657,6 +10798,21 @@ private:
         return std::to_string(offset) + "(%rsp)";
     }
 
+    // The DWARF register (RBP 6, RSP 7) and the offset that memory(offset)
+    // addresses.
+    std::pair<unsigned, std::int64_t> frame_home(std::int32_t offset) const {
+        if (realigned_dynamic_frame_) return {6, offset};
+        if (dynamic_stack_) {
+            return {6, static_cast<std::int64_t>(offset) - frame_size_ -
+                           fixed_cfa_storage_};
+        }
+        if (red_zone_storage_ != 0 && offset >= 0 &&
+            static_cast<std::uint32_t>(offset) < red_zone_storage_) {
+            return {7, static_cast<std::int64_t>(offset) + red_zone_base_};
+        }
+        return {7, offset};
+    }
+
     std::string outgoing_memory(std::size_t offset) const {
         require_frame();
         return std::to_string(offset) + "(%rsp)";
@@ -11109,8 +11265,15 @@ private:
         // The ABI inputs have not been captured yet. Preserve both scratch
         // registers in the frame being allocated so probing cannot corrupt a
         // manual endpoint or an unusual model-defined parameter register.
+        // Without a frame pointer the CFA follows RSP, and R11, which holds
+        // the final RSP, while the probe loop moves RSP.
+        const bool stack_cfa = dwarf_cfi_enabled() &&
+                               !function.frame.has_frame_pointer &&
+                               format_ != ObjectFormat::MachO;
         instruction("pushq", "%r10");
+        if (stack_cfa) output_ << ".cfi_def_cfa_offset 16\n";
         instruction("pushq", "%r11");
+        if (stack_cfa) output_ << ".cfi_def_cfa_offset 24\n";
         if (function.frame.has_frame_pointer) {
             instruction(
                 "leaq",
@@ -11123,6 +11286,8 @@ private:
                 std::to_string(
                     16 - static_cast<std::int64_t>(frame_size_)) +
                     "(%rsp), %r11");
+            if (stack_cfa)
+                output_ << ".cfi_def_cfa %r11, " << frame_size_ + 8U << '\n';
         }
         if (realigned_stack_) {
             instruction(
@@ -11142,6 +11307,8 @@ private:
         instruction("jmp", probe);
         output_ << final_probe << ":\n";
         instruction("movq", "%r11, %rsp");
+        if (stack_cfa)
+            output_ << ".cfi_def_cfa %rsp, " << frame_size_ + 8U << '\n';
         instruction("testb", "$0, (%rsp)");
 
         if (function.frame.has_frame_pointer) {
@@ -11379,9 +11546,6 @@ private:
         const machine::Function& function) {
         if (function.frame.program) return;
         if (compact_gpr_saves_) {
-            if (dwarf_cfi_enabled()) {
-                output_ << ".cfi_remember_state\n";
-            }
             auto cfa_offset = 8U + static_cast<unsigned>(
                 function.callee_saved_registers.size() * 8U) +
                 (compact_gpr_call_pad_ ? 8U : 0U);
@@ -11492,6 +11656,7 @@ private:
 
     void instruction(std::string_view opcode,
                      std::string_view operands = {}) {
+        if (debug_) debug_->row(output_, pending_location_);
         output_ << '\t' << opcode;
         if (!operands.empty()) output_ << '\t' << operands;
         output_ << '\n';
@@ -20585,9 +20750,7 @@ private:
                 instruction("jmp",
                             "*" + register_name(target->storage_name, 64));
             }
-            if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
-                output_ << ".cfi_restore_state\n";
-            }
+            finish_frame_exit();
             return true;
         }
         if (callee) {
@@ -21379,9 +21542,7 @@ private:
         if (tail) {
             emit_frame_exit(function);
             emit_tail_call_transfer(*entity, *symbol);
-            if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
-                output_ << ".cfi_restore_state\n";
-            }
+            finish_frame_exit();
             return;
         }
         for (const auto& hidden : stable.implicit_register_values) {
@@ -22612,6 +22773,14 @@ private:
     // A shrink-wrapped exit that runs before the prologue has no frame.
     void emit_frame_exit(const machine::Function& function) {
         if (!frame_active_) return;
+        // Only an exit that changes the described state needs the region.
+        cfi_exit_ = cfi_ && !function.frame.program &&
+                    format_ != ObjectFormat::MachO &&
+                    (compact_gpr_saves_ || realigned_dynamic_frame_ ||
+                     (function.frame.has_frame_pointer
+                          ? frame_pointer_save_size_ != 0
+                          : frame_size_ + fixed_cfa_storage_ != 0));
+        if (cfi_exit_) output_ << ".cfi_remember_state\n";
         restore_allocated_preserved_registers(function);
         emit_frame_teardown(function);
     }
@@ -22651,6 +22820,12 @@ private:
             instruction("addq",
                         "$" + std::to_string(frame_size_ + fixed_cfa_storage_) +
                             ", %rsp");
+            // As at the frame-pointer pop below, Darwin's compact-unwind
+            // path takes no CFA reset before the return.
+            if (!function.frame.has_frame_pointer && dwarf_cfi_enabled() &&
+                format_ != ObjectFormat::MachO) {
+                output_ << ".cfi_def_cfa_offset 8\n";
+            }
         }
         if (function.frame.has_frame_pointer && frame_pointer_save_size_ != 0) {
             instruction("popq", "%rbp");
@@ -22739,6 +22914,7 @@ private:
         } else {
             instruction("retq");
         }
+        finish_frame_exit();
         return true;
     }
 
@@ -23017,12 +23193,9 @@ private:
         if (uses_wide_vectors_ && !wide_result) instruction("vzeroupper");
         emit_frame_exit(function);
         instruction("retq");
-        if (compact_gpr_saves_ && dwarf_cfi_enabled()) {
-            // The return block may precede cold blocks in layout. Restore the
-            // body CFA state so their unwind rows still describe the pushed
-            // saves rather than the completed epilogue.
-            output_ << ".cfi_restore_state\n";
-        }
+        // The return block may precede other blocks in layout, whose rows
+        // describe the body state again.
+        finish_frame_exit();
     }
 
     void emit_terminator(const machine::Function& function,
@@ -23656,7 +23829,10 @@ private:
             }
         }
         frame_active_ = framed_[value.id.value];
+        cfi_enter_block(function, value.id);
         if (function.frame.prologue_block == value.id) {
+            if (!value.instructions.empty())
+                pending_location_ = value.instructions.front().location;
             for (const auto& instruction : function.frame.program->prologue) {
                 emit_frame_instruction(instruction);
             }
@@ -23725,6 +23901,7 @@ private:
         for (std::size_t index = 0; index < value.instructions.size();
              ++index) {
             const auto& instruction_value = value.instructions[index];
+            pending_location_ = instruction_value.location;
             if (early_test_before[index]) {
                 (void)emit_early_masked_select_test(
                     function, *early_test_before[index]);
@@ -23968,6 +24145,19 @@ private:
         }
         output_ << symbol << ":\n";
         const auto first_jump_table = jump_tables_.size();
+        // Mach-O block labels are not temporary symbols, and llvm-mc takes
+        // no CFI directive after one; -g describes no Mach-O frames.
+        cfi_ = (unwind_enabled() && assembly_uses_dwarf_cfi(format_)) ||
+               (debug_ && debug_->frames() && format_ != ObjectFormat::MachO);
+        cfi_state_ = {};
+        cfi_exit_ = false;
+        if (function.frame.program) {
+            cfi_body_ = {};
+            for (const auto& instruction : function.frame.program->prologue)
+                cfi_body_ = after_frame_instruction(cfi_body_, instruction);
+        }
+        if (debug_) debug_->begin_function();
+        pending_location_ = function.location;
         if (dwarf_cfi_enabled()) output_ << ".cfi_startproc\n";
         const bool seh = format_ == ObjectFormat::Coff && unwind_enabled();
         if (seh) output_ << ".seh_proc " << symbol << "\n";
@@ -24105,7 +24295,8 @@ private:
                 emit_probed_static_frame(function, realigned_dynamic_frame_
                                                        ? fixed_cfa_storage + 8U
                                                        : fixed_cfa_storage);
-                if (dwarf_cfi_enabled() && !function.frame.has_frame_pointer) {
+                if (dwarf_cfi_enabled() && !function.frame.has_frame_pointer &&
+                    format_ == ObjectFormat::MachO) {
                     output_ << ".cfi_def_cfa_offset " << frame_size_ + 8U << '\n';
                 }
             } else if (realigned_stack_) {
@@ -24218,6 +24409,7 @@ private:
             }
         }
         emit_variadic_prologue(function, entity);
+        if (debug_) debug_->end_prologue();
 
         copy_locations_.emplace(function);
         edge_temporaries_ = edge_offsets(function);
@@ -24231,11 +24423,58 @@ private:
         for (const auto& stub : deferred_edge_stubs_) {
             frame_active_ = framed_[stub.predecessor.value];
             output_ << stub.label << ":\n";
+            if (cfi_ && function.frame.program)
+                cfi_transition(frame_active_ ? cfi_body_ : CfiState{});
+            if (const auto& from = block(function, stub.predecessor).instructions;
+                !from.empty()) {
+                pending_location_ = from.back().location;
+            }
             emit_edge_copies(function, stub.predecessor, stub.successor);
             instruction("jmp", block_label(function, stub.successor));
         }
         if (dwarf_cfi_enabled()) output_ << ".cfi_endproc\n";
         if (seh) output_ << ".seh_endproc\n";
+        // Slot homes hold their variables in every block of a frame that is
+        // set up at entry.
+        if (debug_ && debug_->variables() && !function.frame.prologue_block) {
+            for (std::uint32_t index = 0; index < function.stack_slots.size(); ++index) {
+                const auto& slot = function.stack_slots[index];
+                if (slot.kind != machine::StackSlotKind::Local) continue;
+                if (slot.hard_register) {
+                    if (const auto* view = machine_register_view(*slot.hard_register);
+                        view && dwarf_register(view->storage_name)) {
+                        debug_->slot_home(index, slot.name,
+                                          *dwarf_register(view->storage_name), 0, true);
+                    }
+                } else if (!slot.elided && slot.frame_offset) {
+                    const auto [reg, offset] = frame_home(*slot.frame_offset);
+                    debug_->slot_home(index, slot.name, reg, offset);
+                }
+            }
+            // A scalar parameter value without a register keeps its own home.
+            for (const auto& instruction : block(function, function.entry).instructions) {
+                if (instruction.kind != machine::InstructionKind::Target ||
+                    (instruction.opcode != Opcode::Parameter &&
+                     instruction.opcode != Opcode::Fparameter &&
+                     instruction.opcode != Opcode::Vparameter) ||
+                    instruction.defs.empty() || instruction.operands.empty())
+                    continue;
+                const auto value = instruction.defs.front();
+                if (value.kind != machine::RegisterKind::Virtual ||
+                    value.id >= spill_homes_.size() ||
+                    spill_homes_[value.id] == std::numeric_limits<std::size_t>::max() ||
+                    (value.id < function.virtual_register_assignments.size() &&
+                     function.virtual_register_assignments[value.id]))
+                    continue;
+                const auto& home = function.stack_slots[spill_homes_[value.id]];
+                if (home.elided || !home.frame_offset || home.frame_color) continue;
+                const auto [reg, offset] = frame_home(*home.frame_offset);
+                debug_->parameter_home(
+                    std::get<machine::ImmediateOperand>(instruction.operands.front()).value,
+                    reg, offset);
+            }
+        }
+        if (debug_) output_ << debug_->end_function(function.source, symbol, cfi_) << ":\n";
         if (format_ == ObjectFormat::Elf) {
             output_ << ".size " << symbol << ", .-" << symbol << "\n";
         }
@@ -24263,6 +24502,16 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    // Null without -g.
+    native::DebugInfo* debug_{};
+    // The source position of the instructions being printed.
+    SourceLocation pending_location_;
+    bool cfi_{};
+    // Inside a legacy frame's exit, between remember and restore.
+    bool cfi_exit_{};
+    // The state the printed directives describe, and that of the body.
+    CfiState cfi_state_;
+    CfiState cfi_body_;
     std::ostringstream output_;
     std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::vector<FloatLiteral> float_literals_;
@@ -24343,10 +24592,11 @@ std::string emit_managed_machine_assembly(machine::Module& module,
                                           const DynamicAbiPlans& dynamic_plans,
                                           const Subtarget& subtarget,
                                           const CompilerOptions& options,
-                                          Diagnostics& diagnostics) {
+                                          Diagnostics& diagnostics,
+                                          native::DebugInfo* debug) {
     return AssemblyEmitter(
         module, hir_module, manual_plans, dynamic_plans, subtarget, options,
-        diagnostics).run();
+        diagnostics, debug).run();
 }
 
 } // namespace cross::x86_64

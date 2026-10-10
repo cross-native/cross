@@ -79,6 +79,17 @@ struct ResolvedOption {
 
 // Triple chosen when the toolchain was configured (CROSS_DEFAULT_TARGET).
 std::string_view default_target();
+// The toolchain name and version that --version prints first.
+std::string_view toolchain_version();
+
+// The contents of the debug model entry -g selected.
+struct DebugInfoOptions {
+    bool eh_frame{};
+    bool lines{};
+    bool frames{};
+    bool variables{};
+    bool types{};
+};
 
 struct CompilerOptions {
     EmitKind emit{EmitKind::Link};
@@ -195,6 +206,7 @@ struct CompilerOptions {
     bool private_abi{};
     bool ipa_cp_clone{};
     unsigned inline_unit_limit{96};
+    std::optional<DebugInfoOptions> debug_info;
 
     bool wrapv{};
     bool bounds_trap{};

@@ -1,5 +1,6 @@
-# Target-independent optimization presets. Every setting names a public typed
-# option; target modules may add target-constrained presets under other names.
+# Target-independent optimization presets and debug entries. Every preset
+# setting names a public typed option; target modules may add
+# target-constrained presets under other names.
 
 optimization "O0" {
     f.optimize-for = "debug";
@@ -159,4 +160,25 @@ optimization "Oz" {
     f.optimize-for = "minimum-size";
     f.if-conversion-limit = 3;
     f.inline-limit = 8;
+}
+
+# Debugging information that -g emits; profiles name one with `debug`.
+debug "dwarf" {
+    format = "dwarf";
+    version = 5;
+    frame_section = "debug_frame";
+    lines = true;
+    frames = true;
+    variables = true;
+    types = true;
+}
+
+debug "dwarf-lines" {
+    format = "dwarf";
+    version = 5;
+    frame_section = "debug_frame";
+    lines = true;
+    frames = true;
+    variables = false;
+    types = false;
 }

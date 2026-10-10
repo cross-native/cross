@@ -3911,7 +3911,8 @@ written on the command line, after `-ffile-prefix-map=OLD=NEW` replaces a
 leading `OLD` with `NEW` (when several mappings match, the last one applies);
 `$::source::file`, source-unit identities,
 implementation-internal symbol names, and debugging information use that
-spelling, never a path the compiler resolved. Within a source unit and
+spelling, never a path the compiler resolved, and record `.` as the
+compilation directory. Within a source unit and
 section, definitions are emitted in definition order, and source units in
 command-line order, so adding a definition to one source unit changes no other
 unit's symbols or layout.

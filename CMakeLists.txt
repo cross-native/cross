@@ -160,10 +160,17 @@ add_library(cross_middle
 target_link_libraries(cross_middle PUBLIC cross_frontend cross_targets)
 cross_component(cross_middle)
 
+add_library(cross_debug_info
+    src/backend/native/debug_info.cpp
+)
+target_link_libraries(cross_debug_info PUBLIC cross_middle cross_targets)
+cross_component(cross_debug_info)
+
 add_library(cross_raw_backend
     src/target/x86_64/raw_backend.cpp
 )
-target_link_libraries(cross_raw_backend PUBLIC cross_middle cross_targets)
+target_link_libraries(cross_raw_backend PUBLIC cross_middle cross_targets
+                                             cross_debug_info)
 cross_component(cross_raw_backend)
 
 add_library(cross_native_backend
@@ -2053,6 +2060,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/model_validation.cmake")
     set_tests_properties(cross_model_validation PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver")
+    add_test(NAME cross_model_debug_entries
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-debug-entries
+                -P "${CMAKE_SOURCE_DIR}/test/model/debug_entries.cmake")
+    set_tests_properties(cross_model_debug_entries PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;feature.model;feature.driver;feature.debug")
     add_test(NAME cross_mangling_dsl
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2874,6 +2888,16 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/zero_init_in_data.cmake")
     set_tests_properties(cross_zero_init_in_data PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.object")
+    add_test(NAME cross_debug_info
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info.x
+                -DHEADER=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_header.x
+                -DPROBE=${CMAKE_SOURCE_DIR}/test/backend/machine/static_stack_probe.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/debug-info
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/debug_info.cmake")
+    set_tests_properties(cross_debug_info PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.debug;feature.object;feature.frame")
     add_test(NAME cross_symbol_indirection
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

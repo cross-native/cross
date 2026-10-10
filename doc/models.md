@@ -973,7 +973,7 @@ debug "dwarf" {
 
 | Property | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `format` | text | none | `dwarf` is the only shipped emitter. |
+| `format` | text | none | `dwarf` is the only shipped emitter; it implements version 5. |
 | `version` | integer | emitter default | The format version. |
 | `frame_section` | text | `debug_frame` | Where call-frame information goes: `debug_frame` (not loaded) or `eh_frame` (loaded; `-funwind-tables` emits the latter independently). |
 | `lines` | bool | `true` | Line tables and inlining origins for every emitted function, including clones. |

@@ -19,6 +19,10 @@ class Diagnostics;
 class Subtarget;
 struct TargetInfo;
 
+namespace native {
+class DebugInfo;
+}
+
 // Production code-generation boundary implemented once per architecture.
 // The driver and middle end never name architecture ABI-plan or instruction
 // selector types; a RISC backend can use the same HIR/MIR while supplying its
@@ -82,7 +86,7 @@ public:
     [[nodiscard]] std::string emit_managed_assembly(
         mir::ManagedModule& managed_module, hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
-        Diagnostics& diagnostics) const;
+        native::DebugInfo& debug, Diagnostics& diagnostics) const;
 
     [[nodiscard]] virtual machine::Module lower_machine(
         const mir::ManagedModule& managed_module,
@@ -102,6 +106,29 @@ public:
         const hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
         Diagnostics& diagnostics) const = 0;
+
+    // Emitters that describe their functions in `debug` (line rows,
+    // call-frame directives, and address ranges) override these; the
+    // defaults emit the same code and describe nothing.
+    [[nodiscard]] virtual mir::AssemblyBundle emit_raw_assembly_with_debug(
+        const mir::RawModule& raw_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module, const Subtarget& subtarget,
+        const CompilerOptions& options, native::DebugInfo&,
+        Diagnostics& diagnostics) const {
+        return emit_raw_assembly(raw_module, managed_module, hir_module,
+                                 subtarget, options, diagnostics);
+    }
+    [[nodiscard]] virtual std::string emit_machine_assembly_with_debug(
+        machine::Module& machine_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module,
+        const Subtarget& subtarget, const CompilerOptions& options,
+        native::DebugInfo&, Diagnostics& diagnostics) const {
+        return emit_machine_assembly(machine_module, managed_module,
+                                     hir_module, subtarget, options,
+                                     diagnostics);
+    }
 };
 
 [[nodiscard]] const std::vector<const TargetBackend*>& all_target_backends();

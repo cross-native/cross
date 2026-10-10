@@ -12,7 +12,8 @@ namespace cross::native {
 std::string run_machine_pipeline(
     const TargetBackend& backend, mir::ManagedModule& managed_module,
     hir::Module& hir_module, const Subtarget& subtarget,
-    const CompilerOptions& options, Diagnostics& diagnostics) {
+    const CompilerOptions& options, DebugInfo& debug,
+    Diagnostics& diagnostics) {
     auto module = backend.lower_machine(
         managed_module, hir_module, subtarget, options, diagnostics);
     if (diagnostics.errors() != 0 || !machine::verify(module, diagnostics)) {
@@ -22,8 +23,9 @@ std::string run_machine_pipeline(
         !audit_standalone(module, hir_module, diagnostics)) {
         return {};
     }
-    return backend.emit_machine_assembly(
-        module, managed_module, hir_module, subtarget, options, diagnostics);
+    return backend.emit_machine_assembly_with_debug(
+        module, managed_module, hir_module, subtarget, options, debug,
+        diagnostics);
 }
 
 } // namespace cross::native

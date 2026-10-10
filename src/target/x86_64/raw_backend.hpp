@@ -9,6 +9,10 @@
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
+namespace cross::native {
+class DebugInfo;
+}
+
 namespace cross::x86_64 {
 
 mir::RawModule lower_raw(const hir::Module& hir_module, const Subtarget& subtarget,
@@ -19,6 +23,7 @@ mir::AssemblyBundle emit_raw_assembly(const mir::RawModule& mir_module,
                                       const hir::Module& hir_module,
                                       const Subtarget& subtarget,
                                       const CompilerOptions& options,
-                                      Diagnostics& diagnostics);
+                                      Diagnostics& diagnostics,
+                                      native::DebugInfo* debug = nullptr);
 
 } // namespace cross::x86_64

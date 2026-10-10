@@ -80,6 +80,17 @@ public:
             diagnostics);
     }
 
+    mir::AssemblyBundle emit_raw_assembly_with_debug(
+        const mir::RawModule& raw_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module, const Subtarget& subtarget,
+        const CompilerOptions& options, native::DebugInfo& debug,
+        Diagnostics& diagnostics) const override {
+        return x86_64::emit_raw_assembly(
+            raw_module, managed_module, hir_module, subtarget, options,
+            diagnostics, &debug);
+    }
+
     bool prepare_managed(
         mir::ManagedModule& managed_module, hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
@@ -244,6 +255,27 @@ public:
         const hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
         Diagnostics& diagnostics) const override {
+        return emit_machine(machine_module, managed_module, hir_module,
+                            subtarget, options, nullptr, diagnostics);
+    }
+
+    std::string emit_machine_assembly_with_debug(
+        machine::Module& machine_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module,
+        const Subtarget& subtarget, const CompilerOptions& options,
+        native::DebugInfo& debug, Diagnostics& diagnostics) const override {
+        return emit_machine(machine_module, managed_module, hir_module,
+                            subtarget, options, &debug, diagnostics);
+    }
+
+private:
+    std::string emit_machine(
+        machine::Module& machine_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module,
+        const Subtarget& subtarget, const CompilerOptions& options,
+        native::DebugInfo* debug, Diagnostics& diagnostics) const {
         const auto manual_plans = build_manual_abi_plans(
             hir_module, subtarget.target(), subtarget, options, diagnostics,
             &managed_module);
@@ -254,7 +286,7 @@ public:
         if (diagnostics.errors() != 0) return {};
         return emit_managed_machine_assembly(
             machine_module, hir_module, manual_plans, dynamic_plans,
-            subtarget, options, diagnostics);
+            subtarget, options, diagnostics, debug);
     }
 };
 

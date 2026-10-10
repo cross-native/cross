@@ -197,6 +197,7 @@ struct ModelDocument {
     std::vector<ManglingEntry> manglings;
     std::vector<OptimizationEntry> optimizations;
     std::vector<ProfileEntry> profiles;
+    std::vector<DebugEntry> debugs;
 };
 
 class ModelParser {
@@ -210,14 +211,15 @@ public:
             if (current_.kind != ModelTokenKind::Identifier) {
                 fail(current_.line,
                      "expected model domain: abi, mangling, optimization, "
-                     "or profile");
+                     "profile, or debug");
                 break;
             }
             const auto domain = current_.text;
             const auto line = current_.line;
             advance();
             if (domain != "abi" && domain != "mangling" &&
-                domain != "optimization" && domain != "profile") {
+                domain != "optimization" && domain != "profile" &&
+                domain != "debug") {
                 fail(line, "unknown model domain '" + domain + "'");
                 break;
             }
@@ -251,6 +253,11 @@ public:
                         make_optimization(name, *properties, line)) {
                     entry->source = position(line);
                     result.optimizations.push_back(std::move(*entry));
+                }
+            } else if (domain == "debug") {
+                if (auto entry = make_debug(name, *properties, line)) {
+                    entry->source = position(line);
+                    result.debugs.push_back(std::move(*entry));
                 }
             } else if (auto entry = make_profile(name, *properties, line)) {
                 entry->source = position(line);
@@ -2412,13 +2419,65 @@ private:
         result.abi = text_property(properties, "abi");
         result.mangling = text_property(properties, "mangling");
         result.optimization = text_property(properties, "optimization");
+        result.debug = text_property(properties, "debug");
         if (!floating_environment(properties, result.floating_environment) ||
             !collect_option_properties(
                 properties,
                 {"default_for", "target", "abi", "mangling", "optimization",
-                 "fp_traps", "fp_denormal_operand", "fp_denormal_result"},
+                 "debug", "fp_traps", "fp_denormal_operand",
+                 "fp_denormal_result"},
                 result.options)) {
             return std::nullopt;
+        }
+        if (!error_.empty()) return std::nullopt;
+        return result;
+    }
+
+    std::optional<DebugEntry> make_debug(
+        std::string name, const ModelProperties& properties, unsigned line) {
+        if (!known_properties(properties,
+                              {"format", "version", "frame_section", "lines",
+                               "frames", "variables", "types"})) {
+            return std::nullopt;
+        }
+        DebugEntry result;
+        result.canonical_name = std::move(name);
+        const auto line_of = [&](const char* property) {
+            return properties.at(property).line;
+        };
+        const auto format = text_property(properties, "format", line);
+        if (!format) return std::nullopt;
+        if (*format != "dwarf") {
+            fail(line_of("format"), "unknown debug format '" + *format +
+                                        "'; the implemented format is 'dwarf'");
+            return std::nullopt;
+        }
+        if (const auto version = unsigned_property(properties, "version")) {
+            if (*version != 5) {
+                fail(line_of("version"),
+                     "the dwarf debug format implements version 5");
+                return std::nullopt;
+            }
+            result.version = *version;
+        }
+        if (const auto section = text_property(properties, "frame_section")) {
+            if (*section != "debug_frame" && *section != "eh_frame") {
+                fail(line_of("frame_section"),
+                     "debug frame_section must be 'debug_frame' or 'eh_frame'");
+                return std::nullopt;
+            }
+            result.eh_frame = *section == "eh_frame";
+        }
+        const std::pair<const char*, bool*> contents[] = {
+            {"lines", &result.lines},
+            {"frames", &result.frames},
+            {"variables", &result.variables},
+            {"types", &result.types},
+        };
+        for (const auto& [property, flag] : contents) {
+            if (const auto value = bool_property(properties, property)) {
+                *flag = *value;
+            }
         }
         if (!error_.empty()) return std::nullopt;
         return result;
@@ -2583,8 +2642,8 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
         }
     }
 
-    // Mangling, optimization, and profile names are unique within their
-    // kind.
+    // Mangling, optimization, profile, and debug names are unique within
+    // their kind.
     const auto unique_names = [&](const auto& loaded, const auto& added,
                                   std::string_view kind) {
         std::unordered_set<std::string_view> names;
@@ -2602,7 +2661,8 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     if (!unique_names(manglings_, document->manglings, "mangling") ||
         !unique_names(optimizations_, document->optimizations,
                       "optimization") ||
-        !unique_names(profiles_, document->profiles, "profile")) {
+        !unique_names(profiles_, document->profiles, "profile") ||
+        !unique_names(debugs_, document->debugs, "debug")) {
         return false;
     }
 
@@ -2641,6 +2701,9 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     }
     for (auto& entry : document->profiles) {
         profiles_.push_back(std::move(entry));
+    }
+    for (auto& entry : document->debugs) {
+        debugs_.push_back(std::move(entry));
     }
     origins_.push_back(std::move(origin));
     return true;
@@ -2757,6 +2820,13 @@ const ProfileEntry* ModelRegistry::find_profile(std::string_view name) const {
 const OptimizationEntry* ModelRegistry::find_optimization(
     std::string_view name) const {
     for (const auto& entry : optimizations_) {
+        if (entry.canonical_name == name) return &entry;
+    }
+    return nullptr;
+}
+
+const DebugEntry* ModelRegistry::find_debug(std::string_view name) const {
+    for (const auto& entry : debugs_) {
         if (entry.canonical_name == name) return &entry;
     }
     return nullptr;
@@ -2918,6 +2988,9 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             return fail("names unknown optimization preset '" +
                         *profile.optimization + "'");
         }
+        if (profile.debug && !registry.find_debug(*profile.debug)) {
+            return fail("names unknown debug entry '" + *profile.debug + "'");
+        }
         const std::span<const TargetInfo* const> targets =
             target ? std::span<const TargetInfo* const>(&target, 1)
                    : std::span<const TargetInfo* const>{};
@@ -3063,10 +3136,30 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
     const std::span<const OptionAssignment> profile_options =
         profile ? std::span<const OptionAssignment>(profile->options)
                 : std::span<const OptionAssignment>{};
+    for (auto& option : options.command_options) {
+        if (option.name != "g") continue;
+        if (const auto* enabled = std::get_if<bool>(&option.value)) {
+            option.value = !*enabled ? std::string()
+                           : profile && profile->debug ? *profile->debug
+                                                       : std::string("dwarf");
+        }
+    }
     if (!resolve_registered_options(
             options, target_definitions, preset_options, profile_options,
             diagnostics)) {
         return false;
+    }
+    if (const auto debug = resolved_text(options, "g"); !debug.empty()) {
+        const auto* entry = registry.find_debug(debug);
+        if (!entry) {
+            diagnostics.command_error("unknown debug entry '" +
+                                      std::string(debug) + "' from " +
+                                      find_resolved_option(options, "g")->source);
+            return false;
+        }
+        options.debug_info = DebugInfoOptions{
+            entry->eh_frame, entry->lines, entry->frames, entry->variables,
+            entry->types};
     }
     if (selected_target &&
         !normalize_subtarget_options(

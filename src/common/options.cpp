@@ -618,6 +618,12 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.bounds-trap", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Semantic, false, OptionImplementation::Partial,
          "trap on array subscripts outside a known bound"},
+
+        // Debugging information: the debug model entry -g selects, or none.
+        {"g", {}, OptionValueKind::Text, std::string(), {}, 0, 0,
+         OptionCategory::CodeGeneration, false,
+         OptionImplementation::Partial,
+         "debug model entry whose information is emitted; empty for none"},
     };
     return definitions;
 }
@@ -1084,6 +1090,19 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         if (argument == "--print-builtins") { options.print_builtins = true; continue; }
         if (argument == "--print-instructions") { options.print_instructions = true; continue; }
         if (argument == "--print-features") { options.print_features = true; continue; }
+        // -g selects the profile's debug entry once the models are loaded.
+        if (argument == "-g" || argument == "-g0" || argument.starts_with("-g=")) {
+            if (argument == "-g=") {
+                diagnostics.command_error("missing debug entry name after '-g='");
+                continue;
+            }
+            add_command_option(options, "g",
+                               argument == "-g"    ? OptionValue{true}
+                               : argument == "-g0" ? OptionValue{false}
+                                                   : OptionValue{std::string(argument.substr(3))},
+                               std::string(argument));
+            continue;
+        }
         if (common_option(argc, argv, index, options, diagnostics)) continue;
         if (argument == "-e" || argument.starts_with("-L") ||
             argument.starts_with("-l") || argument == "-nostdlib" ||
@@ -1132,8 +1151,12 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
 
 std::string_view default_target() { return CROSS_DEFAULT_TARGET; }
 
+std::string_view toolchain_version() {
+    return "Cross toolchain 0.1.0 (language 0.9)";
+}
+
 void print_version() {
-    std::cout << "Cross toolchain 0.1.0 (language 0.9)\n"
+    std::cout << toolchain_version() << "\n"
                  "Default target: " << default_target() << "\n"
                  "Copyright (C) 2026 Cross contributors\n"
                  "License GPLv3+: GNU GPL version 3 or later\n";
@@ -1159,6 +1182,9 @@ void print_cc_help() {
   -O0/-Og/-O1/-O2/-O3/-Os/-Oz
                         select a model-defined optimization preset
   -O=NAME               select any loaded optimization preset
+  -g, -g=NAME           emit debugging information per the profile's or the
+                        named debug model entry
+  -g0                   emit no debugging information
   -fOPTION/-fno-OPTION  set a registered common boolean option
   -fOPTION=VALUE        set a registered common valued option
   -target TRIPLE        select a compiled-in target

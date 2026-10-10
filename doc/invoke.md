@@ -89,10 +89,34 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-feval-step-limit=N`, `-feval-depth-limit=N`, `-feval-memory-limit=N`, `-feval-byte-limit=N` | Limits for compile-time evaluation and macro expansion. |
 | `-fgeneric-instance-limit=N`, `-fgeneric-depth-limit=N` | Limits for generic instances per compilation (default 4096) and nested instantiation (default 128). |
 | `-fzero-init-in-data` | Put zero-valued static objects with the initialized data instead of zero-filled storage such as `.bss`, so that an image patcher can change them. |
-| `-ffile-prefix-map=OLD=NEW` | Spell source paths that start with `OLD` as `NEW` in `$::source::file` and internal symbol names; line markers, dependency files, and diagnostics keep the real paths. Repeatable; the last matching mapping applies. |
+| `-ffile-prefix-map=OLD=NEW` | Spell source paths that start with `OLD` as `NEW` in `$::source::file`, internal symbol names, and debugging information; line markers, dependency files, and diagnostics keep the real paths. Repeatable; the last matching mapping applies. |
 
 Options that have no meaning without a hosted runtime, such as `-fno-builtin`,
 `-nostdlib`, or `-Ofast`, are rejected rather than ignored.
+
+## Debugging information
+
+| Option | Effect |
+| --- | --- |
+| `-g` | Emit the debugging information of the profile's `debug` model entry, by default the shipped `dwarf`. |
+| `-g=NAME` | Emit that of the loaded `debug` entry `NAME`, such as the shipped `dwarf-lines`. |
+| `-g0` | Emit none (the default). |
+
+The last of these options counts. The shipped `dwarf` entry emits DWARF 5:
+line tables, call-frame information in `.debug_frame` (not loaded; with
+`-funwind-tables` the frames are also in `.eh_frame`), and the compile unit
+with its namespaces, functions, variables, and types. `dwarf-lines` emits
+only the line tables and the call-frame information, and
+[models.md](models.md#debug-entries) describes entries of your own.
+
+Debuggers read the compile unit as C++, so qualified names work as in
+`break app::run`; generic instances and the specialized copies of a function
+carry the function's own name beside their link names. `-g` never changes the
+generated code. Paths in the debugging information are the inputs as written,
+after `-ffile-prefix-map`, and the compilation directory is `.`, so the
+output does not depend on the working directory. `-g` is an error with
+`-emit-llvm` and `-emit-gimple`. [targets.md](targets.md) states what each
+object format and target describes.
 
 ## Preprocessing
 

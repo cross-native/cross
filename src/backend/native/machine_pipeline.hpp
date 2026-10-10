@@ -19,13 +19,16 @@ struct ManagedModule;
 
 namespace native {
 
+class DebugInfo;
+
 // Architecture-independent production path. A target supplies selection,
 // legality, allocation policy, and assembly printing through TargetBackend;
 // the common driver owns structural verification and the standalone audit.
 [[nodiscard]] std::string run_machine_pipeline(
     const TargetBackend& backend, mir::ManagedModule& managed_module,
     hir::Module& hir_module, const Subtarget& subtarget,
-    const CompilerOptions& options, Diagnostics& diagnostics);
+    const CompilerOptions& options, DebugInfo& debug,
+    Diagnostics& diagnostics);
 
 } // namespace native
 } // namespace cross

@@ -48,6 +48,11 @@ records; no unwinder is linked. By default functions assume nothing unwinds
 through them; `-funwind-model=platform` keeps incoming frame state intact for a
 platform unwinder even without tables.
 
+`-g` adds DWARF 5 debugging information ([invoke.md](invoke.md#debugging-information))
+in all three formats. ELF and COFF objects describe frames in `.debug_frame`,
+beside the SEH records of COFF unwind tables. Mach-O objects get no
+call-frame information from `-g`; `-funwind-tables` still emits it.
+
 Only address space 0 exists on the current targets, so
 `[[address_space(N)]]` with any other `N` is an error.
 
@@ -222,7 +227,10 @@ LL/SC atomics, variadic functions, the machine-instruction built-ins below,
 and naked functions. Not supported: vectors, integers wider than 64 bits,
 register locations outside naked functions, position-independent code
 (`-mabicalls`), thread-local storage, MIPS16, microMIPS, and the Allegrex
-VFPU. They are diagnosed when used. A `[[musttail]]` call passes every
+VFPU. They are diagnosed when used. With `-g`, MIPS objects have the compile
+unit with its global variables and types, but no line table, function
+entries, or call-frame information; with `-funwind-tables` as well, the
+unwind records are also written to `.debug_frame`. A `[[musttail]]` call passes every
 argument in a register, cannot target a variadic function or leave a function
 that binds variadic state, and neither function may have `out` or `inout`
 parameters.
@@ -304,10 +312,18 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 
 ## Limits on all targets
 
-- Specified but not implemented yet: the floating intrinsics, and `debug`
-  entries and `-g`.
+- Specified but not implemented yet: the floating intrinsics.
 - `-fbounds-trap` checks only subscripts of arrays with a known bound; it
   does not check subscripts of pointers or `out` and `inout` channels.
+- `-g` describes inlined code with the lines of the function it came from,
+  inside its caller, without inlined-subroutine entries. Variables have
+  locations only where one home holds them for the whole function: the frame
+  slots of functions whose frame is set up at entry, parameters that the
+  register allocator does not assign, register-bound objects, and global
+  objects. Values kept in registers by the optimizer, the pointer through
+  which an `out` or `inout` parameter is copied back, typedef names, lexical
+  scopes, thread-local objects, and big-endian bit-fields are not described,
+  and naked functions have no call-frame information.
 - Generic records and unions (`struct list<T>`) are specified but not
   implemented; `$::feature::generic_types` is absent.
 - A function is wrapped for another ABI or other register locations only

@@ -120,6 +120,7 @@ struct ProfileEntry {
     std::optional<std::string> abi;
     std::optional<std::string> mangling;
     std::optional<std::string> optimization;
+    std::optional<std::string> debug;
     std::vector<OptionAssignment> options;
     floating::Environment floating_environment;
 };
@@ -130,6 +131,19 @@ struct OptimizationEntry {
     std::optional<std::string> inherits;
     std::vector<std::string> targets;
     std::vector<OptionAssignment> options;
+};
+
+// The debugging information -g emits; `dwarf` is the only format.
+struct DebugEntry {
+    std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
+    unsigned version{5};
+    // Call-frame information goes to the loaded .eh_frame, not .debug_frame.
+    bool eh_frame{};
+    bool lines{true};
+    bool frames{true};
+    bool variables{true};
+    bool types{true};
 };
 
 struct ShippedModelSource {
@@ -157,6 +171,7 @@ public:
         std::string_view name) const;
     [[nodiscard]] const OptimizationEntry* find_optimization(
         std::string_view name) const;
+    [[nodiscard]] const DebugEntry* find_debug(std::string_view name) const;
     // The profiles whose default_for patterns match `triple` most
     // specifically; more than one is an ambiguous default.
     [[nodiscard]] std::vector<const ProfileEntry*> default_profiles(
@@ -174,6 +189,9 @@ public:
     [[nodiscard]] const std::vector<OptimizationEntry>& optimizations() const {
         return optimizations_;
     }
+    [[nodiscard]] const std::vector<DebugEntry>& debugs() const {
+        return debugs_;
+    }
     [[nodiscard]] const std::vector<std::string>& origins() const {
         return origins_;
     }
@@ -186,6 +204,7 @@ private:
     std::vector<ManglingEntry> manglings_;
     std::vector<ProfileEntry> profiles_;
     std::vector<OptimizationEntry> optimizations_;
+    std::vector<DebugEntry> debugs_;
     std::vector<std::string> origins_;
     std::unordered_set<std::string> loaded_files_;
 };

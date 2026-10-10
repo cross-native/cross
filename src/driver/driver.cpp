@@ -10,6 +10,7 @@
 #endif
 #include "backend/native/assembler.hpp"
 #include "backend/native/data_emitter.hpp"
+#include "backend/native/debug_info.hpp"
 #include "common/options.hpp"
 #include "common/relocation_addend.hpp"
 #include "common/source.hpp"
@@ -253,6 +254,17 @@ void print_models() {
     for (const auto& origin : model_registry().origins()) {
         std::cout << origin << '\n';
     }
+    for (const auto& debug : model_registry().debugs()) {
+        std::cout << "debug " << debug.canonical_name
+                  << "  format: dwarf  version: " << debug.version
+                  << "  frame_section: "
+                  << (debug.eh_frame ? "eh_frame" : "debug_frame")
+                  << "  lines: " << (debug.lines ? "on" : "off")
+                  << "  frames: " << (debug.frames ? "on" : "off")
+                  << "  variables: " << (debug.variables ? "on" : "off")
+                  << "  types: " << (debug.types ? "on" : "off")
+                  << "  source: " << debug.source << '\n';
+    }
 }
 
 void print_profiles() {
@@ -266,6 +278,7 @@ void print_profiles() {
         if (profile.optimization) {
             std::cout << "  optimization: " << *profile.optimization;
         }
+        if (profile.debug) std::cout << "  debug: " << *profile.debug;
         std::cout << '\n';
         for (const auto& option : profile.options) {
             std::cout << "    " << option.name << " = "
@@ -343,7 +356,7 @@ void print_options(const CompilerOptions& options) {
             continue;
         }
         if (category == "common" &&
-            !definition->name.starts_with("f.")) {
+            definition->name.starts_with("m.")) {
             continue;
         }
         if (category == "target" &&
@@ -930,6 +943,13 @@ int cc_main(int argc, char** argv) {
         diagnostics.command_error("cc does not link; use -S, -c, or -E");
         return 1;
     }
+    if (options.debug_info && (options.emit == EmitKind::LlvmTextDebug ||
+                               options.emit == EmitKind::GimpleTextDebug ||
+                               options.emit == EmitKind::GimpleRtlTextDebug)) {
+        diagnostics.command_error(
+            "-g is not implemented for -emit-llvm and -emit-gimple output");
+        return 1;
+    }
 
     SourceManager sources;
     std::vector<std::string> preprocessed;
@@ -1137,8 +1157,11 @@ int cc_main(int argc, char** argv) {
         return 1;
     }
     if (options.verbose) std::cerr << "cc: emitting raw machine assembly\n";
-    auto raw_assembly = backend->emit_raw_assembly(
-        raw_mir, managed_mir, hir_module, *subtarget, options, diagnostics);
+    native::DebugInfo debug(options, hir_module, managed_mir,
+                            program.enumerations, *subtarget);
+    auto raw_assembly = backend->emit_raw_assembly_with_debug(
+        raw_mir, managed_mir, hir_module, *subtarget, options, debug,
+        diagnostics);
     if (diagnostics.errors() != 0) return 1;
     const codegen::ModuleView patch_data_module{
         hir_module, data_module, managed_mir, raw_mir, raw_assembly};
@@ -1194,10 +1217,11 @@ int cc_main(int argc, char** argv) {
                       << " Machine IR and emitting target assembly\n";
         }
         auto assembly = backend->emit_managed_assembly(
-            managed_mir, hir_module, *subtarget, options, diagnostics);
+            managed_mir, hir_module, *subtarget, options, debug, diagnostics);
         assembly += raw_assembly.module_assembly;
         assembly += native::emit_data_assembly(
             codegen_module, *subtarget, options, diagnostics);
+        assembly = debug.finish(std::move(assembly));
         if (subtarget->object_format() == ObjectFormat::MachO) {
             assembly += ".subsections_via_symbols\n";
         }

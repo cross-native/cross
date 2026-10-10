@@ -14,6 +14,10 @@
 
 #include <string>
 
+namespace cross::native {
+class DebugInfo;
+}
+
 namespace cross::x86_64 {
 
 // Legalize verified target-independent managed MIR into x86-64 Machine IR.
@@ -40,6 +44,7 @@ std::string emit_managed_machine_assembly(machine::Module& module,
                                           const DynamicAbiPlans& dynamic_plans,
                                           const Subtarget& subtarget,
                                           const CompilerOptions& options,
-                                          Diagnostics& diagnostics);
+                                          Diagnostics& diagnostics,
+                                          native::DebugInfo* debug = nullptr);
 
 } // namespace cross::x86_64
