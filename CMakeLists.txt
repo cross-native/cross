@@ -3045,6 +3045,37 @@ if(BUILD_TESTING)
         set_tests_properties(cross_generic_instance_objects_${arch} PROPERTIES
             LABELS "check.compile;arch.${arch};backend.native;feature.object;feature.generic;feature.linkage")
     endforeach()
+    foreach(triple IN ITEMS x86_64-unknown-linux-gnu x86_64-w64-windows-gnu
+                            x86_64-apple-darwin mips64-unknown-elf mips64el-unknown-elf)
+        string(REGEX MATCH "^(x86_64|mips)" arch "${triple}")
+        set(emission_order_labels
+            "check.compile;arch.${arch};backend.native;feature.object;feature.linkage;feature.raw")
+        if(triple MATCHES "^mips64el")
+            string(APPEND emission_order_labels ";endian.little")
+        elseif(triple MATCHES "^mips")
+            string(APPEND emission_order_labels ";endian.big")
+        else()
+            string(APPEND emission_order_labels ";feature.optimization")
+        endif()
+        add_test(NAME cross_emission_order_${triple}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DTRIPLE=${triple}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/emission-order-${triple}
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/native/emission_order.cmake")
+        set_tests_properties(cross_emission_order_${triple} PROPERTIES
+            LABELS "${emission_order_labels}")
+    endforeach()
+    add_test(NAME cross_emission_order_runtime
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DTRIPLE=${cross_default_target}
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/emission-order-runtime
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/emission_order.cmake")
+    set_tests_properties(cross_emission_order_runtime PROPERTIES
+        LABELS "check.runtime;arch.x86_64;backend.native;feature.object;feature.linkage;feature.raw;feature.optimization")
     foreach(level O0 O2)
         add_test(NAME cross_runtime_native_generic_instance_${level}
             COMMAND "${CMAKE_COMMAND}"

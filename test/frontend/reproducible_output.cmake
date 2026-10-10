@@ -198,15 +198,16 @@ if(NOT base_symbols MATCHES "gensym" OR NOT base_symbols STREQUAL added_symbols)
     message(FATAL_ERROR "other units' symbols changed\n${base_symbols}\n${added_symbols}")
 endif()
 
-# Without per-entity sections, units follow command-line order and each
-# unit's definitions their definition order, not the order of declarations.
+# Without per-entity sections, units follow command-line order, each with its
+# functions and then its objects in definition order, not the order of
+# declarations.
 run("shared sections" "${OUTPUT}/one/proj" "${CC}" -S -O0 -target x86_64-unknown-linux-gnu
     -I include ${units} -o shared.s)
 file(READ "${OUTPUT}/one/proj/shared.s" shared)
 set(previous -1)
-foreach(label a_first a_second _a_late _a_scale_G bee_bump bee_helper bee_entry
-              _bee_add_G sea_helper sea_entry a_counter a_text a_file gensym
-              bee_counter bee_text sea_data sea_text)
+foreach(label a_first a_second _a_late _a_scale_G a_counter a_text a_file
+              bee_bump bee_helper bee_entry _bee_add_G gensym bee_counter bee_text
+              sea_helper sea_entry sea_data sea_text)
     string(REGEX MATCH "\n[_a-zA-Z0-9]*${label}[_a-zA-Z0-9]*:" found "${shared}")
     string(FIND "${shared}" "${found}" position)
     if(found STREQUAL "" OR position LESS_EQUAL previous)

@@ -1716,6 +1716,10 @@ private:
         }
         order_by_definition(module_.functions, program_.functions,
                             function_keys_, module_.function_ids);
+        std::vector<std::uint32_t> ordinals(program_.source_units.size() + 1);
+        for (auto& function : module_.functions) {
+            if (function.definition) function.unit_ordinal = ordinals[function.unit_index]++;
+        }
     }
 
     // IDs follow emission order: source units in command-line order and,
@@ -1751,6 +1755,7 @@ private:
             renumbered[old] = static_cast<std::uint32_t>(sorted.size());
             sorted.push_back(std::move(entities[old]));
             sorted.back().id = {renumbered[old]};
+            sorted.back().unit_index = static_cast<std::uint32_t>(places[old].first);
         }
         entities = std::move(sorted);
         for (auto& entry : keys) entry.second = {renumbered[entry.second.value]};
@@ -3161,6 +3166,24 @@ bool Module::raw_owned(const FunctionDecl& declaration) const {
     const auto* entity = function(declaration);
     return entity && entity->definition == &declaration &&
            entity->ownership == BodyOwnership::RawMir;
+}
+
+std::string label_stem(const Function& function) {
+    return std::to_string(function.unit_index) + '_' + std::to_string(function.unit_ordinal);
+}
+
+std::string local_label_symbol(const Module& module, const Label& label) {
+    const auto& owner = module.function(label.owner);
+    const auto ordinal = std::find(owner.labels.begin(), owner.labels.end(), label.id) -
+                         owner.labels.begin();
+    return ".Lcross.label." + label_stem(owner) + '.' + std::to_string(ordinal);
+}
+
+bool emitted_before(const Module& module, FunctionId left, FunctionId right) {
+    const auto place = [&](FunctionId id) {
+        return std::pair(module.function(id).clone_of.value_or(id).value, id.value);
+    };
+    return place(left) < place(right);
 }
 
 Module build(Program& program, const CompilerOptions& options,

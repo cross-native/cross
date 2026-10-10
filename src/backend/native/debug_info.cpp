@@ -678,7 +678,7 @@ void DebugInfo::parameter_home(std::uint64_t index, unsigned reg,
 std::string DebugInfo::end_function(hir::FunctionId function, std::string symbol,
                                     bool frame) {
     auto end = (format_ == ObjectFormat::MachO ? "L" : ".L") +
-               std::string("cross.debug.end.") + std::to_string(function.value);
+               std::string("cross.debug.end.") + hir::label_stem(module_.function(function));
     functions_.push_back({function, std::move(symbol), end, frame,
                           std::move(homes_), std::move(parameter_homes_)});
     homes_.clear();

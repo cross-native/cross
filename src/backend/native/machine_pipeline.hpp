@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include <string>
+#include "middle/raw_mir.hpp"
 
 namespace cross {
 class Diagnostics;
@@ -24,7 +24,7 @@ class DebugInfo;
 // Architecture-independent production path. A target supplies selection,
 // legality, allocation policy, and assembly printing through TargetBackend;
 // the common driver owns structural verification and the standalone audit.
-[[nodiscard]] std::string run_machine_pipeline(
+[[nodiscard]] mir::ManagedAssembly run_machine_pipeline(
     const TargetBackend& backend, mir::ManagedModule& managed_module,
     hir::Module& hir_module, const Subtarget& subtarget,
     const CompilerOptions& options, DebugInfo& debug,

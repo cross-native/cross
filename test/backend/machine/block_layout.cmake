@@ -27,10 +27,11 @@ string(REGEX MATCH
     "dense_choice:[^#]*[.]size dense_choice,"
     dense_body "${assembly}")
 string(REGEX MATCH
-    "[.]Lcross[.]machine[.][0-9]+[.]jump[.]table[.]0:"
-    dense_table "${assembly}")
+    "leaq[\t ]+([.]Lcross[.]machine[.][0-9_]+[.]jump[.]table[.]0)"
+    dense_table "${dense_body}")
+string(REPLACE "." "[.]" dense_table "${CMAKE_MATCH_1}")
 string(REGEX MATCHALL
-    "[.]long[^\r\n]*[.]jump[.]table[.]0"
+    "[.]long[^\r\n]*-${dense_table}\n"
     dense_table_entries "${assembly}")
 list(LENGTH dense_table_entries dense_table_entry_count)
 if(dense_body STREQUAL "" OR dense_table STREQUAL "" OR

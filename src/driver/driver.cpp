@@ -1216,11 +1216,14 @@ int cc_main(int argc, char** argv) {
             std::cerr << "cc: selecting native " << backend->architecture()
                       << " Machine IR and emitting target assembly\n";
         }
-        auto assembly = backend->emit_managed_assembly(
+        auto managed = backend->emit_managed_assembly(
             managed_mir, hir_module, *subtarget, options, debug, diagnostics);
-        assembly += raw_assembly.module_assembly;
-        assembly += native::emit_data_assembly(
-            codegen_module, *subtarget, options, diagnostics);
+        auto functions = std::move(managed.functions);
+        functions.insert(functions.end(), raw_assembly.functions.begin(),
+                         raw_assembly.functions.end());
+        auto assembly = std::move(managed.header) +
+            native::emit_module_assembly(codegen_module, std::move(functions),
+                                         *subtarget, options, diagnostics);
         assembly = debug.finish(std::move(assembly));
         if (subtarget->object_format() == ObjectFormat::MachO) {
             assembly += ".subsections_via_symbols\n";

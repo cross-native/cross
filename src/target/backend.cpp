@@ -9,7 +9,7 @@
 
 namespace cross {
 
-std::string TargetBackend::emit_managed_assembly(
+mir::ManagedAssembly TargetBackend::emit_managed_assembly(
     mir::ManagedModule& managed_module, hir::Module& hir_module,
     const Subtarget& subtarget, const CompilerOptions& options,
     native::DebugInfo& debug, Diagnostics& diagnostics) const {

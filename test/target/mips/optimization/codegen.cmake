@@ -152,9 +152,9 @@ endif()
 
 function_body("${OUTPUT}.enabled.s" mips_shared_epilogue shared_epilogue)
 if(shared_epilogue MATCHES
-       "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9]+[.]return" OR
+       "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9_]+[.]return" OR
    NOT shared_epilogue MATCHES
-       "\\.Lcross[.]mips[.][0-9]+[.]return:\n" OR
+       "\\.Lcross[.]mips[.][0-9_]+[.]return:\n" OR
    NOT shared_epilogue MATCHES "[.]cfi_restore")
     message(FATAL_ERROR
         "a final return should fall through to its CFI epilogue\n"
@@ -162,7 +162,7 @@ if(shared_epilogue MATCHES
 endif()
 function_body("${OUTPUT}.enabled.s" mips_multiple_epilogues multiple_epilogues)
 string(REGEX MATCHALL
-       "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9]+[.]return"
+       "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9_]+[.]return"
        epilogue_branches "${multiple_epilogues}")
 list(LENGTH epilogue_branches epilogue_branch_count)
 if(NOT epilogue_branch_count EQUAL 1)
@@ -215,11 +215,11 @@ function_body("${OUTPUT}.enabled.s"
 function_body("${OUTPUT}.no_delay.s"
               mips_successor_delay empty_successor)
 if(NOT scheduled_successor MATCHES
-       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+\n[\t ]+xori[\t ]" OR
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+xori[\t ]" OR
    NOT scheduled_successor MATCHES
-       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+:\n[\t ]+addiu[\t ]" OR
+       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n[\t ]+addiu[\t ]" OR
    NOT empty_successor MATCHES
-       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]bb[.][0-9]+\n[\t ]+nop")
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+\n[\t ]+nop")
     message(FATAL_ERROR
         "an unconditional edge did not execute a safe successor operation "
         "in its delay slot or -fno-schedule-insns2 was ignored\n"
@@ -231,11 +231,11 @@ function_body("${OUTPUT}.enabled.s"
 function_body("${OUTPUT}.no_delay.s"
               mips_reassociation_pressure empty_successor_compare)
 if(NOT scheduled_successor_compare MATCHES
-       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+\n[\t ]+sltu[\t ]" OR
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+sltu[\t ]" OR
    NOT scheduled_successor_compare MATCHES
-       "[\t ]sltu[^\n]*\n\\.Lcross[.]mips[.][0-9]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)z?l?[\t ]" OR
+       "[\t ]sltu[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)z?l?[\t ]" OR
    NOT empty_successor_compare MATCHES
-       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9]+[.]bb[.][0-9]+\n[\t ]+nop")
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+\n[\t ]+nop")
     message(FATAL_ERROR
         "a fused successor comparison did not fill an unconditional edge "
         "delay slot or -fno-schedule-insns2 was ignored\n"
@@ -297,14 +297,14 @@ file(READ "${OUTPUT}.size.s" size_assembly)
 file(READ "${OUTPUT}.size_no_machine_combine.s"
           materialized_assembly)
 if(NOT pooled_literal MATCHES
-       "[\t ]lui[\t ][^\n]*%hi[(]\\.Lcross[.]mips[.]float[.][0-9]+[)]" OR
+       "[\t ]lui[\t ][^\n]*%hi[(]\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+[)]" OR
    NOT pooled_literal MATCHES
-       "[\t ]ldc1[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.]float[.][0-9]+[)]" OR
+       "[\t ]ldc1[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+[)]" OR
    NOT size_assembly MATCHES
-       "\\.Lcross[.]mips[.]float[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
+       "\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
    NOT materialized_literal MATCHES "[\t ]dli[\t ]" OR
    materialized_assembly MATCHES
-       "\\.Lcross[.]mips[.]float[.][0-9]+:")
+       "\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+:")
     message(FATAL_ERROR
         "MIPS size-mode floating literal pooling or "
         "-fno-machine-combine regressed\n"
@@ -316,14 +316,14 @@ function_body("${OUTPUT}.size.s"
 function_body("${OUTPUT}.size_no_machine_combine.s"
               mips_integer_literal materialized_integer)
 if(NOT pooled_integer MATCHES
-       "[\t ]lui[\t ][^\n]*%hi[(]\\.Lcross[.]mips[.]integer[.][0-9]+[)]" OR
+       "[\t ]lui[\t ][^\n]*%hi[(]\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+[)]" OR
    NOT pooled_integer MATCHES
-       "[\t ]ld[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.]integer[.][0-9]+[)]" OR
+       "[\t ]ld[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+[)]" OR
    NOT size_assembly MATCHES
-       "\\.Lcross[.]mips[.]integer[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
+       "\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
    NOT materialized_integer MATCHES "[\t ]dli[\t ]" OR
    materialized_assembly MATCHES
-       "\\.Lcross[.]mips[.]integer[.][0-9]+:")
+       "\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+:")
     message(FATAL_ERROR
         "MIPS size-mode integer literal pooling or "
         "-fno-machine-combine regressed\n"

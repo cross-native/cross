@@ -87,7 +87,7 @@ if(o2_affine_xor MATCHES "vpmuludq")
         "${o2_affine_xor}")
 endif()
 string(REGEX MATCHALL
-    "vpshufb[\t ]+[.]Lcross[.]shuffle[.]swap16"
+    "vpshufb[\t ]+[.]Lcross[.]machine[.][0-9_]+[.]swap16"
     packed_byte_swaps "${assembly}")
 list(LENGTH packed_byte_swaps packed_byte_swap_count)
 if(NOT packed_byte_swap_count EQUAL 4)
@@ -116,7 +116,7 @@ extract_function("${o3_assembly}" byte_swap_reduction o3_byte_swap)
 extract_function("${o3_assembly}" constant_product_reduction
                  o3_constant_product)
 string(REGEX MATCH
-    "vmovdqu[\t ]+[.]Lcross[.]shuffle[.]swap16\\(%rip\\),[\t ]+%ymm([0-9]+)"
+    "vmovdqu[\t ]+[.]Lcross[.]machine[.][0-9_]+[.]swap16\\(%rip\\),[\t ]+%ymm([0-9]+)"
     o3_mask_load "${o3_byte_swap}")
 if(NOT o3_mask_load)
     message(FATAL_ERROR
@@ -130,7 +130,7 @@ string(REGEX MATCHALL
 list(LENGTH o3_register_byte_swaps o3_register_byte_swap_count)
 if(NOT o3_register_byte_swap_count EQUAL 4 OR
    o3_byte_swap MATCHES
-       "vpshufb[\t ]+[.]Lcross[.]shuffle[.]swap16")
+       "vpshufb[\t ]+[.]Lcross[.]machine[.][0-9_]+[.]swap16")
     message(FATAL_ERROR
         "O3 byte-swap loop did not reuse its allocated shuffle mask\n"
         "${o3_byte_swap}")

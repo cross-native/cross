@@ -175,6 +175,19 @@ std::optional<std::string> assembly_section_directive(
     return std::nullopt;
 }
 
+std::optional<std::string> function_data_section_directive(
+    ObjectFormat format, std::string_view link_name, bool own_section,
+    std::string_view group, std::string& error) {
+    const std::string name =
+        std::string(format == ObjectFormat::Coff ? ".rdata" : ".rodata") +
+        (own_section ? (format == ObjectFormat::Coff ? "$" : ".") + std::string(link_name)
+                     : std::string{});
+    return assembly_section_directive(
+        format, {name, AssemblySectionKind::ReadOnlyData, false, false,
+                 own_section ? group : std::string_view{}, true},
+        error);
+}
+
 std::optional<std::string> assembly_symbol_directives(
     ObjectFormat format, const AssemblySymbolRequest& request,
     std::string& error) {

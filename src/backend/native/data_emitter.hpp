@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "middle/raw_mir.hpp"
+
 #include <string>
+#include <vector>
 
 namespace cross {
 struct CompilerOptions;
@@ -12,16 +15,19 @@ namespace codegen { class ModuleView; }
 
 namespace native {
 
-// Emits only object entities not already materialized by `owned`.  The caller
-// may concatenate the returned text with owned.module_assembly.
-[[nodiscard]] std::string emit_data_assembly(const codegen::ModuleView& module,
-                                              const Subtarget& subtarget,
-                                              const CompilerOptions& options,
-                                              Diagnostics& diagnostics);
+// The native assembly of a group in emission order: each source unit, in
+// command-line order, contributes its functions (managed and raw, with their
+// jump tables and literals) and then its data objects; group-level symbol
+// directives follow.
+[[nodiscard]] std::string emit_module_assembly(
+    const codegen::ModuleView& module,
+    std::vector<mir::FunctionAssembly> functions,
+    const Subtarget& subtarget, const CompilerOptions& options,
+    Diagnostics& diagnostics);
 
 // Emits data objects owned by raw assembly because one or more exact
-// subobjects receive patch-cell-address relocations. The result is suitable
-// for native concatenation and for LLVM/GIMPLE module-level assembly.
+// subobjects receive patch-cell-address relocations, for LLVM/GIMPLE
+// module-level assembly.
 [[nodiscard]] std::string emit_patch_data_assembly(
     const codegen::ModuleView& module, const Subtarget& subtarget,
     const CompilerOptions& options, Diagnostics& diagnostics);

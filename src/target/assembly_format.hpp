@@ -57,6 +57,13 @@ struct AssemblySymbolRequest {
     ObjectFormat format, const AssemblySectionRequest& request,
     std::string& error);
 
+// The read-only section of a function's jump tables and literals: for a
+// function in a section of its own, `.rodata.LINK` (COFF `.rdata$LINK`) in
+// the COMDAT group `group`, if any; otherwise `.rodata` (`.rdata`).
+[[nodiscard]] std::optional<std::string> function_data_section_directive(
+    ObjectFormat format, std::string_view link_name, bool own_section,
+    std::string_view group, std::string& error);
+
 // Returns complete binding/visibility directives without a trailing newline.
 // An empty result is valid for a local symbol on formats without a local
 // directive. Type metadata remains the responsibility of the target emitter.

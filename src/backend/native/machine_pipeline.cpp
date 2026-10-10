@@ -9,7 +9,7 @@
 
 namespace cross::native {
 
-std::string run_machine_pipeline(
+mir::ManagedAssembly run_machine_pipeline(
     const TargetBackend& backend, mir::ManagedModule& managed_module,
     hir::Module& hir_module, const Subtarget& subtarget,
     const CompilerOptions& options, DebugInfo& debug,

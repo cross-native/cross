@@ -616,7 +616,7 @@ public:
         return valid;
     }
 
-    std::string emit_machine_assembly(machine::Module& machine_module,
+    mir::ManagedAssembly emit_machine_assembly(machine::Module& machine_module,
                                       const mir::ManagedModule& managed_module,
                                       const hir::Module& hir_module,
                                       const Subtarget& subtarget,

@@ -7,6 +7,7 @@
 #include "middle/hir.hpp"
 #include "middle/machine_ir.hpp"
 #include "middle/mir.hpp"
+#include "middle/raw_mir.hpp"
 #include "target/target.hpp"
 #include "target/subtarget.hpp"
 #include "target/x86_64/dynamic_abi_plan.hpp"
@@ -36,9 +37,9 @@ machine::Module lower_managed_machine(const mir::ManagedModule& managed,
                                       Diagnostics& diagnostics);
 
 // Finalize frames and print GNU/LLVM integrated-assembler compatible AT&T
-// syntax. Raw naked-function assembly and scalar data are combined by the
-// driver at the module boundary.
-std::string emit_managed_machine_assembly(machine::Module& module,
+// syntax, one entry per function. The driver lays out these entries, raw
+// naked functions, and data in emission order.
+mir::ManagedAssembly emit_managed_machine_assembly(machine::Module& module,
                                           const hir::Module& hir_module,
                                           const ManualAbiPlans& manual_plans,
                                           const DynamicAbiPlans& dynamic_plans,

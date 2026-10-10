@@ -83,7 +83,7 @@ public:
     // This nonvirtual entry point runs the common native machine pipeline:
     // target selection, structural and target verification, standalone
     // auditing, then target assembly emission.
-    [[nodiscard]] std::string emit_managed_assembly(
+    [[nodiscard]] mir::ManagedAssembly emit_managed_assembly(
         mir::ManagedModule& managed_module, hir::Module& hir_module,
         const Subtarget& subtarget, const CompilerOptions& options,
         native::DebugInfo& debug, Diagnostics& diagnostics) const;
@@ -100,7 +100,7 @@ public:
         return true;
     }
 
-    [[nodiscard]] virtual std::string emit_machine_assembly(
+    [[nodiscard]] virtual mir::ManagedAssembly emit_machine_assembly(
         machine::Module& machine_module,
         const mir::ManagedModule& managed_module,
         const hir::Module& hir_module,
@@ -119,7 +119,7 @@ public:
         return emit_raw_assembly(raw_module, managed_module, hir_module,
                                  subtarget, options, diagnostics);
     }
-    [[nodiscard]] virtual std::string emit_machine_assembly_with_debug(
+    [[nodiscard]] virtual mir::ManagedAssembly emit_machine_assembly_with_debug(
         machine::Module& machine_module,
         const mir::ManagedModule& managed_module,
         const hir::Module& hir_module,

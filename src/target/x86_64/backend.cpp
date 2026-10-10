@@ -249,7 +249,7 @@ public:
         return valid;
     }
 
-    std::string emit_machine_assembly(
+    mir::ManagedAssembly emit_machine_assembly(
         machine::Module& machine_module,
         const mir::ManagedModule& managed_module,
         const hir::Module& hir_module,
@@ -259,7 +259,7 @@ public:
                             subtarget, options, nullptr, diagnostics);
     }
 
-    std::string emit_machine_assembly_with_debug(
+    mir::ManagedAssembly emit_machine_assembly_with_debug(
         machine::Module& machine_module,
         const mir::ManagedModule& managed_module,
         const hir::Module& hir_module,
@@ -270,7 +270,7 @@ public:
     }
 
 private:
-    std::string emit_machine(
+    mir::ManagedAssembly emit_machine(
         machine::Module& machine_module,
         const mir::ManagedModule& managed_module,
         const hir::Module& hir_module,

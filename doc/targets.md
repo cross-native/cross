@@ -32,6 +32,18 @@ generates no stack-protector instrumentation. `[[no_sanitize("bounds")]]`
 removes the `-fbounds-trap` checks from a function; other names are accepted
 and have no effect.
 
+Output follows definition order. Each source unit, in command-line order,
+contributes its functions, `[[naked]]` ones included, in definition order
+with its generic instances after them and each copy that `-fipa-cp-clone`
+specializes right after the function it copies, and then its objects. A
+function's jump tables and the constants it loads from memory follow it in
+read-only data: in `.rodata` (COFF `.rdata`, Mach-O `__TEXT,__const`), where
+the functions of one source unit share one copy of each constant, or, when the
+function has a section of its own named after its link name `NAME`
+(`-ffunction-sections`, `[[hot]]`, `[[cold]]`, `[[retain]]`, or a `global`
+generic instance), in `.rodata.NAME` (COFF `.rdata$NAME`), which joins an
+instance's COMDAT group and holds the function's own copy of each constant.
+
 Mach-O output spells every link name with the leading underscore of C symbols
 on that format, so `[[link_name("write")]]` refers to the C function `write`
 (object-file symbol `_write`) and a definition of `app::run` defines

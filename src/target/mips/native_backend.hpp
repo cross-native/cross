@@ -7,6 +7,7 @@
 #include "middle/hir.hpp"
 #include "middle/machine_ir.hpp"
 #include "middle/mir.hpp"
+#include "middle/raw_mir.hpp"
 #include "target/subtarget.hpp"
 
 #include <cstdint>
@@ -25,7 +26,7 @@ enum class ElfAbiTag : std::uint8_t { Default, Eabi32 };
     const Subtarget& subtarget, const CompilerOptions& options,
     Diagnostics& diagnostics);
 
-[[nodiscard]] std::string emit_managed_machine_assembly(
+[[nodiscard]] mir::ManagedAssembly emit_managed_machine_assembly(
     machine::Module& module, const mir::ManagedModule& managed,
     const hir::Module& hir_module, const Subtarget& subtarget,
     const CompilerOptions& options, Diagnostics& diagnostics);

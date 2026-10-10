@@ -3906,8 +3906,9 @@ bool safe_assembly_text(std::string_view text) {
     });
 }
 
-std::string block_symbol(const mir::RawFunction& function, mir::BlockId block) {
-    return ".Lcross." + std::to_string(function.source.value) + '.' +
+std::string block_symbol(const hir::Module& module, const mir::RawFunction& function,
+                         mir::BlockId block) {
+    return ".Lcross." + hir::label_stem(module.function(function.source)) + '.' +
            std::to_string(block.value);
 }
 
@@ -3936,14 +3937,18 @@ public:
             return bundle_;
         }
         bundle_.object_definitions = module_.object_definitions;
-        for (const auto& function : module_.functions) emit_function(function);
+        for (const auto& function : module_.functions) {
+            emit_function(function);
+            bundle_.functions.push_back({function.source, output_.str()});
+            bundle_.module_assembly += bundle_.functions.back().text;
+            output_.str({});
+        }
         collect_managed_patch_sinks();
         for (const auto& patch : patches_) {
             bundle_.patch_relocations.push_back(
                 {patch.sink, patch.end_label, patch.field_bytes});
         }
         bundle_.definitions = module_.definitions;
-        bundle_.module_assembly = output_.str();
         return std::move(bundle_);
     }
 
@@ -4057,7 +4062,7 @@ private:
                   ? std::string(format_ == ObjectFormat::Coff
                                     ? ".text$cross.patch."
                                     : ".text.cross.patch.") +
-                        std::to_string(function.source.value)
+                        function.symbol
             : split_function
                   ? section_prefix() + function.symbol
                   : std::string(".text");
@@ -4118,12 +4123,11 @@ private:
         for (std::size_t layout_index = 0;
              layout_index < function.layout.size(); ++layout_index) {
             const auto id = function.layout[layout_index];
-            if (id != function.entry) output_ << block_symbol(function, id) << ":\n";
+            if (id != function.entry) output_ << block_symbol(hir_, function, id) << ":\n";
             const auto& candidate = function.blocks[id.value];
             if (candidate.source_label_id) {
                 const auto& label = hir_.labels.at(candidate.source_label_id->value);
-                output_ << ".Lcross.label." << function.source.value
-                        << '.' << label.id.value << ":\n";
+                output_ << hir::local_label_symbol(hir_, label) << ":\n";
                 if (label.is_global) {
                     const auto label_symbol =
                         assembly_symbol(format_, label.link_symbol);
@@ -4151,7 +4155,7 @@ private:
                                       : std::nullopt;
                 if (!next || *next != false_target) {
                     output_ << "\tjmp\t"
-                            << block_symbol(function, false_target) << '\n';
+                            << block_symbol(hir_, function, false_target) << '\n';
                 }
             }
         }
@@ -4209,7 +4213,7 @@ private:
                 return address;
             }
             if (value.kind == mir::Operand::Kind::Label) {
-                return block_symbol(function, value.label.target);
+                return block_symbol(hir_, function, value.label.target);
             }
             if (index < instruction.form->operands.size()) {
                 const auto& specification = instruction.form->operands[index];

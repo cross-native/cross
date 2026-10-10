@@ -47,7 +47,7 @@ foreach(pattern
         message(FATAL_ERROR "native Data IR output is missing '${pattern}'")
     endif()
 endforeach()
-if(NOT linux MATCHES "\\.quad \\.Lcross\\.label\\.[0-9]+\\.[0-9]+")
+if(NOT linux MATCHES "\\.quad \\.Lcross\\.label\\.[0-9_]+\\.[0-9]+")
     message(FATAL_ERROR "native Data IR output is missing a typed label relocation")
 endif()
 

@@ -33,13 +33,13 @@ foreach(level O2 O3 Os Oz)
             "${assembly_stdout}\n${assembly_stderr}\n${stdout}\n${stderr}")
     endif()
     file(READ "${OUTPUT}-${level}.s" assembly)
-    if(NOT assembly MATCHES "[.]Lcross[.]float[.][0-9]+" OR
+    if(NOT assembly MATCHES "[.]Lcross[.]machine[.][0-9_]+[.]float[.][0-9]+" OR
        assembly MATCHES "${floating_bits_regex}")
         message(FATAL_ERROR
             "${level} did not pool scalar floating literals\n${assembly}")
     endif()
     if(NOT assembly MATCHES
-           "vbroadcastsd[\t ]+[.]Lcross[.]float[.][0-9]+[(]%rip[)]")
+           "vbroadcastsd[\t ]+[.]Lcross[.]machine[.][0-9_]+[.]float[.][0-9]+[(]%rip[)]")
         message(FATAL_ERROR
             "${level} did not select a memory floating broadcast\n${assembly}")
     endif()
@@ -61,7 +61,7 @@ foreach(level O2 O3 Os Oz)
         endif()
         string(SUBSTRING "${polynomial}" 0 ${polynomial_length} polynomial)
         string(REGEX MATCHALL
-            "movsd[\t ]+[.]Lcross[.]float[.][0-9]+[(]%rip[)],[\t ]+%xmm[0-5]"
+            "movsd[\t ]+[.]Lcross[.]machine[.][0-9_]+[.]float[.][0-9]+[(]%rip[)],[\t ]+%xmm[0-5]"
             cached_literals "${polynomial}")
         list(LENGTH cached_literals cached_literal_count)
         if(cached_literal_count LESS 2)

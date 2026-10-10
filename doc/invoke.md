@@ -37,7 +37,10 @@ The output depends only on the inputs, options, and models, not on the working
 directory or the environment. Internal symbols of `static` entities derive from
 each input's path as written on the command line, so the same command in a
 copy of the tree produces identical files; `-ffile-prefix-map=OLD=NEW` gives
-absolute input paths a location-independent spelling.
+absolute input paths a location-independent spelling. Two separately compiled
+files with the same spelling get the same internal names, so a `global`
+entity named with `$::meta::gensym` gets the same link name in both objects;
+give such files different spellings, for example with `-ffile-prefix-map`.
 
 ## Targets, ABIs, and profiles
 
@@ -77,10 +80,11 @@ preset, profile, or command line), and whether it is `implemented` or only
 
 | Option | Effect |
 | --- | --- |
-| `-ffunction-sections`, `-fdata-sections` | Put each function or object in its own section. |
+| `-ffunction-sections`, `-fdata-sections` | Put each function or object in its own section; a function's jump tables and pooled constants go to a read-only section named after it ([targets.md](targets.md#object-formats)). |
 | `-ffast-math` | Relax floating-point rules: finite math only, no signed zeros, `-ffp-contract=fast`. Under a profile that traps floating exceptions ([models.md](models.md#profiles)), it reassociates floating operations only when no exception but divide-by-zero traps, and `-ffp-contract=fast` fuses a multiply and an add only when overflow and underflow do not trap. |
 | `-funwind-tables` | Emit unwind tables (CFI or SEH). No unwinder is linked. |
 | `-fno-inline-functions` | Disable discretionary inlining; `[[always_inline]]` still applies. |
+| `-fno-ipa-cp-clone` | Do not specialize functions for constant arguments. From `-O3` on x86-64, calls with constant arguments to a function that is not `global` may use a copy of it specialized for those constants: at most four copies per function, each named `NAME.const.I_V` after the function's link name `NAME`, with the index `I` and hexadecimal value `V` of each constant argument, and placed right after the function. |
 | `-fno-shrink-wrap` | Set up the stack frame and save preserved registers at function entry, not only on the paths that need them (the default from `-O1`). |
 | `-fno-div-by-constant` | Keep the divide instruction for division and remainder by a constant. From `-Og`, such a divide becomes a multiplication by a fixed-point reciprocal with shifts and adds when the target prices that sequence lower; `-Os` and `-Oz` replace only a divide that a single shift or mask performs. |
 | `-fno-eval-calls` | Stop evaluating ordinary calls during compilation; required evaluation still happens. |

@@ -1567,8 +1567,8 @@ declarations, imports, or activations never change an existing context.
 - **Fresh identity.** `$::meta::gensym(prefix)` takes a translation-time string
   and returns a one-identifier token with a fresh private identity shared by its
   copies: declarations and references spelled with that token bind to each
-  other and collide with nothing else, even when prefixes or visible spellings
-  match. The visible spelling is `prefix` with each character that cannot
+  other and collide with nothing else in the compilation group, even when
+  prefixes or visible spellings match. The visible spelling is `prefix` with each character that cannot
   appear in an identifier replaced by `_`; an empty result becomes `_`, and `_`
   is prepended to a result that starts with a digit or is a keyword.
 - **Construction is not copying.** A constructed token receives a new identity
@@ -3913,10 +3913,14 @@ leading `OLD` with `NEW` (when several mappings match, the last one applies);
 `$::source::file`, source-unit identities,
 implementation-internal symbol names, and debugging information use that
 spelling, never a path the compiler resolved, and record `.` as the
-compilation directory. Within a source unit and
-section, definitions are emitted in definition order, and source units in
-command-line order, so adding a definition to one source unit changes no other
-unit's symbols or layout.
+compilation directory. Source units of separate groups with the same
+identity have the same implementation-internal names, including the link
+names of `global` entities named with `$::meta::gensym`. Within a source
+unit and section, definitions are emitted in definition order, and source
+units in command-line order, so adding a definition to one source unit
+changes no other unit's symbols or the layout of its definitions, apart from
+the effects of group-wide optimization such as inlining and cloning; a later
+unit's position within a shared section may move.
 
 All inputs of one `cc` command form one compilation group with one output;
 objects produced by separate commands belong to separate groups.

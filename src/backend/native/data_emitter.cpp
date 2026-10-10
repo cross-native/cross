@@ -14,6 +14,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace cross::native {
 namespace {
@@ -68,37 +70,32 @@ class Emitter {
 public:
     Emitter(const codegen::ModuleView& module,
             const Subtarget& subtarget, const CompilerOptions& options,
-            Diagnostics& diagnostics, bool patch_owned = false)
+            Diagnostics& diagnostics)
         : module_(module), options_(options), diagnostics_(diagnostics),
-          format_(subtarget.object_format()), patch_owned_(patch_owned) {}
+          format_(subtarget.object_format()) {}
 
-    std::string run() {
-        if (format_ == ObjectFormat::Unsupported) {
-            for (const auto& object : module_.data().objects) {
-                if (patch_owned_ ==
-                    module_.raw_assembly().owns(object.source)) {
-                    diagnostics_.error(
-                        object.location,
-                        "native data emission is not implemented for this "
-                        "object format");
-                }
-            }
-            return {};
+    // Each source unit's functions in emission order, then its objects.
+    std::string layout(std::vector<mir::FunctionAssembly> functions) {
+        if (!supported(false)) return {};
+        const auto& hir = module_.hir();
+        std::ranges::sort(functions, [&](const mir::FunctionAssembly& left,
+                                         const mir::FunctionAssembly& right) {
+            return hir::emitted_before(hir, left.function, right.function);
+        });
+        std::vector<std::pair<std::uint32_t, std::string>> parts;
+        for (auto& function : functions) {
+            parts.emplace_back(hir.function(function.function).unit_index,
+                               std::move(function.text));
         }
-        bool emitted_object = false;
         for (const auto& object : module_.data().objects) {
-            if (patch_owned_ ==
-                module_.raw_assembly().owns(object.source)) {
-                emit_object(object);
-                emitted_object = true;
-            }
+            emit_object(object);
+            parts.emplace_back(hir.object(object.source).unit_index, out_.str());
+            out_.str({});
         }
-        if (!patch_owned_) emit_symbol_indirections();
-        // GCC's top-level assembly is emitted before its generated functions
-        // and inherits the final section. Leave embedded patch data in the
-        // ordinary text section so subsequent compiler output remains code.
-        if (patch_owned_ && emitted_object) out_ << ".text\n";
-        if (!patch_owned_ && format_ == ObjectFormat::Coff &&
+        std::ranges::stable_sort(parts, {}, [](const auto& part) { return part.first; });
+        for (const auto& part : parts) out_ << part.second;
+        emit_symbol_indirections();
+        if (format_ == ObjectFormat::Coff &&
             std::any_of(module_.data().objects.begin(),
                         module_.data().objects.end(),
                         [&](const data::Object& object) {
@@ -110,7 +107,37 @@ public:
         return out_.str();
     }
 
+    // The objects that raw code patches.
+    std::string patch_data() {
+        if (!supported(true)) return {};
+        bool emitted_object = false;
+        for (const auto& object : module_.data().objects) {
+            if (module_.raw_assembly().owns(object.source)) {
+                emit_object(object);
+                emitted_object = true;
+            }
+        }
+        // GCC's top-level assembly is emitted before its generated functions
+        // and inherits the final section. Leave embedded patch data in the
+        // ordinary text section so subsequent compiler output remains code.
+        if (emitted_object) out_ << ".text\n";
+        return out_.str();
+    }
+
 private:
+    bool supported(bool patch_owned) {
+        if (format_ != ObjectFormat::Unsupported) return true;
+        for (const auto& object : module_.data().objects) {
+            if (patch_owned == module_.raw_assembly().owns(object.source)) {
+                diagnostics_.error(
+                    object.location,
+                    "native data emission is not implemented for this "
+                    "object format");
+            }
+        }
+        return false;
+    }
+
     void emit_alias(std::string_view alias_name,
                     std::string_view target_name, bool weak,
                     hir::SymbolVisibility visibility, bool function,
@@ -317,9 +344,7 @@ private:
                 module_.hir().labels.at(address.label->value);
             result = label.is_global
                          ? assembly_symbol(format_, label.link_symbol)
-                         : ".Lcross.label." +
-                               std::to_string(address.function->value) + '.' +
-                               std::to_string(address.label->value);
+                         : hir::local_label_symbol(module_.hir(), label);
         }
         if (address.addend > 0) {
             result += '+' + std::to_string(address.addend);
@@ -567,24 +592,25 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
-    bool patch_owned_{};
     std::ostringstream out_;
 };
 
 } // namespace
 
-std::string emit_data_assembly(const codegen::ModuleView& module,
-                               const Subtarget& subtarget,
-                               const CompilerOptions& options,
-                               Diagnostics& diagnostics) {
-    return Emitter(module, subtarget, options, diagnostics).run();
+std::string emit_module_assembly(const codegen::ModuleView& module,
+                                 std::vector<mir::FunctionAssembly> functions,
+                                 const Subtarget& subtarget,
+                                 const CompilerOptions& options,
+                                 Diagnostics& diagnostics) {
+    return Emitter(module, subtarget, options, diagnostics)
+        .layout(std::move(functions));
 }
 
 std::string emit_patch_data_assembly(const codegen::ModuleView& module,
                                      const Subtarget& subtarget,
                                      const CompilerOptions& options,
                                      Diagnostics& diagnostics) {
-    return Emitter(module, subtarget, options, diagnostics, true).run();
+    return Emitter(module, subtarget, options, diagnostics).patch_data();
 }
 
 } // namespace cross::native

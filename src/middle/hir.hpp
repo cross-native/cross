@@ -166,6 +166,12 @@ struct Function {
     SourceLocation location;
     std::string source_name;
     std::string source_unit;
+    // Command-line position of the source unit and, for a definition, its
+    // ordinal among that unit's definitions; see label_stem.
+    std::uint32_t unit_index{};
+    std::uint32_t unit_ordinal{};
+    // A compiler specialization of this function, emitted right after it.
+    std::optional<FunctionId> clone_of;
     std::string link_symbol;
     Linkage linkage{Linkage::Group};
     TypeId result_type;
@@ -219,6 +225,8 @@ struct Object {
     SourceLocation location;
     std::string source_name;
     std::string source_unit;
+    // Command-line position of the source unit.
+    std::uint32_t unit_index{};
     std::string link_symbol;
     Linkage linkage{Linkage::Group};
     TypeId type;
@@ -373,6 +381,14 @@ void stabilize_function_address(Module& module, FunctionId function);
 // Preserve the owner's canonical body and its explicit endpoint contract.
 bool stabilize_label_address(Module& module, LabelId label,
                              SourceLocation location, Diagnostics& diagnostics);
+// The stem of a function's internal assembly labels. It names the function by
+// its unit position, so one unit's labels never depend on another unit.
+[[nodiscard]] std::string label_stem(const Function& function);
+// The assembler-local symbol of a label that is not global.
+[[nodiscard]] std::string local_label_symbol(const Module& module, const Label& label);
+// Whether `left` is emitted before `right`: by unit and definition, each
+// clone right after the function it specializes.
+[[nodiscard]] bool emitted_before(const Module& module, FunctionId left, FunctionId right);
 [[nodiscard]] std::string type_name(const Module& module, TypeId type);
 // Storage of an object of the type: its natural layout raised to the
 // alignment the type requests, with the size rounded up to that alignment.

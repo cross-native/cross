@@ -17588,6 +17588,20 @@ bool specialize_surviving_calls(ManagedModule& module,
         }
     }
 
+    // A clone takes the next label ordinal of its origin's unit.
+    std::vector<std::uint32_t> next_ordinal;
+    for (const auto& function : hir_module.functions) {
+        if (!function.definition) continue;
+        if (function.unit_index >= next_ordinal.size())
+            next_ordinal.resize(function.unit_index + 1);
+        next_ordinal[function.unit_index] = std::max(
+            next_ordinal[function.unit_index], function.unit_ordinal + 1);
+    }
+    const auto hex = [](std::uint64_t value) {
+        char digits[16];
+        const auto end = std::to_chars(digits, digits + 16, value, 16).ptr;
+        return std::string(digits, end);
+    };
     std::unordered_map<std::string, hir::FunctionId> variants;
     std::unordered_map<std::uint32_t, unsigned> per_callee;
     bool changed = false;
@@ -17595,10 +17609,8 @@ bool specialize_surviving_calls(ManagedModule& module,
         auto variant = variants.find(site.key);
         hir::FunctionId variant_id;
         if (variant == variants.end()) {
-            if (variants.size() >= 32 ||
-                per_callee[site.callee.value] >= 4) {
-                continue;
-            }
+            // At most four specializations of each function.
+            if (per_callee[site.callee.value] >= 4) continue;
             const auto* original_body = module.find(site.callee);
             if (!original_body) continue;
             const auto original_entity =
@@ -17609,11 +17621,19 @@ bool specialize_surviving_calls(ManagedModule& module,
 
             auto entity = original_entity;
             entity.id = variant_id;
+            entity.clone_of = site.callee;
+            entity.unit_ordinal = next_ordinal[entity.unit_index]++;
             entity.source_name += "$const";
-            entity.link_symbol =
-                "__cross_clone_" +
-                std::to_string(site.callee.value) + "_" +
-                std::to_string(variant_id.value);
+            // Named by the origin and the constant of each specialized
+            // parameter: ORIGIN.const.INDEX_VALUE...
+            entity.link_symbol = original_entity.link_symbol + ".const";
+            for (std::size_t index = 0; index < site.constants.size(); ++index) {
+                if (!site.constants[index]) continue;
+                const auto& constant = *site.constants[index];
+                entity.link_symbol += '.' + std::to_string(index) + '_' +
+                    (constant.integer_high ? hex(constant.integer_high) + '_' : std::string{}) +
+                    hex(constant.integer);
+            }
             entity.linkage = Linkage::Static;
             entity.abi_contract = hir::AbiContract::Dynamic;
             entity.abi_explicit = false;

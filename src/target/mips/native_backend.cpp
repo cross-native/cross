@@ -1087,8 +1087,7 @@ private:
                 value.location);
             if (symbolic) {
                 const auto symbol = entity->is_global ? entity->link_symbol
-                    : ".Lcross.label." + std::to_string(entity->owner.value) +
-                      '.' + std::to_string(entity->id.value);
+                    : hir::local_label_symbol(hir_, *entity);
                 result.operands.push_back(machine::SymbolOperand{
                     symbol, 0, true, std::nullopt, entity->owner, entity->id});
                 result.defs.push_back(reg(value.id));
@@ -4964,23 +4963,32 @@ public:
         active_signature_.reset();
     }
 
-    std::string run() {
+    mir::ManagedAssembly run() {
+        mir::ManagedAssembly result;
         if (format_ != ObjectFormat::Elf && !module_.functions.empty()) {
             diagnostics_.error(
                 module_.functions.front().location,
                 "native MIPS assembly currently requires an ELF target");
-            return {};
+            return result;
         }
         if (elf_abi_tag(subtarget_.abi_info()) == ElfAbiTag::Eabi32) {
             // GNU MIPS linkers use this conventional empty marker in addition
             // to EF_MIPS_ABI_EABI32.  LLVM MC accepts the section even though
             // it cannot infer EABI32 from the PSP triple by itself.
-            output_ << ".section .mdebug.eabi32\n.previous\n"
-                       ".section .gcc_compiled_long32\n.previous\n";
+            result.header = ".section .mdebug.eabi32\n.previous\n"
+                            ".section .gcc_compiled_long32\n.previous\n";
         }
-        for (auto& function : module_.functions) emit_function(function);
-        emit_literal_pools();
-        return output_.str();
+        for (auto& function : module_.functions) {
+            next_label_ = 0;
+            const auto& entity = hir_.function(function.source);
+            shared_literals_ = entity.section || !own_section(entity)
+                ? &unit_literals_[entity.unit_index] : nullptr;
+            emit_function(function);
+            emit_literal_pools(function);
+            result.functions.push_back({function.source, output_.str()});
+            output_.str({});
+        }
+        return result;
     }
 
 private:
@@ -5008,6 +5016,11 @@ private:
         std::string label;
     };
 
+    struct UnitLiterals {
+        std::vector<FloatLiteral> floats;
+        std::vector<IntegerLiteral> integers;
+    };
+
     bool prefer_float_literal(
         const machine::ImmediateOperand& immediate) const {
         if (!options_.machine_combine || immediate.mode.bits != 64 ||
@@ -5033,18 +5046,23 @@ private:
     }
 
     const FloatLiteral& float_literal(
+        const machine::Function& function,
         const machine::ImmediateOperand& immediate) {
-        const auto found = std::find_if(
-            float_literals_.begin(), float_literals_.end(),
-            [&](const FloatLiteral& candidate) {
-                return candidate.bits == immediate.value &&
-                       candidate.width == immediate.mode.bits;
-            });
+        const auto matches = [&](const FloatLiteral& candidate) {
+            return candidate.bits == immediate.value &&
+                   candidate.width == immediate.mode.bits;
+        };
+        const auto found = std::ranges::find_if(float_literals_, matches);
         if (found != float_literals_.end()) return *found;
+        if (shared_literals_) {
+            const auto shared =
+                std::ranges::find_if(shared_literals_->floats, matches);
+            if (shared != shared_literals_->floats.end()) return *shared;
+        }
         const auto index = float_literals_.size();
         float_literals_.push_back(
             {immediate.value, immediate.mode.bits,
-             ".Lcross.mips.float." + std::to_string(index)});
+             label_prefix(function) + ".float." + std::to_string(index)});
         return float_literals_.back();
     }
 
@@ -5068,29 +5086,44 @@ private:
     }
 
     const IntegerLiteral& integer_literal(
+        const machine::Function& function,
         const machine::ImmediateOperand& immediate) {
-        const auto found = std::find_if(
-            integer_literals_.begin(), integer_literals_.end(),
-            [&](const IntegerLiteral& candidate) {
-                return candidate.bits == immediate.value;
-            });
+        const auto matches = [&](const IntegerLiteral& candidate) {
+            return candidate.bits == immediate.value;
+        };
+        const auto found = std::ranges::find_if(integer_literals_, matches);
         if (found != integer_literals_.end()) return *found;
+        if (shared_literals_) {
+            const auto shared =
+                std::ranges::find_if(shared_literals_->integers, matches);
+            if (shared != shared_literals_->integers.end()) return *shared;
+        }
         const auto index = integer_literals_.size();
         integer_literals_.push_back(
             {immediate.value,
-             ".Lcross.mips.integer." + std::to_string(index)});
+             label_prefix(function) + ".integer." + std::to_string(index)});
         return integer_literals_.back();
     }
 
-    void emit_literal_pools() {
+    // A function in a section named after its link name.
+    bool own_section(const hir::Function& entity) const {
+        return options_.function_sections || entity.retain ||
+               entity.mergeable ||
+               entity.temperature != hir::FunctionTemperature::Normal;
+    }
+
+    // The function's literals follow it. In the shared read-only section,
+    // later functions of its unit use them too.
+    void emit_literal_pools(const machine::Function& function) {
         if (float_literals_.empty() && integer_literals_.empty()) return;
+        const auto& entity = hir_.function(function.source);
         std::string error;
-        const auto directive = assembly_section_directive(
-            format_, {".rodata", AssemblySectionKind::ReadOnlyData,
-                      false, false},
+        const auto directive = function_data_section_directive(
+            format_, function.symbol, !entity.section && own_section(entity),
+            entity.mergeable ? assembly_symbol(function.symbol) : std::string{},
             error);
         if (!directive) {
-            diagnostics_.error(module_.functions.front().location, error);
+            diagnostics_.error(function.location, error);
             return;
         }
         output_ << *directive << '\n';
@@ -5105,6 +5138,16 @@ private:
                     << literal.label << ":\n\t.quad "
                     << literal.bits << '\n';
         }
+        if (shared_literals_) {
+            shared_literals_->floats.insert(shared_literals_->floats.end(),
+                                            float_literals_.begin(),
+                                            float_literals_.end());
+            shared_literals_->integers.insert(shared_literals_->integers.end(),
+                                              integer_literals_.begin(),
+                                              integer_literals_.end());
+        }
+        float_literals_.clear();
+        integer_literals_.clear();
     }
 
     static bool identifier_character(unsigned char ch) {
@@ -5926,10 +5969,13 @@ private:
         return realignment_ ? memory(offset, "sp") : memory(offset);
     }
 
+    std::string label_prefix(const machine::Function& function) const {
+        return ".Lcross.mips." + hir::label_stem(hir_.function(function.source));
+    }
+
     std::string block_label(const machine::Function& function,
                             machine::BlockId block) const {
-        return ".Lcross.mips." + std::to_string(function.source.value) +
-               ".bb." + std::to_string(block.value);
+        return label_prefix(function) + ".bb." + std::to_string(block.value);
     }
 
     std::optional<machine::BlockId> layout_successor(
@@ -6051,8 +6097,7 @@ private:
     }
 
     std::string local_label(const machine::Function& function) {
-        return ".Lcross.mips." + std::to_string(function.source.value) +
-               ".tmp." + std::to_string(next_label_++);
+        return label_prefix(function) + ".tmp." + std::to_string(next_label_++);
     }
 
     const machine::StackSlot* spill_slot(
@@ -9456,6 +9501,10 @@ private:
     std::optional<std::unordered_set<std::string>> naked_writable_;
     std::vector<FloatLiteral> float_literals_;
     std::vector<IntegerLiteral> integer_literals_;
+    // Literals in the shared read-only section by unit, and those the active
+    // function may use.
+    std::unordered_map<std::uint32_t, UnitLiterals> unit_literals_;
+    UnitLiterals* shared_literals_{};
     std::string epilogue_label_;
     std::unordered_map<std::uint32_t, SuccessorDelayEntry>
         edge_delay_entries_;
@@ -10818,7 +10867,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 return;
             }
             if (destination && prefer_float_literal(immediate)) {
-                const auto& literal = float_literal(immediate);
+                const auto& literal = float_literal(function, immediate);
                 if (large_code_model()) {
                     materialize_symbol_address("t0", literal.label);
                     instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -10844,7 +10893,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         } else {
             const auto destination = output_gpr(function, target, "t0");
             if (prefer_integer_literal(immediate)) {
-                const auto& literal = integer_literal(immediate);
+                const auto& literal = integer_literal(function, immediate);
                 instruction("lui", "$t0,%hi(" + literal.label + ")");
                 instruction("ld", reg_name(destination) + ",%lo(" +
                                       literal.label + ")($t0)");
@@ -12013,15 +12062,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                     return instruction.patch.has_value();
                 });
         });
-    const auto split_function = options_.function_sections || entity.retain ||
-                                entity.mergeable ||
-                                entity.temperature !=
-                                    hir::FunctionTemperature::Normal;
+    const auto split_function = own_section(entity);
     const auto section = entity.section
         ? *entity.section
         : patch_function
-              ? ".text.cross.patch." +
-                    std::to_string(function.source.value)
+              ? ".text.cross.patch." + function.symbol
         : split_function
               ? std::string(
                     entity.temperature == hir::FunctionTemperature::Hot
@@ -12136,8 +12181,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         emit_parameter_homes(function);
         emit_variadic_prologue(function);
     }
-    epilogue_label_ = ".Lcross.mips." +
-                      std::to_string(function.source.value) + ".return";
+    epilogue_label_ = label_prefix(function) + ".return";
     plan_successor_delay_slots(function);
 
     for (const auto block_id : function.layout) {
@@ -12148,10 +12192,9 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         output_ << block_label(function, found->id) << ":\n";
         for (const auto& label : function.labels) {
             if (label.block == found->id) {
-                output_ << ".Lcross.label." << function.source.value << '.'
-                        << label.label.value << ":\n";
                 const auto& label_entity =
                     hir_.labels.at(label.label.value);
+                output_ << hir::local_label_symbol(hir_, label_entity) << ":\n";
                 if (!label_entity.is_global) continue;
                 const auto label_symbol =
                     assembly_symbol(label_entity.link_symbol);
@@ -12298,7 +12341,7 @@ machine::Module lower_managed_machine(
     return result;
 }
 
-std::string emit_managed_machine_assembly(
+mir::ManagedAssembly emit_managed_machine_assembly(
     machine::Module& module, const mir::ManagedModule& managed,
     const hir::Module& hir_module, const Subtarget& subtarget,
     const CompilerOptions& options, Diagnostics& diagnostics) {

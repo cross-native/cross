@@ -1401,8 +1401,7 @@ private:
                 value.location);
             if (symbolic) {
                 const auto symbol = label->is_global ? label->link_symbol
-                    : ".Lcross.label." + std::to_string(label->owner.value) +
-                      '.' + std::to_string(label->id.value);
+                    : hir::local_label_symbol(hir_, *label);
                 instruction.operands.push_back(machine::SymbolOperand{
                     symbol, 0, true, std::nullopt, label->owner, label->id});
                 instruction.defs.push_back(reg(value.id));
@@ -10017,21 +10016,25 @@ public:
         }
     }
 
-    std::string run() {
+    mir::ManagedAssembly run() {
+        mir::ManagedAssembly result;
         if (format_ == ObjectFormat::Unsupported &&
             !module_.functions.empty()) {
             diagnostics_.error(module_.functions.front().location,
                                "native x86-64 assembly is not implemented for "
                                "this object format");
-            return {};
+            return result;
         }
-        collect_float_literals();
-        collect_vector_literals();
-        for (auto& function : module_.functions) emit_function(function);
-        emit_jump_tables(0, format_ == ObjectFormat::Coff ? ".rdata" : ".rodata");
-        emit_float_literal_pool();
-        emit_vector_literal_pool();
-        return output_.str();
+        for (auto& function : module_.functions) {
+            next_label_ = 0;
+            collect_float_literals(function);
+            collect_vector_literals(function);
+            emit_function(function);
+            emit_read_only_data(function);
+            result.functions.push_back({function.source, output_.str()});
+            output_.str({});
+        }
+        return result;
     }
 
 private:
@@ -10409,16 +10412,27 @@ private:
 
     const FloatLiteral* find_float_literal(
         const machine::ImmediateOperand& immediate) const {
-        const auto found = std::find_if(
-            float_literals_.begin(), float_literals_.end(),
-            [&](const FloatLiteral& candidate) {
-                return same_immediate(candidate.immediate, immediate);
-            });
-        return found == float_literals_.end() ? nullptr : &*found;
+        const auto find = [&](const std::vector<FloatLiteral>& literals)
+            -> const FloatLiteral* {
+            const auto found = std::find_if(
+                literals.begin(), literals.end(),
+                [&](const FloatLiteral& candidate) {
+                    return same_immediate(candidate.immediate, immediate);
+                });
+            return found == literals.end() ? nullptr : &*found;
+        };
+        const auto* found = find(float_literals_);
+        return found || !shared_literals_ ? found : find(*shared_literals_);
     }
 
-    void collect_float_literals() {
+    // The literals of one function that no earlier function of its unit
+    // placed in the shared read-only section, wider first so that none
+    // needs padding.
+    void collect_float_literals(const machine::Function& function) {
         float_literals_.clear();
+        const auto& entity = hir_.function(function.source);
+        shared_literals_ = entity.section || !own_section(entity)
+            ? &unit_literals_[entity.unit_index] : nullptr;
         if (absolute_data_model()) return;
         const auto add = [&](const machine::ImmediateOperand& immediate) {
             if (immediate.value == 0 ||
@@ -10427,42 +10441,36 @@ private:
                 find_float_literal(immediate)) {
                 return;
             }
-            float_literals_.push_back(
-                {immediate,
-                 ".Lcross.float." +
-                     std::to_string(float_literals_.size())});
+            float_literals_.push_back({immediate, {}});
         };
-        for (const auto& function : module_.functions) {
-            for (const auto& immediate :
-                 function.rematerialized_immediates) {
-                if (immediate) add(*immediate);
-            }
-            for (const auto& block : function.blocks) {
-                for (const auto& instruction : block.instructions) {
-                    if ((options_.optimize_for == OptimizationGoal::Size ||
-                         options_.optimize_for == OptimizationGoal::MinimumSize) &&
-                        instruction.opcode == Opcode::Fconstant &&
-                        !instruction.operands.empty()) {
-                        if (const auto* immediate =
-                                std::get_if<machine::ImmediateOperand>(
-                                    &instruction.operands.front())) {
-                            add(*immediate);
-                        }
-                    }
-                    if (instruction.opcode != Opcode::VsplatConstant ||
-                        instruction.operands.size() < 2) {
-                        continue;
-                    }
-                    const auto* immediate =
-                        std::get_if<machine::ImmediateOperand>(
-                            &instruction.operands.front());
-                    const auto* shape =
-                        std::get_if<machine::ImmediateOperand>(
-                            &instruction.operands.back());
-                    if (immediate && shape &&
-                        (shape->high & (1ULL << 32U)) != 0) {
+        for (const auto& immediate : function.rematerialized_immediates) {
+            if (immediate) add(*immediate);
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if ((options_.optimize_for == OptimizationGoal::Size ||
+                     options_.optimize_for == OptimizationGoal::MinimumSize) &&
+                    instruction.opcode == Opcode::Fconstant &&
+                    !instruction.operands.empty()) {
+                    if (const auto* immediate =
+                            std::get_if<machine::ImmediateOperand>(
+                                &instruction.operands.front())) {
                         add(*immediate);
                     }
+                }
+                if (instruction.opcode != Opcode::VsplatConstant ||
+                    instruction.operands.size() < 2) {
+                    continue;
+                }
+                const auto* immediate =
+                    std::get_if<machine::ImmediateOperand>(
+                        &instruction.operands.front());
+                const auto* shape =
+                    std::get_if<machine::ImmediateOperand>(
+                        &instruction.operands.back());
+                if (immediate && shape &&
+                    (shape->high & (1ULL << 32U)) != 0) {
+                    add(*immediate);
                 }
             }
         }
@@ -10474,24 +10482,28 @@ private:
             });
         for (std::size_t index = 0; index < float_literals_.size(); ++index) {
             float_literals_[index].label =
-                ".Lcross.float." + std::to_string(index);
+                label_prefix(function) + ".float." + std::to_string(index);
+        }
+        if (shared_literals_) {
+            shared_literals_->insert(shared_literals_->end(),
+                                     float_literals_.begin(),
+                                     float_literals_.end());
         }
     }
 
-    void collect_vector_literals() {
+    void collect_vector_literals(const machine::Function& function) {
         byte_swap_literal_bytes_ = 0;
-        for (const auto& function : module_.functions) {
-            for (const auto& block : function.blocks) {
-                for (const auto& instruction : block.instructions) {
-                    if (instruction.opcode != Opcode::Vbswap16 ||
-                        instruction.defs.empty()) {
-                        continue;
-                    }
-                    byte_swap_literal_bytes_ = std::max(
-                        byte_swap_literal_bytes_,
-                        static_cast<unsigned>(
-                            instruction.defs.front().mode.bits / 8U));
+        swap16_label_ = label_prefix(function) + ".swap16";
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.opcode != Opcode::Vbswap16 ||
+                    instruction.defs.empty()) {
+                    continue;
                 }
+                byte_swap_literal_bytes_ = std::max(
+                    byte_swap_literal_bytes_,
+                    static_cast<unsigned>(
+                        instruction.defs.front().mode.bits / 8U));
             }
         }
     }
@@ -10518,19 +10530,41 @@ private:
         return immediate ? float_literal_memory(*immediate) : std::nullopt;
     }
 
-    void emit_float_literal_pool() {
-        if (float_literals_.empty()) return;
+    // A function in a section named after its link name.
+    bool own_section(const hir::Function& entity) const {
+        return options_.function_sections || entity.retain ||
+               entity.mergeable ||
+               entity.temperature != hir::FunctionTemperature::Normal;
+    }
+
+    // The function's byte-swap table, literals, and jump tables follow it,
+    // most aligned first.
+    void emit_read_only_data(const machine::Function& function) {
+        if (byte_swap_literal_bytes_ == 0 && float_literals_.empty() &&
+            jump_tables_.empty()) {
+            return;
+        }
+        const auto& entity = hir_.function(function.source);
         std::string error;
-        const auto section = assembly_section_directive(
-            format_,
-            {format_ == ObjectFormat::Coff ? ".rdata" : ".rodata",
-             AssemblySectionKind::ReadOnlyData, false, false},
+        const auto section = function_data_section_directive(
+            format_, function.symbol, !entity.section && own_section(entity),
+            entity.mergeable ? assembly_symbol(function.symbol) : std::string{},
             error);
         if (!section) {
-            diagnostics_.error(module_.functions.front().location, error);
+            diagnostics_.error(function.location, error);
             return;
         }
         output_ << *section << '\n';
+        if (byte_swap_literal_bytes_ != 0) {
+            output_ << ".p2align "
+                    << (byte_swap_literal_bytes_ >= 64 ? 6
+                        : byte_swap_literal_bytes_ >= 32 ? 5 : 4)
+                    << '\n' << swap16_label_ << ":\n";
+            for (unsigned offset = 0; offset < byte_swap_literal_bytes_;
+                 offset += 16) {
+                output_ << "\t.byte 1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14\n";
+            }
+        }
         for (const auto& literal : float_literals_) {
             output_ << ".p2align "
                     << (literal.immediate.mode.bits == 32 ? 2 : 3) << '\n'
@@ -10539,56 +10573,14 @@ private:
                                                           : ".quad ")
                     << literal.immediate.value << '\n';
         }
-    }
-
-    void emit_vector_literal_pool() {
-        if (byte_swap_literal_bytes_ == 0) return;
-        std::string error;
-        const auto section = assembly_section_directive(
-            format_,
-            {format_ == ObjectFormat::Coff ? ".rdata" : ".rodata",
-             AssemblySectionKind::ReadOnlyData, false, false},
-            error);
-        if (!section) {
-            diagnostics_.error(module_.functions.front().location, error);
-            return;
-        }
-        output_ << *section << '\n' << ".p2align "
-                << (byte_swap_literal_bytes_ >= 64 ? 6
-                    : byte_swap_literal_bytes_ >= 32 ? 5 : 4)
-                << "\n.Lcross.shuffle.swap16:\n";
-        for (unsigned offset = 0; offset < byte_swap_literal_bytes_;
-             offset += 16) {
-            output_ << "\t.byte 1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14\n";
-        }
-    }
-
-    // Emits and removes the jump tables from `first` on. A group names the
-    // COMDAT group of the function whose labels they reference.
-    void emit_jump_tables(std::size_t first, std::string_view name,
-                          std::string_view group = {}) {
-        if (jump_tables_.size() <= first) return;
-        std::string error;
-        const auto section = assembly_section_directive(
-            format_,
-            {name, AssemblySectionKind::ReadOnlyData, false, false, group,
-             true},
-            error);
-        if (!section) {
-            diagnostics_.error(module_.functions.front().location, error);
-            return;
-        }
-        output_ << *section << "\n.p2align 2\n";
-        for (auto table = jump_tables_.begin() +
-                          static_cast<std::ptrdiff_t>(first);
-             table != jump_tables_.end(); ++table) {
-            output_ << table->label << ":\n";
-            for (const auto& target : table->targets) {
-                output_ << "\t.long " << target << '-' << table->label
-                        << '\n';
+        if (!jump_tables_.empty()) output_ << ".p2align 2\n";
+        for (const auto& table : jump_tables_) {
+            output_ << table.label << ":\n";
+            for (const auto& target : table.targets) {
+                output_ << "\t.long " << target << '-' << table.label << '\n';
             }
         }
-        jump_tables_.resize(first);
+        jump_tables_.clear();
     }
 
     std::string assembly_symbol(std::string_view link_name) const {
@@ -10697,8 +10689,7 @@ private:
                                     std::string(destination));
             return;
         }
-        const auto label = ".Lcross.pic." +
-                           std::to_string(next_label_++);
+        const auto label = private_label(*active_function_, "pic");
         output_ << label << ":\n";
         instruction("leaq", label + "(%rip), %" +
                                 std::string(destination));
@@ -11151,16 +11142,18 @@ private:
         }
     }
 
+    std::string label_prefix(const machine::Function& function) const {
+        return ".Lcross.machine." + hir::label_stem(hir_.function(function.source));
+    }
+
     std::string block_label(const machine::Function& function,
                             machine::BlockId block) const {
-        return ".Lcross.machine." + std::to_string(function.source.value) +
-               "." + std::to_string(block.value);
+        return label_prefix(function) + "." + std::to_string(block.value);
     }
 
     std::string private_label(const machine::Function& function,
                               std::string_view purpose) {
-        return ".Lcross.machine." + std::to_string(function.source.value) +
-               "." + std::string(purpose) + "." +
+        return label_prefix(function) + "." + std::string(purpose) + "." +
                std::to_string(next_label_++);
     }
 
@@ -14070,8 +14063,7 @@ private:
             for (unsigned chunk = 0;
                  chunk < vector_chunks(target, width); ++chunk) {
                 instruction(vector_move_opcode(width),
-                            ".Lcross.shuffle.swap16(%rip), %" +
-                                destination);
+                            swap16_label_ + "(%rip), %" + destination);
                 store_vector_from(function, target, destination,
                                   chunk, width);
             }
@@ -14119,7 +14111,7 @@ private:
                 if (vex) {
                     instruction("vpshufb",
                                 (registered_mask ? "%" + mask
-                                                 : ".Lcross.shuffle.swap16(%rip)") +
+                                                 : swap16_label_ + "(%rip)") +
                                     ", %" +
                                     source + ", %" + destination);
                 } else {
@@ -14129,7 +14121,7 @@ private:
                     }
                     instruction("pshufb",
                                 (registered_mask ? "%" + mask
-                                                 : ".Lcross.shuffle.swap16(%rip)") +
+                                                 : swap16_label_ + "(%rip)") +
                                     ", %" +
                                     destination);
                 }
@@ -23989,9 +23981,8 @@ private:
         output_ << block_label(function, value.id) << ":\n";
         for (const auto& label : function.labels) {
             if (label.block == value.id) {
-                output_ << ".Lcross.label." << function.source.value << '.'
-                        << label.label.value << ":\n";
                 const auto& entity = hir_.labels.at(label.label.value);
+                output_ << hir::local_label_symbol(hir_, entity) << ":\n";
                 if (!entity.is_global) continue;
                 const auto symbol = assembly_symbol(entity.link_symbol);
                 output_ << ".globl " << symbol << "\n";
@@ -24239,10 +24230,7 @@ private:
         }
         const auto symbol = assembly_symbol(function.symbol);
         const auto patch_function = has_patch(function);
-        const auto split_function = options_.function_sections ||
-                                    entity.retain || entity.mergeable ||
-                                    entity.temperature !=
-                                        hir::FunctionTemperature::Normal;
+        const auto split_function = own_section(entity);
         const auto section_prefix = [&]() -> std::string {
             if (format_ == ObjectFormat::Coff) {
                 if (entity.temperature == hir::FunctionTemperature::Hot)
@@ -24263,7 +24251,7 @@ private:
                 ? std::string(format_ == ObjectFormat::Coff
                                   ? ".text$cross.patch."
                                   : ".text.cross.patch.") +
-                      std::to_string(function.source.value)
+                      function.symbol
             : split_function
                 ? section_prefix() + function.symbol
                 : std::string(".text");
@@ -24320,7 +24308,6 @@ private:
                     << "; .type 32; .endef\n";
         }
         output_ << symbol << ":\n";
-        const auto first_jump_table = jump_tables_.size();
         // Mach-O block labels are not temporary symbols, and llvm-mc takes
         // no CFI directive after one; -g describes no Mach-O frames.
         cfi_ = (unwind_enabled() && assembly_uses_dwarf_cfi(format_)) ||
@@ -24654,13 +24641,6 @@ private:
         if (format_ == ObjectFormat::Elf) {
             output_ << ".size " << symbol << ", .-" << symbol << "\n";
         }
-        if (!group.empty() && format_ != ObjectFormat::MachO) {
-            emit_jump_tables(first_jump_table,
-                             (format_ == ObjectFormat::Coff ? ".rdata$"
-                                                            : ".rodata.") +
-                                 function.symbol,
-                             group);
-        }
         if (entity.retain && format_ == ObjectFormat::Coff &&
             entity.linkage == Linkage::Global) {
             output_ << ".section .drectve\n.ascii \" -include:"
@@ -24691,6 +24671,11 @@ private:
     std::ostringstream output_;
     std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::vector<FloatLiteral> float_literals_;
+    // Literals in the shared read-only section by unit; functions of a unit
+    // there share them.
+    std::unordered_map<std::uint32_t, std::vector<FloatLiteral>> unit_literals_;
+    std::vector<FloatLiteral>* shared_literals_{};
+    std::string swap16_label_;
     std::vector<JumpTable> jump_tables_;
     std::vector<DeferredEdgeStub> deferred_edge_stubs_;
     std::uint32_t next_label_{};
@@ -24762,7 +24747,7 @@ machine::Module lower_managed_machine(const mir::ManagedModule& managed,
     return result;
 }
 
-std::string emit_managed_machine_assembly(machine::Module& module,
+mir::ManagedAssembly emit_managed_machine_assembly(machine::Module& module,
                                           const hir::Module& hir_module,
                                           const ManualAbiPlans& manual_plans,
                                           const DynamicAbiPlans& dynamic_plans,

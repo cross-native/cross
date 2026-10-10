@@ -29,12 +29,15 @@ file(READ "${OUTPUT}.O3.s" o3)
 file(READ "${OUTPUT}.O2.s" o2)
 file(READ "${OUTPUT}.disabled.s" disabled)
 
-if(NOT o3 MATCHES "call[\t ]+__cross_clone_" OR
-   NOT o3 MATCHES "call[\t ]+__cross_group_clone_target")
+# The clone is named after its origin and specialized argument and is
+# emitted right after its origin.
+if(NOT o3 MATCHES "call[\t ]+__cross_group_clone_target[.]const[.]0_1\n" OR
+   NOT o3 MATCHES "call[\t ]+__cross_group_clone_target\n" OR
+   NOT o3 MATCHES "\n__cross_group_clone_target:.*\n__cross_group_clone_target[.]const[.]0_1:.*\nclone_entry:")
     message(FATAL_ERROR
         "O3 did not specialize only the constant surviving call\n${o3}")
 endif()
-if(o2 MATCHES "__cross_clone_" OR disabled MATCHES "__cross_clone_")
+if(o2 MATCHES "[.]const[.]" OR disabled MATCHES "[.]const[.]")
     message(FATAL_ERROR
         "call cloning ignored its O preset or explicit negative flag")
 endif()

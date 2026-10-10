@@ -93,6 +93,18 @@ struct RawModule {
     std::unordered_set<std::uint32_t> object_definitions;
 };
 
+// The assembly of one function followed by its jump tables and literals.
+struct FunctionAssembly {
+    hir::FunctionId function;
+    std::string text;
+};
+
+// Managed functions, after directives that precede every definition.
+struct ManagedAssembly {
+    std::string header;
+    std::vector<FunctionAssembly> functions;
+};
+
 struct AssemblyBundle {
     struct PatchRelocation {
         PatchSink sink;
@@ -110,6 +122,9 @@ struct AssemblyBundle {
     std::unordered_set<std::uint32_t> definitions;
     std::unordered_set<std::uint32_t> object_definitions;
     std::vector<PatchRelocation> patch_relocations;
+    // Each raw function; module_assembly holds them all followed by the data
+    // that the serializers emit as top-level assembly.
+    std::vector<FunctionAssembly> functions;
     std::string module_assembly;
 };
 

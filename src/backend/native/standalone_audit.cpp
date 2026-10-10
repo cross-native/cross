@@ -25,8 +25,7 @@ bool audit_standalone(const machine::Module& machine_module,
                     if (symbol->label && symbol->label->value < hir_module.labels.size()) {
                         const auto& label = hir_module.labels.at(symbol->label->value);
                         const auto expected = label.is_global ? label.link_symbol
-                            : ".Lcross.label." + std::to_string(label.owner.value) +
-                              '.' + std::to_string(label.id.value);
+                            : hir::local_label_symbol(hir_module, label);
                         if (symbol->is_function && symbol->function == label.owner &&
                             symbol->name == expected && (label.definition || label.is_global)) continue;
                     }
