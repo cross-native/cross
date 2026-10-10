@@ -961,7 +961,8 @@ int cc_main(int argc, char** argv) {
         target->data_layout.natural_alignment_limit,
         target->data_layout.f80_storage_bytes,
         target->data_layout.f80_alignment,
-        target->data_layout.code_addresses};
+        target->data_layout.code_addresses,
+        options.wrapv};
     // Macro execution precedes source declarations. Scalar layout queries
     // nevertheless use the same target-owned context as later required folds.
     auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);

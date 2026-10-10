@@ -630,6 +630,8 @@ struct EvaluationLayout {
     unsigned f80_storage_bytes{10};
     unsigned f80_alignment{1};
     CodeAddressRepresentation code_addresses{CodeAddressRepresentation::Opaque};
+    // Signed +, -, *, and << wrap modulo 2^N, as at runtime (-fwrapv).
+    bool wrap_signed{};
 };
 
 struct EvaluationMemberLayout {

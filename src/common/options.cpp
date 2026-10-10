@@ -610,6 +610,14 @@ std::span<const OptionDefinition> common_option_definitions() {
          OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented,
          "place zero-valued static objects with the initialized data"},
+
+        // Signed wrapping and bounds instrumentation.
+        {"f.wrapv", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Semantic, false, OptionImplementation::Implemented,
+         "wrap signed +, -, *, and << modulo 2^N"},
+        {"f.bounds-trap", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Semantic, false, OptionImplementation::Partial,
+         "trap on array subscripts outside a known bound"},
     };
     return definitions;
 }
@@ -924,6 +932,9 @@ bool resolve_registered_options(
     options.finite_math_only =
         resolved_bool(options, "f.finite-math-only");
     options.signed_zeros = resolved_bool(options, "f.signed-zeros", true);
+
+    options.wrapv = resolved_bool(options, "f.wrapv");
+    options.bounds_trap = resolved_bool(options, "f.bounds-trap");
     return true;
 }
 

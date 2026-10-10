@@ -1888,7 +1888,7 @@ EvaluationTask<void> prepare_generic_local_types_async(FunctionDecl& function, P
         co_await rewrite_generic_type_bounds_async(declaration.type, &function, program, diagnostics, state, mangling,
             declaration.location);
         if (state.resource_failed(program)) co_return;
-        if ((evaluation_only(function) || static_bytes) && value && value->kind == Type::Kind::Array &&
+        if ((evaluation_only(function) || declaration.storage_static) && value && value->kind == Type::Kind::Array &&
             !value->lanes && !value->array_bound && !declaration.dynamic_array_bound && declaration.initializer) {
             co_await indices(*declaration.initializer, true);
             if (static_bytes)
@@ -7518,6 +7518,16 @@ public:
         co_return (co_await convert_async(*value, destination, source.location));
     }
 
+    // The value of a pointer derived from an integer, an absolute address.
+    EvaluationTask<std::optional<EvalValue>> required_absolute_pointer_async(const Expr& source) {
+        if (resource_exhausted_ || context_unavailable_) co_return std::nullopt;
+        if (!(co_await validate_required_tree_async(source))) co_return std::nullopt;
+        auto value = co_await expression_async(source);
+        if (!value || !value->address || value->address->kind != AddressConstant::Kind::Absolute ||
+            !value->type || value->type->kind != Type::Kind::Pointer) co_return std::nullopt;
+        co_return value;
+    }
+
     std::optional<EvalValue> required_floating(const Expr& source,
                                                const TypePtr& destination) {
         return required_floating_async(source, destination).run();
@@ -7628,6 +7638,61 @@ public:
             attribute.expression_argument = std::move(expression);
         }
         co_return deferred ? Preparation::Deferred : Preparation::Ready;
+    }
+
+    // A size query can precede the processing of a static array whose bound
+    // comes from its initializer. Complete that bound from the initializer,
+    // evaluated in the object's own context; failures are left to the
+    // initializer's ordinary checks.
+    EvaluationTask<void> complete_initializer_extent_async(const TypePtr& type) {
+        if (!type || type->kind != Type::Kind::Array || type->lanes || type->array_bound) co_return;
+        const auto found = std::find_if(program_.objects.begin(), program_.objects.end(),
+            [&](const auto& object) { return object->type == type && object->initializer; });
+        if (found == program_.objects.end()) co_return;
+        auto* object = found->get();
+        const auto* owner = object_lexical_function(program_, *object);
+        const auto source_namespace = owner ? owner->source_namespace : namespace_prefix(object->name);
+        const LayoutQuery size_of = size_of_ ? *size_of_ : LayoutQuery{};
+        const LayoutQuery align_of = align_of_ ? *align_of_ : LayoutQuery{};
+        std::uint64_t count{};
+        const auto& source = *object->initializer;
+        if (source.kind == Expr::Kind::AggregateInitializer) {
+            std::uint64_t cursor{};
+            for (const auto& entry : source.initializer_entries) {
+                auto selected = cursor;
+                if (!entry.designators.empty() && entry.designators.front().index &&
+                    entry.designators.front().kind == Expr::InitializerDesignator::Kind::Index) {
+                    const auto index = (co_await evaluate_target_integer_requirement_async(program_,
+                        *entry.designators.front().index, diagnostics_, size_of, align_of, source_namespace,
+                        owner, {}, EvaluationIntegerContext::ProbeDefinition)).value;
+                    if (!index || index->value.high || integer_negative(index->value,
+                            evaluation_integer_type(builtin_type(index->type), program_.address_bits)))
+                        co_return;
+                    selected = index->value.low;
+                }
+                if (selected >= std::numeric_limits<std::uint32_t>::max()) co_return;
+                cursor = selected + 1;
+                count = std::max(count, cursor);
+            }
+        } else if (source.kind != Expr::Kind::String && type->element &&
+                   type->element->kind == Type::Kind::Builtin && type->element->builtin == BuiltinType::U8) {
+            Expr length;
+            length.kind = Expr::Kind::Call;
+            length.location = source.location;
+            length.left = std::make_unique<Expr>();
+            length.left->kind = Expr::Kind::Name;
+            length.left->location = source.location;
+            length.left->text = "$::meta::len";
+            length.arguments.push_back(clone_expr(source));
+            const auto bytes = (co_await evaluate_target_integer_requirement_async(program_, length,
+                diagnostics_, size_of, align_of, source_namespace, owner, {},
+                EvaluationIntegerContext::ProbeDefinition)).value;
+            if (!bytes || bytes->value.high) co_return;
+            count = bytes->value.low;
+        }
+        if (count && count <= std::numeric_limits<std::uint32_t>::max() &&
+            fits_unsigned(UInt128{count}, program_.address_bits))
+            type->lanes = static_cast<std::uint32_t>(count);
     }
 
     EvaluationTask<Preparation> prepare_layout_async(const TypePtr& type, EvaluationLayoutKind kind) {
@@ -8599,6 +8664,8 @@ public:
                      "target layout is unavailable for this translation-time query");
                 co_return std::nullopt;
             }
+            if (expression.kind == Expr::Kind::Sizeof && !expression.type)
+                co_await complete_initializer_extent_async(type);
             // Array alignment is independent of its count; vector alignment
             // can depend on its lanes. Pointer layout never needs either
             // pointee extent. Genuine incomplete arrays/VLAs are not deferred.
@@ -11016,7 +11083,8 @@ private:
                                : common_integer_type(integer_type(left.type), integer_type(right.type));
         left.integer = convert_integer(left.integer, integer_type(left.type), type);
         if (!shift) right.integer = convert_integer(right.integer, integer_type(right.type), type);
-        const auto result = checked_integer_operation(operation, left.integer, right.integer, type);
+        const auto result = checked_integer_operation(operation, left.integer, right.integer, type,
+            program_.evaluation_layout.wrap_signed);
         if (result.error != IntegerError::None) {
             fail(location, result.error == IntegerError::ShiftCount
                 ? "invalid shift count during translation-time evaluation"
@@ -14914,10 +14982,29 @@ EvaluationTask<bool> fold_pointer_integer_initializer_async(std::unique_ptr<Expr
                                       const LayoutQuery* align_of = nullptr) {
     Evaluator evaluator(program, diagnostics, caller, std::string(source_namespace),
                         size_of, align_of);
-    if (!evaluator.integer_expression(*expression)) co_return false;
-    if (contains_layout_query(*expression) &&
+    const bool pending_layout = contains_layout_query(*expression) &&
         ((!size_of && !program.evaluation_size_of) ||
-         (!align_of && !program.evaluation_align_of))) co_return true;
+         (!align_of && !program.evaluation_align_of));
+    if (!evaluator.integer_expression(*expression)) {
+        // A pointer derived from an integer is a translation-time value whose
+        // address bits initialize the object. Relocatable addresses and values
+        // that do not fold are left to static data lowering.
+        if (pending_layout || contains_relocation_candidate(*expression, program, source_namespace))
+            co_return false;
+        const auto pointer = co_await evaluator.required_absolute_pointer_async(*expression);
+        if (!pointer) {
+            if (evaluator.resource_exhausted()) evaluator.diagnose(expression->location);
+            co_return false;
+        }
+        auto replacement = std::make_unique<Expr>();
+        replacement->kind = Expr::Kind::Address;
+        replacement->location = expression->location;
+        replacement->type = clone_type(pointer->type);
+        replacement->evaluated_address = pointer->address;
+        expression = std::move(replacement);
+        co_return true;
+    }
+    if (pending_layout) co_return true;
     const auto value = co_await evaluator.required_integer_async(*expression);
     if (value) replace_eval_value(expression, *value);
     else evaluator.diagnose(expression->location);

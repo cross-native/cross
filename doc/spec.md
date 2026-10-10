@@ -382,8 +382,10 @@ u32 powers[4] = { 1, 2, [3] = 8 };
 An array of `u8` may be initialized by a UTF-8 string when the array is large
 enough for its bytes and terminating zero; an omitted bound is inferred.
 Static-duration initializers must be translation-time values or
-target/object-format relocatable address expressions. No initializer invokes a
-hidden initialization routine. A static-duration object whose value is all
+target/object-format relocatable address expressions; a pointer derived from
+an integer translation-time value initializes static storage with its address
+bits, without a relocation. No initializer invokes a hidden initialization
+routine. A static-duration object whose value is all
 zero bits may be placed in storage the loader zeroes; `-fzero-init-in-data`
 places every such object, including a thread-local one, with the initialized
 data instead, so an image patcher can change it.
@@ -658,9 +660,10 @@ left shifts are undefined; right shift of a negative value is target-defined.
 The x86-64 and MIPS targets define it as arithmetic (sign-extending)
 right shift, including during translation-time evaluation.
 Wrapping/saturating/checked operations require user code or instructions. The
-registered option `-fwrapv` instead makes signed `+`, `-`, `*`, and `<<` wrap
-modulo 2^N, at runtime and during translation-time evaluation alike; division
-of the minimum value by -1 and invalid shift counts remain undefined.
+registered option `-fwrapv` instead makes signed `+`, `-` (binary and unary),
+`*`, and `<<` wrap modulo 2^N, at runtime and during translation-time
+evaluation alike; division of the minimum value by -1 and invalid shift counts
+remain undefined.
 
 `bool`, 8-bit, and 16-bit integers promote to `i32`. Other integer ranks
 increase with width; equal-width signed/unsigned types have equal rank;
@@ -3596,8 +3599,11 @@ its condition merely to validate it.
 `$::trap` and `$::unreachable` perform no copy-out or managed-stack cleanup.
 An implementation may offer optional instrumentation that inserts inline
 checks ending in `$::trap()`, such as array-bound and output-channel checks
-under `-fbounds-trap`; `no_sanitize("name")` suppresses the named
-instrumentation per function, and no instrumentation calls a helper.
+under `-fbounds-trap`; an array-bound check traps when a subscript of an
+array with a known bound is negative or not less than the bound, where the
+operand of `&` may equal the bound. `no_sanitize("name")` suppresses the
+named instrumentation per function, optional instrumentation never applies to
+`naked` functions, and no instrumentation calls a helper.
 The atomic intrinsics are listed under “Atomic and concurrent access.”
 `$::eval`, `$::runtime`, `$::quote`, and `$::unquote` are translation
 intrinsics and therefore emit no runtime operation. Additional intrinsics must

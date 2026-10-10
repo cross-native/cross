@@ -25,6 +25,23 @@ foreach(i RANGE ${last})
         message(FATAL_ERROR "diagnostic for ${name} lacks '${pattern}'\n${err}")
     endif()
 endforeach()
+# -fwrapv wraps signed overflow; minimum/-1 division and invalid shift counts
+# remain errors.
+execute_process(COMMAND "${CC}" -emit-llvm -O2 -fwrapv "${OUTPUT_DIR}/bad_overflow.x"
+    -o "${OUTPUT_DIR}/wrapv_overflow.ll" RESULT_VARIABLE status
+    OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "-fwrapv did not wrap translation-time signed overflow\n${err}")
+endif()
+configure_file("${SOURCE_DIR}/bad_wrapv_division.x" "${OUTPUT_DIR}/bad_wrapv_division.x" COPYONLY)
+foreach(name bad_shift bad_wrapv_division)
+    execute_process(COMMAND "${CC}" -emit-llvm -O2 -fwrapv "${OUTPUT_DIR}/${name}.x"
+        -o "${OUTPUT_DIR}/wrapv_${name}.ll" RESULT_VARIABLE status
+        OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(status EQUAL 0 OR NOT err MATCHES "shift|overflow")
+        message(FATAL_ERROR "-fwrapv accepted ${name}\n${err}")
+    endif()
+endforeach()
 configure_file("${SOURCE_DIR}/qualifier_errors.x" "${OUTPUT_DIR}/qualifier_errors.x" COPYONLY)
 execute_process(COMMAND "${CC}" -emit-llvm -O2 "${OUTPUT_DIR}/qualifier_errors.x"
     -o "${OUTPUT_DIR}/qualifier_errors.ll" RESULT_VARIABLE status

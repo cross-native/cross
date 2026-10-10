@@ -60,9 +60,16 @@ bool comparison(mir::BinaryOperation operation) {
 
 enum class IntegerDomain { None, Signed, Unsigned };
 
-IntegerDomain integer_domain(mir::BinaryOperation operation) {
+// Under -fwrapv, signed +, -, *, and << are computed in the unsigned domain,
+// where GCC defines them modulo 2^N.
+IntegerDomain integer_domain(mir::BinaryOperation operation, bool wrapv) {
     using mir::BinaryOperation;
     switch (operation) {
+    case BinaryOperation::Add:
+    case BinaryOperation::Subtract:
+    case BinaryOperation::Multiply:
+    case BinaryOperation::ShiftLeft:
+        return wrapv ? IntegerDomain::Unsigned : IntegerDomain::None;
     case BinaryOperation::SignedDivide:
     case BinaryOperation::SignedRemainder:
     case BinaryOperation::SignedMultiplyHigh:
@@ -85,7 +92,8 @@ IntegerDomain integer_domain(mir::BinaryOperation operation) {
 
 bool domain_uses_right_operand(mir::BinaryOperation operation) {
     return operation != mir::BinaryOperation::ShiftRightArithmetic &&
-           operation != mir::BinaryOperation::ShiftRightLogical;
+           operation != mir::BinaryOperation::ShiftRightLogical &&
+           operation != mir::BinaryOperation::ShiftLeft;
 }
 
 std::string binary_operator(mir::BinaryOperation operation) {
@@ -520,7 +528,7 @@ public:
 
     FunctionEmitter(const hir::Module& hir_module,
                     const mir::ManagedFunction& function,
-                    const CompilerOptions&, Diagnostics& diagnostics,
+                    const CompilerOptions& options, Diagnostics& diagnostics,
                     TypeEmitter& types, GimpleStart start)
         : hir_(hir_module), function_(function), diagnostics_(diagnostics),
           types_(types), start_(start),
@@ -541,11 +549,21 @@ public:
                 temporaries_[value.id.value].push_back(
                     {type, next_version_++});
             }
+            if (options.wrapv && value.kind == mir::ValueKind::Unary &&
+                value.unary == mir::UnaryOperation::Negate &&
+                types_.is_integer(value.type)) {
+                IntegerDomainTemporary temporary;
+                temporary.domain = IntegerDomain::Unsigned;
+                temporary.left_version = next_version_++;
+                temporary.result_version = next_version_++;
+                integer_temporaries_[value.id.value] = temporary;
+                continue;
+            }
             if (value.kind != mir::ValueKind::Binary ||
                 value.operands.size() != 2) {
                 continue;
             }
-            const auto domain = integer_domain(value.binary);
+            const auto domain = integer_domain(value.binary, options.wrapv);
             const auto operand_type =
                 function_.values.at(value.operands.front().value).type;
             if (domain == IntegerDomain::None ||
@@ -871,12 +889,12 @@ private:
             const auto& temporary = integer_temporaries_.at(value.id.value);
             if (!temporary) continue;
             const auto left = value.operands.at(0);
-            const auto right = value.operands.at(1);
             out_ << "  "
                  << types_.integer_domain_name(
                         function_.values.at(left.value).type, temporary->domain)
                  << ' ' << integer_temporary_base(value.id, "left") << ";\n";
             if (temporary->right_version) {
+                const auto right = value.operands.at(1);
                 out_ << "  "
                      << types_.integer_domain_name(
                             function_.values.at(right.value).type,
@@ -1335,6 +1353,19 @@ private:
         }
         if (value.kind == ValueKind::Unary) {
             const auto operand = value.operands.front();
+            if (const auto& wrapping = integer_temporaries_.at(value.id.value)) {
+                const auto left = integer_temporary_reference(
+                    value.id, "left", wrapping->left_version);
+                const auto result = integer_temporary_reference(
+                    value.id, "result", *wrapping->result_version);
+                out_ << "  " << left << " = __VIEW_CONVERT <"
+                     << types_.integer_domain_name(value.type, wrapping->domain)
+                     << ">(" << reference(operand) << ");\n"
+                     << "  " << result << " = -" << left << ";\n"
+                     << "  " << reference(value.id) << " = __VIEW_CONVERT <"
+                     << types_.name(value.type) << ">(" << result << ");\n";
+                return;
+            }
             out_ << "  " << reference(value.id) << " = ";
             if (value.unary == mir::UnaryOperation::IsZero) {
                 out_ << reference(operand)

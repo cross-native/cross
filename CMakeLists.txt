@@ -2563,6 +2563,143 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     set_tests_properties(cross_runtime_division_by_constant_llvm PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.llvm;middle;feature.optimization;opt.O2")
+    # Loop bounds computed inside a vectorized reduction loop.
+    foreach(level O0 O1 O2 O3 Os Oz)
+        add_test(NAME cross_runtime_loop_invariant_bounds_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/loop_invariant_bounds.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-loop-bounds-${level}
+                -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_loop_invariant_bounds_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.vector;opt.${level}")
+        add_test(NAME cross_runtime_loop_invariant_bounds_mips_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/loop_invariant_bounds.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-loop-bounds-mips-${level}
+                -DEXPECTED=P -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_loop_invariant_bounds_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    # Array bounds and enumerators that query a bound inferred from an initializer.
+    foreach(target x86_64-unknown-linux-gnu mips-unknown-elf)
+        string(REGEX REPLACE "-.*" "" architecture "${target}")
+        add_test(NAME cross_inferred_bound_queries_${architecture}
+            COMMAND $<TARGET_FILE:cross_cc> -target ${target} -S
+                    "${CMAKE_SOURCE_DIR}/test/language/inferred_bounds.x"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/inferred-bounds-${architecture}.s")
+    endforeach()
+    set_tests_properties(cross_inferred_bound_queries_x86_64 PROPERTIES
+        LABELS "check.compile;arch.x86_64;frontend;feature.array;feature.evaluation;feature.enum")
+    set_tests_properties(cross_inferred_bound_queries_mips PROPERTIES
+        LABELS "check.compile;arch.mips;frontend;feature.array;feature.evaluation;feature.enum")
+    # Static pointers initialized from integers.
+    add_test(NAME cross_integer_pointer_initializers
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/integer_pointers.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/integer-pointers
+            -P "${CMAKE_SOURCE_DIR}/test/middle/data/integer_pointers.cmake")
+    set_tests_properties(cross_integer_pointer_initializers PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.initializer;feature.pointer")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_integer_pointer_initializers_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/integer_pointers.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-integer-pointers-${level}
+                -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_integer_pointer_initializers_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.initializer;feature.pointer;opt.${level}")
+    endforeach()
+    add_test(NAME cross_runtime_integer_pointer_initializers_mips
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/integer_pointers.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-integer-pointers-mips
+            -DEXPECTED=P
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_integer_pointer_initializers_mips PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;middle;feature.initializer;feature.pointer;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    # -fwrapv at run time and in translation-time evaluation.
+    foreach(level O0 O2 O3)
+        add_test(NAME cross_runtime_wrapv_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/wrapv.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-wrapv-${level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${level};-fwrapv"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_wrapv_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.semantics;feature.optimization;feature.evaluation;opt.${level}")
+        add_test(NAME cross_runtime_wrapv_mips_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/wrapv.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-wrapv-mips-${level}
+                -DEXPECTED=P "-DCC_FLAGS=-${level};-fwrapv"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_wrapv_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.semantics;feature.optimization;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    if(CROSS_ENABLE_GCC_GIMPLE_TEXT AND CROSS_TEST_GCC)
+        add_test(NAME cross_gcc_gimple_wrapv
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DGCC=${CROSS_TEST_GCC}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/wrapv.x
+                -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_wrapv_harness.c
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-wrapv
+                "-DLEVELS=O0;O2;O3" -DCC_FLAGS=-fwrapv -DEXPECTED=0
+                "-DPATTERN== -cross_domain_left_"
+                -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+        set_tests_properties(cross_gcc_gimple_wrapv PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.gcc;feature.semantics;opt.O0;opt.O2;opt.O3")
+    endif()
+    # -fbounds-trap instrumentation.
+    add_test(NAME cross_runtime_bounds_trap
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/bounds_trap.x
+            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bounds-trap
+            -P "${CMAKE_SOURCE_DIR}/test/middle/bounds_trap.cmake")
+    set_tests_properties(cross_runtime_bounds_trap PROPERTIES
+        LABELS "check.runtime;check.compile;arch.x86_64;arch.mips;backend.native;middle;feature.array;feature.array_bounds;opt.O0;opt.O2;opt.O3")
+    foreach(level O0 O2)
+        foreach(case bounds_ok bounds_past bounds_negative bounds_outer bounds_vla)
+            if(case STREQUAL "bounds_ok")
+                set(bounds_expected P)
+            else()
+                set(bounds_expected T)
+            endif()
+            add_test(NAME cross_runtime_bounds_trap_mips_${case}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/bounds_trap.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bounds-trap-mips-${case}-${level}
+                    -DEXPECTED=${bounds_expected}
+                    "-DCC_FLAGS=-${level};-fbounds-trap;-DCASE=${case}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_runtime_bounds_trap_mips_${case}_${level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;middle;feature.array;feature.array_bounds;opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     add_test(NAME cross_x86_64_feature_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

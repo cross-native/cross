@@ -51,9 +51,12 @@ struct IntegerResult {
     IntegerError error{};
 };
 
+// `wrap_signed` makes signed +, -, *, and << wrap modulo 2^N (-fwrapv);
+// MIN / -1 and invalid shift counts remain errors.
 inline IntegerResult checked_integer_operation(IntegerOperation operation,
                                               UInt128 left, UInt128 right,
-                                              IntegerType type) {
+                                              IntegerType type,
+                                              bool wrap_signed = false) {
     const auto left_negative = integer_negative(left, type);
     const auto right_negative = integer_negative(right, type);
     const auto minimum = shift_left(UInt128{1}, type.bits - 1);
@@ -68,14 +71,14 @@ inline IntegerResult checked_integer_operation(IntegerOperation operation,
     case IntegerOperation::Subtract: {
         const bool addition = operation == IntegerOperation::Add;
         result = mask_to(addition ? add(left, right) : subtract(left, right), type.bits);
-        if (type.is_signed &&
+        if (type.is_signed && !wrap_signed &&
             (addition ? left_negative == right_negative : left_negative != right_negative) &&
             integer_negative(result, type) != left_negative)
             return {{}, IntegerError::Overflow};
         break;
     }
     case IntegerOperation::Multiply:
-        if (type.is_signed && right != UInt128{}) {
+        if (type.is_signed && !wrap_signed && right != UInt128{}) {
             const auto limit = left_negative != right_negative ? minimum : maximum;
             if (divide(limit, magnitude(right)).first < magnitude(left))
                 return {{}, IntegerError::Overflow};
@@ -104,7 +107,7 @@ inline IntegerResult checked_integer_operation(IntegerOperation operation,
             return {{}, IntegerError::ShiftCount};
         const auto count = static_cast<unsigned>(right.low);
         if (operation == IntegerOperation::ShiftLeft) {
-            if (type.is_signed &&
+            if (type.is_signed && !wrap_signed &&
                 (left_negative || shift_right(maximum, count) < left))
                 return {{}, IntegerError::Overflow};
             result = shift_left(left, count);

@@ -1,9 +1,10 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Serializes SOURCE as GIMPLE at each of LEVELS (default O0 and O2), compiles
-# it with GCC, links the C HARNESS, and requires the harness to exit with
-# EXPECTED. The GIMPLE text must match PATTERN when one is given.
+# Serializes SOURCE as GIMPLE at each of LEVELS (default O0 and O2), with the
+# optional CC_FLAGS, compiles it with GCC, links the C HARNESS, and requires
+# the harness to exit with EXPECTED. The GIMPLE text must match PATTERN when
+# one is given.
 foreach(required CC GCC SOURCE HARNESS OUTPUT EXPECTED)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} is required")
@@ -17,7 +18,7 @@ foreach(level IN LISTS LEVELS)
     set(gimple_source "${OUTPUT}.${level}.gimple.c")
     set(executable "${OUTPUT}.${level}.exe")
     execute_process(
-        COMMAND "${CC}" -emit-gimple -${level} "${SOURCE}" -o "${gimple_source}"
+        COMMAND "${CC}" -emit-gimple -${level} ${CC_FLAGS} "${SOURCE}" -o "${gimple_source}"
         RESULT_VARIABLE status ERROR_VARIABLE err)
     if(NOT status EQUAL 0)
         message(FATAL_ERROR "Cross GIMPLE serialization failed:\n${err}")

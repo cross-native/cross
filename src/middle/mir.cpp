@@ -862,9 +862,7 @@ public:
     ManagedLowerer(hir::Module& module, const Subtarget& subtarget,
                    const CompilerOptions& options, Diagnostics& diagnostics)
         : hir_(module), subtarget_(subtarget), target_(subtarget.target()),
-          diagnostics_(diagnostics) {
-        (void)options;
-    }
+          diagnostics_(diagnostics), bounds_trap_(options.bounds_trap) {}
 
     ManagedModule run() {
         for (auto& function : hir_.functions) {
@@ -1052,6 +1050,11 @@ private:
 
     std::optional<ManagedFunction> lower_function(const hir::Function& function) {
         failed_ = false;
+        // A naked body is the programmer's exact code: no instrumentation.
+        bounds_checks_ = bounds_trap_ && !function.naked &&
+            std::find(function.no_sanitize.begin(), function.no_sanitize.end(),
+                      "bounds") == function.no_sanitize.end();
+        dynamic_counts_.clear();
         current_patch_sinks_.clear();
         current_patch_origins_.clear();
         parameter_values_.clear();
@@ -1709,9 +1712,18 @@ private:
                 const auto lane = co_await lower_vector_lane_async(expression, true);
                 co_return lane ? lane->memory : std::nullopt;
             }
+            std::optional<ValueId> dynamic_count;
+            std::uint64_t fixed_count{};
             if (aggregate_type && array_type(hir_, *aggregate_type)) {
                 const auto aggregate = co_await lower_designator_address_async(*expression.left, access);
                 if (!aggregate) co_return std::nullopt;
+                fixed_count = hir_.type(aggregate->type).lanes;
+                if (fixed_count == 0) {
+                    const auto name = local_name(*expression.left);
+                    const auto* local = name ? find_local(*name) : nullptr;
+                    if (local && local->dynamic_address)
+                        dynamic_count = dynamic_counts_.at(local->dynamic_address->value);
+                }
                 element = qualified_array_element(aggregate->type);
                 base = decay_array_address(aggregate->address,
                                            aggregate->type,
@@ -1737,6 +1749,10 @@ private:
                 !integer_type(hir_, current_.values[index->value].type)) {
                 co_return std::nullopt;
             }
+            if (bounds_checks_ && (fixed_count != 0 || dynamic_count))
+                require_subscript_in_bounds(*index, fixed_count, dynamic_count,
+                                            &expression == one_past_subscript_,
+                                            expression.location);
             co_return DesignatorAddress{
                 indexed_address(*base, *index, element,
                                 expression.location),
@@ -2596,6 +2612,47 @@ private:
         terminate(TerminatorKind::Trap, location, std::nullopt, {});
         enter(ready);
         return true;
+    }
+
+    // -fbounds-trap: trap unless `index` selects one of the array's elements
+    // or forms its one-past address. The index compares as an unsigned value
+    // as wide as an address or the index, so a negative index is out of range.
+    void require_subscript_in_bounds(ValueId index, std::uint64_t fixed_count,
+                                     std::optional<ValueId> dynamic_count,
+                                     bool one_past, SourceLocation location) {
+        const auto index_type = current_.values[index.value].type;
+        const auto bits = type_bits(hir_, index_type);
+        if (const auto& value = current_.values[index.value];
+            !dynamic_count && value.kind == ValueKind::ConstantInteger) {
+            const UInt128 constant_index{value.integer, value.integer_high};
+            const bool negative =
+                signed_type(hir_, index_type) && bit(constant_index, bits - 1U);
+            if (!negative && (one_past ? !(UInt128{fixed_count} < constant_index)
+                                       : constant_index < UInt128{fixed_count}))
+                return;
+        }
+        const auto compare_type = *hir_.builtin(
+            bits <= hir_.address_bits ? BuiltinType::Uptr
+            : bits <= 64 ? BuiltinType::U64 : BuiltinType::U128);
+        const auto wide = cast(index, compare_type, location);
+        const auto limit = dynamic_count
+            ? cast(*dynamic_count, compare_type, location)
+            : constant(UInt128{fixed_count}, compare_type, location);
+        const auto in_bounds = add_value(
+            ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), location);
+        current_.values[in_bounds.value].binary = one_past
+            ? BinaryOperation::UnsignedLessEqual : BinaryOperation::UnsignedLess;
+        current_.values[in_bounds.value].operands = {wide, limit};
+        const auto ready = new_block(location);
+        const auto trap = new_block(location);
+        terminate(TerminatorKind::ConditionalBranch, location, in_bounds,
+                  {ready, trap});
+        enter(trap);
+        const auto operation = add_effectful(
+            ValueKind::Intrinsic, *hir_.builtin(BuiltinType::Void), location);
+        current_.values[operation.value].intrinsic = IntrinsicOperation::Trap;
+        terminate(TerminatorKind::Trap, location, std::nullopt, {});
+        enter(ready);
     }
 
     bool initialize_aggregate_items(
@@ -3859,8 +3916,10 @@ private:
                     }
                 }
                 if (operand) {
-                    if (auto designator =
-                            co_await lower_designator_address_async(*operand)) {
+                    const auto* enclosing = std::exchange(one_past_subscript_, operand);
+                    auto designator = co_await lower_designator_address_async(*operand);
+                    one_past_subscript_ = enclosing;
+                    if (designator) {
                         if (designator->bit_field) {
                             diagnostics_.error(
                                 expression.location,
@@ -6354,6 +6413,7 @@ private:
                     *bound, element, element_size, alignment,
                     declaration.location);
                 const LocalBinding binding{{}, type, address, dynamic_size};
+                dynamic_counts_.emplace(address.value, dynamic_count);
                 if (declaration.initializer &&
                     !initialize_dynamic_array(
                         binding, *declaration.initializer, dynamic_count)) {
@@ -6873,6 +6933,13 @@ private:
     const Subtarget& subtarget_;
     const TargetInfo& target_;
     Diagnostics& diagnostics_;
+    // -fbounds-trap, and whether it instruments the current function.
+    bool bounds_trap_{};
+    bool bounds_checks_{};
+    // The subscript operand of `&`, which may form the one-past address.
+    const Expr* one_past_subscript_{};
+    // Element counts of variable-length arrays, by allocation value.
+    std::unordered_map<std::uint32_t, ValueId> dynamic_counts_;
     ManagedModule result_;
     ManagedFunction current_;
     std::optional<BlockId> current_block_;
@@ -12288,6 +12355,13 @@ bool reduce_affine_address_inductions(
                 step.integer == 0 || step.integer_high != 0) {
                 continue;
             }
+            // The pointer recurrence equals the indexed addresses only while
+            // the index does not wrap: an index as wide as an address wraps
+            // with it, and signed overflow is undefined without -fwrapv.
+            if (type_bits(hir_module, index_phi.type) < hir_module.address_bits &&
+                (options.wrapv || !signed_type(hir_module, index_phi.type))) {
+                continue;
+            }
             const auto latch = carried->predecessor;
             const auto index_type = index_phi.type;
             const auto index_location = index_phi.location;
@@ -13873,6 +13947,24 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
                value.kind == ValueKind::ConstantInteger ||
                value.kind == ValueKind::ConstantFloating;
     };
+    // The bound must be loop invariant. Folding can leave an invariant
+    // expression of constants inside the loop; the header computes it on
+    // every entry, so the transform may recompute it in the preheader.
+    const std::function<bool(ValueId)> invariant_expression =
+        [&](ValueId id) {
+            if (!loop_values.contains(id.value)) return true;
+            const auto& value = function.values[id.value];
+            if (value.effect_input || value.effect_output ||
+                (value.kind != ValueKind::ConstantInteger &&
+                 value.kind != ValueKind::Unary &&
+                 value.kind != ValueKind::Binary &&
+                 value.kind != ValueKind::Cast)) {
+                return false;
+            }
+            return std::all_of(value.operands.begin(), value.operands.end(),
+                               invariant_expression);
+        };
+    if (!invariant_expression(condition.operands[1])) return std::nullopt;
 
     struct ReductionCandidate {
         ValueId phi;
@@ -14323,18 +14415,19 @@ bool vectorize_reduction_loop(
             ? lanes_constant
             : add_integer_constant(index_type, vector_step);
 
-    // The bound is loop invariant, but folding may have materialized it as
-    // a constant inside the loop, where it does not dominate the preheader
-    // or the alias guard. Give those blocks their own copy.
-    auto bound = pattern.bound;
-    if (definitions[bound.value] &&
-        pattern.loop.blocks.contains(definitions[bound.value]->value)) {
-        auto clone = function.values[bound.value];
-        clone.id = {};
-        clone.effect_input.reset();
-        clone.effect_output.reset();
-        bound = append_value(preheader_values, std::move(clone));
-    }
+    // The bound is loop invariant, but folding may have left it as an
+    // expression of constants inside the loop, where it does not dominate
+    // the preheader or the alias guard. Recompute it in the preheader.
+    const std::function<ValueId(ValueId)> preheader_copy = [&](ValueId id) {
+        if (!definitions[id.value] ||
+            !pattern.loop.blocks.contains(definitions[id.value]->value)) {
+            return id;
+        }
+        auto clone = function.values[id.value];
+        for (auto& operand : clone.operands) operand = preheader_copy(operand);
+        return append_value(preheader_values, std::move(clone));
+    };
+    const auto bound = preheader_copy(pattern.bound);
     // The recognized induction starts at zero, so rounding the bound down to
     // a whole vector group gives a loop-invariant end index. Comparing the
     // induction with this limit avoids a subtract in every vector iteration.

@@ -42,5 +42,22 @@ int main() {
         IntegerOperation::ShiftLeft, UInt128{1}, UInt128{32}, i32);
     if (badshift.error != cross::IntegerError::ShiftCount)
         return 6;
+
+    // Wrapping signed arithmetic (-fwrapv) keeps minimum/-1 and invalid
+    // shift counts as errors.
+    const UInt128 minimum{0x80000000};
+    const UInt128 minus_one{0xffffffff};
+    const auto wrapped = [&](IntegerOperation operation, UInt128 left, UInt128 right) {
+        return cross::checked_integer_operation(operation, left, right, i32, true);
+    };
+    if (wrapped(IntegerOperation::Add, UInt128{0x7fffffff}, UInt128{1}).value != minimum ||
+        wrapped(IntegerOperation::Subtract, minimum, UInt128{1}).value != UInt128{0x7fffffff} ||
+        wrapped(IntegerOperation::Multiply, UInt128{0x10000}, UInt128{0x10000}).value != UInt128{} ||
+        wrapped(IntegerOperation::ShiftLeft, minus_one, UInt128{31}).value != minimum ||
+        wrapped(IntegerOperation::ShiftLeft, UInt128{3}, UInt128{31}).error != cross::IntegerError::None)
+        return 7;
+    if (wrapped(IntegerOperation::Divide, minimum, minus_one).error != cross::IntegerError::Overflow ||
+        wrapped(IntegerOperation::ShiftLeft, UInt128{1}, UInt128{32}).error != cross::IntegerError::ShiftCount)
+        return 8;
     return 0;
 }

@@ -27,9 +27,10 @@ An alias must name a compatible definition in the same compilation. An
 instance of a `global` generic goes to a COMDAT group keyed by its link name
 on ELF and COFF, and is a weak definition on Mach-O, so the linker keeps one
 copy. `[[hot]]` and `[[cold]]` functions go to separate text sections.
-`[[used]]` forces emission. `[[no_stack_protector]]` and
-`[[no_sanitize("name")]]` are accepted; Cross generates neither kind of
-instrumentation.
+`[[used]]` forces emission. `[[no_stack_protector]]` is accepted; Cross
+generates no stack-protector instrumentation. `[[no_sanitize("bounds")]]`
+removes the `-fbounds-trap` checks from a function; other names are accepted
+and have no effect.
 
 Mach-O output spells every link name with the leading underscore of C symbols
 on that format, so `[[link_name("write")]]` refers to the C function `write`
@@ -91,6 +92,8 @@ Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
 atomics, thread-local storage, and variadic functions are supported, but a
 variadic function or function pointer cannot use register or stack locations.
+
+`$::trap()`, like a failed `-fbounds-trap` check, executes `ud2`.
 
 A `[[musttail]]` call cannot target a variadic function or leave a function
 that binds variadic state, and passes every argument in a register. With
@@ -178,6 +181,8 @@ by number (`$8`) because 64-bit assemblers read `$t0`–`$t3` differently.
 Allegrex has a single-precision FPU: `f64` arithmetic is an error. Code that
 needs floating point under `-msoft-float` is an error, because Cross does not
 call a software floating-point library.
+
+`$::trap()`, like a failed `-fbounds-trap` check, executes `break 7`.
 
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 hard-float `f32` and `f64`, structures and unions by value under every ABI,
@@ -268,9 +273,10 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 
 ## Limits on all targets
 
-- Specified but not implemented yet: the floating intrinsics, `-fwrapv`,
-  `-fbounds-trap`, `debug` entries and `-g`, and the profile
-  floating-environment properties.
+- Specified but not implemented yet: the floating intrinsics, `debug`
+  entries and `-g`, and the profile floating-environment properties.
+- `-fbounds-trap` checks only subscripts of arrays with a known bound; it
+  does not check subscripts of pointers or `out` and `inout` channels.
 - Generic records and unions (`struct list<T>`) are specified but not
   implemented; `$::feature::generic_types` is absent.
 - A function is wrapped for another ABI or other register locations only

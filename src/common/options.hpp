@@ -192,6 +192,9 @@ struct CompilerOptions {
     bool ipa_cp_clone{};
     unsigned inline_unit_limit{96};
 
+    bool wrapv{};
+    bool bounds_trap{};
+
     bool verbose{};
     bool save_temps{};
     bool show_help{};
