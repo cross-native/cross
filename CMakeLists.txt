@@ -5186,6 +5186,21 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/embed_values.cmake")
     set_tests_properties(cross_embed_values PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;frontend;feature.preprocessor")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_tsv_enum_${level}
+                 COMMAND "${CMAKE_COMMAND}"
+                         -DCC=$<TARGET_FILE:cross_cc>
+                         -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                         -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/tsv_enum.x
+                         -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/tsv-enum-${level}
+                         -DENTRY=tsv_enum_entry
+                         -DEXPECTED=7
+                         "-DCC_FLAGS=-${level}"
+                         -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_tsv_enum_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;frontend;feature.macro;feature.enum;feature.preprocessor;opt.${level}")
+    endforeach()
     add_test(NAME cross_meta_object_checks
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/meta_objects.x
