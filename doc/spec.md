@@ -385,8 +385,8 @@ Static-duration initializers must be translation-time values or
 target/object-format relocatable address expressions. No initializer invokes a
 hidden initialization routine. A static-duration object whose value is all
 zero bits may be placed in storage the loader zeroes; `-fzero-init-in-data`
-places every such object with the initialized data instead, so an image
-patcher can change it.
+places every such object, including a thread-local one, with the initialized
+data instead, so an image patcher can change it.
 
 ### Values, conversions, and casts
 
@@ -1369,18 +1369,20 @@ object-file symbols. `link_name` is preserved unchanged.
 
 Macro state and semantic source-unit identity do not leak between primary
 inputs. In a multi-input stream, `cpp` emits a compiler-generated
-`#$::source::unit "normalized-path"` boundary before each primary input,
-followed by its normal line marker. `cc` accepts this boundary in preprocessed
-Cross and uses it for `static` visibility. It is not a source directive and is
+`#$::source::unit "path"` boundary before each primary input, where `path`
+is the input's source-unit identity, followed by its normal line marker. `cc`
+accepts this boundary in preprocessed Cross verbatim and uses it for `static`
+visibility. It is not a source directive and is
 rejected when written in a `.x` file. Duplicate global definitions and
 unnamespaced type or tag conflicts remain semantic errors; preprocessing does
 not rename them.
 
 ### Source positions and dependency output
 
-`cpp` emits `#line` around inputs/includes. Source macros, diagnostics, and
-dependencies use original paths/positions; diagnostics include file, line,
-column when known, and reason.
+`cpp` emits `#line` around inputs/includes. Diagnostics and dependencies use
+original paths and positions, and `$::source::file` uses the original path
+after `-ffile-prefix-map`; diagnostics include file, line, column when known,
+and reason.
 
 Dependencies come from the textual include graph and active, declared
 `$::embed` operations and never contain temporary paths. `-M` and `-MM`
@@ -3892,7 +3894,8 @@ byte-identical preprocessed, assembly, object, and dependency output
 regardless of the working directory, environment, host, thread count, or
 allocator behavior. A source unit is identified by its primary input's path as
 written on the command line, after `-ffile-prefix-map=OLD=NEW` replaces a
-leading `OLD` with `NEW`; `$::source::file`, source-unit identities,
+leading `OLD` with `NEW` (when several mappings match, the last one applies);
+`$::source::file`, source-unit identities,
 implementation-internal symbol names, and debugging information use that
 spelling, never a path the compiler resolved. Within a source unit and
 section, definitions are emitted in definition order, and source units in

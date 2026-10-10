@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <numeric>
+#include <set>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,7 +60,20 @@ std::string_view parameter_mode_name(ParameterMode mode) {
     return {};
 }
 
-std::string model_entity_name(std::string_view qualified_name, const FreshIdentifier* fresh) {
+// Gensym link stems number the expansions of each source unit from one in
+// expansion order, so that one unit's expansions never rename another's
+// symbols.
+using FreshRanks = std::map<std::pair<std::string, std::uint64_t>, std::uint64_t>;
+
+std::string fresh_link_stem(const FreshIdentifier& fresh, const FreshRanks& ranks) {
+    auto local = fresh;
+    if (const auto found = ranks.find({fresh.source_unit, fresh.expansion.value});
+        found != ranks.end()) local.expansion = {found->second};
+    return fresh_identifier_link_stem(local);
+}
+
+std::string model_entity_name(std::string_view qualified_name, const FreshIdentifier* fresh,
+                              const FreshRanks& ranks) {
     if (!fresh) return std::string(qualified_name);
     // A private identifier is reusable in distinct lexical namespaces. Its
     // opaque leaf identity must not erase the enclosing entity placement from
@@ -65,15 +81,15 @@ std::string model_entity_name(std::string_view qualified_name, const FreshIdenti
     const auto separator = qualified_name.rfind("::");
     auto result = separator == std::string_view::npos ? std::string{}
         : std::string(qualified_name.substr(0, separator + 2));
-    result += fresh_identifier_link_stem(*fresh);
+    result += fresh_link_stem(*fresh, ranks);
     return result;
 }
 
 std::string resolved_link_name(const FunctionDecl& function,
-                               const CompilerOptions& options) {
+                               const CompilerOptions& options, const FreshRanks& ranks) {
     if (const auto exact = decode_attribute_string(function.attribute("link_name"));
         !exact.empty()) return exact;
-    const auto model_name = model_entity_name(function.name, function.fresh.get());
+    const auto model_name = model_entity_name(function.name, function.fresh.get(), ranks);
     if (function.linkage == Linkage::Global ||
         (function.linkage != Linkage::Static && !function.definition())) {
         std::vector<ManglingParameter> parameters;
@@ -107,10 +123,10 @@ const Attribute* object_attribute(const ObjectDecl& object, std::string_view nam
 }
 
 std::string resolved_link_name(const ObjectDecl& object,
-                               const CompilerOptions& options) {
+                               const CompilerOptions& options, const FreshRanks& ranks) {
     if (const auto exact = decode_attribute_string(object_attribute(object, "link_name"));
         !exact.empty()) return exact;
-    const auto model_name = model_entity_name(object.name, object.fresh.get());
+    const auto model_name = model_entity_name(object.name, object.fresh.get(), ranks);
     if (object.linkage == Linkage::Global ||
         (object.linkage != Linkage::Static && !object.initializer)) {
         return encode_model_link_name(
@@ -1698,6 +1714,81 @@ private:
                 }
             }
         }
+        order_by_definition(module_.functions, program_.functions,
+                            function_keys_, module_.function_ids);
+    }
+
+    // IDs follow emission order: source units in command-line order and,
+    // within a unit, definitions in definition order. An entity without a
+    // definition keeps the place of its first declaration.
+    template <typename Entity, typename Source, typename Id>
+    void order_by_definition(std::vector<Entity>& entities,
+                             const std::vector<std::unique_ptr<Source>>& sources,
+                             std::unordered_map<std::string, Id>& keys,
+                             std::unordered_map<const Source*, Id>& ids) const {
+        std::unordered_map<std::string_view, std::size_t> units;
+        for (const auto& unit : program_.source_units) units.emplace(unit, units.size());
+        std::unordered_map<const Source*, std::size_t> positions;
+        for (std::size_t index = 0; index < sources.size(); ++index)
+            positions.emplace(sources[index].get(), index);
+        std::vector<std::pair<std::size_t, std::size_t>> places;
+        places.reserve(entities.size());
+        for (const auto& entity : entities) {
+            const auto* source = entity.definition ? entity.definition : entity.declarations.front();
+            const auto unit = units.find(source->source_unit);
+            places.emplace_back(unit == units.end() ? units.size() : unit->second,
+                                positions.at(source));
+        }
+        std::vector<std::uint32_t> order(entities.size());
+        std::iota(order.begin(), order.end(), 0U);
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
+            return places[left] < places[right];
+        });
+        std::vector<std::uint32_t> renumbered(entities.size());
+        std::vector<Entity> sorted;
+        sorted.reserve(entities.size());
+        for (const auto old : order) {
+            renumbered[old] = static_cast<std::uint32_t>(sorted.size());
+            sorted.push_back(std::move(entities[old]));
+            sorted.back().id = {renumbered[old]};
+        }
+        entities = std::move(sorted);
+        for (auto& entry : keys) entry.second = {renumbered[entry.second.value]};
+        for (auto& entry : ids) entry.second = {renumbered[entry.second.value]};
+    }
+
+    const FreshRanks& fresh_ranks() {
+        if (fresh_ranks_) return *fresh_ranks_;
+        std::set<std::pair<std::string, std::uint64_t>> expansions;
+        const auto add = [&](const FreshIdentifier* fresh) {
+            if (fresh) expansions.emplace(fresh->source_unit, fresh->expansion.value);
+        };
+        const auto add_labels = [&](auto&& self, const Statement& statement) -> void {
+            if (statement.global_label) add(statement.label_fresh.get());
+            for (const auto& child : statement.statements) self(self, *child);
+            if (statement.first) self(self, *statement.first);
+            if (statement.second) self(self, *statement.second);
+        };
+        for (const auto& function : program_.functions) {
+            add(function->fresh.get());
+            if (function->body) add_labels(add_labels, *function->body);
+        }
+        for (const auto& object : program_.objects) add(object->fresh.get());
+        for (const auto& label : program_.global_labels) {
+            add(label.owner_fresh.get());
+            add(label.label_fresh.get());
+        }
+        auto& ranks = fresh_ranks_.emplace();
+        const std::string* unit{};
+        std::uint64_t rank{};
+        for (const auto& expansion : expansions) {
+            if (!unit || *unit != expansion.first) {
+                unit = &expansion.first;
+                rank = 0;
+            }
+            ranks.emplace(expansion, ++rank);
+        }
+        return ranks;
     }
 
     ContinuationTask<void> finish_functions_async() {
@@ -1735,7 +1826,7 @@ private:
             function.mergeable = function.linkage == Linkage::Global &&
                                  function.definition &&
                                  function.definition->generic_instance;
-            function.link_symbol = resolved_link_name(*representative, options_);
+            function.link_symbol = resolved_link_name(*representative, options_, fresh_ranks());
             if (function.link_symbol.empty()) {
                 diagnostics_.error(
                     representative->location,
@@ -2108,10 +2199,11 @@ private:
             if (owner_fresh || label_fresh) {
                 const auto split = qualified_name.rfind("::");
                 if (split != std::string_view::npos) {
-                    model_name = model_entity_name(qualified_name.substr(0, split), owner_fresh);
+                    model_name = model_entity_name(qualified_name.substr(0, split), owner_fresh,
+                                                   fresh_ranks());
                     model_name += "::";
                     model_name += label_fresh
-                        ? fresh_identifier_link_stem(*label_fresh)
+                        ? fresh_link_stem(*label_fresh, fresh_ranks())
                         : std::string(qualified_name.substr(split + 2));
                 }
             }
@@ -2317,6 +2409,8 @@ private:
                 }
             }
         }
+        order_by_definition(module_.objects, program_.objects,
+                            object_keys_, module_.object_ids);
     }
 
     ContinuationTask<void> finish_objects_async() {
@@ -2328,7 +2422,7 @@ private:
             object.location = representative->location;
             object.source_unit = representative->source_unit;
             object.linkage = representative->linkage;
-            object.link_symbol = resolved_link_name(*representative, options_);
+            object.link_symbol = resolved_link_name(*representative, options_, fresh_ranks());
             if (object.link_symbol.empty()) {
                 diagnostics_.error(
                     representative->location,
@@ -2618,6 +2712,7 @@ private:
     std::unordered_set<NominalTypeKey, NominalTypeKeyHash> alignment_active_;
     std::unordered_map<std::string, FunctionId> function_keys_;
     std::unordered_map<std::string, ObjectId> object_keys_;
+    std::optional<FreshRanks> fresh_ranks_;
 };
 
 // The fields every interning helper below compares, so equal types share a

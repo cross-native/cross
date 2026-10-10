@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -97,6 +98,7 @@ struct CompilerOptions {
     std::vector<std::filesystem::path> forced_includes;
     std::vector<std::filesystem::path> macro_includes;
     DependencyMode dependency_mode{DependencyMode::None};
+    bool dependency_phony_targets{};
     std::optional<std::filesystem::path> dependency_file;
     std::vector<DependencyTarget> dependency_targets;
     std::vector<std::filesystem::path> model_paths;
@@ -138,6 +140,11 @@ struct CompilerOptions {
     std::uint64_t eval_memory_limit{64 * 1024 * 1024};
     std::uint64_t eval_step_limit{1000000};
     unsigned eval_depth_limit{256};
+    std::uint64_t generic_instance_limit{4096};
+    unsigned generic_depth_limit{128};
+    // -ffile-prefix-map settings in order; a later match takes precedence.
+    std::vector<std::pair<std::string, std::string>> file_prefix_maps;
+    bool zero_init_in_data{};
     bool omit_frame_pointer{};
     bool tree_ccp{};
     bool tree_bit_ccp{};
@@ -241,6 +248,10 @@ std::uint64_t resolved_unsigned(const CompilerOptions& options,
 std::string_view resolved_text(const CompilerOptions& options,
                                std::string_view name,
                                std::string_view fallback = {});
+// The spelling of a source path in output: its generic form with the last
+// matching -ffile-prefix-map applied.
+std::string mapped_source_path(const CompilerOptions& options,
+                               const std::filesystem::path& path);
 std::string_view option_origin_name(OptionOrigin origin);
 std::string option_value_text(const OptionValue& value);
 std::string option_type_text(const OptionDefinition& definition);

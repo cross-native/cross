@@ -514,7 +514,8 @@ std::string Preprocessor::expand_text(std::string_view text,
                                       std::unordered_set<std::string>& disabled,
                                       unsigned depth,
                                       std::optional<SourceLocation> condition,
-                                      std::optional<SourceLocation> origin) const {
+                                      std::optional<SourceLocation> origin,
+                                      std::optional<OpenInvocation>* open_invocation) const {
     if (depth > 100) return std::string(text);
     std::string output;
     for (std::size_t i = 0; i < text.size();) {
@@ -557,7 +558,7 @@ std::string Preprocessor::expand_text(std::string_view text,
         }
         if (origin && origin->valid() && name == "$::source::file") {
             std::ostringstream spelling;
-            spelling << std::quoted(origin->file->path.generic_string());
+            spelling << std::quoted(mapped_source_path(options_, origin->file->path));
             output += spelling.str();
             continue;
         }
@@ -581,6 +582,7 @@ std::string Preprocessor::expand_text(std::string_view text,
         auto open = i;
         while (open < text.size() && std::isspace(static_cast<unsigned char>(text[open])) != 0) ++open;
         if (open >= text.size() || text[open] != '(') {
+            if (open_invocation && open >= text.size()) *open_invocation = OpenInvocation{name, false};
             disabled.erase(name);
             output += name;
             continue;
@@ -618,6 +620,7 @@ std::string Preprocessor::expand_text(std::string_view text,
             argument.push_back(ch);
         }
         if (nesting != 0) {
+            if (open_invocation) *open_invocation = OpenInvocation{name, true};
             output += name;
             output.append(text.substr(open, i - open));
             disabled.erase(name);
@@ -639,6 +642,8 @@ std::string Preprocessor::expand_text(std::string_view text,
 
 std::string Preprocessor::expand_macros(std::string_view source, const SourceFile* file) {
     std::istringstream input{std::string(source)};
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(input, line);) lines.push_back(std::move(line));
     std::ostringstream output;
     struct ConditionalGroup {
         SourceLocation location;
@@ -659,19 +664,36 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
         return diagnostics_.errors() == errors &&
             evaluate_preprocessing_condition(expanded, location, diagnostics_, address_bits);
     };
-    std::string line;
     unsigned line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
+    while (line_number < lines.size()) {
+        auto line = std::move(lines[line_number++]);
         const auto stripped = trim(line);
         const auto location = line_number <= line_locations_.size()
             ? line_locations_[line_number - 1] : SourceLocation{file, 0, line_number, 1};
         const bool active = conditions.empty() || conditions.back().active;
         if (!stripped.starts_with('#')) {
             if (active) {
-                std::unordered_set<std::string> disabled;
-                output << expand_text(line, disabled, 0, {}, location) << '\n';
-                output_line_locations_.push_back(location);
+                // An invocation's arguments may span lines; it ends at the
+                // matching parenthesis. Its expansion takes the first line.
+                for (;;) {
+                    std::unordered_set<std::string> disabled;
+                    std::optional<OpenInvocation> open;
+                    auto expanded = expand_text(line, disabled, 0, {}, location, &open);
+                    const auto next = line_number < lines.size()
+                        ? trim(lines[line_number]) : std::string{};
+                    if (open && line_number < lines.size() && !next.starts_with('#') &&
+                        (open->arguments || next.starts_with('('))) {
+                        line += ' ';
+                        line += lines[line_number++];
+                        continue;
+                    }
+                    if (open && open->arguments)
+                        diagnostics_.error(location, "unterminated argument list invoking macro '" +
+                                                         open->name + "'");
+                    output << expanded << '\n';
+                    output_line_locations_.push_back(location);
+                    break;
+                }
             }
             continue;
         }

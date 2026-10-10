@@ -533,10 +533,11 @@ void track_block_comment(std::string_view line, bool& inside) {
     }
 }
 
-std::string normalized_unit(const std::filesystem::path& path) {
+// Identifies one file among dependencies; never written to output.
+std::string dependency_identity(const std::filesystem::path& path) {
     std::error_code error;
-    const auto normalized = std::filesystem::weakly_canonical(path, error);
-    return (error ? path.lexically_normal() : normalized).generic_string();
+    const auto canonical = std::filesystem::weakly_canonical(path, error);
+    return (error ? path.lexically_normal() : canonical).generic_string();
 }
 
 std::string unit_occurrence(std::string path,
@@ -648,6 +649,9 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
     std::unordered_map<std::string, unsigned> unit_counts;
     EmbedSnapshots snapshots;
     for (const auto& input : options.inputs) {
+        // A source unit is identified by its primary input's path as written,
+        // after -ffile-prefix-map, never by a path the compiler resolved.
+        const auto unit = mapped_source_path(options, input);
         const SourceFile* preprocessed{};
         std::vector<SourceLocation> line_origins;
         std::vector<std::string> line_units;
@@ -661,8 +665,7 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
                 serialized = written->text;
                 auto source = without_line_markers(sources, *written,
                                                    line_origins, line_units,
-                                                   unit_occurrence(normalized_unit(input),
-                                                                   unit_counts),
+                                                   unit_occurrence(unit, unit_counts),
                                                    diagnostics);
                 preprocessed = sources.add(input, std::move(source), {}, {},
                                            line_origins, line_units);
@@ -675,13 +678,13 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
             line_origins = preprocessor.output_line_locations();
             serialized = with_line_markers(source, line_origins, input);
             line_units.assign(line_origins.size(),
-                unit_occurrence(normalized_unit(input), unit_counts));
+                              unit_occurrence(unit, unit_counts));
             preprocessed = sources.add(input, std::move(source), {}, {},
                                        line_origins, line_units);
         }
         if (!preprocessed) continue;
         if (options.inputs.size() > 1)
-            serialized.insert(0, source_unit_marker(normalized_unit(input)));
+            serialized.insert(0, source_unit_marker(unit));
         outputs.push_back(std::move(serialized));
         if (diagnostics.errors() == 0) {
             auto embedded = discover_embeds(sources, *preprocessed, line_origins,
@@ -690,11 +693,7 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
                 (compiler && options.emit != EmitKind::Preprocess), &snapshots);
             preprocessed = embedded.source;
             std::unordered_set<std::string> seen;
-            for (const auto& path : found) {
-                std::error_code error;
-                const auto canonical = std::filesystem::weakly_canonical(path, error);
-                seen.insert((error ? path.lexically_normal() : canonical).generic_string());
-            }
+            for (const auto& path : found) seen.insert(dependency_identity(path));
             for (const auto& path : embedded.dependencies)
                 if (seen.insert(path.generic_string()).second) found.push_back(path);
         }
@@ -748,12 +747,24 @@ std::string make_escape(std::string_view spelling) {
     return result;
 }
 
+// cpp writes one rule per input; cc writes one rule for the single output of
+// its group, whose prerequisites are those of every input.
 std::string dependency_text(
     const CompilerOptions& options,
     const std::vector<std::vector<std::filesystem::path>>& dependencies,
     bool compiler) {
+    std::vector<std::vector<std::filesystem::path>> rules;
+    if (!compiler) {
+        rules = dependencies;
+    } else {
+        std::unordered_set<std::string> seen;
+        auto& group = rules.emplace_back();
+        for (const auto& input : dependencies)
+            for (const auto& path : input)
+                if (seen.insert(dependency_identity(path)).second) group.push_back(path);
+    }
     std::ostringstream output;
-    for (std::size_t index = 0; index < dependencies.size(); ++index) {
+    for (std::size_t index = 0; index < rules.size(); ++index) {
         if (!options.dependency_targets.empty()) {
             for (std::size_t target = 0; target < options.dependency_targets.size(); ++target) {
                 if (target != 0) output << ' ';
@@ -765,15 +776,22 @@ std::string dependency_text(
             auto target = options.inputs[index].stem();
             target += ".o";
             if (compiler && options.dependency_mode == DependencyMode::Alongside &&
-                options.output && options.inputs.size() == 1 &&
-                options.emit != EmitKind::Preprocess)
+                options.output && options.emit != EmitKind::Preprocess)
                 target = *options.output;
             output << make_escape(target.generic_string());
         }
         output << ':';
-        for (const auto& path : dependencies[index])
+        for (const auto& path : rules[index])
             output << ' ' << make_escape(path.generic_string());
         output << '\n';
+    }
+    if (options.dependency_phony_targets) {
+        std::unordered_set<std::string> seen;
+        for (const auto& input : options.inputs) seen.insert(dependency_identity(input));
+        for (const auto& rule : rules)
+            for (const auto& path : rule)
+                if (seen.insert(dependency_identity(path)).second)
+                    output << make_escape(path.generic_string()) << ":\n";
     }
     return output.str();
 }
@@ -931,7 +949,8 @@ int cc_main(int argc, char** argv) {
     program.address_bits = subtarget->abi_info().address_bits;
     program.evaluation_limits = {
         options.eval_byte_limit, options.eval_memory_limit,
-        options.eval_step_limit, options.eval_depth_limit};
+        options.eval_step_limit, options.eval_depth_limit,
+        options.generic_instance_limit, options.generic_depth_limit};
     program.evaluation_layout = {
         target->data_layout.byte_order == ByteOrder::Big
             ? EvaluationByteOrder::Big : EvaluationByteOrder::Little,
@@ -953,6 +972,8 @@ int cc_main(int argc, char** argv) {
         auto sections = split_source_units(sources, *source);
         compilation_units.insert(compilation_units.end(), sections.begin(), sections.end());
     }
+    for (const auto* unit : compilation_units)
+        program.source_units.push_back(unit->source_unit_at(1));
     for (const auto* preprocessed_source : compilation_units) {
         auto tokens = Lexer(*preprocessed_source, diagnostics).lex();
         // One expansion path for every source unit. An unused syntax

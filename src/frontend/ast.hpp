@@ -618,6 +618,8 @@ struct EvaluationLimits {
     std::uint64_t memory{64 * 1024 * 1024};
     std::uint64_t steps{1000000};
     unsigned depth{256};
+    std::uint64_t generic_instances{4096};
+    unsigned generic_depth{128};
 };
 
 enum class EvaluationByteOrder { Little, Big };
@@ -854,6 +856,11 @@ struct Program {
     // snapshots are not ordinary callable symbols and never enter runtime HIR.
     std::vector<std::unique_ptr<FunctionDecl>> expansion_definitions;
     std::vector<std::unique_ptr<ObjectDecl>> objects;
+    // Source-unit identities in command-line order; they order emission.
+    std::vector<std::string> source_units;
+    // Next ordinal of a lifted literal object in each source unit, so that
+    // its internal name does not depend on other units.
+    std::unordered_map<std::string, std::uint64_t> literal_ordinals;
 };
 
 std::string encode_link_name(std::string_view qualified_name, bool label = false,

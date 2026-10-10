@@ -266,6 +266,69 @@ execute_process(COMMAND "${CPP}" -MF "${OUTPUT}.invalid.d" "${source}"
 if(status EQUAL 0 OR NOT err MATCHES "require -M")
     message(FATAL_ERROR "orphan -MF was accepted\n${out}\n${err}")
 endif()
+foreach(tool CPP CC)
+    execute_process(COMMAND "${${tool}}" -MP "${source}" -o "${OUTPUT}.orphan-mp.i"
+        RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(status EQUAL 0 OR NOT err MATCHES "-MP.*require -M")
+        message(FATAL_ERROR "${tool} accepted -MP without -M\n${out}\n${err}")
+    endif()
+endforeach()
+
+# cpp writes one rule per input and cc one rule for the output of its group;
+# -MP adds one phony target per prerequisite that is not a primary input.
+file(WRITE "${local_dir}/third.x" "#include <shared.h>\nglobal i32 third = SHARED_VALUE;\n")
+set(inputs "${source}" "${local_dir}/third.x")
+set(headers "asset\\ \\#\\ $$.h" "inactive.h" "shared.h" "system.h")
+function(check_dependencies text tool rules shared)
+    foreach(header IN LISTS headers)
+        string(FIND "${text}" "${header}:\n" first)
+        string(FIND "${text}" "${header}:\n" last REVERSE)
+        if(first EQUAL -1 OR NOT first EQUAL last)
+            message(FATAL_ERROR "${tool} -MP needs one phony target for ${header}\n${text}")
+        endif()
+    endforeach()
+    string(REGEX MATCHALL "[.]x[\n ]" primary "${text}")
+    string(REGEX MATCHALL ": " rule_list "${text}")
+    string(REGEX MATCHALL "shared[.]h" shared_list "${text}")
+    list(LENGTH primary primary_count)
+    list(LENGTH rule_list rule_count)
+    list(LENGTH shared_list shared_count)
+    if(text MATCHES "[.]x:" OR NOT primary_count EQUAL 2 OR
+       NOT rule_count EQUAL rules OR NOT shared_count EQUAL shared)
+        message(FATAL_ERROR "${tool} wrote unexpected dependency rules\n${text}")
+    endif()
+endfunction()
+execute_process(COMMAND "${CC}" -M -MP ${search} ${inputs}
+    RESULT_VARIABLE status OUTPUT_VARIABLE group_dep ERROR_VARIABLE err)
+if(NOT status EQUAL 0 OR NOT group_dep MATCHES "^main[.]o: [^\n]*main[.]x[^\n]*third[.]x\n")
+    message(FATAL_ERROR "cc did not write one rule for its group\n${group_dep}\n${err}")
+endif()
+check_dependencies("${group_dep}" CC 1 2)
+execute_process(COMMAND "${CPP}" -M -MP ${search} ${inputs}
+    RESULT_VARIABLE status OUTPUT_VARIABLE input_dep ERROR_VARIABLE err)
+if(NOT status EQUAL 0 OR NOT input_dep MATCHES "^main[.]o: [^\n]*\nthird[.]o: [^\n]*third[.]x")
+    message(FATAL_ERROR "cpp did not write one rule per input\n${input_dep}\n${err}")
+endif()
+check_dependencies("${input_dep}" CPP 2 3)
+execute_process(COMMAND "${CC}" -MD -MP -S ${search} ${inputs}
+    -o "${OUTPUT}.group.s" -MF "${OUTPUT}.group.d"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "cc -MD with several inputs failed\n${out}\n${err}")
+endif()
+file(READ "${OUTPUT}.group.d" group_depfile)
+string(FIND "${group_depfile}" "preprocessor-dependencies.group.s:" target_end)
+math(EXPR rest_begin "${target_end} + 34")
+string(SUBSTRING "${group_depfile}" ${rest_begin} -1 depfile_rest)
+string(SUBSTRING "${group_dep}" 7 -1 group_rest)
+if(target_end EQUAL -1 OR NOT depfile_rest STREQUAL group_rest)
+    message(FATAL_ERROR "cc -MD did not name the group output\n${group_depfile}\n${group_dep}")
+endif()
+execute_process(COMMAND "${CC}" -M -MT raw_target -MQ "a $" ${search} ${inputs}
+    RESULT_VARIABLE status OUTPUT_VARIABLE target_dep ERROR_VARIABLE err)
+if(NOT status EQUAL 0 OR NOT target_dep MATCHES "^raw_target a\\\\ [$][$]: [^\n]*third[.]x\n$")
+    message(FATAL_ERROR "cc -MT/-MQ did not name the group rule\n${target_dep}\n${err}")
+endif()
 
 execute_process(COMMAND "${CPP}" -MD ${search} "${source}"
     -o "${OUTPUT}.collision.d"

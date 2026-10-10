@@ -134,6 +134,10 @@ bool common_option(int argc, char** argv, int& index, CompilerOptions& options,
                 ? DependencyMode::Only : DependencyMode::Alongside;
         return true;
     }
+    if (argument == "-MP") {
+        options.dependency_phony_targets = true;
+        return true;
+    }
     if (argument == "-MF" || argument.starts_with("-MF")) {
         if (!take_value(argc, argv, index, "-MF", value, diagnostics)) return true;
         options.dependency_file = value;
@@ -319,6 +323,11 @@ std::optional<OptionValue> checked_option_value(
             reason = "alignment must be zero or a power of two";
             return std::nullopt;
         }
+    }
+    if (result && definition.name == "f.file-prefix-map" &&
+        std::get<std::string>(*result).find('=') == std::string::npos) {
+        reason = "expects OLD=NEW";
+        return std::nullopt;
     }
     return result;
 }
@@ -583,6 +592,24 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.signed-zeros", {}, OptionValueKind::Boolean, true, {}, 0, 0,
          OptionCategory::Semantic, false, OptionImplementation::Partial,
          "preserve the distinction between positive and negative zero"},
+
+        // Source spelling, generic budgets, and zero-valued data placement.
+        {"f.file-prefix-map", {}, OptionValueKind::Text, std::string(), {},
+         0, 0, OptionCategory::Semantic, false,
+         OptionImplementation::Implemented,
+         "spell source paths starting with OLD as NEW; repeatable"},
+        {"f.generic-instance-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{4096}, {}, 1, 1048576, OptionCategory::Semantic, false,
+         OptionImplementation::Implemented,
+         "maximum generic instances per compilation"},
+        {"f.generic-depth-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{128}, {}, 1, 1024, OptionCategory::Semantic, false,
+         OptionImplementation::Implemented,
+         "maximum nesting of generic instantiation"},
+        {"f.zero-init-in-data", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::CodeGeneration, false,
+         OptionImplementation::Implemented,
+         "place zero-valued static objects with the initialized data"},
     };
     return definitions;
 }
@@ -835,6 +862,32 @@ bool resolve_registered_options(
     options.eval_memory_limit = resolved_unsigned(options, "f.eval-memory-limit", 64 * 1024 * 1024);
     options.eval_step_limit = resolved_unsigned(options, "f.eval-step-limit", 1000000);
     options.eval_depth_limit = static_cast<unsigned>(resolved_unsigned(options, "f.eval-depth-limit", 256));
+    options.generic_instance_limit =
+        resolved_unsigned(options, "f.generic-instance-limit", 4096);
+    options.generic_depth_limit = static_cast<unsigned>(
+        resolved_unsigned(options, "f.generic-depth-limit", 128));
+    options.zero_init_in_data = resolved_bool(options, "f.zero-init-in-data");
+    // -ffile-prefix-map is repeatable: every profile and command-line setting
+    // adds a mapping. The registry value lists them for inspection.
+    options.file_prefix_maps.clear();
+    std::string prefix_maps;
+    for (const auto settings : {profile_options,
+                                std::span<const OptionAssignment>(
+                                    options.command_options)}) {
+        for (const auto& setting : settings) {
+            if (setting.name != "f.file-prefix-map") continue;
+            const auto& text = std::get<std::string>(setting.value);
+            const auto equals = text.find('=');
+            options.file_prefix_maps.emplace_back(
+                std::filesystem::path(text.substr(0, equals)).generic_string(),
+                std::filesystem::path(text.substr(equals + 1)).generic_string());
+            if (!prefix_maps.empty()) prefix_maps += ' ';
+            prefix_maps += text;
+        }
+    }
+    if (!options.file_prefix_maps.empty()) {
+        options.resolved_options["f.file-prefix-map"].value = prefix_maps;
+    }
     options.function_sections =
         resolved_bool(options, "f.function-sections");
     options.data_sections = resolved_bool(options, "f.data-sections");
@@ -904,6 +957,18 @@ std::string_view resolved_text(const CompilerOptions& options,
     if (!option) return fallback;
     const auto* value = std::get_if<std::string>(&option->value);
     return value ? std::string_view(*value) : fallback;
+}
+
+std::string mapped_source_path(const CompilerOptions& options,
+                               const std::filesystem::path& path) {
+    auto spelling = path.generic_string();
+    for (auto map = options.file_prefix_maps.rbegin();
+         map != options.file_prefix_maps.rend(); ++map) {
+        if (spelling.starts_with(map->first)) {
+            return map->second + spelling.substr(map->first.size());
+        }
+    }
+    return spelling;
 }
 
 std::string_view option_origin_name(OptionOrigin origin) {
@@ -1015,8 +1080,10 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         options.inputs.emplace_back(argument);
     }
     if (options.dependency_mode == DependencyMode::None &&
-        (options.dependency_file || !options.dependency_targets.empty()))
-        diagnostics.command_error("-MF, -MT, and -MQ require -M, -MM, -MD, or -MMD");
+        (options.dependency_file || !options.dependency_targets.empty() ||
+         options.dependency_phony_targets))
+        diagnostics.command_error(
+            "-MF, -MP, -MT, and -MQ require -M, -MM, -MD, or -MMD");
     return diagnostics.errors() == 0;
 }
 
@@ -1035,8 +1102,10 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
         options.inputs.emplace_back(argument);
     }
     if (options.dependency_mode == DependencyMode::None &&
-        (options.dependency_file || !options.dependency_targets.empty()))
-        diagnostics.command_error("-MF, -MT, and -MQ require -M, -MM, -MD, or -MMD");
+        (options.dependency_file || !options.dependency_targets.empty() ||
+         options.dependency_phony_targets))
+        diagnostics.command_error(
+            "-MF, -MP, -MT, and -MQ require -M, -MM, -MD, or -MMD");
     return diagnostics.errors() == 0;
 }
 
@@ -1065,6 +1134,7 @@ void print_cc_help() {
   -MD/-MMD              emit source and a Make dependency file
   -MF FILE              set dependency output path
   -MT TARGET/-MQ TARGET set dependency target (raw/Make-escaped)
+  -MP                   add a phony target for each included or embedded file
   -O0/-Og/-O1/-O2/-O3/-Os/-Oz
                         select a model-defined optimization preset
   -O=NAME               select any loaded optimization preset
@@ -1110,6 +1180,9 @@ void print_cpp_help() {
   -MD/-MMD              emit source and a Make dependency file
   -MF FILE              set dependency output path
   -MT TARGET/-MQ TARGET set dependency target (raw/Make-escaped)
+  -MP                   add a phony target for each included or embedded file
+  -ffile-prefix-map=OLD=NEW
+                        spell source paths starting with OLD as NEW
   -target TRIPLE        select target macros
   -march=CPU            select target instruction compatibility
   -mtune=CPU            select target tuning

@@ -33,6 +33,12 @@ after the first input when `-o` is absent. Definitions without `static` or
 `global` are shared within the group but not exported to the linker. Compile
 separately and link only `global` entities to combine objects.
 
+The output depends only on the inputs, options, and models, not on the working
+directory or the environment. Internal symbols of `static` entities derive from
+each input's path as written on the command line, so the same command in a
+copy of the tree produces identical files; `-ffile-prefix-map=OLD=NEW` gives
+absolute input paths a location-independent spelling.
+
 ## Targets, ABIs, and profiles
 
 | Option | Selects |
@@ -79,6 +85,9 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-fno-div-by-constant` | Keep the divide instruction for division and remainder by a constant. From `-Og`, such a divide becomes a multiplication by a fixed-point reciprocal with shifts and adds when the target prices that sequence lower; `-Os` and `-Oz` replace only a divide that a single shift or mask performs. |
 | `-fno-eval-calls` | Stop evaluating ordinary calls during compilation; required evaluation still happens. |
 | `-feval-step-limit=N`, `-feval-depth-limit=N`, `-feval-memory-limit=N`, `-feval-byte-limit=N` | Limits for compile-time evaluation and macro expansion. |
+| `-fgeneric-instance-limit=N`, `-fgeneric-depth-limit=N` | Limits for generic instances per compilation (default 4096) and nested instantiation (default 128). |
+| `-fzero-init-in-data` | Put zero-valued static objects with the initialized data instead of zero-filled storage such as `.bss`, so that an image patcher can change them. |
+| `-ffile-prefix-map=OLD=NEW` | Spell source paths that start with `OLD` as `NEW` in `$::source::file` and internal symbol names; line markers, dependency files, and diagnostics keep the real paths. Repeatable; the last matching mapping applies. |
 
 Options that have no meaning without a hosted runtime, such as `-fno-builtin`,
 `-nostdlib`, or `-Ofast`, are rejected rather than ignored.
@@ -91,8 +100,11 @@ file's directory, then `-I`, then `-isystem`; angle includes search only `-I`
 and `-isystem`. There are no implicit include directories. `-include` and
 `-imacros` files are looked up relative to the current directory first and
 apply to every input; all `-imacros` files are processed before the `-include`
-files. `-M`, `-MM`, `-MD`, `-MMD`, `-MF`, `-MT`, and
-`-MQ` write Make dependencies, including files read by `$::embed`.
+files. `-M`, `-MM`, `-MD`, `-MMD`, `-MF`, `-MT`, and `-MQ` write Make
+dependencies, including files read by `$::embed`. `cpp` writes one rule per
+input and `cc` one rule for its output, whose prerequisites are the files of
+every input. `-MP` adds an empty rule for each prerequisite other than an
+input, so that Make does not fail when a header is deleted.
 
 ## Inspecting the compiler
 

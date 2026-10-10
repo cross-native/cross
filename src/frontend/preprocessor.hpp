@@ -32,6 +32,12 @@ private:
         bool function_like{};
         bool variadic{};
     };
+    // A function-like macro invocation left open at the end of a line: its
+    // name still awaits '(' or its arguments await ')'.
+    struct OpenInvocation {
+        std::string name;
+        bool arguments{};
+    };
 
     std::string expand_includes(const std::filesystem::path& path,
                                 std::vector<std::filesystem::path>& stack);
@@ -44,7 +50,8 @@ private:
                             std::unordered_set<std::string>& disabled,
                             unsigned depth,
                             std::optional<SourceLocation> condition = {},
-                            std::optional<SourceLocation> origin = {}) const;
+                            std::optional<SourceLocation> origin = {},
+                            std::optional<OpenInvocation>* open = nullptr) const;
     std::string substitute(const Macro& macro, const std::vector<std::string>& arguments,
                            std::unordered_set<std::string>& disabled,
                            unsigned depth,

@@ -37,6 +37,11 @@ on that format, so `[[link_name("write")]]` refers to the C function `write`
 `_app::run`. ELF and COFF use link names unchanged. Mach-O cannot hold a
 `global label` in a function with unwind tables.
 
+Assembly output quotes a link name that contains characters other than
+letters, digits, `_`, `.`, and `$`, such as the `::` in `"app::run"`. GNU `as`
+accepts quoted symbol names from version 2.26. Linker scripts and debuggers
+need the same quoting, for example `ENTRY("app::run")` in a GNU `ld` script.
+
 `-funwind-tables` (or `-fasynchronous-unwind-tables`) emits CFI or SEH unwind
 records; no unwinder is linked. By default functions assume nothing unwinds
 through them; `-funwind-model=platform` keeps incoming frame state intact for a
@@ -199,8 +204,7 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 ## Limits on all targets
 
 - Specified but not implemented yet: the floating intrinsics, `-fwrapv`,
-  `-fzero-init-in-data`, `-fbounds-trap`, `-MP`, `-ffile-prefix-map`, the
-  generic budget options, `debug` entries and `-g`, and the profile
+  `-fbounds-trap`, `debug` entries and `-g`, and the profile
   floating-environment properties.
 - Generic records and unions (`struct list<T>`) are specified but not
   implemented; `$::feature::generic_types` is absent.

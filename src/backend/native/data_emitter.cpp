@@ -240,8 +240,10 @@ private:
             [&](const mir::AssemblyBundle::PatchRelocation& relocation) {
                 return relocation.sink.object == object.source;
             });
+        // -fzero-init-in-data keeps zero values in the file image.
         const bool zero = object.initializer == data::InitializerKind::Zero &&
-                          !object.read_only && !patched;
+                          !object.read_only && !patched &&
+                          !options_.zero_init_in_data;
         const bool uninitialized =
             object.initializer == data::InitializerKind::Uninitialized;
         const bool split_section = options_.data_sections || object.retain;

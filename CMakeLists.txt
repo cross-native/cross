@@ -2640,6 +2640,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/symbol_metadata.cmake")
     set_tests_properties(cross_symbol_metadata PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.object")
+    add_test(NAME cross_zero_init_in_data
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/zero-init-in-data
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/zero_init_in_data.cmake")
+    set_tests_properties(cross_zero_init_in_data PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.object")
     add_test(NAME cross_symbol_indirection
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -4777,6 +4784,30 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/forced_includes.cmake")
     set_tests_properties(cross_forced_includes PROPERTIES
         LABELS "frontend;feature.preprocessor;arch.x86_64;check.compile;diagnostics")
+    add_test(NAME cross_reproducible_output
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/reproducible-output
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/reproducible_output.cmake")
+    set_tests_properties(cross_reproducible_output PROPERTIES
+        LABELS "check.compile;arch.x86_64;frontend;backend.native;feature.driver;feature.linkage;feature.object")
+    add_test(NAME cross_macro_invocation_lines
+        COMMAND "${CMAKE_COMMAND}"
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/macro_lines.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/macro-lines
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/macro_lines.cmake")
+    set_tests_properties(cross_macro_invocation_lines PROPERTIES
+        LABELS "check.compile;arch.x86_64;frontend;feature.preprocessor;diagnostics")
+    add_test(NAME cross_generic_budgets
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-budgets
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/generic_budgets.cmake")
+    set_tests_properties(cross_generic_budgets PROPERTIES
+        LABELS "check.compile;arch.x86_64;frontend;feature.generic;feature.resources;diagnostics")
     add_test(NAME cross_embed_values
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -2560,9 +2560,16 @@ EvaluationTask<void> rewrite_generic_expr_async(std::unique_ptr<Expr>& expressio
     if (found != state.instances.end()) {
         internal_name = found->name;
     } else {
-        if (state.depth >= 128 || state.instances.size() >= 4096) {
+        const auto& limits = program.evaluation_limits;
+        if (state.depth >= limits.generic_depth ||
+            state.instances.size() >= limits.generic_instances) {
             ++program.evaluation_resource_errors;
-            diagnostics.error(expression->location, "generic instantiation budget exceeded");
+            diagnostics.error(expression->location,
+                state.depth >= limits.generic_depth
+                    ? "generic instantiation budget exceeded: nesting depth limit " +
+                          std::to_string(limits.generic_depth) + " (-fgeneric-depth-limit)"
+                    : "generic instantiation budget exceeded: instance limit " +
+                          std::to_string(limits.generic_instances) + " (-fgeneric-instance-limit)");
             co_return;
         }
         internal_name = generic->name + "$G" +
@@ -3174,7 +3181,8 @@ private:
 
         auto adapter = std::make_unique<FunctionDecl>();
         adapter->location = location;
-        adapter->name = "$adapter." + std::to_string(ordinal_++);
+        adapter->name = "$adapter." + std::to_string(stable_hash(source.source_unit)) + '.' +
+                        std::to_string(ordinals_[source.source_unit]++);
         adapter->source_unit = source.source_unit;
         adapter->return_type = clone_type(signature.result);
         adapter->linkage = Linkage::Static;
@@ -3470,7 +3478,8 @@ private:
     std::string default_abi_;
     FunctionDecl* caller_{};
     std::string source_unit_;
-    std::uint64_t ordinal_{};
+    // Per source unit, so that one unit's adapters do not rename another's.
+    std::unordered_map<std::string, std::uint64_t> ordinals_;
     std::unordered_map<std::string, std::string> adapters_;
     std::vector<NameMap<TypePtr>> scopes_;
 };
@@ -16376,8 +16385,7 @@ bool expand_raw_inline(Program& program, Diagnostics& diagnostics) {
 
 class StringPoolLifter {
 public:
-    explicit StringPoolLifter(Program& program)
-        : program_(program), ordinal_(program.objects.size()) {}
+    explicit StringPoolLifter(Program& program) : program_(program) {}
 
     void pointer_argument(std::unique_ptr<Expr>& expression,
                           const FunctionDecl* caller) {
@@ -16405,6 +16413,12 @@ public:
     }
 
 private:
+    // Unique in the group, and independent of other units' literals.
+    std::string unit_ordinal(const std::string& unit) {
+        return std::to_string(stable_hash(unit)) + '.' +
+               std::to_string(program_.literal_ordinals[unit]++);
+    }
+
     static bool u8_array_string(const TypePtr& type,
                                 const std::unique_ptr<Expr>& initializer) {
         return type && type->kind == Type::Kind::Array && type->element &&
@@ -16418,12 +16432,12 @@ private:
         if (!expression) return;
         if (expression->kind == Expr::Kind::ByteSequence && expression->type) {
             if (static_initializer_) return;
-            const auto name = "$value." + std::to_string(ordinal_++);
             auto object = std::make_unique<ObjectDecl>();
             object->location = expression->location;
-            object->name = name;
             object->source_unit = source_unit_.empty() && expression->location.file
                 ? expression->location.file->source_unit_at(expression->location.line) : source_unit_;
+            const auto name = "$value." + unit_ordinal(object->source_unit);
+            object->name = name;
             object->type = clone_type(expression->type);
             object->type->is_const = true;
             object->initializer = std::move(expression);
@@ -16486,13 +16500,13 @@ private:
             return;
         }
         if (expression->kind == Expr::Kind::String) {
-            const auto name = "$string." + std::to_string(ordinal_++);
             auto object = std::make_unique<ObjectDecl>();
             object->location = expression->location;
-            object->name = name;
             object->source_unit = source_unit_.empty() && expression->location.file
                 ? expression->location.file->source_unit_at(expression->location.line)
                 : source_unit_;
+            const auto name = "$string." + unit_ordinal(object->source_unit);
+            object->name = name;
             object->type = array_type(
                 builtin_type(BuiltinType::U8, true),
                 static_cast<std::uint32_t>(expression->string_value.size() + 1));
@@ -16535,7 +16549,6 @@ private:
     Program& program_;
     std::string source_unit_;
     bool static_initializer_{};
-    std::uint64_t ordinal_{};
 };
 
 void lift_string_literals(Program& program) {
