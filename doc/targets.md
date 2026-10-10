@@ -95,6 +95,13 @@ variadic function or function pointer cannot use register or stack locations.
 
 `$::trap()`, like a failed `-fbounds-trap` check, executes `ud2`.
 
+The x86-64 profiles declare the floating environment in which these systems
+start a program: MXCSR and the x87 control word mask every exception, and
+denormals are kept (FTZ and DAZ clear). Code that unmasks exceptions or sets
+FTZ needs a profile that declares it ([models.md](models.md#profiles)). The
+`f32` and `f64` relational operators compile to `ucomiss` and `ucomisd`, which
+raise the invalid-operation exception only for a signaling NaN.
+
 A `[[musttail]]` call cannot target a variadic function or leave a function
 that binds variadic state, and passes every argument in a register. With
 automatic locations, each argument must be an integer or a pointer and the
@@ -134,6 +141,30 @@ For example, these two commands select the same CPU and ABI:
 cc -c -O2 -mprofile=vr4300-o32 input.x -o input.o
 cc -c -O2 -target mips-unknown-elf -march=vr4300 -mabi=o32 input.x -o input.o
 ```
+
+The MIPS profiles declare the IEEE default floating environment: no
+exception traps, and denormal results are kept. The VR4300 FPU raises an
+unimplemented-operation exception for a denormal operand, and for a denormal
+result unless FCSR.FS flushes it, so on a VR4300 that environment needs a
+system that emulates those operations. Code that runs with traps enabled or
+with FS set declares its environment in its own profile; threads of the N64
+operating system, for example, start with FS and the invalid-operation enable
+set:
+
+```text
+profile "n64-thread" {
+    target = "mips-unknown-elf";
+    abi = "o32";
+    mangling = "cross";
+    m.arch = "vr4300";
+    fp_traps = ["invalid"];
+    fp_denormal_operand = "trap";
+    fp_denormal_result = "flush";
+}
+```
+
+`$::_ctc1` changes the FCSR without changing the environment that the profile
+declares.
 
 ABIs:
 
@@ -273,8 +304,8 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 
 ## Limits on all targets
 
-- Specified but not implemented yet: the floating intrinsics, `debug`
-  entries and `-g`, and the profile floating-environment properties.
+- Specified but not implemented yet: the floating intrinsics, and `debug`
+  entries and `-g`.
 - `-fbounds-trap` checks only subscripts of arrays with a known bound; it
   does not check subscripts of pointers or `out` and `inout` channels.
 - Generic records and unions (`struct list<T>`) are specified but not
@@ -287,6 +318,13 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
   serializer does not encode, among them aggregate static initializers,
   variadic functions and calls through a variadic function pointer, label
   addresses, `$::patch` values, and `[[musttail]]` calls.
+- `-emit-llvm` and `-emit-gimple` output ignores the profile's floating
+  environment: it is valid only where no exception traps and denormal results
+  are kept.
+- Compile-time evaluation takes the truth value of a floating operand (in a
+  condition, `!`, `&&`, `||`, or a conversion to `bool`) as raising no
+  exception; at run time, a signaling NaN, or a denormal operand that the
+  profile traps, traps there.
 - On MIPS, a function that allocates a variable-length array cannot also have
   a local aligned beyond the stack alignment (8 bytes under o32 and EABI, 16
   under n64 and the Cross ABIs).

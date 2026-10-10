@@ -78,7 +78,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | Option | Effect |
 | --- | --- |
 | `-ffunction-sections`, `-fdata-sections` | Put each function or object in its own section. |
-| `-ffast-math` | Relax floating-point rules: finite math only, no signed zeros, `-ffp-contract=fast`. |
+| `-ffast-math` | Relax floating-point rules: finite math only, no signed zeros, `-ffp-contract=fast`. Under a profile that traps floating exceptions ([models.md](models.md#profiles)), it reassociates floating operations only when no exception but divide-by-zero traps, and `-ffp-contract=fast` fuses a multiply and an add only when overflow and underflow do not trap. |
 | `-funwind-tables` | Emit unwind tables (CFI or SEH). No unwinder is linked. |
 | `-fno-inline-functions` | Disable discretionary inlining; `[[always_inline]]` still applies. |
 | `-fno-shrink-wrap` | Set up the stack frame and save preserved registers at function entry, not only on the paths that need them (the default from `-O1`). |

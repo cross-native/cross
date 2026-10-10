@@ -16,6 +16,13 @@ namespace cross::mir {
 std::optional<UInt128> unsigned_upper_bound_at_exit(const ManagedFunction& function,
                                                   ValueId value, BlockId at);
 bool has_reachable_return(const ManagedFunction& function);
+// Whether `value` is a floating operation that may raise an exception that
+// `environment` traps, so that it may execute only where the source executes
+// it. Negation, reinterpretation, selection, and data movement raise none.
+bool may_trap_floating(const ManagedValue& value,
+                       const ManagedFunction& function,
+                       const hir::Module& hir_module,
+                       const floating::Environment& environment);
 
 struct LocalAddress {
     SlotId slot;

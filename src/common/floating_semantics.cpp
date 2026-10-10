@@ -212,7 +212,8 @@ Number decode(Value value) {
     return result;
 }
 
-UInt128 rounded_quotient(BigUnsigned numerator, BigUnsigned denominator) {
+UInt128 rounded_quotient(BigUnsigned numerator, BigUnsigned denominator,
+                         bool& inexact) {
     UInt128 quotient;
     auto shift = static_cast<int>(numerator.bits()) - static_cast<int>(denominator.bits());
     for (; shift >= 0; --shift) {
@@ -221,16 +222,27 @@ UInt128 rounded_quotient(BigUnsigned numerator, BigUnsigned denominator) {
         numerator.subtract(trial);
         if (shift < 128) quotient = bit_or(quotient, shift_left(UInt128{1}, static_cast<unsigned>(shift)));
     }
+    inexact = !numerator.zero();
     const auto halfway = numerator.shifted(1).compare(denominator);
     if (halfway > 0 || (halfway == 0 && bit(quotient, 0)))
         quotient = add(quotient, {1});
     return quotient;
 }
 
+void raise(ExceptionSet* raised, Exception exception) {
+    if (raised) *raised |= exception_set(exception);
+}
+
 Value round_rational(Format format, bool negative, BigUnsigned numerator,
-                     BigUnsigned denominator, int binary_scale = 0) {
+                     BigUnsigned denominator, int binary_scale = 0,
+                     ExceptionSet* raised = nullptr) {
     const auto info = spec(format);
     if (numerator.zero()) return encoded(format, negative, 0);
+    const auto overflow = [&] {
+        raise(raised, Exception::Overflow);
+        raise(raised, Exception::Inexact);
+        return infinity(format, negative);
+    };
     auto exponent = static_cast<int>(numerator.bits()) -
                     static_cast<int>(denominator.bits());
     if (exponent >= 0) {
@@ -240,19 +252,23 @@ Value round_rational(Format format, bool negative, BigUnsigned numerator,
         --exponent;
     }
     exponent += binary_scale;
-    if (exponent > info.bias) return infinity(format, negative);
+    if (exponent > info.bias) return overflow();
     const auto normal = exponent >= 1 - info.bias;
+    if (!normal) raise(raised, Exception::Underflow);
     const int target_exponent = normal ? exponent : 1 - info.bias;
     const int shift = static_cast<int>(info.precision - 1) - target_exponent + binary_scale;
     if (shift >= 0) numerator = numerator.shifted(static_cast<unsigned>(shift));
     else denominator = denominator.shifted(static_cast<unsigned>(-shift));
-    auto rounded = rounded_quotient(std::move(numerator), std::move(denominator));
+    bool inexact{};
+    auto rounded = rounded_quotient(std::move(numerator), std::move(denominator),
+                                    inexact);
+    if (inexact) raise(raised, Exception::Inexact);
     const auto hidden = shift_left(UInt128{1}, info.precision - 1);
     if (normal) {
         if (bit(rounded, info.precision)) {
             rounded = hidden;
             ++exponent;
-            if (exponent > info.bias) return infinity(format, negative);
+            if (exponent > info.bias) return overflow();
         }
         if (!info.explicit_bit) rounded = subtract(rounded, hidden);
         return encoded(format, negative, static_cast<unsigned>(exponent + info.bias), rounded);
@@ -261,6 +277,12 @@ Value round_rational(Format format, bool negative, BigUnsigned numerator,
         return encoded(format, negative, 1, info.explicit_bit ? hidden : UInt128{});
     }
     return encoded(format, negative, 0, rounded);
+}
+
+// A NaN whose quiet bit, the most significant fraction bit, is clear.
+bool signaling(Value value) {
+    return decode(value).kind == Class::NaN &&
+           !bit(value.bits, spec(value.format).precision - 2);
 }
 
 bool magnitude_less(const Number& a, const Number& b) {
@@ -328,13 +350,15 @@ std::optional<Value> parse(std::string text, Format format) {
                           std::move(denominator), binary_scale);
 }
 
-Value convert(Value value, Format format) {
+Value convert(Value value, Format format, ExceptionSet* raised) {
     if (value.format == format) return value;
+    if (denormal(value)) raise(raised, Exception::DenormalOperand);
+    if (signaling(value)) raise(raised, Exception::Invalid);
     const auto number = decode(value);
     if (number.kind == Class::NaN) return nan(format);
     if (number.kind == Class::Infinity) return infinity(format, number.negative);
     return round_rational(format, number.negative, number.significand,
-                          BigUnsigned{UInt128{1}}, number.scale);
+                          BigUnsigned{UInt128{1}}, number.scale, raised);
 }
 
 Value negate(Value value) {
@@ -343,17 +367,31 @@ Value negate(Value value) {
     return value;
 }
 
-Value binary(Operation operation, Value left, Value right, Format format) {
-    const auto a = decode(convert(left, format));
-    auto b = decode(convert(right, format));
+Value binary(Operation operation, Value left, Value right, Format format,
+             ExceptionSet* raised) {
+    left = convert(left, format, raised);
+    right = convert(right, format, raised);
+    if (denormal(left) || denormal(right))
+        raise(raised, Exception::DenormalOperand);
+    if (signaling(left) || signaling(right)) raise(raised, Exception::Invalid);
+    const auto a = decode(left);
+    auto b = decode(right);
     if (operation == Operation::Subtract) b.negative = !b.negative;
     if (a.kind == Class::NaN || b.kind == Class::NaN) return nan(format);
+    const auto invalid = [&] {
+        raise(raised, Exception::Invalid);
+        return nan(format);
+    };
     const bool product_sign = a.negative != b.negative;
     if (operation == Operation::Multiply || operation == Operation::Divide) {
-        if ((a.kind == Class::Infinity && b.kind == Class::Zero) ||
-            (a.kind == Class::Zero && b.kind == Class::Infinity) ||
+        if ((operation == Operation::Multiply &&
+             ((a.kind == Class::Infinity && b.kind == Class::Zero) ||
+              (a.kind == Class::Zero && b.kind == Class::Infinity))) ||
             (operation == Operation::Divide && a.kind == b.kind &&
-             (a.kind == Class::Zero || a.kind == Class::Infinity))) return nan(format);
+             (a.kind == Class::Zero || a.kind == Class::Infinity))) return invalid();
+        if (operation == Operation::Divide && a.kind == Class::Finite &&
+            b.kind == Class::Zero)
+            raise(raised, Exception::DivideByZero);
         if (a.kind == Class::Infinity ||
             (operation == Operation::Multiply && b.kind == Class::Infinity) ||
             (operation == Operation::Divide && b.kind == Class::Zero))
@@ -366,12 +404,12 @@ Value binary(Operation operation, Value left, Value right, Format format) {
         if (operation == Operation::Multiply)
             return round_rational(format, product_sign,
                 a.significand.multiply(b.significand), BigUnsigned{UInt128{1}},
-                a.scale + b.scale);
+                a.scale + b.scale, raised);
         return round_rational(format, product_sign, a.significand,
-                              b.significand, a.scale - b.scale);
+                              b.significand, a.scale - b.scale, raised);
     }
     if (a.kind == Class::Infinity || b.kind == Class::Infinity) {
-        if (a.kind == b.kind && a.negative != b.negative) return nan(format);
+        if (a.kind == b.kind && a.negative != b.negative) return invalid();
         return infinity(format, a.kind == Class::Infinity ? a.negative : b.negative);
     }
     if (a.kind == Class::Zero && b.kind == Class::Zero)
@@ -385,12 +423,22 @@ Value binary(Operation operation, Value left, Value right, Format format) {
     else { y.subtract(x); x = std::move(y); negative = b.negative; }
     if (x.zero()) negative = false;
     return round_rational(format, negative, std::move(x),
-                          BigUnsigned{UInt128{1}}, scale);
+                          BigUnsigned{UInt128{1}}, scale, raised);
 }
 
-bool compare(Comparison comparison, Value left, Value right) {
+bool compare(Comparison comparison, Value left, Value right,
+             ExceptionSet* raised) {
+    if (denormal(left) || denormal(right))
+        raise(raised, Exception::DenormalOperand);
     const auto a = decode(left);
     const auto b = decode(right);
+    // The relational comparisons signal on every NaN, equality only on a
+    // signaling one.
+    const bool equality = comparison == Comparison::Equal ||
+                          comparison == Comparison::NotEqual;
+    if (signaling(left) || signaling(right) ||
+        (!equality && (a.kind == Class::NaN || b.kind == Class::NaN)))
+        raise(raised, Exception::Invalid);
     if (a.kind == Class::NaN || b.kind == Class::NaN)
         return comparison == Comparison::NotEqual;
     int ordering{};
@@ -418,21 +466,36 @@ bool nonzero(Value value) {
     return decode(value).kind != Class::Zero;
 }
 
-Value from_integer(UInt128 bits, unsigned width, bool is_signed, Format format) {
+bool denormal(Value value) {
+    const auto info = spec(value.format);
+    return mask_to(shift_right(value.bits, info.fraction_bits()),
+                   info.exponent_bits) == UInt128{} &&
+           mask_to(value.bits, info.fraction_bits()) != UInt128{};
+}
+
+Value from_integer(UInt128 bits, unsigned width, bool is_signed, Format format,
+                   ExceptionSet* raised) {
     bits = mask_to(bits, width);
     const bool negative = is_signed && width != 0 && bit(bits, width - 1);
     if (negative) bits = mask_to(cross::negate(bits), width);
     return round_rational(format, negative, BigUnsigned{bits},
-                          BigUnsigned{UInt128{1}});
+                          BigUnsigned{UInt128{1}}, 0, raised);
 }
 
-std::optional<UInt128> to_integer(Value value, unsigned width, bool is_signed) {
+std::optional<UInt128> to_integer(Value value, unsigned width, bool is_signed,
+                                  ExceptionSet* raised) {
+    if (denormal(value)) raise(raised, Exception::DenormalOperand);
     const auto number = decode(value);
     if (number.kind == Class::Infinity || number.kind == Class::NaN)
         return std::nullopt;
     auto magnitude = number.significand;
     if (number.scale >= 0) magnitude = magnitude.shifted(static_cast<unsigned>(number.scale));
-    else magnitude = magnitude.right_shifted(static_cast<unsigned>(-number.scale));
+    else {
+        magnitude = magnitude.right_shifted(static_cast<unsigned>(-number.scale));
+        if (magnitude.shifted(static_cast<unsigned>(-number.scale))
+                .compare(number.significand) != 0)
+            raise(raised, Exception::Inexact);
+    }
     if (magnitude.bits() > 128) return std::nullopt;
     const auto bits = magnitude.small();
     if (number.negative) {
@@ -444,6 +507,45 @@ std::optional<UInt128> to_integer(Value value, unsigned width, bool is_signed) {
     if (is_signed ? !fits_signed_positive(bits, width) : !fits_unsigned(bits, width))
         return std::nullopt;
     return bits;
+}
+
+std::string_view exception_name(Exception exception) {
+    switch (exception) {
+    case Exception::Invalid: return "invalid";
+    case Exception::DivideByZero: return "divide-by-zero";
+    case Exception::Overflow: return "overflow";
+    case Exception::Underflow: return "underflow";
+    case Exception::Inexact: return "inexact";
+    case Exception::DenormalOperand: return "denormal-operand";
+    }
+    return {};
+}
+
+bool permits_new_intermediates(const Environment& environment) {
+    return (environment.traps & ~exception_set(Exception::DivideByZero)) == 0;
+}
+
+bool permits_contraction(const Environment& environment) {
+    return (environment.traps & (exception_set(Exception::Overflow) |
+                                 exception_set(Exception::Underflow))) == 0;
+}
+
+std::optional<Exception> trap(const Environment& environment,
+                              ExceptionSet raised, Value* result) {
+    if (result && environment.flush_denormal_results && denormal(*result)) {
+        const auto info = spec(result->format);
+        *result = encoded(result->format, bit(result->bits, info.sign_bit()), 0);
+        raised |= exception_set(Exception::Underflow) |
+                  exception_set(Exception::Inexact);
+    }
+    for (const auto exception :
+         {Exception::DenormalOperand, Exception::Invalid,
+          Exception::DivideByZero, Exception::Overflow, Exception::Underflow,
+          Exception::Inexact}) {
+        if ((raised & environment.traps & exception_set(exception)) != 0)
+            return exception;
+    }
+    return std::nullopt;
 }
 
 } // namespace cross::floating

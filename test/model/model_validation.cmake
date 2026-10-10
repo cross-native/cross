@@ -103,6 +103,37 @@ profile "p" {
     target = "arm-none-eabi";
 }
 ]=])
+expect_rejected(profile-fp-trap 2
+    "profile fp_traps names unknown exception 'denormal'" [=[
+profile "p" {
+    fp_traps = ["invalid", "denormal"];
+}
+]=])
+expect_rejected(profile-fp-trap-twice 2
+    "profile fp_traps lists 'invalid' twice" [=[
+profile "p" {
+    fp_traps = ["invalid", "overflow", "invalid"];
+}
+]=])
+expect_rejected(profile-fp-trap-list 2
+    "model property 'fp_traps' must be a list" [=[
+profile "p" {
+    fp_traps = "invalid";
+}
+]=])
+expect_rejected(profile-fp-operand 3
+    "profile fp_denormal_operand must be 'ieee' or 'trap'" [=[
+profile "p" {
+    fp_traps = [];
+    fp_denormal_operand = "flush";
+}
+]=])
+expect_rejected(profile-fp-result 2
+    "profile fp_denormal_result must be 'ieee' or 'flush'" [=[
+profile "p" {
+    fp_denormal_result = "trap";
+}
+]=])
 expect_rejected(preset-parent 1
     "optimization preset 'o' inherits unknown preset 'no-such-parent'" [=[
 optimization "o" {
@@ -270,6 +301,29 @@ profile "any-target" {
     m.cmodel = "medium";
 }
 ]=])
+
+# --print-profiles shows a declared floating environment; the defaults are
+# the masked IEEE environment.
+file(WRITE "${OUTPUT}/environment.xm" [=[
+profile "trapping" {
+    fp_traps = ["invalid", "divide-by-zero"];
+    fp_denormal_operand = "trap";
+    fp_denormal_result = "flush";
+}
+profile "masked" {
+    fp_traps = [];
+    fp_denormal_operand = "ieee";
+    fp_denormal_result = "ieee";
+}
+]=])
+execute_process(
+    COMMAND "${CC}" "--model=${OUTPUT}/environment.xm" --print-profiles
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0 OR NOT stdout MATCHES
+   "\ntrapping\n    fp_traps = invalid, divide-by-zero\n    fp_denormal_operand = trap\n    fp_denormal_result = flush\nmasked\n")
+    message(FATAL_ERROR
+        "--print-profiles does not show the floating environment\n${stdout}\n${stderr}")
+endif()
 
 # A profile may name a preset of a file loaded after its own.
 file(WRITE "${OUTPUT}/first.xm" [=[

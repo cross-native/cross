@@ -2412,14 +2412,65 @@ private:
         result.abi = text_property(properties, "abi");
         result.mangling = text_property(properties, "mangling");
         result.optimization = text_property(properties, "optimization");
-        if (!collect_option_properties(
+        if (!floating_environment(properties, result.floating_environment) ||
+            !collect_option_properties(
                 properties,
-                {"default_for", "target", "abi", "mangling",
-                 "optimization"}, result.options)) {
+                {"default_for", "target", "abi", "mangling", "optimization",
+                 "fp_traps", "fp_denormal_operand", "fp_denormal_result"},
+                result.options)) {
             return std::nullopt;
         }
         if (!error_.empty()) return std::nullopt;
         return result;
+    }
+
+    bool floating_environment(const ModelProperties& properties,
+                              floating::Environment& result) {
+        using floating::Exception;
+        if (const auto traps = list_property(properties, "fp_traps")) {
+            const auto line = properties.find("fp_traps")->second.line;
+            for (const auto& name : *traps) {
+                std::optional<Exception> found;
+                for (const auto exception :
+                     {Exception::Invalid, Exception::DivideByZero,
+                      Exception::Overflow, Exception::Underflow,
+                      Exception::Inexact}) {
+                    if (floating::exception_name(exception) == name) {
+                        found = exception;
+                    }
+                }
+                if (!found) {
+                    fail(line, "profile fp_traps names unknown exception '" +
+                                   name + "'");
+                    return false;
+                }
+                if ((result.traps & floating::exception_set(*found)) != 0) {
+                    fail(line, "profile fp_traps lists '" + name + "' twice");
+                    return false;
+                }
+                result.traps |= floating::exception_set(*found);
+            }
+        }
+        if (const auto value = text_property(properties, "fp_denormal_operand")) {
+            if (*value == "trap") {
+                result.traps |=
+                    floating::exception_set(Exception::DenormalOperand);
+            } else if (*value != "ieee") {
+                fail(properties.find("fp_denormal_operand")->second.line,
+                     "profile fp_denormal_operand must be 'ieee' or 'trap'");
+                return false;
+            }
+        }
+        if (const auto value = text_property(properties, "fp_denormal_result")) {
+            if (*value == "flush") {
+                result.flush_denormal_results = true;
+            } else if (*value != "ieee") {
+                fail(properties.find("fp_denormal_result")->second.line,
+                     "profile fp_denormal_result must be 'ieee' or 'flush'");
+                return false;
+            }
+        }
+        return error_.empty();
     }
 
     ModelLexer lexer_;
@@ -2954,6 +3005,7 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
     }
     if (profile) {
         options.profile = profile->canonical_name;
+        options.floating_environment = profile->floating_environment;
         if (!options.abi_explicit && profile->abi) options.abi = *profile->abi;
         if (!options.mangling_explicit && profile->mangling) {
             options.mangling = *profile->mangling;

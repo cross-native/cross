@@ -269,6 +269,44 @@ bool has_reachable_return(const ManagedFunction& function) {
     return false;
 }
 
+bool may_trap_floating(const ManagedValue& value, const ManagedFunction& function,
+                       const hir::Module& hir_module,
+                       const floating::Environment& environment) {
+    if (environment.traps == 0) return false;
+    switch (value.kind) {
+    case ValueKind::Unary:
+        if (value.unary == UnaryOperation::Negate) return false;
+        break;
+    case ValueKind::Cast:
+        if (value.cast == CastOperation::Reinterpret) return false;
+        break;
+    case ValueKind::Binary:
+    case ValueKind::Intrinsic:
+    case ValueKind::MachineInstruction:
+        break;
+    default:
+        return false;
+    }
+    const auto floating = [&](hir::TypeId id) {
+        const auto* type = &hir_module.type(id);
+        if (type->kind == hir::Type::Kind::Vector && type->element)
+            type = &hir_module.type(*type->element);
+        if (type->kind != hir::Type::Kind::Builtin) return false;
+        switch (type->builtin) {
+        case BuiltinType::F32:
+        case BuiltinType::F64:
+        case BuiltinType::F80:
+        case BuiltinType::F128:
+        case BuiltinType::Fptr: return true;
+        default: return false;
+        }
+    };
+    return floating(value.type) ||
+           std::any_of(value.operands.begin(), value.operands.end(), [&](ValueId operand) {
+               return floating(function.values[operand.value].type);
+           });
+}
+
 std::optional<UInt128> unsigned_upper_bound_at_exit(const ManagedFunction& function,
                                                   ValueId value, BlockId at) {
     const DominatorTree dominance(function);

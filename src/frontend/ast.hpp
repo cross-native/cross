@@ -7,6 +7,7 @@
 
 #include "common/source.hpp"
 #include "common/code_address.hpp"
+#include "common/floating_semantics.hpp"
 #include "common/uint128.hpp"
 #include "frontend/token.hpp"
 #include "frontend/name.hpp"
@@ -632,6 +633,8 @@ struct EvaluationLayout {
     CodeAddressRepresentation code_addresses{CodeAddressRepresentation::Opaque};
     // Signed +, -, *, and << wrap modulo 2^N, as at runtime (-fwrapv).
     bool wrap_signed{};
+    // The profile's floating environment, as at runtime.
+    floating::Environment floating_environment{};
 };
 
 struct EvaluationMemberLayout {

@@ -2700,6 +2700,50 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
+    # Profile floating environments: speculation, evaluation, and traps.
+    set(floating_environment ${CMAKE_SOURCE_DIR}/test/middle/floating_environment)
+    add_test(NAME cross_floating_environment_speculation
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${floating_environment}/speculation.x
+            -DMODEL=${floating_environment}/environments.xm
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-environment-speculation
+            -P "${floating_environment}/speculation.cmake")
+    set_tests_properties(cross_floating_environment_speculation PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.floating;feature.optimization;feature.model;opt.O2;opt.O3")
+    add_test(NAME cross_floating_environment_evaluation
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${floating_environment}/evaluation.x
+            -DMODEL=${floating_environment}/environments.xm
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-environment-evaluation
+            -P "${floating_environment}/evaluation.cmake")
+    set_tests_properties(cross_floating_environment_evaluation PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;frontend;feature.floating;feature.evaluation;feature.model;opt.O2")
+    foreach(case guarded_O2 guarded_O3 unguarded signaling)
+        set(environment_flags "--model=${floating_environment}/environments.xm;-mprofile=trapping-fp")
+        if(case MATCHES "^guarded_(.*)")
+            set(environment_expected P)
+            set(environment_level ${CMAKE_MATCH_1})
+            list(APPEND environment_flags -${environment_level})
+        else()
+            set(environment_expected T)
+            set(environment_level O2)
+            string(TOUPPER "${case}" environment_case)
+            list(APPEND environment_flags -D${environment_case})
+        endif()
+        add_test(NAME cross_runtime_floating_environment_mips_${case}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${floating_environment}/trap_runtime.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-environment-mips-${case}
+                -DEXPECTED=${environment_expected} "-DCC_FLAGS=${environment_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_floating_environment_mips_${case} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.floating;feature.optimization;feature.model;opt.${environment_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     add_test(NAME cross_x86_64_feature_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

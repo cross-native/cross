@@ -3241,9 +3241,9 @@ private:
                     (element_bits == 8 || element_bits == 16 ||
                      element_bits == 32 || element_bits == 64) &&
                     (!floating || element_bits == 64 ||
-                     (options_.fast_math &&
+                     (floating_reassociation(options_) &&
                       subtarget_.has_feature(Feature::Avx))) &&
-                    (!floating || !options_.fast_math ||
+                    (!floating || !floating_reassociation(options_) ||
                      first_extract.uses.front().mode.bits <= 256);
                 if (first_extract.opcode != Opcode::Vextract ||
                     !supported_shape || !first_lane ||
@@ -3290,7 +3290,7 @@ private:
                 // Integer reassociation may already have folded `0 + lane0`
                 // to lane0. Preserve that legal simplification and start the
                 // explicit add chain at lane 1.
-                if ((!floating || options_.fast_math) &&
+                if ((!floating || floating_reassociation(options_)) &&
                     lane_one_follows) {
                         initial = first_extract.defs.front();
                         previous = initial;
@@ -3351,7 +3351,7 @@ private:
                 }
 
                 machine::TargetOpcodeId reduction_opcode;
-                if (floating && !options_.fast_math) {
+                if (floating && !floating_reassociation(options_)) {
                     reduction_opcode = Opcode::VreduceAddOrdered;
                 } else if (reduction_operation == Opcode::Fadd ||
                            reduction_operation == Opcode::Add) {
@@ -7921,7 +7921,7 @@ private:
                         machine::VirtualRegisterClass::Vector);
         };
         const bool emitter_may_form_fma =
-            options_.fp_contract == FpContractMode::Fast &&
+            floating_contraction(options_) &&
             subtarget_.has_feature(Feature::Fma);
         const auto rematerialized = [&](machine::Register value)
             -> const machine::ImmediateOperand* {
@@ -12001,7 +12001,7 @@ private:
     void plan_fused_multiply_adds(const machine::Function& function) {
         fused_adds_.clear();
         fused_multiplications_.clear();
-        if (options_.fp_contract != FpContractMode::Fast ||
+        if (!floating_contraction(options_) ||
             !subtarget_.has_feature(Feature::Fma)) {
             return;
         }

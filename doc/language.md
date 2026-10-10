@@ -59,7 +59,11 @@ Pointers, arrays, `struct`, `union`, `enum`, bit-fields, `typedef`, and
 arithmetic conversions follow C's rules applied to exact widths: `bool`, 8-bit,
 and 16-bit values promote to `i32`. Signed overflow, division by zero, and
 out-of-range shifts are undefined. Floating expressions round to their own
-type; there is no excess precision.
+type; there is no excess precision. The selected profile declares which
+floating exceptions trap and whether denormal results flush to zero
+([models.md](models.md#profiles)); the compiler runs an operation that may
+trap only where the source runs it, and compile-time evaluation flushes as the
+profile says and does not evaluate an operation that would trap.
 
 ```x
 enum color [[underlying(u8)]] {

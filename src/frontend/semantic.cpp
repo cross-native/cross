@@ -11042,12 +11042,19 @@ private:
         if (is_floating(type)) {
             const auto format = floating_format(type->builtin,
                                                 program_.address_bits);
+            floating::ExceptionSet raised{};
             if (value.floating) {
-                value.floating = floating::convert(*value.floating, format);
+                if (value.floating->format != format) {
+                    value.floating = floating::convert(*value.floating, format, &raised);
+                    if (!floating_environment_permits(raised, &*value.floating, location))
+                        co_return std::nullopt;
+                }
             } else if (is_integer(value.type)) {
                 const auto source = integer_type(value.type);
                 value.floating = floating::from_integer(value.integer,
-                    source.bits, source.is_signed, format);
+                    source.bits, source.is_signed, format, &raised);
+                if (!floating_environment_permits(raised, &*value.floating, location))
+                    co_return std::nullopt;
             } else co_return std::nullopt;
             value.type = clone_type(type);
             co_return value;
@@ -11059,12 +11066,14 @@ private:
                 co_return EvalValue{UInt128{floating::nonzero(*value.floating)},
                                  clone_type(type)};
             }
+            floating::ExceptionSet raised{};
             const auto integer = floating::to_integer(*value.floating,
-                                                      target.bits, target.is_signed);
+                                                      target.bits, target.is_signed, &raised);
             if (!integer) {
                 fail(location, "floating-to-integer conversion is out of range during translation-time evaluation");
                 co_return std::nullopt;
             }
+            if (!floating_environment_permits(raised, nullptr, location)) co_return std::nullopt;
             co_return EvalValue{*integer, clone_type(type)};
         }
         if (!is_integer(value.type) || !is_integer(type)) co_return std::nullopt;
@@ -11116,8 +11125,11 @@ private:
                 : operation == "<=" ? floating::Comparison::LessEqual
                 : operation == ">" ? floating::Comparison::Greater
                                    : floating::Comparison::GreaterEqual;
-            co_return EvalValue{UInt128{floating::compare(comparison,
-                *left.floating, *right.floating)}, builtin_type(BuiltinType::Bool)};
+            floating::ExceptionSet raised{};
+            const bool result = floating::compare(comparison,
+                *left.floating, *right.floating, &raised);
+            if (!floating_environment_permits(raised, nullptr, location)) co_return std::nullopt;
+            co_return EvalValue{UInt128{result}, builtin_type(BuiltinType::Bool)};
         }
         if (operation != "+" && operation != "-" && operation != "*" &&
             operation != "/") co_return std::nullopt;
@@ -11125,9 +11137,27 @@ private:
             : operation == "-" ? floating::Operation::Subtract
             : operation == "*" ? floating::Operation::Multiply
                                 : floating::Operation::Divide;
-        co_return EvalValue{floating::binary(opcode, *left.floating,
+        floating::ExceptionSet raised{};
+        auto result = floating::binary(opcode, *left.floating,
             *right.floating, floating_format(result_type->builtin,
-                                              program_.address_bits)), result_type};
+                                              program_.address_bits), &raised);
+        if (!floating_environment_permits(raised, &result, location)) co_return std::nullopt;
+        co_return EvalValue{result, result_type};
+    }
+
+    // Applies the profile's floating environment to an operation that raised
+    // `raised`: an operation that would trap is not evaluated.
+    bool floating_environment_permits(floating::ExceptionSet raised,
+                                      floating::Value* result, SourceLocation location) {
+        const auto trapped = floating::trap(
+            program_.evaluation_layout.floating_environment, raised, result);
+        if (!trapped) return true;
+        fail(location, *trapped == floating::Exception::DenormalOperand
+            ? std::string("floating-point operation traps on a denormal operand during translation-time evaluation")
+            : "floating-point operation raises the enabled '" +
+                  std::string(floating::exception_name(*trapped)) +
+                  "' exception during translation-time evaluation");
+        return false;
     }
 
     struct Flow {

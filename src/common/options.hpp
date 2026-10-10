@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common/diagnostic.hpp"
+#include "common/floating_semantics.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -135,6 +136,9 @@ struct CompilerOptions {
     FpContractMode fp_contract{FpContractMode::Off};
     bool finite_math_only{};
     bool signed_zeros{true};
+    // From the selected profile's fp_traps, fp_denormal_operand, and
+    // fp_denormal_result.
+    floating::Environment floating_environment{};
     bool evaluate_calls{true};
     std::uint64_t eval_byte_limit{16 * 1024 * 1024};
     std::uint64_t eval_memory_limit{64 * 1024 * 1024};
@@ -251,6 +255,10 @@ std::uint64_t resolved_unsigned(const CompilerOptions& options,
 std::string_view resolved_text(const CompilerOptions& options,
                                std::string_view name,
                                std::string_view fallback = {});
+// -ffast-math reassociation and -ffp-contract=fast contraction, unless the
+// floating environment traps an exception that they could newly raise.
+bool floating_reassociation(const CompilerOptions& options);
+bool floating_contraction(const CompilerOptions& options);
 // The spelling of a source path in output: its generic form with the last
 // matching -ffile-prefix-map applied.
 std::string mapped_source_path(const CompilerOptions& options,

@@ -121,6 +121,7 @@ struct ProfileEntry {
     std::optional<std::string> mangling;
     std::optional<std::string> optimization;
     std::vector<OptionAssignment> options;
+    floating::Environment floating_environment;
 };
 
 struct OptimizationEntry {

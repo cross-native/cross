@@ -11772,6 +11772,7 @@ bool supports_loop_invariant(const ManagedValue& value,
 void move_loop_invariants(ManagedFunction& function,
                           const hir::Module& hir_module,
                           const Subtarget& subtarget,
+                          const floating::Environment& environment,
                           std::span<const CanonicalLoop> loops) {
     if (function.blocks.size() < 2) return;
     std::vector<std::optional<BlockId>> definition_block(
@@ -11792,8 +11793,13 @@ void move_loop_invariants(ManagedFunction& function,
                 for (const auto id : block.values) {
                     if (invariant.contains(id.value)) continue;
                     const auto& value = function.values[id.value];
+                    // A floating operation that may trap leaves only the
+                    // header, which runs whenever the preheader does.
                     if (!supports_loop_invariant(
-                            value, function, hir_module, subtarget)) {
+                            value, function, hir_module, subtarget) ||
+                        (block_id != loop.header.value &&
+                         may_trap_floating(value, function, hir_module,
+                                           environment))) {
                         continue;
                     }
                     const bool operands_invariant = std::all_of(
@@ -14249,7 +14255,7 @@ bool vectorize_reduction_loop(
     const auto lanes = vector_bits / element_bits;
     if (lanes < 2) return false;
     const bool floating = floating_type(hir_module, scalar_type);
-    const bool reassociate = !floating || options.fast_math;
+    const bool reassociate = !floating || floating_reassociation(options);
     std::unordered_map<std::uint32_t, unsigned> select_depths;
     std::function<unsigned(ValueId)> select_depth = [&](ValueId id) {
         if (id.value >= function.values.size()) return 0U;
@@ -15815,7 +15821,7 @@ void vectorize_reduction_loops(ManagedFunction& function,
         // vectorized expression must contain enough arithmetic to amortize
         // lane extraction and those ordered additions.
         if (unrelated_effect ||
-            (floating && !options.fast_math &&
+            (floating && !floating_reassociation(options) &&
              arithmetic_operations < 2)) {
             continue;
         }
@@ -17068,6 +17074,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 FunctionAnalysisManager& analyses) {
                 move_loop_invariants(
                     function, hir_module, subtarget,
+                    options.floating_environment,
                     analyses.loops().canonical_loops());
                 return PassResult::changed_values();
             });
@@ -17160,6 +17167,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 FunctionAnalysisManager& analyses) {
                 move_loop_invariants(
                     function, hir_module, subtarget,
+                    options.floating_environment,
                     analyses.loops().canonical_loops());
                 return PassResult::changed_values();
             });

@@ -970,6 +970,16 @@ std::string_view resolved_text(const CompilerOptions& options,
     return value ? std::string_view(*value) : fallback;
 }
 
+bool floating_reassociation(const CompilerOptions& options) {
+    return options.fast_math &&
+           floating::permits_new_intermediates(options.floating_environment);
+}
+
+bool floating_contraction(const CompilerOptions& options) {
+    return options.fp_contract == FpContractMode::Fast &&
+           floating::permits_contraction(options.floating_environment);
+}
+
 std::string mapped_source_path(const CompilerOptions& options,
                                const std::filesystem::path& path) {
     auto spelling = path.generic_string();

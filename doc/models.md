@@ -942,8 +942,8 @@ With `-mprofile=NAME`, the profile's `target` applies only when the command
 line has no `-target`. A profile chosen by `default_for` never changes the
 target. The target is fixed before the profile's `m.*` options are checked.
 
-`debug` names the entry `-g` selects. `fp_traps` lists the floating-point
-exceptions the program runs with enabled, from `invalid`, `divide-by-zero`,
+`debug` names the entry `-g` selects. `fp_traps` lists the distinct
+floating-point exceptions the program runs with enabled, from `invalid`, `divide-by-zero`,
 `overflow`, `underflow`, and `inexact`; `fp_denormal_operand` is `ieee` or
 `trap`; `fp_denormal_result` is `ieee` or `flush`. The language specification
 defines what the compiler may and may not do under each environment.

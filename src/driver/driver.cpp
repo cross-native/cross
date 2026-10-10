@@ -271,6 +271,26 @@ void print_profiles() {
             std::cout << "    " << option.name << " = "
                       << option_value_text(option.value) << '\n';
         }
+        using floating::Exception;
+        const auto& environment = profile.floating_environment;
+        std::string traps;
+        for (const auto exception :
+             {Exception::Invalid, Exception::DivideByZero, Exception::Overflow,
+              Exception::Underflow, Exception::Inexact}) {
+            if ((environment.traps & floating::exception_set(exception)) == 0) {
+                continue;
+            }
+            if (!traps.empty()) traps += ", ";
+            traps += floating::exception_name(exception);
+        }
+        if (!traps.empty()) std::cout << "    fp_traps = " << traps << '\n';
+        if ((environment.traps &
+             floating::exception_set(Exception::DenormalOperand)) != 0) {
+            std::cout << "    fp_denormal_operand = trap\n";
+        }
+        if (environment.flush_denormal_results) {
+            std::cout << "    fp_denormal_result = flush\n";
+        }
     }
 }
 
@@ -962,7 +982,8 @@ int cc_main(int argc, char** argv) {
         target->data_layout.f80_storage_bytes,
         target->data_layout.f80_alignment,
         target->data_layout.code_addresses,
-        options.wrapv};
+        options.wrapv,
+        options.floating_environment};
     // Macro execution precedes source declarations. Scalar layout queries
     // nevertheless use the same target-owned context as later required folds.
     auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);
