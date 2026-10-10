@@ -120,4 +120,7 @@ X(VariadicState, "mips.variadic.state")
 X(StackSave, "mips.stack.save")
 X(StackAllocate, "mips.stack.allocate")
 X(StackRestore, "mips.stack.restore")
+// A registry instruction form. Operand 0 is the form ID; the form's
+// operands follow, with a memory operand as base register and displacement.
+X(Machine, "mips.machine")
 X(Invalid, "mips.invalid")

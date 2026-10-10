@@ -166,6 +166,7 @@ the features it implies, and `-m`/`-mno-` options adjust them:
 | `-mfix4300` | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
 | `-mbranch-likely`, `-mcond-move`, `-mrotate` | Allow branch-likely, conditional-move, and rotate instructions. |
 | `-mcmodel=large` | Materialize full 64-bit addresses and call through registers. |
+| `-mlong-calls` | Call every function through a register (`lui`, `addiu`, `jalr`), so callers and callees need not lie in the same 256 MB region that `jal` reaches. |
 
 `cross-n64` and `n64` code uses 64-bit addresses and produces ELF64 objects
 that assume a 64-bit FPU; the other ABIs produce ELF32, even on a 64-bit CPU.
@@ -181,13 +182,77 @@ call a software floating-point library.
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 hard-float `f32` and `f64`, structures and unions by value under every ABI,
 function pointers, variable-length arrays, computed goto, `$::patch` values,
-LL/SC atomics, and variadic functions. Not supported: vectors, integers wider
-than 64 bits, manual register locations, machine-instruction built-ins,
-position-independent code (`-mabicalls`), thread-local storage, MIPS16,
-microMIPS, and the Allegrex VFPU. They are diagnosed when used. A
-`[[musttail]]` call passes every argument in a register, cannot target a
-variadic function or leave a function that binds variadic state, and neither
-function may have `out` or `inout` parameters.
+LL/SC atomics, variadic functions, the machine-instruction built-ins below,
+and naked functions. Not supported: vectors, integers wider than 64 bits,
+register locations outside naked functions, position-independent code
+(`-mabicalls`), thread-local storage, MIPS16, microMIPS, and the Allegrex
+VFPU. They are diagnosed when used. A `[[musttail]]` call passes every
+argument in a register, cannot target a variadic function or leave a function
+that binds variadic state, and neither function may have `out` or `inout`
+parameters.
+
+Machine-instruction built-ins (`--print-instructions` lists each form with
+its feature gates and whether it is privileged or volatile):
+
+| Built-in | Instruction | Needs |
+| --- | --- | --- |
+| `$::_mfc0(out u32 value, n)`, `$::_mtc0(in u32 value, n)` | `mfc0`, `mtc0` of coprocessor 0 register `n` | |
+| `$::_dmfc0`, `$::_dmtc0` with `u64` | `dmfc0`, `dmtc0` | MIPS III |
+| `$::_tlbp()`, `$::_tlbr()`, `$::_tlbwi()`, `$::_tlbwr()` | TLB probe, read, and writes | |
+| `$::_cache(operation, object)` | `cache operation` on the line that holds `object` (`*pointer` or `pointer[index]`) | MIPS III or MIPS32 |
+| `$::_sync()` | `sync` | MIPS II |
+| `$::_cfc1(out u32 value, n)`, `$::_ctc1(in u32 value, n)` | FPU control register `n`; 31 is the FCSR | hard float |
+| `$::_sqrt`, `$::_abs`, `$::_neg` with `f32` or `f64` operands | `sqrt.s`/`.d`, `abs.s`/`.d`, `neg.s`/`.d` | hard float; `sqrt` MIPS II; `f64` not with `-msingle-float` |
+| `$::_eret()` | `eret`; naked functions only | MIPS III or MIPS32 |
+| `$::_jr(in value)` | `jr` through a register; naked functions only | |
+| `$::_nop()` | `nop` | |
+
+Register numbers and cache operations are constants. Coprocessor 0, TLB,
+cache, `sync`, and FCSR forms are kept, in order with memory accesses and each
+other; every coprocessor 0 and FCSR read is volatile, since Count, Random,
+Cause, and the FCSR flags change without a write. `sqrt`, `abs`, and `neg`
+are optimized like arithmetic. Floating-point operations are not ordered
+against `$::_ctc1` or `$::_cfc1`.
+
+Coprocessor 0 and the TLB are not interlocked. The compiler keeps the
+distances of the R4000 hazard table, which the VR4300 keeps: two instructions
+from `mtc0` to `mfc0` of the same register and to an ERET that reads EPC;
+three from a Status or Cause write to any later instruction, because
+interrupts are sampled against them, and four from a Status write to a
+coprocessor instruction such as ERET; one to three between writes of the TLB
+registers, TLB operations, and their reads; and three from `tlbwi` or `tlbwr`
+to a load or store. Instructions already scheduled between them count, and
+NOPs fill the rest, or one EHB on MIPS32 Release 2. Every distance is complete
+before a branch, jump, call, or return. A store and a `cache` operation are
+separated by two instructions that are not loads or cache operations. MIPS I
+`mfc0` results have a load delay. Instruction-fetch hazards are not tracked:
+code is assumed to run unmapped or through an unchanged mapping.
+
+A `[[naked]]` function names a register for each parameter and its result,
+binds every local object to a register, and leaves through `$::_jr` or
+`$::_eret`:
+
+```text
+[[naked, clobber("k0", "k1")]]
+global void timer_vector() {
+    register u32 now "k0";
+    $::_mfc0(now, 9);
+    now = now + 46875000u32;
+    $::_mtc0(now, 11);
+    $::_eret();
+}
+```
+
+Any general or floating register can hold a bound object, including `k0`,
+`k1`, `sp`, and `ra`. Temporaries use the registers of the `clobber` list,
+and a bound register that the function writes anyway while its object's value
+is not needed. A naked function has
+no frame: a value that needs another register, stack storage, a call, a
+`return`, or an instruction that writes a register outside its clobbers,
+interface, and bound registers (such as `hi` and `lo` for a multiply) is an
+error. `[[raw_inline]]` functions whose bodies are one basic block are inlined
+into it. Other functions cannot call a naked function that has parameters or
+a result.
 
 A variadic definition reads its unnamed arguments through the states of its
 ABI. Under `o32`, `arg_area` (`void *`) is the C `va_start` address: the

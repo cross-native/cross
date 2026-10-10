@@ -343,13 +343,28 @@ public:
                         "compilation ABI; mixed address models are not "
                         "supported");
             }
-            if (function.ownership == hir::BodyOwnership::RawMir ||
-                function.naked) {
-                diagnostics.error(
-                    function.location,
-                    "raw/naked MIPS functions await the architecture instruction registry");
-            }
-            if (function.result_location) {
+            // A naked body writes its result register itself; managed
+            // functions have no manual MIPS endpoints yet.
+            if (function.result_location && function.naked) {
+                const auto* view = find_register(subtarget.target(),
+                                                 *function.result_location);
+                const auto bits = hir_module.type(function.result_type).kind ==
+                                          hir::Type::Kind::Pointer
+                                      ? hir_module.address_bits
+                                      : type_bits(hir_module,
+                                                  function.result_type);
+                if (!view || std::none_of(
+                                 view->instruction_scalar_modes.begin(),
+                                 view->instruction_scalar_modes.end(),
+                                 [&](const RegisterEntry::ScalarMode& mode) {
+                                     return mode.bits == bits;
+                                 })) {
+                    diagnostics.error(
+                        function.location,
+                        "a naked MIPS result location must name one "
+                        "register that carries the result type");
+                }
+            } else if (function.result_location) {
                 diagnostics.error(
                     function.location,
                     "manual MIPS result endpoints are not implemented yet; use a registered ABI");
@@ -369,7 +384,8 @@ public:
                         "bits or complete records through 8191 bytes");
                 }
                 if (parameter.physical_location &&
-                    *parameter.physical_location != "auto") {
+                    *parameter.physical_location != "auto" &&
+                    !function.naked) {
                     diagnostics.error(
                         parameter.location,
                         "manual MIPS parameter endpoints are not implemented yet; use [[abi(...)]]");
@@ -422,6 +438,16 @@ public:
                          Diagnostics& diagnostics) const override {
         for (const auto& function : managed_module.functions) {
             for (const auto& value : function.values) {
+                if (value.kind == mir::ValueKind::Call && value.callee) {
+                    const auto& callee = hir_module.function(*value.callee);
+                    if (callee.naked && (!callee.parameters.empty() ||
+                                         callee.result_location)) {
+                        diagnostics.error(
+                            value.location,
+                            "calls to a MIPS naked function with manual "
+                            "parameters or a result are not implemented");
+                    }
+                }
                 if (value.kind != mir::ValueKind::Call || value.callee ||
                     !value.call_signature) {
                     continue;

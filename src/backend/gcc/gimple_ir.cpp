@@ -1284,6 +1284,13 @@ private:
             out_ << ");\n";
             return;
         }
+        if (value.kind == ValueKind::MachineInstruction) {
+            diagnostics_.error(
+                value.location,
+                "the GCC GIMPLE serializer does not represent machine "
+                "instruction built-ins");
+            return;
+        }
         if (value.kind == ValueKind::PatchValue) {
             diagnostics_.error(
                 value.location,

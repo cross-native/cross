@@ -15,6 +15,7 @@
 #include "middle/mir_pass.hpp"
 #include "middle/patch_sink.hpp"
 #include "middle/mir_transform.hpp"
+#include "target/instruction_constraints.hpp"
 #include "target/subtarget.hpp"
 #include <algorithm>
 #include <bit>
@@ -817,7 +818,7 @@ bool supported_call_type(const hir::Module& module, hir::TypeId type,
 
 bool eligible_function(const hir::Module& module, const hir::Function& function,
                        const TargetInfo& target) {
-    if (!function.definition || function.naked) return false;
+    if (!function.definition) return false;
     const auto* abi = find_abi(target, function.abi);
     if (!abi || !abi->function_selectable ||
         (function.variadic && !abi->variadic_supported)) return false;
@@ -847,7 +848,8 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             attribute.name != "noreturn" &&
             attribute.name != "variadic" &&
             attribute.name != "stack_cleanup" &&
-            attribute.name != "clobber") {
+            attribute.name != "clobber" &&
+            attribute.name != "naked") {
             return false;
         }
     }
@@ -1016,6 +1018,38 @@ private:
         return retained == destination->second.dynamic_arrays;
     }
 
+    // Binds a naked parameter to the register its location names; the
+    // parameter is that register for the whole body.
+    void bind_hard_register(const std::string& name, SourceLocation location,
+                            hir::TypeId type, std::string_view register_name,
+                            const NameKey& key, std::uint32_t index) {
+        const auto* view = find_register(target_, register_name);
+        const auto bits = type_bits(hir_, type);
+        const auto floating = floating_type(hir_, type);
+        if (!view ||
+            std::none_of(view->instruction_scalar_modes.begin(),
+                         view->instruction_scalar_modes.end(),
+                         [&](const RegisterEntry::ScalarMode& mode) {
+                             return mode.bits == bits &&
+                                    mode.floating == floating;
+                         })) {
+            diagnostics_.error(location,
+                               "naked parameter '" + name +
+                                   "' must name one target register that "
+                                   "carries its type");
+            failed_ = true;
+            return;
+        }
+        const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
+        current_.slots.push_back({slot, location, type,
+                                  "$param." + std::to_string(index),
+                                  std::string(register_name), false, false,
+                                  false, 1, index});
+        const LocalBinding binding{slot, type, std::nullopt, std::nullopt};
+        scopes_.back().bindings.emplace(key, binding);
+        scopes_.back().slots.push_back(slot);
+    }
+
     std::optional<ManagedFunction> lower_function(const hir::Function& function) {
         failed_ = false;
         current_patch_sinks_.clear();
@@ -1042,6 +1076,7 @@ private:
         collect_copyout_names(*function.definition->body);
         current_.location = function.location;
         current_.result_type = function.result_type;
+        naked_ = function.naked;
         has_dynamic_arrays_ =
             contains_dynamic_array(*function.definition->body);
         std::vector<ActiveDynamicArray> dynamic_arrays;
@@ -1061,6 +1096,14 @@ private:
         const bool pointer_transport = !hir::manual_interface(function);
         for (std::uint32_t index = 0; index < function.parameters.size(); ++index) {
             const auto& parameter = function.parameters[index];
+            if (naked_) {
+                // A naked parameter is the register its location names.
+                bind_hard_register(parameter.name, parameter.location,
+                                   parameter.type,
+                                   parameter.physical_location.value_or(""),
+                                   name_key(parameter), index);
+                continue;
+            }
             const bool transport =
                 pointer_transport && parameter.mode != ParameterMode::In;
             const auto value = add_value(
@@ -1154,6 +1197,12 @@ private:
             (void)store_slot(binding, value, state.location);
         }
         lower_statement(*function.definition->body);
+        if (current_block_ && naked_ && !failed_) {
+            diagnostics_.error(function.location,
+                               "reachable end of naked function requires an "
+                               "explicit target control transfer");
+            failed_ = true;
+        }
         if (current_block_) {
             if (void_type(hir_, function.result_type) &&
                 !function.definition->attribute("noreturn")) {
@@ -1325,8 +1374,10 @@ private:
                                          !local_names_.contains(name_key(*expression.left))
                                      ? resolve_function(*expression.left)
                                      : nullptr;
+            // A machine instruction may write any object operand.
             const bool builtin = expression.left->kind == Expr::Kind::Name &&
-                expression.left->text.starts_with("$::");
+                expression.left->text.starts_with("$::") &&
+                !expression.left->text.starts_with("$::_");
             for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
                 if (builtin ||
                     (callee && (index >= callee->parameters.size() ||
@@ -5080,6 +5131,204 @@ private:
         return lower_atomic_call_async(expression).run();
     }
 
+    static const Expr& without_parentheses(const Expr& expression) {
+        const Expr* result = &expression;
+        while (result->kind == Expr::Kind::Parenthesized && result->left)
+            result = result->left.get();
+        return *result;
+    }
+
+    static bool memory_designator(const Expr& expression) {
+        return (expression.kind == Expr::Kind::Unary &&
+                expression.text == "*") ||
+               (expression.kind == Expr::Kind::Binary &&
+                (expression.text == "index" || expression.text == "member" ||
+                 expression.text == "pointer_member"));
+    }
+
+    bool machine_operand_matches(const InstructionOperandEntry& field,
+                                 const Expr& argument) {
+        const auto type = infer_type(argument);
+        const bool name = argument.kind == Expr::Kind::Name;
+        if (field.allow_memory && memory_designator(argument)) {
+            const auto pointee = designator_type(argument);
+            return !field.memory_bits ||
+                   (pointee && type_bits(hir_, *pointee) == field.memory_bits);
+        }
+        if (field.allow_register && name) {
+            return type && !hir_.type(*type).is_atomic &&
+                   (!field.value_bits ||
+                    type_bits(hir_, *type) == field.value_bits) &&
+                   floating_type(hir_, *type) ==
+                       (field.register_class == "floating") &&
+                   (field.role == InstructionOperandRole::Input ||
+                    !hir_.type(*type).is_const);
+        }
+        if (!field.allow_immediate || !argument.evaluated_integer) {
+            return false;
+        }
+        const auto value = convert_integer(
+            argument.evaluated_integer->value,
+            {builtin_bits(argument.evaluated_integer->type, hir_.address_bits),
+             builtin_signed(argument.evaluated_integer->type), false},
+            {128, true, false});
+        return (!value.high || (value.high == UINT64_MAX &&
+                                value.low >= (std::uint64_t{1} << 63))) &&
+               instruction_immediate_fits(value.low, field);
+    }
+
+    // The available registry form a machine-instruction call names, or a
+    // diagnostic explaining why none or several apply.
+    const InstructionEntry* select_machine_form(const Expr& call) {
+        const auto& name = call.left->text;
+        const InstructionEntry* selected = nullptr;
+        bool arity = false;
+        bool ambiguous = false;
+        std::optional<InstructionFeatureConflict> conflict;
+        for (const auto* form : find_instruction_forms(target_, name)) {
+            if (form->operands.size() != call.arguments.size()) continue;
+            arity = true;
+            bool matches = true;
+            for (std::size_t index = 0; index < form->operands.size();
+                 ++index) {
+                if (!machine_operand_matches(
+                        form->operands[index],
+                        without_parentheses(*call.arguments[index]))) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            if (const auto missing = instruction_feature_conflict(
+                    *form, [&](std::string_view feature) {
+                        return subtarget_.supports_registry_feature(feature);
+                    })) {
+                if (!conflict) conflict = missing;
+                continue;
+            }
+            ambiguous = ambiguous || selected;
+            selected = form;
+        }
+        const auto prefix = "target instruction '" + name + "' ";
+        std::string message;
+        if (ambiguous) {
+            message = prefix + "has ambiguous typed forms for these operands";
+        } else if (selected) {
+            return selected;
+        } else if (conflict) {
+            message = prefix +
+                      (conflict->forbidden ? "is unavailable with feature '"
+                                           : "requires feature '") +
+                      std::string(conflict->feature) + "'";
+        } else if (!arity) {
+            message = prefix + "has no form accepting " +
+                      std::to_string(call.arguments.size()) + " operands";
+        } else {
+            message = "no typed form of " + prefix + "matches these operands";
+        }
+        diagnostics_.error(call.location, message);
+        failed_ = true;
+        return nullptr;
+    }
+
+    ContinuationTask<std::optional<ValueId>> lower_machine_instruction_async(
+        const Expr& expression) {
+        const auto& name = expression.left->text;
+        const auto fail = [&](std::string message) -> std::optional<ValueId> {
+            diagnostics_.error(expression.location,
+                               "target instruction '" + name + "' " +
+                                   std::move(message));
+            failed_ = true;
+            return std::nullopt;
+        };
+        const auto* form = select_machine_form(expression);
+        if (!form) co_return std::nullopt;
+        // A naked body leaves through a raw return; raw branches stay in the
+        // raw lowerer, structured control and goto cover branching here.
+        const bool exit = form->control == InstructionControlEffect::RawReturn ||
+                          form->control == InstructionControlEffect::Trap;
+        if (form->control != InstructionControlEffect::None &&
+            (!naked_ || !exit)) {
+            co_return fail(naked_ ? "is a raw branch; use goto or structured "
+                                    "control flow in this naked function"
+                                  : "transfers control and is only available "
+                                    "in a naked function");
+        }
+        if (form->stack_delta != 0 || form->ordered_stack_delta != 0 ||
+            form->ordered_stack_reset) {
+            co_return fail("changes machine stack state and is only "
+                           "available in a naked function");
+        }
+        std::vector<ValueId> operands;
+        const Expr* output = nullptr;
+        for (std::size_t index = 0; index < form->operands.size(); ++index) {
+            const auto& field = form->operands[index];
+            const auto& argument =
+                without_parentheses(*expression.arguments[index]);
+            if (field.allow_memory && memory_designator(argument)) {
+                const auto designator =
+                    co_await lower_designator_address_async(argument);
+                if (!designator) co_return std::nullopt;
+                operands.push_back(designator->address);
+                continue;
+            }
+            if (field.allow_register && argument.kind == Expr::Kind::Name) {
+                if (field.role != InstructionOperandRole::Input) {
+                    if (output) co_return fail("has more than one output");
+                    output = &argument;
+                }
+                if (field.role == InstructionOperandRole::Output) continue;
+                const auto value = co_await lower_expression_async(argument);
+                if (!value) co_return std::nullopt;
+                operands.push_back(*value);
+                continue;
+            }
+            const auto type = infer_type(argument);
+            if (!argument.evaluated_integer || !type) {
+                co_return fail("requires a translation-time constant for "
+                               "operand " + std::to_string(index + 1));
+            }
+            const auto constant =
+                add_value(ValueKind::ConstantInteger, *type, argument.location);
+            current_.values[constant.value].integer =
+                argument.evaluated_integer->value.low;
+            current_.values[constant.value].integer_high =
+                argument.evaluated_integer->value.high;
+            operands.push_back(constant);
+        }
+        const LocalBinding* local = nullptr;
+        const hir::Object* object = nullptr;
+        auto result_type = *hir_.builtin(BuiltinType::Void);
+        if (output) {
+            local = find_local(name_key(*output));
+            object = local ? nullptr : resolve_object(*output);
+            if ((!local && (!object || !global_scalar(*object))) ||
+                (local && local->dynamic_address)) {
+                co_return fail("output must name a scalar object");
+            }
+            result_type = hir_.unqualified(local ? local->type : object->type);
+        }
+        const auto result =
+            pure_instruction_form(*form)
+                ? add_value(ValueKind::MachineInstruction, result_type,
+                            expression.location)
+                : add_effectful(ValueKind::MachineInstruction, result_type,
+                                expression.location);
+        current_.values[result.value].instruction_form =
+            instruction_form_id(target_, *form);
+        current_.values[result.value].operands = std::move(operands);
+        if (local) {
+            (void)store_slot(*local, result, expression.location);
+        } else if (object) {
+            (void)store_global(*object, result, expression.location);
+        }
+        if (exit) {
+            terminate(TerminatorKind::Unreachable, expression.location,
+                      std::nullopt, {});
+        }
+        co_return result;
+    }
+
     ContinuationTask<std::optional<ValueId>> lower_call_async(const Expr& expression) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
             co_return co_await lower_indirect_call_async(expression);
@@ -5293,12 +5542,7 @@ private:
             co_return result;
         }
         if (expression.left->text.starts_with("$::_")) {
-            diagnostics_.error(
-                expression.location,
-                "target instruction '" + expression.left->text +
-                    "' is only available in a naked function or has no "
-                    "managed MIR form");
-            co_return std::nullopt;
+            co_return co_await lower_machine_instruction_async(expression);
         }
         if (find_local(name_key(*expression.left)) ||
             parameter_values_.contains(name_key(*expression.left)) ||
@@ -5925,7 +6169,12 @@ private:
                 }
                 const auto* view = find_register(
                     target_, *declaration.location_name);
-                if (!view || view->hard_scalar_modes.empty()) {
+                // A naked body may bind any register an instruction operand
+                // can carry, including compiler-owned ones.
+                const auto* modes = !view ? nullptr
+                                    : naked_ ? &view->instruction_scalar_modes
+                                             : &view->hard_scalar_modes;
+                if (!modes || modes->empty()) {
                     diagnostics_.error(
                         declaration.location,
                         "target register '" + *declaration.location_name +
@@ -5933,7 +6182,7 @@ private:
                     failed_ = true;
                     return;
                 }
-                if (view->compiler_owned) {
+                if (view->compiler_owned && !naked_) {
                     diagnostics_.error(
                         declaration.location,
                         "hard register object cannot use compiler-owned "
@@ -5945,8 +6194,7 @@ private:
                 const auto bits = type_bits(declaration.type);
                 const auto floating = is_floating(declaration.type);
                 const bool valid_type = std::any_of(
-                    view->hard_scalar_modes.begin(),
-                    view->hard_scalar_modes.end(),
+                    modes->begin(), modes->end(),
                     [&](const RegisterEntry::ScalarMode& mode) {
                         return mode.bits == bits &&
                                mode.floating == floating;
@@ -5984,6 +6232,13 @@ private:
                     }
                 }
                 physical_location = *declaration.location_name;
+            } else if (naked_ && !declaration.storage_static) {
+                diagnostics_.error(
+                    declaration.location,
+                    "ordinary automatic and stack objects are not permitted "
+                    "in a naked function; bind the object to a register");
+                failed_ = true;
+                return;
             } else if (declaration.storage_register) {
                 // `register` without a fixed location remains an optimizer
                 // preference and uses an ordinary managed slot.
@@ -6156,6 +6411,14 @@ private:
             return;
         case Statement::Kind::Return: {
             if (!current_block_) { failed_ = true; return; }
+            if (naked_) {
+                diagnostics_.error(
+                    statement.location,
+                    "ordinary return is not permitted in a naked function; "
+                    "use an explicit target control-transfer built-in");
+                failed_ = true;
+                return;
+            }
             const Attribute* musttail{};
             for (const auto& attribute : statement.attributes) {
                 if (attribute.name == "musttail") musttail = &attribute;
@@ -6635,6 +6898,8 @@ private:
     std::unordered_map<TokenIdentity, ValueId, TokenIdentityHash> current_patch_origins_;
     std::uint32_t next_patch_id_{};
     bool has_dynamic_arrays_{};
+    // A naked body: hard-bound registers only, raw exits, no frame.
+    bool naked_{};
     bool failed_{};
 };
 
@@ -7080,7 +7345,10 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                    value.kind == ValueKind::Call ||
                                    (value.kind == ValueKind::Intrinsic &&
                                     value.intrinsic !=
-                                        IntrinsicOperation::Expect);
+                                        IntrinsicOperation::Expect) ||
+                                   // Only an impure form joins the chain.
+                                   (value.kind == ValueKind::MachineInstruction &&
+                                    value.effect_input.has_value());
             if (!effectful) {
                 if (value.effect_input || value.effect_output) {
                     fail(value.location, "pure value carries effects");
@@ -8545,8 +8813,11 @@ void inline_managed_calls(ManagedModule& module,
                 }
                 const auto& entity = hir_module.function(*call.callee);
                 const auto* callee = module.find(*call.callee);
+                // A naked function admits only raw-compatible inlining.
                 const bool mandatory =
-                    has_function_attribute(entity, "always_inline");
+                    has_function_attribute(entity, "always_inline") ||
+                    (hir_module.function(caller.source).naked &&
+                     has_function_attribute(entity, "raw_inline"));
                 const bool forbidden =
                     has_function_attribute(entity, "noinline");
                 const bool requested =
@@ -8583,9 +8854,24 @@ void inline_managed_calls(ManagedModule& module,
     }
 
     for (const auto& caller : module.functions) {
+        const bool naked = hir_module.function(caller.source).naked;
         for (const auto& block : caller.blocks) {
             for (const auto value_id : block.values) {
                 const auto& value = caller.values[value_id.value];
+                if (naked && value.kind == ValueKind::Call) {
+                    const auto* callee = value.callee
+                        ? &hir_module.function(*value.callee)
+                        : nullptr;
+                    diagnostics.error(
+                        value.location,
+                        callee && has_function_attribute(*callee, "raw_inline")
+                            ? "raw_inline call to '" + callee->source_name +
+                                  "' could not be inlined into the naked "
+                                  "function"
+                            : std::string("ordinary calls are not permitted "
+                                          "in a naked function"));
+                    continue;
+                }
                 if (value.kind != ValueKind::Call || !value.callee ||
                     !module.owns(*value.callee)) {
                     continue;
@@ -9440,6 +9726,10 @@ std::optional<std::string> redundant_expression_key(
         result += ':' + std::to_string(static_cast<unsigned>(value.cast));
         break;
     case ValueKind::Select:
+        break;
+    case ValueKind::MachineInstruction:
+        if (is_effectful_value(value)) return std::nullopt;
+        result += ':' + std::to_string(value.instruction_form.value);
         break;
     default: return std::nullopt;
     }
@@ -16541,6 +16831,20 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
         (void)promotion.run(module);
+    }
+    // A naked function has no frame: the scalar cells of its inlined
+    // helpers and its dead temporaries disappear at every level.
+    for (auto& function : module.functions) {
+        if (!hir_module.function(function.source).naked) continue;
+        if (!options.tree_copy_prop) {
+            promote_scalar_slots(function, hir_module);
+            propagate_trivial_copies(function);
+        }
+        if (!options.tree_ccp) {
+            (void)fold_constants(function, hir_module);
+            simplify_integer_operations(function, hir_module);
+        }
+        if (!options.tree_dce) eliminate_dead_values(function);
     }
 
     // This is the one module pass in the early scalar pipeline: it reaches a

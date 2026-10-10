@@ -5556,7 +5556,7 @@ EvaluationTask<std::optional<SourceExpressionIssue>> source_instruction_error_as
     for (std::size_t i = 0; i < call.arguments.size(); ++i) {
         auto& facts = operands[i];
         if (facts.kind == Kind::Patch) continue; // Reuse the isolated initial proof.
-        const Expr* source = call.arguments[i].get();
+        Expr* source = call.arguments[i].get();
         while (source->kind == Expr::Kind::Parenthesized && source->left) source = source->left.get();
         facts.type = type_of(*source, false);
         facts.floating = is_floating(facts.type);
@@ -5634,6 +5634,8 @@ EvaluationTask<std::optional<SourceExpressionIssue>> source_instruction_error_as
                 const auto integer = evaluation_integer_type(builtin_type(proof.value->type), program.address_bits);
                 facts.integer_bits = integer.bits;
                 facts.integer_signed = integer.is_signed;
+                // Managed lowering encodes the proven immediate.
+                if (retain_constants) source->evaluated_integer = proof.value;
             }
         }
     }

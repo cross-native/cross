@@ -1679,6 +1679,52 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
     set_tests_properties(cross_mips_vr4300_runtime PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.codegen")
+    # Machine-instruction built-ins, coprocessor 0 hazards, and naked
+    # functions on the VR4300.
+    add_test(NAME cross_mips_machine_instructions COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions_codegen.x
+        -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions_errors.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-machine-instructions
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions.cmake")
+    set_tests_properties(cross_mips_machine_instructions PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.raw;diagnostics;isa.vr4300")
+    foreach(level O0 O2)
+        set(name cross_mips_machine_instructions_runtime_${level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-machine-instructions-${level}
+            -DMIPS_CPUS=vr4300 -DEXPECTED=11111111111 "-DCC_FLAGS=-${level}"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.raw;isa.vr4300;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    # o32 record arguments start at a slot of their alignment; Cross and a
+    # Clang-compiled C reference call each other.
+    foreach(level O0 O2)
+        set(name cross_mips_o32_records_${level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/o32_records.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/o32_records_start.s
+            -DREFERENCE_C=${CMAKE_SOURCE_DIR}/test/target/mips/o32_records.c
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-o32-records-${level}
+            -DEXPECTED=1 "-DCC_FLAGS=-${level}"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.records;profile.o32;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_mips_long_calls COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/long_calls.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-long-calls
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/long_calls.cmake")
+    set_tests_properties(cross_mips_long_calls PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.calls;opt.O2")
     add_test(NAME cross_mips_n64
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

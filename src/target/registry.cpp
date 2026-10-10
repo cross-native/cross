@@ -213,6 +213,7 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         }
         if (source.kind == Kind::Register) {
             if (!field.allow_register || (field.role != InstructionOperandRole::Input && !source.writable)) return false;
+            if (field.value_bits && !source.deferred && source.bits != field.value_bits) return false;
             const auto carries_type = [&](const RegisterEntry& reg) {
                 if (!source.type || source.deferred) return true;
                 if (source.type->is_atomic) return false;
@@ -241,7 +242,7 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
     };
     unsigned matches{};
     bool arity{};
-    std::optional<std::string_view> missing_feature;
+    std::optional<InstructionFeatureConflict> feature_conflict;
     for (const auto* form : forms) {
         if (form->operands.size() != arguments.size()) continue;
         arity = true;
@@ -250,11 +251,9 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         for (std::size_t i = 0; i < arguments.size(); ++i)
             if (!operand_matches(arguments[i], form->operands[i], id)) { match = false; break; }
         if (!match) continue;
-        std::optional<std::string_view> missing;
-        if (!subtarget.supports_registry_feature(form->feature)) missing = form->feature;
-        for (const auto feature : form->required_features)
-            if (!subtarget.supports_registry_feature(feature) && !missing) missing = feature;
-        if (missing) { if (!missing_feature) missing_feature = missing; }
+        const auto conflict = instruction_feature_conflict(*form,
+            [&](std::string_view feature) { return subtarget.supports_registry_feature(feature); });
+        if (conflict) { if (!feature_conflict) feature_conflict = conflict; }
         else ++matches;
     }
     if (matches == 1) return {};
@@ -262,7 +261,9 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         if (std::any_of(arguments.begin(), arguments.end(), [](const auto& argument) { return argument.deferred; })) return {};
         return prefix + "has ambiguous typed forms for these operands";
     }
-    if (missing_feature) return prefix + "requires feature '" + std::string(*missing_feature) + "'";
+    if (feature_conflict)
+        return prefix + (feature_conflict->forbidden ? "is unavailable with feature '" : "requires feature '") +
+            std::string(feature_conflict->feature) + "'";
     if (!arity) return prefix + "has no form accepting " + std::to_string(arguments.size()) + " operands";
     if (memory_error) return memory_error;
     if (label_scope_error) return prefix + "requires a same-function label operand";

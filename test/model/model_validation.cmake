@@ -214,6 +214,23 @@ abi "a" {
     rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
 }
 ]=])
+# A cursor aligns to a power of two of positions or to the value.
+expect_rejected(abi-cursor-alignment 11
+    "ABI rule cursor_alignment must be a power of two or \"value\"" [=[
+abi "a" {
+    architecture = "mips";
+    address_bits = 32;
+    stack_alignment = 8;
+    stack_slot_bytes = 4;
+    bank "integer" { class = "integer"; register_bits = 32; arguments = ["a0"]; results = ["v0"]; }
+    rule "integer" {
+        match = ["integer"];
+        action = "direct";
+        bank = "integer";
+        cursor_alignment = "even";
+    }
+}
+]=])
 
 # Valid entries load whether or not they apply: entries of another
 # architecture, a parent declared later, and a profile without a target whose

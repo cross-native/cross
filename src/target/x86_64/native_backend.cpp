@@ -1876,6 +1876,19 @@ private:
             instruction.has_side_effects = true;
             return instruction;
         }
+        if (value.kind == ValueKind::MachineInstruction) {
+            diagnostics_.error(
+                value.location,
+                "target instruction '" +
+                    std::string(instruction_form(subtarget_.target(),
+                                                 value.instruction_form)
+                                    .name) +
+                    "' is only available in a naked function on x86-64");
+            auto instruction =
+                target_instruction(Opcode::IntrinsicNoop, value.location);
+            instruction.has_side_effects = true;
+            return instruction;
+        }
         if (value.kind == ValueKind::Intrinsic) {
             auto instruction = target_instruction(
                 value.intrinsic == mir::IntrinsicOperation::Expect

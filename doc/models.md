@@ -375,7 +375,7 @@ A `rule` block places values:
 | `carrier_bits` | integer | `0` | no |
 | `extension` | text | `"none"` | no |
 | `register_failure` | text | the entry's | no |
-| `cursor_alignment` | integer | `1` | no |
+| `cursor_alignment` | integer or `"value"` | `1` | no |
 | `cursor_advance` | integer | `0` | no |
 | `stack_alignment` | integer | `0` | no |
 | `stack_size` | integer | `0` | no |
@@ -460,13 +460,18 @@ takes at least one slot and the bytes of its carrier, and in a `"packed"`
 area is aligned to that size, up to `stack_alignment`), and `"error"`
 rejects the function's signature. A `"flatten"` value counts as one value.
 
-`cursor_alignment`, a power of two, aligns the position of every cursor
-that the rule uses before the value is placed. A nonzero `cursor_advance`
-makes the value use exactly that many positions of each such cursor; a
-value that needs more is an error. Without them, a value starts at the next
-position and uses one position per register. The shipped `o32` and
-`eabi32` entries use them so that 64-bit values start at an even position
-and an `f64` takes two positions.
+`cursor_alignment` aligns the position of every cursor that the rule uses
+before the value is placed: to a power of two of positions, or, with
+`"value"`, to the alignment of the value the rule places (for an
+`"indirect"` rule, an address), at most the entry's `stack_alignment`,
+counted in positions of `stack_slot_bytes` and at least one. A nonzero
+`cursor_advance` makes the value use exactly that many positions of each such
+cursor; a value that needs more is an error. Without them, a value starts at
+the next position and uses one position per register. The shipped `o32`
+entry aligns its arguments to the value, so 64-bit scalars and records with
+8-byte alignment start at an even slot and an `f64` in floating-point
+registers takes two positions; `eabi32` aligns its 64-bit values to two
+positions.
 
 `stack_alignment`, a power of two, and `stack_size`, both in bytes,
 override the alignment and the minimum size of a value that the rule places

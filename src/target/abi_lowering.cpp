@@ -24,6 +24,8 @@ struct PieceRequest {
 struct LoweredValue {
     std::vector<PieceRequest> pieces;
     const AbiRule* rule{};
+    // Positions every cursor of the rule is aligned to before placement.
+    std::size_t cursor_alignment{1};
     bool force_stack{};
     bool ignored{};
     bool indirect{};
@@ -242,6 +244,17 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
         auto attempt = [&]() -> std::optional<LoweredValue> {
             LoweredValue result;
             result.rule = rule;
+            result.cursor_alignment = rule->cursor_alignment;
+            if (rule->cursor_alignment_value) {
+                // The placed value's alignment, capped like the stack's;
+                // an indirect rule places an address.
+                const auto bytes = rule->action == AbiRuleAction::Indirect
+                    ? (abi.address_bits + 7U) / 8U
+                    : value_alignment(value, abi);
+                result.cursor_alignment = std::max<std::size_t>(
+                    1, std::min<std::size_t>(bytes, abi.stack_alignment) /
+                           abi.stack_slot_bytes);
+            }
             const auto effective_bits =
                 value.transport == ValueTransport::ByReference
                     ? static_cast<std::uint16_t>(abi.address_bits)
@@ -597,9 +610,7 @@ using CursorMap = std::unordered_map<std::string, std::size_t>;
 
 bool prepare_rule_cursors(const LoweredValue& lowered, CursorMap& cursors,
                           CursorMap& starts) {
-    const auto alignment = lowered.rule
-                               ? lowered.rule->cursor_alignment
-                               : 1U;
+    const auto alignment = lowered.cursor_alignment;
     for (const auto& piece : lowered.pieces) {
         if (!piece.bank || starts.contains(piece.bank->cursor)) continue;
         std::size_t aligned{};

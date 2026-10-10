@@ -812,9 +812,24 @@ private:
                 target.size = 1;
             }
             if (slot.physical_location && *slot.physical_location != "auto") {
-                diagnostics_.error(
-                    slot.location,
-                    "MIPS managed hard-register locals are not implemented yet");
+                // A naked body's hard-bound object is its register; its
+                // slot keeps MIR slot numbering only.
+                const auto physical =
+                    naked_ ? physical_register_id(*slot.physical_location)
+                           : std::nullopt;
+                if (physical) {
+                    hard_slots_.emplace(slot.id.value, *physical);
+                } else {
+                    diagnostics_.error(
+                        slot.location,
+                        naked_ ? "naked MIPS hard register '" +
+                                     *slot.physical_location +
+                                     "' is not a general or floating "
+                                     "register"
+                               : std::string("MIPS managed hard-register "
+                                             "locals are not implemented "
+                                             "yet"));
+                }
             }
             current_.stack_slots.push_back(std::move(target));
         }
@@ -1176,6 +1191,21 @@ private:
             }
             return result;
         }
+        if ((value.kind == ValueKind::Load || value.kind == ValueKind::Store) &&
+            value.slot && hard_slots_.contains(value.slot->value)) {
+            // A hard-bound object reads and writes its register.
+            machine::Instruction copy;
+            copy.kind = machine::InstructionKind::Copy;
+            copy.location = value.location;
+            const bool load = value.kind == ValueKind::Load;
+            const auto data = load ? reg(value.id) : reg(value.operands.front());
+            const auto physical = machine::Register::physical_register(
+                hard_slots_.at(value.slot->value), data.mode);
+            copy.defs = {load ? data : physical};
+            copy.uses = {load ? physical : data};
+            copy.has_side_effects = !load;
+            return copy;
+        }
         if (value.kind == ValueKind::Load) {
             const auto opcode = load_opcode(
                 value.type, Opcode::LoadSigned, Opcode::LoadUnsigned,
@@ -1456,12 +1486,12 @@ private:
             result.has_side_effects = true;
             return result;
         }
+        if (value.kind == ValueKind::MachineInstruction ||
+            (value.kind == ValueKind::Intrinsic &&
+             value.intrinsic == mir::IntrinsicOperation::MachineNop)) {
+            return lower_machine_instruction(value);
+        }
         if (value.kind == ValueKind::Intrinsic) {
-            if (value.intrinsic == mir::IntrinsicOperation::MachineNop) {
-                diagnostics_.error(
-                    value.location,
-                    "MIPS selection received an unavailable $::_nop operation");
-            }
             auto result = target_instruction(
                 value.intrinsic == mir::IntrinsicOperation::Expect
                     ? Opcode::Expect
@@ -1562,6 +1592,71 @@ private:
         if (result.opcode == Opcode::Invalid) {
             unsupported(value, "the selected scalar operation");
         }
+        return result;
+    }
+
+    // A registry form keeps its identity through Machine IR; the emitter
+    // prints it from the registry.
+    machine::Instruction lower_machine_instruction(
+        const mir::ManagedValue& value) {
+        const auto& target = subtarget_.target();
+        const auto* form =
+            value.kind == mir::ValueKind::MachineInstruction
+                ? &instruction_form(target, value.instruction_form)
+                : find_instruction(target, "$::_nop");
+        auto result = target_instruction(Opcode::Machine, value.location);
+        result.operands.push_back(immediate_operand(
+            instruction_form_id(target, *form).value, 0, machine::i32));
+        std::size_t next = 0;
+        for (const auto& field : form->operands) {
+            if (field.allow_register &&
+                field.role == InstructionOperandRole::Output) {
+                const auto output = reg(value.id);
+                result.operands.push_back(register_operand(output));
+                result.defs.push_back(output);
+                continue;
+            }
+            if (next >= value.operands.size()) {
+                diagnostics_.error(value.location,
+                                   "MIPS instruction operands disagree with "
+                                   "the registry form");
+                break;
+            }
+            const auto operand = value.operands[next++];
+            const auto& source = source_->values[operand.value];
+            if (field.allow_register || field.allow_memory) {
+                if (field.role == InstructionOperandRole::InOut) {
+                    diagnostics_.error(value.location,
+                                       "MIPS registry forms have no in-place "
+                                       "operands");
+                }
+                const auto input = reg(operand);
+                result.operands.push_back(register_operand(input));
+                result.uses.push_back(input);
+                if (field.allow_memory) {
+                    result.operands.push_back(
+                        immediate_operand(0, 0, machine::i16, true));
+                }
+                continue;
+            }
+            if (source.kind != mir::ValueKind::ConstantInteger) {
+                diagnostics_.error(value.location,
+                                   "MIPS instruction immediate is not a "
+                                   "constant");
+            }
+            result.operands.push_back(immediate_operand(
+                source.integer, source.integer_high, machine::i32));
+        }
+        const auto names = [](const std::vector<std::string_view>& resources,
+                              std::string_view name) {
+            return std::find(resources.begin(), resources.end(), name) !=
+                   resources.end();
+        };
+        result.may_load = names(form->implicit_reads, "memory");
+        result.may_store = names(form->implicit_writes, "memory");
+        result.has_side_effects =
+            value.kind != mir::ValueKind::MachineInstruction ||
+            !mir::pure_instruction_form(*form);
         return result;
     }
 
@@ -1676,6 +1771,183 @@ private:
         return classify_managed_interface(hir_, entity, subtarget_, abi);
     }
 
+    // A naked body's hard-bound registers also hold temporaries. A value in
+    // one block takes a hard register H when, wherever the object's value in
+    // H is still needed, H holds exactly that value, and no other value is
+    // written to H while it lives. Values read from or stored to the object
+    // go first, which removes their copies; any other value may then use an
+    // H the function writes anyway. A value that fails keeps an ordinary
+    // color.
+    void coalesce_hard_registers(
+        machine::Function& function,
+        const std::vector<std::unordered_set<std::uint32_t>>& live_in,
+        const std::vector<std::unordered_set<std::uint32_t>>& live_out,
+        const std::vector<std::unordered_set<std::uint32_t>>& interference,
+        const std::vector<bool>& eligible) const {
+        const auto count = function.virtual_registers.size();
+        const auto& entity = hir_.function(function.source);
+        const auto is_copy = [](const machine::Instruction& instruction) {
+            return instruction.kind == machine::InstructionKind::Copy &&
+                   instruction.defs.size() == 1 &&
+                   instruction.uses.size() == 1;
+        };
+        const auto physical = [](const machine::Register& value,
+                                 std::uint32_t id) {
+            return value.kind == machine::RegisterKind::Physical &&
+                   value.id == id;
+        };
+        const auto mentions = [](const std::vector<machine::Register>& list,
+                                 std::uint32_t id) {
+            return std::any_of(list.begin(), list.end(),
+                               [&](const machine::Register& value) {
+                                   return value.kind ==
+                                              machine::RegisterKind::Virtual &&
+                                          value.id == id;
+                               });
+        };
+        std::unordered_set<std::uint32_t> hard_registers;
+        for (const auto& [slot, hard] : hard_slots_) {
+            (void)slot;
+            hard_registers.insert(hard.value);
+        }
+        for (const bool connected : {true, false}) {
+            for (const auto hard_id : hard_registers) {
+                const machine::PhysicalRegisterId hard{hard_id};
+                const bool floating = hard_id >= fpr_physical_base;
+                const auto name = floating ? fpr_name(hard) : gpr_name(hard);
+                // Writable without a program store: declared or an interface.
+                bool writable =
+                    std::find(entity.clobbers.begin(), entity.clobbers.end(),
+                              name) != entity.clobbers.end() ||
+                    entity.result_location == name ||
+                    std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                                [&](const hir::Parameter& parameter) {
+                                    return parameter.physical_location == name;
+                                });
+                for (const auto& block : function.blocks) {
+                    for (const auto& instruction : block.instructions) {
+                        writable = writable ||
+                                   (is_copy(instruction) &&
+                                    physical(instruction.defs.front(), hard_id));
+                    }
+                }
+                for (const auto& block : function.blocks) {
+                    if (block.id.value >= live_in.size()) continue;
+                    const auto& code = block.instructions;
+                    const auto size = code.size();
+                    const auto defines = [&](std::size_t index) {
+                        return std::any_of(
+                            code[index].defs.begin(), code[index].defs.end(),
+                            [&](const machine::Register& value) {
+                                return physical(value, hard_id);
+                            });
+                    };
+                    // The object's value is needed at a position when a later
+                    // instruction reads H before redefining it; it is assumed
+                    // needed after the block.
+                    std::vector<bool> needed(size + 1, true);
+                    for (std::size_t index = size; index-- > 0;) {
+                        needed[index] = needed[index + 1];
+                        if (defines(index)) needed[index] = false;
+                        if (std::any_of(code[index].uses.begin(),
+                                        code[index].uses.end(),
+                                        [&](const machine::Register& value) {
+                                            return physical(value, hard_id);
+                                        })) {
+                            needed[index] = true;
+                        }
+                    }
+                    // The value equal to the object's value at each position.
+                    std::vector<std::optional<std::uint32_t>> content(size + 1);
+                    for (std::size_t index = 0; index < size; ++index) {
+                        content[index + 1] = content[index];
+                        const auto& instruction = code[index];
+                        if (is_copy(instruction) &&
+                            physical(instruction.uses.front(), hard_id) &&
+                            instruction.defs.front().kind ==
+                                machine::RegisterKind::Virtual) {
+                            content[index + 1] = instruction.defs.front().id;
+                        } else if (is_copy(instruction) &&
+                                   physical(instruction.defs.front(), hard_id) &&
+                                   instruction.uses.front().kind ==
+                                       machine::RegisterKind::Virtual) {
+                            content[index + 1] = instruction.uses.front().id;
+                        } else if (defines(index)) {
+                            content[index + 1].reset();
+                        }
+                    }
+                    const auto try_assign = [&](std::uint32_t id) {
+                        if (id >= count || !eligible[id] ||
+                            function.virtual_register_assignments[id] ||
+                            (function.virtual_register_classes[id] ==
+                             machine::VirtualRegisterClass::Floating) != floating ||
+                            live_in[block.id.value].contains(id) ||
+                            live_out[block.id.value].contains(id)) {
+                            return;
+                        }
+                        std::optional<std::size_t> first;
+                        std::size_t last = 0;
+                        for (std::size_t index = 0; index < size; ++index) {
+                            if (mentions(code[index].defs, id) && !first) {
+                                first = index;
+                            }
+                            if (mentions(code[index].uses, id)) last = index;
+                        }
+                        if (!first) return;
+                        last = std::max(last, *first);
+                        for (std::size_t position = *first + 1; position <= last;
+                             ++position) {
+                            if (needed[position] && content[position] != id) {
+                                return;
+                            }
+                            if (position < last && defines(position) &&
+                                !(is_copy(code[position]) &&
+                                  code[position].uses.front() ==
+                                      machine::Register::virtual_register(
+                                          {id}, function.virtual_registers[id]))) {
+                                return;
+                            }
+                        }
+                        if (std::any_of(interference[id].begin(),
+                                        interference[id].end(),
+                                        [&](std::uint32_t neighbor) {
+                                            return neighbor < count &&
+                                                   function.virtual_register_assignments
+                                                           [neighbor] == hard;
+                                        })) {
+                            return;
+                        }
+                        function.virtual_register_assignments[id] = hard;
+                    };
+                    if (connected) {
+                        for (const auto& instruction : code) {
+                            if (!is_copy(instruction)) continue;
+                            if (physical(instruction.uses.front(), hard_id) &&
+                                instruction.defs.front().kind ==
+                                    machine::RegisterKind::Virtual) {
+                                try_assign(instruction.defs.front().id);
+                            } else if (physical(instruction.defs.front(),
+                                                hard_id) &&
+                                       instruction.uses.front().kind ==
+                                           machine::RegisterKind::Virtual) {
+                                try_assign(instruction.uses.front().id);
+                            }
+                        }
+                        continue;
+                    }
+                    if (!writable) continue;
+                    for (const auto& instruction : code) {
+                        for (const auto& definition : instruction.defs) {
+                            if (definition.kind == machine::RegisterKind::Virtual) {
+                                try_assign(definition.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // A call preserves only as many low bits of the GPRs it does not clobber
     // as its ABI's narrowest integer bank has: 32 under o32 and cross32, even
     // on a MIPS III CPU whose GPRs have 64.
@@ -1694,7 +1966,7 @@ private:
 
     bool allocate_registers(machine::Function& function) {
         const auto& entity = hir_.function(function.source);
-        if (!options_.register_allocation) {
+        if (!options_.register_allocation && !naked_) {
             const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
             bool changed = false;
             std::unordered_set<std::uint32_t> saved;
@@ -2287,6 +2559,29 @@ private:
                                   20U, 22U, 24U, 26U, 28U, 30U}) {
             floating_colors.push_back({fpr_physical_base + number});
         }
+        if (naked_) {
+            coalesce_hard_registers(function, live_in, live_out, interference,
+                                    eligible);
+            // A naked body colors temporaries only with the registers its
+            // clobber contract declares and no hard-bound object owns.
+            integer_colors.clear();
+            floating_colors.clear();
+            for (const auto& name : entity.clobbers) {
+                const auto physical = physical_register_id(name);
+                if (!physical || physical->value == 0 ||
+                    std::any_of(hard_slots_.begin(), hard_slots_.end(),
+                                [&](const auto& hard) {
+                                    return hard.second == *physical;
+                                })) {
+                    continue;
+                }
+                if (physical->value < fpr_physical_base) {
+                    integer_colors.push_back(*physical);
+                } else if ((physical->value - fpr_physical_base) % 2U == 0) {
+                    floating_colors.push_back(*physical);
+                }
+            }
+        }
 
         std::vector<std::uint32_t> order(count);
         for (std::uint32_t id = 0; id < count; ++id) order[id] = id;
@@ -2564,6 +2859,9 @@ private:
         };
         std::unordered_set<std::uint32_t> saved;
         const auto preserve_storage = [&](machine::PhysicalRegisterId physical) {
+            // A naked function's contract is the programmer's: it saves
+            // nothing.
+            if (naked_) return;
             if (physical.value > fpr_physical_base &&
                 physical.value < fpr_physical_base + fpr_names.size() &&
                 (physical.value - fpr_physical_base) % 2U != 0 &&
@@ -2641,7 +2939,7 @@ private:
     }
 
     bool fold_pointer_offsets(machine::Function& function) {
-        if (!options_.combine_addresses) return false;
+        if (!options_.combine_addresses && !naked_) return false;
         bool changed = false;
         std::vector<std::optional<machine::ImmediateOperand>> constants(
             function.virtual_registers.size());
@@ -2738,6 +3036,12 @@ private:
         for (auto& block : function.blocks) {
             for (auto& instruction : block.instructions) {
                 const auto opcode = decode_opcode(instruction.opcode);
+                if (opcode == Opcode::Machine) {
+                    changed = fold_form_displacements(instruction,
+                                                      definitions) ||
+                              changed;
+                    continue;
+                }
                 const bool pointer_access =
                     opcode == Opcode::PointerLoadSigned ||
                     opcode == Opcode::PointerLoadUnsigned ||
@@ -2765,6 +3069,55 @@ private:
                 instruction.operands.push_back(*offset);
                 changed = true;
             }
+        }
+        return changed;
+    }
+
+    // Folds a constant pointer offset into a registry form's memory
+    // displacement while the sum stays a signed 16-bit field.
+    bool fold_form_displacements(
+        machine::Instruction& instruction,
+        const std::vector<const machine::Instruction*>& definitions) const {
+        const auto& form = subtarget_.target().instructions.at(
+            std::get<machine::ImmediateOperand>(instruction.operands.front())
+                .value);
+        bool changed = false;
+        std::size_t next = 1;
+        for (const auto& field : form.operands) {
+            if (!field.allow_memory) {
+                ++next;
+                continue;
+            }
+            auto& base = std::get<machine::RegisterOperand>(
+                instruction.operands[next]);
+            auto& displacement = std::get<machine::ImmediateOperand>(
+                instruction.operands[next + 1]);
+            next += 2;
+            const auto address = base.value;
+            if (address.kind != machine::RegisterKind::Virtual ||
+                address.id >= definitions.size() ||
+                !definitions[address.id] ||
+                definitions[address.id]->opcode != Opcode::PointerOffset ||
+                definitions[address.id]->uses.size() != 1) {
+                continue;
+            }
+            const auto* offset = std::get_if<machine::ImmediateOperand>(
+                &definitions[address.id]->operands.back());
+            if (!offset) continue;
+            const auto sum = static_cast<std::int64_t>(displacement.value) +
+                             static_cast<std::int64_t>(offset->value);
+            if (sum < std::numeric_limits<std::int16_t>::min() ||
+                sum > std::numeric_limits<std::int16_t>::max()) {
+                continue;
+            }
+            const auto replacement = definitions[address.id]->uses.front();
+            const auto use = std::find(instruction.uses.begin(),
+                                       instruction.uses.end(), address);
+            if (use == instruction.uses.end()) continue;
+            *use = replacement;
+            base.value = replacement;
+            displacement.value = static_cast<std::uint64_t>(sum);
+            changed = true;
         }
         return changed;
     }
@@ -3017,7 +3370,7 @@ private:
     }
 
     bool select_integer_immediates(machine::Function& function) {
-        if (!options_.machine_combine) return false;
+        if (!options_.machine_combine && !naked_) return false;
 
         std::vector<std::optional<machine::ImmediateOperand>> constants(
             function.virtual_registers.size());
@@ -4086,7 +4439,7 @@ private:
             {{LoweringPass::PropagateCopies}, Stage::Canonicalization,
              "propagate-copies"},
             [this](machine::Function& function) {
-                if (!options_.cprop_registers) return false;
+                if (!options_.cprop_registers && !naked_) return false;
                 const auto is_copy = [](const machine::Instruction& value) {
                     const auto opcode = decode_opcode(value.opcode);
                     return opcode == Opcode::Expect ||
@@ -4200,7 +4553,7 @@ private:
             {{LoweringPass::EliminateDeadValues}, Stage::Canonicalization,
              "eliminate-dead-machine-values"},
             [this](machine::Function& function) {
-                if (!options_.machine_dce) return false;
+                if (!options_.machine_dce && !naked_) return false;
                 std::vector<bool> implicit_parameter_storage(
                     function.virtual_registers.size());
                 for (const auto& block : function.blocks) {
@@ -4438,8 +4791,10 @@ private:
             std::max(1U, subtarget_.abi_info().stack_alignment);
         current_.frame.outgoing_argument_alignment =
             current_.frame.stack_alignment;
-        current_.frame.has_frame_pointer = true;
+        current_.frame.has_frame_pointer = !entity.naked;
         current_.frame.elide_incoming_saves = elide_noreturn_saves(entity);
+        naked_ = entity.naked;
+        hard_slots_.clear();
         create_registers(source);
         create_stack_slots(source);
         lower_blocks(source);
@@ -4463,6 +4818,11 @@ private:
     std::unordered_map<std::uint32_t,
                        std::vector<machine::PhysicalRegisterId>>
         private_clobbers_;
+    // The function is naked: frameless, spill-free allocation over its
+    // declared registers, and hard-bound objects live in their registers.
+    bool naked_{};
+    std::unordered_map<std::uint32_t, machine::PhysicalRegisterId>
+        hard_slots_;
 };
 
 } // namespace
@@ -4518,7 +4878,10 @@ public:
             // Dynamic SP effects are not yet part of the pinned fixed-frame
             // program contract. Retain the verified MIR marks and late frame
             // emitter, with a stable FP for every fixed home.
-            if (has_dynamic_stack(function) || frame_realignment(function)) continue;
+            if (has_dynamic_stack(function) || frame_realignment(function) ||
+                hir_.function(function.source).naked) {
+                continue;
+            }
             active_signature_ = classify_entity(hir_.function(function.source), function.location);
             if (!active_signature_) continue;
             prepare_parameter_homes(function);
@@ -4728,6 +5091,8 @@ private:
 
     void raw_instruction(std::string_view opcode,
                          std::string_view operands = {}) {
+        count_hazard_separation(opcode);
+        audit_naked_write(opcode, operands);
         output_ << '\t' << opcode;
         if (!operands.empty()) {
             output_ << '\t';
@@ -4843,10 +5208,435 @@ private:
         return true;
     }
 
+    const InstructionEntry& machine_form(
+        const machine::Instruction& instruction) const {
+        return subtarget_.target().instructions.at(
+            std::get<machine::ImmediateOperand>(instruction.operands.front())
+                .value);
+    }
+
+    // The physical register of a registry-form operand: a hard register,
+    // an assigned color, or a scratch that holds the value of its home.
+    std::string_view form_register(const machine::Function& function,
+                                   machine::Register value, bool floating,
+                                   bool output, std::string_view scratch,
+                                   SourceLocation location) {
+        if (value.kind == machine::RegisterKind::Physical) {
+            return floating ? fpr_name({value.id}) : gpr_name({value.id});
+        }
+        if (output) {
+            return floating ? output_fpr(function, value, scratch)
+                            : output_gpr(function, value, scratch);
+        }
+        return floating ? input_fpr(function, value, scratch, location)
+                        : input_gpr(function, value, scratch, location);
+    }
+
+    void emit_machine_form(const machine::Function& function,
+                           const machine::Instruction& value) {
+        const auto& form = machine_form(value);
+        std::string operands;
+        std::vector<std::uint64_t> immediates(form.operands.size());
+        std::size_t next = 1;
+        unsigned gpr_inputs = 0;
+        unsigned fpr_inputs = 0;
+        std::optional<machine::Register> output;
+        std::string_view output_name;
+        bool floating_output = false;
+        for (std::size_t index = 0; index < form.operands.size(); ++index) {
+            const auto& field = form.operands[index];
+            if (!operands.empty()) operands += ',';
+            if (field.allow_register || field.allow_memory) {
+                const auto reg = std::get<machine::RegisterOperand>(
+                                     value.operands[next++])
+                                     .value;
+                const bool floating = field.register_class == "floating";
+                const bool is_output =
+                    field.role == InstructionOperandRole::Output;
+                const std::string_view scratch =
+                    is_output ? (floating ? "f2" : "t1")
+                    : floating ? (fpr_inputs++ == 0 ? "f0" : "f2")
+                               : (gpr_inputs++ == 0 ? "t0" : "t1");
+                const auto name = form_register(function, reg, floating,
+                                                is_output, scratch,
+                                                value.location);
+                if (is_output) {
+                    output = reg;
+                    output_name = name;
+                    floating_output = floating;
+                }
+                if (field.allow_memory) {
+                    const auto& displacement =
+                        std::get<machine::ImmediateOperand>(
+                            value.operands[next++]);
+                    operands += memory(
+                        static_cast<std::int64_t>(displacement.value), name);
+                } else {
+                    operands += reg_name(name);
+                }
+                continue;
+            }
+            const auto& immediate =
+                std::get<machine::ImmediateOperand>(value.operands[next++]);
+            immediates[index] = immediate.value;
+            operands += field.assembly_register_number
+                            ? "$" + std::to_string(immediate.value)
+                            : std::to_string(immediate.value);
+        }
+        hazard_form_ = &form;
+        hazard_immediates_ = std::move(immediates);
+        instruction(form.assembly_mnemonic, operands);
+        // A raw jump has a delay slot; ERET does not.
+        if (form.control != InstructionControlEffect::None &&
+            form.assembly_mnemonic != "eret") {
+            instruction("nop");
+        }
+        if (output && output->kind == machine::RegisterKind::Virtual) {
+            if (floating_output) {
+                commit_fpr(function, *output, output_name, value.location);
+            } else {
+                commit_gpr(function, *output, output_name, value.location);
+            }
+        }
+    }
+
+    // A naked function has no frame: every value it computes must be in a
+    // register, and no instruction may address a stack slot.
+    bool check_naked_storage(const machine::Function& function) {
+        bool valid = true;
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                // Object lifetimes emit nothing.
+                if (decode_opcode(instruction.opcode) ==
+                        Opcode::LifetimeStart ||
+                    decode_opcode(instruction.opcode) ==
+                        Opcode::LifetimeEnd) {
+                    continue;
+                }
+                const bool slot = std::any_of(
+                    instruction.operands.begin(), instruction.operands.end(),
+                    [](const machine::Operand& operand) {
+                        return std::holds_alternative<
+                            machine::StackSlotOperand>(operand);
+                    });
+                // HI/LO dependency tokens are not storage.
+                const auto unassigned = [&](const machine::Register& value) {
+                    return value.kind == machine::RegisterKind::Virtual &&
+                           (value.id >=
+                                function.virtual_register_assignments.size() ||
+                            !function.virtual_register_assignments[value.id]) &&
+                           !(value.mode == machine::i1 &&
+                             function.virtual_register_classes[value.id] ==
+                                 machine::VirtualRegisterClass::Memory);
+                };
+                if (slot ||
+                    std::any_of(instruction.defs.begin(),
+                                instruction.defs.end(), unassigned) ||
+                    std::any_of(instruction.uses.begin(),
+                                instruction.uses.end(), unassigned)) {
+                    // The first value is enough to locate the shortage.
+                    diagnostics_.error(
+                        instruction.location,
+                        slot ? "a naked function cannot use stack storage"
+                             : "a naked function value needs a register; "
+                               "declare more registers in its clobber "
+                               "contract");
+                    return false;
+                }
+            }
+        }
+        return valid;
+    }
+
+    // Registers a naked function may write: its declared clobbers, its
+    // interface, and its hard-bound objects.
+    std::unordered_set<std::string> naked_registers(
+        const machine::Function& function) const {
+        const auto& entity = hir_.function(function.source);
+        std::unordered_set<std::string> result{"zero"};
+        for (const auto& name : entity.clobbers) result.insert(name);
+        if (entity.result_location) result.insert(*entity.result_location);
+        for (const auto& parameter : entity.parameters) {
+            if (parameter.physical_location) {
+                result.insert(*parameter.physical_location);
+            }
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto* registers :
+                     {&instruction.defs, &instruction.uses}) {
+                    for (const auto& value : *registers) {
+                        if (value.kind != machine::RegisterKind::Physical) {
+                            continue;
+                        }
+                        const auto gpr = gpr_name({value.id});
+                        result.insert(std::string(
+                            gpr.empty() ? fpr_name({value.id}) : gpr));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    // Registers an emitted instruction writes implicitly or through its
+    // first operand. Explicit coprocessor writes belong to the program.
+    std::vector<std::string> written_registers(
+        std::string_view opcode, std::string_view operands) const {
+        if (opcode == "jal" || opcode == "bal" || opcode == "bgezal" ||
+            opcode == "bltzal") {
+            return {"ra"};
+        }
+        if (writes_hilo(opcode)) return {"hi", "lo"};
+        if (opcode.starts_with("c.")) return {"fcsr"};
+        if (hazard_store(opcode) || control_transfer(opcode) ||
+            opcode == "nop" || opcode == "ehb" || opcode == "sync" ||
+            opcode == "cache" || opcode == "break" ||
+            opcode == "syscall" || opcode.starts_with("tlb") ||
+            opcode == "mtc0" || opcode == "dmtc0" || opcode == "ctc1") {
+            return {};
+        }
+        const auto destination = register_operand(
+            operands, opcode == "mtc1" || opcode == "dmtc1" ? 1 : 0);
+        if (!destination) return {};
+        return {*destination};
+    }
+
+    void audit_naked_write(std::string_view opcode,
+                           std::string_view operands) {
+        if (!naked_writable_) return;
+        for (const auto& name : written_registers(opcode, operands)) {
+            if (naked_writable_->contains(name)) continue;
+            diagnostics_.error(
+                function_location_,
+                "naked function writes '$" + name + "' in '" +
+                    std::string(opcode) + ' ' + std::string(operands) +
+                    "', outside its clobber contract");
+            naked_writable_->insert(name);
+        }
+    }
+
+    // Hazard event classes of an emitted mnemonic.
+    static bool hazard_load(std::string_view opcode) {
+        return memory_load(opcode) || opcode == "lwl" || opcode == "lwr" ||
+               opcode == "ldl" || opcode == "ldr";
+    }
+
+    static bool hazard_store(std::string_view opcode) {
+        return opcode == "sb" || opcode == "sh" || opcode == "sw" ||
+               opcode == "sd" || opcode == "swc1" || opcode == "sdc1" ||
+               opcode == "sc" || opcode == "scd" || opcode == "swl" ||
+               opcode == "swr" || opcode == "sdl" || opcode == "sdr";
+    }
+
+    static bool in_hazard_event(std::string_view opcode, HazardEvent event) {
+        switch (event) {
+        case HazardEvent::Instruction: return true;
+        case HazardEvent::Load: return hazard_load(opcode);
+        case HazardEvent::Store: return hazard_store(opcode);
+        case HazardEvent::Cache: return opcode == "cache";
+        case HazardEvent::Coprocessor:
+            return opcode.find('.') != std::string_view::npos ||
+                   opcode.ends_with("c0") || opcode.ends_with("c1") ||
+                   opcode.starts_with("bc1") || opcode.starts_with("tlb") ||
+                   opcode == "eret" || opcode == "cache";
+        }
+        return false;
+    }
+
+    static bool control_transfer(std::string_view opcode) {
+        return (opcode.starts_with('b') && opcode != "break") ||
+               opcode.starts_with('j') || opcode == "eret";
+    }
+
+    bool hazard_fact_applies(const HazardFact& fact) const {
+        if (!fact.when_operand) return true;
+        const auto value = *fact.when_operand < hazard_immediates_.size()
+                               ? hazard_immediates_[*fact.when_operand]
+                               : 0;
+        return std::find(fact.when_values.begin(), fact.when_values.end(),
+                         value) != fact.when_values.end();
+    }
+
+    // The resource a fact names for the registry form being emitted.
+    std::string hazard_resource(const HazardFact& fact) const {
+        if (!fact.operand) return std::string(fact.resource);
+        const auto value = *fact.operand < hazard_immediates_.size()
+                               ? hazard_immediates_[*fact.operand]
+                               : 0;
+        return std::string(fact.resource) + '.' + std::to_string(value);
+    }
+
+    static bool resource_family(std::string_view resource,
+                                const HazardFact& use) {
+        return use.operand ? resource.starts_with(use.resource) &&
+                                 resource.size() > use.resource.size() &&
+                                 resource[use.resource.size()] == '.'
+                           : resource == use.resource;
+    }
+
+    // The largest separation any possible user of `resource` needs after a
+    // write that makes it available at `stage`. A form's write can reach a
+    // user in any function; a write by an ordinary instruction class counts
+    // only users in this function, whose entry and call returns assume one.
+    unsigned hazard_requirement(std::string_view resource, unsigned stage,
+                                bool class_write) const {
+        unsigned result = 0;
+        const auto consider = [&](const HazardFact& use) {
+            if (resource_family(resource, use) && stage > use.stage + 1)
+                result = std::max(result, stage - use.stage - 1);
+        };
+        const auto& target = subtarget_.target();
+        for (const auto& event : target.hazard_events) {
+            if (!event.writes) consider(event.fact);
+        }
+        if (class_write) {
+            for (const auto* form : hazard_forms_) {
+                for (const auto& use : form->hazard_uses) consider(use);
+            }
+        } else {
+            for (const auto& form : target.instructions) {
+                for (const auto& use : form.hazard_uses) consider(use);
+            }
+        }
+        return result;
+    }
+
+    // Separate `opcode` from every pending write it uses; before a control
+    // transfer, finish every pending write, since its successors are not
+    // the following instructions.
+    void resolve_hazards(std::string_view opcode,
+                         const InstructionEntry* form) {
+        if (pending_hazards_.empty()) return;
+        // Execution hazards (registry form writes) and class writes such as
+        // stores are padded separately: Release 2 clears the former with one
+        // EHB.
+        unsigned execution = 0;
+        unsigned other = 0;
+        const auto need = [&](const PendingHazard& pending, unsigned count) {
+            auto& needed = pending.class_write ? other : execution;
+            needed = std::max(needed, count);
+        };
+        const auto use = [&](const std::string& resource, unsigned stage) {
+            for (const auto& pending : pending_hazards_) {
+                if (pending.resource != resource ||
+                    pending.stage <= stage + 1) {
+                    continue;
+                }
+                const auto required = pending.stage - stage - 1;
+                if (required > pending.separated) {
+                    need(pending, required - pending.separated);
+                }
+            }
+        };
+        for (const auto& event : subtarget_.target().hazard_events) {
+            if (!event.writes && in_hazard_event(opcode, event.event)) {
+                use(std::string(event.fact.resource), event.fact.stage);
+            }
+        }
+        if (form) {
+            for (const auto& fact : form->hazard_uses) {
+                if (hazard_fact_applies(fact)) {
+                    use(hazard_resource(fact), fact.stage);
+                }
+            }
+        }
+        if (control_transfer(opcode)) {
+            for (const auto& pending : pending_hazards_) {
+                if (pending.required > pending.separated + 1) {
+                    need(pending, pending.required - pending.separated - 1);
+                }
+            }
+        }
+        if (execution != 0 && subtarget_.has_feature(Feature::Mips32r2)) {
+            raw_instruction("ehb");
+            std::erase_if(pending_hazards_, [](const PendingHazard& pending) {
+                return !pending.class_write;
+            });
+            execution = 0;
+            other = other == 0 ? 0 : other - 1;
+        }
+        for (auto count = std::max(execution, other); count != 0; --count) {
+            raw_instruction("nop");
+        }
+    }
+
+    static bool call_transfer(std::string_view opcode) {
+        return opcode == "jal" || opcode == "jalr" || opcode == "bal" ||
+               opcode == "bgezal" || opcode == "bltzal";
+    }
+
+    void count_hazard_separation(std::string_view opcode) {
+        for (auto& pending : pending_hazards_) {
+            if (std::none_of(pending.unseparated_by.begin(),
+                             pending.unseparated_by.end(),
+                             [&](HazardEvent event) {
+                                 return in_hazard_event(opcode, event);
+                             })) {
+                ++pending.separated;
+            }
+        }
+        std::erase_if(pending_hazards_, [](const PendingHazard& pending) {
+            return pending.separated >= pending.required;
+        });
+        // The callee returns after the call's delay slot.
+        if (call_return_countdown_ != 0 && --call_return_countdown_ == 0) {
+            assume_unknown_hazard_writes();
+        }
+        if (call_transfer(opcode)) call_return_countdown_ = 1;
+    }
+
+    void add_hazard_write(std::string resource, unsigned stage,
+                          std::vector<HazardEvent> unseparated_by,
+                          bool class_write, unsigned separated = 0) {
+        const auto required =
+            hazard_requirement(resource, stage, class_write);
+        if (required <= separated) return;
+        std::erase_if(pending_hazards_, [&](const PendingHazard& pending) {
+            return pending.resource == resource;
+        });
+        pending_hazards_.push_back({std::move(resource), stage, separated,
+                                    required, std::move(unseparated_by),
+                                    class_write});
+    }
+
+    void record_hazard_writes(std::string_view opcode,
+                              const InstructionEntry* form) {
+        for (const auto& event : subtarget_.target().hazard_events) {
+            if (event.writes && in_hazard_event(opcode, event.event)) {
+                add_hazard_write(std::string(event.fact.resource),
+                                 event.fact.stage, event.unseparated_by,
+                                 true);
+            }
+        }
+        if (form) {
+            for (const auto& fact : form->hazard_writes) {
+                if (hazard_fact_applies(fact)) {
+                    add_hazard_write(hazard_resource(fact), fact.stage, {},
+                                     false);
+                }
+            }
+        }
+    }
+
+    // A function entry or a call return may follow a class write that only
+    // the transfer instruction separates.
+    void assume_unknown_hazard_writes() {
+        for (const auto& event : subtarget_.target().hazard_events) {
+            if (event.writes) {
+                add_hazard_write(std::string(event.fact.resource),
+                                 event.fact.stage, event.unseparated_by,
+                                 true, 1);
+            }
+        }
+    }
+
     void instruction(std::string_view opcode,
                      std::string_view operands = {},
                      bool defer_load_delay = false) {
         if (split_doubleword_coprocessor_access(opcode, operands)) return;
+        const auto* form = std::exchange(hazard_form_, nullptr);
+        resolve_hazards(opcode, form);
         const bool floating_multiply =
             opcode == "mul.s" || opcode == "mul.d" || opcode == "mul.ps";
         // MIPS I--III only require a transfer delay when the immediately
@@ -4886,7 +5676,16 @@ private:
             }
         }
 
+        if (fcsr_transfer_pending_) {
+            if (in_hazard_event(opcode, HazardEvent::Coprocessor)) {
+                raw_instruction("nop");
+                if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
+            }
+            fcsr_transfer_pending_ = false;
+        }
+
         raw_instruction(opcode, operands);
+        record_hazard_writes(opcode, form);
         if (!defer_load_delay &&
             !subtarget_.has_feature(Feature::LoadInterlocks) &&
             memory_load(opcode)) {
@@ -4897,13 +5696,26 @@ private:
         }
         if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
             (opcode == "mfc1" || opcode == "mtc1" ||
-             opcode == "dmfc1" || opcode == "dmtc1")) {
+             opcode == "dmfc1" || opcode == "dmtc1" || opcode == "cfc1")) {
             const auto destination =
                 register_operand(operands,
-                                 opcode == "mfc1" || opcode == "dmfc1"
+                                 opcode == "mfc1" || opcode == "dmfc1" ||
+                                         opcode == "cfc1"
                                      ? 0
                                      : 1);
             if (destination) fpu_transfer_delay_register_ = *destination;
+        }
+        // CTC1 changes the FCSR that following FPU instructions read.
+        if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
+            opcode == "ctc1") {
+            fcsr_transfer_pending_ = true;
+        }
+        // MIPS I coprocessor 0 moves have a load delay.
+        if (!subtarget_.has_feature(Feature::LoadInterlocks) &&
+            (opcode == "mfc0" || opcode == "dmfc0")) {
+            if (const auto destination = register_operand(operands, 0)) {
+                fpu_transfer_delay_register_ = *destination;
+            }
         }
         if (!subtarget_.has_feature(Feature::FpuCompareInterlocks) &&
             opcode.starts_with("c.")) {
@@ -4928,6 +5740,7 @@ private:
             if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
             fpu_transfer_delay_register_.reset();
         }
+        count_hazard_separation({});
         output_ << "\t.word\t0x" << std::hex << std::setw(8)
                 << std::setfill('0') << word << std::dec << std::setfill(' ');
         if (!comment.empty()) output_ << "\t# " << comment;
@@ -4965,6 +5778,12 @@ private:
     // materializes every 64-bit address from all four relocation halves.
     bool large_code_model() const {
         return wide_addresses_ && options_.code_model == CodeModel::Large;
+    }
+
+    // A direct call or tail jump names only the caller's 256 MB region;
+    // the large code model and -mlong-calls go through a register.
+    bool far_calls() const {
+        return large_code_model() || resolved_bool(options_, "m.long-calls");
     }
 
     void materialize_symbol_address(std::string_view destination,
@@ -6200,6 +7019,34 @@ private:
                    const machine::Instruction& value) {
         const auto target = value.defs.front();
         const auto source = value.uses.front();
+        if (target.kind == machine::RegisterKind::Physical ||
+            source.kind == machine::RegisterKind::Physical) {
+            // A hard-bound object's register.
+            const bool floating =
+                (target.kind == machine::RegisterKind::Physical
+                     ? target.id
+                     : source.id) >= fpr_physical_base;
+            const auto from = form_register(function, source, floating, false,
+                                            floating ? "f0" : "t0",
+                                            value.location);
+            const auto to = form_register(function, target, floating, true,
+                                          floating ? "f2" : "t1",
+                                          value.location);
+            if (from != to) {
+                instruction(floating ? (target.mode.bits == 32 ? "mov.s"
+                                                               : "mov.d")
+                                     : "move",
+                            reg_name(to) + "," + reg_name(from));
+            }
+            if (target.kind == machine::RegisterKind::Virtual) {
+                if (floating) {
+                    commit_fpr(function, target, to, value.location);
+                } else {
+                    commit_gpr(function, target, to, value.location);
+                }
+            }
+            return;
+        }
         if (same_physical_assignment(function, target, source)) return;
         if (const auto assigned = assigned_gpr(function, target)) {
             load_vreg(function, source, *assigned, value.location);
@@ -7537,10 +8384,10 @@ private:
                                 "$ra," + memory(saved_ra_offset_, "sp"));
                 }
             }
-            // Under the large model the callee may lie outside the 256 MB
+            // With far calls the callee may lie outside the 256 MB
             // region a direct jump can name.  $at is the emitter's own
             // scratch and never carries an argument or a live value here.
-            if (large_code_model()) {
+            if (far_calls()) {
                 materialize_symbol_address(
                     "at", assembly_symbol(callee_symbol->name));
                 instruction("jr", "$at");
@@ -7560,7 +8407,7 @@ private:
             const auto target = input_gpr(function, callee_register->value,
                                           "at", call.location);
             instruction("jalr", reg_name(target));
-        } else if (large_code_model()) {
+        } else if (far_calls()) {
             materialize_symbol_address("at",
                                        assembly_symbol(callee_symbol->name));
             instruction("jalr", "$at");
@@ -8517,6 +9364,27 @@ private:
     unsigned hilo_write_barrier_{};
     bool fpu_multiply_pending_{};
     std::optional<std::string> fpu_transfer_delay_register_;
+    bool fcsr_transfer_pending_{};
+    // A write to a non-interlocked resource that a later user may need to
+    // be separated from.
+    struct PendingHazard {
+        std::string resource;
+        unsigned stage{};
+        unsigned separated{};
+        unsigned required{};
+        std::vector<HazardEvent> unseparated_by;
+        // Written by an instruction class, not by a registry form.
+        bool class_write{};
+    };
+    std::vector<PendingHazard> pending_hazards_;
+    // Registry forms in the function being emitted, and the form (with its
+    // immediate operand values) the next instruction() emits.
+    std::vector<const InstructionEntry*> hazard_forms_;
+    const InstructionEntry* hazard_form_{};
+    std::vector<std::uint64_t> hazard_immediates_;
+    unsigned call_return_countdown_{};
+    // Registers a naked function being emitted may write.
+    std::optional<std::unordered_set<std::string>> naked_writable_;
     std::vector<FloatLiteral> float_literals_;
     std::vector<IntegerLiteral> integer_literals_;
     std::string epilogue_label_;
@@ -9815,6 +10683,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         opcode == Opcode::LifetimeEnd || opcode == Opcode::IntrinsicNoop) {
         return;
     }
+    if (opcode == Opcode::Machine) {
+        emit_machine_form(function, value);
+        return;
+    }
     if (opcode == Opcode::Parameter || opcode == Opcode::Fparameter) {
         capture_parameter(function, value);
         return;
@@ -10906,11 +11778,32 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     hilo_write_barrier_ = 0;
     fpu_multiply_pending_ = false;
     fpu_transfer_delay_register_.reset();
+    fcsr_transfer_pending_ = false;
+    pending_hazards_.clear();
+    call_return_countdown_ = 0;
+    hazard_forms_.clear();
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (decode_opcode(instruction.opcode) == Opcode::Machine) {
+                hazard_forms_.push_back(&machine_form(instruction));
+            }
+        }
+    }
+    assume_unknown_hazard_writes();
     // Fully allocated, non-overlapping parameter sets are captured directly.
     // Otherwise home the whole incoming register set before materialization:
     // EABI/Cross banks may overlap t0/t1 assembly scratches, so mixing direct
     // and fallback captures would let an early value destroy a later one.
-    if (function.frame.program) {
+    naked_writable_.reset();
+    if (entity.naked) {
+        // No frame: every value must already live in a register.
+        if (!check_naked_storage(function)) return;
+        frame_size_ = 0;
+        realignment_ = 0;
+        saves_fp_ = false;
+        saves_ra_ = false;
+        naked_writable_ = naked_registers(function);
+    } else if (function.frame.program) {
         frame_size_ = function.frame.program->stack_size;
         realignment_ = 0;
         saves_fp_ = false;
@@ -10974,6 +11867,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
     else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
+    else if (subtarget_.has_feature(Feature::Mips32r2)) output_ << ".set mips32r2\n";
+    else if (subtarget_.has_feature(Feature::Mips32)) output_ << ".set mips32\n";
     else if (subtarget_.has_feature(Feature::Mips2)) output_ << ".set mips2\n";
     else output_ << ".set mips1\n";
     unsigned alignment_power = 2;
@@ -11005,9 +11900,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                                      ? "$fp" : "$sp")
             << ',' << frame_size_ << ','
             << respell_registers("$ra") << '\n';
+    // A naked function has no unwind description.
     const bool cfi = (options_.unwind_tables ||
                       options_.asynchronous_unwind_tables) &&
-                     assembly_uses_dwarf_cfi(format_);
+                     assembly_uses_dwarf_cfi(format_) && !entity.naked;
     if (cfi) output_ << ".cfi_startproc\n";
     if (function.frame.program) {
         if (!function.frame.prologue_block) {
@@ -11054,8 +11950,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     }
     // Entry homes run before a shrink-wrapped prologue.
     frame_active_ = !function.frame.prologue_block;
-    emit_parameter_homes(function);
-    emit_variadic_prologue(function);
+    if (!entity.naked) {
+        emit_parameter_homes(function);
+        emit_variadic_prologue(function);
+    }
     epilogue_label_ = ".Lcross.mips." +
                       std::to_string(function.source.value) + ".return";
     plan_successor_delay_slots(function);

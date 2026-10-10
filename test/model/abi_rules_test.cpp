@@ -195,6 +195,30 @@ bool validate_shipped_abis() {
         return false;
     }
 
+    // A record starts at a slot of its own alignment: an 8-byte-aligned one
+    // at an even slot, a 4-byte-aligned one at the next.
+    const auto o32_double_record = aggregate(64, {f64});
+    auto o32_word_record = aggregate(64, {o32_i32, o32_i32});
+    o32_word_record.alignment_bits = 32;
+    const auto o32_double_after_word = classify_call_arguments(
+        *o32, std::array{o32_i32, o32_double_record}, o32_hard);
+    const auto o32_words_after_word = classify_call_arguments(
+        *o32, std::array{o32_i32, o32_word_record}, o32_hard);
+    const auto o32_double_after_three = classify_call_arguments(
+        *o32, std::array{o32_i32, o32_i32, o32_i32, o32_double_record},
+        o32_hard);
+    if (!o32_double_after_word ||
+        !register_is(o32_double_after_word.layout.arguments[1], 0, "a2") ||
+        !register_is(o32_double_after_word.layout.arguments[1], 1, "a3") ||
+        !o32_words_after_word ||
+        !register_is(o32_words_after_word.layout.arguments[1], 0, "a1") ||
+        !register_is(o32_words_after_word.layout.arguments[1], 1, "a2") ||
+        !o32_double_after_three ||
+        !stack_is(o32_double_after_three.layout.arguments[3], 0, 16) ||
+        !stack_is(o32_double_after_three.layout.arguments[3], 1, 20)) {
+        return false;
+    }
+
     const auto o32_i64_result = classify_return(*o32, i64, o32_hard);
     const auto o32_f64_result = classify_return(*o32, f64, o32_hard);
     const auto o32_soft_f64_result = classify_return(*o32, f64, o32_soft);

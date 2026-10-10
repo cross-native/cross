@@ -7,6 +7,7 @@
 #include "common/memory_order.hpp"
 #include "common/patch_address.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -73,6 +74,11 @@ enum class ValueKind {
     Call,
     PatchValue,
     Intrinsic,
+    // A registry instruction form in managed code. Operands follow the
+    // form's operand order without its outputs: register inputs, constant
+    // immediates, and addresses of memory operands. The value is the single
+    // output, if any. It joins the effect chain unless the form is pure.
+    MachineInstruction,
     // A completed, effect-free void expression; never a machine register.
     VoidValue,
 };
@@ -188,10 +194,31 @@ struct ManagedValue {
     unsigned memory_alignment{};
     std::optional<EffectId> effect_input;
     std::optional<EffectId> effect_output;
+    InstructionFormId instruction_form;
     std::vector<ValueId> operands;
     std::vector<CallArgument> call_arguments;
     std::vector<PhiIncoming> incoming;
 };
+
+// A form whose only effect is its register result: the optimizer may
+// merge, move, or delete it like a language operation. A form without a
+// result runs for an effect, declared or not.
+[[nodiscard]] inline bool pure_instruction_form(const InstructionEntry& form) {
+    return form.implicit_reads.empty() && form.implicit_writes.empty() &&
+           !form.volatile_effect && !form.privileged &&
+           form.control == InstructionControlEffect::None &&
+           form.stack_delta == 0 && form.ordered_stack_delta == 0 &&
+           !form.ordered_stack_reset &&
+           std::none_of(form.operands.begin(), form.operands.end(),
+                        [](const InstructionOperandEntry& operand) {
+                            return operand.allow_memory;
+                        }) &&
+           std::any_of(form.operands.begin(), form.operands.end(),
+                       [](const InstructionOperandEntry& operand) {
+                           return operand.allow_register &&
+                                  operand.role != InstructionOperandRole::Input;
+                       });
+}
 
 struct ManagedSlot {
     SlotId id;

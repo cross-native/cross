@@ -399,10 +399,7 @@ std::string Preprocessor::evaluate_query(
         return enabled;
     };
     const auto instruction_enabled = [&](const InstructionEntry& instruction) {
-        return feature_enabled(instruction.feature) &&
-               std::all_of(
-                   instruction.required_features.begin(),
-                   instruction.required_features.end(), feature_enabled);
+        return !instruction_feature_conflict(instruction, feature_enabled);
     };
     const auto scalar_bits = [address_bits](std::string_view type) {
         if (type == "bool" || type == "i8" || type == "u8") return 8u;

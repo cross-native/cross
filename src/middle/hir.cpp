@@ -1845,9 +1845,11 @@ private:
             const auto abi_text = decode_attribute_string(representative->attribute("abi"));
             const auto selected = abi_text.empty() ? options_.abi : abi_text;
             function.abi_explicit = !abi_text.empty();
+            // A naked interface is fixed by its manual locations.
             function.abi_contract =
                 !function.variadic && !function.abi_explicit && function.definition &&
-                        function.linkage != Linkage::Global
+                        function.linkage != Linkage::Global &&
+                        !representative->attribute("naked")
                     ? AbiContract::Dynamic
                     : AbiContract::Registered;
             const auto* selected_abi =
@@ -2096,7 +2098,10 @@ private:
             if (!function.definition) {
                 function.ownership = BodyOwnership::None;
             } else if (function.naked) {
-                function.ownership = BodyOwnership::RawMir;
+                function.ownership =
+                    target_.naked_lowering == NakedLowering::Constrained
+                        ? BodyOwnership::ManagedAst
+                        : BodyOwnership::RawMir;
                 validate_naked_interface(function);
             } else {
                 function.ownership = BodyOwnership::ManagedAst;

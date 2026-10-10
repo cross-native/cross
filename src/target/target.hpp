@@ -139,6 +139,9 @@ struct AbiRule {
     // the number of physical endpoints used by the value (for example a
     // double in the MIPS o32 paired-FPR convention).
     unsigned cursor_alignment{1};
+    // Align instead to the placed value's alignment, at most the entry's
+    // stack alignment, counted in `stack_slot_bytes` positions.
+    bool cursor_alignment_value{};
     unsigned cursor_advance{};
     // Zero means unlimited.  This makes leading-argument conventions model
     // data without giving the common interpreter an architecture name.
@@ -275,6 +278,46 @@ struct InstructionOperandEntry {
     // A direct label field can impose an owner constraint independently of
     // its spelling or the source function's ABI.
     InstructionLabelScope label_scope{InstructionLabelScope::AnyVisible};
+    // Nonzero: a register operand carries a value of exactly this width.
+    // Forms of one mnemonic can differ only by value width, such as single
+    // and double precision in the same floating registers.
+    unsigned value_bits{};
+    // The immediate names an architectural register by number and prints in
+    // register syntax, such as a MIPS coprocessor register `$12`.
+    bool assembly_register_number{};
+};
+
+// A pipeline resource the hardware does not interlock. A writer makes it
+// available at `stage`; a user reads it at `stage`. A user that follows a
+// writer of the same resource needs writer.stage - (user.stage + 1)
+// instructions between them. With `operand`, the resource is qualified by
+// that immediate operand's value (resource "cp0" and operand value 12 name
+// "cp0.12").
+struct HazardFact {
+    std::string_view resource;
+    unsigned stage{};
+    std::optional<unsigned> operand{};
+    // When set, the fact applies only while immediate operand
+    // `when_operand` has one of `when_values`.
+    std::optional<unsigned> when_operand{};
+    std::vector<std::uint64_t> when_values{};
+};
+
+// Classes of instructions that implicitly use or write hazard resources.
+enum class HazardEvent : std::uint8_t {
+    Instruction,  // every instruction
+    Load,
+    Store,
+    Cache,        // a cache-maintenance instruction
+    Coprocessor,  // a coprocessor instruction
+};
+
+struct HazardEventEntry {
+    HazardEvent event{HazardEvent::Instruction};
+    HazardFact fact;
+    bool writes{};
+    // Instructions of these classes do not separate this write from a user.
+    std::vector<HazardEvent> unseparated_by{};
 };
 
 enum class InstructionControlEffect {
@@ -315,6 +358,18 @@ struct InstructionEntry {
     std::optional<unsigned> assembly_broadcast_operand;
     unsigned assembly_broadcast_count{};
     std::string_view assembly_operand_prefix{};
+    // The form is unavailable while any of these features is enabled.
+    std::vector<std::string_view> forbidden_features{};
+    // The instruction executes only in a privileged mode.
+    bool privileged{};
+    // Every execution is observable: the instruction reads state that can
+    // change independently of the program (a timer, for example) or has an
+    // effect beyond its operands. It is never merged, removed, or reordered
+    // across another effect.
+    bool volatile_effect{};
+    // Scheduling facts for resources the hardware does not interlock.
+    std::vector<HazardFact> hazard_writes{};
+    std::vector<HazardFact> hazard_uses{};
 
     InstructionEntry() = default;
 
@@ -337,6 +392,33 @@ struct InstructionEntry {
           ordered_stack_delta(floating_stack_delta),
           ordered_stack_reset(resets_floating_stack) {}
 };
+
+// Dense identity of one instruction form: its index in
+// `TargetInfo::instructions`.
+struct InstructionFormId {
+    std::uint32_t value{};
+    friend bool operator==(InstructionFormId, InstructionFormId) = default;
+};
+
+struct InstructionFeatureConflict {
+    std::string_view feature;
+    // The feature is enabled but forbidden, rather than required but absent.
+    bool forbidden{};
+};
+
+// The first feature that makes `form` unavailable under `enabled`, if any.
+template <typename Enabled>
+std::optional<InstructionFeatureConflict> instruction_feature_conflict(
+    const InstructionEntry& form, const Enabled& enabled) {
+    if (!enabled(form.feature)) return InstructionFeatureConflict{form.feature};
+    for (const auto feature : form.required_features) {
+        if (!enabled(feature)) return InstructionFeatureConflict{feature};
+    }
+    for (const auto feature : form.forbidden_features) {
+        if (enabled(feature)) return InstructionFeatureConflict{feature, true};
+    }
+    return std::nullopt;
+}
 
 struct PatchValueMaterializerEntry {
     std::string_view type_name;
@@ -464,6 +546,8 @@ struct ElfAbiTagEntry {
     unsigned address_bits{};
 };
 
+enum class NakedLowering { Raw, Constrained };
+
 struct TargetInfo {
     std::string_view architecture;
     std::vector<std::string_view> triple_prefixes;
@@ -483,6 +567,12 @@ struct TargetInfo {
     std::vector<InstructionAddressMode> instruction_address_modes{};
     std::vector<LanguageFeatureEntry> language_features{};
     std::vector<ElfAbiTagEntry> elf_abi_tags{};
+    // Hazard resources that classes of instructions use or write implicitly.
+    std::vector<HazardEventEntry> hazard_events{};
+    // How `[[naked]]` bodies lower: through the raw instruction lowerer, or
+    // through managed MIR with frameless, spill-free allocation restricted
+    // to the function's declared registers.
+    NakedLowering naked_lowering{NakedLowering::Raw};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;
@@ -508,6 +598,14 @@ const InstructionEntry* find_instruction(const TargetInfo& target, std::string_v
 std::vector<const InstructionEntry*> find_instruction_forms(
     const TargetInfo& target, std::string_view name);
 bool target_has_instruction(const TargetInfo& target, std::string_view name);
+[[nodiscard]] inline InstructionFormId instruction_form_id(
+    const TargetInfo& target, const InstructionEntry& form) {
+    return {static_cast<std::uint32_t>(&form - target.instructions.data())};
+}
+[[nodiscard]] inline const InstructionEntry& instruction_form(
+    const TargetInfo& target, InstructionFormId id) {
+    return target.instructions.at(id.value);
+}
 const AddressSpaceEntry* find_address_space(const TargetInfo& target,
                                             std::uint32_t number);
 // Source pointer types require an explicitly registered native representation.

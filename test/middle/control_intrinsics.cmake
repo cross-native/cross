@@ -56,10 +56,13 @@ execute_process(
     OUTPUT_VARIABLE mips_stdout
     ERROR_VARIABLE mips_stderr
 )
-if(mips_status EQUAL 0 OR NOT mips_stderr MATCHES
-   "target instruction '\\$::_nop' is not available")
-    message(FATAL_ERROR
-        "MIPS accepted unavailable managed $::_nop\n${mips_stdout}\n${mips_stderr}")
+if(NOT mips_status EQUAL 0)
+    message(FATAL_ERROR "MIPS rejected the managed $::_nop\n${mips_stderr}")
+endif()
+file(READ "${OUTPUT}-mips.s" mips_assembly)
+if(NOT mips_assembly MATCHES
+   "\ncontrol_machine_nop:\n[^\n]*\n[^\n]*\n\tnop\n\tjr\t[$]ra\n")
+    message(FATAL_ERROR "MIPS did not keep the managed $::_nop\n${mips_assembly}")
 endif()
 
 if(GIMPLE_TEXT)

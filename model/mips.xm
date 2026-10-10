@@ -592,7 +592,7 @@ abi "o32" {
         max_bits = 128;
         unit_bits = 32;
         extension = "sign";
-        cursor_alignment = 2;
+        cursor_alignment = "value";
         applies_to = ["arguments"];
     }
 
@@ -621,7 +621,7 @@ abi "o32" {
         bank = "floating64";
         min_bits = 64;
         max_bits = 64;
-        cursor_alignment = 2;
+        cursor_alignment = "value";
         cursor_advance = 2;
         argument_limit = 2;
         requires_unused_banks = ["integer"];
@@ -678,7 +678,7 @@ abi "o32" {
         min_bits = 33;
         max_bits = 128;
         unit_bits = 32;
-        cursor_alignment = 2;
+        cursor_alignment = "value";
         applies_to = ["arguments"];
     }
 
@@ -706,6 +706,7 @@ abi "o32" {
         bank = "integer";
         min_bits = 1;
         unit_bits = 32;
+        cursor_alignment = "value";
         applies_to = ["arguments"];
     }
 

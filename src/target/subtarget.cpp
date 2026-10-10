@@ -229,6 +229,14 @@ bool normalize_subtarget_options(const TargetInfo& target,
                 "'");
             return false;
         }
+        for (const auto forbidden : instruction.forbidden_features) {
+            if (known_instruction_feature(forbidden)) continue;
+            diagnostics.command_error(
+                "target instruction '" + std::string(instruction.name) +
+                "' excludes unknown feature '" + std::string(forbidden) +
+                "'");
+            return false;
+        }
     }
 
     const auto explicit_value = [&](std::string_view name,

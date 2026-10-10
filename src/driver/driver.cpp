@@ -106,8 +106,7 @@ void install_evaluation_layout_queries(Program& current, const TargetInfo* targe
             ? current.address_bits : type_bits(type);
         for (const auto* form : find_instruction_forms(*target, instruction)) {
             if (form->operands.size() != count || index >= count ||
-                !subtarget.supports_registry_feature(form->feature) ||
-                !std::all_of(form->required_features.begin(), form->required_features.end(),
+                instruction_feature_conflict(*form,
                     [&](std::string_view feature) { return subtarget.supports_registry_feature(feature); })) continue;
             const auto& operand = form->operands[index];
             if (patch_operand_accepts_type(operand, name, bits)) candidates.push_back({
@@ -386,7 +385,12 @@ void print_target_instructions(const TargetInfo& target) {
         for (const auto feature : instruction.required_features) {
             line << ',' << feature;
         }
+        for (const auto feature : instruction.forbidden_features) {
+            line << ",!" << feature;
+        }
         line << ']';
+        if (instruction.privileged) line << " privileged";
+        if (instruction.volatile_effect) line << " volatile";
         const auto text = std::move(line).str();
         if (emitted.insert(text).second) std::cout << text << '\n';
     }

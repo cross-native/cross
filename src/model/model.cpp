@@ -1676,8 +1676,19 @@ private:
                     unsigned_property(block.properties, "max_elements")) {
                 rule.max_elements = *value;
             }
-            if (const auto value = unsigned_property(
-                    block.properties, "cursor_alignment")) {
+            // A stated alignment, or "value" for the placed value's own.
+            if (const auto found = block.properties.find("cursor_alignment");
+                found != block.properties.end() &&
+                found->second.value.kind == ModelValue::Kind::Text) {
+                if (found->second.value.text != "value") {
+                    fail(found->second.line,
+                         "ABI rule cursor_alignment must be a power of two "
+                         "or \"value\"");
+                    return std::nullopt;
+                }
+                rule.cursor_alignment_value = true;
+            } else if (const auto value = unsigned_property(
+                           block.properties, "cursor_alignment")) {
                 rule.cursor_alignment = *value;
             }
             if (const auto value = unsigned_property(
@@ -2183,7 +2194,8 @@ private:
                                              "register bank");
                 return false;
             }
-            if ((rule.cursor_alignment != 1 || rule.cursor_advance != 0) &&
+            if ((rule.cursor_alignment != 1 || rule.cursor_alignment_value ||
+                 rule.cursor_advance != 0) &&
                 !needs_bank) {
                 fail(rule_line, rule_model + " uses cursor policy without a "
                                              "register bank");

@@ -1119,6 +1119,12 @@ private:
             out_ << ")\n";
             return;
         }
+        if (value.kind == ValueKind::MachineInstruction) {
+            diagnostics_.error(value.location,
+                               "the LLVM text serializer does not represent "
+                               "machine instruction built-ins");
+            return;
+        }
         if (value.kind == ValueKind::PatchValue) {
             if (value.patch_initial_address) {
                 diagnostics_.error(value.location,

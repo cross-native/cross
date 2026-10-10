@@ -3291,9 +3291,9 @@ require:
 Temporaries, scalar locals whose addresses are not taken, structured
 control flow, pointer accesses, and recursively eliminated `raw_inline`
 calls are permitted. Compatibility is checked after optimization, so dead
-managed-only code does not invalidate a call. Register allocation may use
-hard-bound interface registers and resources explicitly named by
-`clobber`; it shall not create a spill. A `raw_inline` function remains
+managed-only code does not invalidate a call. Register allocation may use resources explicitly named by `clobber` and,
+while the bound object's value is not needed, a hard-bound register that the
+function writes; it shall not create a spill. A `raw_inline` function remains
 an ordinary callable function in managed contexts unless `always_inline`
 also requires inlining. Taking its address is permitted, but such an indirect
 call is never raw-compatible.
@@ -3333,7 +3333,9 @@ A mnemonic may have several forms. Selection uses:
 An instruction form may require an exact physical register rather than only a
 register class.
 
-No/ambiguous best form is an error. A selected form denotes the instruction's
+No/ambiguous best form is an error. A form whose only effect is its register
+result is pure; a form without a result is preserved. A selected form denotes
+the instruction's
 typed semantics and operand constraints, not an opaque exact-opcode barrier.
 The compiler may fold it, combine it with surrounding operations, choose an
 equivalent instruction or sequence, or delete it when its result and effects
