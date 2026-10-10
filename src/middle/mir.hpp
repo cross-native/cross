@@ -88,7 +88,22 @@ enum class IntrinsicOperation {
     Unreachable,
     Trap,
     MachineNop,
+    // Pure operations on one floating type: correctly rounded square root,
+    // sign operations, and minNum/maxNum, whose NaN operand yields the
+    // other operand and whose equal operands yield the first.
+    Sqrt,
+    Fabs,
+    Copysign,
+    Fmin,
+    Fmax,
 };
+[[nodiscard]] inline bool floating_intrinsic_operation(IntrinsicOperation operation) {
+    return operation == IntrinsicOperation::Sqrt ||
+           operation == IntrinsicOperation::Fabs ||
+           operation == IntrinsicOperation::Copysign ||
+           operation == IntrinsicOperation::Fmin ||
+           operation == IntrinsicOperation::Fmax;
+}
 enum class AtomicOperation {
     Load, Store, Exchange, CompareExchange,
     FetchAdd, FetchSub, FetchAnd, FetchXor, FetchOr,

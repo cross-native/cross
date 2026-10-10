@@ -20,6 +20,11 @@ endfunction()
 
 reject(cast-pointer expression_cast_pointer_error.x
        "pointer casts require an integer at least as wide")
+reject(cast-address expression_cast_address_error.x
+       "integer value is not representable as a target address")
+reject(cast-address-mips expression_cast_address_runtime_error.x
+       "integer value is not representable as a target address"
+       -target mips-unknown-elf)
 reject(cast-float-pointer expression_cast_float_pointer_error.x
        "explicit cast cannot convert between a pointer and a non-integer type")
 reject(sizeof-void expression_sizeof_void_error.x

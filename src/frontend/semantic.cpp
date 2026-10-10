@@ -1299,6 +1299,8 @@ TypePtr translation_intrinsic_type(const Expr& expression, bool procedural, Type
         return builtin_type(BuiltinType::Void);
     case ControlIntrinsic::None: break;
     }
+    if (floating_intrinsic(expression) != FloatingIntrinsic::None)
+        return expression.arguments.empty() ? TypePtr{} : type_of(*expression.arguments.front());
     switch (atomic_builtin(expression)) {
     case AtomicBuiltin::Store: case AtomicBuiltin::ThreadFence: case AtomicBuiltin::SignalFence:
         return builtin_type(BuiltinType::Void);
@@ -5692,6 +5694,32 @@ EvaluationTask<std::optional<SourceExpressionIssue>> source_control_intrinsic_er
     co_return std::nullopt;
 }
 
+// A floating intrinsic takes operands of one floating type, its result type.
+// The target decides which floating types have an inline form.
+template<class TypeOf>
+std::optional<SourceExpressionIssue> source_floating_intrinsic_error(
+    const Expr& call, const TypeOf& type_of) {
+    const auto operation = floating_intrinsic(call);
+    if (operation == FloatingIntrinsic::None) return std::nullopt;
+    const auto& name = call.left->text;
+    const auto arity = floating_intrinsic_arity(operation);
+    if (call.arguments.size() != arity)
+        return SourceExpressionIssue{call.location,
+            name + (arity == 1 ? " requires one argument" : " requires two arguments")};
+    TypePtr first;
+    for (const auto& argument : call.arguments) {
+        const auto type = type_of(*argument, true);
+        if (!type || type->kind == Type::Kind::Generic) continue;
+        if (!is_floating(type))
+            return SourceExpressionIssue{argument->location, name + " requires floating operands"};
+        if (!first) first = type;
+        else if (first->builtin != type->builtin)
+            return SourceExpressionIssue{argument->location,
+                name + " requires operands of one floating type"};
+    }
+    return std::nullopt;
+}
+
 // Portable source constraints do not execute an atomic access or ask a target
 // to select its lock-free sequence. Pointer representation/address-space
 // lowering stays with the ordinary resolved-model conversion path.
@@ -6265,6 +6293,12 @@ private:
                         co_return co_await constant_(operand, types_.local_types, {});
                     },
                     !evaluation_only(function_)))
+                error(issue->location, issue->message);
+            co_return;
+        }
+        if (floating_intrinsic(node) != FloatingIntrinsic::None) {
+            if (const auto issue = source_floating_intrinsic_error(node,
+                    [&](const Expr& operand, bool decay) { return type(operand, decay); }))
                 error(issue->location, issue->message);
             co_return;
         }
@@ -9600,6 +9634,11 @@ private:
             }
         }
         if (!(co_await validate_control_intrinsic_async(node))) co_return false;
+        if (const auto issue = source_floating_intrinsic_error(node,
+                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
+            fail(issue->location, issue->message);
+            co_return false;
+        }
         if (!(co_await validate_atomic_intrinsic_async(node))) co_return false;
         if (!(co_await validate_patch_constraints_async(node, patch_operand))) co_return false;
         if (source_instruction_call(node)) {
@@ -9743,6 +9782,7 @@ private:
             }
         }
         if (control_intrinsic(node) != ControlIntrinsic::None || atomic_builtin(node) != AtomicBuiltin::None ||
+            floating_intrinsic(node) != FloatingIntrinsic::None ||
             patch_intrinsic(node) || source_instruction_call(node))
             co_return co_await validate_unevaluated_constraints_async(node, true, {}, false, use);
         if (node.kind == Expr::Kind::Call) {
@@ -10988,6 +11028,15 @@ private:
             EvalValue result{UInt128{}, clone_type(type)};
             result.address = AddressConstant{};
             co_return result;
+        }
+        if (type->kind == Type::Kind::Pointer && !value.pointer() && is_integer(value.type)) {
+            // A wider integer converts only when its value fits the address.
+            const auto from = integer_type(value.type);
+            if (from.bits > program_.address_bits &&
+                !fits_unsigned(mask_to(value.integer, from.bits), program_.address_bits)) {
+                fail(location, "integer value is not representable as a target address");
+                co_return std::nullopt;
+            }
         }
         if (pointer_resolver_ && type->kind == Type::Kind::Pointer && !value.string) {
             auto source = value_expression(value, location);
@@ -13282,6 +13331,33 @@ private:
         // Keep recursive tree transforms off the much larger scalar/byte
         // intrinsic frame. The token overload of is_kind has its own handler.
         const auto& name = expression.left->text;
+        if (const auto operation = floating_intrinsic(name); operation != FloatingIntrinsic::None) {
+            if (const auto issue = source_floating_intrinsic_error(expression,
+                    [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
+                fail(issue->location, issue->message);
+                co_return std::nullopt;
+            }
+            std::vector<EvalValue> operands;
+            for (const auto& argument : expression.arguments) {
+                auto value = co_await this->expression_async(*argument);
+                if (!value) co_return std::nullopt;
+                if (!value->floating) {
+                    fail(argument->location, name + " requires floating operands");
+                    co_return std::nullopt;
+                }
+                operands.push_back(std::move(*value));
+            }
+            const auto& x = *operands.front().floating;
+            floating::ExceptionSet raised{};
+            auto result =
+                operation == FloatingIntrinsic::Sqrt ? floating::square_root(x, &raised)
+                : operation == FloatingIntrinsic::Fabs ? floating::absolute(x)
+                : operation == FloatingIntrinsic::Copysign ? floating::copy_sign(x, *operands[1].floating)
+                : operation == FloatingIntrinsic::Fmin ? floating::min_num(x, *operands[1].floating, &raised)
+                                                        : floating::max_num(x, *operands[1].floating, &raised);
+            if (!floating_environment_permits(raised, &result, expression.location)) co_return std::nullopt;
+            co_return EvalValue{result, builtin_type(operands.front().type->builtin)};
+        }
         if (atomic_builtin(name) == AtomicBuiltin::IsLockFree) {
             if (!(co_await validate_unevaluated_constraints_async(expression))) co_return std::nullopt;
             const auto type = atomic_query_type(expression,
@@ -15023,7 +15099,15 @@ EvaluationTask<bool> fold_pointer_integer_initializer_async(std::unique_ptr<Expr
             co_return false;
         const auto pointer = co_await evaluator.required_absolute_pointer_async(*expression);
         if (!pointer) {
-            if (evaluator.resource_exhausted()) evaluator.diagnose(expression->location);
+            // An integer converted to a pointer is never relocatable.
+            const Expr* source = expression.get();
+            while (source->left && (source->kind == Expr::Kind::Parenthesized ||
+                   (source->kind == Expr::Kind::Cast && source->type &&
+                    source->type->kind == Type::Kind::Pointer)))
+                source = source->left.get();
+            if (evaluator.resource_exhausted() ||
+                (source != expression.get() && evaluator.integer_expression(*source)))
+                evaluator.diagnose(expression->location);
             co_return false;
         }
         auto replacement = std::make_unique<Expr>();

@@ -1188,6 +1188,39 @@ private:
             case mir::IntrinsicOperation::MachineNop:
                 out_ << "  call void asm sideeffect \"nop\", \"\"()\n";
                 break;
+            case mir::IntrinsicOperation::Sqrt:
+            case mir::IntrinsicOperation::Fabs:
+            case mir::IntrinsicOperation::Copysign: {
+                const auto type = ir_type(hir_, value.type);
+                out_ << "  " << result << " = call " << type << " @"
+                     << llvm_floating_intrinsic(value.intrinsic, type) << '(';
+                for (std::size_t index = 0; index < value.operands.size(); ++index) {
+                    out_ << (index ? ", " : "") << type << ' '
+                         << reference(value.operands[index]);
+                }
+                out_ << ")\n";
+                break;
+            }
+            case mir::IntrinsicOperation::Fmin:
+            case mir::IntrinsicOperation::Fmax: {
+                // A NaN left operand yields the right one; equal operands
+                // yield the left one.
+                const auto type = ir_type(hir_, value.type);
+                const auto left = reference(value.operands[0]);
+                const auto right = reference(value.operands[1]);
+                const bool minimum = value.intrinsic == mir::IntrinsicOperation::Fmin;
+                out_ << "  " << result << ".nan = fcmp uno " << type << ' '
+                     << left << ", " << left << '\n'
+                     << "  " << result << ".right = fcmp olt " << type << ' '
+                     << (minimum ? right + ", " + left : left + ", " + right) << '\n'
+                     << "  " << result << ".number = select i1 " << result
+                     << ".right, " << type << ' ' << right << ", " << type << ' '
+                     << left << '\n'
+                     << "  " << result << " = select i1 " << result << ".nan, "
+                     << type << ' ' << right << ", " << type << ' ' << result
+                     << ".number\n";
+                break;
+            }
             }
             return;
         }

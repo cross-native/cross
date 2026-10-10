@@ -608,6 +608,7 @@ TargetInfo make_target(ByteOrder order,
         {{"eabi32", 32}},
         target_hazard_events(),
         NakedLowering::Constrained,
+        {{"$::sqrt", "$::_sqrt"}},
     };
 }
 

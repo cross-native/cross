@@ -2669,6 +2669,122 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.mips;backend.native;feature.semantics;feature.optimization;opt.${level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
+    # Subscript indices narrower and wider than an address.
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_subscripts_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-subscripts-${level}
+                -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_subscripts_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.semantics;feature.array;feature.evaluation;opt.${level}")
+        add_test(NAME cross_runtime_subscripts_mips_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-subscripts-mips-${level}
+                -DEXPECTED=P -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_subscripts_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.semantics;feature.array;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(endian big little)
+            add_test(NAME cross_runtime_subscripts_n64_${endian}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_n64_entry_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-subscripts-n64-${endian}-${level}
+                    -DN64_ENDIAN=${endian} -DEXTRA_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_runtime_subscripts_n64_${endian}_${level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.semantics;feature.array;endian.${endian};opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    # Floating intrinsics at run time, in evaluation, and through LLVM IR.
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_floating_intrinsics_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-intrinsics-${level}
+                -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_floating_intrinsics_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;feature.intrinsics;feature.evaluation;opt.${level}")
+        add_test(NAME cross_runtime_floating_intrinsics_avx_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-intrinsics-avx-${level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${level};-mavx"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_floating_intrinsics_avx_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;feature.intrinsics;isa.avx;opt.${level}")
+        add_test(NAME cross_runtime_floating_intrinsics_llvm_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DCC_FLAGS=-${level}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-intrinsics-${level}.ll
+                -DENTRY=test_entry -DEXPECTED=0
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+        set_tests_properties(cross_runtime_floating_intrinsics_llvm_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.llvm;feature.floating;feature.intrinsics;opt.${level}")
+        add_test(NAME cross_runtime_floating_intrinsics_mips_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-intrinsics-mips-${level}
+                -DEXPECTED=P -DCC_FLAGS=-${level} "-DMIPS_CPUS=vr4300;r3000;r6000"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_floating_intrinsics_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.floating;feature.intrinsics;isa.vr4300;isa.r3000;isa.r6000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(endian big little)
+            add_test(NAME cross_runtime_floating_intrinsics_n64_${endian}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_n64_entry_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-intrinsics-n64-${endian}-${level}
+                    -DN64_ENDIAN=${endian} -DEXTRA_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_runtime_floating_intrinsics_n64_${endian}_${level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.floating;feature.intrinsics;endian.${endian};opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    # The x87 f80 and binary128 forms.
+    foreach(level O1 O2)
+        add_test(NAME cross_runtime_floating_intrinsics_x87_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics_x86.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-intrinsics-x87-${level}
+                -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_floating_intrinsics_x87_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;feature.intrinsics;feature.evaluation;opt.${level}")
+    endforeach()
+    add_test(NAME cross_floating_intrinsic_errors
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics_errors.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-intrinsic-errors
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics_errors.cmake")
+    set_tests_properties(cross_floating_intrinsic_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.floating;feature.intrinsics")
     if(CROSS_ENABLE_GCC_GIMPLE_TEXT AND CROSS_TEST_GCC)
         add_test(NAME cross_gcc_gimple_wrapv
             COMMAND "${CMAKE_COMMAND}"

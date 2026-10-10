@@ -69,6 +69,15 @@ struct Environment {
 [[nodiscard]] Value convert(Value value, Format format,
                             ExceptionSet* raised = nullptr);
 [[nodiscard]] Value negate(Value value);
+// Sign operations transfer only the sign bit, NaN payloads included.
+[[nodiscard]] Value absolute(Value value);
+[[nodiscard]] Value copy_sign(Value magnitude, Value sign);
+[[nodiscard]] bool is_nan(Value value);
+[[nodiscard]] Value square_root(Value value, ExceptionSet* raised = nullptr);
+// IEEE 754 minNum and maxNum: a NaN operand yields the other operand, and
+// operands that compare equal, such as zeros of either sign, yield the left.
+[[nodiscard]] Value min_num(Value left, Value right, ExceptionSet* raised = nullptr);
+[[nodiscard]] Value max_num(Value left, Value right, ExceptionSet* raised = nullptr);
 [[nodiscard]] Value binary(Operation operation, Value left, Value right,
                            Format result_format,
                            ExceptionSet* raised = nullptr);

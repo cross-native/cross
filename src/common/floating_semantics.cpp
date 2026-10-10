@@ -285,6 +285,28 @@ bool signaling(Value value) {
            !bit(value.bits, spec(value.format).precision - 2);
 }
 
+// The integer square root by binary digits; `inexact` reports a remainder.
+BigUnsigned integer_square_root(BigUnsigned value, bool& inexact) {
+    BigUnsigned root;
+    if (value.zero()) {
+        inexact = false;
+        return root;
+    }
+    auto digit = BigUnsigned{UInt128{1}}.shifted((value.bits() - 1) & ~1U);
+    while (!digit.zero()) {
+        auto trial = root;
+        trial.add(digit);
+        root = root.right_shifted(1);
+        if (value.compare(trial) >= 0) {
+            value.subtract(trial);
+            root.add(digit);
+        }
+        digit = digit.right_shifted(2);
+    }
+    inexact = !value.zero();
+    return root;
+}
+
 bool magnitude_less(const Number& a, const Number& b) {
     const auto scale = std::min(a.scale, b.scale);
     return a.significand.shifted(static_cast<unsigned>(a.scale - scale)).compare(
@@ -365,6 +387,57 @@ Value negate(Value value) {
     const auto sign = spec(value.format).sign_bit();
     value.bits = bit_xor(value.bits, shift_left(UInt128{1}, sign));
     return value;
+}
+
+Value absolute(Value value) {
+    value.bits = bit_and(value.bits,
+                         bit_not(shift_left(UInt128{1}, spec(value.format).sign_bit())));
+    return value;
+}
+
+Value copy_sign(Value magnitude, Value sign) {
+    const auto sign_bit = spec(magnitude.format).sign_bit();
+    magnitude = absolute(magnitude);
+    if (bit(sign.bits, spec(sign.format).sign_bit()))
+        magnitude.bits = bit_or(magnitude.bits, shift_left(UInt128{1}, sign_bit));
+    return magnitude;
+}
+
+bool is_nan(Value value) {
+    return decode(value).kind == Class::NaN;
+}
+
+Value square_root(Value value, ExceptionSet* raised) {
+    if (denormal(value)) raise(raised, Exception::DenormalOperand);
+    if (signaling(value)) raise(raised, Exception::Invalid);
+    const auto number = decode(value);
+    if (number.kind == Class::NaN) return nan(value.format);
+    if (number.kind == Class::Zero) return value;
+    if (number.negative) {
+        raise(raised, Exception::Invalid);
+        return nan(value.format);
+    }
+    if (number.kind == Class::Infinity) return value;
+    // An integer root of at least precision + 2 bits leaves the rounding
+    // position above its last bit, so a remainder only decides between the
+    // two neighbors as half a unit of that last bit would.
+    auto significand = number.significand;
+    auto scale = number.scale;
+    if (scale % 2 != 0) {
+        significand = significand.shifted(1);
+        --scale;
+    }
+    const auto wanted = 2 * (spec(value.format).precision + 2);
+    if (significand.bits() < wanted) {
+        const auto shift = (wanted - significand.bits() + 1) & ~1U;
+        significand = significand.shifted(shift);
+        scale -= static_cast<int>(shift);
+    }
+    bool inexact{};
+    auto numerator = integer_square_root(std::move(significand), inexact).shifted(1);
+    if (inexact) numerator.add_small(1);
+    return round_rational(value.format, false, std::move(numerator),
+                          BigUnsigned{UInt128{2}}, scale / 2, raised);
 }
 
 Value binary(Operation operation, Value left, Value right, Format format,
@@ -460,6 +533,20 @@ bool compare(Comparison comparison, Value left, Value right,
     case Comparison::GreaterEqual: return ordering >= 0;
     }
     return false;
+}
+
+Value min_num(Value left, Value right, ExceptionSet* raised) {
+    if (signaling(left) || signaling(right)) raise(raised, Exception::Invalid);
+    if (is_nan(left)) return right;
+    if (is_nan(right)) return left;
+    return compare(Comparison::Less, right, left, raised) ? right : left;
+}
+
+Value max_num(Value left, Value right, ExceptionSet* raised) {
+    if (signaling(left) || signaling(right)) raise(raised, Exception::Invalid);
+    if (is_nan(left)) return right;
+    if (is_nan(right)) return left;
+    return compare(Comparison::Less, left, right, raised) ? right : left;
 }
 
 bool nonzero(Value value) {

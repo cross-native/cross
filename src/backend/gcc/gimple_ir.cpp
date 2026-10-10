@@ -1335,6 +1335,16 @@ private:
                     value.location,
                     "GCC GIMPLE serialization cannot preserve managed $::_nop");
                 break;
+            case mir::IntrinsicOperation::Sqrt:
+            case mir::IntrinsicOperation::Fabs:
+            case mir::IntrinsicOperation::Copysign:
+            case mir::IntrinsicOperation::Fmin:
+            case mir::IntrinsicOperation::Fmax:
+                diagnostics_.error(
+                    value.location,
+                    "the GCC GIMPLE serializer does not represent floating "
+                    "intrinsics");
+                break;
             }
             return;
         }

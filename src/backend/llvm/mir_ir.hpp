@@ -8,11 +8,23 @@
 #include "middle/mir.hpp"
 
 #include <string>
+#include <string_view>
 
 namespace cross {
 
 inline std::string llvm_label_name(hir::LabelId label) {
     return "cross.label." + std::to_string(label.value);
+}
+
+// The LLVM intrinsic of a Cross square root, absolute value, or sign
+// transfer on the LLVM floating type `type`, such as `llvm.sqrt.f64`.
+inline std::string llvm_floating_intrinsic(mir::IntrinsicOperation operation,
+                                           std::string_view type) {
+    const std::string_view suffix = type == "float" ? "f32"
+        : type == "double" ? "f64" : type == "x86_fp80" ? "f80" : "f128";
+    const std::string_view name = operation == mir::IntrinsicOperation::Sqrt ? "sqrt"
+        : operation == mir::IntrinsicOperation::Fabs ? "fabs" : "copysign";
+    return "llvm." + std::string(name) + "." + std::string(suffix);
 }
 
 struct TargetInfo;

@@ -778,6 +778,19 @@ private:
         }
     }
 
+    // A double's sign word reaches a GPR through the carrier cell where there
+    // is neither a 64-bit GPR nor MFHC1 and FPXX code cannot name the odd
+    // half of a register pair: MIPS II and MIPS32 Release 1.
+    bool sign_word_in_memory(const mir::ManagedValue& value) const {
+        return value.kind == mir::ValueKind::Intrinsic &&
+               (value.intrinsic == mir::IntrinsicOperation::Fabs ||
+                value.intrinsic == mir::IntrinsicOperation::Copysign) &&
+               type_bits(hir_, value.type) == 64 &&
+               subtarget_.has_feature(Feature::Mips2) &&
+               !subtarget_.has_feature(Feature::Mips3) &&
+               !subtarget_.has_feature(Feature::Mips32r2);
+    }
+
     bool unaligned_pointer_access(const mir::ManagedValue& value) const {
         if ((value.kind != mir::ValueKind::PointerLoad &&
              value.kind != mir::ValueKind::PointerStore) ||
@@ -921,7 +934,8 @@ private:
                 current_.virtual_register_classes.end() ||
             std::any_of(source.values.begin(), source.values.end(),
                         [this](const mir::ManagedValue& value) {
-                            return unaligned_pointer_access(value);
+                            return unaligned_pointer_access(value) ||
+                                   sign_word_in_memory(value);
                         })) {
             machine::StackSlot carrier;
             carrier.id = {
@@ -1490,6 +1504,61 @@ private:
             (value.kind == ValueKind::Intrinsic &&
              value.intrinsic == mir::IntrinsicOperation::MachineNop)) {
             return lower_machine_instruction(value);
+        }
+        if (value.kind == ValueKind::Intrinsic &&
+            value.intrinsic == mir::IntrinsicOperation::Sqrt) {
+            // The registry's SQRT.fmt form of the operand's width.
+            const auto& target = subtarget_.target();
+            const auto bits = type_bits(hir_, value.type);
+            const auto entry = std::find_if(
+                target.intrinsic_forms.begin(), target.intrinsic_forms.end(),
+                [](const IntrinsicFormEntry& candidate) {
+                    return candidate.intrinsic == "$::sqrt";
+                });
+            std::optional<InstructionFeatureConflict> conflict;
+            for (const auto* form : find_instruction_forms(
+                     target, entry->instruction)) {
+                if (form->operands.front().value_bits != bits) continue;
+                conflict = instruction_feature_conflict(
+                    *form, [&](std::string_view feature) {
+                        return subtarget_.supports_registry_feature(feature);
+                    });
+                if (conflict) continue;
+                auto form_value = value;
+                form_value.kind = ValueKind::MachineInstruction;
+                form_value.instruction_form =
+                    instruction_form_id(subtarget_.target(), *form);
+                return lower_machine_instruction(form_value);
+            }
+            diagnostics_.error(
+                value.location,
+                "$::sqrt " +
+                    (conflict ? (conflict->forbidden
+                                     ? "is unavailable with feature '"
+                                     : "requires feature '") +
+                                    std::string(conflict->feature) + "'"
+                              : std::string("has no MIPS form for this type")) +
+                    " on the selected MIPS CPU");
+            auto result = target_instruction(Opcode::Invalid, value.location);
+            result.defs.push_back(reg(value.id));
+            return result;
+        }
+        if (value.kind == ValueKind::Intrinsic &&
+            mir::floating_intrinsic_operation(value.intrinsic)) {
+            auto result = target_instruction(
+                value.intrinsic == mir::IntrinsicOperation::Fabs ? Opcode::Fabs
+                : value.intrinsic == mir::IntrinsicOperation::Copysign
+                    ? Opcode::Fcopysign
+                : value.intrinsic == mir::IntrinsicOperation::Fmin
+                    ? Opcode::Fmin : Opcode::Fmax,
+                value.location);
+            for (const auto operand : value.operands) {
+                const auto source = reg(operand);
+                result.operands.push_back(register_operand(source));
+                result.uses.push_back(source);
+            }
+            result.defs.push_back(reg(value.id));
+            return result;
         }
         if (value.kind == ValueKind::Intrinsic) {
             auto result = target_instruction(
@@ -11090,6 +11159,119 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                                      reg_name(source_gpr) + ",1");
         }
         commit_gpr(function, target, destination, value.location);
+        return;
+    }
+    if (opcode == Opcode::Fmin || opcode == Opcode::Fmax) {
+        // A NaN left operand selects the right one; otherwise the right one
+        // is selected only when it orders strictly beyond the left one. The
+        // quiet comparisons do not signal on a quiet NaN, and MOV.fmt copies
+        // the selected bits unchanged.
+        const auto x = value.uses.front();
+        const auto target = value.defs.front();
+        const std::string suffix = x.mode.bits == 32 ? ".s" : ".d";
+        const auto left = input_fpr(function, x, "f0", value.location);
+        const auto right =
+            input_fpr(function, value.uses[1], "f2", value.location);
+        const auto destination = output_fpr(function, target, "f4");
+        const auto take_right = local_label(function);
+        const auto take_left = local_label(function);
+        const auto done = local_label(function);
+        instruction("c.un" + suffix, reg_name(left) + "," + reg_name(left));
+        instruction("bc1t", take_right);
+        instruction("nop");
+        instruction("c.olt" + suffix,
+                    opcode == Opcode::Fmin
+                        ? reg_name(right) + "," + reg_name(left)
+                        : reg_name(left) + "," + reg_name(right));
+        instruction("bc1f", take_left);
+        instruction("nop");
+        output_ << take_right << ":\n";
+        if (destination != right) {
+            instruction("mov" + suffix,
+                        reg_name(destination) + "," + reg_name(right));
+        }
+        instruction("b", done);
+        instruction("nop");
+        output_ << take_left << ":\n";
+        if (destination != left) {
+            instruction("mov" + suffix,
+                        reg_name(destination) + "," + reg_name(left));
+        }
+        output_ << done << ":\n";
+        commit_fpr(function, target, destination, value.location);
+        return;
+    }
+    if (opcode == Opcode::Fabs || opcode == Opcode::Fcopysign) {
+        // ABS.fmt and NEG.fmt are arithmetic on these FPUs, so a NaN operand
+        // would signal and become the default NaN. Move only the sign bit
+        // through t0/t1 instead: the word of a single, the doubleword of a
+        // double with 64-bit GPRs, or otherwise the double's high word, read
+        // with MFHC1 on MIPS32 Release 2, from the odd register of an FP32
+        // pair on MIPS I, and through the carrier cell where FPXX code cannot
+        // name that register.
+        const auto x = value.uses.front();
+        const auto target = value.defs.front();
+        const bool single = x.mode.bits == 32;
+        const bool doubleword = !single && subtarget_.has_feature(Feature::Mips3);
+        const bool high_word = !single && !doubleword;
+        const bool high_half_moves = subtarget_.has_feature(Feature::Mips32r2);
+        const bool through_memory = high_word && !high_half_moves &&
+            subtarget_.has_feature(Feature::Mips2);
+        const auto carrier = through_memory
+            ? aggregate_carrier_offset(function, value.location) : 0;
+        const auto high_offset = carrier +
+            (subtarget_.target().data_layout.byte_order == ByteOrder::Big ? 0 : 4);
+        const auto source = input_fpr(function, x, "f0", value.location);
+        const auto sign = opcode == Opcode::Fcopysign
+            ? input_fpr(function, value.uses[1], "f2", value.location)
+            : std::string_view{};
+        const auto destination = output_fpr(function, target, "f4");
+        const auto odd = [](std::string_view even) {
+            unsigned number{};
+            std::from_chars(even.data() + 1, even.data() + even.size(), number);
+            return "$f" + std::to_string(number + 1);
+        };
+        const auto read_high = [&](std::string_view gpr, std::string_view fpr) {
+            if (through_memory) {
+                instruction("sdc1", reg_name(fpr) + "," + memory(carrier));
+                instruction("lw", reg_name(gpr) + "," + memory(high_offset));
+            } else if (high_half_moves) {
+                instruction("mfhc1", reg_name(gpr) + "," + reg_name(fpr));
+            } else {
+                instruction("mfc1", reg_name(gpr) + "," + odd(fpr));
+            }
+        };
+        // The source is read last, so the carrier still holds it.
+        if (high_word) {
+            if (!sign.empty()) read_high("t1", sign);
+            read_high("t0", source);
+        } else {
+            if (!sign.empty())
+                move_fpr_to_gpr(sign, "t1", doubleword ? 64U : 32U);
+            move_fpr_to_gpr(source, "t0", doubleword ? 64U : 32U);
+        }
+        instruction(doubleword ? "dsll" : "sll", "$t0,$t0,1");
+        instruction(doubleword ? "dsrl" : "srl", "$t0,$t0,1");
+        if (!sign.empty()) {
+            instruction(doubleword ? "dsrl32" : "srl", "$t1,$t1,31");
+            instruction(doubleword ? "dsll32" : "sll", "$t1,$t1,31");
+            instruction("or", "$t0,$t0,$t1");
+        }
+        if (through_memory) {
+            instruction("sw", "$t0," + memory(high_offset));
+            instruction("ldc1", reg_name(destination) + "," + memory(carrier));
+        } else if (high_word) {
+            if (destination != source) {
+                instruction("mov.d", reg_name(destination) + "," +
+                                         reg_name(source));
+            }
+            instruction(high_half_moves ? "mthc1" : "mtc1",
+                        "$t0," + (high_half_moves ? reg_name(destination)
+                                                  : odd(destination)));
+        } else {
+            move_gpr_to_fpr("t0", destination, doubleword ? 64U : 32U);
+        }
+        commit_fpr(function, target, destination, value.location);
         return;
     }
     if (opcode == Opcode::Fneg || opcode == Opcode::Fiszero) {

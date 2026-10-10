@@ -60,6 +60,12 @@ A `label` is a code address with the size and alignment of a pointer.
 `(uptr)` converts it to that address; in a static initializer the conversion is
 a relocation against the label, like `(uptr)&function`.
 
+A pointer converts only to an integer at least as wide as `uptr`. An integer
+narrower than an address converts to an object pointer by its signedness, so
+`(u8 *)(i8)-1` is the last address. A constant wider than an address must be
+an address in range, `0` through the largest address; otherwise the conversion
+is an error. At run time a wider integer keeps its low address bits.
+
 ## x86-64
 
 | Triple | Format | Default ABI |
@@ -106,6 +112,13 @@ denormals are kept (FTZ and DAZ clear). Code that unmasks exceptions or sets
 FTZ needs a profile that declares it ([models.md](models.md#profiles)). The
 `f32` and `f64` relational operators compile to `ucomiss` and `ucomisd`, which
 raise the invalid-operation exception only for a signaling NaN.
+
+The floating intrinsics use SSE for `f32` and `f64` and the x87 unit for
+`f80`; `$::fmin` and `$::fmax` are `minss`/`maxss` (`minsd`/`maxsd`) with an
+ordered compare that substitutes the second operand for a NaN first one. On
+`f128`, `$::fabs` and `$::copysign` change the sign bit, and `$::sqrt`,
+`$::fmin`, and `$::fmax` are errors. The `f80` forms round as the x87
+precision control selects, which must be the 64-bit significand.
 
 A `[[musttail]]` call cannot target a variadic function or leave a function
 that binds variadic state, and passes every argument in a register. With
@@ -220,6 +233,12 @@ call a software floating-point library.
 
 `$::trap()`, like a failed `-fbounds-trap` check, executes `break 7`.
 
+`$::sqrt` executes `sqrt.s` or `sqrt.d`, which MIPS I lacks: there it is an
+error and `$::has_intrinsic($::sqrt)` is 0. `$::fabs` and `$::copysign` change
+the sign bit in general registers rather than with `abs.fmt` or `neg.fmt`, so
+they keep a NaN operand's payload and raise no exception. `$::fmin` and
+`$::fmax` branch on quiet comparisons and copy the selected operand.
+
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 hard-float `f32` and `f64`, structures and unions by value under every ABI,
 function pointers, variable-length arrays, computed goto, `$::patch` values,
@@ -312,7 +331,6 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 
 ## Limits on all targets
 
-- Specified but not implemented yet: the floating intrinsics.
 - `-fbounds-trap` checks only subscripts of arrays with a known bound; it
   does not check subscripts of pointers or `out` and `inout` channels.
 - `-g` describes inlined code with the lines of the function it came from,
@@ -333,7 +351,7 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 - `-emit-gimple` rejects what GCC's `__GIMPLE` input cannot express or the
   serializer does not encode, among them aggregate static initializers,
   variadic functions and calls through a variadic function pointer, label
-  addresses, `$::patch` values, and `[[musttail]]` calls.
+  addresses, `$::patch` values, floating intrinsics, and `[[musttail]]` calls.
 - `-emit-llvm` and `-emit-gimple` output ignores the profile's floating
   environment: it is valid only where no exception traps and denormal results
   are kept.

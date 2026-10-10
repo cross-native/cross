@@ -254,6 +254,26 @@ Statements are C99's. The differences in expressions:
   see [Function pointers](#function-pointers) for their casts.
 - `$::assume(condition)` and `$::unreachable()` state facts the optimizer may
   use; neither adds a check.
+- `$::sqrt`, `$::fabs`, `$::copysign`, `$::fmin`, and `$::fmax` take operands
+  of one floating type and return that type: the correctly rounded square
+  root, the absolute value and sign transfer, which change only the sign bit,
+  and IEEE minNum and maxNum, where a NaN operand yields the other operand and
+  equal operands, such as `0.0` and `-0.0`, yield the first. They evaluate at
+  translation time like operators; a target without an inline form reports
+  an error, and `$::has_intrinsic` tells whether it has one.
+
+```x
+f64 distance(in f64 x, in f64 y) {
+    return $::sqrt(x * x + y * y);
+}
+
+f32 clamp(in f32 value, in f32 low, in f32 high) {
+    return $::fmin($::fmax(value, low), high);   // a NaN value yields low
+}
+
+$::static_assert($::sqrt(2.25) == 1.5, "evaluated at translation time");
+$::static_assert($::copysign(3.0, -0.0) == -3.0, "the sign of -0.0");
+```
 
 ## Namespaces
 

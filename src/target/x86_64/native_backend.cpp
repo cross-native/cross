@@ -1891,6 +1891,46 @@ private:
             instruction.has_side_effects = true;
             return instruction;
         }
+        if (value.kind == ValueKind::Intrinsic &&
+            mir::floating_intrinsic_operation(value.intrinsic)) {
+            using mir::IntrinsicOperation;
+            const auto operation = value.intrinsic;
+            auto instruction = target_instruction(
+                operation == IntrinsicOperation::Sqrt ? Opcode::Fsqrt
+                : operation == IntrinsicOperation::Fabs ? Opcode::Fabs
+                : operation == IntrinsicOperation::Copysign ? Opcode::Fcopysign
+                : operation == IntrinsicOperation::Fmin ? Opcode::Fmin
+                                                        : Opcode::Fmax,
+                value.location);
+            for (const auto operand : value.operands) {
+                const auto source = reg(operand);
+                instruction.operands.push_back(register_operand(source));
+                instruction.uses.push_back(source);
+            }
+            const auto target = reg(value.id);
+            instruction.defs.push_back(target);
+            if (target.mode.bits == 128 &&
+                operation != IntrinsicOperation::Fabs &&
+                operation != IntrinsicOperation::Copysign) {
+                diagnostics_.error(
+                    value.location,
+                    std::string(operation == IntrinsicOperation::Sqrt ? "$::sqrt"
+                                : operation == IntrinsicOperation::Fmin ? "$::fmin"
+                                                                        : "$::fmax") +
+                        " has no inline x86-64 form for f128");
+            }
+            // Scalar forms build masks in RAX and compute in XMM0-XMM2;
+            // binary128 sign operations use RAX, RCX, and RDX.
+            if (target.mode.bits <= 64) {
+                append_fixed_clobber(instruction, "rax", machine::i64);
+                for (const auto name : {"xmm0", "xmm1", "xmm2"})
+                    append_fixed_clobber(instruction, name, machine::i128);
+            } else if (target.mode.bits == 128) {
+                for (const auto name : {"rax", "rcx", "rdx"})
+                    append_fixed_clobber(instruction, name, machine::i64);
+            }
+            return instruction;
+        }
         if (value.kind == ValueKind::Intrinsic) {
             auto instruction = target_instruction(
                 value.intrinsic == mir::IntrinsicOperation::Expect
@@ -16194,6 +16234,136 @@ private:
         store(function, target, destination);
     }
 
+    // $::sqrt, $::fabs, $::copysign, $::fmin, and $::fmax. Scalar forms keep
+    // their operands in place and compute in XMM0-XMM2; f80 forms use the x87
+    // stack; binary128 sign operations work on RAX:RDX with RCX.
+    void emit_float_intrinsic(const machine::Function& function,
+                              const machine::Instruction& value) {
+        const auto opcode = value.opcode;
+        const auto x = value.uses.front();
+        const auto target = value.defs.front();
+        if (x.mode.bits == 128) {
+            if (opcode == Opcode::Fcopysign) {
+                load(function, value.uses[1], "rax", "rcx");
+                instruction("shrq", "$63, %rcx");
+                instruction("shlq", "$63, %rcx");
+            }
+            load(function, x, "rax", "rdx");
+            instruction("btrq", "$63, %rdx");
+            if (opcode == Opcode::Fcopysign) instruction("orq", "%rcx, %rdx");
+            store(function, target, "rax", "rdx");
+            return;
+        }
+        if (x.mode.bits == 80) {
+            if (opcode == Opcode::Fmin || opcode == Opcode::Fmax) {
+                // st(0) = isnan(x) ? y : x, then the ordered comparison with
+                // y keeps that left operand unless y is strictly beyond it.
+                load_x87(function, value.uses[1]);
+                load_x87(function, x);
+                instruction("fucomi", "%st(0), %st");
+                instruction("fcmovu", "%st(1), %st");
+                if (opcode == Opcode::Fmin) {
+                    instruction("fucomi", "%st(1), %st");
+                    instruction("fcmovnbe", "%st(1), %st");
+                } else {
+                    instruction("fxch", "%st(1)");
+                    instruction("fucomi", "%st(1), %st");
+                    instruction("fcmovbe", "%st(1), %st");
+                }
+                instruction("fstp", "%st(1)");
+                store_x87(function, target);
+                return;
+            }
+            load_x87(function, x);
+            instruction(opcode == Opcode::Fsqrt ? "fsqrt" : "fabs");
+            if (opcode == Opcode::Fcopysign) {
+                const auto positive = private_label(function, "copysign");
+                instruction("testb", "$128, " +
+                    memory(vreg_offset(function, value.uses[1]) + 9));
+                instruction("je", positive);
+                instruction("fchs");
+                output_ << positive << ":\n";
+            }
+            store_x87(function, target);
+            return;
+        }
+        const bool single = x.mode.bits == 32;
+        const bool avx = subtarget_.has_feature(Feature::Avx);
+        const auto scalar = float_suffix(x);
+        const std::string packed = single ? "ps" : "pd";
+        const auto operand = [&](machine::Register source,
+                                 std::string_view scratch) {
+            if (const auto* assigned = assigned_simd_register(function, source))
+                return "%" + std::string(assigned->name);
+            load_float(function, source, scratch);
+            return "%" + std::string(scratch);
+        };
+        // destination = first OP second, as the three-operand AVX forms.
+        const auto binary = [&](const std::string& mnemonic,
+                                const std::string& second,
+                                const std::string& first,
+                                const std::string& destination) {
+            if (avx) {
+                instruction("v" + mnemonic,
+                            second + ", " + first + ", " + destination);
+                return;
+            }
+            if (first != destination) {
+                instruction("movaps", first + ", " + destination);
+            }
+            instruction(mnemonic, second + ", " + destination);
+        };
+        const auto load_mask = [&](bool sign) {
+            if (single) {
+                instruction("movl", sign ? "$2147483648, %eax" : "$2147483647, %eax");
+                instruction("movd", "%eax, %xmm1");
+            } else {
+                instruction("movabsq", sign ? "$-9223372036854775808, %rax"
+                                            : "$9223372036854775807, %rax");
+                instruction("movq", "%rax, %xmm1");
+            }
+        };
+        if (opcode == Opcode::Fsqrt) {
+            const auto source = operand(x, "xmm0");
+            const auto* assigned = assigned_simd_register(function, target);
+            const auto destination = assigned ? std::string(assigned->name)
+                                              : std::string("xmm1");
+            if (avx) {
+                instruction("vsqrt" + scalar,
+                            source + ", " + source + ", %" + destination);
+            } else {
+                instruction("sqrt" + scalar, source + ", %" + destination);
+            }
+            store_float(function, target, destination);
+            return;
+        }
+        if (opcode == Opcode::Fabs) {
+            load_mask(false);
+            binary("and" + packed, "%xmm1", operand(x, "xmm0"), "%xmm2");
+            store_float(function, target, "xmm2");
+            return;
+        }
+        if (opcode == Opcode::Fcopysign) {
+            load_mask(true);
+            binary("and" + packed, "%xmm1", operand(value.uses[1], "xmm2"), "%xmm2");
+            binary("andn" + packed, operand(x, "xmm0"), "%xmm1", "%xmm1");
+            binary("or" + packed, "%xmm2", "%xmm1", "%xmm1");
+            store_float(function, target, "xmm1");
+            return;
+        }
+        // minNum/maxNum: MINSS/MAXSS of (y, x) returns x for unordered or
+        // equal operands; an ordered mask of x then substitutes y for NaN x.
+        const auto y = value.uses[1];
+        const auto left = operand(x, "xmm0");
+        binary((opcode == Opcode::Fmin ? "min" : "max") + scalar, left,
+               operand(y, "xmm1"), "%xmm1");
+        binary("cmpord" + scalar, left, left, "%xmm2");
+        binary("and" + packed, "%xmm2", "%xmm1", "%xmm1");
+        binary("andn" + packed, operand(y, "xmm0"), "%xmm2", "%xmm2");
+        binary("or" + packed, "%xmm2", "%xmm1", "%xmm1");
+        store_float(function, target, "xmm1");
+    }
+
     void emit_float_extend_to_f128(const machine::Function& function,
                                    const machine::Instruction& value) {
         const auto source = value.uses.front();
@@ -23726,6 +23896,12 @@ private:
                    value.opcode == Opcode::Not ||
                    value.opcode == Opcode::Iszero) {
             emit_unary(function, value);
+        } else if (value.opcode == Opcode::Fsqrt ||
+                   value.opcode == Opcode::Fabs ||
+                   value.opcode == Opcode::Fcopysign ||
+                   value.opcode == Opcode::Fmin ||
+                   value.opcode == Opcode::Fmax) {
+            emit_float_intrinsic(function, value);
         } else if (value.opcode == Opcode::Fneg ||
                    value.opcode == Opcode::Fiszero) {
             emit_float_unary(function, value);

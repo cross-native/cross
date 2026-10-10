@@ -860,7 +860,8 @@ the function ABI. Impossible register allocation is diagnosed.
 
 `&lvalue` produces a pointer to the designated object or function; `*pointer`
 designates its target. Object-pointer addition/subtraction scales by the
-complete pointed-to type. Within one array object, pointers may range from its
+complete pointed-to type; the integer of a subscript or pointer offset
+converts to `iptr` before scaling. Within one array object, pointers may range from its
 first element through one past its last element. The one-past pointer may be
 formed, compared, and subtracted but not dereferenced. Subtracting two pointers
 requires positions in the same array and yields `iptr`; relational pointer
@@ -3584,7 +3585,7 @@ Required intrinsics are:
 | `$::trap()` | When available, emit a documented inline abnormal transfer; preserve prior sequenced effects; never return normally. |
 | `$::alignof(type-or-expression)` | Unevaluated compile-time `uptr` alignment query. |
 | `$::offsetof(type, designator)` | Unevaluated compile-time `uptr` offset of a member designator (a member name followed by `.member` and `[constant]` steps) within a complete record type. |
-| `$::sqrt(x)`, `$::fabs(x)`, `$::copysign(x, y)`, `$::fmin(x, y)`, `$::fmax(x, y)` | Floating operations on one floating type: correctly rounded square root, absolute value, sign transfer, and IEEE 754 `minNum`/`maxNum`; each lowers to one instruction or a finite inline sequence, or is diagnosed. |
+| `$::sqrt(x)`, `$::fabs(x)`, `$::copysign(x, y)`, `$::fmin(x, y)`, `$::fmax(x, y)` | Floating operations whose operands have one floating type, the result type: correctly rounded square root, absolute value, sign transfer, and IEEE 754 `minNum`/`maxNum`, where a NaN operand yields the other operand and operands that compare equal, such as zeros of opposite sign, yield the first; each lowers to one instruction or a finite inline sequence, or is diagnosed. |
 | `$::static_assert(constant, string)` | Compile-time declaration requiring nonzero `constant`. |
 | `$::patch(initial[, site])` | Siteful runtime scalar source with the lifecycle, identity, sink, and lowering contract defined under patchable values. |
 

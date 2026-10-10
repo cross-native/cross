@@ -459,29 +459,29 @@ std::string Preprocessor::evaluate_query(
         return find_include(including, *written, quoted).empty() ? "0" : "1";
     }
     auto argument = normalized_argument(0);
-    if (name == "$::has_intrinsic") {
-        const auto* entry = find_core_expression_builtin(argument);
-        return entry && entry->kind == CoreBuiltinKind::Intrinsic ? "1" : "0";
-    }
-    if (name == "$::has_instruction") {
-        if (!target) return "0";
-        const auto forms = find_instruction_forms(*target, argument);
+    const auto instruction_available = [&](std::string_view instruction) {
+        const auto forms = find_instruction_forms(*target, instruction);
         return std::any_of(forms.begin(), forms.end(), [&](const auto* form) {
             return instruction_enabled(*form);
-        }) ? "1" : "0";
+        });
+    };
+    // A core entry the target lowers through a registry instruction is
+    // usable only where a form of that instruction is.
+    const auto* core = find_core_expression_builtin(argument);
+    const bool core_usable = core && (!target ||
+        std::none_of(target->intrinsic_forms.begin(), target->intrinsic_forms.end(),
+            [&](const IntrinsicFormEntry& required) {
+                return required.intrinsic == argument &&
+                    !instruction_available(required.instruction);
+            }));
+    if (name == "$::has_intrinsic") {
+        return core_usable && core->kind == CoreBuiltinKind::Intrinsic ? "1" : "0";
+    }
+    if (name == "$::has_instruction") {
+        return target && instruction_available(argument) ? "1" : "0";
     }
     if (name == "$::has_builtin") {
-        return find_core_expression_builtin(argument) ||
-                       ([&] {
-                            if (!target) return false;
-                            const auto forms =
-                                find_instruction_forms(*target, argument);
-                            return std::any_of(
-                                forms.begin(), forms.end(),
-                                [&](const auto* form) {
-                                    return instruction_enabled(*form);
-                                });
-                       }()) ? "1" : "0";
+        return core_usable || (target && instruction_available(argument)) ? "1" : "0";
     }
     if (name == "$::has_attribute") {
         return is_known_attribute(argument) ? "1" : "0";

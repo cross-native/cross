@@ -516,6 +516,13 @@ bool eligible_expression(const Expr& expression) {
             expression.left->text == "$::trap") {
             return true;
         }
+        if (floating_intrinsic(expression) != FloatingIntrinsic::None) {
+            return std::all_of(expression.arguments.begin(),
+                               expression.arguments.end(),
+                               [](const auto& argument) {
+                                   return eligible_expression(*argument);
+                               });
+        }
         if (atomic_intrinsic(expression.left->text)) {
             return std::all_of(expression.arguments.begin(),
                                expression.arguments.end(),
@@ -1574,8 +1581,17 @@ private:
         return value;
     }
 
+    // An address index has address width: a narrower index extends by its
+    // signedness and a wider one keeps its low bits, as in pointer arithmetic.
+    ValueId address_index(ValueId index, SourceLocation location) {
+        if (type_bits(hir_, current_.values[index.value].type) == hir_.address_bits)
+            return index;
+        return cast(index, *hir_.builtin(BuiltinType::Iptr), location);
+    }
+
     ValueId indexed_address(ValueId base, ValueId index,
                             hir::TypeId pointee, SourceLocation location) {
+        index = address_index(index, location);
         const auto value = add_value(ValueKind::IndexedAddress,
                                      hir_.pointer_to(pointee), location);
         current_.values[value.value].operands = {base, index};
@@ -2236,6 +2252,7 @@ private:
                 MemoryOrder::SeqCst, location, MemoryOrder::SeqCst,
                 is_volatile);
         }
+        index = address_index(index, location);
         const auto value = add_effectful(ValueKind::IndexedLoad, *pointer.pointee,
                                          location);
         auto& load = current_.values[value.value];
@@ -3237,6 +3254,11 @@ private:
                            ? infer_type(*expression.arguments.front())
                            : std::nullopt;
             }
+            if (floating_intrinsic(expression) != FloatingIntrinsic::None) {
+                if (expression.arguments.empty()) return std::nullopt;
+                const auto type = infer_type(*expression.arguments.front());
+                return type ? std::optional(hir_.unqualified(*type)) : std::nullopt;
+            }
             if (expression.left->text == "$::assume" ||
                 expression.left->text == "$::unreachable" ||
                 expression.left->text == "$::trap") {
@@ -3794,11 +3816,31 @@ private:
                          type_bits(hir_, destination_type) <
                              hir_.address_bits) ||
                         (destination_pointer &&
+                         hir_.type(destination_type).pointee &&
+                         hir_.type(*hir_.type(destination_type).pointee).kind ==
+                             hir::Type::Kind::Function &&
                          type_bits(hir_, source_type) < hir_.address_bits))) {
                 diagnostics_.error(
                     expression.location,
                     "pointer casts require an integer at least as wide as the target address");
                 break;
+            }
+            if (destination_pointer && !source_pointer) {
+                // An integer becomes an object address like an index: a
+                // narrower one extends by its signedness. A wider constant
+                // must fit.
+                const auto& value = current_.values[source->value];
+                const auto bits = type_bits(hir_, source_type);
+                if (value.kind == ValueKind::ConstantInteger &&
+                    bits > hir_.address_bits &&
+                    !fits_unsigned(mask_to(UInt128{value.integer, value.integer_high}, bits),
+                                   hir_.address_bits)) {
+                    diagnostics_.error(
+                        expression.location,
+                        "integer value is not representable as a target address");
+                    break;
+                }
+                source = address_index(*source, expression.location);
             }
             result = cast(*source, destination_type, expression.location);
             break;
@@ -5471,6 +5513,40 @@ private:
             const auto converted = mask_to(expected->value, bits);
             intrinsic.integer = converted.low;
             intrinsic.integer_high = converted.high;
+            co_return result;
+        }
+        if (const auto operation = floating_intrinsic(expression);
+            operation != FloatingIntrinsic::None) {
+            const auto& name = expression.left->text;
+            const auto type = infer_type(expression);
+            if (expression.arguments.size() != floating_intrinsic_arity(operation) ||
+                !type || !floating_type(hir_, *type)) {
+                diagnostics_.error(expression.location,
+                                   name + " requires operands of one floating type");
+                co_return std::nullopt;
+            }
+            std::vector<ValueId> operands;
+            for (const auto& argument : expression.arguments) {
+                const auto argument_type = infer_type(*argument);
+                if (!argument_type || hir_.unqualified(*argument_type) != *type) {
+                    diagnostics_.error(argument->location,
+                                       name + " requires operands of one floating type");
+                    co_return std::nullopt;
+                }
+                auto source = co_await lower_expression_async(*argument);
+                if (!source) co_return std::nullopt;
+                operands.push_back(cast(*source, *type, argument->location));
+            }
+            const auto result = add_value(ValueKind::Intrinsic, *type,
+                                          expression.location);
+            auto& intrinsic = current_.values[result.value];
+            intrinsic.intrinsic =
+                operation == FloatingIntrinsic::Sqrt ? IntrinsicOperation::Sqrt
+                : operation == FloatingIntrinsic::Fabs ? IntrinsicOperation::Fabs
+                : operation == FloatingIntrinsic::Copysign ? IntrinsicOperation::Copysign
+                : operation == FloatingIntrinsic::Fmin ? IntrinsicOperation::Fmin
+                                                        : IntrinsicOperation::Fmax;
+            intrinsic.operands = std::move(operands);
             co_return result;
         }
         if (expression.left->text == "$::assume") {
@@ -7412,7 +7488,8 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                    value.kind == ValueKind::Call ||
                                    (value.kind == ValueKind::Intrinsic &&
                                     value.intrinsic !=
-                                        IntrinsicOperation::Expect) ||
+                                        IntrinsicOperation::Expect &&
+                                    !floating_intrinsic_operation(value.intrinsic)) ||
                                    // Only an impure form joins the chain.
                                    (value.kind == ValueKind::MachineInstruction &&
                                     value.effect_input.has_value());
@@ -7655,7 +7732,10 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                         base.pointee != result.pointee ||
                         !integer_type(
                             hir_module,
-                            function.values[value.operands[1].value].type)) {
+                            function.values[value.operands[1].value].type) ||
+                        type_bits(hir_module,
+                                  function.values[value.operands[1].value].type) !=
+                            hir_module.address_bits) {
                         fail(value.location, "indexed address type mismatch");
                     }
                 }
@@ -7710,7 +7790,22 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                          "invalid dynamic stack-restore operation");
                 }
             }
-            if (value.kind == ValueKind::Intrinsic) {
+            if (value.kind == ValueKind::Intrinsic &&
+                floating_intrinsic_operation(value.intrinsic)) {
+                const auto arity = value.intrinsic == IntrinsicOperation::Sqrt ||
+                                           value.intrinsic == IntrinsicOperation::Fabs
+                                       ? 1U : 2U;
+                if (value.operands.size() != arity ||
+                    !floating_type(hir_module, value.type) ||
+                    std::any_of(value.operands.begin(), value.operands.end(),
+                                [&](ValueId operand) {
+                                    return operand.value >= function.values.size() ||
+                                           function.values[operand.value].type !=
+                                               value.type;
+                                })) {
+                    fail(value.location, "invalid floating-intrinsic MIR operation");
+                }
+            } else if (value.kind == ValueKind::Intrinsic) {
                 const bool expect =
                     value.intrinsic == IntrinsicOperation::Expect;
                 const bool machine_nop =
@@ -8081,6 +8176,7 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                         (!direct_element && !vector_element) ||
                         !managed_value_type(hir_module, value.type) ||
                         !integer_type(hir_module, index_type) ||
+                        type_bits(hir_module, index_type) != hir_module.address_bits ||
                         value.is_volatile_access !=
                             hir_module.type(*base_type.pointee).is_volatile) {
                         fail(value.location, "indexed-load type or volatile metadata mismatch");
@@ -12370,6 +12466,11 @@ bool reduce_affine_address_inductions(
             }
             const auto latch = carried->predecessor;
             const auto index_type = index_phi.type;
+            const auto index_bits = type_bits(hir_module, index_type);
+            // New offsets are address indices.
+            const auto address_index_type =
+                index_bits == hir_module.address_bits
+                    ? index_type : *hir_module.builtin(BuiltinType::Iptr);
             const auto index_location = index_phi.location;
             const auto update_location = update.location;
             const auto step_elements = step.integer;
@@ -12388,12 +12489,22 @@ bool reduce_affine_address_inductions(
                             return false;
                         }
                         const auto& value = function.values[id.value];
+                        // A same-width view, or the index's own conversion
+                        // to an address index, which cannot wrap here.
                         if (value.kind == ValueKind::Cast &&
-                            value.cast == CastOperation::Reinterpret &&
-                            value.operands.size() == 1 &&
-                            type_bits(hir_module, value.type) ==
-                        type_bits(hir_module, index_type)) {
-                            return derive(value.operands.front(), offset);
+                            value.operands.size() == 1) {
+                            const auto from = type_bits(
+                                hir_module,
+                                function.values[value.operands.front().value].type);
+                            const auto to = type_bits(hir_module, value.type);
+                            if ((value.cast == CastOperation::Reinterpret &&
+                                 to == index_bits) ||
+                                ((value.cast == CastOperation::SignExtend ||
+                                  value.cast == CastOperation::Truncate) &&
+                                 from == index_bits &&
+                                 to == hir_module.address_bits)) {
+                                return derive(value.operands.front(), offset);
+                            }
                         }
                         if (value.kind != ValueKind::Binary ||
                             value.binary != BinaryOperation::Add ||
@@ -12493,7 +12604,8 @@ bool reduce_affine_address_inductions(
                         });
                     if (group == groups.end()) {
                         groups.push_back({*base, base_value.type,
-                                          index_type, element_size, {}});
+                                          address_index_type, element_size,
+                                          {}});
                         group = std::prev(groups.end());
                     }
                     group->accesses.push_back({id, block_id, *offset});
@@ -12520,11 +12632,22 @@ bool reduce_affine_address_inductions(
                 pointer_phi.kind = ValueKind::Phi;
                 const auto pointer_phi_id = append(std::move(pointer_phi));
 
+                auto step_index = *step_id;
+                if (address_index_type != index_type) {
+                    ManagedValue constant;
+                    constant.location = update_location;
+                    constant.type = address_index_type;
+                    constant.kind = ValueKind::ConstantInteger;
+                    constant.integer = step_elements;
+                    step_index = append(std::move(constant));
+                    function.blocks[loop.preheader.value].values.push_back(
+                        step_index);
+                }
                 ManagedValue pointer_next;
                 pointer_next.location = update_location;
                 pointer_next.type = group.pointer_type;
                 pointer_next.kind = ValueKind::IndexedAddress;
-                pointer_next.operands = {pointer_phi_id, *step_id};
+                pointer_next.operands = {pointer_phi_id, step_index};
                 const auto pointer_next_id = append(std::move(pointer_next));
                 function.blocks[latch.value].values.push_back(
                     pointer_next_id);
@@ -13845,6 +13968,18 @@ bool rebalance_unsigned_add_recurrences(
     return !candidates.empty();
 }
 
+// A vectorizable access indexes by the loop index or by its zero extension
+// to address width. The recognized loops count up from zero below an
+// unsigned bound, so the narrower index never wraps.
+bool is_vector_address_index(const ManagedFunction& function,
+                             ValueId candidate, ValueId index) {
+    if (candidate == index) return true;
+    const auto& value = function.values[candidate.value];
+    return value.kind == ValueKind::Cast &&
+           value.cast == CastOperation::ZeroExtend &&
+           value.operands.size() == 1 && value.operands.front() == index;
+}
+
 bool scalar_vector_element(const hir::Module& hir_module,
                            hir::TypeId type) {
     const auto& value = hir_module.type(type);
@@ -14072,7 +14207,8 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
         const auto& address = function.values[address_id.value];
         if (address.kind != ValueKind::IndexedAddress ||
             address.operands.size() != 2 ||
-            address.operands[1] != result.index ||
+            !is_vector_address_index(function, address.operands[1],
+                                     result.index) ||
             loop_values.contains(address.operands[0].value) ||
             !vector_element_compatible(
                 hir_module,
@@ -14161,7 +14297,8 @@ bool vectorizable_reduction_term(
         required.insert(address_id.value);
         if (address.kind != ValueKind::IndexedAddress ||
             address.operands.size() != 2 ||
-            address.operands[1] != pattern.index) {
+            !is_vector_address_index(function, address.operands[1],
+                                     pattern.index)) {
             return false;
         }
         const auto base = address.operands.front();
@@ -14170,7 +14307,8 @@ bool vectorizable_reduction_term(
     }
     if (value.kind == ValueKind::IndexedLoad &&
         !value.is_volatile_access && value.operands.size() == 2 &&
-        value.operands[1] == pattern.index) {
+        is_vector_address_index(function, value.operands[1],
+                                pattern.index)) {
         const auto base = value.operands.front();
         return definitions[base.value] &&
                !pattern.loop.blocks.contains(definitions[base.value]->value);
@@ -14461,6 +14599,16 @@ bool vectorize_reduction_loop(
     std::optional<ValueId> alias_condition;
     if (needs_alias_guard) {
         const auto& store = pattern.stores.front();
+        auto end_index = bound;
+        if (index_bits < hir_module.address_bits) {
+            ManagedValue extension;
+            extension.location = alias_guard.location;
+            extension.type = *hir_module.builtin(BuiltinType::Uptr);
+            extension.kind = ValueKind::Cast;
+            extension.cast = CastOperation::ZeroExtend;
+            extension.operands = {bound};
+            end_index = append_value(alias_guard.values, std::move(extension));
+        }
         for (const auto load_base : pattern.load_bases) {
             if (load_base == store.base) continue;
             const auto append_address = [&](ValueId base) {
@@ -14468,7 +14616,7 @@ bool vectorize_reduction_loop(
                 end.location = alias_guard.location;
                 end.type = function.values[base.value].type;
                 end.kind = ValueKind::IndexedAddress;
-                end.operands = {base, bound};
+                end.operands = {base, end_index};
                 return append_value(alias_guard.values, std::move(end));
             };
             const auto store_end = append_address(store.base);
@@ -14790,6 +14938,32 @@ bool vectorize_reduction_loop(
     std::unordered_map<std::uint32_t, ValueId> comparison_zeroes;
     ValueId active_vector_index = vector_index;
     ValueId active_lane_index = vector_lane_index;
+    // Rebuild an access's address index, the loop index or its extension.
+    // The vector indices do not wrap, so an extension of the vector index
+    // plus the group's offset in address width equals the extended group
+    // index and leaves the offset to the addressing mode.
+    unsigned active_group{};
+    std::unordered_map<std::uint32_t, ValueId> extended_indices;
+    const auto vector_address_index = [&](ValueId original) {
+        if (original == pattern.index) return active_vector_index;
+        auto extended = extended_indices.find(original.value);
+        if (extended == extended_indices.end()) {
+            auto extension = function.values[original.value];
+            extension.operands = {vector_index};
+            extended = extended_indices.emplace(
+                original.value,
+                append_value(vector_body.values, std::move(extension))).first;
+        }
+        if (active_group == 0) return extended->second;
+        ManagedValue offset;
+        offset.location = function.values[original.value].location;
+        offset.type = function.values[original.value].type;
+        offset.kind = ValueKind::Binary;
+        offset.binary = BinaryOperation::Add;
+        offset.operands = {extended->second,
+                           add_integer_constant(offset.type, active_group * lanes)};
+        return append_value(vector_body.values, std::move(offset));
+    };
     std::unordered_map<std::uint32_t, ValueId> active_affine_values;
     std::function<ValueId(ValueId)> vectorize_value;
     const auto splat_scalar = [&](ValueId original) {
@@ -14903,21 +15077,18 @@ bool vectorize_reduction_loop(
         }
         if (source.kind == ValueKind::PointerLoad ||
             source.kind == ValueKind::IndexedLoad) {
-            ValueId base;
-            if (source.kind == ValueKind::PointerLoad) {
-                const auto address =
-                    function.values[source.operands.front().value];
-                base = address.operands.front();
-            } else {
-                base = source.operands.front();
-            }
+            const auto operands = source.kind == ValueKind::PointerLoad
+                ? function.values[source.operands.front().value].operands
+                : source.operands;
+            const auto base = operands.front();
+            const auto index = vector_address_index(operands[1]);
             ManagedValue load;
             load.location = source.location;
             load.type = vector_type_for(source.type);
             load.kind = ValueKind::IndexedLoad;
             load.is_volatile_access = false;
             load.memory_alignment = source.memory_alignment;
-            load.operands = {base, active_vector_index};
+            load.operands = {base, index};
             const auto result = append_effectful(std::move(load));
             vector_values.emplace(id.value, result);
             return result;
@@ -15070,6 +15241,7 @@ bool vectorize_reduction_loop(
         active_affine_carriers.push_back(affine.carrier);
     }
     for (unsigned group = 0; group < interleave; ++group) {
+        active_group = group;
         if (group == 0) {
             active_vector_index = vector_index;
             active_lane_index = vector_lane_index;
@@ -15139,7 +15311,8 @@ bool vectorize_reduction_loop(
             address.id = {};
             address.effect_input.reset();
             address.effect_output.reset();
-            address.operands = {store.base, active_vector_index};
+            address.operands = {store.base,
+                                vector_address_index(address.operands[1])};
             const auto address_id = append_value(
                 vector_body.values, std::move(address));
             auto vector_store = function.values[store.store.value];
@@ -15846,6 +16019,7 @@ struct EarlyExitLoopPattern {
     ValueId bound;
     ValueId index_next;
     ValueId base;
+    ValueId address_index;
     ValueId load;
     ValueId compared_load;
     ValueId invariant;
@@ -16038,17 +16212,21 @@ std::optional<EarlyExitLoopPattern> find_early_exit_loop(
     }
 
     std::optional<ValueId> base;
+    ValueId address_index{};
     if (load.kind == ValueKind::IndexedLoad && load.operands.size() == 2 &&
-        load.operands[1] == index_id) {
+        is_vector_address_index(function, load.operands[1], index_id)) {
         base = load.operands[0];
+        address_index = load.operands[1];
     } else if (load.kind == ValueKind::PointerLoad &&
                load.operands.size() == 1) {
         const auto address_id = load.operands.front();
         const auto& address = function.values[address_id.value];
         if (address.kind == ValueKind::IndexedAddress &&
             address.operands.size() == 2 &&
-            address.operands[1] == index_id) {
+            is_vector_address_index(function, address.operands[1],
+                                    index_id)) {
             base = address.operands[0];
+            address_index = address.operands[1];
         }
     }
     if (!base) return std::nullopt;
@@ -16083,7 +16261,7 @@ std::optional<EarlyExitLoopPattern> find_early_exit_loop(
     }
     return EarlyExitLoopPattern{
         loop, test_id, latch_id, exit_id, index_id, *initial_index,
-        range.operands[1], index_next, *base, *load_id,
+        range.operands[1], index_next, *base, address_index, *load_id,
         *compared_load_id, invariant,
         condition.binary, load_on_left};
 }
@@ -16246,6 +16424,13 @@ bool vectorize_early_exit_loop(ManagedFunction& function,
     const auto vector_range_id =
         append_value(vector_header.values, std::move(vector_range));
 
+    auto vector_address_index = vector_index;
+    if (pattern.address_index != pattern.index) {
+        auto extension = function.values[pattern.address_index.value];
+        extension.operands = {vector_index};
+        vector_address_index =
+            append_value(vector_body.values, std::move(extension));
+    }
     EffectId current_effect = vector_body_effect;
     ManagedValue vector_load;
     vector_load.location = function.values[pattern.load.value].location;
@@ -16253,7 +16438,7 @@ bool vectorize_early_exit_loop(ManagedFunction& function,
     vector_load.kind = ValueKind::IndexedLoad;
     vector_load.memory_alignment =
         function.values[pattern.load.value].memory_alignment;
-    vector_load.operands = {pattern.base, vector_index};
+    vector_load.operands = {pattern.base, vector_address_index};
     vector_load.effect_input = current_effect;
     const EffectId load_effect{
         static_cast<std::uint32_t>(function.effects.size())};

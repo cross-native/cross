@@ -171,6 +171,36 @@ int main() {
         permits_new_intermediates(n64) || !permits_contraction(n64) ||
         permits_contraction(Environment{underflow_flag})) return 57;
 
+    // Square roots are correctly rounded in every format; sign operations and
+    // minNum/maxNum move operand bits, NaN payloads included.
+    const auto two32 = *parse("2.0", f32);
+    if (square_root(two32).bits != UInt128{0x3fb504f3}) return 20;
+    if (square_root(*parse("2.0", f64)).bits != UInt128{0x3ff6a09e667f3bcdULL}) return 20;
+    if (square_root(*parse("2.0", f80)).bits != UInt128{0xb504f333f9de6484ULL, 0x3fff}) return 20;
+    if (square_root(*parse("2.0", f128)).bits !=
+        UInt128{0xc908b2fb1366ea95ULL, 0x3fff6a09e667f3bcULL}) return 20;
+    if (square_root(*parse("0x1p-149", f32)).bits != UInt128{0x1a3504f3}) return 21;
+    if (square_root(*parse("0x1p-1074", f64)).bits != UInt128{0x1e60000000000000ULL}) return 21;
+    if (square_root(*parse("6.25", f64)).bits != parse("2.5", f64)->bits) return 21;
+    if (square_root(negative_zero).bits != negative_zero.bits) return 22;
+    if (square_root(infinity).bits != infinity.bits) return 22;
+    if (!is_nan(square_root(*parse("-1.0", f32))) || !is_nan(square_root(invalid))) return 22;
+    const Value payload{UInt128{0xffc12345}, f32};
+    if (absolute(payload).bits != UInt128{0x7fc12345}) return 23;
+    if (copy_sign(payload, one).bits != UInt128{0x7fc12345} ||
+        copy_sign(one, payload).bits != UInt128{0xbf800000} ||
+        copy_sign(*parse("1.5", f80), *parse("-0.0", f80)).bits !=
+            UInt128{0xc000000000000000ULL, 0xbfff}) return 23;
+    if (min_num(payload, one).bits != one.bits || min_num(one, payload).bits != one.bits ||
+        max_num(payload, one).bits != one.bits || max_num(one, payload).bits != one.bits) return 24;
+    if (!is_nan(min_num(payload, invalid)) || !is_nan(max_num(invalid, payload))) return 24;
+    if (min_num(zero, negative_zero).bits != zero.bits ||
+        min_num(negative_zero, zero).bits != negative_zero.bits ||
+        max_num(zero, negative_zero).bits != zero.bits ||
+        max_num(negative_zero, zero).bits != negative_zero.bits) return 25;
+    if (min_num(one, two32).bits != one.bits || min_num(two32, one).bits != one.bits ||
+        max_num(one, two32).bits != two32.bits || max_num(two32, one).bits != two32.bits) return 25;
+
     // Independent host IEEE operations cross-check thousands of exact target
     // results and their exceptions; exceptional NaN payloads are
     // intentionally not specified.
@@ -205,6 +235,10 @@ int main() {
             if (actual != expected && !both_nan) return 18;
             if (!same_flags(soft_raised, host_raised)) return 20;
         }
+        volatile float root = std::sqrt(static_cast<float>(a));
+        const auto actual = square_root(soft_a).bits.low;
+        const auto expected = std::bit_cast<std::uint32_t>(static_cast<float>(root));
+        if (actual != expected && !(std::isnan(root) && is_nan(square_root(soft_a)))) return 26;
     }
     for (int i = 0; i < 2000; ++i) {
         const auto bits_a = next();
@@ -262,6 +296,11 @@ int main() {
         if (!soft_truncated ||
             soft_truncated->low != static_cast<std::uint32_t>(truncated) ||
             !same_flags(soft_raised, host_raised)) return 25;
+        volatile double root = std::sqrt(a);
+        const auto actual_root = square_root(soft_a).bits.low;
+        const auto expected_root = std::bit_cast<std::uint64_t>(static_cast<double>(root));
+        if (actual_root != expected_root &&
+            !(std::isnan(static_cast<double>(root)) && is_nan(square_root(soft_a)))) return 27;
     }
     return 0;
 }

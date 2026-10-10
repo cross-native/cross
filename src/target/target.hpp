@@ -548,6 +548,13 @@ struct ElfAbiTagEntry {
 
 enum class NakedLowering { Raw, Constrained };
 
+// A compiler intrinsic that the target lowers to a registry instruction is
+// usable only where a form of that instruction is.
+struct IntrinsicFormEntry {
+    std::string_view intrinsic;
+    std::string_view instruction;
+};
+
 struct TargetInfo {
     std::string_view architecture;
     std::vector<std::string_view> triple_prefixes;
@@ -573,6 +580,7 @@ struct TargetInfo {
     // through managed MIR with frameless, spill-free allocation restricted
     // to the function's declared registers.
     NakedLowering naked_lowering{NakedLowering::Raw};
+    std::vector<IntrinsicFormEntry> intrinsic_forms{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;

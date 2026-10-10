@@ -114,6 +114,28 @@ inline const char* control_intrinsic_arity_error(const Expr& expression) {
     return nullptr;
 }
 
+// Operations on one floating type that return that type.
+enum class FloatingIntrinsic { None, Sqrt, Fabs, Copysign, Fmin, Fmax };
+
+inline FloatingIntrinsic floating_intrinsic(std::string_view name) {
+    if (name == "$::sqrt") return FloatingIntrinsic::Sqrt;
+    if (name == "$::fabs") return FloatingIntrinsic::Fabs;
+    if (name == "$::copysign") return FloatingIntrinsic::Copysign;
+    if (name == "$::fmin") return FloatingIntrinsic::Fmin;
+    if (name == "$::fmax") return FloatingIntrinsic::Fmax;
+    return FloatingIntrinsic::None;
+}
+
+inline FloatingIntrinsic floating_intrinsic(const Expr& expression) {
+    return expression.kind == Expr::Kind::Call && expression.left &&
+        expression.left->kind == Expr::Kind::Name
+        ? floating_intrinsic(expression.left->text) : FloatingIntrinsic::None;
+}
+
+inline std::size_t floating_intrinsic_arity(FloatingIntrinsic operation) {
+    return operation == FloatingIntrinsic::Sqrt || operation == FloatingIntrinsic::Fabs ? 1 : 2;
+}
+
 struct AssumptionViolation {
     enum class Kind { Effects, QualifiedRead } kind;
     const Expr* expression;
@@ -173,6 +195,8 @@ std::optional<AssumptionViolation> assumption_violation(
                 // Only the operand's source type is observed.
             } else if (control_intrinsic(*node) == ControlIntrinsic::Expect) {
                 if (!node->arguments.empty()) push(node->arguments.front().get());
+            } else if (floating_intrinsic(*node) != FloatingIntrinsic::None) {
+                for (const auto& argument : node->arguments) push(argument.get());
             } else if (node->left && node->left->kind == Expr::Kind::Name &&
                        node->left->text == "$::eval") {
                 // Its required value is prepared independently; no runtime
