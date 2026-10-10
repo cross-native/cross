@@ -62,8 +62,9 @@ out-of-range shifts are undefined. Floating expressions round to their own
 type; there is no excess precision. The selected profile declares which
 floating exceptions trap and whether denormal results flush to zero
 ([models.md](models.md#profiles)); the compiler runs an operation that may
-trap only where the source runs it, and compile-time evaluation flushes as the
-profile says and does not evaluate an operation that would trap.
+trap exactly where the source runs it, even when its result is unused, and
+compile-time evaluation flushes as the profile says and does not evaluate an
+operation that would trap.
 
 ```x
 enum color [[underlying(u8)]] {

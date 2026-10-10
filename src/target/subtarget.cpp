@@ -77,6 +77,12 @@ std::optional<unsigned> Subtarget::integer_multiply_high_cost(
     return target_->cost_model.integer_multiply_high(*this, query);
 }
 
+floating::NanEncoding Subtarget::nan_encoding() const {
+    const auto& layout = target_->data_layout;
+    return !layout.nan2008_feature.empty() && has_feature(layout.nan2008_feature)
+        ? floating::NanEncoding::Ieee2008 : layout.nan_encoding;
+}
+
 std::optional<TargetFeatureId> Subtarget::feature_id(
     std::string_view name) const {
     if (!table_) return std::nullopt;

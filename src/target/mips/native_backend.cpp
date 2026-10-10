@@ -53,6 +53,19 @@ AssemblySymbolVisibility assembly_visibility(
     return AssemblySymbolVisibility::Default;
 }
 
+// NEG.fmt is arithmetic on these FPUs: it signals invalid on a signaling
+// NaN, a VR4300 traps on a denormal operand, and FCSR.FS may flush one.
+// Where the environment traps either exception or flushes, negation flips
+// the sign bit in general registers instead, like $::fabs.
+bool negation_flips_sign_in_gpr(const CompilerOptions& options) {
+    using floating::Exception;
+    const auto& environment = options.floating_environment;
+    return (environment.traps &
+            (floating::exception_set(Exception::Invalid) |
+             floating::exception_set(Exception::DenormalOperand))) != 0 ||
+           environment.flush_denormal_results;
+}
+
 enum class LoweringPass : std::uint16_t {
     HoistParameterCaptures,
     PropagateCopies,
@@ -782,9 +795,15 @@ private:
     // is neither a 64-bit GPR nor MFHC1 and FPXX code cannot name the odd
     // half of a register pair: MIPS II and MIPS32 Release 1.
     bool sign_word_in_memory(const mir::ManagedValue& value) const {
-        return value.kind == mir::ValueKind::Intrinsic &&
-               (value.intrinsic == mir::IntrinsicOperation::Fabs ||
-                value.intrinsic == mir::IntrinsicOperation::Copysign) &&
+        const bool sign_operation =
+            (value.kind == mir::ValueKind::Intrinsic &&
+             (value.intrinsic == mir::IntrinsicOperation::Fabs ||
+              value.intrinsic == mir::IntrinsicOperation::Copysign)) ||
+            (value.kind == mir::ValueKind::Unary &&
+             value.unary == mir::UnaryOperation::Negate &&
+             is_floating(hir_, value.type) &&
+             negation_flips_sign_in_gpr(options_));
+        return sign_operation &&
                type_bits(hir_, value.type) == 64 &&
                subtarget_.has_feature(Feature::Mips2) &&
                !subtarget_.has_feature(Feature::Mips3) &&
@@ -1581,7 +1600,8 @@ private:
                 hir_, source_->values[value.operands.front().value].type);
             const auto opcode = floating
                 ? value.unary == mir::UnaryOperation::Negate
-                      ? Opcode::Fneg
+                      ? (negation_flips_sign_in_gpr(options_) ? Opcode::FnegSign
+                                                              : Opcode::Fneg)
                       : Opcode::Fiszero
                 : value.unary == mir::UnaryOperation::Negate
                       ? Opcode::Neg
@@ -1825,8 +1845,14 @@ private:
                     managed_value.kind == mir::ValueKind::LifetimeEnd) {
                     continue;
                 }
-                target.instructions.push_back(
-                    lower_value(managed_value));
+                auto instruction = lower_value(managed_value);
+                // A floating operation that may raise a trapped exception
+                // stays where the source runs it, even when unused.
+                if (mir::may_trap_floating(managed_value, source, hir_,
+                                           options_.floating_environment)) {
+                    instruction.has_side_effects = true;
+                }
+                target.instructions.push_back(std::move(instruction));
             }
             target.instructions.push_back(lower_terminator(block.terminator));
             current_.blocks.push_back(std::move(target));
@@ -4971,6 +4997,8 @@ public:
                 "native MIPS assembly currently requires an ELF target");
             return result;
         }
+        // EF_MIPS_NAN2008 tells linkers and loaders the NaN encoding.
+        if (subtarget_.has_feature(Feature::Nan2008)) output_ << ".nan 2008\n";
         if (elf_abi_tag(subtarget_.abi_info()) == ElfAbiTag::Eabi32) {
             // GNU MIPS linkers use this conventional empty marker in addition
             // to EF_MIPS_ABI_EABI32.  LLVM MC accepts the section even though
@@ -11213,8 +11241,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
     if (opcode == Opcode::Fmin || opcode == Opcode::Fmax) {
         // A NaN left operand selects the right one; otherwise the right one
         // is selected only when it orders strictly beyond the left one. The
-        // quiet comparisons do not signal on a quiet NaN, and MOV.fmt copies
-        // the selected bits unchanged.
+        // quiet comparisons signal only on a signaling NaN, so a NaN left
+        // operand still compares the right one, and MOV.fmt copies the
+        // selected bits unchanged.
         const auto x = value.uses.front();
         const auto target = value.defs.front();
         const std::string suffix = x.mode.bits == 32 ? ".s" : ".d";
@@ -11222,11 +11251,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto right =
             input_fpr(function, value.uses[1], "f2", value.location);
         const auto destination = output_fpr(function, target, "f4");
+        const auto left_nan = local_label(function);
         const auto take_right = local_label(function);
         const auto take_left = local_label(function);
         const auto done = local_label(function);
         instruction("c.un" + suffix, reg_name(left) + "," + reg_name(left));
-        instruction("bc1t", take_right);
+        instruction("bc1t", left_nan);
         instruction("nop");
         instruction("c.olt" + suffix,
                     opcode == Opcode::Fmin
@@ -11241,6 +11271,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         }
         instruction("b", done);
         instruction("nop");
+        output_ << left_nan << ":\n";
+        instruction("c.un" + suffix, reg_name(right) + "," + reg_name(right));
+        instruction("b", take_right);
+        instruction("nop");
         output_ << take_left << ":\n";
         if (destination != left) {
             instruction("mov" + suffix,
@@ -11250,9 +11284,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         commit_fpr(function, target, destination, value.location);
         return;
     }
-    if (opcode == Opcode::Fabs || opcode == Opcode::Fcopysign) {
+    if (opcode == Opcode::Fabs || opcode == Opcode::Fcopysign ||
+        opcode == Opcode::FnegSign) {
         // ABS.fmt and NEG.fmt are arithmetic on these FPUs, so a NaN operand
-        // would signal and become the default NaN. Move only the sign bit
+        // would signal and become the default NaN. Change only the sign bit
         // through t0/t1 instead: the word of a single, the doubleword of a
         // double with 64-bit GPRs, or otherwise the double's high word, read
         // with MFHC1 on MIPS32 Release 2, from the odd register of an FP32
@@ -11299,8 +11334,14 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 move_fpr_to_gpr(sign, "t1", doubleword ? 64U : 32U);
             move_fpr_to_gpr(source, "t0", doubleword ? 64U : 32U);
         }
-        instruction(doubleword ? "dsll" : "sll", "$t0,$t0,1");
-        instruction(doubleword ? "dsrl" : "srl", "$t0,$t0,1");
+        if (opcode == Opcode::FnegSign) {
+            instruction("lui", "$t1,0x8000");
+            if (doubleword) instruction("dsll32", "$t1,$t1,0");
+            instruction("xor", "$t0,$t0,$t1");
+        } else {
+            instruction(doubleword ? "dsll" : "sll", "$t0,$t0,1");
+            instruction(doubleword ? "dsrl" : "srl", "$t0,$t0,1");
+        }
         if (!sign.empty()) {
             instruction(doubleword ? "dsrl32" : "srl", "$t1,$t1,31");
             instruction(doubleword ? "dsll32" : "sll", "$t1,$t1,31");

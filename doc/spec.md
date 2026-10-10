@@ -704,20 +704,27 @@ floating environment is a property of the selected profile
 operand traps, and whether a denormal result flushes to zero. The shipped
 profiles declare a masked environment with gradual underflow, which is not
 source observable. Under a profile that declares traps or flushing, an
-operation that may raise an enabled trap is executed only where the source
-executes it, never speculatively, and translation-time evaluation follows the
-declared environment: a result flushes to zero where the profile says so, and
-an operation that would trap is not folded, so a mandatory evaluation of it
-is diagnosed. `-ffast-math` never introduces an operation that can trap where
-the source has none. Floating operations raise the exceptions IEC 60559
-specifies: `<`, `<=`, `>`, and `>=` are signaling comparisons, `==` and `!=`
-quiet ones; unary `-` raises none; a conversion to an integer that discards a
-fraction raises inexact. Under `fp_denormal_operand = "trap"`, an arithmetic
-operation, comparison, or conversion with a denormal operand traps. A literal
-denotes its rounded value; flushing applies to operation results, and whether
-tininess is detected before or after rounding is target-defined. Machine operations that change x87 precision, rounding, or control
-state must restore the target default before ordinary floating code or a
-managed call. Cross never inserts a hidden floating-environment helper.
+operation that may raise an enabled trap is executed exactly where the source
+executes it, never speculatively and even when its result is unused, and
+translation-time evaluation follows the declared environment: a result
+flushes to zero where the profile says so, and an operation that would trap
+is not folded, so a mandatory evaluation of it is diagnosed. `-ffast-math`
+never introduces an operation that can trap where the source has none.
+Floating operations raise the exceptions IEC 60559 specifies: `<`, `<=`, `>`,
+and `>=` are signaling comparisons, `==` and `!=` quiet ones, and the truth
+value of a floating operand is its quiet comparison with zero; unary `-`,
+`$::fabs`, and `$::copysign` raise none; a conversion to an integer that
+discards a fraction raises inexact. Under `fp_denormal_operand = "trap"`, an
+arithmetic operation, comparison, or conversion with a denormal operand traps.
+A literal denotes its rounded value; flushing applies to the results of
+arithmetic, square roots, and conversions, not to operations that copy an
+operand such as unary `-` and `$::fmin`, and whether tininess is detected
+before or after rounding is target-defined. Which NaNs are signaling and the
+NaN that an invalid operation produces are target-defined; translation-time
+evaluation uses the target's. Machine operations that change x87 precision,
+rounding, or control state must restore the target default before ordinary
+floating code or a managed call. Cross never inserts a hidden
+floating-environment helper.
 
 `f128` always denotes binary128, independently of a platform `long double`.
 Its literals, object layout, conversions, and ABI classification are available

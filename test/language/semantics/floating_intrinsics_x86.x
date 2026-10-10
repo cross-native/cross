@@ -3,7 +3,8 @@
 
 // The x87 f80 forms of the floating intrinsics and the binary128 sign
 // operations on x86-64, checked against exactly computed encodings. The x87
-// precision control must select a 64-bit significand.
+// precision control must select a 64-bit significand. Copies of call results
+// and literals keep every bit, and a volatile f80 object can be initialized.
 
 struct words { u64 low; u64 high; };
 union bits80 { f80 value; struct words parts; };
@@ -55,6 +56,7 @@ global volatile u64 sqrt80_cases[7][4] = {
 };
 global volatile u64 nan80_high = 0xffffu64;
 global volatile u64 nan80_low = 0xc000000000012345u64;
+global volatile f80 two = 2.0f80;
 
 $::static_assert(f80_is($::sqrt(2.0f80), 0x3fffu64, 0xb504f333f9de6484u64), "f80 root");
 $::static_assert(f80_is($::fabs(f80_of(0xffffu64, 0xc000000000012345u64)),
@@ -93,5 +95,9 @@ global u32 test_entry() {
     if (!f80_is($::eval($::sqrt(3.0f80)), 0x3fffu64, 0xddb3d742c265539eu64) ||
         !f80_is(sqrt80(3.0f80), 0x3fffu64, 0xddb3d742c265539eu64))
         return 26u32;
+    const f80 copied = f80_of(sqrt80_cases[0][0], sqrt80_cases[0][1]);
+    if (copied != 2.0f80 || !f80_is(copied, 0x4000u64, 0x8000000000000000u64) ||
+        !f80_is(two, 0x4000u64, 0x8000000000000000u64))
+        return 27u32;
     return 0u32;
 }

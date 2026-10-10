@@ -29,7 +29,7 @@ compile_assembly(override -march=haswell -mno-avx)
 
 if(NOT legacy_assembly MATCHES "[	 ]addsd[	 ]" OR
    NOT legacy_assembly MATCHES "[	 ]mulsd[	 ]" OR
-   NOT legacy_assembly MATCHES "[	 ]ucomisd[	 ]" OR
+   NOT legacy_assembly MATCHES "[	 ]comisd[	 ]" OR
    NOT legacy_assembly MATCHES "[	 ]cvtsd2ss[	 ]" OR
    legacy_assembly MATCHES "[	 ]vaddsd[	 ]")
     message(FATAL_ERROR
@@ -38,7 +38,7 @@ endif()
 
 if(NOT avx_assembly MATCHES "[	 ]vaddsd[	 ]" OR
    NOT avx_assembly MATCHES "[	 ]vmulsd[	 ]" OR
-   NOT avx_assembly MATCHES "[	 ]vucomisd[	 ]" OR
+   NOT avx_assembly MATCHES "[	 ]vcomisd[	 ]" OR
    NOT avx_assembly MATCHES "[	 ]vcvtsd2ss[	 ]")
     message(FATAL_ERROR
         "-mavx did not select VEX scalar floating forms\n${avx_assembly}")

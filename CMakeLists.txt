@@ -2765,7 +2765,7 @@ if(BUILD_TESTING)
         endforeach()
     endforeach()
     # The x87 f80 and binary128 forms.
-    foreach(level O1 O2)
+    foreach(level O0 O1 O2)
         add_test(NAME cross_runtime_floating_intrinsics_x87_${level}
             COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
@@ -2776,6 +2776,20 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_floating_intrinsics_x87_${level} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.floating;feature.intrinsics;feature.evaluation;opt.${level}")
+    endforeach()
+    # The MXCSR flags of operations under the trapping-fp and default profiles.
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_floating_flags_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_environment/flags_runtime.x
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/middle/floating_environment/environments.xm
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-flags-${level}
+                -DLEVEL=${level}
+                -P "${CMAKE_SOURCE_DIR}/test/middle/floating_environment/flags_runtime.cmake")
+        set_tests_properties(cross_runtime_floating_flags_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.floating;feature.model;opt.${level}")
     endforeach()
     add_test(NAME cross_floating_intrinsic_errors
         COMMAND "${CMAKE_COMMAND}"
@@ -2850,7 +2864,25 @@ if(BUILD_TESTING)
             -P "${floating_environment}/evaluation.cmake")
     set_tests_properties(cross_floating_environment_evaluation PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;frontend;feature.floating;feature.evaluation;feature.model;opt.O2")
-    foreach(case guarded_O2 guarded_O3 unguarded signaling)
+    add_test(NAME cross_floating_nan_encoding
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${floating_environment}/nan_encoding.x
+            -DMODEL=${floating_environment}/environments.xm
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-nan-encoding
+            -P "${floating_environment}/nan_encoding.cmake")
+    set_tests_properties(cross_floating_nan_encoding PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.floating;feature.evaluation;feature.model;isa.vr4300;isa.mips32r2;opt.O2")
+    add_test(NAME cross_floating_environment_lowering
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${floating_environment}/lowering.x
+            -DMODEL=${floating_environment}/environments.xm
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-environment-lowering
+            -P "${floating_environment}/lowering.cmake")
+    set_tests_properties(cross_floating_environment_lowering PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.floating;feature.model;isa.avx;isa.vr4300;isa.r6000;opt.O2")
+    foreach(case guarded_O2 guarded_O3 unguarded signaling fmin_signaling)
         set(environment_flags "--model=${floating_environment}/environments.xm;-mprofile=trapping-fp")
         if(case MATCHES "^guarded_(.*)")
             set(environment_expected P)
@@ -2869,9 +2901,10 @@ if(BUILD_TESTING)
                 -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-environment-mips-${case}
                 -DEXPECTED=${environment_expected} "-DCC_FLAGS=${environment_flags}"
+                "-DMIPS_CPUS=vr4300;r3000;r6000"
                 -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
         set_tests_properties(cross_runtime_floating_environment_mips_${case} PROPERTIES
-            LABELS "check.runtime;arch.mips;backend.native;middle;feature.floating;feature.optimization;feature.model;opt.${environment_level}"
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.floating;feature.optimization;feature.model;isa.vr4300;isa.r3000;isa.r6000;endian.big;endian.little;opt.${environment_level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
     add_test(NAME cross_x86_64_feature_codegen

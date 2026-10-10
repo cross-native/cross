@@ -48,11 +48,13 @@ int main() {
     const auto f64 = Format::Binary64;
     const auto f80 = Format::Extended80;
     const auto f128 = Format::Binary128;
+    const auto ieee = NanEncoding::Ieee2008;
+    const auto legacy = NanEncoding::Legacy;
     const auto one = *parse("1.0", f32);
     const auto half_ulp = *parse("0x1p-24", f32);
     const auto above_half = *parse("0x1.8p-24", f32);
-    if (binary(Operation::Add, one, half_ulp, f32).bits != UInt128{0x3f800000}) return 1;
-    if (binary(Operation::Add, one, above_half, f32).bits != UInt128{0x3f800001}) return 2;
+    if (binary(Operation::Add, one, half_ulp, f32, ieee).bits != UInt128{0x3f800000}) return 1;
+    if (binary(Operation::Add, one, above_half, f32, ieee).bits != UInt128{0x3f800001}) return 2;
     if (parse("1.000000059604644775390625", f32)->bits !=
         UInt128{0x3f800000}) return 2;
     if (parse("1.000000059604644775390626", f32)->bits !=
@@ -60,45 +62,45 @@ int main() {
     if (parse("0x1p-149", f32)->bits != UInt128{1}) return 3;
     if (parse("0x1p-150", f32)->bits != UInt128{}) return 4;
     if (parse("0x1.8p-150", f32)->bits != UInt128{1}) return 5;
-    if (binary(Operation::Divide, one, *parse("3.0", f32), f32).bits !=
+    if (binary(Operation::Divide, one, *parse("3.0", f32), f32, ieee).bits !=
         UInt128{0x3eaaaaab}) return 6;
     if (parse("1.5", f80)->bits != UInt128{0xc000000000000000ULL, 0x3fff}) return 7;
     if (parse("1.5", f128)->bits != UInt128{0, 0x3fff800000000000ULL}) return 8;
-    if (convert(*parse("1.5", f128), f64).bits != UInt128{0x3ff8000000000000ULL}) return 9;
+    if (convert(*parse("1.5", f128), f64, ieee).bits != UInt128{0x3ff8000000000000ULL}) return 9;
     if (from_integer(UInt128{0xffffffff}, 32, true, f32).bits !=
         UInt128{0xbf800000}) return 10;
     if (to_integer(*parse("-1.5", f64), 32, true) != UInt128{0xffffffff}) return 11;
     if (to_integer(*parse("-0.5", f64), 32, false) != UInt128{}) return 12;
     const auto negative_zero = *parse("-0.0", f32);
     if (negative_zero.bits != UInt128{0x80000000} || nonzero(negative_zero)) return 13;
-    if (!compare(Comparison::Equal, negative_zero, *parse("0.0", f32))) return 14;
-    const auto infinity = binary(Operation::Divide, one, *parse("0.0", f32), f32);
+    if (!compare(Comparison::Equal, negative_zero, *parse("0.0", f32), ieee)) return 14;
+    const auto infinity = binary(Operation::Divide, one, *parse("0.0", f32), f32, ieee);
     if (infinity.bits != UInt128{0x7f800000}) return 15;
-    if (binary(Operation::Multiply, one, infinity, f32).bits !=
+    if (binary(Operation::Multiply, one, infinity, f32, ieee).bits !=
         UInt128{0x7f800000}) return 15;
-    const auto invalid = binary(Operation::Subtract, infinity, infinity, f32);
-    if (compare(Comparison::Equal, invalid, invalid) ||
-        !compare(Comparison::NotEqual, invalid, invalid)) return 16;
+    const auto invalid = binary(Operation::Subtract, infinity, infinity, f32, ieee);
+    if (compare(Comparison::Equal, invalid, invalid, ieee) ||
+        !compare(Comparison::NotEqual, invalid, invalid, ieee)) return 16;
     if (binary(Operation::Add, *parse("1.0", f128),
-               *parse("0x1p-112", f128), f128).bits !=
+               *parse("0x1p-112", f128), f128, ieee).bits !=
         UInt128{1, 0x3fff000000000000ULL}) return 17;
 
     // Exceptions and the environment.
     const auto raised_by = [&](Operation op, Value a, Value b) {
         ExceptionSet raised{};
-        (void)binary(op, a, b, f32, &raised);
+        (void)binary(op, a, b, f32, ieee, &raised);
         return raised;
     };
     const auto zero = *parse("0.0", f32);
     const auto max = f32_bits(0x7f7fffff);
     const auto tiny_product = binary(Operation::Multiply, *parse("1.0e-30", f32),
-                                     *parse("1.0e-10", f32), f32);
+                                     *parse("1.0e-10", f32), f32, ieee);
     const auto denormal_value = *parse("0x1p-140", f32);
     if (raised_by(Operation::Divide, zero, zero) != invalid_flag) return 30;
     if (raised_by(Operation::Divide, one, zero) != divide_flag) return 31;
     if (raised_by(Operation::Divide, infinity, zero) != 0 ||
-        binary(Operation::Divide, infinity, zero, f32).bits != infinity.bits ||
-        binary(Operation::Divide, zero, infinity, f32).bits != zero.bits) return 31;
+        binary(Operation::Divide, infinity, zero, f32, ieee).bits != infinity.bits ||
+        binary(Operation::Divide, zero, infinity, f32, ieee).bits != zero.bits) return 31;
     if (raised_by(Operation::Subtract, infinity, infinity) != invalid_flag) return 32;
     if (raised_by(Operation::Multiply, max, *parse("2.0", f32)) != (overflow_flag | inexact_flag))
         return 33;
@@ -118,23 +120,65 @@ int main() {
     if (raised_by(Operation::Add, quiet_nan, one) != 0 ||
         raised_by(Operation::Add, signaling_nan, one) != invalid_flag) return 40;
     ExceptionSet raised{};
-    if (compare(Comparison::Less, quiet_nan, one, &raised) || raised != invalid_flag) return 41;
+    if (compare(Comparison::Less, quiet_nan, one, ieee, &raised) || raised != invalid_flag) return 41;
     raised = 0;
-    if (compare(Comparison::Equal, quiet_nan, one, &raised) || raised != 0) return 42;
-    if (compare(Comparison::NotEqual, signaling_nan, one, &raised) == false ||
+    if (compare(Comparison::Equal, quiet_nan, one, ieee, &raised) || raised != 0) return 42;
+    if (compare(Comparison::NotEqual, signaling_nan, one, ieee, &raised) == false ||
         raised != invalid_flag) return 43;
     raised = 0;
-    (void)compare(Comparison::Equal, denormal_value, one, &raised);
+    (void)compare(Comparison::Equal, denormal_value, one, ieee, &raised);
     if (raised != denormal_flag) return 44;
     raised = 0;
-    (void)convert(*parse("1.0e-40", f64), f32, &raised);
+    (void)convert(*parse("1.0e-40", f64), f32, ieee, &raised);
     if (raised != (underflow_flag | inexact_flag)) return 45;
     raised = 0;
-    (void)convert(*parse("1.0e300", f64), f32, &raised);
+    (void)convert(*parse("1.0e300", f64), f32, ieee, &raised);
     if (raised != (overflow_flag | inexact_flag)) return 46;
     raised = 0;
-    (void)convert(signaling_nan, f64, &raised);
+    (void)convert(signaling_nan, f64, ieee, &raised);
     if (raised != invalid_flag) return 47;
+    // The legacy MIPS encoding reverses the meaning of the quiet bit and has
+    // its own default NaN.
+    if (nan(f32, ieee).bits != UInt128{0x7fc00000} ||
+        nan(f32, legacy).bits != UInt128{0x7fbfffff} ||
+        nan(f64, ieee).bits != UInt128{0x7ff8000000000000ULL} ||
+        nan(f64, legacy).bits != UInt128{0x7ff7ffffffffffffULL} ||
+        nan(f80, ieee).bits != UInt128{0xc000000000000000ULL, 0x7fff} ||
+        nan(f128, legacy).bits != UInt128{~0ULL, 0x7fff7fffffffffffULL}) return 60;
+    if (!signaling(quiet_nan, legacy) || signaling(signaling_nan, legacy) ||
+        signaling(quiet_nan, ieee) || !signaling(signaling_nan, ieee) ||
+        signaling(infinity, legacy) || signaling(one, legacy)) return 61;
+    raised = 0;
+    if (binary(Operation::Divide, zero, zero, f32, legacy, &raised).bits !=
+            UInt128{0x7fbfffff} || raised != invalid_flag) return 62;
+    raised = 0;
+    if (binary(Operation::Add, signaling_nan, one, f32, legacy, &raised).bits !=
+            UInt128{0x7fbfffff} || raised != 0) return 63;
+    (void)binary(Operation::Add, quiet_nan, one, f32, legacy, &raised);
+    if (raised != invalid_flag) return 63;
+    raised = 0;
+    (void)square_root(signaling_nan, legacy, &raised);
+    if (raised != 0) return 64;
+    (void)square_root(quiet_nan, legacy, &raised);
+    if (raised != invalid_flag) return 64;
+    raised = 0;
+    if (compare(Comparison::Equal, quiet_nan, one, legacy, &raised) ||
+        raised != invalid_flag) return 65;
+    raised = 0;
+    if (convert(signaling_nan, f64, legacy, &raised).bits !=
+            UInt128{0x7ff7ffffffffffffULL} || raised != 0) return 66;
+    // minNum/maxNum raise invalid for a signaling NaN and a denormal operand
+    // exception for a denormal, whichever operand they select.
+    raised = 0;
+    if (min_num(quiet_nan, denormal_value, ieee, &raised).bits != denormal_value.bits ||
+        raised != denormal_flag) return 67;
+    raised = 0;
+    if (max_num(quiet_nan, signaling_nan, ieee, &raised).bits != signaling_nan.bits ||
+        raised != invalid_flag) return 68;
+    raised = 0;
+    if (min_num(quiet_nan, one, ieee, &raised).bits != one.bits || raised != 0) return 69;
+    if (max_num(quiet_nan, one, legacy, &raised).bits != one.bits ||
+        raised != invalid_flag) return 69;
     raised = 0;
     (void)from_integer(UInt128{16777217}, 32, true, f32, &raised);
     if (raised != inexact_flag) return 48;
@@ -174,32 +218,32 @@ int main() {
     // Square roots are correctly rounded in every format; sign operations and
     // minNum/maxNum move operand bits, NaN payloads included.
     const auto two32 = *parse("2.0", f32);
-    if (square_root(two32).bits != UInt128{0x3fb504f3}) return 20;
-    if (square_root(*parse("2.0", f64)).bits != UInt128{0x3ff6a09e667f3bcdULL}) return 20;
-    if (square_root(*parse("2.0", f80)).bits != UInt128{0xb504f333f9de6484ULL, 0x3fff}) return 20;
-    if (square_root(*parse("2.0", f128)).bits !=
+    if (square_root(two32, ieee).bits != UInt128{0x3fb504f3}) return 20;
+    if (square_root(*parse("2.0", f64), ieee).bits != UInt128{0x3ff6a09e667f3bcdULL}) return 20;
+    if (square_root(*parse("2.0", f80), ieee).bits != UInt128{0xb504f333f9de6484ULL, 0x3fff}) return 20;
+    if (square_root(*parse("2.0", f128), ieee).bits !=
         UInt128{0xc908b2fb1366ea95ULL, 0x3fff6a09e667f3bcULL}) return 20;
-    if (square_root(*parse("0x1p-149", f32)).bits != UInt128{0x1a3504f3}) return 21;
-    if (square_root(*parse("0x1p-1074", f64)).bits != UInt128{0x1e60000000000000ULL}) return 21;
-    if (square_root(*parse("6.25", f64)).bits != parse("2.5", f64)->bits) return 21;
-    if (square_root(negative_zero).bits != negative_zero.bits) return 22;
-    if (square_root(infinity).bits != infinity.bits) return 22;
-    if (!is_nan(square_root(*parse("-1.0", f32))) || !is_nan(square_root(invalid))) return 22;
+    if (square_root(*parse("0x1p-149", f32), ieee).bits != UInt128{0x1a3504f3}) return 21;
+    if (square_root(*parse("0x1p-1074", f64), ieee).bits != UInt128{0x1e60000000000000ULL}) return 21;
+    if (square_root(*parse("6.25", f64), ieee).bits != parse("2.5", f64)->bits) return 21;
+    if (square_root(negative_zero, ieee).bits != negative_zero.bits) return 22;
+    if (square_root(infinity, ieee).bits != infinity.bits) return 22;
+    if (!is_nan(square_root(*parse("-1.0", f32), ieee)) || !is_nan(square_root(invalid, ieee))) return 22;
     const Value payload{UInt128{0xffc12345}, f32};
     if (absolute(payload).bits != UInt128{0x7fc12345}) return 23;
     if (copy_sign(payload, one).bits != UInt128{0x7fc12345} ||
         copy_sign(one, payload).bits != UInt128{0xbf800000} ||
         copy_sign(*parse("1.5", f80), *parse("-0.0", f80)).bits !=
             UInt128{0xc000000000000000ULL, 0xbfff}) return 23;
-    if (min_num(payload, one).bits != one.bits || min_num(one, payload).bits != one.bits ||
-        max_num(payload, one).bits != one.bits || max_num(one, payload).bits != one.bits) return 24;
-    if (!is_nan(min_num(payload, invalid)) || !is_nan(max_num(invalid, payload))) return 24;
-    if (min_num(zero, negative_zero).bits != zero.bits ||
-        min_num(negative_zero, zero).bits != negative_zero.bits ||
-        max_num(zero, negative_zero).bits != zero.bits ||
-        max_num(negative_zero, zero).bits != negative_zero.bits) return 25;
-    if (min_num(one, two32).bits != one.bits || min_num(two32, one).bits != one.bits ||
-        max_num(one, two32).bits != two32.bits || max_num(two32, one).bits != two32.bits) return 25;
+    if (min_num(payload, one, ieee).bits != one.bits || min_num(one, payload, ieee).bits != one.bits ||
+        max_num(payload, one, ieee).bits != one.bits || max_num(one, payload, ieee).bits != one.bits) return 24;
+    if (!is_nan(min_num(payload, invalid, ieee)) || !is_nan(max_num(invalid, payload, ieee))) return 24;
+    if (min_num(zero, negative_zero, ieee).bits != zero.bits ||
+        min_num(negative_zero, zero, ieee).bits != negative_zero.bits ||
+        max_num(zero, negative_zero, ieee).bits != zero.bits ||
+        max_num(negative_zero, zero, ieee).bits != negative_zero.bits) return 25;
+    if (min_num(one, two32, ieee).bits != one.bits || min_num(two32, one, ieee).bits != one.bits ||
+        max_num(one, two32, ieee).bits != two32.bits || max_num(two32, one, ieee).bits != two32.bits) return 25;
 
     // Independent host IEEE operations cross-check thousands of exact target
     // results and their exceptions; exceptional NaN payloads are
@@ -226,7 +270,7 @@ int main() {
                 : op == Operation::Multiply ? a * b : a / b;
             const auto host_raised = host_flags();
             ExceptionSet soft_raised{};
-            const auto actual = binary(op, soft_a, soft_b, f32, &soft_raised).bits.low;
+            const auto actual = binary(op, soft_a, soft_b, f32, ieee, &soft_raised).bits.low;
             const auto expected = std::bit_cast<std::uint32_t>(static_cast<float>(host));
             const bool both_nan = (actual & 0x7f800000U) == 0x7f800000U &&
                 (actual & 0x007fffffU) != 0 &&
@@ -236,9 +280,9 @@ int main() {
             if (!same_flags(soft_raised, host_raised)) return 20;
         }
         volatile float root = std::sqrt(static_cast<float>(a));
-        const auto actual = square_root(soft_a).bits.low;
+        const auto actual = square_root(soft_a, ieee).bits.low;
         const auto expected = std::bit_cast<std::uint32_t>(static_cast<float>(root));
-        if (actual != expected && !(std::isnan(root) && is_nan(square_root(soft_a)))) return 26;
+        if (actual != expected && !(std::isnan(root) && is_nan(square_root(soft_a, ieee)))) return 26;
     }
     for (int i = 0; i < 2000; ++i) {
         const auto bits_a = next();
@@ -255,7 +299,7 @@ int main() {
                 : op == Operation::Multiply ? a * b : a / b;
             const auto host_raised = host_flags();
             ExceptionSet soft_raised{};
-            const auto actual = binary(op, soft_a, soft_b, f64, &soft_raised).bits.low;
+            const auto actual = binary(op, soft_a, soft_b, f64, ieee, &soft_raised).bits.low;
             const auto expected = std::bit_cast<std::uint64_t>(static_cast<double>(host));
             const bool both_nan = (actual & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL &&
                 (actual & 0x000fffffffffffffULL) != 0 &&
@@ -269,7 +313,7 @@ int main() {
         volatile float narrowed = static_cast<float>(a);
         auto host_raised = host_flags();
         ExceptionSet soft_raised{};
-        const auto soft_narrowed = convert(soft_a, f32, &soft_raised);
+        const auto soft_narrowed = convert(soft_a, f32, ieee, &soft_raised);
         if (std::bit_cast<std::uint32_t>(static_cast<float>(narrowed)) !=
                 soft_narrowed.bits.low &&
             !std::isnan(static_cast<float>(narrowed))) return 22;
@@ -297,10 +341,10 @@ int main() {
             soft_truncated->low != static_cast<std::uint32_t>(truncated) ||
             !same_flags(soft_raised, host_raised)) return 25;
         volatile double root = std::sqrt(a);
-        const auto actual_root = square_root(soft_a).bits.low;
+        const auto actual_root = square_root(soft_a, ieee).bits.low;
         const auto expected_root = std::bit_cast<std::uint64_t>(static_cast<double>(root));
         if (actual_root != expected_root &&
-            !(std::isnan(static_cast<double>(root)) && is_nan(square_root(soft_a)))) return 27;
+            !(std::isnan(static_cast<double>(root)) && is_nan(square_root(soft_a, ieee)))) return 27;
     }
     return 0;
 }

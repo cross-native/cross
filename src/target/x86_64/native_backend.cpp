@@ -2314,8 +2314,14 @@ private:
                     managed_value.kind == mir::ValueKind::LifetimeEnd) {
                     continue;
                 }
-                target.instructions.push_back(
-                    lower_value(managed_value));
+                auto instruction = lower_value(managed_value);
+                // A floating operation that may raise a trapped exception
+                // stays where the source runs it, even when unused.
+                if (mir::may_trap_floating(managed_value, source, hir_,
+                                           options_.floating_environment)) {
+                    instruction.has_side_effects = true;
+                }
+                target.instructions.push_back(std::move(instruction));
             }
             target.instructions.push_back(lower_terminator(block.terminator));
             current_.blocks.push_back(std::move(target));
@@ -11825,9 +11831,10 @@ private:
         instruction("fstpt", memory(offset));
     }
 
+    // An f80 or binary128 value moves as its whole 16-byte home.
     void load_float(const machine::Function& function, machine::Register source,
                     std::string_view xmm) {
-        if (source.mode.bits == 128) {
+        if (source.mode.bits == 80 || source.mode.bits == 128) {
             instruction("movdqu", memory(vreg_offset(function, source)) +
                                       ", %" + std::string(xmm));
             return;
@@ -11872,7 +11879,7 @@ private:
 
     void store_float(const machine::Function& function, machine::Register target,
                      std::string_view xmm) {
-        if (target.mode.bits == 128) {
+        if (target.mode.bits == 80 || target.mode.bits == 128) {
             instruction("movdqu", "%" + std::string(xmm) + ", " +
                                       memory(vreg_offset(function, target)));
             return;
@@ -15975,12 +15982,16 @@ private:
                 store_x87(function, target);
                 return;
             }
-            // Reload in comparison order: st(0)=left, st(1)=right.
+            // Reload in comparison order: st(0)=left, st(1)=right. The
+            // relational operators are signaling comparisons.
             instruction("fstp", "%st(0)");
             instruction("fstp", "%st(0)");
             load_x87(function, right);
             load_x87(function, left);
-            instruction("fucomip", "%st(1), %st");
+            instruction(value.opcode == Opcode::FcmpEq ||
+                                value.opcode == Opcode::FcmpNe
+                            ? "fucomip" : "fcomip",
+                        "%st(1), %st");
             instruction("fstp", "%st(0)");
             std::string condition;
             if (value.opcode == Opcode::FcmpEq) condition = "e";
@@ -16099,8 +16110,11 @@ private:
         const auto left_register = source_register(left, "xmm0");
         const auto right_register = right == left
             ? left_register : source_register(right, "xmm1");
-        instruction((subtarget_.has_feature(Feature::Avx) ? "vucomi" : "ucomi") +
-                        suffix,
+        // The relational operators are signaling comparisons.
+        const bool quiet = value.opcode == Opcode::FcmpEq ||
+                           value.opcode == Opcode::FcmpNe;
+        instruction(std::string(subtarget_.has_feature(Feature::Avx) ? "v" : "") +
+                        (quiet ? "ucomi" : "comi") + suffix,
                     "%" + right_register + ", %" + left_register);
         std::string condition;
         if (value.opcode == Opcode::FcmpEq) condition = "e";
@@ -16343,10 +16357,40 @@ private:
             store_float(function, target, "xmm1");
             return;
         }
-        // minNum/maxNum: MINSS/MAXSS of (y, x) returns x for unordered or
-        // equal operands; an ordered mask of x then substitutes y for NaN x.
         const auto y = value.uses[1];
         const auto left = operand(x, "xmm0");
+        if ((options_.floating_environment.traps &
+             floating::exception_set(floating::Exception::Invalid)) != 0) {
+            // MINSS and MAXSS raise invalid on a quiet NaN, which this
+            // environment traps. Quiet comparisons select the operand
+            // instead: an unordered pair takes y unless only y is a NaN.
+            const auto right = operand(y, "xmm1");
+            const auto compare = std::string(avx ? "vucomi" : "ucomi") + scalar;
+            const auto copy = [&](const std::string& source) {
+                if (source != "%xmm1")
+                    instruction(avx ? "vmovaps" : "movaps", source + ", %xmm1");
+            };
+            const auto unordered = private_label(function, "fminmax.unordered");
+            const auto take_left = private_label(function, "fminmax.left");
+            const auto take_right = private_label(function, "fminmax.right");
+            const auto done = private_label(function, "fminmax.done");
+            instruction(compare, right + ", " + left);
+            instruction("jp", unordered);
+            instruction(opcode == Opcode::Fmin ? "ja" : "jb", take_right);
+            output_ << take_left << ":\n";
+            copy(left);
+            instruction("jmp", done);
+            output_ << unordered << ":\n";
+            instruction(compare, left + ", " + left);
+            instruction("jnp", take_left);
+            output_ << take_right << ":\n";
+            copy(right);
+            output_ << done << ":\n";
+            store_float(function, target, "xmm1");
+            return;
+        }
+        // minNum/maxNum: MINSS/MAXSS of (y, x) returns x for unordered or
+        // equal operands; an ordered mask of x then substitutes y for NaN x.
         binary((opcode == Opcode::Fmin ? "min" : "max") + scalar, left,
                operand(y, "xmm1"), "%xmm1");
         binary("cmpord" + scalar, left, left, "%xmm2");

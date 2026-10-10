@@ -5005,6 +5005,34 @@ const char* source_expression_conversion_error(const Expr& node, const TypeOf& t
     return nullptr;
 }
 
+// Compiler intrinsics and machine instructions are called; they have no
+// address, unlike the compiler's named constants.
+bool builtin_operation_name(std::string_view name) {
+    const auto* core = find_core_expression_builtin(name);
+    return core ? core->kind == CoreBuiltinKind::Intrinsic : is_machine_builtin_name(name);
+}
+
+std::string builtin_value_error(std::string_view name) {
+    return "built-in '" + std::string(name) + "' has no address; it can only be called";
+}
+
+// The first built-in operation that `node` names without calling it.
+const Expr* uncalled_builtin(const Expr& node, bool callee = false) {
+    if (node.kind == Expr::Kind::Name)
+        return !callee && builtin_operation_name(node.text) ? &node : nullptr;
+    const Expr* found = nullptr;
+    const auto visit = [&](const Expr& child, bool child_callee = false) {
+        if (!found) found = uncalled_builtin(child, child_callee);
+    };
+    if (node.left) visit(*node.left, node.kind == Expr::Kind::Call ||
+                                        (callee && node.kind == Expr::Kind::Parenthesized));
+    if (node.right) visit(*node.right);
+    if (node.third) visit(*node.third);
+    for (const auto& argument : node.arguments) visit(*argument);
+    visit_initializer_children(node, [&](const Expr& child) { visit(child); });
+    return found;
+}
+
 template<class TypeOf>
 std::optional<std::string> source_name_error(const Expr& node, Program& program,
                                             const FunctionDecl* caller, const TypeOf& type_of,
@@ -5014,14 +5042,17 @@ std::optional<std::string> source_name_error(const Expr& node, Program& program,
     // validation, without changing ordinary callable-signature diagnostics.
     if (node.kind == Expr::Kind::Call && node.left && node.left->kind == Expr::Kind::Name &&
         node.left->text.starts_with("$::"))
-        return source_name_error(*node.left, program, caller, type_of);
+        return source_name_error(*node.left, program, caller, type_of, true);
     if (node.kind != Expr::Kind::Name) return {};
     if (node.text.starts_with("$::")) {
         // Instruction names and operand/resource interpretation stay with the
         // target. Compiler-owned names do not bypass source validation merely
         // because an enclosing expression already has a known scalar type.
-        if (is_machine_builtin_name(node.text) || find_core_expression_builtin(node.text)) return {};
-        return "unknown compiler builtin '" + node.text + "'";
+        if (!find_core_expression_builtin(node.text) && !is_machine_builtin_name(node.text))
+            return "unknown compiler builtin '" + node.text + "'";
+        if (!direct_callee && builtin_operation_name(node.text))
+            return builtin_value_error(node.text);
+        return {};
     }
     const auto type = type_of(node);
     // Translation-only functions have no address, even in unselected or
@@ -6947,6 +6978,11 @@ public:
     std::optional<EvalValue> required_scalar(const Expr& source) {
         return required_scalar_async(source).run();
     }
+    // The truth value of a required condition, absent when taking it traps.
+    std::optional<bool> required_truth(const EvalValue& value, SourceLocation location) {
+        if (!floating_truth_permitted(value, location)) return std::nullopt;
+        return value.truthy();
+    }
     bool validate_required_tree(const Expr& source) {
         return validate_required_tree_async(source).run();
     }
@@ -7581,7 +7617,10 @@ public:
                  "required expression is not a scalar translation-time value");
             co_return std::nullopt;
         }
-        value = (co_await convert_async(*value, destination, source.location));
+        // Initializing a volatile or atomic object accesses none.
+        auto type = destination ? clone_type(destination) : TypePtr{};
+        if (type) type->is_volatile = type->is_atomic = false;
+        value = (co_await convert_async(*value, type, source.location));
         if (!value) fail(source.location,
                          "floating initializer cannot be converted to its type");
         co_return value;
@@ -10646,6 +10685,7 @@ private:
             fail(location, "emitted object addresses cannot be inspected during translation-time evaluation");
             return false;
         }
+        if (!floating_truth_permitted(value, location)) return false;
         return !value.meta_pointer || live_meta_pointer(value, location);
     }
 
@@ -11094,7 +11134,8 @@ private:
             floating::ExceptionSet raised{};
             if (value.floating) {
                 if (value.floating->format != format) {
-                    value.floating = floating::convert(*value.floating, format, &raised);
+                    value.floating = floating::convert(*value.floating, format,
+                        program_.evaluation_layout.nan_encoding, &raised);
                     if (!floating_environment_permits(raised, &*value.floating, location))
                         co_return std::nullopt;
                 }
@@ -11112,6 +11153,7 @@ private:
             if (!is_integer(type)) co_return std::nullopt;
             const auto target = integer_type(type);
             if (target.is_bool) {
+                if (!floating_truth_permitted(value, location)) co_return std::nullopt;
                 co_return EvalValue{UInt128{floating::nonzero(*value.floating)},
                                  clone_type(type)};
             }
@@ -11176,7 +11218,8 @@ private:
                                    : floating::Comparison::GreaterEqual;
             floating::ExceptionSet raised{};
             const bool result = floating::compare(comparison,
-                *left.floating, *right.floating, &raised);
+                *left.floating, *right.floating,
+                program_.evaluation_layout.nan_encoding, &raised);
             if (!floating_environment_permits(raised, nullptr, location)) co_return std::nullopt;
             co_return EvalValue{UInt128{result}, builtin_type(BuiltinType::Bool)};
         }
@@ -11189,7 +11232,8 @@ private:
         floating::ExceptionSet raised{};
         auto result = floating::binary(opcode, *left.floating,
             *right.floating, floating_format(result_type->builtin,
-                                              program_.address_bits), &raised);
+                                              program_.address_bits),
+            program_.evaluation_layout.nan_encoding, &raised);
         if (!floating_environment_permits(raised, &result, location)) co_return std::nullopt;
         co_return EvalValue{result, result_type};
     }
@@ -11207,6 +11251,17 @@ private:
                   std::string(floating::exception_name(*trapped)) +
                   "' exception during translation-time evaluation");
         return false;
+    }
+
+    // The truth value of a floating operand is its quiet comparison with
+    // zero, which raises what that comparison raises.
+    bool floating_truth_permitted(const EvalValue& value, SourceLocation location) {
+        if (!value.floating) return true;
+        floating::ExceptionSet raised{};
+        (void)floating::compare(floating::Comparison::NotEqual, *value.floating,
+            floating::Value{UInt128{}, value.floating->format},
+            program_.evaluation_layout.nan_encoding, &raised);
+        return floating_environment_permits(raised, nullptr, location);
     }
 
     struct Flow {
@@ -12700,6 +12755,8 @@ private:
                 auto scalar = (co_await read_meta_pointer_async((co_await vector_lane_pointer_async(*value, lane)), expression.location));
                 if (!scalar) co_return std::nullopt;
                 std::optional<EvalValue> updated;
+                if (expression.text == "!" && !floating_truth_permitted(*scalar, expression.location))
+                    co_return std::nullopt;
                 if (expression.text == "!") updated = EvalValue{scalar->truthy() ? UInt128{}
                     : mask_to(bit_not(UInt128{}), integer_type(result_type->element).bits), result_type->element};
                 else if (expression.text == "-") {
@@ -12728,6 +12785,7 @@ private:
                 co_return value;
             }
             if (expression.text == "!") {
+                if (!floating_truth_permitted(*value, expression.location)) co_return std::nullopt;
                 co_return EvalValue{UInt128{!value->truthy()},
                                  builtin_type(BuiltinType::Bool)};
             }
@@ -13331,6 +13389,11 @@ private:
         // Keep recursive tree transforms off the much larger scalar/byte
         // intrinsic frame. The token overload of is_kind has its own handler.
         const auto& name = expression.left->text;
+        if (control_intrinsic(expression) == ControlIntrinsic::Expect) {
+            // The expectation is only a frequency hint.
+            if (!(co_await validate_control_intrinsic_async(expression))) co_return std::nullopt;
+            co_return (co_await this->expression_async(*expression.arguments.front()));
+        }
         if (const auto operation = floating_intrinsic(name); operation != FloatingIntrinsic::None) {
             if (const auto issue = source_floating_intrinsic_error(expression,
                     [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
@@ -13348,14 +13411,17 @@ private:
                 operands.push_back(std::move(*value));
             }
             const auto& x = *operands.front().floating;
+            const auto encoding = program_.evaluation_layout.nan_encoding;
             floating::ExceptionSet raised{};
             auto result =
-                operation == FloatingIntrinsic::Sqrt ? floating::square_root(x, &raised)
+                operation == FloatingIntrinsic::Sqrt ? floating::square_root(x, encoding, &raised)
                 : operation == FloatingIntrinsic::Fabs ? floating::absolute(x)
                 : operation == FloatingIntrinsic::Copysign ? floating::copy_sign(x, *operands[1].floating)
-                : operation == FloatingIntrinsic::Fmin ? floating::min_num(x, *operands[1].floating, &raised)
-                                                        : floating::max_num(x, *operands[1].floating, &raised);
-            if (!floating_environment_permits(raised, &result, expression.location)) co_return std::nullopt;
+                : operation == FloatingIntrinsic::Fmin ? floating::min_num(x, *operands[1].floating, encoding, &raised)
+                                                        : floating::max_num(x, *operands[1].floating, encoding, &raised);
+            // No result flushes: a square root is never denormal, and the
+            // others copy an operand.
+            if (!floating_environment_permits(raised, nullptr, expression.location)) co_return std::nullopt;
             co_return EvalValue{result, builtin_type(operands.front().type->builtin)};
         }
         if (atomic_builtin(name) == AtomicBuiltin::IsLockFree) {
@@ -14440,7 +14506,7 @@ private:
             // value. Every reached assertion observes the current call/iteration,
             // sharing its ordinary evaluation budgets and retained name bindings.
             const auto value = (co_await required_scalar_async(*statement.expression));
-            if (!value) co_return {Flow::Failed};
+            if (!value || !floating_truth_permitted(*value, statement.location)) co_return {Flow::Failed};
             if (!value->truthy()) {
                 fail(statement.location, "$::static_assert failed: " + statement.assertion_message);
                 co_return {Flow::Failed};
@@ -16286,6 +16352,10 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
             continue;
         }
         if (object->initializer) {
+            if (const auto* builtin = uncalled_builtin(*object->initializer)) {
+                diagnostics.error(builtin->location, builtin_value_error(builtin->text));
+                continue;
+            }
             auto* owner = object_lexical_function(program, *object);
             const auto source_namespace = owner ? owner->source_namespace : namespace_prefix(object->name);
             const bool byte_array = object->type &&
@@ -16867,7 +16937,9 @@ EvaluationTask<void> validate_static_assertion_async(Program& program, Diagnosti
             diagnostics.error(assertion.location,
                 "$::static_assert condition is not a scalar constant expression");
         evaluator.diagnose(assertion.location);
-    } else if (!value->truthy()) {
+    } else if (const auto truth = evaluator.required_truth(*value, assertion.location); !truth) {
+        evaluator.diagnose(assertion.location);
+    } else if (!*truth) {
         diagnostics.error(assertion.location, "$::static_assert failed: " + assertion.message);
     }
 }

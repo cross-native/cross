@@ -1550,6 +1550,8 @@ const TargetInfo target{
         scalar_float_binary_form("$::_divsd", "divsd"),
         scalar_float_compare_form("$::_ucomiss", "ucomiss"),
         scalar_float_compare_form("$::_ucomisd", "ucomisd"),
+        scalar_float_compare_form("$::_comiss", "comiss"),
+        scalar_float_compare_form("$::_comisd", "comisd"),
         scalar_bit_move_form("$::_movd", "movd", 32, true),
         scalar_bit_move_form("$::_movd", "movd", 32, false),
         scalar_bit_move_form("$::_movq", "movq", 64, true),

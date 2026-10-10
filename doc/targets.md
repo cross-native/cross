@@ -122,15 +122,23 @@ The x86-64 profiles declare the floating environment in which these systems
 start a program: MXCSR and the x87 control word mask every exception, and
 denormals are kept (FTZ and DAZ clear). Code that unmasks exceptions or sets
 FTZ needs a profile that declares it ([models.md](models.md#profiles)). The
-`f32` and `f64` relational operators compile to `ucomiss` and `ucomisd`, which
-raise the invalid-operation exception only for a signaling NaN.
+relational operators compile to `comiss`, `comisd`, and `fcomip`, which raise
+the invalid-operation exception for every NaN; `==`, `!=`, and the truth value
+of a floating operand use `ucomiss`, `ucomisd`, and `fucomip`, which raise it
+only for a signaling NaN. An invalid operation evaluated at compile time
+produces a positive quiet NaN, such as 0x7fc00000 for `f32`, where SSE and the
+x87 unit produce a negative one. FTZ does not apply to `f80` and `f128`
+results, and `f128` operations raise no exceptions.
 
 The floating intrinsics use SSE for `f32` and `f64` and the x87 unit for
 `f80`; `$::fmin` and `$::fmax` are `minss`/`maxss` (`minsd`/`maxsd`) with an
-ordered compare that substitutes the second operand for a NaN first one. On
-`f128`, `$::fabs` and `$::copysign` change the sign bit, and `$::sqrt`,
-`$::fmin`, and `$::fmax` are errors. The `f80` forms round as the x87
-precision control selects, which must be the 64-bit significand.
+ordered compare that substitutes the second operand for a NaN first one.
+Because those instructions raise the invalid-operation exception for a quiet
+NaN, under a profile that traps that exception the two intrinsics compare with
+`ucomiss` or `ucomisd` and branch instead. On `f128`, `$::fabs` and `$::copysign` change
+the sign bit, and `$::sqrt`, `$::fmin`, and `$::fmax` are errors. The `f80`
+forms round as the x87 precision control selects, which must be the 64-bit
+significand.
 
 A `[[musttail]]` call cannot target a variadic function or leave a function
 that binds variadic state, and passes every argument in a register. With
@@ -196,6 +204,18 @@ profile "n64-thread" {
 `$::_ctc1` changes the FCSR without changing the environment that the profile
 declares.
 
+Without `-mnan2008`, MIPS FPUs use the legacy NaN encoding: a set most
+significant fraction bit marks a signaling NaN, and an invalid operation
+produces the NaN 0x7fbfffff (`f32`) or 0x7ff7ffffffffffff (`f64`).
+Compile-time evaluation follows the selected encoding.
+
+`neg.s` and `neg.d` are arithmetic on these FPUs: they raise the
+invalid-operation exception for a signaling NaN, need not keep a NaN's sign
+and payload, and trap on a VR4300 for a denormal operand. Unary `-` uses them
+only under a profile that traps neither the invalid-operation exception nor
+denormal operands and keeps denormal results; otherwise it flips the sign bit
+in general registers, as `$::fabs` does.
+
 ABIs:
 
 | ABI | Aliases | Notes |
@@ -228,6 +248,7 @@ the features it implies, and `-m`/`-mno-` options adjust them:
 | `-mfp32`, `-mfpxx`, `-mfp64`, `-modd-spreg` | FPU register model. |
 | `-mllsc` | 32-bit LL/SC atomics. |
 | `-mfix4300` | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
+| `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |
 | `-mbranch-likely`, `-mcond-move`, `-mrotate` | Allow branch-likely, conditional-move, and rotate instructions. |
 | `-mcmodel=large` | Materialize full 64-bit addresses and call through registers. |
 | `-mlong-calls` | Call every function through a register (`lui`, `addiu`, `jalr`), so callers and callees need not lie in the same 256 MB region that `jal` reaches. |
@@ -249,7 +270,8 @@ call a software floating-point library.
 error and `$::has_intrinsic($::sqrt)` is 0. `$::fabs` and `$::copysign` change
 the sign bit in general registers rather than with `abs.fmt` or `neg.fmt`, so
 they keep a NaN operand's payload and raise no exception. `$::fmin` and
-`$::fmax` branch on quiet comparisons and copy the selected operand.
+`$::fmax` branch on quiet comparisons, which compare the second operand also
+when the first is a NaN, and copy the selected operand.
 
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 hard-float `f32` and `f64`, structures and unions by value under every ABI,
@@ -367,10 +389,6 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 - `-emit-llvm` and `-emit-gimple` output ignores the profile's floating
   environment: it is valid only where no exception traps and denormal results
   are kept.
-- Compile-time evaluation takes the truth value of a floating operand (in a
-  condition, `!`, `&&`, `||`, or a conversion to `bool`) as raising no
-  exception; at run time, a signaling NaN, or a denormal operand that the
-  profile traps, traps there.
 - On MIPS, a function that allocates a variable-length array cannot also have
   a local aligned beyond the stack alignment (8 bytes under o32 and EABI, 16
   under n64 and the Cross ABIs).

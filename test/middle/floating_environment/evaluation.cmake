@@ -4,8 +4,9 @@
 # Under a profile that flushes denormal results and traps the invalid
 # operation and denormal operands, an evaluated result flushes to zero, and an
 # operation that would trap is not evaluated: an opportunistic evaluation
-# leaves it for runtime and a required one is an error. The default profile
-# evaluates the same source with gradual underflow.
+# leaves it for runtime and a required one is an error; the truth value of a
+# denormal is such an operation. Sign operations copy bits and never flush.
+# The default profile evaluates the same source with gradual underflow.
 
 foreach(required CC SOURCE MODEL OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -52,6 +53,8 @@ expect_object(default tiny 71362)
 expect_object(default negative_tiny 2147555010)
 expect_object(default written 71362)
 expect_object(default huge 2139095040)
+expect_object(default magnitude 71362)
+expect_object(default transferred 2147555010)
 function_text(text invalid_quotient)
 if(text MATCHES "\tdivss\t")
     message(FATAL_ERROR "default: 0/0 was not evaluated\n${text}")
@@ -65,6 +68,8 @@ expect_object(trapping tiny 0)
 expect_object(trapping negative_tiny 2147483648)
 expect_object(trapping written 71362)
 expect_object(trapping huge 2139095040)
+expect_object(trapping magnitude 71362)
+expect_object(trapping transferred 2147555010)
 function_text(text folded)
 if(text MATCHES "\tdivss\t")
     message(FATAL_ERROR "trapping: 1/4 was not evaluated\n${text}")
@@ -74,7 +79,7 @@ if(NOT text MATCHES "\tdivss\t")
     message(FATAL_ERROR "trapping: 0/0 was evaluated\n${text}")
 endif()
 
-foreach(case INVALID DENORMAL)
+foreach(case INVALID DENORMAL TRUTH)
     compile(default-${case} -D${case})
     if(NOT status EQUAL 0)
         message(FATAL_ERROR "default: ${case} was rejected\n${stderr}")
@@ -89,4 +94,9 @@ compile(trapping-denormal -DDENORMAL ${trapping})
 if(status EQUAL 0 OR NOT stderr MATCHES
    "evaluation[.]x:24:[0-9]+: error: floating-point operation traps on a denormal operand during translation-time evaluation")
     message(FATAL_ERROR "trapping: a denormal operand was not diagnosed\n${stderr}")
+endif()
+compile(trapping-truth -DTRUTH ${trapping})
+if(status EQUAL 0 OR NOT stderr MATCHES
+   "evaluation[.]x:27:[0-9]+: error: floating-point operation traps on a denormal operand during translation-time evaluation")
+    message(FATAL_ERROR "trapping: the truth value of a denormal was not diagnosed\n${stderr}")
 endif()

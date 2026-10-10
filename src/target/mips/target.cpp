@@ -454,6 +454,9 @@ const SubtargetTable subtargets{
         {"fpu-transfer-interlocks", false, false, {"mips1"}, {}},
         {"fpu-compare-interlocks", false, false, {"mips1"}, {}},
         {"hilo-interlocks", false, false, {"mips1"}, {}},
+        // FCSR.NAN2008: Release 2 FPUs may implement the IEEE 754-2008 NaN
+        // encoding; earlier ones have only the legacy encoding.
+        {"nan2008", false, true, {"mips32r2"}, {}},
     },
     {
         {"generic", {"mips1", "hard-float", "fp32", "odd-spreg"}},
@@ -548,6 +551,8 @@ std::vector<OptionDefinition> target_options() {
     boolean("llsc", false, "enable load-linked/store-conditional atomics");
     boolean("branch-likely", false, "enable branch-likely instructions");
     boolean("fix4300", false, "work around the early VR4300 FP multiply erratum");
+    boolean("nan2008", false,
+            "use the IEEE 754-2008 NaN encoding instead of the legacy one");
     boolean("long-calls", false,
             "call through a register so the callee may lie outside the "
             "caller's 256 MB region");
@@ -576,7 +581,8 @@ TargetInfo make_target(ByteOrder order,
              ? BitFieldOrder::MostSignificantFirst
              : BitFieldOrder::LeastSignificantFirst,
          BitFieldUnitSharing::SameUnqualifiedBase,
-         BitFieldPlacement::AlignedUnits, CodeAddressRepresentation::Flat},
+         BitFieldPlacement::AlignedUnits, CodeAddressRepresentation::Flat,
+         floating::NanEncoding::Legacy, "nan2008"},
         target_registers(),
         {
             {"i8", 8, "mips1", PatchAddressRepresentation::FlatUptr, false, true},

@@ -22,4 +22,11 @@ global f32 invalid_quotient() {
 global f32 nan_value = $::eval(0.0f32 / 0.0f32);
 #elif defined(DENORMAL)
 global f32 doubled = $::eval(1.0e-40f32 * 2.0f32);
+#elif defined(TRUTH)
+// The truth value of a denormal is its comparison with zero.
+global u32 truth = $::eval(1.0e-40f32 ? 1u32 : 0u32);
 #endif
+
+// Sign operations only copy bits, so their results are never flushed.
+global f32 magnitude = $::eval($::fabs(-1.0e-40f32));
+global f32 transferred = $::eval($::copysign(1.0e-40f32, -1.0f32));

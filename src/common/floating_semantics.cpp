@@ -181,13 +181,6 @@ Value infinity(Format format, bool negative) {
                    spec(format).explicit_bit ? shift_left(UInt128{1}, 63) : UInt128{});
 }
 
-Value nan(Format format) {
-    const auto info = spec(format);
-    return encoded(format, false, info.max_field(),
-                   bit_or(shift_left(UInt128{1}, info.precision - 2),
-                          info.explicit_bit ? shift_left(UInt128{1}, 63) : UInt128{}));
-}
-
 Number decode(Value value) {
     const auto info = spec(value.format);
     const auto field = static_cast<unsigned>(
@@ -279,12 +272,6 @@ Value round_rational(Format format, bool negative, BigUnsigned numerator,
     return encoded(format, negative, 0, rounded);
 }
 
-// A NaN whose quiet bit, the most significant fraction bit, is clear.
-bool signaling(Value value) {
-    return decode(value).kind == Class::NaN &&
-           !bit(value.bits, spec(value.format).precision - 2);
-}
-
 // The integer square root by binary digits; `inexact` reports a remainder.
 BigUnsigned integer_square_root(BigUnsigned value, bool& inexact) {
     BigUnsigned root;
@@ -372,12 +359,13 @@ std::optional<Value> parse(std::string text, Format format) {
                           std::move(denominator), binary_scale);
 }
 
-Value convert(Value value, Format format, ExceptionSet* raised) {
+Value convert(Value value, Format format, NanEncoding encoding,
+              ExceptionSet* raised) {
     if (value.format == format) return value;
     if (denormal(value)) raise(raised, Exception::DenormalOperand);
-    if (signaling(value)) raise(raised, Exception::Invalid);
+    if (signaling(value, encoding)) raise(raised, Exception::Invalid);
     const auto number = decode(value);
-    if (number.kind == Class::NaN) return nan(format);
+    if (number.kind == Class::NaN) return nan(format, encoding);
     if (number.kind == Class::Infinity) return infinity(format, number.negative);
     return round_rational(format, number.negative, number.significand,
                           BigUnsigned{UInt128{1}}, number.scale, raised);
@@ -407,15 +395,32 @@ bool is_nan(Value value) {
     return decode(value).kind == Class::NaN;
 }
 
-Value square_root(Value value, ExceptionSet* raised) {
+// The most significant fraction bit marks a quiet NaN in the 2008 encoding
+// and a signaling one in the legacy encoding.
+bool signaling(Value value, NanEncoding encoding) {
+    return is_nan(value) &&
+           bit(value.bits, spec(value.format).precision - 2) ==
+               (encoding == NanEncoding::Legacy);
+}
+
+Value nan(Format format, NanEncoding encoding) {
+    const auto info = spec(format);
+    const auto quiet = shift_left(UInt128{1}, info.precision - 2);
+    auto fraction = encoding == NanEncoding::Ieee2008
+        ? quiet : subtract(quiet, UInt128{1});
+    if (info.explicit_bit) fraction = bit_or(fraction, shift_left(UInt128{1}, 63));
+    return encoded(format, false, info.max_field(), fraction);
+}
+
+Value square_root(Value value, NanEncoding encoding, ExceptionSet* raised) {
     if (denormal(value)) raise(raised, Exception::DenormalOperand);
-    if (signaling(value)) raise(raised, Exception::Invalid);
+    if (signaling(value, encoding)) raise(raised, Exception::Invalid);
     const auto number = decode(value);
-    if (number.kind == Class::NaN) return nan(value.format);
+    if (number.kind == Class::NaN) return nan(value.format, encoding);
     if (number.kind == Class::Zero) return value;
     if (number.negative) {
         raise(raised, Exception::Invalid);
-        return nan(value.format);
+        return nan(value.format, encoding);
     }
     if (number.kind == Class::Infinity) return value;
     // An integer root of at least precision + 2 bits leaves the rounding
@@ -441,19 +446,20 @@ Value square_root(Value value, ExceptionSet* raised) {
 }
 
 Value binary(Operation operation, Value left, Value right, Format format,
-             ExceptionSet* raised) {
-    left = convert(left, format, raised);
-    right = convert(right, format, raised);
+             NanEncoding encoding, ExceptionSet* raised) {
+    left = convert(left, format, encoding, raised);
+    right = convert(right, format, encoding, raised);
     if (denormal(left) || denormal(right))
         raise(raised, Exception::DenormalOperand);
-    if (signaling(left) || signaling(right)) raise(raised, Exception::Invalid);
+    if (signaling(left, encoding) || signaling(right, encoding))
+        raise(raised, Exception::Invalid);
     const auto a = decode(left);
     auto b = decode(right);
     if (operation == Operation::Subtract) b.negative = !b.negative;
-    if (a.kind == Class::NaN || b.kind == Class::NaN) return nan(format);
+    if (a.kind == Class::NaN || b.kind == Class::NaN) return nan(format, encoding);
     const auto invalid = [&] {
         raise(raised, Exception::Invalid);
-        return nan(format);
+        return nan(format, encoding);
     };
     const bool product_sign = a.negative != b.negative;
     if (operation == Operation::Multiply || operation == Operation::Divide) {
@@ -500,16 +506,14 @@ Value binary(Operation operation, Value left, Value right, Format format,
 }
 
 bool compare(Comparison comparison, Value left, Value right,
-             ExceptionSet* raised) {
+             NanEncoding encoding, ExceptionSet* raised) {
     if (denormal(left) || denormal(right))
         raise(raised, Exception::DenormalOperand);
     const auto a = decode(left);
     const auto b = decode(right);
-    // The relational comparisons signal on every NaN, equality only on a
-    // signaling one.
     const bool equality = comparison == Comparison::Equal ||
                           comparison == Comparison::NotEqual;
-    if (signaling(left) || signaling(right) ||
+    if (signaling(left, encoding) || signaling(right, encoding) ||
         (!equality && (a.kind == Class::NaN || b.kind == Class::NaN)))
         raise(raised, Exception::Invalid);
     if (a.kind == Class::NaN || b.kind == Class::NaN)
@@ -535,18 +539,26 @@ bool compare(Comparison comparison, Value left, Value right,
     return false;
 }
 
-Value min_num(Value left, Value right, ExceptionSet* raised) {
-    if (signaling(left) || signaling(right)) raise(raised, Exception::Invalid);
+Value min_num(Value left, Value right, NanEncoding encoding,
+              ExceptionSet* raised) {
+    if (denormal(left) || denormal(right))
+        raise(raised, Exception::DenormalOperand);
+    if (signaling(left, encoding) || signaling(right, encoding))
+        raise(raised, Exception::Invalid);
     if (is_nan(left)) return right;
     if (is_nan(right)) return left;
-    return compare(Comparison::Less, right, left, raised) ? right : left;
+    return compare(Comparison::Less, right, left, encoding) ? right : left;
 }
 
-Value max_num(Value left, Value right, ExceptionSet* raised) {
-    if (signaling(left) || signaling(right)) raise(raised, Exception::Invalid);
+Value max_num(Value left, Value right, NanEncoding encoding,
+              ExceptionSet* raised) {
+    if (denormal(left) || denormal(right))
+        raise(raised, Exception::DenormalOperand);
+    if (signaling(left, encoding) || signaling(right, encoding))
+        raise(raised, Exception::Invalid);
     if (is_nan(left)) return right;
     if (is_nan(right)) return left;
-    return compare(Comparison::Less, left, right, raised) ? right : left;
+    return compare(Comparison::Less, left, right, encoding) ? right : left;
 }
 
 bool nonzero(Value value) {

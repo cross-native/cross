@@ -280,8 +280,11 @@ bool may_trap_floating(const ManagedValue& value, const ManagedFunction& functio
     case ValueKind::Cast:
         if (value.cast == CastOperation::Reinterpret) return false;
         break;
-    case ValueKind::Binary:
     case ValueKind::Intrinsic:
+        if (value.intrinsic == IntrinsicOperation::Fabs ||
+            value.intrinsic == IntrinsicOperation::Copysign) return false;
+        break;
+    case ValueKind::Binary:
     case ValueKind::MachineInstruction:
         break;
     default:

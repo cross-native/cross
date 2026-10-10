@@ -99,6 +99,7 @@ public:
         const IntegerOperationCostQuery& query) const;
     [[nodiscard]] std::optional<unsigned> integer_multiply_high_cost(
         const IntegerOperationCostQuery& query) const;
+    [[nodiscard]] floating::NanEncoding nan_encoding() const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;
     }

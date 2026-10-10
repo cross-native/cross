@@ -2050,7 +2050,7 @@ private:
             }
             value = *parsed;
         }
-        value = floating::convert(value, format);
+        value = floating::convert(value, format, subtarget_.nan_encoding());
         const auto* bits = acquire_scratch(
             builtin_type(type->builtin == BuiltinType::F32
                              ? BuiltinType::U32 : BuiltinType::U64),
@@ -2999,9 +2999,13 @@ private:
                     return false;
                 }
             }
+            // The relational operators are signaling comparisons.
+            const bool quiet = operation == "==" || operation == "!=";
             const auto* compare = binary_register_form(
-                scalar_float_name(comparison_type, "$::_ucomiss",
-                                  "$::_ucomisd"),
+                quiet ? scalar_float_name(comparison_type, "$::_ucomiss",
+                                          "$::_ucomisd")
+                      : scalar_float_name(comparison_type, "$::_comiss",
+                                          "$::_comisd"),
                 *left_register, *right_register);
             if (!compare) {
                 diagnostics_.error(expression.location,

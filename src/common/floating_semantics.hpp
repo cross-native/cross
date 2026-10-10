@@ -48,6 +48,13 @@ struct Environment {
     friend bool operator==(const Environment&, const Environment&) = default;
 };
 
+// How a target encodes NaNs. In the IEEE 754-2008 encoding a set most
+// significant fraction bit marks a quiet NaN, and the default NaN that an
+// invalid operation produces sets only that bit. In the legacy MIPS encoding
+// that bit marks a signaling NaN, and the default NaN sets every other
+// fraction bit.
+enum class NanEncoding { Ieee2008, Legacy };
+
 // Whether a rewrite may create floating intermediate results that the source
 // does not compute, as reassociation does: such a result can overflow,
 // underflow, be inexact or denormal, or be an infinity that a later operation
@@ -63,25 +70,38 @@ struct Environment {
 //
 // An operation adds the exceptions it raises to `*raised` when given one.
 // Underflow means a tiny nonzero result, detected before rounding, which an
-// enabled underflow trap takes even when the result is exact. Signaling NaNs
-// have a clear quiet bit (IEC 60559:2008). Negation raises nothing.
+// enabled underflow trap takes even when the result is exact. A NaN result
+// is the default NaN of `encoding`, which also tells signaling NaNs apart.
+// Negation and the sign operations raise nothing.
 [[nodiscard]] std::optional<Value> parse(std::string text, Format format);
-[[nodiscard]] Value convert(Value value, Format format,
+[[nodiscard]] Value convert(Value value, Format format, NanEncoding encoding,
                             ExceptionSet* raised = nullptr);
 [[nodiscard]] Value negate(Value value);
 // Sign operations transfer only the sign bit, NaN payloads included.
 [[nodiscard]] Value absolute(Value value);
 [[nodiscard]] Value copy_sign(Value magnitude, Value sign);
 [[nodiscard]] bool is_nan(Value value);
-[[nodiscard]] Value square_root(Value value, ExceptionSet* raised = nullptr);
+[[nodiscard]] bool signaling(Value value, NanEncoding encoding);
+// The default NaN.
+[[nodiscard]] Value nan(Format format, NanEncoding encoding);
+[[nodiscard]] Value square_root(Value value, NanEncoding encoding,
+                                ExceptionSet* raised = nullptr);
 // IEEE 754 minNum and maxNum: a NaN operand yields the other operand, and
 // operands that compare equal, such as zeros of either sign, yield the left.
-[[nodiscard]] Value min_num(Value left, Value right, ExceptionSet* raised = nullptr);
-[[nodiscard]] Value max_num(Value left, Value right, ExceptionSet* raised = nullptr);
+// A signaling NaN raises invalid and a denormal operand raises a denormal
+// operand exception, whichever operand is selected.
+[[nodiscard]] Value min_num(Value left, Value right, NanEncoding encoding,
+                            ExceptionSet* raised = nullptr);
+[[nodiscard]] Value max_num(Value left, Value right, NanEncoding encoding,
+                            ExceptionSet* raised = nullptr);
 [[nodiscard]] Value binary(Operation operation, Value left, Value right,
-                           Format result_format,
+                           Format result_format, NanEncoding encoding,
                            ExceptionSet* raised = nullptr);
+// The relational comparisons signal on every NaN, equality only on a
+// signaling one; the truth value of a floating value is its quiet comparison
+// with zero.
 [[nodiscard]] bool compare(Comparison comparison, Value left, Value right,
+                           NanEncoding encoding,
                            ExceptionSet* raised = nullptr);
 [[nodiscard]] bool nonzero(Value value);
 [[nodiscard]] bool denormal(Value value);

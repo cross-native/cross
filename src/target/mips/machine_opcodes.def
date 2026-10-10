@@ -120,10 +120,11 @@ X(VariadicState, "mips.variadic.state")
 X(StackSave, "mips.stack.save")
 X(StackAllocate, "mips.stack.allocate")
 X(StackRestore, "mips.stack.restore")
-// Floating intrinsics without a registry form; a square root is the
-// registry's SQRT.fmt.
+// Floating intrinsics without a registry form, and negation through general
+// registers; a square root is the registry's SQRT.fmt.
 X(Fabs, "mips.fabs")
 X(Fcopysign, "mips.fcopysign")
+X(FnegSign, "mips.fneg.sign")
 X(Fmin, "mips.fmin")
 X(Fmax, "mips.fmax")
 // A registry instruction form. Operand 0 is the form ID; the form's

@@ -9052,7 +9052,11 @@ void inline_managed_calls(ManagedModule& module,
     }
 }
 
-void eliminate_dead_values(ManagedFunction& function) {
+// A floating operation that may raise a trapped exception stays even when
+// its result is unused.
+void eliminate_dead_values(ManagedFunction& function,
+                           const hir::Module& hir_module,
+                           const floating::Environment& environment) {
     std::vector<bool> live(function.values.size());
     std::vector<ValueId> pending;
     const auto mark = [&](ValueId value) {
@@ -9065,7 +9069,9 @@ void eliminate_dead_values(ManagedFunction& function) {
     for (const auto& block : function.blocks) {
         if (block.terminator.value) mark(*block.terminator.value);
         for (const auto value_id : block.values) {
-            if (is_effectful_value(function.values[value_id.value])) {
+            const auto& value = function.values[value_id.value];
+            if (is_effectful_value(value) ||
+                may_trap_floating(value, function, hir_module, environment)) {
                 mark(value_id);
             }
         }
@@ -9535,7 +9541,8 @@ bool acyclic_control_flow(const ManagedFunction& function) {
 }
 
 bool locally_removable_function(const ManagedFunction& function,
-                                const hir::Module& hir_module) {
+                                const hir::Module& hir_module,
+                                const floating::Environment& environment) {
     const auto& entity = hir_module.function(function.source);
     if (!function.labels.empty() || !acyclic_control_flow(function) ||
         std::any_of(entity.parameters.begin(), entity.parameters.end(),
@@ -9557,7 +9564,8 @@ bool locally_removable_function(const ManagedFunction& function,
                 value.kind == ValueKind::PointerStore ||
                 value.kind == ValueKind::GlobalStore ||
                 value.kind == ValueKind::Atomic ||
-                value.kind == ValueKind::PatchValue) {
+                value.kind == ValueKind::PatchValue ||
+                may_trap_floating(value, function, hir_module, environment)) {
                 return false;
             }
             if ((value.kind == ValueKind::Load ||
@@ -9580,14 +9588,16 @@ bool locally_removable_function(const ManagedFunction& function,
 }
 
 std::unordered_set<std::uint32_t> infer_removable_functions(
-    const ManagedModule& module, const hir::Module& hir_module) {
+    const ManagedModule& module, const hir::Module& hir_module,
+    const floating::Environment& environment) {
     std::unordered_set<std::uint32_t> removable;
     bool changed = true;
     while (changed) {
         changed = false;
         for (const auto& function : module.functions) {
             if (removable.contains(function.source.value) ||
-                !locally_removable_function(function, hir_module)) {
+                !locally_removable_function(function, hir_module,
+                                            environment)) {
                 continue;
             }
             bool calls_are_removable = true;
@@ -10834,8 +10844,12 @@ void simplify_floating_math(ManagedFunction& function,
         const auto right_id = value.operands[1];
         const auto& left = function.values[left_id.value];
         const auto& right = function.values[right_id.value];
+        // An identity deletes the operation, which must stay where the
+        // environment traps what it may raise.
         if (!floating_type(hir_module, left.type) ||
-            left.type != right.type) {
+            left.type != right.type ||
+            may_trap_floating(value, function, hir_module,
+                              options.floating_environment)) {
             continue;
         }
         if (options.finite_math_only && left_id == right_id) {
@@ -17128,15 +17142,18 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             (void)fold_constants(function, hir_module);
             simplify_integer_operations(function, hir_module);
         }
-        if (!options.tree_dce) eliminate_dead_values(function);
+        if (!options.tree_dce) {
+            eliminate_dead_values(function, hir_module,
+                                  options.floating_environment);
+        }
     }
 
     // This is the one module pass in the early scalar pipeline: it reaches a
     // fixed point over the call graph and therefore intentionally brackets
     // the per-function pass managers.
     if (options.ipa_pure_const) {
-        const auto removable =
-            infer_removable_functions(module, hir_module);
+        const auto removable = infer_removable_functions(
+            module, hir_module, options.floating_environment);
         for (auto& function : module.functions) {
             eliminate_dead_removable_calls(function, removable);
         }
@@ -17507,8 +17524,9 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     if (options.tree_dce) {
         pipeline.add(
             PassId::DeadCodeElimination,
-            [](ManagedFunction& function, FunctionAnalysisManager&) {
-                eliminate_dead_values(function);
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_dead_values(function, hir_module,
+                                      options.floating_environment);
                 return PassResult::changed_values();
             });
     }

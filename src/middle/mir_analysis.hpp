@@ -17,8 +17,10 @@ std::optional<UInt128> unsigned_upper_bound_at_exit(const ManagedFunction& funct
                                                   ValueId value, BlockId at);
 bool has_reachable_return(const ManagedFunction& function);
 // Whether `value` is a floating operation that may raise an exception that
-// `environment` traps, so that it may execute only where the source executes
-// it. Negation, reinterpretation, selection, and data movement raise none.
+// `environment` traps, so that it executes exactly where the source executes
+// it: it is neither speculated nor removed when its result is unused.
+// Negation, sign operations, reinterpretation, selection, and data movement
+// raise none.
 bool may_trap_floating(const ManagedValue& value,
                        const ManagedFunction& function,
                        const hir::Module& hir_module,

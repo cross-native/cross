@@ -1003,7 +1003,8 @@ int cc_main(int argc, char** argv) {
         target->data_layout.f80_alignment,
         target->data_layout.code_addresses,
         options.wrapv,
-        options.floating_environment};
+        options.floating_environment,
+        subtarget->nan_encoding()};
     // Macro execution precedes source declarations. Scalar layout queries
     // nevertheless use the same target-owned context as later required folds.
     auto macro_layout = hir::build_constant_context(program, options, *target, diagnostics);

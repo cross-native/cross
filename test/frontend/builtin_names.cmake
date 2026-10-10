@@ -113,6 +113,26 @@ foreach(case
     string(SUBSTRING "${case}" ${start} -1 source)
     check(keyword_name_${keyword} "reserved keyword '${keyword}' cannot be a declared name" "${source}\n")
 endforeach()
+# A built-in operation is called; naming it as a value is an error.
+foreach(case
+        "local|typedef f64 (*unary)(in f64 x);\nglobal f64 apply(in f64 x) { unary f = $::fabs; return f(x); }"
+        "cast|global u64 entry() { return (u64)$::expect; }"
+        "statement|global void entry() { $::trap; }"
+        "global|typedef f64 (*unary)(in f64 x);\nglobal unary pointer = $::sqrt;"
+        "instruction|global u64 entry() { return (u64)$::_nop; }")
+    string(FIND "${case}" "|" split)
+    string(SUBSTRING "${case}" 0 ${split} key)
+    math(EXPR start "${split} + 1")
+    string(SUBSTRING "${case}" ${start} -1 source)
+    check(builtin_value_${key} "built-in '[$]::[a-z_]+' has no address; it can only be called" "${source}\n")
+endforeach()
+# $::expect evaluates to its value.
+check(expect_evaluation pass [=[
+global u32 hinted(in u32 x) { return $::expect(x, 1); }
+$::static_assert(hinted(3u32) == 3u32, "expect in a call");
+$::static_assert($::eval($::expect(4u32, 1)) == 4u32, "expect evaluated");
+global u32 entry() { return hinted(5u32); }
+]=])
 check(keyword_prefixes pass [=[
 static i32 stacked(in i32 in_value) { return in_value; }
 global u32 whiles<u32 inner>() { return inner; }

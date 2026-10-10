@@ -633,8 +633,10 @@ struct EvaluationLayout {
     CodeAddressRepresentation code_addresses{CodeAddressRepresentation::Opaque};
     // Signed +, -, *, and << wrap modulo 2^N, as at runtime (-fwrapv).
     bool wrap_signed{};
-    // The profile's floating environment, as at runtime.
+    // The profile's floating environment and the target's NaN encoding, as
+    // at runtime.
     floating::Environment floating_environment{};
+    floating::NanEncoding nan_encoding{floating::NanEncoding::Ieee2008};
 };
 
 struct EvaluationMemberLayout {
