@@ -329,6 +329,8 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
         result = bytes_type();
     } else if (source->kind == Type::Kind::Buffer) {
         result = buffer_type();
+    } else if (source->kind == Type::Kind::TypeValue) {
+        result = type_value_type();
     } else {
         const auto found = substitutions.find(generic_type_key(*source));
         if (found == substitutions.end()) {
@@ -549,7 +551,7 @@ RecordDecl instantiate_record(const RecordDecl& source, const TypeSubstitutions&
     for (const auto& member : source.members)
         copy.members.push_back({member.location, member.name, clone_type(member.type, types, values),
             member.bit_width ? clone_expr(*member.bit_width, types, values) : nullptr,
-            clone_attributes(member.attributes, types, values), member.fresh});
+            clone_attributes(member.attributes, types, values), member.fresh, member.embedded});
     return copy;
 }
 
@@ -1288,6 +1290,22 @@ bool validate_generic_redeclarations(const Program& program,
     return diagnostics.errors() == errors;
 }
 
+// The result types of the type-reflection operations; null for other names.
+TypePtr reflection_result_type(std::string_view name) {
+    if (name == "$::meta::type" || name == "$::meta::member_type" || name == "$::meta::element")
+        return type_value_type();
+    if (name == "$::meta::same_type" || name == "$::meta::is_type_kind" || name == "$::meta::is_signed")
+        return builtin_type(BuiltinType::Bool);
+    if (name == "$::meta::size" || name == "$::meta::align" || name == "$::meta::member_count" ||
+        name == "$::meta::member_offset" || name == "$::meta::count" || name == "$::meta::enumerator_count")
+        return builtin_type(BuiltinType::Uptr);
+    if (name == "$::meta::bits" || name == "$::meta::member_bit_offset" || name == "$::meta::member_bit_width")
+        return builtin_type(BuiltinType::U32);
+    if (name == "$::meta::member_name" || name == "$::meta::enumerator_name" || name == "$::meta::type_tokens")
+        return tokens_type();
+    return {};
+}
+
 template <typename TypeOf>
 TypePtr translation_intrinsic_type(const Expr& expression, bool procedural, TypeOf&& type_of) {
     if (expression.kind != Expr::Kind::Call || !expression.left ||
@@ -1339,6 +1357,7 @@ TypePtr translation_intrinsic_type(const Expr& expression, bool procedural, Type
     if (procedural && expression.left->text == "$::meta::tokens") return tokens_type();
     if (procedural && expression.left->text == "$::meta::call_site") return tokens_type();
     if (procedural && expression.left->text == "$::meta::gensym") return tokens_type();
+    if (auto reflection = reflection_result_type(expression.left->text)) return reflection;
     if (procedural && (expression.left->text == "$::meta::child" ||
         expression.left->text == "$::meta::replace_child")) return syntax_type();
     if (procedural && expression.left->text == "$::meta::child_count")
@@ -2906,7 +2925,8 @@ void lift_static_locals(Program& program, FunctionDecl& function) {
     StaticLocalLifter(program).run(function);
 }
 
-enum class SourceMemberIssue { None, NotMember, UnknownType, NotPointer, NotRecord, IncompleteRecord, MissingMember };
+enum class SourceMemberIssue { None, NotMember, UnknownType, NotPointer, NotRecord, IncompleteRecord, MissingMember,
+    AmbiguousMember };
 
 template<class TypeOf>
 const RecordMemberDecl* source_record_member(const Expr& expression, const Program& program,
@@ -2934,12 +2954,22 @@ const RecordMemberDecl* source_record_member(const Expr& expression, const Progr
     if (owner->kind != Type::Kind::Record) return reject(SourceMemberIssue::NotRecord);
     const auto record = program.record_definition(owner->nominal_key());
     if (!record) return reject(SourceMemberIssue::IncompleteRecord);
-    const auto member = std::find_if(record->members.begin(), record->members.end(),
-        [&](const RecordMemberDecl& candidate) { return candidate.member_name() == member_name(*selected->right); });
-    if (member == record->members.end()) return reject(SourceMemberIssue::MissingMember);
+    const auto lookup = find_record_member(program, *record, member_name(*selected->right));
+    if (lookup.ambiguous) return reject(SourceMemberIssue::AmbiguousMember);
+    if (!lookup.member()) return reject(SourceMemberIssue::MissingMember);
     if (issue) *issue = SourceMemberIssue::None;
-    if (owner_type) *owner_type = std::move(owner);
-    return &*member;
+    if (owner_type) *owner_type = member_lookup_owner(owner, lookup);
+    return lookup.member();
+}
+
+// The position among the members an initializer fills by position of the
+// member a designator names, or of the embedded member it is promoted from.
+std::optional<std::size_t> designated_position(const Program& program, const RecordDecl& record,
+                                               const MemberName& name) {
+    const auto lookup = find_record_member(program, record, name);
+    if (!lookup.member()) return {};
+    return static_cast<std::size_t>(std::count_if(record.members.data(), lookup.members.front(),
+        [](const RecordMemberDecl& candidate) { return candidate.initialized(); }));
 }
 
 class FunctionPointerAdapterLifter {
@@ -3311,6 +3341,22 @@ private:
         if (expression->kind == Expr::Kind::Address)
             (void)adapt(expression, expression->type);
         (void)adapt(expression, destination);
+        // An implicit conversion to an embedded member's type becomes an
+        // explicit cast, which static data and lowering apply.
+        if (destination && destination->kind == Type::Kind::Pointer && expression->kind != Expr::Kind::Cast)
+            if (const auto source = infer(*expression); source && source->kind == Type::Kind::Pointer)
+                if (const auto embedded = embedded_pointer_conversion(program_, source, destination, false);
+                    embedded && !embedded->path.ambiguous &&
+                    !embedded_conversion_qualifier_error(*embedded, source, destination)) {
+                    auto cast = std::make_unique<Expr>();
+                    cast->kind = Expr::Kind::Cast;
+                    cast->location = expression->location;
+                    cast->type = clone_type(destination);
+                    cast->left = std::move(expression);
+                    expression = std::move(cast);
+                    rewrite(expression->left);
+                    return;
+                }
         switch (expression->kind) {
         case Expr::Kind::Assign: {
             rewrite(expression->left);
@@ -3403,11 +3449,8 @@ private:
             const auto record = type->kind == Type::Kind::Record
                 ? program_.record_definition(type->nominal_key()) : nullptr;
             if (!record) return {};
-            const auto member = std::find_if(record->members.begin(), record->members.end(),
-                [&](const RecordMemberDecl& candidate) {
-                    return candidate.member_name() == designator.member_name();
-                });
-            type = member == record->members.end() ? TypePtr{} : member->type;
+            const auto lookup = find_record_member(program_, *record, designator.member_name());
+            type = lookup.member() ? lookup.member()->type : TypePtr{};
         }
         return type;
     }
@@ -3422,7 +3465,7 @@ private:
         const auto named_members = [&](auto&& visit) {
             std::size_t logical = 0;
             for (const auto& member : record->members)
-                if (!member.name.empty() && visit(member, logical++)) return;
+                if (member.initialized() && visit(member, logical++)) return;
         };
         std::optional<std::size_t> position = 0;
         for (auto& entry : initializer.initializer_entries) {
@@ -3432,13 +3475,9 @@ private:
                 target = designated_type(destination, entry.designators);
                 position.reset();
                 const auto& first = entry.designators.front();
-                if (record && first.kind == Expr::InitializerDesignator::Kind::Member) {
-                    named_members([&](const RecordMemberDecl& member, std::size_t logical) {
-                        if (member.member_name() != first.member_name()) return false;
-                        position = logical + 1;
-                        return true;
-                    });
-                }
+                if (record && first.kind == Expr::InitializerDesignator::Kind::Member)
+                    if (const auto selected = designated_position(program_, *record, first.member_name()))
+                        position = *selected + 1;
             } else if (destination && destination->kind == Type::Kind::Array) {
                 target = qualified_element_type(destination);
             } else if (record && position) {
@@ -3869,6 +3908,8 @@ struct EvalValue {
     std::shared_ptr<const SyntaxNode> syntax_node;
     std::optional<SyntaxSpan> syntax_span;
     std::shared_ptr<const SyntaxContext> syntax_context;
+    // A `$::meta::type` value.
+    TypePtr reflected;
     std::shared_ptr<const std::string> bytes;
     std::size_t byte_offset{};
     std::size_t byte_length{};
@@ -4470,15 +4511,25 @@ std::optional<SourceExpressionIssue> source_offsetof_error(const Expr& node, con
                 ? program.record_definition(type->nominal_key()) : nullptr;
             if (!step.record)
                 return SourceExpressionIssue{designator.location, "$::offsetof member designator requires a record"};
-            const auto member = std::find_if(step.record->members.begin(), step.record->members.end(),
-                [&](const RecordMemberDecl& candidate) { return candidate.member_name() == designator.member_name(); });
-            if (member == step.record->members.end())
+            const auto lookup = find_record_member(program, *step.record, designator.member_name());
+            if (lookup.ambiguous)
+                return SourceExpressionIssue{designator.location, "member '" + designator.member +
+                    "' is ambiguous: embedded members at the same depth both have it"};
+            if (!lookup.member())
                 return SourceExpressionIssue{designator.location,
                     "record has no member named '" + designator.member + "'"};
-            if (member->bit_width)
+            if (lookup.member()->bit_width)
                 return SourceExpressionIssue{designator.location, "$::offsetof cannot be applied to a bit-field"};
-            step.member = &*member;
-            type = member->type;
+            // A promoted member contributes one step per embedded member.
+            for (std::size_t at = 0; at < lookup.members.size(); ++at) {
+                step.member = lookup.members[at];
+                if (at) {
+                    step.owner = type;
+                    step.record = lookup.owners[at];
+                }
+                type = step.member->type;
+                if (steps && at + 1 < lookup.members.size()) steps->push_back(step);
+            }
         }
         if (steps) steps->push_back(std::move(step));
     }
@@ -4534,6 +4585,9 @@ std::optional<SourceExpressionIssue> source_object_expression_error(const Expr& 
         case SourceMemberIssue::MissingMember:
             return SourceExpressionIssue{node.right->location,
                 "record has no member named '" + node.right->text + "'"};
+        case SourceMemberIssue::AmbiguousMember:
+            return SourceExpressionIssue{node.right->location, "member '" + node.right->text +
+                "' is ambiguous: embedded members at the same depth both have it"};
         default: break;
         }
     } else if (node.kind == Expr::Kind::Binary && node.text == "index" && node.left && node.right) {
@@ -4873,7 +4927,7 @@ const char* source_value_error(const TypePtr& type) {
 // check must not execute a source value, including in an untaken helper branch.
 const char* source_conversion_error(const TypePtr& source, const TypePtr& destination,
                                     SourceConversion conversion = SourceConversion::Implicit,
-                                    bool direct_function = false) {
+                                    bool direct_function = false, const Program* program = nullptr) {
     if (!source || !destination || source->kind == Type::Kind::Generic ||
         destination->kind == Type::Kind::Generic) return nullptr;
     // A void expression may forward no result, but never becomes a scalar,
@@ -4886,6 +4940,12 @@ const char* source_conversion_error(const TypePtr& source, const TypePtr& destin
         is_label_type(destination)) return nullptr;
     const bool source_pointer = source->kind == Type::Kind::Pointer;
     const bool destination_pointer = destination->kind == Type::Kind::Pointer;
+    if (program)
+        if (const auto embedded = embedded_pointer_conversion(*program, source, destination,
+                conversion == SourceConversion::Explicit))
+            return embedded->path.ambiguous
+                ? "pointer conversion to an embedded member's type is ambiguous"
+                : embedded_conversion_qualifier_error(*embedded, source, destination);
     if ((source_pointer && is_floating(destination)) ||
         (destination_pointer && is_floating(source)))
         return conversion == SourceConversion::Explicit
@@ -4995,13 +5055,14 @@ const char* source_meta_expression_error(const Expr& node, const TypeOf& type_of
 }
 
 template<class TypeOf>
-const char* source_expression_conversion_error(const Expr& node, const TypeOf& type_of) {
+const char* source_expression_conversion_error(const Expr& node, const TypeOf& type_of,
+                                               const Program* program = nullptr) {
     if (node.kind == Expr::Kind::Cast && node.left)
         return source_conversion_error(type_of(*node.left, true), node.type, SourceConversion::Explicit,
-            source_function_designator(*node.left, type_of));
+            source_function_designator(*node.left, type_of), program);
     if (node.kind == Expr::Kind::Assign && node.text == "=" && node.left && node.right)
         return source_conversion_error(type_of(*node.right, true), type_of(*node.left, false),
-            SourceConversion::Implicit, source_function_designator(*node.right, type_of));
+            SourceConversion::Implicit, source_function_designator(*node.right, type_of), program);
     return nullptr;
 }
 
@@ -5917,6 +5978,14 @@ public:
         else if (name == "$::meta::alloc") arguments(call, {A::Integer});
         else if (name == "$::meta::cap") arguments(call, {A::Buffer});
         else if (name == "$::meta::freeze") arguments(call, {A::Buffer, A::Integer});
+        else if (name == "$::meta::type") arguments(call, {A::Tokens});
+        else if (name == "$::meta::same_type") arguments(call, {A::Type, A::Type});
+        else if (name == "$::meta::is_type_kind") arguments(call, {A::Type, A::String});
+        else if (name == "$::meta::member_name" || name == "$::meta::member_type" ||
+                 name == "$::meta::member_offset" || name == "$::meta::member_bit_offset" ||
+                 name == "$::meta::member_bit_width" || name == "$::meta::enumerator_name")
+            arguments(call, {A::Type, A::Integer});
+        else if (reflection_result_type(name)) arguments(call, {A::Type});
         else error(call.location, "unknown translation-only operation '" + name + "'");
         return true;
     }
@@ -5924,7 +5993,7 @@ public:
 private:
     enum class Argument {
         Tokens, Node, Match, Span, Context, Buffer, Integer, String,
-        Sequence, BytesOrBuffer, MatchOrNode, TokensOrNode, StringOrBytes,
+        Sequence, BytesOrBuffer, MatchOrNode, TokensOrNode, StringOrBytes, Type,
     };
 
     TypePtr type(const Expr& expression) { return type_(expression); }
@@ -5950,6 +6019,7 @@ private:
         case Argument::BytesOrBuffer: return actual->kind == Type::Kind::Bytes || actual->kind == Type::Kind::Buffer;
         case Argument::MatchOrNode: return actual->kind == Type::Kind::SyntaxMatch || actual->kind == Type::Kind::Syntax;
         case Argument::TokensOrNode: return actual->kind == Type::Kind::Tokens || actual->kind == Type::Kind::Syntax;
+        case Argument::Type: return actual->kind == Type::Kind::TypeValue;
         }
         return false;
     }
@@ -6116,7 +6186,7 @@ private:
         if (valid_ && !compound)
             if (const auto* reason = source_conversion_error(source, destination, kind,
                     source_function_designator(value,
-                        [&](const Expr& operand, bool decay) { return type(operand, decay); })))
+                        [&](const Expr& operand, bool decay) { return type(operand, decay); }), &program_))
                 error(value.location, std::string(reason) + " in " + std::string(context));
     }
 
@@ -6427,7 +6497,8 @@ private:
                             object_lvalue(argument)) {
                             record_conversion(parameter.type, actual, argument.location, "parameter copy-out");
                             if (valid_)
-                                if (const auto* reason = source_conversion_error(parameter.type, actual))
+                                if (const auto* reason = source_conversion_error(parameter.type, actual,
+                                        SourceConversion::Implicit, false, &program_))
                                     error(argument.location, std::string(reason) + " in parameter copy-out");
                         }
                     } else {
@@ -7069,7 +7140,7 @@ public:
             if (const auto* reason = source_conversion_error(from, destination, SourceConversion::Implicit,
                     source_function_designator(source, [&](const Expr& node, bool decay) {
                         return expression_type(node, decay);
-                    }))) {
+                    }), &program_)) {
                 fail(source.location, reason);
                 co_return std::nullopt;
             }
@@ -7318,8 +7389,21 @@ public:
                     const auto owner = source.text == "pointer_member" && type
                         ? (type->kind == Type::Kind::Array ? qualified_element_type(type) : type->pointee) : type;
                     std::optional<EvaluationMemberLayout> member;
-                    if (program_.evaluation_member_layout)
-                        member = co_await program_.evaluation_member_layout.async(owner, member_name(*source.right));
+                    if (program_.evaluation_member_layout && owner && owner->kind == Type::Kind::Record)
+                        if (const auto record = program_.record_definition(owner->nominal_key())) {
+                            // A promoted member adds the offset of each embedded member.
+                            const auto lookup = find_record_member(program_, *record, member_name(*source.right));
+                            auto step_owner = owner;
+                            std::uint64_t offset{};
+                            for (const auto* step : lookup.member() ? lookup.members
+                                                                    : std::vector<const RecordMemberDecl*>{}) {
+                                member = co_await program_.evaluation_member_layout.async(step_owner, step->member_name());
+                                if (!member) break;
+                                offset += member->offset;
+                                step_owner = step->type;
+                            }
+                            if (member) member->offset = offset;
+                        }
                     if (!member || member->bit_width) {
                         fail(source.location, "static address member requires a complete addressable target subobject");
                         co_return std::nullopt;
@@ -7376,6 +7460,17 @@ public:
             fail(location, "static address initializer requires a compatible pointer, label, or address-width integer type");
             co_return std::nullopt;
         }
+        if (pointer)
+            if (const auto embedded = embedded_pointer_conversion(program_, value.type, destination, explicit_cast)) {
+                const auto offset = embedded->path.ambiguous ? std::nullopt
+                    : co_await embedded_offset_async(*embedded,
+                        embedded->downward ? destination->pointee : value.type->pointee);
+                if (!offset || !(co_await static_address_offset_async(value, {UInt128{*offset}, false}, 1,
+                        !embedded->downward, location))) {
+                    fail(location, "static address initializer requires an unambiguous embedded member");
+                    co_return std::nullopt;
+                }
+            }
         value.type = destination;
         co_return value;
     }
@@ -8728,7 +8823,8 @@ public:
                          type->kind == Type::Kind::Span ||
                          type->kind == Type::Kind::Context ||
                          type->kind == Type::Kind::Bytes ||
-                         type->kind == Type::Kind::Buffer)) {
+                         type->kind == Type::Kind::Buffer ||
+                         type->kind == Type::Kind::TypeValue)) {
                 fail(expression.location, type_name(type) + " has no runtime size or alignment");
                 co_return std::nullopt;
             }
@@ -8794,7 +8890,7 @@ public:
                 if (step.member) {
                     if (program_.evaluation_member_layout)
                         if (const auto layout = co_await program_.evaluation_member_layout.async(
-                                step.owner, step.designator->member_name()))
+                                step.owner, step.member->member_name()))
                             displacement = layout->offset;
                 } else {
                     const auto index = co_await this->expression_async(*step.designator->index);
@@ -8887,6 +8983,7 @@ private:
             type->kind == Type::Kind::Syntax ||
             type->kind == Type::Kind::Span ||
             type->kind == Type::Kind::Context ||
+            type->kind == Type::Kind::TypeValue ||
             contains_tokens(type->pointee) || contains_tokens(type->element) ||
             (type->function && (contains_tokens(type->function->result) ||
                 std::any_of(type->function->parameters.begin(), type->function->parameters.end(),
@@ -9573,7 +9670,8 @@ private:
                     fail(argument.location, "a record value requires the same nominal record type in parameter copy-out");
                     co_return false;
                 }
-                if (const auto* reason = source_conversion_error(to, object)) {
+                if (const auto* reason = source_conversion_error(to, object, SourceConversion::Implicit,
+                        false, &program_)) {
                     fail(argument.location, std::string(reason) + " in parameter copy-out");
                     co_return false;
                 }
@@ -9616,7 +9714,7 @@ private:
         }
         if (!(co_await validate_constant_lane_index_async(node))) co_return false;
         if (const auto* reason = source_expression_conversion_error(node,
-                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
+                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); }, &program_)) {
             fail(node.location, reason);
             co_return false;
         }
@@ -9745,7 +9843,7 @@ private:
         }
         if (!(co_await validate_constant_lane_index_async(node))) co_return false;
         if (const auto* reason = source_expression_conversion_error(node,
-                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
+                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); }, &program_)) {
             fail(node.location, reason);
             co_return false;
         }
@@ -10067,6 +10165,19 @@ private:
                 }
                 co_return true;
             }
+            if (reflection_result_type(name)) {
+                for (const auto& argument : node.arguments)
+                    if (!(co_await validate_required_tree_async(*argument))) co_return false;
+                bool valid = true;
+                MetaIntrinsicArgumentValidator validator(
+                    [&](const Expr& operand) { return expression_type(operand); },
+                    [&](SourceLocation location, std::string message) {
+                        fail(location, std::move(message));
+                        valid = false;
+                    });
+                (void)validator.intrinsic(node);
+                co_return valid;
+            }
             if (name.starts_with("$::meta::") &&
                 name != "$::meta::parse") {
                 fail(node.location, name + " is not implemented for byte evaluation");
@@ -10295,7 +10406,7 @@ private:
         co_return true;
     }
 
-    static bool macro_convertible(const TypePtr& from, const TypePtr& to, bool explicit_cast = false,
+    bool macro_convertible(const TypePtr& from, const TypePtr& to, bool explicit_cast = false,
                                    bool direct_function = false) {
         if (!from || !to) return false;
         if (is_label_type(from) || is_label_type(to)) {
@@ -10329,6 +10440,9 @@ private:
                 !source_conversion_error(from, to,
                     explicit_cast ? SourceConversion::Explicit : SourceConversion::Implicit,
                     direct_function);
+        if (const auto embedded = embedded_pointer_conversion(program_, from, to, explicit_cast))
+            return from->address_space == to->address_space && !embedded->path.ambiguous &&
+                !embedded_conversion_qualifier_error(*embedded, from, to);
         return from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Pointer &&
             from->address_space == to->address_space &&
             (compatible_pointee(from->pointee, to->pointee) ||
@@ -10874,6 +10988,86 @@ private:
         co_return value;
     }
 
+    // The offset of the embedded member a conversion's path leads to.
+    EvaluationTask<std::optional<std::uint64_t>> embedded_offset_async(const EmbeddedConversion& conversion,
+                                                                       TypePtr outer) {
+        std::uint64_t offset{};
+        for (const auto* member : conversion.path.members) {
+            if (!program_.evaluation_member_layout) co_return std::nullopt;
+            const auto layout = co_await program_.evaluation_member_layout.async(outer, member->member_name());
+            if (!layout) co_return std::nullopt;
+            offset += layout->offset;
+            outer = member->type;
+        }
+        co_return offset;
+    }
+
+    // A pointer converted to or from an embedded member's type moves by that
+    // member's offset, as at runtime; a null pointer stays null.
+    EvaluationTask<std::optional<EvalValue>> embedded_conversion_async(EvalValue value,
+        const EmbeddedConversion& conversion, const TypePtr& type, SourceLocation location) {
+        if (!value.truthy()) {
+            value.type = clone_type(type);
+            co_return value;
+        }
+        const auto outer = conversion.downward ? type->pointee : value.type->pointee;
+        if (value.meta_pointer && !conversion.downward) {
+            // The same subobject view as taking the embedded member's address.
+            for (const auto* member : conversion.path.members) {
+                auto next = co_await meta_member_step_async(std::move(value), member, location);
+                if (!next) co_return std::nullopt;
+                value = std::move(*next);
+            }
+            value.type = clone_type(type);
+            co_return value;
+        }
+        const auto offset = co_await embedded_offset_async(conversion, outer);
+        if (!offset) {
+            fail(location, "target layout is unavailable for this translation-time query");
+            co_return std::nullopt;
+        }
+        if (value.meta_pointer) {
+            auto& pointer = *value.meta_pointer;
+            const auto size = co_await meta_object_size_async(outer);
+            const auto start = pointer.view_offset + pointer.position;
+            const auto backing = pointer.mutable_buffer ? pointer.mutable_buffer->data.size()
+                : pointer.immutable ? pointer.immutable->size() : 0;
+            if (!size || start < *offset || *size > backing - (start - *offset)) {
+                fail(location, "pointer conversion from an embedded member's type requires a pointer to "
+                    "that member of an enclosing object");
+                co_return std::nullopt;
+            }
+            pointer.view_offset = start - *offset;
+            pointer.view_length = *size;
+            pointer.position = 0;
+            pointer.access_alignment.reset();
+            pointer.union_member_view = false;
+            pointer.bit_field.reset();
+        } else if (value.address && value.address->kind == AddressConstant::Kind::Absolute) {
+            const auto before = value.address->absolute;
+            const auto after = conversion.downward ? subtract(before, UInt128{*offset}) : add(before, UInt128{*offset});
+            if ((conversion.downward && before < UInt128{*offset}) || !fits_unsigned(after, program_.address_bits)) {
+                fail(location, "pointer conversion to or from an embedded member's type leaves the address range");
+                co_return std::nullopt;
+            }
+            value.address->absolute = after;
+        } else if (value.address) {
+            const auto moved = offset_relocation_addend(relocation_addend(value.address->addend),
+                {UInt128{*offset}, false}, 1, !conversion.downward);
+            const auto addend = moved ? relocation_addend_i64(*moved) : std::nullopt;
+            if (!addend) {
+                fail(location, "static address addend exceeds the supported relocation range");
+                co_return std::nullopt;
+            }
+            value.address->addend = *addend;
+        } else {
+            fail(location, "pointer conversion to or from an embedded member's type requires an address");
+            co_return std::nullopt;
+        }
+        value.type = clone_type(type);
+        co_return value;
+    }
+
     EvaluationTask<std::optional<EvalValue>> convert_async(EvalValue value, const TypePtr& type,
                                      SourceLocation location, bool explicit_cast = false) {
         if (!type || type->is_volatile || type->is_atomic) {
@@ -10945,6 +11139,14 @@ private:
         if (value.tokens || type->kind == Type::Kind::Tokens) {
             if (!procedural_ || !value.tokens || type->kind != Type::Kind::Tokens) {
                 fail(location, "token values cannot be converted to or from runtime types");
+                co_return std::nullopt;
+            }
+            value.type = clone_type(type);
+            co_return value;
+        }
+        if (value.reflected || type->kind == Type::Kind::TypeValue) {
+            if (!value.reflected || type->kind != Type::Kind::TypeValue) {
+                fail(location, "$::meta::type values cannot be converted to or from other values");
                 co_return std::nullopt;
             }
             value.type = clone_type(type);
@@ -11028,6 +11230,16 @@ private:
                 co_return std::nullopt;
             co_return value;
         }
+        if (type->kind == Type::Kind::Pointer && value.type && value.type->kind == Type::Kind::Pointer)
+            if (const auto embedded = embedded_pointer_conversion(program_, value.type, type, explicit_cast)) {
+                if (const auto* reason = embedded->path.ambiguous
+                        ? "pointer conversion to an embedded member's type is ambiguous"
+                        : embedded_conversion_qualifier_error(*embedded, value.type, type)) {
+                    fail(location, reason);
+                    co_return std::nullopt;
+                }
+                co_return co_await embedded_conversion_async(std::move(value), *embedded, type, location);
+            }
         if (value.meta_pointer) {
             if (type->kind != Type::Kind::Pointer) {
                 fail(location, "meta data pointers cannot convert to integer or other runtime values");
@@ -11666,7 +11878,7 @@ private:
                 continue;
             }
             const auto& member = frame.record->members[frame.next++];
-            if (member.name.empty()) continue;
+            if (!member.initialized()) continue;
             const auto member_type = member.type;
             const auto member_name = member.member_name();
             std::optional<EvaluationMemberLayout> layout;
@@ -11810,7 +12022,7 @@ private:
         const auto record = program_.record_definition(type->nominal_key());
         if (!record) co_return false;
         for (const auto& member : record->members) {
-            if (member.name.empty()) continue;
+            if (!member.initialized()) continue;
             std::optional<EvaluationMemberLayout> layout;
             if (program_.evaluation_member_layout)
                 layout = co_await program_.evaluation_member_layout.async(type, member.member_name());
@@ -11915,7 +12127,7 @@ private:
             Frame next;
             if (frame.record) {
                 while (frame.next < frame.record->members.size() &&
-                       frame.record->members[frame.next].name.empty()) ++frame.next;
+                       !frame.record->members[frame.next].initialized()) ++frame.next;
                 if (frame.next == frame.record->members.size()) {
                     finish(!frame.any);
                     continue;
@@ -12009,7 +12221,7 @@ private:
             std::optional<EvalMetaPointer::BitField> field;
             if (frame.record) {
                 while (frame.next < frame.record->members.size() &&
-                       frame.record->members[frame.next].name.empty()) ++frame.next;
+                       !frame.record->members[frame.next].initialized()) ++frame.next;
                 if (frame.next == frame.record->members.size()) {
                     work.pop_back();
                     continue;
@@ -12171,71 +12383,84 @@ private:
         std::optional<EvalValue> base;
         if (expression.text == "member") base = co_await meta_designator_pointer_async(*expression.left);
         else base = co_await this->expression_async(*expression.left);
-        bool sized = base && base->meta_pointer;
-        if (sized) sized = co_await sized_meta_pointer_async(*base, expression.location);
-        if (!sized || base->type->pointee->kind != Type::Kind::Record) {
-            fail(expression.location,
+        const auto record = base && base->type && base->type->kind == Type::Kind::Pointer &&
+            base->type->pointee && base->type->pointee->kind == Type::Kind::Record
+            ? program_.record_definition(base->type->pointee->nominal_key()) : nullptr;
+        const auto lookup = record ? find_record_member(program_, *record, member_name(*expression.right))
+                                   : MemberLookup{};
+        // A promoted member is reached through each embedded member in turn.
+        for (std::size_t at = 0; base && at < std::max<std::size_t>(lookup.members.size(), 1); ++at)
+            base = co_await meta_member_step_async(std::move(*base),
+                lookup.member() ? lookup.members[at] : nullptr, expression.location);
+        co_return base;
+    }
+
+    EvaluationTask<std::optional<EvalValue>> meta_member_step_async(
+        EvalValue base, const RecordMemberDecl* member, SourceLocation location) {
+        bool sized = base.meta_pointer.has_value();
+        if (sized) sized = co_await sized_meta_pointer_async(base, location);
+        if (!sized || base.type->pointee->kind != Type::Kind::Record) {
+            fail(location,
                  "meta record member access requires a supported structure pointer");
             co_return std::nullopt;
         }
-        if (!(co_await meta_record_effective_access_async(*base, expression.location)))
+        if (!(co_await meta_record_effective_access_async(base, location)))
             co_return std::nullopt;
-        const auto* member = selected_record_member(expression);
         std::optional<EvaluationMemberLayout> layout;
-        if (program_.evaluation_member_layout)
+        if (member && program_.evaluation_member_layout)
             layout = co_await program_.evaluation_member_layout.async(
-                base->type->pointee, member_name(*expression.right));
+                base.type->pointee, member->member_name());
         if (!member || !layout ||
             !meta_object_type(member->type) ||
             (layout->bit_width && !is_integer(member->type)) ||
             meta_volatile_or_atomic(member->type)) {
-            fail(expression.location,
+            fail(location,
                  "meta record member requires a supported non-volatile object type");
             co_return std::nullopt;
         }
         const auto member_size = (co_await meta_object_size_async(member->type));
-        const auto record_size = (co_await meta_object_size_async(base->type->pointee));
+        const auto record_size = (co_await meta_object_size_async(base.type->pointee));
         if (!member_size || !record_size ||
             layout->offset > *record_size ||
             *member_size > *record_size - layout->offset) {
-            fail(expression.location, "meta record member is outside its target layout");
+            fail(location, "meta record member is outside its target layout");
             co_return std::nullopt;
         }
         const auto member_alignment = (co_await meta_object_alignment_async(member->type));
         const auto record_alignment =
-            (co_await meta_object_alignment_async(base->type->pointee));
+            (co_await meta_object_alignment_async(base.type->pointee));
         if (!member_alignment || !record_alignment) {
-            fail(expression.location, "meta record alignment is unavailable");
+            fail(location, "meta record alignment is unavailable");
             co_return std::nullopt;
         }
-        auto& pointer = *base->meta_pointer;
+        auto& pointer = *base.meta_pointer;
         if (pointer.position > pointer.view_length ||
             *record_size > pointer.view_length - pointer.position) {
-            fail(expression.location, "meta pointer read is outside its view");
+            fail(location, "meta pointer read is outside its view");
             co_return std::nullopt;
         }
         const auto record_offset = pointer.view_offset + pointer.position;
         const auto effective_record_alignment = pointer.access_alignment
             .value_or(*record_alignment);
         if (record_offset % effective_record_alignment != 0) {
-            fail(expression.location, "misaligned meta pointer access for target record type");
+            fail(location, "misaligned meta pointer access for target record type");
             co_return std::nullopt;
         }
         pointer.access_alignment = std::min<std::size_t>(
             effective_record_alignment,
             std::min<std::size_t>(layout->alignment, *member_alignment));
-        pointer.union_member_view |= base->type->pointee->is_union;
+        pointer.union_member_view |= base.type->pointee->is_union;
         if (layout->bit_width) {
             const auto storage_bits = *member_size * 8U;
             if (*layout->bit_width == 0 ||
                 *layout->bit_width > storage_bits ||
                 layout->bit_offset > storage_bits - *layout->bit_width) {
-                fail(expression.location, "meta bit-field has invalid target layout");
+                fail(location, "meta bit-field has invalid target layout");
                 co_return std::nullopt;
             }
             pointer.bit_field = EvalMetaPointer::BitField{
                 *layout->bit_width, layout->bit_offset,
-                clone_type(base->type->pointee), record_offset};
+                clone_type(base.type->pointee), record_offset};
         } else {
             pointer.bit_field.reset();
         }
@@ -12244,13 +12469,13 @@ private:
         pointer.view_length = *member_size;
         pointer.position = 0;
         auto type = clone_type(member->type);
-        type->is_const = type->is_const || base->type->pointee->is_const;
+        type->is_const = type->is_const || base.type->pointee->is_const;
         type->is_volatile = type->is_volatile ||
-            base->type->pointee->is_volatile;
-        type->may_alias = type->may_alias || may_alias(base->type->pointee);
+            base.type->pointee->is_volatile;
+        type->may_alias = type->may_alias || may_alias(base.type->pointee);
         auto pointer_type_value = pointer_type(type);
-        pointer_type_value->address_space = base->type->address_space;
-        base->type = std::move(pointer_type_value);
+        pointer_type_value->address_space = base.type->address_space;
+        base.type = std::move(pointer_type_value);
         co_return base;
     }
 
@@ -13449,10 +13674,12 @@ private:
             name == "$::meta::child" || name == "$::meta::is_kind" || name == "$::meta::is_production" ||
             name == "$::meta::is_extension" || name == "$::meta::replace_child" ||
             name == "$::meta::extension_match" || name == "$::meta::error" ||
-            name == "$::meta::warning" || name == "$::meta::note")) {
+            name == "$::meta::warning" || name == "$::meta::note" ||
+            name == "$::meta::type" || name == "$::meta::type_tokens")) {
             fail_context(expression.location);
             co_return std::nullopt;
         }
+        if (reflection_result_type(name)) co_return (co_await reflection_call_async(expression));
         const bool token_kind = name == "$::meta::is_kind" &&
             !expression.arguments.empty() && expression_type(*expression.arguments[0]) &&
             expression_type(*expression.arguments[0])->kind == Type::Kind::Tokens;
@@ -13599,6 +13826,261 @@ private:
             co_return std::nullopt;
         }
         co_return EvalValue{UInt128{node.kind == found->second}, builtin_type(BuiltinType::Bool)};
+    }
+
+    // Type reflection: queries of `$::meta::type` values.
+    static std::string_view reflected_kind(const TypePtr& type) {
+        switch (type->kind) {
+        case Type::Kind::Pointer: return "pointer";
+        case Type::Kind::Array: return "array";
+        case Type::Kind::Vector: return "vector";
+        case Type::Kind::Function: return "function";
+        case Type::Kind::Record: return type->is_union ? "union" : "struct";
+        case Type::Kind::Builtin:
+            if (type->builtin == BuiltinType::Void) return "void";
+            if (type->builtin == BuiltinType::Bool) return "bool";
+            if (type->builtin == BuiltinType::Label) return "label";
+            if (!type->nominal_key().empty()) return "enum";
+            return is_floating(type) ? "floating" : "integer";
+        default: return {};
+        }
+    }
+
+    // Array extents that a type keeps as required expressions are fixed, so
+    // that equal types compare the same.
+    EvaluationTask<bool> resolve_reflected_bounds_async(const TypePtr& type, SourceLocation location) {
+        std::vector<Type*> pending{type.get()};
+        std::unordered_set<const Type*> seen;
+        while (!pending.empty()) {
+            auto* node = pending.back();
+            pending.pop_back();
+            if (!node || !seen.insert(node).second) continue;
+            if (node->kind == Type::Kind::Array && !node->lanes && node->array_bound) {
+                const auto bound = co_await required_integer_async(*node->array_bound);
+                const auto lanes = bound ? fixed_array_bound_value({bound->integer, bound->type->builtin},
+                                                                   program_.address_bits) : std::nullopt;
+                if (!lanes) {
+                    if (bound) fail(location, "array bound must be a positive integer constant");
+                    co_return false;
+                }
+                node->lanes = *lanes;
+            }
+            pending.push_back(node->pointee.get());
+            pending.push_back(node->element.get());
+            if (node->function) {
+                pending.push_back(node->function->result.get());
+                for (const auto& parameter : node->function->parameters) pending.push_back(parameter.type.get());
+            }
+        }
+        co_return true;
+    }
+
+    EvaluationTask<std::optional<EvalValue>> reflection_call_async(const Expr& expression) {
+        const auto& name = expression.left->text;
+        const auto location = expression.location;
+        if (!procedural_ || !macro_context_) {
+            fail_context(location);
+            co_return std::nullopt;
+        }
+        const auto reflected = [&](TypePtr type) -> EvaluationTask<std::optional<EvalValue>> {
+            if (!type || !(co_await resolve_reflected_bounds_async(type, location)) ||
+                !charge_meta_bytes(64, location)) co_return std::nullopt;
+            EvalValue result{UInt128{}, type_value_type()};
+            result.reflected = std::move(type);
+            co_return result;
+        };
+        const auto boolean = [](bool value) {
+            return EvalValue{UInt128{value ? 1U : 0U}, builtin_type(BuiltinType::Bool)};
+        };
+        const auto width = [](std::uint64_t value) {
+            return EvalValue{UInt128{value}, builtin_type(BuiltinType::U32)};
+        };
+        const auto identifier = [&](std::string spelling, std::shared_ptr<const SyntaxContext> context,
+                                    std::shared_ptr<const FreshIdentifier> fresh) {
+            const auto source = macro_context_->invocation;
+            MetaToken token;
+            token.kind = TokenKind::Identifier;
+            token.text = std::move(spelling);
+            token.origin = {token_origin(source).span, {}, std::move(context), {}, 0, {}, std::move(fresh)};
+            token.origin.span_end = token_origin(source).last_span();
+            return token;
+        };
+        if (name == "$::meta::type") {
+            auto input = co_await this->expression_async(*expression.arguments[0]);
+            if (!input) co_return std::nullopt;
+            TypePtr type;
+            if (input->tokens && !input->tokens->empty() && program_.evaluation_parse_type)
+                type = co_await program_.evaluation_parse_type.async(*input->tokens, call_context_, location);
+            if (!type || contains_meta_type(type)) {
+                fail(location, "$::meta::type requires tokens that name a type");
+                co_return std::nullopt;
+            }
+            co_return co_await reflected(std::move(type));
+        }
+        auto subject = co_await this->expression_async(*expression.arguments[0]);
+        if (!subject) co_return std::nullopt;
+        if (!subject->reflected) {
+            fail(expression.arguments[0]->location, name + " requires a $::meta::type value");
+            co_return std::nullopt;
+        }
+        const auto type = subject->reflected;
+        const auto kind = reflected_kind(type);
+        if (name == "$::meta::same_type") {
+            auto other = co_await this->expression_async(*expression.arguments[1]);
+            if (!other || !other->reflected) {
+                fail(expression.arguments[1]->location, name + " requires a $::meta::type value");
+                co_return std::nullopt;
+            }
+            co_return boolean(same_type(without_alignment(type), without_alignment(other->reflected)));
+        }
+        if (name == "$::meta::is_type_kind") {
+            auto selector = co_await this->expression_async(*expression.arguments[1]);
+            if (!selector || !selector->string || selector->offset >= selector->string->size()) {
+                fail(expression.arguments[1]->location, name + " requires a translation-time kind string");
+                co_return std::nullopt;
+            }
+            const auto written = std::string_view(*selector->string).substr(selector->offset,
+                selector->string->size() - selector->offset - 1);
+            static constexpr std::string_view kinds[] = {"void", "bool", "integer", "floating",
+                "pointer", "array", "struct", "union", "enum", "vector", "function", "label"};
+            if (std::find(std::begin(kinds), std::end(kinds), written) == std::end(kinds)) {
+                fail(expression.arguments[1]->location, "unknown type kind '" + std::string(written) + "'");
+                co_return std::nullopt;
+            }
+            co_return boolean(kind == written);
+        }
+        if (name == "$::meta::type_tokens") {
+            // One identifier bound to the type itself, as a quoted alias is.
+            std::string spelling;
+            for (const auto ch : type_name(type))
+                spelling.push_back(std::isalnum(static_cast<unsigned char>(ch)) != 0 ? ch : '_');
+            if (spelling.empty() || std::isdigit(static_cast<unsigned char>(spelling.front())) != 0 ||
+                is_reserved_identifier(spelling))
+                spelling.insert(spelling.begin(), '_');
+            if (!charge_meta_bytes(96 + 2 * spelling.size(), location)) co_return std::nullopt;
+            auto token = identifier(spelling, macro_context_, {});
+            token.origin.alias_binding = std::make_shared<const AliasBinding>(AliasBinding{
+                AliasBinding::Role::Use, spelling,
+                std::make_shared<const AliasDefinition>(type, 32 + spelling.size()), nullptr, nullptr});
+            TokenSequence result;
+            if (!append_tokens(result, {token}, location)) co_return std::nullopt;
+            co_return token_value(std::move(result), location);
+        }
+        if (name == "$::meta::size" || name == "$::meta::align") {
+            const bool size = name == "$::meta::size";
+            const auto* query = size ? size_of_ : align_of_;
+            std::optional<std::uint64_t> value;
+            if (query && !contains_meta_type(type) && !invalid_layout_query_type(type, program_, size))
+                value = co_await query->async(type);
+            if (!value || !*value) {
+                fail(location, name + " requires a complete object type");
+                co_return std::nullopt;
+            }
+            co_return meta_count_value(*value, location, name);
+        }
+        if (name == "$::meta::bits" || name == "$::meta::is_signed") {
+            const bool scalar = kind == "bool" || kind == "integer" || kind == "floating" ||
+                kind == "pointer" || kind == "enum";
+            if (!scalar) {
+                fail(location, name + " requires a scalar or enumeration type");
+                co_return std::nullopt;
+            }
+            if (kind == "floating") {
+                const auto format = floating_format(type->builtin, program_.address_bits);
+                if (name == "$::meta::is_signed") co_return boolean(true);
+                co_return width(format == floating::Format::Binary32 ? 32
+                    : format == floating::Format::Binary64 ? 64
+                    : format == floating::Format::Extended80 ? 80 : 128);
+            }
+            const auto integer = evaluation_integer_type(type, program_.address_bits);
+            if (name == "$::meta::is_signed") co_return boolean(kind != "pointer" && integer.is_signed);
+            co_return width(integer.bits);
+        }
+        if (name == "$::meta::element" || name == "$::meta::count") {
+            const bool element = name == "$::meta::element";
+            if (kind == "array" || kind == "vector") {
+                if (element) co_return co_await reflected(qualified_element_type(type));
+                std::uint64_t lanes = type->lanes;
+                if (!lanes && !type->scalable && size_of_) {
+                    const auto whole = co_await size_of_->async(type);
+                    const auto part = co_await size_of_->async(type->element);
+                    if (whole && part && *part) lanes = *whole / *part;
+                }
+                if (!lanes || type->scalable) {
+                    fail(location, name + " requires a fixed array or vector length");
+                    co_return std::nullopt;
+                }
+                co_return meta_count_value(lanes, location, name);
+            }
+            if (kind == "pointer")
+                co_return element ? co_await reflected(type->pointee) : meta_count_value(1, location, name);
+            if (kind == "enum")
+                co_return element ? co_await reflected(builtin_type(type->builtin)) : meta_count_value(0, location, name);
+            fail(location, name + " requires an array, vector, pointer, or enumeration type");
+            co_return std::nullopt;
+        }
+        const bool enumerators = name == "$::meta::enumerator_count" || name == "$::meta::enumerator_name";
+        const EnumDecl* enumeration{};
+        std::shared_ptr<const RecordDecl> record;
+        if (enumerators) {
+            for (const auto& candidate : program_.enumerations)
+                if (kind == "enum" && candidate.nominal_key() == type->nominal_key()) enumeration = &candidate;
+            if (!enumeration) {
+                fail(location, name + " requires an enumeration type");
+                co_return std::nullopt;
+            }
+        } else {
+            if (kind != "struct" && kind != "union") {
+                fail(location, name + " requires a record or union type");
+                co_return std::nullopt;
+            }
+            record = program_.record_definition(type->nominal_key());
+            if (!record) {
+                fail(location, name + " requires a complete record or union type");
+                co_return std::nullopt;
+            }
+        }
+        const auto count = enumerators ? enumeration->enumerators.size() : record->members.size();
+        if (name == "$::meta::member_count" || name == "$::meta::enumerator_count")
+            co_return meta_count_value(count, location, name);
+        const auto index = co_await this->expression_async(*expression.arguments[1]);
+        if (!index || !is_integer(index->type) ||
+            integer_negative(index->integer, integer_type(index->type)) ||
+            index->integer.high != 0 || index->integer.low >= count) {
+            fail(expression.arguments[1]->location, name + " index is out of range");
+            co_return std::nullopt;
+        }
+        const auto at = static_cast<std::size_t>(index->integer.low);
+        TokenSequence names;
+        if (enumerators) {
+            // An enumerator is looked up where the reflected type was named.
+            const auto& spelling = enumeration->enumerators[at].name;
+            const auto component = spelling.rfind("::");
+            if (!charge_input_context(call_context_, location)) co_return std::nullopt;
+            auto token = identifier(spelling.substr(component == std::string::npos ? 0 : component + 2),
+                                    call_context_, {});
+            token.origin.lookup_mode = TokenOrigin::LookupMode::Invocation;
+            if (!append_tokens(names, {token}, location)) co_return std::nullopt;
+            co_return token_value(std::move(names), location);
+        }
+        const auto& member = record->members[at];
+        if (name == "$::meta::member_name") {
+            if (!member.name.empty() &&
+                !append_tokens(names, {identifier(member.name, macro_context_, member.fresh)}, location))
+                co_return std::nullopt;
+            co_return token_value(std::move(names), location);
+        }
+        if (name == "$::meta::member_type") co_return co_await reflected(clone_type(member.type));
+        std::optional<EvaluationMemberLayout> layout;
+        if (program_.evaluation_member_layout)
+            layout = co_await program_.evaluation_member_layout.async(type, member.member_name());
+        if (!layout) {
+            fail(location, "target layout is unavailable for this translation-time query");
+            co_return std::nullopt;
+        }
+        if (name == "$::meta::member_offset") co_return meta_count_value(layout->offset, location, name);
+        if (name == "$::meta::member_bit_width") co_return width(layout->bit_width.value_or(0));
+        co_return width(layout->bit_width ? layout->bit_offset : 0);
     }
 
     EvaluationTask<std::optional<EvalValue>> other_intrinsic_call_async(const Expr& expression) {
@@ -15922,16 +16404,12 @@ TypePtr initializer_child_type(const Program& program, const TypePtr& parent,
             Expr::InitializerDesignator::Kind::Member) {
             return {};
         }
-        const auto member = std::find_if(
-            record->members.begin(), record->members.end(),
-            [&](const RecordMemberDecl& candidate) {
-                return candidate.member_name() == designator->member_name();
-            });
-        return member == record->members.end() ? TypePtr{} : member->type;
+        const auto lookup = find_record_member(program, *record, designator->member_name());
+        return lookup.member() ? lookup.member()->type : TypePtr{};
     }
     std::size_t index{};
     for (const auto& member : record->members) {
-        if (member.name.empty()) continue;
+        if (!member.initialized()) continue;
         if (index++ == position) return member.type;
     }
     return {};
@@ -15996,22 +16474,9 @@ EvaluationTask<void> fold_static_initializer_async(Expr& initializer, TypePtr ty
         } else if (first && first->kind ==
                                 Expr::InitializerDesignator::Kind::Member &&
                    type->kind == Type::Kind::Record) {
-            const auto record = program.record_definition(type->nominal_key());
-            if (record) {
-                const auto member = std::find_if(
-                    record->members.begin(), record->members.end(),
-                    [&](const RecordMemberDecl& candidate) {
-                        return candidate.member_name() == first->member_name();
-                    });
-                if (member != record->members.end()) {
-                    selected = static_cast<std::size_t>(
-                        std::count_if(
-                            record->members.begin(), member,
-                            [](const RecordMemberDecl& candidate) {
-                                return !candidate.name.empty();
-                            }));
-                }
-            }
+            if (const auto record = program.record_definition(type->nominal_key()))
+                if (const auto position = designated_position(program, *record, first->member_name()))
+                    selected = *position;
         }
         auto destination = initializer_child_type(program, type, first,
                                                   selected);
@@ -16743,22 +17208,9 @@ private:
                                         Expr::InitializerDesignator::Kind::Member &&
                            destination &&
                            destination->kind == Type::Kind::Record) {
-                    const auto record = program_.record_definition(destination->nominal_key());
-                    if (record) {
-                        const auto member = std::find_if(
-                            record->members.begin(), record->members.end(),
-                            [&](const RecordMemberDecl& candidate) {
-                                return candidate.member_name() == first->member_name();
-                            });
-                        if (member != record->members.end()) {
-                            selected = static_cast<std::size_t>(
-                                std::count_if(
-                                    record->members.begin(), member,
-                                    [](const RecordMemberDecl& candidate) {
-                                        return !candidate.name.empty();
-                                    }));
-                        }
-                    }
+                    if (const auto record = program_.record_definition(destination->nominal_key()))
+                        if (const auto position = designated_position(program_, *record, first->member_name()))
+                            selected = *position;
                 }
                 auto child = initializer_child_type(program_, destination,
                                                      first, selected);
@@ -16906,7 +17358,7 @@ RecordDecl copy_evaluation_declaration(const RecordDecl& source) {
     for (const auto& member : source.members)
         result.members.push_back({member.location, member.name, clone_type(member.type),
             member.bit_width ? clone_expr(*member.bit_width) : nullptr,
-            clone_attributes(member.attributes, {}, {}), member.fresh});
+            clone_attributes(member.attributes, {}, {}), member.fresh, member.embedded});
     return result;
 }
 

@@ -11,6 +11,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -475,6 +476,10 @@ SyntaxExecution::SyntaxExecution(SourceManager& sources, Diagnostics& diagnostic
     declarations_.evaluation_limits = limits_;
     declarations_.evaluation_layout = layout_;
     if (install_evaluation) install_evaluation(declarations_);
+    declarations_.evaluation_parse_type = [this](const TokenSequence& tokens,
+        std::shared_ptr<const SyntaxContext> context, SourceLocation location) {
+        return parse_type_async(tokens, std::move(context), location);
+    };
     semantics_ = std::make_unique<ExpansionSemantics>(declarations_, diagnostics_,
         std::move(mangling), std::move(canonical_abi));
 }
@@ -904,6 +909,39 @@ ContinuationTask<std::shared_ptr<const SyntaxNode>> SyntaxExecution::parse_token
         tokens[at].split_offset = input[at].split_offset;
     }
     co_return co_await Parser::parse_syntax_tokens_async(category, std::move(tokens), std::move(context), diagnostics_);
+}
+
+ContinuationTask<TypePtr> SyntaxExecution::parse_type_async(const TokenSequence& input,
+    std::shared_ptr<const SyntaxContext> context, SourceLocation location) {
+    if (!context || input.empty()) co_return {};
+    std::string text;
+    std::vector<SourceTokenOrigin> origins;
+    for (const auto& token : input) {
+        if (!work(location)) co_return {};
+        if (token.kind == TokenKind::End || token.kind == TokenKind::Invalid ||
+            token.text.empty() || token.text.find('\0') != std::string::npos ||
+            token.text.size() + 1 > limits_.bytes - std::min<std::uint64_t>(text.size(), limits_.bytes)) co_return {};
+        const auto begin = text.size();
+        text += token.text;
+        origins.push_back({begin, text.size(), token.origin, token.splice});
+        text += ' ';
+    }
+    const auto size = text.size();
+    const auto* source = sources_.add("<meta::type>", std::move(text),
+        {{0, size, "$::meta::type", location, context->definition,
+          SourceExpansion::Kind::FragmentParse}}, std::move(origins));
+    auto tokens = Lexer(*source, diagnostics_).lex();
+    if (tokens.size() != input.size() + 1) co_return {};
+    for (std::size_t at = 0; at < input.size(); ++at) {
+        if (tokens[at].kind != input[at].kind || tokens[at].text != input[at].text ||
+            tokens[at].splice != input[at].splice) co_return {};
+        tokens[at].split_source = input[at].split_source;
+        tokens[at].split_offset = input[at].split_offset;
+    }
+    // Parse errors become one evaluation error at the operation.
+    std::ostringstream output;
+    Diagnostics quiet(output);
+    co_return co_await Parser::parse_type_tokens_async(std::move(tokens), std::move(context), quiet);
 }
 
 std::optional<SyntaxExecution::Output> SyntaxExecution::materialize_node(

@@ -101,6 +101,56 @@ token or one balanced group.
 | `span(one)` | The token's source position. |
 | `error(span, message)`, `warning(...)`, `note(...)` | Report a diagnostic at a position; an error stops the expansion. |
 
+### Type reflection
+
+A `$::meta::type` value stands for a type during compilation. Like
+`$::meta::tokens`, the name is a type in a declaration and an operation
+before `(`. `$::meta::type(tokens)` gives the type that tokens name: tokens
+taken from the macro's input are resolved at the invocation, and tokens
+written in a quote where the quote is. A record is complete for a query if it
+is complete where the expansion runs, so a macro invoked after a definition,
+including a block-scope one, can inspect it.
+
+| Operation | Result |
+| --- | --- |
+| `type(tokens)` | The type the tokens name. |
+| `same_type(a, b)` | Whether two types are the same; a typedef denotes the type it aliases. |
+| `is_type_kind(t, kind)` | Test the kind: `"void"`, `"bool"`, `"integer"`, `"floating"`, `"pointer"`, `"array"`, `"struct"`, `"union"`, `"enum"`, `"vector"`, `"function"`, or `"label"`. |
+| `size(t)`, `align(t)` | `sizeof` and `$::alignof` of a complete type. |
+| `bits(t)`, `is_signed(t)` | The width and signedness of a scalar or enumeration type. |
+| `member_count(t)`, `member_name(t, i)`, `member_type(t, i)`, `member_offset(t, i)` | The members of a complete record or union in declaration order, including embedded members and unnamed bit-fields; an unnamed member's name is empty. |
+| `member_bit_offset(t, i)`, `member_bit_width(t, i)` | A bit-field's lowest bit in the unit at its offset, read as its declared type in the target's byte order, and its width; zero width for other members. |
+| `element(t)`, `count(t)` | Array element and length, vector lane and lane count, pointer pointee and 1, or enumeration underlying type and 0. |
+| `enumerator_count(t)`, `enumerator_name(t, i)` | The enumerators of an enumeration; a name is resolved at the invocation. |
+| `type_tokens(t)` | Tokens that denote the type wherever they are spliced, even where its name is hidden. |
+
+Counts and offsets are `uptr` and widths `u32`. A query on an incomplete type,
+an index out of range, or a type of the wrong kind is an error.
+
+```x
+struct header { u8 version; u16 flags; u32 length; };
+
+[[macro]]
+static $::meta::tokens member_sum($::meta::tokens input) {
+    $::meta::type t = $::meta::type(input);
+    $::meta::tokens sum = $::meta::parse("0u64");
+    for (uptr i = 0; i < $::meta::member_count(t); ++i) {
+        if (!$::meta::is_type_kind($::meta::member_type(t, i), "integer")) continue;
+        $::meta::tokens name = $::meta::member_name(t, i);
+        sum = $::quote { $::unquote(sum) + (u64)p->$::unquote(name) };
+    }
+    return $::quote {
+        static u64 checksum(in const $::unquote($::meta::type_tokens(t)) *p) {
+            return $::unquote(sum);
+        }
+    };
+}
+
+member_sum! { struct header }
+
+global u64 header_sum(in const struct header *h) { return checksum(h); }
+```
+
 ## Syntax extensions
 
 A syntax extension declares a prefix keyword, a pattern, and an expander

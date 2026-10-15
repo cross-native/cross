@@ -125,7 +125,19 @@ struct RecordMember {
     TypePtr pending_source_type{};
     bool packed{};
     std::shared_ptr<const FreshIdentifier> fresh;
+    bool embedded{};
     [[nodiscard]] MemberName member_name() const { return {name, fresh}; }
+    // Initializers fill every member except an unnamed bit-field.
+    [[nodiscard]] bool initialized() const { return !name.empty() || embedded; }
+};
+
+// A member of an embedded record found by name from an enclosing record: its
+// offset is from that record, its type carries the qualifiers of the embedded
+// members on the way, and `path` holds the member indices leading to it.
+struct PromotedMember {
+    RecordMember member;
+    std::vector<std::uint32_t> path;
+    bool ambiguous{};
 };
 
 struct Record {
@@ -141,6 +153,8 @@ struct Record {
     std::uint64_t size{};
     unsigned alignment{1};
     std::vector<RecordMember> members;
+    // Names promoted from embedded members, shallowest first wins.
+    std::vector<PromotedMember> promoted;
     std::vector<const RecordDecl*> declarations;
     const RecordDecl* definition{};
     // Required-layout contexts may outlive the evaluator's active view scope.
@@ -270,8 +284,14 @@ public:
     }
     [[nodiscard]] Record& record(RecordId id) { return records.at(id.value); }
     [[nodiscard]] const Record* record(const NominalTypeKey& key) const;
+    // A direct member, else an unambiguous promoted one.
     [[nodiscard]] const RecordMember* member(RecordId record,
                                              const MemberName& name) const;
+    [[nodiscard]] const PromotedMember* promoted_member(RecordId record,
+                                                        const MemberName& name) const;
+    // Fill a record's promoted names once its members and the records they
+    // embed are known.
+    void promote_members(RecordId record);
     [[nodiscard]] const Function& function(FunctionId id) const {
         return functions.at(id.value);
     }
@@ -411,6 +431,10 @@ natural_alignment(const Module& module, TypeId type, const TargetInfo& target);
 // The largest alignment requested by the type or its array elements; packing
 // never lowers a member below it.
 [[nodiscard]] unsigned requested_alignment(const Module& module, TypeId type);
+// The offset in record `outer` of its embedded member of record `inner` at
+// the shallowest depth that has one, if exactly one is there.
+[[nodiscard]] std::optional<std::uint64_t>
+embedded_member_offset(const Module& module, RecordId outer, RecordId inner);
 // Naturally aligned scalar capability shared by required evaluation and MIR.
 // Concrete access alignment/address-space checks remain in target lowering.
 [[nodiscard]] bool lock_free_atomic_type(const Module& module, TypeId type,

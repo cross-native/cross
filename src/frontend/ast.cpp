@@ -120,7 +120,7 @@ bool is_meta_type(const TypePtr& type) {
     switch (type->kind) {
     case Type::Kind::Tokens: case Type::Kind::SyntaxMatch: case Type::Kind::Syntax:
     case Type::Kind::Span: case Type::Kind::Context: case Type::Kind::Bytes:
-    case Type::Kind::Buffer: return true;
+    case Type::Kind::Buffer: case Type::Kind::TypeValue: return true;
     default: return false;
     }
 }
@@ -267,6 +267,12 @@ TypePtr buffer_type() {
     return type;
 }
 
+TypePtr type_value_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::TypeValue;
+    return type;
+}
+
 TypePtr builtin_type(BuiltinType kind, bool is_const, bool is_volatile,
                      bool is_atomic) {
     auto type = std::make_shared<Type>();
@@ -375,6 +381,7 @@ std::string type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::Context) return "$::meta::context";
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
+    if (type->kind == Type::Kind::TypeValue) return "$::meta::type";
     std::string prefix;
     if (type->is_const) prefix += "const ";
     if (type->is_volatile) prefix += "volatile ";
@@ -450,6 +457,7 @@ std::string canonical_type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::Context) return "$::meta::context";
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
+    if (type->kind == Type::Kind::TypeValue) return "$::meta::type";
     std::string result;
     if (type->is_const) result += 'K';
     if (type->is_volatile) result += 'V';
@@ -621,7 +629,7 @@ static bool same_type_impl(const TypePtr& left, const TypePtr& right,
     if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
         left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span ||
         left->kind == Type::Kind::Context || left->kind == Type::Kind::Bytes ||
-        left->kind == Type::Kind::Buffer) return true;
+        left->kind == Type::Kind::Buffer || left->kind == Type::Kind::TypeValue) return true;
     return left->builtin == right->builtin &&
            left->nominal_key() == right->nominal_key();
 }
@@ -656,6 +664,110 @@ std::shared_ptr<const RecordDecl> Program::record_definition(const NominalTypeKe
     if (const auto* record = record_index.definition(*this, key))
         return std::shared_ptr<const RecordDecl>{std::shared_ptr<const RecordDecl>{}, record};
     return {};
+}
+
+namespace {
+
+template<class Matches>
+MemberLookup search_embedded(const Program& program, const RecordDecl& record, const Matches& matches) {
+    struct Candidate {
+        std::vector<const RecordMemberDecl*> members;
+        std::vector<std::shared_ptr<const RecordDecl>> owners;
+    };
+    std::vector<Candidate> level{{{}, {{std::shared_ptr<const RecordDecl>{}, &record}}}};
+    MemberLookup result;
+    while (!level.empty() && result.members.empty()) {
+        std::vector<Candidate> next;
+        for (const auto& candidate : level) {
+            for (const auto& member : candidate.owners.back()->members) {
+                if (matches(member)) {
+                    if (!result.members.empty()) {
+                        result.ambiguous = true;
+                        return result;
+                    }
+                    result.members = candidate.members;
+                    result.members.push_back(&member);
+                    result.owners = candidate.owners;
+                }
+                if (!result.members.empty() || !member.embedded || !member.type ||
+                    member.type->kind != Type::Kind::Record) continue;
+                auto definition = program.record_definition(member.type->nominal_key());
+                // An invalid record embedding itself is diagnosed elsewhere.
+                if (!definition || std::any_of(candidate.owners.begin(), candidate.owners.end(),
+                        [&](const auto& owner) { return owner->nominal_key() == definition->nominal_key(); }))
+                    continue;
+                auto deeper = candidate;
+                deeper.members.push_back(&member);
+                deeper.owners.push_back(std::move(definition));
+                next.push_back(std::move(deeper));
+            }
+        }
+        level = std::move(next);
+    }
+    return result;
+}
+
+} // namespace
+
+MemberLookup find_record_member(const Program& program, const RecordDecl& record,
+                                const MemberName& name) {
+    return search_embedded(program, record,
+        [&](const RecordMemberDecl& member) { return member.member_name() == name; });
+}
+
+MemberLookup find_embedded_type(const Program& program, const TypePtr& outer,
+                                const TypePtr& inner) {
+    if (!outer || !inner || outer->kind != Type::Kind::Record || inner->kind != Type::Kind::Record)
+        return {};
+    const auto record = program.record_definition(outer->nominal_key());
+    if (!record) return {};
+    auto result = search_embedded(program, *record, [&](const RecordMemberDecl& member) {
+        return member.embedded && member.type && member.type->kind == Type::Kind::Record &&
+            member.type->is_union == inner->is_union && member.type->nominal_key() == inner->nominal_key();
+    });
+    if (!result.owners.empty()) result.owners.front() = record;
+    return result;
+}
+
+TypePtr member_lookup_owner(const TypePtr& owner, const MemberLookup& lookup) {
+    if (!owner || lookup.members.size() < 2) return owner;
+    auto result = owner;
+    for (std::size_t at = 0; at + 1 < lookup.members.size(); ++at) {
+        auto next = std::make_shared<Type>(*lookup.members[at]->type);
+        next->is_const = next->is_const || result->is_const;
+        next->is_volatile = next->is_volatile || result->is_volatile;
+        next->may_alias = next->may_alias || result->may_alias;
+        result = std::move(next);
+    }
+    return result;
+}
+
+std::optional<EmbeddedConversion> embedded_pointer_conversion(const Program& program,
+    const TypePtr& source, const TypePtr& destination, bool explicit_cast) {
+    if (!source || !destination || source->kind != Type::Kind::Pointer ||
+        destination->kind != Type::Kind::Pointer) return {};
+    const auto& from = source->pointee;
+    const auto& to = destination->pointee;
+    if (!from || !to || from->kind != Type::Kind::Record || to->kind != Type::Kind::Record ||
+        (from->is_union == to->is_union && from->nominal_key() == to->nominal_key())) return {};
+    EmbeddedConversion result{find_embedded_type(program, from, to), false};
+    if (result.path.members.empty() && !result.path.ambiguous && explicit_cast)
+        result = {find_embedded_type(program, to, from), true};
+    if (result.path.members.empty() && !result.path.ambiguous) return {};
+    return result;
+}
+
+const char* embedded_conversion_qualifier_error(const EmbeddedConversion& conversion,
+    const TypePtr& source, const TypePtr& destination) {
+    bool is_const = source->pointee->is_const, is_volatile = source->pointee->is_volatile;
+    if (!conversion.downward)
+        for (const auto* member : conversion.path.members) {
+            is_const = is_const || member->type->is_const;
+            is_volatile = is_volatile || member->type->is_volatile;
+        }
+    if ((is_const && !destination->pointee->is_const) || (is_volatile && !destination->pointee->is_volatile))
+        return "pointer conversion to or from an embedded member's type discards qualifiers";
+    return nullptr;
 }
 
 TypeComparison compare_source_types(const TypePtr& left, const TypePtr& right) {
@@ -872,7 +984,7 @@ unsigned type_bits(const TypePtr& type) {
         type->kind == Type::Kind::Tokens || type->kind == Type::Kind::SyntaxMatch ||
         type->kind == Type::Kind::Syntax || type->kind == Type::Kind::Span ||
         type->kind == Type::Kind::Context || type->kind == Type::Kind::Bytes ||
-        type->kind == Type::Kind::Buffer)
+        type->kind == Type::Kind::Buffer || type->kind == Type::Kind::TypeValue)
         return 0;
     if (type->kind == Type::Kind::Vector) {
         return type->scalable ? 0 : type_bits(type->element) * type->lanes;

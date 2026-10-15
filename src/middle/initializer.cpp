@@ -171,7 +171,7 @@ private:
             std::size_t logical_index{};
             for (auto candidate = record.members.begin();
                  candidate != record.members.end(); ++candidate) {
-                if (candidate->name.empty()) continue;
+                if (!candidate->initialized()) continue;
                 if (index && logical_index++ == *index) {
                     member = candidate;
                     break;
@@ -225,11 +225,20 @@ private:
             return std::nullopt;
         }
         const auto& record = module_.record(*type.record);
-        const auto member = std::find_if(
+        auto member = std::find_if(
             record.members.begin(), record.members.end(),
             [&](const hir::RecordMember& candidate) {
                 return candidate.member_name() == designator.member_name();
             });
+        // A promoted member is designated through the embedded members.
+        const auto* promoted = member == record.members.end()
+            ? module_.promoted_member(*type.record, designator.member_name()) : nullptr;
+        if (promoted && promoted->ambiguous) {
+            error(designator.location, "member '" + designator.member +
+                "' is ambiguous: embedded members at the same depth both have it");
+            return std::nullopt;
+        }
+        if (promoted) member = record.members.begin() + promoted->path.front();
         if (member == record.members.end()) {
             error(
                 designator.location,
@@ -238,18 +247,18 @@ private:
             result_.valid = false;
             return std::nullopt;
         }
-        const auto index = static_cast<std::size_t>(
-            std::distance(record.members.begin(), member));
-        path.push_back(static_cast<std::uint64_t>(index));
+        const auto& selected = promoted ? promoted->member : *member;
+        if (promoted) path.insert(path.end(), promoted->path.begin(), promoted->path.end());
+        else path.push_back(static_cast<std::uint64_t>(std::distance(record.members.begin(), member)));
         const auto logical_index = static_cast<std::size_t>(std::count_if(
             record.members.begin(), member,
             [](const hir::RecordMember& candidate) {
-                return !candidate.name.empty();
+                return candidate.initialized();
             }));
-        return Selection{member->type,
-                         parent_offset ? std::optional(*parent_offset + member->offset) : std::nullopt,
+        return Selection{selected.type,
+                         parent_offset ? std::optional(*parent_offset + selected.offset) : std::nullopt,
                          std::move(path), Position{static_cast<std::uint64_t>(logical_index)},
-                         member->bit_width, member->bit_offset};
+                         selected.bit_width, selected.bit_offset};
     }
 
     bool occupied(const Path& path, SourceLocation location) {
@@ -340,9 +349,10 @@ private:
         }
         for (std::size_t index = 0; index < named.size(); ++index) {
             const auto& member = exhaustive->members[index];
-            if (named[index] || member.name.empty()) continue;
+            if (named[index] || !member.initialized()) continue;
             error(source.location, "initializer of exhaustive record '" + exhaustive->source_name +
-                "' does not name member '" + member.name + "'");
+                (member.name.empty() ? "' does not initialize its anonymous embedded member"
+                                     : "' does not name member '" + member.name + "'"));
             break;
         }
     }
@@ -382,6 +392,7 @@ SourceTypes source_types_for(const TypePtr& destination, const Program& program,
                     shape.location = member.location;
                     shape.name = member.name;
                     shape.fresh = member.fresh;
+                    shape.embedded = member.embedded;
                     shape.type = layout.intern_type(member.type);
                     members.push_back(std::move(shape));
                 }
@@ -394,6 +405,7 @@ SourceTypes source_types_for(const TypePtr& destination, const Program& program,
                 shape.alignment_complete = false;
                 shape.retained_definition = record;
                 shape.definition = record.get();
+                layout.promote_members(record_id);
             }
         }
     };

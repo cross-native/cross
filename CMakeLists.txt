@@ -4645,6 +4645,73 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/language/expression_core_errors.cmake")
     set_tests_properties(cross_expression_core_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.semantics")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_embedded_members_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/embedded_members.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embedded-members-${level}
+                    -DENTRY=embedded_members_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_embedded_members_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.x86_64;backend.native;feature.records;feature.evaluation;opt.${level}")
+        add_test(NAME cross_mips_embedded_members_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/embedded_members.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/language/embedded_members_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embedded-members-mips-${level}
+                    -DEXPECTED=P -DMIPS_CPUS=vr4300 -DMIPS_ENDIANS=b "-DCC_FLAGS=-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_embedded_members_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.mips;backend.native;feature.records;feature.evaluation;profile.o32;isa.vr4300;endian.big;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_embedded_members_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embedded-members-errors
+                -P "${CMAKE_SOURCE_DIR}/test/language/embedded_members_errors.cmake")
+    set_tests_properties(cross_embedded_members_errors PROPERTIES
+        LABELS "check.compile;diagnostics;frontend;arch.x86_64;feature.records")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_type_reflection_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/type_reflection.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/type-reflection-${level}
+                    -DENTRY=type_reflection_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_type_reflection_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.x86_64;backend.native;feature.meta;feature.records;opt.${level}")
+        # Bit-field positions are reflected in each byte order.
+        add_test(NAME cross_mips_type_reflection_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/type_reflection.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/type_reflection_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/type-reflection-mips-${level}
+                    -DEXPECTED=P -DMIPS_CPUS=vr4300 "-DMIPS_ENDIANS=b;l" "-DCC_FLAGS=-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_type_reflection_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.mips;backend.native;feature.meta;feature.records;profile.o32;isa.vr4300;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_type_reflection_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/type-reflection-errors
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/type_reflection_errors.cmake")
+    set_tests_properties(cross_type_reflection_errors PROPERTIES
+        LABELS "check.compile;diagnostics;frontend;arch.x86_64;feature.meta")
     add_test(NAME cross_expression_core_llvm
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

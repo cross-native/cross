@@ -124,6 +124,39 @@ global struct version current = { .major = 1, .minor = 4 };
 // { .major = 2 } is an error: member 'minor' is not named
 ```
 
+A member with a record or union type and no name embeds that type: an
+anonymous definition, as in C11, or a named type, designated by its tag or
+typedef name. The members of an embedded record can be used as if they were
+declared in the enclosing record, in accesses, initializer designators, and
+`$::offsetof`, unless a member at a shallower depth has the same name; two
+candidates at the same depth make that access an error. A pointer to the
+record converts implicitly to a pointer to an embedded type at any depth, and
+an explicit cast converts it back; a null pointer stays null. Embedding adds
+no methods or dispatch, and the layout and ABI are those of ordinary members.
+An embedded member counts as one member of an `[[exhaustive]]` structure.
+
+```x
+struct entity { f32 x; f32 y; };
+
+struct enemy {
+    u32 flags;
+    struct entity;                // designated `entity`
+    struct { u16 hp; u16 mp; };   // anonymous
+};
+
+static f32 sum(in const struct entity *e) { return e->x + e->y; }
+
+global f32 update(struct enemy *foe) {
+    foe->hp = 3;                                 // promoted from the anonymous member
+    struct entity *self = foe;                   // points to foe->entity
+    struct enemy *back = (struct enemy *)self;   // back to foe
+    return sum(foe) + back->y + foe->entity.x;
+}
+
+global struct enemy boss = { .x = 1.0f32, .hp = 50, .flags = 1 };
+$::static_assert($::offsetof(struct enemy, y) == 8, "promoted member offset");
+```
+
 `[[may_alias]]` exempts a type from the effective-type aliasing rules, which
 otherwise follow C (any object may be accessed through `u8` or `i8`). Write it
 after a typedef's name, after a record's tag in its definition

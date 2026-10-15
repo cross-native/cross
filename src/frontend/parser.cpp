@@ -488,6 +488,9 @@ EvaluationTask<std::optional<SyntaxExecution::Output>> Parser::expand_at_positio
     const auto& imports = context->imports;
     const auto& bindings = context->syntax_bindings;
     auto execution = syntax_->execution();
+    // Definitions read so far, such as block-scope records, are complete
+    // where the expansion runs.
+    execution->publish_declarations(Program{}, pending_records_, pending_enumerations_);
     if (macro_start()) {
         auto name = (co_await parse_qualified_name_async());
         ++index_; // '!'
@@ -3278,7 +3281,7 @@ EvaluationTask<bool> Parser::type_start_async(TypeProbe probe) {
     // type/expression ambiguity, an immediate argument list selects the call;
     // required type positions and ordinary named declarations stay types.
     if (probe != TypeProbe::Required && token.kind == TokenKind::BuiltinName &&
-        (token.is("$::meta::tokens") || token.is("$::meta::span")) &&
+        (token.is("$::meta::tokens") || token.is("$::meta::span") || token.is("$::meta::type")) &&
         std::as_const(*this).current(1).is("(")) co_return false;
     if (token.kind == TokenKind::PreparedFragment)
         co_return token.prepared && token.prepared->category == SyntaxParseCategory::Type;
@@ -3323,7 +3326,7 @@ EvaluationTask<bool> Parser::type_start_async(TypeProbe probe) {
            token.is("$::meta::syntax_match") ||
            token.is("$::meta::syntax") ||
            token.is("$::meta::span") ||
-           token.is("$::meta::context") ||
+           token.is("$::meta::context") || token.is("$::meta::type") ||
            token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
@@ -3544,6 +3547,11 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
         } else if ((co_await current_async()).is("$::meta::tokens")) {
             ++index_;
             type = tokens_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+        } else if ((co_await current_async()).is("$::meta::type")) {
+            ++index_;
+            type = type_value_type();
             type->is_const = is_const;
             type->is_volatile = is_volatile;
         } else if ((co_await current_async()).is("$::meta::bytes") || (co_await current_async()).is("$::meta::buffer")) {
@@ -6317,8 +6325,41 @@ EvaluationTask<void> Parser::parse_record_members_async(RecordDecl& declaration)
             continue;
         }
         const auto member_location = (co_await current_async()).location;
+        const auto type_begin = index_;
         SpecifierAttributes specifier_attributes{member_attributes, SpecifierAttributes::Context::Member};
         auto base_type = co_await parse_type_async(true, {}, &specifier_attributes);
+        if (base_type && base_type->kind == Type::Kind::Record && (co_await current_async()).is(";")) {
+            // A record or union type without a declarator is embedded. Its
+            // designator is the written tag or typedef name; an anonymous
+            // definition has only a private identity.
+            std::optional<std::size_t> name_index;
+            for (auto at = type_begin; at < index_ && !tokens_[at].is("{"); ++at) {
+                if (tokens_[at].is("[[")) {
+                    for (unsigned depth = 0; at < index_; ++at) {
+                        if (tokens_[at].is("[[")) ++depth;
+                        else if (tokens_[at].is("]]") && --depth == 0) break;
+                    }
+                } else if (tokens_[at].kind == TokenKind::Identifier && !tokens_[at].is("struct") &&
+                           !tokens_[at].is("union") && !tokens_[at].is("const") &&
+                           !tokens_[at].is("volatile") && !tokens_[at].is("restrict")) {
+                    name_index = at;
+                }
+            }
+            resolve_specifier_attributes(specifier_attributes, true);
+            RecordMemberDecl embedded{member_location, {}, std::move(base_type), nullptr,
+                std::move(member_attributes), {}, true};
+            if (name_index) {
+                const auto text = tokens_[*name_index].text;
+                embedded.name = std::string(text.substr(text.rfind("::") == std::string_view::npos
+                    ? 0 : text.rfind("::") + 2));
+                embedded.fresh = token_origin(tokens_[*name_index].location).fresh;
+            } else {
+                embedded.fresh = std::make_shared<const FreshIdentifier>();
+            }
+            declaration.members.push_back(std::move(embedded));
+            (co_await expect_async(";", "after record member declaration"));
+            continue;
+        }
         bool parsed_member = false;
         do {
             ProductionScope member_declarator(*this, SyntaxProduction::MemberDeclarator);
@@ -6327,7 +6368,10 @@ EvaluationTask<void> Parser::parse_record_members_async(RecordDecl& declaration)
             std::size_t member_name_index{};
             auto member_type = co_await parse_declarator_async(copy_type(base_type), member_name,
                 DeclaratorContext::Named, nullptr, &member_name_location, nullptr, &member_name_index);
-            const auto member_fresh = token_origin(member_name_location).fresh;
+            // An unnamed bit-field has a private identity, so that every
+            // member can be designated, as reflection does.
+            const auto member_fresh = member_name ? token_origin(member_name_location).fresh
+                                                  : std::make_shared<const FreshIdentifier>();
             if (member_name && member_fresh) member_name = tokens_[member_name_index].text;
             resolve_specifier_attributes(specifier_attributes, true);
             auto item_attributes = co_await parse_attributes_async();

@@ -760,6 +760,29 @@ ContinuationTask<std::optional<AddressValue>> address_value_async(
             co_return value;
         }
         if (expression.type->kind == Type::Kind::Pointer) {
+            // A cast between a record and a type embedded in it moves by the
+            // embedded member's offset.
+            const auto* from = value->pointee ? module.type(*value->pointee).record
+                ? &module.record(*module.type(*value->pointee).record) : nullptr
+                : value->cast_pointee && value->cast_pointee->kind == Type::Kind::Record
+                ? module.record(value->cast_pointee->nominal_key()) : nullptr;
+            const auto* to = expression.type->pointee && expression.type->pointee->kind == Type::Kind::Record
+                ? module.record(expression.type->pointee->nominal_key()) : nullptr;
+            if (from && to && from->id != to->id && !value->integer) {
+                const auto upward = hir::embedded_member_offset(module, from->id, to->id);
+                const auto offset = upward ? upward : hir::embedded_member_offset(module, to->id, from->id);
+                const auto moved = offset ? offset_relocation_addend(relocation_addend(value->address.addend),
+                    {UInt128{*offset}, false}, 1, upward.has_value()) : std::nullopt;
+                const auto addend = moved ? relocation_addend_i64(*moved) : std::nullopt;
+                if (addend) {
+                    value->address.addend = *addend;
+                    value->pointee.reset();
+                    value->cast_pointee = expression.type->pointee;
+                    value->owner_const = false;
+                    value->owner_volatile = false;
+                    co_return value;
+                }
+            }
             if (!expression.type->pointee ||
                 (value->owner_const && !expression.type->pointee->is_const) ||
                 (value->owner_volatile && !expression.type->pointee->is_volatile) ||

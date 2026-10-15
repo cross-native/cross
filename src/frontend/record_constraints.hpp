@@ -93,7 +93,8 @@ inline std::optional<RecordSourceError> record_source_error(const RecordDecl& so
     struct Frame {
         std::shared_ptr<const RecordDecl> record;
         std::size_t next{};
-        std::unordered_set<MemberName, MemberNameHash> names;
+        // Each named member, and whether it is embedded.
+        std::unordered_map<MemberName, bool, MemberNameHash> names;
     };
     // The caller owns the root, which is therefore not recorded as a proof.
     std::vector<Frame> frames;
@@ -118,8 +119,13 @@ inline std::optional<RecordSourceError> record_source_error(const RecordDecl& so
         const auto error = [&](std::string message) -> std::optional<RecordSourceError> {
             return RecordSourceError{member.location, std::move(message)};
         };
-        if (!member.name.empty() && !frame.names.insert(member.member_name()).second)
-            return error("duplicate record member '" + member.name + "'");
+        if (!member.name.empty()) {
+            const auto [prior, inserted] = frame.names.emplace(member.member_name(), member.embedded);
+            if (!inserted)
+                return error(member.embedded || prior->second
+                    ? "embedded member name '" + member.name + "' collides with another member"
+                    : "duplicate record member '" + member.name + "'");
+        }
         pending.assign(1, member.type);
         seen.clear();
         while (!pending.empty()) {

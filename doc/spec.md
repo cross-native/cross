@@ -363,7 +363,9 @@ or elements; `.member = value` and `[constant_index] = value` select a
 destination and reset the successive position after it. A nested brace list
 initializes a nested aggregate. Missing members/elements and padding are zero
 initialized, except that a brace initializer of a structure declared
-`exhaustive` must initialize each named member, by position or by designator.
+`exhaustive` must initialize each member other than an unnamed bit-field, by
+position or by designator; an embedded member is initialized by an entry for it
+or for a member promoted from it.
 Excess entries, duplicate designators, invalid member names, and out-of-range
 indices are errors.
 
@@ -801,7 +803,7 @@ embedded type to a pointer to a type that embeds it yields a pointer to the
 enclosing object; the behavior is undefined unless the operand points to such
 an embedded member. Embedding adds no methods, interfaces, or dispatch.
 
-```text
+```x
 struct entity { f32 x; f32 y; };
 struct enemy { struct entity; u32 health; };
 
@@ -2001,7 +2003,7 @@ completeness is needed, an index out of range, and a type of the wrong kind are
 errors. Indices follow the index rules of “Embedded assets and
 translation-time bytes”. A generic instance is an ordinary type.
 
-```text
+```x
 [[macro]]
 static $::meta::tokens swap_members($::meta::tokens input) {
     $::meta::type t = $::meta::type(input);
@@ -3914,7 +3916,7 @@ The following object, type, and symbol attributes are normative:
 | `visibility("kind")` | Selects `default`, `hidden`, `protected`, or `internal` visibility when supported. |
 | `noinit` | Places an uninitialized static-duration object in non-zeroed storage. |
 | `address(N)` | On a declaration without an initializer or body: the entity is at the fixed address `N`, a nonzero `uptr` value; it has no link symbol, no storage is emitted, and references use that address. A definition of it in the group, or `alias`, `weakref`, or `thread_local` with it, is an error. |
-| `exhaustive` | On a structure definition: a brace initializer of the structure must initialize each named member. |
+| `exhaustive` | On a structure definition: a brace initializer of the structure must initialize each member other than an unnamed bit-field. |
 | `thread_local` | Gives a static-duration object thread-local storage. |
 | `tls_model("model")` | Selects a target TLS model for a thread-local entity. |
 | `link_name("name")` | Replaces the default link name of a global function, object, or label. |

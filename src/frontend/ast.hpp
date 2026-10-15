@@ -66,7 +66,9 @@ struct Type {
         Span,
         Context,
         Bytes,
-        Buffer
+        Buffer,
+        // `$::meta::type`: a type reflected by translation-time code.
+        TypeValue
     } kind{Kind::Builtin};
     BuiltinType builtin{BuiltinType::Void};
     TypePtr pointee;
@@ -149,6 +151,7 @@ std::span<const std::string_view> core_keyword_names();
 bool is_reserved_identifier(std::string_view name);
 TypePtr bytes_type();
 TypePtr buffer_type();
+TypePtr type_value_type();
 TypePtr pointer_type(TypePtr pointee, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
 TypePtr generic_type(std::string name, bool is_const = false,
@@ -585,7 +588,12 @@ struct RecordMemberDecl {
     std::unique_ptr<Expr> bit_width;
     std::vector<Attribute> attributes;
     std::shared_ptr<const FreshIdentifier> fresh;
+    // An embedded record or union: named by its tag or typedef name, or, when
+    // anonymous, with an empty name and a private identity.
+    bool embedded{};
     [[nodiscard]] MemberName member_name() const { return {name, fresh}; }
+    // Initializers fill every member except an unnamed bit-field.
+    [[nodiscard]] bool initialized() const { return !name.empty() || embedded; }
 };
 
 struct RecordDecl {
@@ -826,6 +834,10 @@ struct Program {
         std::span<const EvaluationInstructionOperand>)> evaluation_instruction_source;
     ContinuationQuery<std::optional<EvaluationMemberLayout>(
         const TypePtr&, const MemberName&)> evaluation_member_layout;
+    // `$::meta::type`: the type that tokens name, each token looked up in its
+    // own context over the environment of the given call site; null if none.
+    ContinuationQuery<TypePtr(const TokenSequence&, std::shared_ptr<const SyntaxContext>,
+        SourceLocation)> evaluation_parse_type;
     ContinuationQuery<EvaluationInitializerPlan(const Expr&, const TypePtr&)>
         evaluation_initializer_plan;
     ContinuationQuery<EvaluationInitializerTypePlan(const Expr&, const TypePtr&,
@@ -869,6 +881,41 @@ struct Program {
     // its internal name does not depend on other units.
     std::unordered_map<std::string, std::uint64_t> literal_ordinals;
 };
+
+// A member of a record or union found directly or, failing that, through its
+// embedded members, breadth first: `members` leads from the record's own
+// member to the found one and `owners` keeps the definitions holding them.
+// Two candidates at the shallowest depth make the lookup ambiguous.
+struct MemberLookup {
+    std::vector<const RecordMemberDecl*> members;
+    std::vector<std::shared_ptr<const RecordDecl>> owners;
+    bool ambiguous{};
+    [[nodiscard]] const RecordMemberDecl* member() const {
+        return ambiguous || members.empty() ? nullptr : members.back();
+    }
+};
+MemberLookup find_record_member(const Program& program, const RecordDecl& record,
+                                const MemberName& name);
+// The embedded members leading from the record `outer` to an embedded member
+// of type `inner` (qualifiers aside) at the shallowest depth that has one.
+MemberLookup find_embedded_type(const Program& program, const TypePtr& outer,
+                                const TypePtr& inner);
+// The record that holds the member `lookup` found from an object of type
+// `owner`, qualified by the owner and by each embedded member on the way.
+TypePtr member_lookup_owner(const TypePtr& owner, const MemberLookup& lookup);
+// A pointer conversion between a record and a type embedded in it: `path`
+// leads from the outer record to the embedded member, and `downward` marks
+// the explicit conversion from the embedded type back to the outer record.
+struct EmbeddedConversion {
+    MemberLookup path;
+    bool downward{};
+};
+std::optional<EmbeddedConversion> embedded_pointer_conversion(const Program& program,
+    const TypePtr& source, const TypePtr& destination, bool explicit_cast);
+// Null when the destination pointee keeps the qualifiers the conversion
+// yields: the source pointee's and, upward, those of each embedded member.
+const char* embedded_conversion_qualifier_error(const EmbeddedConversion& conversion,
+    const TypePtr& source, const TypePtr& destination);
 
 std::string encode_link_name(std::string_view qualified_name, bool label = false,
                              std::string_view mangling_name = "default");

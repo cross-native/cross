@@ -279,6 +279,10 @@ public:
     ContinuationTask<std::shared_ptr<const SyntaxNode>> parse_tokens_async(SyntaxParseCategory category,
         const TokenSequence& input, std::shared_ptr<const SyntaxContext> context,
         SourceLocation location);
+    // The type that tokens name for `$::meta::type`, or null. Unlike a parse in
+    // an explicit context, every token keeps its own lexical context.
+    ContinuationTask<TypePtr> parse_type_async(const TokenSequence& input,
+        std::shared_ptr<const SyntaxContext> context, SourceLocation location);
     std::optional<Output> materialize_node(const SyntaxNode& node, SourceLocation location,
         SyntaxParseCategory deferred_category = SyntaxParseCategory::None);
     const EvaluationLimits& limits() const { return limits_; }

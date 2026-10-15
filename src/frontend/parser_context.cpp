@@ -1656,4 +1656,20 @@ EvaluationTask<std::shared_ptr<const SyntaxNode>> Parser::parse_syntax_tokens_as
     co_return co_await parser.parse_syntax_tokens_async(category, std::move(input));
 }
 
+EvaluationTask<TypePtr> Parser::parse_type_tokens_async(std::vector<Token> input,
+    std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics) {
+    if (!context || !context->parse_environment || input.size() < 2) co_return {};
+    const auto& environment = *context->parse_environment;
+    if (environment.syntax && environment.execution.expired()) co_return {};
+    const auto errors = diagnostics.errors();
+    Parser parser(std::move(input), diagnostics, nullptr, environment.address_bits);
+    parser.restore_environment(environment, *context);
+    auto type = co_await parser.parse_type_async();
+    std::optional<std::string> name;
+    if (type) type = co_await parser.parse_declarator_async(std::move(type), name, DeclaratorContext::TypeName);
+    if (!type || name || (co_await parser.current_async()).kind != TokenKind::End ||
+        diagnostics.errors() != errors) co_return {};
+    co_return type;
+}
+
 } // namespace cross

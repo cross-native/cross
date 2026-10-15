@@ -74,6 +74,10 @@ public:
     static EvaluationTask<std::shared_ptr<const SyntaxNode>> parse_syntax_tokens_async(
         SyntaxParseCategory category, std::vector<Token> input,
         std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics);
+    // A complete type name over the environment of `context`, each token in
+    // its own lexical context ($::meta::type). Null when no type is named.
+    static EvaluationTask<TypePtr> parse_type_tokens_async(std::vector<Token> input,
+        std::shared_ptr<const SyntaxContext> context, Diagnostics& diagnostics);
     std::shared_ptr<const SyntaxContext> syntax_context(SourceLocation location) const;
     std::shared_ptr<const SyntaxContext> effective_context(SourceLocation location,
         const SyntaxParseEnvironment* environment = nullptr) const;

@@ -1411,6 +1411,7 @@ private:
         record.alignment = record_alignment;
         record.size = rounded.value_or(0);
         module_.record(id) = std::move(record);
+        if (valid) module_.promote_members(id);
         layout_state_[id.value] = valid ? 2 : 3;
         co_return valid;
     }
@@ -1438,6 +1439,7 @@ private:
             member.location = source.location;
             member.name = source.name;
             member.fresh = source.fresh;
+            member.embedded = source.embedded;
             member.type = intern_type(source.type);
             member.pending_source_type = source.type;
             if (source.bit_width) {
@@ -3093,7 +3095,77 @@ const RecordMember* Module::member(RecordId id,
     const auto found = std::find_if(
         source.members.begin(), source.members.end(),
         [&](const RecordMember& candidate) { return candidate.member_name() == name; });
-    return found == source.members.end() ? nullptr : &*found;
+    if (found != source.members.end()) return &*found;
+    const auto* promoted = promoted_member(id, name);
+    return promoted && !promoted->ambiguous ? &promoted->member : nullptr;
+}
+
+std::optional<std::uint64_t> embedded_member_offset(const Module& module, RecordId outer, RecordId inner) {
+    std::vector<std::pair<RecordId, std::uint64_t>> level{{outer, 0}};
+    for (std::size_t depth = 0; !level.empty() && depth < module.records.size(); ++depth) {
+        std::vector<std::pair<RecordId, std::uint64_t>> next;
+        std::optional<std::uint64_t> found;
+        bool ambiguous{};
+        for (const auto& [id, base] : level)
+            for (const auto& member : module.record(id).members) {
+                const auto& type = module.type(member.type);
+                if (!member.embedded || type.kind != Type::Kind::Record || !type.record) continue;
+                if (*type.record == inner) {
+                    ambiguous = ambiguous || found.has_value();
+                    found = base + member.offset;
+                }
+                next.emplace_back(*type.record, base + member.offset);
+            }
+        if (found) return ambiguous ? std::nullopt : found;
+        level = std::move(next);
+    }
+    return std::nullopt;
+}
+
+const PromotedMember* Module::promoted_member(RecordId id, const MemberName& name) const {
+    const auto& promoted = record(id).promoted;
+    const auto found = std::find_if(promoted.begin(), promoted.end(),
+        [&](const PromotedMember& candidate) { return candidate.member.member_name() == name; });
+    return found == promoted.end() ? nullptr : &*found;
+}
+
+void Module::promote_members(RecordId id) {
+    // Direct members hide promoted names; each promoted name keeps its
+    // shallowest candidate, and a second one at that depth is ambiguous.
+    constexpr auto direct = std::numeric_limits<std::size_t>::max();
+    std::vector<PromotedMember> promoted;
+    std::unordered_map<MemberName, std::size_t, MemberNameHash> names;
+    const auto members = records.at(id.value).members;
+    for (const auto& member : members) names.emplace(member.member_name(), direct);
+    const auto add = [&](PromotedMember candidate) {
+        const auto [found, inserted] = names.emplace(candidate.member.member_name(), promoted.size());
+        if (inserted) {
+            promoted.push_back(std::move(candidate));
+        } else if (found->second != direct) {
+            auto& prior = promoted[found->second];
+            if (candidate.path.size() < prior.path.size()) prior = std::move(candidate);
+            else if (candidate.path.size() == prior.path.size()) prior.ambiguous = true;
+        }
+    };
+    for (std::uint32_t index = 0; index < members.size(); ++index) {
+        const auto& member = members[index];
+        const auto embedded = type(member.type);
+        if (!member.embedded || embedded.kind != Type::Kind::Record || !embedded.record) continue;
+        const auto& inner = record(*embedded.record);
+        const auto promote = [&](const RecordMember& found, const std::vector<std::uint32_t>& path,
+                                 bool ambiguous) {
+            PromotedMember candidate{found, {index}, ambiguous};
+            candidate.member.offset = member.offset + found.offset;
+            candidate.member.type = add_qualifiers(found.type, embedded.is_const, embedded.is_volatile,
+                                                   embedded.may_alias);
+            candidate.path.insert(candidate.path.end(), path.begin(), path.end());
+            add(std::move(candidate));
+        };
+        for (std::uint32_t at = 0; at < inner.members.size(); ++at)
+            if (!inner.members[at].name.empty()) promote(inner.members[at], {at}, false);
+        for (const auto& deeper : inner.promoted) promote(deeper.member, deeper.path, deeper.ambiguous);
+    }
+    records.at(id.value).promoted = std::move(promoted);
 }
 
 const Object* Module::object(const ObjectDecl& declaration) const {

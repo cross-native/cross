@@ -3558,8 +3558,53 @@ private:
         }
     }
 
+    // A pointer to a record converts to a pointer to a type embedded in it,
+    // and an explicit cast converts back, by the embedded member's offset; a
+    // null pointer stays null. Qualifiers were checked in the frontend.
+    std::optional<ValueId> embedded_pointer_cast(ValueId source, hir::TypeId destination,
+                                                 bool explicit_cast, SourceLocation location) {
+        const auto source_type = current_.values[source.value].type;
+        const auto& from = hir_.type(source_type);
+        const auto& to = hir_.type(destination);
+        if (from.kind != hir::Type::Kind::Pointer || to.kind != hir::Type::Kind::Pointer ||
+            !from.pointee || !to.pointee || from.address_space != to.address_space) return std::nullopt;
+        const auto outer = hir_.type(*from.pointee).record, inner = hir_.type(*to.pointee).record;
+        if (!outer || !inner || *outer == *inner) return std::nullopt;
+        bool downward = false;
+        auto offset = hir::embedded_member_offset(hir_, *outer, *inner);
+        if (!offset && explicit_cast) {
+            offset = hir::embedded_member_offset(hir_, *inner, *outer);
+            downward = true;
+        }
+        if (!offset) return std::nullopt;
+        if (*offset == 0 || !current_block_) return cast(source, destination, location);
+        const auto null = null_pointer_constant(destination, location);
+        if (!null) {
+            failed_ = true;
+            return source;
+        }
+        const auto nonnull = booleanize(source, location);
+        const auto entry = *current_block_;
+        const auto adjust = new_block(location);
+        const auto merge = new_block(location);
+        terminate(TerminatorKind::ConditionalBranch, location, nonnull, {adjust, merge});
+        enter(adjust);
+        const auto bytes_type = hir_.pointer_to(*hir_.builtin(BuiltinType::U8));
+        const auto moved = pointer_offset(cast(source, bytes_type, location), bytes_type,
+            constant(UInt128{*offset}, *hir_.builtin(BuiltinType::Iptr), location), !downward, location);
+        const auto adjusted = cast(*moved, destination, location);
+        const auto adjusted_block = *current_block_;
+        terminate(TerminatorKind::Branch, location, std::nullopt, {merge});
+        enter(merge);
+        const auto result = add_value(ValueKind::Phi, destination, location);
+        current_.values[result.value].incoming = {{entry, *null}, {adjusted_block, adjusted}};
+        return result;
+    }
+
     ValueId assignment_cast(ValueId source, hir::TypeId destination,
                             SourceLocation location) {
+        if (const auto embedded = embedded_pointer_cast(source, destination, false, location))
+            return *embedded;
         const auto& from = hir_.type(current_.values[source.value].type);
         const auto& to = hir_.type(destination);
         if (from.kind == hir::Type::Kind::Pointer &&
@@ -3764,6 +3809,11 @@ private:
             }
             auto source = co_await lower_expression_async(*expression.left);
             if (!source) break;
+            if (const auto embedded = embedded_pointer_cast(*source, destination_type, true,
+                                                            expression.location)) {
+                result = *embedded;
+                break;
+            }
             const auto source_type = current_.values[source->value].type;
             // An explicit scalar-to-vector cast splats, like the implicit conversion.
             const bool splat = vector_type(hir_, destination_type) &&
