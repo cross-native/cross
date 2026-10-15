@@ -47,6 +47,12 @@ foreach(pattern
             "n64 large-model assembly is missing '${pattern}'\n${large_text}")
     endif()
 endforeach()
+# The large model keeps complete addresses; only sym32 folds %lo into a load
+# or store.
+if(large_text MATCHES "%lo[(][^)]*[)][(]")
+    message(FATAL_ERROR
+        "n64 large-model assembly folds a %lo displacement\n${large_text}")
+endif()
 run_cc(n64-object -c -O2 -mprofile=mips64-n64 -mabi=n64 "${SOURCE}"
        -o "${big_object}")
 run_cc(n64el-object -c -O2 -mprofile=mips64el-n64 -mabi=n64 "${SOURCE}"
@@ -71,11 +77,12 @@ foreach(pattern
         "[\t ]ld[\t ][$][0-9]+,[0-9]+[(][$][0-9]+[)]"
         "[\t ]sd[\t ][$][0-9]+,[0-9]+[(][$][0-9]+[)]"
         "[\t ]lui[\t ][$][0-9]+,%hi[(]n64_object[)]"
-        "[\t ]daddiu[\t ][$][0-9]+,[$][0-9]+,%lo[(]n64_object[)]"
+        "[\t ]ld[\t ][$][0-9]+,%lo[(]n64_object[)][(][$][0-9]+[)]"
+        "[\t ]daddiu[\t ][$][0-9]+,[$][0-9]+,%lo[(]"
         "[\t ]ld[\t ][$][0-9]+,0[(][$]29[)]"
         "[\t ]ld[\t ][$][0-9]+,8[(][$]29[)]"
         "[\t ]mov\.d[\t ][^\n]*[$]f13"
-        "[\t ]mov\.s[\t ][^\n]*[$]f14"
+        "[\t ](mov\.s|cvt\.d\.s)[\t ][^\n]*[$]f14"
         "\n\t\.quad n64_object\n"
         "\\.quad \\.Lcross\\.patch\\.value\\.[0-9]+\\.end-8")
     if(NOT text MATCHES "${pattern}")

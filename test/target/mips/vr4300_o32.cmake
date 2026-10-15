@@ -53,8 +53,8 @@ foreach(pattern
         "\\.frame[\t ]+\\$sp,"
         "[\t ]daddu[\t ]"
         "[\t ]mul\\.d[\t ]"
-        "[\t ]mov\\.d[\t ][^\n]*[$]f12"
-        "[\t ]mov\\.d[\t ][^\n]*[$]f14"
+        "[\t ](mov\\.d|dmtc1)[\t ][^\n]*[$]f12"
+        "[\t ](mov\\.d|dmtc1)[\t ][^\n]*[$]f14"
         "[\t ]c\\.lt\\.s[\t ]"
         "[\t ]c\\.lt\\.d[\t ]"
         "[\t ]sub\\.s[\t ]"
@@ -75,7 +75,7 @@ if(assembly MATCHES
 endif()
 
 file(READ "${fix_assembly}" fixed)
-if(NOT fixed MATCHES "[\t ]mul\\.d[^\n]*\n[\t ]add\\.d" OR
+if(NOT fixed MATCHES "[\t ]mul\\.d[^\n]*\n([\t ]jr[\t ][$]ra\n)?[\t ]add\\.d" OR
    fixed MATCHES "[\t ]mul\\.d[^\n]*\n[\t ]nop")
     message(FATAL_ERROR
         "-mfix4300 did not use safe work between FP multiplies\n${fixed}")

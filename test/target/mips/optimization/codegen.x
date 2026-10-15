@@ -373,3 +373,59 @@ global void mips_output_division(in u32 left, in u32 right,
     quotient = left / right;
     remainder = left % right;
 }
+
+global u32 mips_quality_counter;
+global u32 mips_quality_table[16];
+struct MipsQualityPair {
+    u32 first;
+    u32 second;
+};
+global struct MipsQualityPair mips_quality_pair;
+
+[[abi("o32"), noinline]]
+global u32 mips_global_scalar(in u32 value) {
+    mips_quality_counter = mips_quality_counter + value;
+    return mips_quality_counter + 1u32;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_global_field() {
+    return mips_quality_pair.second;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_global_index(in u32 index) {
+    return mips_quality_table[index & 15u32];
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_compare_immediates(in i32 value, in u32 count) {
+    u32 below = (value < 100);
+    u32 above = (count > 1000u32);
+    u32 zero = (count == 0u32);
+    return below + above * 2u32 + zero * 4u32;
+}
+
+[[abi("o32"), noinline]]
+global i32 mips_zero_branch(in i32 value, in i32 other) {
+    if (value < 0) return other + 1;
+    return other - 7;
+}
+
+[[abi("o32"), noinline]]
+global void mips_store_loop(in u32 *cells, in u32 count, in u32 value) {
+    for (u32 index = 0u32; index < count; index = index + 1u32) {
+        cells[index] = value;
+        value = value * 3u32 + 1u32;
+    }
+}
+
+[[abi("o32"), noinline]]
+global f32 mips_int_to_float(in i32 value, in f32 scale) {
+    return (f32)value * scale;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_swap_call(in u32 left, in u32 right) {
+    return mips_quality_counter + mips_global_index(right) * left;
+}

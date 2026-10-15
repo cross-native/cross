@@ -1,0 +1,360 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Code-quality kernels: global accesses through split %hi/%lo addresses,
+// comparisons and branches against immediates, filled delay slots (moved
+// loads, multiplies, constants, copies, result and argument moves), boolean
+// widenings, and narrow casts. Every kernel is u32 k(in u32 a, in u32 b,
+// in u32 c). The kernels run in template order on both sides, so global
+// state carries over identically.
+
+struct QPair {
+    u32 first;
+    u32 second;
+};
+
+global u32 q_counter = 7u32;
+global u32 q_state[4] = { 1u32, 2u32, 3u32, 4u32 };
+global u16 q_half = 0xfff0u16;
+global u8 q_byte = 0xfdu8;
+global u64 q_wide = 0x0123456789abcdefu64;
+global struct QPair q_pair = { .first = 5u32, .second = 6u32 };
+global struct QPair q_pairs[8];
+global const u32 q_table[16] = {
+    3u32, 1u32, 4u32, 1u32, 5u32, 9u32, 2u32, 6u32,
+    5u32, 3u32, 5u32, 8u32, 9u32, 7u32, 9u32, 3u32,
+};
+
+[[abi("@ABI@"), noinline]]
+static u32 q_helper(in u32 x, in u32 y) {
+    return x * 3u32 + y;
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 q_helper4(in u32 p1, in u32 p2, in u32 p3, in u32 p4) {
+    return p1 - p2 + (p3 ^ p4);
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 q_greater(in u32 x, in u32 y) {
+    return x > y + 1000u32;
+}
+
+[[abi("@ABI@"), noinline]]
+static i32 q_negative(in i32 x) {
+    return x < 0i32;
+}
+
+// A 64-bit boolean result fills a register pair under o32.
+[[abi("@ABI@"), noinline]]
+static u64 q_wide_less(in u64 x, in u64 y) {
+    return x < y;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_scalar(in u32 a, in u32 b, in u32 c) {
+    q_counter = q_counter + a;
+    q_state[1] = q_state[0] ^ q_counter;
+    u32 r = q_state[1] + q_state[2] + b;
+    q_state[0] = r - c;
+    return r ^ q_counter;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_field(in u32 a, in u32 b, in u32 c) {
+    q_pair.second = q_pair.second + a;
+    return q_pair.second ^ b ^ c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_fields(in u32 a, in u32 b, in u32 c) {
+    q_pair.first = q_pair.first * 5u32 + b;
+    q_pair.second = q_pair.second + q_pair.first + c;
+    return q_pair.first ^ q_pair.second ^ a;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_table(in u32 a, in u32 b, in u32 c) {
+    return q_table[a & 15u32] + q_table[b & 15u32] * 3u32 +
+        q_table[(a ^ c) & 15u32] * 7u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_pairs(in u32 a, in u32 b, in u32 c) {
+    u32 i = a & 7u32;
+    q_pairs[i].second = b;
+    q_pairs[(i + 1u32) & 7u32].first = c;
+    q_pairs[(i + 3u32) & 7u32].second = q_pairs[i].second + c;
+    return q_pairs[i].second + q_pairs[(b + 1u32) & 7u32].first +
+        q_pairs[(c + 3u32) & 7u32].second;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_narrow(in u32 a, in u32 b, in u32 c) {
+    u16 add = a;
+    u8 sub = b;
+    q_half = q_half + add;
+    q_byte = q_byte - sub;
+    i8 view = q_byte;
+    i32 signed_view = view;
+    u32 widened = signed_view;
+    return q_half + widened + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_wide(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    q_wide = q_wide + ((wa << 32) | wb);
+    u32 low = q_wide;
+    u32 high = q_wide >> 32;
+    return low ^ high ^ c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_global_loop(in u32 a, in u32 b, in u32 c) {
+    u32 sum = c;
+    u32 n = a & 15u32;
+    for (u32 i = 0u32; i < n; i = i + 1u32) {
+        q_counter = q_counter + q_table[i];
+        sum = sum + q_counter;
+    }
+    return sum ^ b;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_cmp_signed(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    u32 r0 = (sa < 10i32);
+    u32 r1 = (sa <= -32768i32);
+    u32 r2 = (sa > 32767i32);
+    u32 r3 = (sa >= -1i32);
+    u32 r4 = (sb < 0i32);
+    u32 r5 = (sb <= 0i32);
+    u32 r6 = (sb > 0i32);
+    u32 r7 = (sb >= 0i32);
+    u32 r8 = (sa < 32768i32);
+    u32 r9 = (sa > -32769i32);
+    u32 r10 = (10i32 < sb);
+    u32 r11 = (-5i32 >= sb);
+    u32 r12 = (sa <= 2147483647i32);
+    u32 r13 = (sa > -2147483647i32);
+    u32 r14 = (sb < -32767i32);
+    u32 r15 = (sb >= 100i32);
+    return r0 | r1 << 1 | r2 << 2 | r3 << 3 | r4 << 4 | r5 << 5 |
+        r6 << 6 | r7 << 7 | r8 << 8 | r9 << 9 | r10 << 10 |
+        r11 << 11 | r12 << 12 | r13 << 13 | r14 << 14 | r15 << 15 |
+        (c & 0xffffu32) << 16;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_cmp_unsigned(in u32 a, in u32 b, in u32 c) {
+    u32 r0 = (a < 1000u32);
+    u32 r1 = (a <= 32767u32);
+    u32 r2 = (a > 0u32);
+    u32 r3 = (a >= 1u32);
+    u32 r4 = (b < 0xffff8000u32);
+    u32 r5 = (b <= 0xfffffffeu32);
+    u32 r6 = (b > 0xffffffffu32);
+    u32 r7 = (b >= 32768u32);
+    u32 r8 = (c < 65535u32);
+    u32 r9 = (c > 65536u32);
+    u32 r10 = (7u32 < a);
+    u32 r11 = (0u32 >= b);
+    u32 r12 = (a == 0u32);
+    u32 r13 = (a != 0u32);
+    u32 r14 = (b == 255u32);
+    u32 r15 = (b != 65535u32);
+    u32 r16 = (c == 65536u32);
+    u32 r17 = (c != 0xffffffffu32);
+    u32 r18 = (a == 0xffff8001u32);
+    u32 r19 = (b != 0xffffffffu32);
+    return r0 | r1 << 1 | r2 << 2 | r3 << 3 | r4 << 4 | r5 << 5 |
+        r6 << 6 | r7 << 7 | r8 << 8 | r9 << 9 | r10 << 10 |
+        r11 << 11 | r12 << 12 | r13 << 13 | r14 << 14 | r15 << 15 |
+        r16 << 16 | r17 << 17 | r18 << 18 | r19 << 19;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_cmp_wide(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 x = (wa << 32) | wb;
+    i64 sx = x;
+    u32 r0 = (x < 100u64);
+    u32 r1 = (x >= 0xffffffffffff8000u64);
+    u32 r2 = (sx < -5i64);
+    u32 r3 = (sx > 32767i64);
+    u32 r4 = (sx <= 0i64);
+    u32 r5 = (x == 0u64);
+    u32 r6 = (x != 1u64);
+    u32 r7 = (sx >= -32768i64);
+    return r0 | r1 << 1 | r2 << 2 | r3 << 3 | r4 << 4 | r5 << 5 |
+        r6 << 6 | r7 << 7 | (c & 0xffu32) << 8;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_branches(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    u32 r = c;
+    if (sa < 0i32) r = r + 1u32;
+    if (sa >= 0i32) r = r + 2u32;
+    if (sb <= 0i32) r = r * 3u32;
+    if (sb > 0i32) r = r ^ 5u32;
+    if (a > 0u32) r = r + 7u32;
+    if (b <= 0u32) r = r + 11u32;
+    if (sa < 100i32) r = r * 13u32;
+    if (a >= 1000u32) r = r ^ 0x55u32;
+    if (sb > -32768i32) r = r + 17u32;
+    if (c < 32768u32) r = r - 19u32;
+    if (a == 7u32) r = r + 23u32;
+    if (b != 3u32) r = r + 29u32;
+    return r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_branch_loop(in u32 a, in u32 b, in u32 c) {
+    u32 i = 0u32;
+    u32 acc = b;
+    while (i < 20u32) {
+        if (acc > 1000u32) {
+            acc = acc - 1000u32;
+        } else {
+            acc = acc + (a & 0xfffu32) + i;
+        }
+        i = i + 1u32;
+    }
+    i32 k = 10i32;
+    while (k > 0i32) {
+        acc = acc + c;
+        k = k - 3i32;
+    }
+    return acc;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_delay_memory(in u32 a, in u32 b, in u32 c) {
+    u32 buffer[16];
+    for (u32 i = 0u32; i < 16u32; i = i + 1u32) {
+        buffer[i] = a * i + b;
+    }
+    u32 best = c;
+    for (u32 i = 0u32; i < 16u32; i = i + 1u32) {
+        u32 value = buffer[i];
+        if (value > best) {
+            best = value;
+        } else {
+            best = best + (value & 7u32);
+        }
+    }
+    return best;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_delay_stores(in u32 a, in u32 b, in u32 c) {
+    u32 cells[8];
+    u32 sum = 0u32;
+    for (u32 i = 0u32; i < 8u32; i = i + 1u32) {
+        cells[i] = (a >> i) + c;
+        if ((b & (1u32 << i)) != 0u32) {
+            cells[(i + 3u32) & 7u32] = sum;
+        }
+        sum = sum + cells[i];
+    }
+    return sum ^ cells[a & 7u32];
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_delay_multiply(in u32 a, in u32 b, in u32 c) {
+    u32 acc = c;
+    u32 n = (a & 31u32) + 1u32;
+    for (u32 i = 0u32; i < n; i = i + 1u32) {
+        acc = acc * b + i;
+        if ((acc & 1u32) != 0u32) {
+            acc = acc * 3u32;
+        }
+    }
+    return acc;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_delay_divide(in u32 a, in u32 b, in u32 c) {
+    u32 divisor = (b & 15u32) + 1u32;
+    u32 acc = a;
+    u32 sum = 0u32;
+    for (u32 i = 0u32; i < 6u32; i = i + 1u32) {
+        sum = sum + acc % divisor;
+        acc = acc / divisor + c;
+    }
+    return acc ^ sum;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_returns(in u32 a, in u32 b, in u32 c) {
+    if (a == b) return c;
+    if (a < 100u32) return a + 1u32;
+    if (b > 1000u32) return b;
+    if (c == 0u32) return a;
+    return a ^ b;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_calls(in u32 a, in u32 b, in u32 c) {
+    u32 first = q_helper(b, a);
+    u32 second = q_helper(c, first);
+    return q_helper4(second, a, b, first) + q_helper(a, c);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_select_chain(in u32 a, in u32 b, in u32 c) {
+    u32 r;
+    if (a < b) {
+        r = a;
+    } else if (b < c) {
+        r = b;
+    } else {
+        r = c;
+    }
+    i32 sa = a;
+    u32 s = (sa < 0i32) ? 1u32 : 0u32;
+    return r * 2u32 + s;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_narrow_casts(in u32 a, in u32 b, in u32 c) {
+    u8 x8 = a;
+    u16 x16 = b;
+    u8 c8 = c;
+    u16 a16 = a >> 3;
+    i8 s8 = c8;
+    i16 s16 = a16;
+    u8 y8 = x8 + 200u8;
+    u16 y16 = x16 * 3u16;
+    i32 t8 = s8;
+    i32 t16 = s16;
+    u32 w8 = y8;
+    u32 w16 = y16;
+    u32 v8 = t8;
+    u32 v16 = t16;
+    return w8 + (w16 << 8) + v8 * 3u32 + v16 * 5u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_booleans(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    u32 r = q_greater(a, b) + q_greater(b, c) * 2u32;
+    i32 n = q_negative(sa);
+    u32 wide = (a > 1000u32);
+    u32 masked = (b == 0u32) & 3u32;
+    i64 sign = (sa < 0i32);
+    u32 narrowed = sign;
+    u32 negative = n;
+    u64 less = q_wide_less(((u64)a << 32) | b, ((u64)c << 32) | a);
+    u32 less_low = less;
+    u32 less_high = less >> 32;
+    return r + negative * 4u32 + wide * 8u32 + masked * 16u32 +
+        narrowed * 32u32 + (c & 7u32) * 64u32 + less_low * 512u32 +
+        less_high * 1024u32;
+}

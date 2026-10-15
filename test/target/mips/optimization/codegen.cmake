@@ -217,7 +217,7 @@ function_body("${OUTPUT}.no_delay.s"
 if(NOT scheduled_successor MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+xori[\t ]" OR
    NOT scheduled_successor MATCHES
-       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n[\t ]+addiu[\t ]" OR
+       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n([\t ]+jr[\t ]+\\$ra\n)?[\t ]+addiu[\t ]" OR
    NOT empty_successor MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+\n[\t ]+nop")
     message(FATAL_ERROR
@@ -260,7 +260,7 @@ endif()
 if(NOT scheduled_fp MATCHES
        "[\t ]dmtc1[\t ]+\\$zero,\\$f[0-9]+\n[\t ]+nop\n[\t ]+add[.]d" OR
    scheduled_fp MATCHES
-       "[\t ]dli[\t ][^\n]*,0\n[\t ]+dmtc1")
+       "[\t ]li[\t ][^\n]*,0\n[\t ]+dmtc1")
     message(FATAL_ERROR
         "MIPS zero floating constant did not use the architectural zero "
         "register or lost its required transfer delay\n${scheduled_fp}")
@@ -302,7 +302,7 @@ if(NOT pooled_literal MATCHES
        "[\t ]ldc1[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+[)]" OR
    NOT size_assembly MATCHES
        "\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
-   NOT materialized_literal MATCHES "[\t ]dli[\t ]" OR
+   NOT materialized_literal MATCHES "[\t ]dsll[\t ]" OR
    materialized_assembly MATCHES
        "\\.Lcross[.]mips[.][0-9_]+[.]float[.][0-9]+:")
     message(FATAL_ERROR
@@ -321,7 +321,7 @@ if(NOT pooled_integer MATCHES
        "[\t ]ld[\t ][^\n]*%lo[(]\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+[)]" OR
    NOT size_assembly MATCHES
        "\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+:\n[\t ]+\\.quad[\t ]" OR
-   NOT materialized_integer MATCHES "[\t ]dli[\t ]" OR
+   NOT materialized_integer MATCHES "[\t ]dsll[\t ]" OR
    materialized_assembly MATCHES
        "\\.Lcross[.]mips[.][0-9_]+[.]integer[.][0-9]+:")
     message(FATAL_ERROR
@@ -660,9 +660,9 @@ if(pressure_risc STREQUAL pressure_cisc)
         "the RISC endpoint did not reduce pressure-heavy store unrolling")
 endif()
 if(NOT pressure_risc MATCHES
-       "[\t ]li[\t ]+\\\$[a-z0-9]+,4294967294" OR
+       "[\t ]li[\t ]+\\\$[a-z0-9]+,-2\n" OR
    NOT pressure_cisc MATCHES
-       "[\t ]li[\t ]+\\\$[a-z0-9]+,4294967292")
+       "[\t ]li[\t ]+\\\$[a-z0-9]+,-4\n")
     message(FATAL_ERROR
         "store-loop pressure did not select factors two and four\n"
         "RISC:\n${pressure_risc}\nCISC:\n${pressure_cisc}")
@@ -687,8 +687,8 @@ function_body("${OUTPUT}.unroll_risc.s"
               mips_compact_store compact_risc)
 function_body("${OUTPUT}.unroll_cisc.s"
               mips_compact_store compact_cisc)
-if(NOT compact_risc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,4" OR
-   NOT compact_cisc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,4")
+if(NOT compact_risc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,-4\n" OR
+   NOT compact_cisc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,-4\n")
     message(FATAL_ERROR
         "an endpoint reduced a compact store loop below factor four\n"
         "RISC:\n${compact_risc}\nCISC:\n${compact_cisc}")
@@ -772,4 +772,90 @@ if(NOT paired_count EQUAL 1 OR NOT separate_count EQUAL 2 OR
         "entry captures regressed\n"
         "paired:\n${paired_division}\nseparate:\n${separate_division}\n"
         "MIPS I:\n${mips1_division}\noutput:\n${output_division}")
+endif()
+
+# Global accesses add %lo in the load or store and share one %hi; an access
+# that only ever uses one offset of an object folds that offset.
+function_body("${OUTPUT}.enabled.s" mips_global_scalar global_scalar)
+function_body("${OUTPUT}.no_address_combine.s" mips_global_scalar
+              global_address)
+string(REGEX MATCHALL "%hi[(]mips_quality_counter[)]" scalar_highs
+       "${global_scalar}")
+list(LENGTH scalar_highs scalar_high_count)
+if(NOT scalar_high_count EQUAL 1 OR
+   NOT global_scalar MATCHES
+       "[\t ]lw[\t ][^\n]*,%lo[(]mips_quality_counter[)][(]" OR
+   NOT global_scalar MATCHES
+       "[\t ]sw[\t ][^\n]*,%lo[(]mips_quality_counter[)][(]" OR
+   global_scalar MATCHES "addiu[^\n]*%lo" OR
+   NOT global_address MATCHES
+       "[\t ]addiu[\t ][^\n]*,%lo[(]mips_quality_counter[)]")
+    message(FATAL_ERROR
+        "MIPS global accesses did not share a %hi and fold %lo, or "
+        "-fno-combine-addresses was ignored\n"
+        "combined:\n${global_scalar}\nseparate:\n${global_address}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_global_field global_field)
+function_body("${OUTPUT}.enabled.s" mips_global_index global_index)
+if(NOT global_field MATCHES "%hi[(]mips_quality_pair[+]4[)]" OR
+   NOT global_field MATCHES
+       "[\t ]lw[\t ][^\n]*,%lo[(]mips_quality_pair[+]4[)][(]" OR
+   NOT global_index MATCHES
+       "[\t ]lw[\t ][^\n]*,%lo[(]mips_quality_table[)][(]" OR
+   global_index MATCHES "addiu[^\n]*%lo")
+    message(FATAL_ERROR
+        "MIPS member or indexed global access did not fold its %lo\n"
+        "member:\n${global_field}\nindexed:\n${global_index}")
+endif()
+
+# Comparisons with constants select SLTI/SLTIU (plus XORI for a complement)
+# and need no mask on their 0/1 result.
+function_body("${OUTPUT}.enabled.s" mips_compare_immediates
+              compare_immediates)
+function_body("${OUTPUT}.no_machine_combine.s" mips_compare_immediates
+              compare_registers)
+if(NOT compare_immediates MATCHES "[\t ]slti[\t ][^\n]*,\\$a0,100\n" OR
+   NOT compare_immediates MATCHES
+       "[\t ]sltiu[\t ][^\n]*,1001\n[\t ]+xori[\t ][^\n]*,1\n" OR
+   NOT compare_immediates MATCHES "[\t ]sltiu[\t ][^\n]*,1\n" OR
+   compare_immediates MATCHES "[\t ](li|andi)[\t ]" OR
+   NOT compare_registers MATCHES "[\t ]slt[\t ]")
+    message(FATAL_ERROR
+        "MIPS comparison immediates or -fno-machine-combine regressed\n"
+        "immediate:\n${compare_immediates}\nregister:\n${compare_registers}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_zero_branch zero_branch)
+if(NOT zero_branch MATCHES "[\t ]b(ltz|gez)[\t ]+\\$a0," OR
+   zero_branch MATCHES "[\t ]slt" OR
+   NOT zero_branch MATCHES "[\t ]jr[\t ]+\\$ra\n[\t ]+addiu[\t ]")
+    message(FATAL_ERROR
+        "a MIPS comparison with zero did not branch on the register or "
+        "fill its return delay slot\n${zero_branch}")
+endif()
+
+# Delay slots take an instruction from the block that falls into the
+# branch, the call's last argument move, and an integer conversion reads
+# its source register directly.
+function_body("${OUTPUT}.enabled.s" mips_store_loop store_loop)
+function_body("${OUTPUT}.no_delay.s" mips_store_loop store_loop_empty)
+function_body("${OUTPUT}.enabled.s" mips_swap_call swap_call)
+function_body("${OUTPUT}.no_delay.s" mips_swap_call swap_call_empty)
+if(NOT store_loop MATCHES "[\t ]beq[^\n]*\n[\t ]+li[\t ]" OR
+   NOT store_loop MATCHES "[\t ]bne[^\n]*\n[\t ]+addiu[\t ]" OR
+   NOT store_loop_empty MATCHES "[\t ]bne[^\n]*\n[\t ]+nop\n" OR
+   NOT swap_call MATCHES
+       "[\t ]jal[\t ]+mips_global_index\n[\t ]+move[\t ]+\\$a0,\\$a1\n" OR
+   NOT swap_call_empty MATCHES "[\t ]jal[\t ]+mips_global_index\n[\t ]+nop\n")
+    message(FATAL_ERROR
+        "MIPS cross-block or call delay slots regressed or "
+        "-fno-schedule-insns2 was ignored\n"
+        "loop:\n${store_loop}\nloop without delay slots:\n${store_loop_empty}\n"
+        "call:\n${swap_call}\ncall without delay slots:\n${swap_call_empty}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_int_to_float int_to_float)
+if(NOT int_to_float MATCHES "[\t ]mtc1[\t ]+\\$a0,\\$f" OR
+   int_to_float MATCHES "[\t ]move[\t ]+\\$t0")
+    message(FATAL_ERROR
+        "MIPS integer-to-float conversion staged its source through t0\n"
+        "${int_to_float}")
 endif()

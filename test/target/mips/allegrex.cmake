@@ -97,6 +97,14 @@ if(assembly MATCHES "[	 ](daddu|dsubu|ld|sd|ldc1|sdc1)[	 ]")
 endif()
 
 file(READ "${pair_assembly}" pair)
+# GNU as reads $t0-$t3 as registers 12-15 in EABI objects, so their GPRs
+# are spelled by number.
+foreach(text assembly pair)
+    if("${${text}}" MATCHES "[$](t[0-9]|a[0-7]|v[01]|s[0-8]|ra|sp|fp|gp|at)[^0-9a-z_]")
+        message(FATAL_ERROR
+            "EABI32 assembly names a general register symbolically\n${${text}}")
+    endif()
+endforeach()
 file(READ "${pair_baseline_assembly}" pair_baseline)
 file(READ "${pair_mips1_assembly}" pair_mips1)
 file(READ "${pair_cross_be_assembly}" pair_cross_be)
@@ -115,9 +123,9 @@ foreach(text pair pair_mips1 pair_cross_be pair_cross_le)
     endforeach()
 endforeach()
 
-if(pair MATCHES "addiu[\t ]+[$]t2,[$]t2,-1" OR
-   NOT pair MATCHES "sltiu[\t ]+[$]t6,[$]t2,32" OR
-   NOT pair_baseline MATCHES "addiu[\t ]+[$]t2,[$]t2,-1")
+if(pair MATCHES "addiu[\t ]+[$]10,[$]10,-1" OR
+   NOT pair MATCHES "sltiu[\t ]+[$]14,[$]10,32" OR
+   NOT pair_baseline MATCHES "addiu[\t ]+[$]10,[$]10,-1")
     message(FATAL_ERROR
         "independent MIPS machine-combine control did not select the constant-time i64 shift expansion\noptimized:\n${pair}\nbaseline:\n${pair_baseline}")
 endif()

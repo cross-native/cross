@@ -78,9 +78,11 @@ expect(invalidate "${code}" "\tsw\t[^\n]*\n\tnop\n\tnop\n\tcache\t17,")
 # the return jump and its delay slot.
 body("${text}" set_status code)
 expect(set_status "${code}" "\tmtc0\t[$]a0,[$]12\n\tnop\n\tnop\n\tnop\n\tjr\t[$]ra\n")
-# TLB write: three instructions before a load.
+# TLB write: three instructions before a load, which may sit in the delay
+# slot of the return.
 body("${text}" after_tlb code)
-expect(after_tlb "${code}" "\ttlbwi\n\tnop\n\tnop\n\tnop\n\tlw\t")
+expect(after_tlb "${code}"
+    "\ttlbwi\n\tnop\n\tnop\n(\tnop\n|\tjr\t[$]ra\n)\tlw\t")
 # A pure form inlines and merges.
 body("${text}" inline_root code)
 string(REGEX MATCHALL "\tsqrt[.]s\t" roots "${code}")

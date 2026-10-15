@@ -254,8 +254,10 @@ the features it implies, and `-m`/`-mno-` options adjust them:
 that assume a 64-bit FPU; the other ABIs produce ELF32, even on a 64-bit CPU.
 With 64-bit addresses, symbol addresses use two instructions by default, so
 symbols must lie in the low 2 GB or in the sign-extended KSEG0/KSEG1 range
-unless `-mcmodel=large` is given, and assembly output names general registers
-by number (`$8`) because 64-bit assemblers read `$t0`–`$t3` differently.
+unless `-mcmodel=large` is given. Assembly output names general registers by
+number (`$8`) under these ABIs and under ABIs whose `elf_abi_tag` is
+`"eabi32"` ([models.md](models.md)), such as `eabi32`, because assemblers
+read `$t0`–`$t3` there as registers 12–15.
 
 Allegrex has a single-precision FPU: `f64` arithmetic is an error. Code that
 needs floating point under `-msoft-float` is an error, because Cross does not

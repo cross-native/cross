@@ -9,12 +9,17 @@
 # ctest never runs this script. Rerun it by hand only when a kernel set
 # gains, loses, or renames a kernel, and check the results in.
 #
-# usage: generate.py <kernels.x.in> <start.s> <main.cpp>
+# usage: generate.py <kernels.x.in> <start.s> <main.cpp> [<start_n64.s>]
+#
+# The optional n64 startup calls the same kernels as n64 functions: it spells
+# GPRs by number, as the n64 assembler reads $t0-$t3 as registers 12-15, and
+# passes each u32 argument sign-extended, as that ABI requires.
 
 import re
 import sys
 
 template, out_s, out_cpp = sys.argv[1:4]
+out_n64 = sys.argv[4] if len(sys.argv) > 4 else None
 src = open(template).read()
 names = re.findall(r"global u32 (k_\w+)\(", src)
 
@@ -87,3 +92,32 @@ header_cpp = [
 open(out_s, "w").write("\n".join(header_s + [asm_line(line) for line in s]) + "\n")
 open(out_cpp, "w").write("\n".join(header_cpp + cpp) + "\n")
 print(f"{len(names)} kernels x {len(ARGS)} argument sets -> {out_s}, {out_cpp}")
+
+if out_n64:
+    def signed(value):
+        return value - (1 << 32) if value & 0x80000000 else value
+
+    n64 = [
+        ".set noreorder", ".set noat", ".set mips64",
+        '.section .text.boot,"ax",@progbits', ".globl _start", ".ent _start", "_start:",
+        "lui $29,0x8080", "daddiu $29,$29,-64",
+        # n64 is defined on a 64-bit FPU: enable CU1 and FR.
+        "mfc0 $12,$12", "lui $13,0x2400", "or $12,$12,$13", "mtc0 $12,$12", "nop", "nop",
+    ]
+    for n in names:
+        for (a, b, c) in ARGS:
+            n64 += [f"li $4,{signed(a)}", f"li $5,{signed(b)}", f"li $6,{signed(c)}",
+                    f"jal {n}", "nop", "move $4,$2", "jal print_hex", "nop"]
+    n64 += [
+        "move $4,$0", "daddiu $2,$0,1", "daddiu $25,$0,1", ".word 0x7000007f",
+        ".Lhalt:", "b .Lhalt", "nop", ".end _start",
+        ".ent print_hex", "print_hex:", "lui $12,0xbf00", "ori $12,$12,0x0900",
+        "addiu $13,$0,8",
+        "1:", "srl $14,$4,28", "sltiu $15,$14,10", "beq $15,$0,2f", "nop",
+        "addiu $14,$14,48", "b 3f", "nop", "2:", "addiu $14,$14,87", "3:", "sb $14,0($12)",
+        "sll $4,$4,4", "addiu $13,$13,-1", "bne $13,$0,1b", "nop",
+        "addiu $14,$0,10", "sb $14,0($12)", "jr $31", "nop", ".end print_hex",
+    ]
+    open(out_n64, "w").write(
+        "\n".join(header_s + [asm_line(line) for line in n64]) + "\n")
+    print(f"n64 startup -> {out_n64}")

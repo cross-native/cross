@@ -8,13 +8,27 @@
 # QEMU R4000, and compare every printed kernel result line by line against
 # the host reference. No Python runs at test time; generate.py only produces
 # the checked-in start_*.s/main_*.cpp files, ahead of time, by hand.
+#
+# ADDRESS_MODEL=64 runs the n64 ABI on ELF64 images linked directly at their
+# KSEG0 address; QEMU_CPU selects the emulated CPU.
 
-foreach(required CC HOST_CXX TEMPLATE STARTUP HOST_MAIN LINKER
-                 WRAPPER_TEMPLATE WRAPPER_LINKER OUTPUT)
+if(NOT DEFINED ADDRESS_MODEL OR "${ADDRESS_MODEL}" STREQUAL "")
+    set(ADDRESS_MODEL 32)
+endif()
+set(required_paths CC HOST_CXX TEMPLATE STARTUP HOST_MAIN LINKER OUTPUT)
+if(ADDRESS_MODEL STREQUAL "32")
+    list(APPEND required_paths WRAPPER_TEMPLATE WRAPPER_LINKER)
+elseif(NOT ADDRESS_MODEL STREQUAL "64")
+    message(FATAL_ERROR "ADDRESS_MODEL must be 32 or 64, got '${ADDRESS_MODEL}'")
+endif()
+foreach(required IN LISTS required_paths)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
 endforeach()
+if(NOT DEFINED QEMU_CPU OR "${QEMU_CPU}" STREQUAL "")
+    set(QEMU_CPU R4000)
+endif()
 if(NOT DEFINED TARGET_FLAGS OR "${TARGET_FLAGS}" STREQUAL "")
     message(FATAL_ERROR "TARGET_FLAGS must name the MIPS target/CPU flags")
 endif()
@@ -27,12 +41,18 @@ endif()
 
 if(ENDIAN STREQUAL "BE")
     set(mips_triple mips-unknown-elf)
+    if(ADDRESS_MODEL STREQUAL "64")
+        set(mips_triple mips64-unknown-elf)
+    endif()
     set(wrapper_triple mips64-unknown-elf)
     set(elf32_format elf32btsmip)
     set(elf64_format elf64btsmip)
     set(qemu_name qemu-system-mips64)
 elseif(ENDIAN STREQUAL "LE")
     set(mips_triple mipsel-unknown-elf)
+    if(ADDRESS_MODEL STREQUAL "64")
+        set(mips_triple mips64el-unknown-elf)
+    endif()
     set(wrapper_triple mips64el-unknown-elf)
     set(elf32_format elf32ltsmip)
     set(elf64_format elf64ltsmip)
@@ -82,7 +102,11 @@ if(WIN32)
 else()
     set(HOST_ABI sysv_abi)
 endif()
-set(MIPS_ABI o32)
+if(ADDRESS_MODEL STREQUAL "64")
+    set(MIPS_ABI n64)
+else()
+    set(MIPS_ABI o32)
+endif()
 
 file(READ "${TEMPLATE}" template_source)
 string(REPLACE "@ABI@" "${HOST_ABI}" host_source "${template_source}")
@@ -120,29 +144,37 @@ set(elf64 "${OUTPUT}.elf64")
 
 run_checked(mips-compile "${CC}" -c "${OPT_LEVEL}" ${target_flags} ${extra_flags}
             "${mips_x}" -o "${mips_object}")
-# The startup is MIPS III code for the QEMU host but must carry a 32-bit FPU
-# tag: MIPS I objects are FP32 and VR4300 objects are FPXX.
-run_checked(startup "${LLVM_MC}" --filetype=obj
-            --triple=${mips_triple} --mcpu=mips3
-            --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${start_object}")
-run_checked(link-elf32 "${LLD}" -m ${elf32_format} -T "${LINKER}"
-            "${start_object}" "${mips_object}" -o "${elf32}")
-run_checked(flatten-image "${LLVM_OBJCOPY}" -O binary "${elf32}" "${image}")
+if(ADDRESS_MODEL STREQUAL "64")
+    run_checked(startup "${LLVM_MC}" --filetype=obj
+                --triple=${mips_triple} --mcpu=mips64
+                --mattr=+noabicalls "${STARTUP}" -o "${start_object}")
+    run_checked(link-elf64 "${LLD}" -m ${elf64_format} -T "${LINKER}"
+                "${start_object}" "${mips_object}" -o "${elf64}")
+else()
+    # The startup is MIPS III code for the QEMU host but must carry a 32-bit
+    # FPU tag: MIPS I objects are FP32 and VR4300 objects are FPXX.
+    run_checked(startup "${LLVM_MC}" --filetype=obj
+                --triple=${mips_triple} --mcpu=mips3
+                --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${start_object}")
+    run_checked(link-elf32 "${LLD}" -m ${elf32_format} -T "${LINKER}"
+                "${start_object}" "${mips_object}" -o "${elf32}")
+    run_checked(flatten-image "${LLVM_OBJCOPY}" -O binary "${elf32}" "${image}")
 
-# See test/target/mips/runtime.cmake for why the wrapper exists: Malta's
-# 64-bit firmware wants a sign-extended 64-bit kernel entry, so the already
-# relocated o32 image is transported into KSEG0 unmodified -- every
-# instruction under test remains the exact llvm-mc o32 output.
-file(TO_CMAKE_PATH "${image}" IMAGE)
-configure_file("${WRAPPER_TEMPLATE}" "${wrapper_source}" @ONLY)
-run_checked(wrapper "${LLVM_MC}" --filetype=obj
-            --triple=${wrapper_triple} --mcpu=mips3
-            "${wrapper_source}" -o "${wrapper_object}")
-run_checked(link-wrapper "${LLD}" -m ${elf64_format} -T "${WRAPPER_LINKER}"
-            "${wrapper_object}" -o "${elf64}")
+    # See test/target/mips/runtime.cmake for why the wrapper exists: Malta's
+    # 64-bit firmware wants a sign-extended 64-bit kernel entry, so the
+    # already relocated o32 image is transported into KSEG0 unmodified --
+    # every instruction under test remains the exact llvm-mc o32 output.
+    file(TO_CMAKE_PATH "${image}" IMAGE)
+    configure_file("${WRAPPER_TEMPLATE}" "${wrapper_source}" @ONLY)
+    run_checked(wrapper "${LLVM_MC}" --filetype=obj
+                --triple=${wrapper_triple} --mcpu=mips3
+                "${wrapper_source}" -o "${wrapper_object}")
+    run_checked(link-wrapper "${LLD}" -m ${elf64_format} -T "${WRAPPER_LINKER}"
+                "${wrapper_object}" -o "${elf64}")
+endif()
 
 execute_process(
-    COMMAND "${QEMU}" -M malta -cpu R4000 -m 64M -bios none
+    COMMAND "${QEMU}" -M malta -cpu ${QEMU_CPU} -m 64M -bios none
             -kernel "${elf64}" -display none
             -serial none -serial none -serial stdio -monitor none
             -no-reboot -semihosting

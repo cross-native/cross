@@ -18,30 +18,40 @@ between backends rather than between the compiler and a hand-written oracle.
   kernel sets and is integer-only, so it runs on both CPU profiles;
   `float_kernels.x.in` keeps `k_p_float`, the one kernel needing
   float-to-integer conversion, which MIPS I (`r3000-o32`) diagnoses.
-- `start_int.s`, `start_float.s`, `start_private.s` -- checked-in generated
-  MIPS bare-metal startup, one per kernel set. Each calls every kernel with
-  six argument triples and prints each `u32` result as 8 hex digits over the
-  Malta UART, then exits through the UHI semihosting trap.
-- `main_int.cpp`, `main_float.cpp`, `main_private.cpp` -- checked-in
-  generated host reference, printing the same values in the same order from
-  the native x86-64 backend.
+  `quality_kernels.x.in` exercises code-quality transforms: global
+  addressing, immediate comparisons, branches against zero, filled delay
+  slots, call argument placement, and boolean widenings. It runs on every CPU
+  class and byte order, under n64, and with the transforms switched off.
+- `start_int.s`, `start_float.s`, `start_private.s`, `start_quality.s` --
+  checked-in generated MIPS bare-metal startup, one per kernel set. Each
+  calls every kernel with six argument triples and prints each `u32` result
+  as 8 hex digits over the Malta UART, then exits through the UHI
+  semihosting trap. `start_quality_n64.s` calls the quality kernels under
+  n64.
+- `main_int.cpp`, `main_float.cpp`, `main_private.cpp`, `main_quality.cpp` --
+  checked-in generated host reference, printing the same values in the same
+  order from the native x86-64 backend.
 - `generate.py` -- regenerates a kernel set's `start_*.s`/`main_*.cpp` pair
   from its template. The generated files are checked in so ctest needs no
   Python; rerun this by hand (`python generate.py <set>_kernels.x.in
-  start_<set>.s main_<set>.cpp`) only when a kernel set gains, loses, or
-  renames a kernel.
+  start_<set>.s main_<set>.cpp [start_<set>_n64.s]`) only when a kernel set
+  gains, loses, or renames a kernel. The optional fourth path receives the
+  n64 startup.
 - `differential.cmake` -- the `-P` driver, described below.
 
 ## differential.cmake
 
 Given `CC`, `HOST_CXX`, `TEMPLATE`, `STARTUP`, `HOST_MAIN`, `LINKER`,
 `WRAPPER_TEMPLATE`, `WRAPPER_LINKER`, `TARGET_FLAGS`, and `OUTPUT` (plus
-optional `OPT_LEVEL`, default `-O2`; `EXTRA_FLAGS`; and `ENDIAN`, `BE` or
-`LE`, default `BE`), it substitutes `@ABI@` for both sides, compiles and runs
+optional `OPT_LEVEL`, default `-O2`; `EXTRA_FLAGS`; `ENDIAN`, `BE` or `LE`,
+default `BE`; `QEMU_CPU`, default `R4000`; and `ADDRESS_MODEL`, `32` or `64`,
+default `32`), it substitutes `@ABI@` for both sides, compiles and runs
 the host reference, compiles the MIPS side and runs it under
 `qemu-system-mips64`/`qemu-system-mips64el` through the same `bare.ld` +
 `runtime64.s.in`/`bare64.ld` wrapping as `runtime.cmake`, then splits both
-stdout captures into lines and compares them positionally. Every mismatching
+stdout captures into lines and compares them positionally. With
+`ADDRESS_MODEL=64` the MIPS side uses the n64 ABI and is linked as an ELF64
+image at its KSEG0 address, without the wrapper. Every mismatching
 kernel/argument-set pair is reported with its expected and actual value via
 `message(FATAL_ERROR)`; otherwise the test passes. Only CMake string/list
 operations run at test time -- no Python. Like `runtime.cmake`, the test
