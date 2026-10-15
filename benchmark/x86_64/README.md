@@ -21,11 +21,15 @@ reference result before timing.
 The runtime corpus separates integer, bitwise, call, reduction,
 streaming-write, memory-dependency, indirect-access, pointer-chasing,
 branching, selection, search, floating-throughput, and floating-dependency
-use cases. Each category has multiple kernels. Scores first take a geometric
-mean within each category and then weight categories equally; the robust speed
-gate also has to survive removing any one category. Code size is built as six
-separate scalar, call, linear-memory, indirect-memory, control, and floating
-units and is checked again after removing any one unit.
+use cases, plus game-style 32-bit integer and `f32` kernels that keep their
+state in static arrays and call small static helpers (a subtractive random
+generator, fixed-point physics, a slot bitmap, table-driven angles, a 4x4
+transform, and box collisions). Each category has multiple kernels. Scores
+first take a geometric mean within each category and then weight categories
+equally; the robust speed gate also has to survive removing any one category.
+Code size is built as seven separate scalar, call, linear-memory,
+indirect-memory, control, floating, and game units and is checked again after
+removing any one unit.
 
 Build Cross into `build/` as described in [doc/install.md](../../doc/install.md)
 (or pass another compiler with `--cross-cc`), then run from the repository root:

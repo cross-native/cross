@@ -16,7 +16,10 @@ Cross LLVM-IR-to-`llc` path. It adds their rows only when complete MIPS III/o32
 `u64` probes succeed; target registration alone is not considered support.
 
 The Cross and C sources reuse the paired scalar, call, memory, indirect,
-control, and floating corpus in `benchmark/x86_64/kernels`. Every generated
+control, floating, and game corpus in `benchmark/x86_64/kernels`; the game
+kernels are the 32-bit integer and `f32` work on static state that console
+game code does, while most other kernels are `u64` and favor Cross over GCC's
+`-mgp32` register pairs and `libgcc` calls. Every generated
 native Cross object must have no undefined symbols. GCC and LLVM competitors
 may use target compiler-runtime helpers from the selected o32 `libgcc`; the
 driver validates and names every reference, links only the required archive

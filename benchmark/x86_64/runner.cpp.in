@@ -685,6 +685,230 @@ double reference_iir(const double *data, std::size_t count,
     return first + second;
 }
 
+std::uint32_t reference_float_bits(float value) {
+    return std::bit_cast<std::uint32_t>(value);
+}
+
+std::uint64_t reference_game_rng(std::uint64_t state, std::size_t iterations) {
+    std::int32_t table[55];
+    std::uint32_t seed = static_cast<std::uint32_t>(state) | 1U;
+    for (auto &entry : table) {
+        seed = seed * 1664525U + 1013904223U;
+        entry = static_cast<std::int32_t>(seed >> 1);
+    }
+    std::uint32_t a = 0;
+    std::uint32_t b = 31;
+    std::uint32_t bits = 0;
+    float total = 0.0F;
+    for (std::size_t n = 0; n < iterations; ++n) {
+        a = a == 0 ? 54U : a - 1U;
+        b = b == 0 ? 54U : b - 1U;
+        std::int32_t value = table[a] - table[b];
+        if (value < 0) value += 2147483647;
+        table[a] = value;
+        total = total + static_cast<float>(value & 16777215) * (1.0F / 16777216.0F);
+        bits ^= static_cast<std::uint32_t>(value);
+    }
+    return (static_cast<std::uint64_t>(bits) << 32) | reference_float_bits(total);
+}
+
+std::int32_t reference_fixed_mul(std::int32_t a, std::int32_t b) {
+    return static_cast<std::int32_t>(
+        (static_cast<std::int64_t>(a) * static_cast<std::int64_t>(b)) >> 16);
+}
+
+std::uint64_t reference_game_fixed(std::uint64_t state, std::size_t iterations) {
+    std::int32_t px[32];
+    std::int32_t py[32];
+    std::int32_t vx[32];
+    std::int32_t vy[32];
+    std::uint32_t seed = static_cast<std::uint32_t>(state >> 32) ^
+                         static_cast<std::uint32_t>(state);
+    for (std::size_t k = 0; k < 32; ++k) {
+        seed = seed * 1664525U + 1013904223U;
+        px[k] = static_cast<std::int32_t>(seed & 1048575U) - 524288;
+        py[k] = static_cast<std::int32_t>((seed >> 12) & 1048575U);
+        vx[k] = static_cast<std::int32_t>((seed >> 7) & 262143U) - 131072;
+        vy[k] = 0;
+    }
+    std::uint32_t hits = 0;
+    for (std::size_t n = 0; n < iterations; ++n) {
+        const std::size_t k = n & 31U;
+        std::int32_t velocity_y = vy[k] - 6554;
+        std::int32_t position_y = py[k] + velocity_y;
+        if (position_y < 0) {
+            position_y = -position_y;
+            velocity_y = reference_fixed_mul(-velocity_y, 52429);
+            ++hits;
+        }
+        std::int32_t velocity_x = reference_fixed_mul(vx[k], 65208);
+        std::int32_t position_x = px[k] + velocity_x;
+        if (position_x < -1048576 || position_x > 1048576) {
+            velocity_x = -velocity_x;
+            position_x = px[k];
+        }
+        px[k] = position_x;
+        py[k] = position_y;
+        vx[k] = velocity_x;
+        vy[k] = velocity_y;
+    }
+    std::uint32_t sum = hits;
+    for (std::size_t k = 0; k < 32; ++k) {
+        sum = sum * 31U + static_cast<std::uint32_t>(px[k]);
+        sum = sum * 31U + static_cast<std::uint32_t>(py[k]);
+    }
+    return (static_cast<std::uint64_t>(hits) << 32) | sum;
+}
+
+std::uint64_t reference_game_slots(std::uint64_t state, std::size_t iterations) {
+    std::uint32_t bitmap[8] = {};
+    std::uint16_t live_slots[64] = {};
+    std::uint32_t seed = static_cast<std::uint32_t>(state) ^ 2654435769U;
+    std::uint32_t live = 0;
+    std::uint32_t checksum = 0;
+    for (std::size_t n = 0; n < iterations; ++n) {
+        seed = seed * 1664525U + 1013904223U;
+        if (live < 64U && ((seed >> 16) & 3U) != 0) {
+            std::uint32_t word_index = 0;
+            while (bitmap[word_index] == 4294967295U) ++word_index;
+            const std::uint32_t word = bitmap[word_index];
+            const auto bit = static_cast<std::uint32_t>(std::countr_one(word));
+            bitmap[word_index] = word | (1U << bit);
+            const std::uint32_t slot = word_index * 32U + bit;
+            live_slots[live++] = static_cast<std::uint16_t>(slot);
+            checksum = checksum * 31U + slot;
+        } else if (live != 0) {
+            std::uint32_t pick = (seed >> 8) & 63U;
+            while (pick >= live) pick -= live;
+            const std::uint32_t slot = live_slots[pick];
+            bitmap[slot >> 5] &= ~(1U << (slot & 31U));
+            live_slots[pick] = live_slots[--live];
+            checksum ^= slot << 3;
+        }
+    }
+    return (static_cast<std::uint64_t>(live) << 32) | checksum;
+}
+
+float reference_sine(std::uint32_t angle) {
+    static constexpr float quarter[65] = {
+        0.0F, 0.024541229009628296F, 0.049067676067352295F,
+        0.0735645666718483F, 0.0980171412229538F, 0.12241067737340927F,
+        0.1467304676771164F, 0.1709618866443634F, 0.19509032368659973F,
+        0.21910123527050018F, 0.24298018217086792F, 0.2667127549648285F,
+        0.290284663438797F, 0.3136817514896393F, 0.3368898630142212F,
+        0.3598950505256653F, 0.3826834261417389F, 0.40524131059646606F,
+        0.4275550842285156F, 0.4496113359928131F, 0.4713967442512512F,
+        0.49289819598197937F, 0.5141027569770813F, 0.5349976420402527F,
+        0.5555702447891235F, 0.5758081674575806F, 0.5956993103027344F,
+        0.6152315735816956F, 0.6343932747840881F, 0.6531728506088257F,
+        0.6715589761734009F, 0.6895405650138855F, 0.7071067690849304F,
+        0.7242470979690552F, 0.7409511208534241F, 0.7572088241577148F,
+        0.7730104327201843F, 0.7883464097976685F, 0.803207516670227F,
+        0.8175848126411438F, 0.8314695954322815F, 0.8448535799980164F,
+        0.8577286005020142F, 0.8700869679450989F, 0.8819212913513184F,
+        0.89322429895401F, 0.903989315032959F, 0.91420978307724F,
+        0.9238795042037964F, 0.9329928159713745F, 0.9415440559387207F,
+        0.949528157711029F, 0.9569403529167175F, 0.9637760519981384F,
+        0.9700312614440918F, 0.9757021069526672F, 0.9807852506637573F,
+        0.9852776527404785F, 0.9891765117645264F, 0.9924795627593994F,
+        0.9951847195625305F, 0.9972904324531555F, 0.9987954497337341F,
+        0.99969881772995F, 1.0F,
+    };
+    const std::uint32_t quadrant = (angle >> 14) & 3U;
+    std::uint32_t position = angle & 16383U;
+    if ((quadrant & 1U) != 0) position = 16384U - position;
+    const std::uint32_t index = position >> 8;
+    const float fraction = static_cast<float>(position & 255U) * (1.0F / 256.0F);
+    const float low = quarter[index];
+    const float high = index < 64U ? quarter[index + 1U] : low;
+    const float value = low + (high - low) * fraction;
+    return (quadrant & 2U) != 0 ? 0.0F - value : value;
+}
+
+std::uint64_t reference_game_angles(std::uint64_t state, std::size_t iterations) {
+    std::uint32_t heading = static_cast<std::uint32_t>(state) & 65535U;
+    std::uint32_t turn = (static_cast<std::uint32_t>(state >> 16) & 65535U) | 1U;
+    float x = 0.0F;
+    float y = 0.0F;
+    for (std::size_t n = 0; n < iterations; ++n) {
+        heading = (heading + turn) & 65535U;
+        turn = (turn + 97U) & 65535U;
+        x = x + reference_sine((heading + 16384U) & 65535U) * 1.5F;
+        y = y + reference_sine(heading) * 1.5F;
+    }
+    return (static_cast<std::uint64_t>(reference_float_bits(x)) << 32) |
+           reference_float_bits(y);
+}
+
+std::uint64_t reference_game_transform(std::uint64_t state, std::size_t iterations) {
+    float vertex[32][4];
+    std::uint32_t seed = static_cast<std::uint32_t>(state) | 1U;
+    for (auto &row : vertex) {
+        for (std::size_t c = 0; c < 3; ++c) {
+            seed = seed * 1664525U + 1013904223U;
+            row[c] = static_cast<float>(seed >> 20) * (1.0F / 256.0F) - 8.0F;
+        }
+        row[3] = 1.0F;
+    }
+    const float tx = static_cast<float>(static_cast<std::uint32_t>(state >> 32) & 255U) *
+                     (1.0F / 16384.0F);
+    const float matrix[16] = {
+        0.9950042F, -0.0998334F, 0.0F, tx,
+        0.0998334F, 0.9950042F, 0.0F, 0.0F,
+        0.0F, 0.0F, 1.0F, 0.0F,
+        0.0F, 0.0F, 0.0F, 1.0F,
+    };
+    for (std::size_t n = 0; n < iterations; ++n) {
+        auto &row = vertex[n & 31U];
+        const float vx = row[0];
+        const float vy = row[1];
+        const float vz = row[2];
+        const float vw = row[3];
+        for (std::size_t r = 0; r < 3; ++r) {
+            row[r] = matrix[r * 4] * vx + matrix[r * 4 + 1] * vy +
+                     matrix[r * 4 + 2] * vz + matrix[r * 4 + 3] * vw;
+        }
+    }
+    std::uint32_t sum = 0;
+    for (const auto &row : vertex) {
+        for (std::size_t c = 0; c < 3; ++c) {
+            sum = sum * 31U + reference_float_bits(row[c]);
+        }
+    }
+    return sum;
+}
+
+std::uint64_t reference_game_collide(std::uint64_t state, std::size_t iterations) {
+    float box_x[32];
+    float box_y[32];
+    std::uint32_t seed = static_cast<std::uint32_t>(state) | 1U;
+    for (std::size_t k = 0; k < 32; ++k) {
+        seed = seed * 1664525U + 1013904223U;
+        box_x[k] = static_cast<float>(seed >> 27);
+        box_y[k] = static_cast<float>((seed >> 22) & 31U);
+    }
+    const auto distance = [](float a, float b) { return a > b ? a - b : b - a; };
+    std::uint32_t contacts = 0;
+    for (std::size_t n = 0; n < iterations; ++n) {
+        const std::size_t k = n & 31U;
+        float x = box_x[k] + ((n & 2U) != 0 ? 0.75F : -0.5F);
+        float y = box_y[k] + ((n & 4U) != 0 ? 0.625F : -0.375F);
+        if (x >= 32.0F) x = x - 32.0F;
+        if (x < 0.0F) x = x + 32.0F;
+        if (y >= 32.0F) y = y - 32.0F;
+        if (y < 0.0F) y = y + 32.0F;
+        box_x[k] = x;
+        box_y[k] = y;
+        for (std::size_t j = 0; j < 32; ++j) {
+            if (j != k && distance(box_x[j], x) < 2.0F &&
+                distance(box_y[j], y) < 2.0F) {
+                ++contacts;
+            }
+        }
+    }
+    return contacts;
+}
+
 template <class Function>
 struct KernelDescriptor {
     std::string_view name;
@@ -700,6 +924,12 @@ static constexpr KernelDescriptor<ScalarFunction> scalar_kernels[] = {
     {"bitswap", "bitwise", reference_bitswap},
     {"call_leaf", "calls", reference_call_leaf},
     {"call_chain", "calls", reference_call_chain},
+    {"game_rng", "game-integer", reference_game_rng},
+    {"game_fixed", "game-integer", reference_game_fixed},
+    {"game_slots", "game-integer", reference_game_slots},
+    {"game_angles", "game-floating", reference_game_angles},
+    {"game_transform", "game-floating", reference_game_transform},
+    {"game_collide", "game-floating", reference_game_collide},
 };
 
 static constexpr KernelDescriptor<MemoryFunction> memory_kernels[] = {

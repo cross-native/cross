@@ -189,6 +189,7 @@ UNITS: tuple[str, ...] = (
     "indirect",
     "control",
     "floating",
+    "game",
 )
 BASE_COMPILERS: tuple[str, ...] = (
     "cross",
@@ -244,6 +245,12 @@ KERNELS: tuple[Kernel, ...] = (
     kernel("quotient", "fp-throughput", "floating", "floating_pair", 512),
     kernel("recurrence", "fp-dependency", "floating", "floating", 1024),
     kernel("iir", "fp-dependency", "floating", "floating", 1024),
+    kernel("game_rng", "game-integer", "game", "scalar", 1024),
+    kernel("game_fixed", "game-integer", "game", "scalar", 1024),
+    kernel("game_slots", "game-integer", "game", "scalar", 1024),
+    kernel("game_angles", "game-floating", "game", "scalar", 512),
+    kernel("game_transform", "game-floating", "game", "scalar", 512),
+    kernel("game_collide", "game-floating", "game", "scalar", 64),
 )
 
 

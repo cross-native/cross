@@ -1,0 +1,289 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
+
+union game_bits {
+    float value;
+    uint32_t bits;
+};
+
+static uint32_t game_float_bits(float value) {
+    union game_bits view;
+    view.value = value;
+    return view.bits;
+}
+
+static int32_t game_rng_table[55];
+static uint32_t game_rng_a;
+static uint32_t game_rng_b;
+
+BENCH_NOINLINE uint64_t @PREFIX@game_rng(uint64_t state, size_t iterations) {
+    uint32_t seed = (uint32_t)state | 1u;
+    for (uint32_t k = 0; k < 55u; ++k) {
+        seed = seed * 1664525u + 1013904223u;
+        game_rng_table[k] = (int32_t)(seed >> 1);
+    }
+    game_rng_a = 0;
+    game_rng_b = 31;
+    uint32_t bits = 0;
+    float total = 0.0f;
+    for (size_t n = 0; n < iterations; ++n) {
+        uint32_t a = game_rng_a == 0 ? 54u : game_rng_a - 1u;
+        uint32_t b = game_rng_b == 0 ? 54u : game_rng_b - 1u;
+        int32_t v = game_rng_table[a] - game_rng_table[b];
+        if (v < 0) {
+            v = v + 2147483647;
+        }
+        game_rng_table[a] = v;
+        game_rng_a = a;
+        game_rng_b = b;
+        total = total + (float)(v & 16777215) * (1.0f / 16777216.0f);
+        bits = bits ^ (uint32_t)v;
+    }
+    return ((uint64_t)bits << 32) | (uint64_t)game_float_bits(total);
+}
+
+static int32_t game_fixed_px[32];
+static int32_t game_fixed_py[32];
+static int32_t game_fixed_vx[32];
+static int32_t game_fixed_vy[32];
+
+static int32_t game_fixed_mul(int32_t a, int32_t b) {
+    return (int32_t)(((int64_t)a * (int64_t)b) >> 16);
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@game_fixed(uint64_t state, size_t iterations) {
+    uint32_t seed = (uint32_t)(state >> 32) ^ (uint32_t)state;
+    for (uint32_t k = 0; k < 32u; ++k) {
+        seed = seed * 1664525u + 1013904223u;
+        game_fixed_px[k] = (int32_t)(seed & 1048575u) - 524288;
+        game_fixed_py[k] = (int32_t)((seed >> 12) & 1048575u);
+        game_fixed_vx[k] = (int32_t)((seed >> 7) & 262143u) - 131072;
+        game_fixed_vy[k] = 0;
+    }
+    uint32_t hits = 0;
+    for (size_t n = 0; n < iterations; ++n) {
+        size_t k = n & 31u;
+        int32_t vy = game_fixed_vy[k] - 6554;
+        int32_t py = game_fixed_py[k] + vy;
+        if (py < 0) {
+            py = 0 - py;
+            vy = game_fixed_mul(0 - vy, 52429);
+            hits = hits + 1u;
+        }
+        int32_t vx = game_fixed_mul(game_fixed_vx[k], 65208);
+        int32_t px = game_fixed_px[k] + vx;
+        if (px < -1048576 || px > 1048576) {
+            vx = 0 - vx;
+            px = game_fixed_px[k];
+        }
+        game_fixed_px[k] = px;
+        game_fixed_py[k] = py;
+        game_fixed_vx[k] = vx;
+        game_fixed_vy[k] = vy;
+    }
+    uint32_t sum = hits;
+    for (uint32_t k = 0; k < 32u; ++k) {
+        sum = sum * 31u + (uint32_t)game_fixed_px[k];
+        sum = sum * 31u + (uint32_t)game_fixed_py[k];
+    }
+    return ((uint64_t)hits << 32) | (uint64_t)sum;
+}
+
+static uint32_t game_slot_bitmap[8];
+static uint16_t game_slot_live[64];
+
+BENCH_NOINLINE uint64_t @PREFIX@game_slots(uint64_t state, size_t iterations) {
+    for (uint32_t w = 0; w < 8u; ++w) {
+        game_slot_bitmap[w] = 0;
+    }
+    uint32_t seed = (uint32_t)state ^ 2654435769u;
+    uint32_t live = 0;
+    uint32_t checksum = 0;
+    for (size_t n = 0; n < iterations; ++n) {
+        seed = seed * 1664525u + 1013904223u;
+        if (live < 64u && ((seed >> 16) & 3u) != 0) {
+            uint32_t w = 0;
+            while (game_slot_bitmap[w] == 4294967295u) {
+                ++w;
+            }
+            uint32_t word = game_slot_bitmap[w];
+            uint32_t bit = 0;
+            while (((word >> bit) & 1u) != 0) {
+                ++bit;
+            }
+            game_slot_bitmap[w] = word | (1u << bit);
+            uint32_t slot = w * 32u + bit;
+            game_slot_live[live] = (uint16_t)slot;
+            live = live + 1u;
+            checksum = checksum * 31u + slot;
+        } else if (live != 0) {
+            uint32_t pick = (seed >> 8) & 63u;
+            while (pick >= live) {
+                pick = pick - live;
+            }
+            uint32_t slot = game_slot_live[pick];
+            game_slot_bitmap[slot >> 5] =
+                game_slot_bitmap[slot >> 5] & ~(1u << (slot & 31u));
+            live = live - 1u;
+            game_slot_live[pick] = game_slot_live[live];
+            checksum = checksum ^ (slot << 3);
+        }
+    }
+    return ((uint64_t)live << 32) | (uint64_t)checksum;
+}
+
+static const float game_sine_quarter[65] = {
+    0.0f, 0.024541229009628296f, 0.049067676067352295f,
+    0.0735645666718483f, 0.0980171412229538f, 0.12241067737340927f,
+    0.1467304676771164f, 0.1709618866443634f, 0.19509032368659973f,
+    0.21910123527050018f, 0.24298018217086792f, 0.2667127549648285f,
+    0.290284663438797f, 0.3136817514896393f, 0.3368898630142212f,
+    0.3598950505256653f, 0.3826834261417389f, 0.40524131059646606f,
+    0.4275550842285156f, 0.4496113359928131f, 0.4713967442512512f,
+    0.49289819598197937f, 0.5141027569770813f, 0.5349976420402527f,
+    0.5555702447891235f, 0.5758081674575806f, 0.5956993103027344f,
+    0.6152315735816956f, 0.6343932747840881f, 0.6531728506088257f,
+    0.6715589761734009f, 0.6895405650138855f, 0.7071067690849304f,
+    0.7242470979690552f, 0.7409511208534241f, 0.7572088241577148f,
+    0.7730104327201843f, 0.7883464097976685f, 0.803207516670227f,
+    0.8175848126411438f, 0.8314695954322815f, 0.8448535799980164f,
+    0.8577286005020142f, 0.8700869679450989f, 0.8819212913513184f,
+    0.89322429895401f, 0.903989315032959f, 0.91420978307724f,
+    0.9238795042037964f, 0.9329928159713745f, 0.9415440559387207f,
+    0.949528157711029f, 0.9569403529167175f, 0.9637760519981384f,
+    0.9700312614440918f, 0.9757021069526672f, 0.9807852506637573f,
+    0.9852776527404785f, 0.9891765117645264f, 0.9924795627593994f,
+    0.9951847195625305f, 0.9972904324531555f, 0.9987954497337341f,
+    0.99969881772995f, 1.0f,
+};
+
+static float game_sine(uint32_t angle) {
+    uint32_t quadrant = (angle >> 14) & 3u;
+    uint32_t position = angle & 16383u;
+    if ((quadrant & 1u) != 0) {
+        position = 16384u - position;
+    }
+    uint32_t index = position >> 8;
+    float fraction = (float)(position & 255u) * (1.0f / 256.0f);
+    float low = game_sine_quarter[index];
+    float high = index < 64u ? game_sine_quarter[index + 1u] : low;
+    float value = low + (high - low) * fraction;
+    return (quadrant & 2u) != 0 ? 0.0f - value : value;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@game_angles(uint64_t state, size_t iterations) {
+    uint32_t heading = (uint32_t)state & 65535u;
+    uint32_t turn = ((uint32_t)(state >> 16) & 65535u) | 1u;
+    float x = 0.0f;
+    float y = 0.0f;
+    for (size_t n = 0; n < iterations; ++n) {
+        heading = (heading + turn) & 65535u;
+        turn = (turn + 97u) & 65535u;
+        x = x + game_sine((heading + 16384u) & 65535u) * 1.5f;
+        y = y + game_sine(heading) * 1.5f;
+    }
+    return ((uint64_t)game_float_bits(x) << 32) | (uint64_t)game_float_bits(y);
+}
+
+static float game_vertex[32][4];
+static float game_matrix[16];
+
+BENCH_NOINLINE uint64_t @PREFIX@game_transform(uint64_t state, size_t iterations) {
+    uint32_t seed = (uint32_t)state | 1u;
+    for (uint32_t k = 0; k < 32u; ++k) {
+        for (uint32_t c = 0; c < 3u; ++c) {
+            seed = seed * 1664525u + 1013904223u;
+            game_vertex[k][c] = (float)(seed >> 20) * (1.0f / 256.0f) - 8.0f;
+        }
+        game_vertex[k][3] = 1.0f;
+    }
+    float tx = (float)((uint32_t)(state >> 32) & 255u) * (1.0f / 16384.0f);
+    game_matrix[0] = 0.9950042f;
+    game_matrix[1] = -0.0998334f;
+    game_matrix[2] = 0.0f;
+    game_matrix[3] = tx;
+    game_matrix[4] = 0.0998334f;
+    game_matrix[5] = 0.9950042f;
+    game_matrix[6] = 0.0f;
+    game_matrix[7] = 0.0f;
+    game_matrix[8] = 0.0f;
+    game_matrix[9] = 0.0f;
+    game_matrix[10] = 1.0f;
+    game_matrix[11] = 0.0f;
+    game_matrix[12] = 0.0f;
+    game_matrix[13] = 0.0f;
+    game_matrix[14] = 0.0f;
+    game_matrix[15] = 1.0f;
+    for (size_t n = 0; n < iterations; ++n) {
+        size_t k = n & 31u;
+        float vx = game_vertex[k][0];
+        float vy = game_vertex[k][1];
+        float vz = game_vertex[k][2];
+        float vw = game_vertex[k][3];
+        for (uint32_t row = 0; row < 3u; ++row) {
+            game_vertex[k][row] = game_matrix[row * 4u] * vx +
+                                  game_matrix[row * 4u + 1u] * vy +
+                                  game_matrix[row * 4u + 2u] * vz +
+                                  game_matrix[row * 4u + 3u] * vw;
+        }
+    }
+    uint32_t sum = 0;
+    for (uint32_t k = 0; k < 32u; ++k) {
+        for (uint32_t c = 0; c < 3u; ++c) {
+            sum = sum * 31u + game_float_bits(game_vertex[k][c]);
+        }
+    }
+    return (uint64_t)sum;
+}
+
+static float game_box_x[32];
+static float game_box_y[32];
+
+static float game_distance(float a, float b) {
+    return a > b ? a - b : b - a;
+}
+
+BENCH_NOINLINE uint64_t @PREFIX@game_collide(uint64_t state, size_t iterations) {
+    uint32_t seed = (uint32_t)state | 1u;
+    for (uint32_t k = 0; k < 32u; ++k) {
+        seed = seed * 1664525u + 1013904223u;
+        game_box_x[k] = (float)(seed >> 27);
+        game_box_y[k] = (float)((seed >> 22) & 31u);
+    }
+    uint32_t contacts = 0;
+    for (size_t n = 0; n < iterations; ++n) {
+        size_t k = n & 31u;
+        float x = game_box_x[k] + ((n & 2u) != 0 ? 0.75f : -0.5f);
+        float y = game_box_y[k] + ((n & 4u) != 0 ? 0.625f : -0.375f);
+        if (x >= 32.0f) {
+            x = x - 32.0f;
+        }
+        if (x < 0.0f) {
+            x = x + 32.0f;
+        }
+        if (y >= 32.0f) {
+            y = y - 32.0f;
+        }
+        if (y < 0.0f) {
+            y = y + 32.0f;
+        }
+        game_box_x[k] = x;
+        game_box_y[k] = y;
+        for (size_t j = 0; j < 32u; ++j) {
+            if (j != k && game_distance(game_box_x[j], x) < 2.0f &&
+                game_distance(game_box_y[j], y) < 2.0f) {
+                contacts = contacts + 1u;
+            }
+        }
+    }
+    return (uint64_t)contacts;
+}

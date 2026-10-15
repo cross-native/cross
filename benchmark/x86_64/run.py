@@ -167,6 +167,7 @@ BUILD_UNITS: tuple[str, ...] = (
     "indirect",
     "control",
     "floating",
+    "game",
 )
 CATEGORIES: tuple[str, ...] = (
     "integer",
@@ -182,6 +183,8 @@ CATEGORIES: tuple[str, ...] = (
     "search",
     "fp-throughput",
     "fp-dependency",
+    "game-integer",
+    "game-floating",
 )
 KIND_ORDER: tuple[str, ...] = (
     "scalar",
@@ -257,6 +260,12 @@ KERNELS: tuple[KernelSpec, ...] = (
     KernelSpec("quotient", "fp-throughput", "floating", "floating_pair"),
     KernelSpec("recurrence", "fp-dependency", "floating", "floating"),
     KernelSpec("iir", "fp-dependency", "floating", "floating"),
+    KernelSpec("game_rng", "game-integer", "game", "scalar"),
+    KernelSpec("game_fixed", "game-integer", "game", "scalar"),
+    KernelSpec("game_slots", "game-integer", "game", "scalar"),
+    KernelSpec("game_angles", "game-floating", "game", "scalar"),
+    KernelSpec("game_transform", "game-floating", "game", "scalar"),
+    KernelSpec("game_collide", "game-floating", "game", "scalar"),
 )
 
 
@@ -676,6 +685,9 @@ async def build_llc(
             (
                 config.tools.llc,
                 f"-{level.llc_opt}",
+                # Linkable into the position-independent runner that hosts
+                # such as Ubuntu build by default, like the C peers' objects.
+                "--relocation-model=pic",
                 "--filetype=obj",
                 optimized_ir,
                 "-o",
