@@ -19,8 +19,10 @@ A model file contains entries of these kinds:
 - `profile`: a named set of target, ABI, mangling, preset, and option
   defaults;
 - `debug`: the contents of debugging information;
-- `cpu`: a processor's instruction set and instruction costs; and
-- `data_base`: data reached through a base register.
+- `cpu`: a processor's instruction set and instruction costs;
+- `data_base`: data reached through a base register; and
+- `address_space`: a pointer representation with a stored width, a base,
+  and a byte order.
 
 Models cannot add keywords, expressions, functions, libraries, runtime
 helpers, macros, instructions, intrinsics, attributes, compiler options, or
@@ -95,7 +97,7 @@ kind "name" {
 ```
 
 The kinds are `abi`, `mangling`, `optimization`, `profile`, `debug`, `cpu`,
-and `data_base`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
+`data_base`, and `address_space`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
 `variadic_shadow`) and `cpu` entries (`instruction`) contain blocks, and a
 block has no `;` after its closing brace. Every
 property and every mangling rule ends in `;`. `#` and `//` start comments
@@ -1087,6 +1089,31 @@ must not carry arguments or results in the selected ABIs. The program sets
 the base register before such code runs, and the linker keeps the sections
 within the base's reach; on MIPS, `$gp` holds the address the linker gives
 `_gp` and reaches 32 KiB on either side of it.
+
+## Address-space entries
+
+An `address_space` entry declares a pointer representation that
+`[[address_space("NAME")]]` selects ([spec.md](spec.md)): pointers into the
+space are stored in `bits` bits as the distance of their target from a base.
+This entry describes an arena of 32-bit offsets kept in big-endian order:
+
+```text
+address_space "arena32" {
+    bits = 32;
+    base_object = "game_arena";
+    byte_order = "big";
+}
+```
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `bits` | integer | none | Required: the stored width, at most the target's pointer width. |
+| `base` | integer | `0` | A constant base address. |
+| `base_object` | text | none | The link name of a `global` object of pointer type that holds the base at run time; it excludes `base`. |
+| `byte_order` | text | the target's | `big` or `little`: the order of the stored pointer's bytes. |
+
+The shipped `flat32` entry has 32 bits and base 0; on a 32-bit target its
+pointers equal native ones. An `address_space` entry contains no block.
 
 ## Queries and inspection
 

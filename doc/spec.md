@@ -402,7 +402,8 @@ becomes a function pointer except under `&`.
 Assignment converts the source to the destination type. A cast `(T) value`
 requests the same conversion explicitly. Conversions are permitted between
 arithmetic types, between compatible pointer types, between `void *` and
-object pointers, and between pointers and sufficiently wide integers as
+object pointers, between pointers to a record or union and to a type
+embedded in it, and between pointers and sufficiently wide integers as
 specified below. An explicit cast may also convert between any two
 function-pointer types; calling through a pointer whose callable interface
 differs from the called function's own is undefined unless the target
@@ -423,7 +424,8 @@ Initialization, assignment, arguments, return, and parameter copy-out all use
 assignment conversion and permit arithmetic narrowing. An implicit pointer
 conversion may add pointee qualifiers but cannot discard `const` or `volatile`,
 change atomic qualification, or convert unrelated pointee types except through
-`void *`. Adding nested pointee qualifiers requires `const` on every intervening
+`void *` or to an embedded member's type (see “Embedded members”). Adding
+nested pointee qualifiers requires `const` on every intervening
 destination pointer; for example, `T **` cannot become `const T **`.
 
 ### Conditional pointer result types
@@ -774,6 +776,67 @@ an unnamed field. Its declared type fixes signedness and shall not request
 alignment. Atomic bit-fields are invalid; allocation, ordering, crossing, and
 zero-width effects are target ABI facts.
 
+### Embedded members
+
+A member declared with a record or union type and no declarator embeds that
+type: an anonymous definition such as `struct { i32 a; i32 b; };`, or a named
+type such as `struct base;`, a typedef name of a record or union, or a generic
+instance. An embedded member is laid out, initialized, and copied like any
+member. A named one is designated by its tag or typedef name, which must
+differ from the names of the other members, so `w.base` and
+`$::offsetof(struct outer, base)` denote it; an anonymous one has no name.
+
+A member access `x.m` or `p->m` that finds no member `m` in its record or
+union searches the embedded members breadth first: the shallowest depth at
+which a member `m` exists decides, and more than one such member at that
+depth is an error at the access. A designator in an initializer may name a
+promoted member the same way.
+
+A pointer to a record or union converts implicitly to a pointer to a type
+embedded in it at any depth when exactly one member at the shallowest depth
+that embeds that type exists; the result points to that member, pointee
+qualifiers carry over, and a null pointer converts to a null pointer. An
+explicit cast performs the same conversion. A cast from a pointer to an
+embedded type to a pointer to a type that embeds it yields a pointer to the
+enclosing object; the behavior is undefined unless the operand points to such
+an embedded member. Embedding adds no methods, interfaces, or dispatch.
+
+```text
+struct entity { f32 x; f32 y; };
+struct enemy { struct entity; u32 health; };
+
+f32 advance(struct entity *e, in f32 dx);
+
+global f32 step(struct enemy *foe) {
+    return advance(foe, 1.0f32) + foe->y;   // converts foe; promotes y
+}
+```
+
+### Byte order
+
+`[[byte_order("big")]]` or `[[byte_order("little")]]` on a typedef of an
+integer or floating type, or on a record or union definition, declares the
+order in which objects of the type store the bytes of their scalars; without
+it, scalars use the target's order. The order qualifies the type like an
+address space:
+
+- A load through such a type converts the stored bytes to an ordinary value of
+  the unqualified type, and a store converts back; both remain single accesses
+  for volatility, atomicity, and effective type. `bool` and 8-bit types have
+  no order.
+- On a record or union, the order applies to every scalar member, bit-field
+  container, and nested record or array member whose type declares no order
+  of its own, and bit-fields are allocated as the target's ABI for that byte
+  order allocates them (most significant bit first for big-endian ABIs).
+  Member offsets and sizes do not change.
+- A pointer to a type in one order is not a pointer to the type in another
+  order, and taking the address of a scalar member of an ordered record yields
+  a pointer to the member's ordered type. An explicit cast between such
+  pointers reinterprets the bytes.
+- Translation-time evaluation and static initializers use the declared order,
+  and lowering uses byte-reversing loads and stores or a finite inline
+  sequence.
+
 ### Size, alignment, and translation checks
 
 Layout and aggregate passing are target properties. `sizeof` returns `uptr`;
@@ -938,7 +1001,8 @@ lvalues has no acquired effective type; for a later non-modifying access its
 effective type is the lvalue type used for that access. An lvalue access must
 otherwise use a compatible type, the corresponding signed or unsigned type,
 an aggregate containing such a type, or an `i8` or `u8` type. The byte types
-may inspect or modify any object representation.
+may inspect or modify any object representation. A type in a declared byte
+order is compatible with the same type in any other order for these rules.
 
 Reading a non-active union member is a defined representation reinterpretation
 when the bytes form a valid value of that member and its alignment is
@@ -1106,7 +1170,8 @@ through feature queries rather than assumed by portable Cross code.
 
 An address-space-qualified pointee type uses
 `[[address_space(N)]]`, where `N` is an address-space number from the target
-registry:
+registry, or `[[address_space("NAME")]]`, where `NAME` is an
+`address_space` model entry ([models.md](models.md#address-space-entries)):
 
 ```text
 volatile u32 [[address_space(1)]] *device_status;
@@ -1121,6 +1186,17 @@ space. Each address-space entry specifies pointer width, null representation,
 permitted operations, volatility defaults if any, and ABI lowering. Dynamic
 ABI allocation may use such a type only when caller and callee use the same
 address-space entry.
+
+A model entry may give its space a stored width, a base, and a byte order.
+A pointer into such a space is stored in that width and byte order as the
+distance of its target from the base, and a stored zero is its null pointer.
+It converts implicitly to a pointer to the same pointee in the generic space
+by adding the base; a pointer in the generic space converts into the space
+only by an explicit cast, which subtracts the base. A distance the width
+cannot represent is an error in translation-time evaluation and undefined at
+run time, where optional instrumentation may check it and execute
+`$::trap()`. Arithmetic, comparison, and subtraction of such pointers work on
+distances, and an access through one converts it first.
 
 ## Volatile access and data layout
 
@@ -1895,6 +1971,57 @@ bounded capture is deferred until the owner has expanded, as described under
 A diagnostic in generated source first points to the most specific generated
 token, then prints the expansion chain of invocations and definitions; the
 chain is part of the diagnostic contract.
+
+### Type reflection
+
+Translation-time code inspects types through `$::meta::type`, an opaque
+translation-time value: it may be copied, assigned, and passed between
+translation-time functions, and it cannot be stored at run time, converted, or
+emitted except through `type_tokens`. Like `$::meta::tokens`, the name denotes
+the type in a type position and the operation when followed by `(`.
+
+| Operation | Result |
+| --- | --- |
+| `$::meta::type(tokens)` | The type that `tokens` name, resolved where the tokens carry their meaning: tokens copied from a macro's input resolve at the invocation, and tokens written in a quote where the quote is written. Tokens that do not name a type are an error. |
+| `$::meta::same_type(a, b)` | `bool`: whether `a` and `b` are the same type; a typedef name denotes the type it aliases. |
+| `$::meta::is_type_kind(t, kind)` | `bool` testing whether `t` is a `"void"`, `"bool"`, `"integer"`, `"floating"`, `"pointer"`, `"array"`, `"struct"`, `"union"`, `"enum"`, `"vector"`, `"function"`, or `"label"` type; another kind is an error. |
+| `$::meta::size(t)`, `$::meta::align(t)` | `sizeof` and `$::alignof` of a complete type, as `uptr`. |
+| `$::meta::bits(t)`, `$::meta::is_signed(t)` | The width in bits, as `u32`, and the signedness of a scalar or enumeration type. |
+| `$::meta::member_count(t)` | The number of members of a complete record or union, as `uptr`, counting embedded members and unnamed bit-fields. |
+| `$::meta::member_name(t, i)` | The name of member `i` in declaration order as an identifier token, or no tokens for an anonymous embedded member or an unnamed bit-field. |
+| `$::meta::member_type(t, i)`, `$::meta::member_offset(t, i)` | Its type, and its byte offset as `uptr`; for a bit-field, the offset of the naturally aligned unit of its declared type that contains it. |
+| `$::meta::member_bit_offset(t, i)`, `$::meta::member_bit_width(t, i)` | For a bit-field, the position of its least significant bit when that unit is read as its declared type, and its width, both as `u32`; zero width for other members. |
+| `$::meta::element(t)`, `$::meta::count(t)` | The element type and length of an array, the lane type and lane count of a fixed vector, the pointee of a pointer with count 1, or the underlying type of an enumeration with count 0; `count` is a `uptr`. |
+| `$::meta::enumerator_count(t)`, `$::meta::enumerator_name(t, i)` | The enumerators of an enumeration in declaration order; the name is an identifier token. |
+| `$::meta::type_tokens(t)` | Tokens that denote `t` wherever they are spliced, with the hygiene of a name written in a quote. |
+
+A query sees a type as complete where the evaluation runs, so an item macro
+invoked after a record's definition can inspect it. An incomplete type where
+completeness is needed, an index out of range, and a type of the wrong kind are
+errors. Indices follow the index rules of “Embedded assets and
+translation-time bytes”. A generic instance is an ordinary type.
+
+```text
+[[macro]]
+static $::meta::tokens swap_members($::meta::tokens input) {
+    $::meta::type t = $::meta::type(input);
+    $::meta::tokens body = $::meta::parse("");
+    for (uptr i = 0; i < $::meta::member_count(t); ++i) {
+        $::meta::type m = $::meta::member_type(t, i);
+        $::meta::tokens name = $::meta::member_name(t, i);
+        if ($::meta::is_type_kind(m, "integer") && $::meta::size(m) > 1) {
+            body = $::meta::concat(body, $::quote {
+                p->$::unquote(name) = $::bswap(p->$::unquote(name));
+            });
+        }
+    }
+    return $::quote {
+        static void to_native($::unquote($::meta::type_tokens(t)) *p) {
+            $::unquote(body)
+        }
+    };
+}
+```
 
 ### Embedded assets and translation-time bytes
 
@@ -3773,7 +3900,8 @@ The following object, type, and symbol attributes are normative:
 | `atomic` | Gives the attributed object or pointed-to type the atomic access contract. |
 | `underlying(T)` | Selects the exact integer representation of an enumeration. |
 | `may_alias` | Accesses through the attributed type may alias incompatible effective types. |
-| `address_space(N)` | Selects a target address-space-qualified type. |
+| `address_space(N)`, `address_space("NAME")` | Selects a target or model address-space-qualified type. |
+| `byte_order("order")` | On a typedef of an integer or floating type or on a record or union definition: the stored byte order, `big` or `little`. |
 | `vector_size(B)` | Defines a fixed vector of total size B bytes. |
 | `ext_vector_type(N)` | Defines a fixed vector with N lanes. |
 | `scalable_vector(N)` | Defines a target-scalable vector with at least N lanes. |
