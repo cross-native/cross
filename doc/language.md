@@ -238,7 +238,27 @@ Other rules:
   `[[variadic(...)]]` bindings of the target ABI's state.
 - A function may define an operator for a nominal record, union, or enum type
   with `[[operator("+")]]`. There are no other overloads and no user-defined
-  conversions.
+  conversions. An enumeration with an underlying type is a distinct integer
+  type, so bindings give it its own arithmetic, such as saturation:
+
+```x
+enum sample [[underlying(i16)]] { sample_zero };
+
+[[operator("+")]]
+global enum sample add_samples(in enum sample a, in enum sample b) {
+    i32 sum = (i32)a + (i32)b;
+    if (sum > 32767) sum = 32767;
+    if (sum < -32768) sum = -32768;
+    return (enum sample)sum;
+}
+
+global enum sample mix(in enum sample a, in enum sample b) {
+    return a + b;   // add_samples(a, b)
+}
+
+$::static_assert((i32)((enum sample)30000 + (enum sample)10000) == 32767,
+                 "bindings evaluate at translation time too");
+```
 
 ## Expressions and statements
 

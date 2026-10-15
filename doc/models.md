@@ -11,17 +11,21 @@ version number and can change between compiler releases; keep custom model
 files with the release that reads them. A file starts directly with an entry;
 there is no header.
 
-A model file contains entries of four kinds:
+A model file contains entries of these kinds:
 
 - `abi`: a calling convention;
 - `mangling`: the rules that form link names;
-- `optimization`: a named preset of option values; and
+- `optimization`: a named preset of option values;
 - `profile`: a named set of target, ABI, mangling, preset, and option
-  defaults.
+  defaults;
+- `debug`: the contents of debugging information;
+- `cpu`: a processor's instruction set and instruction costs; and
+- `data_base`: data reached through a base register.
 
 Models cannot add keywords, expressions, functions, libraries, runtime
 helpers, macros, instructions, intrinsics, attributes, compiler options, or
-optimization passes, and they cannot weaken diagnostics or reorder the
+optimization passes; a `cpu` entry describes instructions the compiler
+already implements, and they cannot weaken diagnostics or reorder the
 compiler's work. Unknown entry kinds, properties, options, and entry names
 are errors.
 
@@ -90,9 +94,10 @@ kind "name" {
 }
 ```
 
-The kinds are `abi`, `mangling`, `optimization`, `profile`, and `debug`.
-Only `abi` entries contain blocks (`bank`, `rule`, `variadic_state`, and
-`variadic_shadow`), and a block has no `;` after its closing brace. Every
+The kinds are `abi`, `mangling`, `optimization`, `profile`, `debug`, `cpu`,
+and `data_base`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
+`variadic_shadow`) and `cpu` entries (`instruction`) contain blocks, and a
+block has no `;` after its closing brace. Every
 property and every mangling rule ends in `;`. `#` and `//` start comments
 that end at the end of the line.
 
@@ -925,6 +930,7 @@ profile "x86_64-kernel" {
 | `optimization` | text | none | no |
 | `f.*`, `m.*` | option value | | no |
 | `debug` | text | `dwarf` | no |
+| `data_bases` | list | `[]` | no |
 | `fp_traps` | list | `[]` | no |
 | `fp_denormal_operand` | text | `ieee` | no |
 | `fp_denormal_result` | text | `ieee` | no |
@@ -942,7 +948,8 @@ With `-mprofile=NAME`, the profile's `target` applies only when the command
 line has no `-target`. A profile chosen by `default_for` never changes the
 target. The target is fixed before the profile's `m.*` options are checked.
 
-`debug` names the entry `-g` selects. `fp_traps` lists the distinct
+`debug` names the entry `-g` selects, and `data_bases` the `data_base`
+entries in use ([Data-base entries](#data-base-entries)). `fp_traps` lists the distinct
 floating-point exceptions the program runs with enabled, from `invalid`, `divide-by-zero`,
 `overflow`, `underflow`, and `inexact`; `fp_denormal_operand` is `ieee` or
 `trap`; `fp_denormal_result` is `ieee` or `flush`. The language specification
@@ -986,6 +993,101 @@ shipped `dwarf` when the profile names none; `-g0` emits nothing. The shipped
 `dwarf-lines` entry enables only `lines` and `frames`. A `debug` entry contains
 no block.
 
+## CPU entries
+
+A `cpu` entry describes a processor: the instruction-set features it
+implements, which decide what the compiler may emit, and the cost of its
+instructions, which guides the compiler's choice among correct instruction
+sequences and their order. The compiler implements every instruction and
+inline sequence it uses; an entry states which of them a processor has and
+what they cost. This entry describes part of the VR4300:
+
+```text
+cpu "vr4300" {
+    architecture = "mips";
+    features = ["mips3", "hard-float", "fp32", "odd-spreg", "llsc",
+                "branch-likely", "load-interlocks"];
+    instruction "div.s" { latency = 29; issue = 29; }
+    instruction "mul.s" { latency = 5; }
+    instruction "div" { latency = 37; issue = 37; }
+}
+```
+
+| Property | Type | Default | Required |
+| --- | --- | --- | --- |
+| `architecture` | text | none | yes |
+| `inherits` | text | none | no |
+| `features` | list | `[]` | no |
+| `issue_width` | integer | `1` | no |
+
+`architecture` names a compiled-in architecture as `cc --print-targets`
+prints it. `inherits` names a `cpu` entry of the same architecture whose
+properties and blocks this entry starts from; the entry replaces individual
+properties and `instruction` blocks, and an inheritance cycle is an error.
+`features` lists the instruction-set features the processor implements by
+the names of the `-m` feature options (`cc --print-options=target`); each is
+enabled as its option would enable it. `issue_width` is the number of
+instructions the processor starts per cycle.
+
+An `instruction "NAME"` block describes one instruction, named as
+`cc --print-costs` lists the target's instructions:
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `latency` | integer | `1` | Cycles from the start of the instruction until a dependent instruction can use its result. |
+| `issue` | integer | `1` | Cycles before the processor can start another instruction of the same kind. |
+| `available` | bool | `true` | `false` removes an instruction that the features would allow. |
+
+`-march=NAME` (`m.arch`) selects the entry whose `features` and `available`
+properties decide which instructions are legal; explicit `-mFEATURE` and
+`-mno-FEATURE` options adjust its features. `-mtune=NAME` (`m.tune`) selects
+the entry whose costs guide instruction selection and scheduling; without it
+the `-march` entry's costs apply. Costs never change which instructions are
+legal or what a program computes. An operation with an inline alternative,
+such as `$::clz`, uses the instruction only where the `-march` entry has it
+and the `-mtune` costs favor it; a machine instruction built-in (`$::_name`)
+that needs an unavailable instruction is an error.
+
+The shipped CPUs are `cpu` entries in `model/mips.xm` and
+`model/x86_64.xm`.
+
+## Data-base entries
+
+A `data_base` entry describes data that code reaches through a register
+holding a fixed base address, with one instruction and a short offset,
+instead of a full address, such as MIPS small data. This is the shipped
+`mips-gp`:
+
+```text
+data_base "mips-gp" {
+    base = "gp";
+    sections = [".sdata", ".sbss"];
+    max_size = 8;
+    kinds = ["writable"];
+}
+```
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `base` | text | none | Required: the register that holds the base address, by a name `cc --print-registers` lists. |
+| `sections` | list | none | Required: the sections the base reaches; the first holds objects with initial values, the second, if given, objects that start as zero. |
+| `max_size` | integer | `0` | Objects of at most this many bytes that have no `section` attribute are placed in those sections. |
+| `kinds` | list | `["writable"]` | Which objects `max_size` places: `writable` objects, `readonly` objects (defined `const`), and `literal` constants the compiler creates. |
+
+A profile's `data_bases` property or `-mdata-bases=NAME[,NAME...]` selects
+entries; `-mdata-bases=none`, the default, selects none. While an entry is
+selected, the compiler does not allocate its base register, places the
+qualifying objects defined in the compilation group in its sections (in the
+first listed entry that admits them), and reaches every object defined or
+declared with a `section` attribute naming one of its sections through the
+base. An object defined in another group is reached by its full address
+unless its declaration names such a section, so `section` opts an object in
+or out. Thread-local objects are never placed by size. The base register
+must not carry arguments or results in the selected ABIs. The program sets
+the base register before such code runs, and the linker keeps the sections
+within the base's reach; on MIPS, `$gp` holds the address the linker gives
+`_gp` and reaches 32 KiB on either side of it.
+
 ## Queries and inspection
 
 The preprocessor queries `$::has_abi("NAME")`, `$::has_mangling("NAME")`,
@@ -1018,6 +1120,11 @@ These options list what the loaded models define:
 - `--print-profiles` lists each profile's target, ABI, mangling, preset,
   and option settings.
 - `--print-optimizations` lists each preset, its parent, and its settings.
+- `--print-cpus` lists the selected target's `cpu` entries with their
+  parents and features, and `--print-costs` prints the latency, issue cost,
+  and availability of every instruction for the selected `-march` and
+  `-mtune`.
+- `--print-data-bases` lists the `data_base` entries.
 - `--print-options[=all|optimization|common|target]` lists each option
   with its value for the compilation, its origin (`default`, `preset`,
   `profile`, or `command-line`), whether presets may set it, and the model

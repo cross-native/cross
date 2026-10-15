@@ -316,7 +316,8 @@ bound creates a variable-length array under the managed-frame rules.
 
 `const`, `volatile`, and `restrict` qualify the type immediately built at their
 declarator position. A `const` object cannot be changed through that qualified
-lvalue. `volatile` and `restrict` have the contracts defined later.
+lvalue, and modifying an object whose definition has a `const`-qualified type
+is undefined. `volatile` and `restrict` have the contracts defined later.
 `typedef` declares aliases, not objects. An alias does not create a distinct
 type, except that an alias declared with `aligned` is distinct for layout only,
 as described under alignment and packing.
@@ -3593,6 +3594,9 @@ Required intrinsics are:
 | `$::alignof(type-or-expression)` | Unevaluated compile-time `uptr` alignment query. |
 | `$::offsetof(type, designator)` | Unevaluated compile-time `uptr` offset of a member designator (a member name followed by `.member` and `[constant]` steps) within a complete record type. |
 | `$::sqrt(x)`, `$::fabs(x)`, `$::copysign(x, y)`, `$::fmin(x, y)`, `$::fmax(x, y)` | Floating operations whose operands have one floating type, the result type: correctly rounded square root, absolute value, sign transfer, and IEEE 754 `minNum`/`maxNum`, where a NaN operand yields the other operand and operands that compare equal, such as zeros of opposite sign, yield the first; each lowers to one instruction or a finite inline sequence, or is diagnosed. |
+| `$::clz(x)`, `$::ctz(x)`, `$::popcount(x)` | Leading zero bits, trailing zero bits, and one bits of the integer `x` at the width of its type, as a `u32`; a zero `x` gives the width for the first two. |
+| `$::rotl(x, n)`, `$::rotr(x, n)` | The integer `x` rotated left or right by the integer `n` modulo the width of `x`'s type, so a negative `n` rotates the other way; the result has `x`'s type. |
+| `$::bswap(x)` | The integer `x`, whose width is a multiple of 8 bits, with its bytes in reverse order; the result has `x`'s type. |
 | `$::static_assert(constant, string)` | Compile-time declaration requiring nonzero `constant`. |
 | `$::patch(initial[, site])` | Siteful runtime scalar source with the lifecycle, identity, sink, and lowering contract defined under patchable values. |
 
@@ -3618,6 +3622,9 @@ array with a known bound is negative or not less than the bound, where the
 operand of `&` may equal the bound. `no_sanitize("name")` suppresses the
 named instrumentation per function, optional instrumentation never applies to
 `naked` functions, and no instrumentation calls a helper.
+The bit intrinsics `$::clz` through `$::bswap` evaluate at translation time
+like operators and, on every target, lower to an instruction or a finite
+inline sequence.
 The atomic intrinsics are listed under “Atomic and concurrent access.”
 `$::eval`, `$::runtime`, `$::quote`, and `$::unquote` are translation
 intrinsics and therefore emit no runtime operation. Additional intrinsics must
