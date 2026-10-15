@@ -153,6 +153,7 @@ add_library(cross_middle
     src/middle/frame_ir.cpp
     src/middle/mir.cpp
     src/middle/mir_analysis.cpp
+    src/middle/mir_memory.cpp
     src/middle/mir_pass.cpp
     src/middle/mir_transform.cpp
     src/middle/shrink_wrap.cpp
@@ -2662,6 +2663,91 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     set_tests_properties(cross_runtime_division_by_constant_llvm PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.llvm;middle;feature.optimization;opt.O2")
+    # Floating constant folding, constant-object reads, memory value
+    # forwarding, conditional replacement, and shared store addresses.
+    add_test(NAME cross_mir_folding_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/mir_folding_codegen.x
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/middle/floating_environment/environments.xm
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mir-folding-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/mir_folding_codegen.cmake")
+    set_tests_properties(cross_mir_folding_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.floating;feature.model;isa.vr4300;opt.O2")
+    foreach(folding_test floating_folding floating_folding_wide memory_forwarding
+                         conditional_replacement)
+        string(REPLACE "_" "-" folding_name "${folding_test}")
+        if(folding_test STREQUAL "floating_folding_wide")
+            # f80 and f128 arithmetic exist only on x86-64.
+            set(folding_modes O0 O2 O2-no-tree-ccp)
+            set(folding_mips_modes "")
+            set(folding_labels "feature.floating")
+        elseif(folding_test STREQUAL "floating_folding")
+            set(folding_modes O0 O2 O3 O2-no-tree-ccp O2-no-div-by-constant)
+            set(folding_mips_modes O2 O2-no-tree-ccp)
+            # The R3000 has no square root.
+            set(folding_cpus vr4300)
+            set(folding_labels "feature.floating")
+        elseif(folding_test STREQUAL "memory_forwarding")
+            set(folding_modes O0 O2 O3 Os O2-no-tree-fre O2-no-tree-ccp O2-no-ivopts)
+            set(folding_mips_modes O2 O2-no-tree-fre O2-no-ivopts)
+            set(folding_cpus vr4300 r3000)
+            set(folding_labels "feature.pointer;feature.object")
+        else()
+            set(folding_modes O0 O2 O2-no-tree-ccp)
+            set(folding_mips_modes O2 O2-no-tree-ccp)
+            set(folding_cpus vr4300 r3000)
+            set(folding_labels "feature.control")
+        endif()
+        foreach(folding_mode IN LISTS folding_modes)
+            string(REGEX MATCH "^O[0-9s]" folding_level "${folding_mode}")
+            if(folding_mode MATCHES "^O[0-9s]-no-(.*)$")
+                set(folding_flags "-${folding_level};-fno-${CMAKE_MATCH_1}")
+            else()
+                set(folding_flags "-${folding_mode}")
+            endif()
+            # Calls run at run time, so the optimizer, not translation-time
+            # evaluation, sees their constant operands.
+            list(APPEND folding_flags -fno-eval-calls)
+            add_test(NAME cross_runtime_${folding_test}_${folding_mode}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/${folding_test}.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-${folding_name}-${folding_mode}
+                    -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${folding_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_${folding_test}_${folding_mode} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;${folding_labels};opt.${folding_level}")
+        endforeach()
+        foreach(folding_mode IN LISTS folding_mips_modes)
+            string(REGEX MATCH "^O[0-9s]" folding_level "${folding_mode}")
+            if(folding_mode MATCHES "^O[0-9s]-no-(.*)$")
+                set(folding_flags "-${folding_level};-fno-${CMAKE_MATCH_1}")
+            else()
+                set(folding_flags "-${folding_mode}")
+            endif()
+            # Calls run at run time, so the optimizer, not translation-time
+            # evaluation, sees their constant operands.
+            list(APPEND folding_flags -fno-eval-calls)
+            set(folding_isa_labels "")
+            foreach(folding_cpu IN LISTS folding_cpus)
+                string(APPEND folding_isa_labels ";isa.${folding_cpu}")
+            endforeach()
+            add_test(NAME cross_runtime_${folding_test}_mips_${folding_mode}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/${folding_test}.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-${folding_name}-mips-${folding_mode}
+                    -DEXPECTED=P "-DCC_FLAGS=${folding_flags}"
+                    "-DMIPS_CPUS=${folding_cpus}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_runtime_${folding_test}_mips_${folding_mode} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;${folding_labels}${folding_isa_labels};endian.big;endian.little;opt.${folding_level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     # Loop bounds computed inside a vectorized reduction loop.
     foreach(level O0 O1 O2 O3 Os Oz)
         add_test(NAME cross_runtime_loop_invariant_bounds_${level}
@@ -2967,7 +3053,8 @@ if(BUILD_TESTING)
             -P "${floating_environment}/lowering.cmake")
     set_tests_properties(cross_floating_environment_lowering PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.floating;feature.model;isa.avx;isa.vr4300;isa.r6000;opt.O2")
-    foreach(case guarded_O2 guarded_O3 unguarded signaling fmin_signaling)
+    foreach(case guarded_O2 guarded_O3 unguarded signaling fmin_signaling
+                 constant_comparison)
         set(environment_flags "--model=${floating_environment}/environments.xm;-mprofile=trapping-fp")
         if(case MATCHES "^guarded_(.*)")
             set(environment_expected P)

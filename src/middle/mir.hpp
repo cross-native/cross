@@ -328,9 +328,12 @@ ManagedModule lower_managed(hir::Module& hir_module,
                             Diagnostics& diagnostics);
 bool verify(const ManagedModule& module, const hir::Module& hir_module,
             Diagnostics& diagnostics);
+// `data_module`, when given, supplies the initial values of const objects
+// whose reads may fold.
 void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
-              Diagnostics& diagnostics);
+              Diagnostics& diagnostics,
+              const data::Module* data_module = nullptr);
 
 // Materialize native-register-width views of proven non-wrapping unsigned
 // loop inductions. Targets whose integer registers are wider than their

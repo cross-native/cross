@@ -361,7 +361,8 @@ std::span<const OptionDefinition> common_option_definitions() {
          "maximum independent vector reduction streams"},
         {"f.tree-ccp", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
-         "scalar constant propagation and folding"},
+         "constant folding, constant-object reads, and conditional "
+         "constant replacement"},
         {"f.tree-bit-ccp", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "propagate integer known bits and narrow compatible memory reads"},
@@ -376,7 +377,7 @@ std::span<const OptionDefinition> common_option_definitions() {
          "dead local-slot store elimination"},
         {"f.tree-fre", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
-         "local fully redundant expression elimination"},
+         "redundant expression and load elimination over the dominator tree"},
         {"f.tree-tail-merge", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "factor profitable common SSA tails before machine selection"},
@@ -405,7 +406,8 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.div-by-constant", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "replace profitable integer division and remainder by a constant "
-         "with multiplication, shifts, and adds"},
+         "with multiplication, shifts, and adds, and floating division by a "
+         "power of two with multiplication"},
         {"f.tree-loop-rotate", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "rotate legal guarded loops to a bottom continuation test"},

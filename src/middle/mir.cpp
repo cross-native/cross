@@ -18,6 +18,7 @@
 #include "target/instruction_constraints.hpp"
 #include "target/subtarget.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <cstdint>
@@ -9350,6 +9351,8 @@ void eliminate_dead_values(ManagedFunction& function,
     compact_managed_values(function);
 }
 
+} // namespace
+
 void remove_effectful_values(
     ManagedFunction& function,
     const std::unordered_set<std::uint32_t>& removed) {
@@ -9369,6 +9372,8 @@ void remove_effectful_values(
     compact_effects(function);
     compact_managed_values(function);
 }
+
+namespace {
 
 bool optimizable_slot(const ManagedFunction& function, SlotId slot) {
     const auto& value = function.slots[slot.value];
@@ -10154,6 +10159,14 @@ std::optional<std::string> redundant_expression_key(
         result += ':' + std::to_string(static_cast<unsigned>(value.cast));
         break;
     case ValueKind::Select:
+    case ValueKind::IndexedAddress:
+    case ValueKind::Splat:
+    case ValueKind::ExtractElement:
+    case ValueKind::InsertElement:
+        break;
+    case ValueKind::Intrinsic:
+        if (!floating_intrinsic_operation(value.intrinsic)) return std::nullopt;
+        result += ':' + std::to_string(static_cast<unsigned>(value.intrinsic));
         break;
     case ValueKind::MachineInstruction:
         if (is_effectful_value(value)) return std::nullopt;
@@ -10167,20 +10180,75 @@ std::optional<std::string> redundant_expression_key(
     return result;
 }
 
-void eliminate_fully_redundant_expressions(ManagedFunction& function) {
+bool floating_zero(const ManagedValue& value, unsigned bits);
+
+// Value numbering over the dominator tree: an expression is replaced by an
+// equal one that dominates it. A constant that the target materializes in
+// one operation, and an address a constant displacement from its base, are
+// shared only within their block: each use absorbs them for free, while a
+// shared value would occupy a register. An operation that may raise a
+// trapped floating exception runs wherever the source runs it.
+void eliminate_fully_redundant_expressions(
+    ManagedFunction& function, const hir::Module& hir_module,
+    const Subtarget& subtarget, const floating::Environment& environment) {
+    const auto shared_across_blocks = [&](const ManagedValue& value) {
+        const auto bits = type_bits(hir_module, value.type);
+        if (value.kind == ValueKind::ConstantInteger) {
+            return subtarget.integer_constant_materialization_cost(
+                       {bits, value.integer, value.integer_high,
+                        signed_type(hir_module, value.type)}) > 1;
+        }
+        if (value.kind == ValueKind::ConstantFloating) {
+            return (bits == 32 || bits == 64) && !floating_zero(value, bits);
+        }
+        return value.kind != ValueKind::IndexedAddress ||
+               function.values[value.operands[1].value].kind !=
+                   ValueKind::ConstantInteger;
+    };
+    const DominatorTree dominators(function);
     std::unordered_set<std::uint32_t> removed;
     ValueReplacements replacements;
-    for (const auto& block : function.blocks) {
-        std::unordered_map<std::string, ValueId> available;
-        for (const auto id : block.values) {
-            replacements.rewrite(function.values[id.value]);
-            const auto key = redundant_expression_key(
-                function.values[id.value]);
+    std::unordered_map<std::string, ValueId> available;
+    std::vector<std::vector<std::string>> scopes;
+    std::vector<std::pair<BlockId, bool>> pending{{function.entry, false}};
+    while (!pending.empty()) {
+        const auto [block_id, leaving] = pending.back();
+        pending.pop_back();
+        if (leaving) {
+            for (const auto& key : scopes.back()) available.erase(key);
+            scopes.pop_back();
+            continue;
+        }
+        pending.push_back({block_id, true});
+        scopes.emplace_back();
+        std::unordered_map<std::string, ValueId> local;
+        for (const auto id : function.blocks[block_id.value].values) {
+            auto& value = function.values[id.value];
+            replacements.rewrite(value);
+            if (may_trap_floating(value, function, hir_module, environment)) {
+                continue;
+            }
+            const auto key = redundant_expression_key(value);
             if (!key) continue;
-            const auto [found, inserted] = available.emplace(*key, id);
-            if (inserted) continue;
-            replacements.add(id, found->second);
-            removed.insert(id.value);
+            if (const auto found = available.find(*key);
+                found != available.end()) {
+                replacements.add(id, found->second);
+                removed.insert(id.value);
+                continue;
+            }
+            if (!shared_across_blocks(value)) {
+                const auto [found, inserted] = local.emplace(*key, id);
+                if (!inserted) {
+                    replacements.add(id, found->second);
+                    removed.insert(id.value);
+                }
+                continue;
+            }
+            available.emplace(*key, id);
+            scopes.back().push_back(*key);
+        }
+        for (const auto child : dominators.children(block_id)) {
+            pending.push_back({child, false});
         }
     }
     replacements.apply(function);
@@ -10956,6 +11024,85 @@ bool profitable_division_sequence(const DivisionSequence& sequence,
     return replacement < original;
 }
 
+std::optional<floating::Format> floating_format(const hir::Module& module,
+                                                hir::TypeId id) {
+    if (!floating_type(module, id)) return std::nullopt;
+    switch (type_bits(module, id)) {
+    case 32: return floating::Format::Binary32;
+    case 64: return floating::Format::Binary64;
+    case 80: return floating::Format::Extended80;
+    case 128: return floating::Format::Binary128;
+    default: return std::nullopt;
+    }
+}
+
+std::optional<floating::Value> floating_constant_value(
+    const ManagedFunction& function, const hir::Module& module, ValueId id) {
+    const auto& value = function.values[id.value];
+    const auto format = floating_format(module, value.type);
+    if (value.kind != ValueKind::ConstantFloating || !format) return std::nullopt;
+    return floating::Value{UInt128{value.integer, value.integer_high}, *format};
+}
+
+void make_floating_constant(ManagedValue& value, floating::Value result) {
+    value.kind = ValueKind::ConstantFloating;
+    value.integer = result.bits.low;
+    value.integer_high = result.bits.high;
+    value.operands.clear();
+}
+
+// Replaces x / d by x * (1 / d) when 1 / d is exact, finite, and normal, so
+// that d is a power of two: both have the same exact value, hence the same
+// rounded result and exceptions, and neither constant is a denormal
+// operand. This holds in every floating environment.
+bool reduce_floating_divisions(ManagedFunction& function,
+                               const hir::Module& hir_module) {
+    bool changed = false;
+    for (auto& block : function.blocks) {
+        std::vector<ValueId> rewritten;
+        rewritten.reserve(block.values.size());
+        for (const auto id : block.values) {
+            const auto& candidate = function.values[id.value];
+            const auto divisor =
+                candidate.kind == ValueKind::Binary &&
+                        candidate.binary == BinaryOperation::SignedDivide &&
+                        candidate.operands.size() == 2 &&
+                        floating_type(hir_module, candidate.type)
+                    ? floating_constant_value(function, hir_module,
+                                              candidate.operands[1])
+                    : std::nullopt;
+            if (divisor && !floating::is_nan(*divisor) &&
+                floating::nonzero(*divisor)) {
+                floating::ExceptionSet raised{};
+                const auto one = floating::from_integer(
+                    UInt128{1}, 2, false, divisor->format);
+                const auto reciprocal = floating::binary(
+                    floating::Operation::Divide, one, *divisor,
+                    divisor->format, floating::NanEncoding::Ieee2008,
+                    &raised);
+                if (raised == 0 && floating::nonzero(reciprocal)) {
+                    ManagedValue constant;
+                    constant.id = ValueId{
+                        static_cast<std::uint32_t>(function.values.size())};
+                    constant.location = candidate.location;
+                    constant.type =
+                        function.values[candidate.operands[1].value].type;
+                    make_floating_constant(constant, reciprocal);
+                    rewritten.push_back(constant.id);
+                    function.values.push_back(std::move(constant));
+                    auto& division = function.values[id.value];
+                    division.binary = BinaryOperation::Multiply;
+                    division.operands[1] = rewritten.back();
+                    changed = true;
+                }
+            }
+            rewritten.push_back(id);
+        }
+        block.values = std::move(rewritten);
+    }
+    return changed;
+}
+
 bool reduce_constant_divisions(ManagedFunction& function,
                                const hir::Module& hir_module,
                                const Subtarget& subtarget,
@@ -11705,6 +11852,64 @@ bool unpredictable_memory_condition(const ManagedFunction& function,
     return value_depends_on_ordinary_memory(function, *data, visited);
 }
 
+// Leaves BLOCK in place as an unreachable block without edges.
+void disconnect_block(ManagedFunction& function, ManagedBlock& block) {
+    block.predecessors.clear();
+    function.effects[block.effect.value].incoming.clear();
+    block.terminator.kind = TerminatorKind::Unreachable;
+    block.terminator.value.reset();
+    block.terminator.successors.clear();
+    block.terminator.effect = block.effect;
+}
+
+// Absorbs MERGE into OWNER when OWNER branches only to MERGE, MERGE has no
+// other predecessor, phi, or label, and records MERGE's effect phi in
+// FORWARDED for the caller to forward.
+void absorb_linear_successor(
+    ManagedFunction& function, BlockId owner_id, BlockId merge_id,
+    std::unordered_map<std::uint32_t, EffectId>& forwarded) {
+    auto& owner = function.blocks[owner_id.value];
+    auto& merge = function.blocks[merge_id.value];
+    if (owner.terminator.kind != TerminatorKind::Branch ||
+        owner.terminator.successors != std::vector<BlockId>{merge_id} ||
+        merge.predecessors != std::vector<BlockId>{owner_id} ||
+        merge_id == owner_id ||
+        std::any_of(function.labels.begin(), function.labels.end(),
+                    [&](const ManagedLabel& label) {
+                        return label.block == merge_id;
+                    }) ||
+        std::any_of(merge.values.begin(), merge.values.end(),
+                    [&](ValueId id) {
+                        return function.values[id.value].kind == ValueKind::Phi;
+                    })) {
+        return;
+    }
+    forwarded[merge.effect.value] = owner.terminator.effect;
+    owner.values.insert(owner.values.end(), merge.values.begin(),
+                        merge.values.end());
+    merge.values.clear();
+    owner.terminator = merge.terminator;
+    for (const auto successor_id : owner.terminator.successors) {
+        auto& successor = function.blocks[successor_id.value];
+        std::replace(successor.predecessors.begin(),
+                     successor.predecessors.end(), merge_id, owner_id);
+        auto& successor_effect = function.effects[successor.effect.value];
+        for (auto& incoming : successor_effect.incoming) {
+            if (incoming.predecessor == merge_id) incoming.predecessor = owner_id;
+        }
+        for (const auto id : successor.values) {
+            auto& value = function.values[id.value];
+            if (value.kind != ValueKind::Phi) continue;
+            for (auto& incoming : value.incoming) {
+                if (incoming.predecessor == merge_id) {
+                    incoming.predecessor = owner_id;
+                }
+            }
+        }
+    }
+    disconnect_block(function, merge);
+}
+
 // Converts the diamond owned by OWNER_INDEX. Disconnected arms stay in place
 // as unreachable blocks, and effects to be replaced are recorded in FORWARDED
 // (from -> to); if_convert_diamonds applies both once at the end.
@@ -11839,12 +12044,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
         return result;
     };
     const auto disconnect = [&](ManagedBlock& arm) {
-        arm.predecessors.clear();
-        function.effects[arm.effect.value].incoming.clear();
-        arm.terminator.kind = TerminatorKind::Unreachable;
-        arm.terminator.value.reset();
-        arm.terminator.successors.clear();
-        arm.terminator.effect = arm.effect;
+        disconnect_block(function, arm);
     };
 
     if (truth.terminator.kind == TerminatorKind::Return &&
@@ -11991,47 +12191,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
     // jump, this keeps chains of source-level `if` statements in one MIR loop
     // body so the loop vectorizer can see nested selects as a single packed
     // expression.
-    const bool merge_has_label = std::any_of(
-        function.labels.begin(), function.labels.end(),
-        [&](const ManagedLabel& label) {
-            return label.block == merge_id;
-        });
-    const bool merge_has_phi = std::any_of(
-        merge.values.begin(), merge.values.end(),
-        [&](ValueId id) {
-            return function.values[id.value].kind == ValueKind::Phi;
-        });
-    if (!merge_has_label && !merge_has_phi &&
-        merge.predecessors.size() == 1 &&
-        merge.predecessors.front() == owner.id) {
-        forwarded[merge.effect.value] = owner.terminator.effect;
-        owner.values.insert(owner.values.end(), merge.values.begin(),
-                            merge.values.end());
-        merge.values.clear();
-        owner.terminator = merge.terminator;
-        for (const auto successor_id : owner.terminator.successors) {
-            auto& successor = function.blocks[successor_id.value];
-            std::replace(successor.predecessors.begin(),
-                         successor.predecessors.end(), merge_id, owner.id);
-            auto& successor_effect =
-                function.effects[successor.effect.value];
-            for (auto& incoming : successor_effect.incoming) {
-                if (incoming.predecessor == merge_id) {
-                    incoming.predecessor = owner.id;
-                }
-            }
-            for (const auto id : successor.values) {
-                auto& value = function.values[id.value];
-                if (value.kind != ValueKind::Phi) continue;
-                for (auto& incoming : value.incoming) {
-                    if (incoming.predecessor == merge_id) {
-                        incoming.predecessor = owner.id;
-                    }
-                }
-            }
-        }
-        disconnect(merge);
-    }
+    absorb_linear_successor(function, owner.id, merge_id, forwarded);
     return true;
 }
 
@@ -12056,6 +12216,309 @@ bool if_convert_diamonds(ManagedFunction& function,
         eliminate_unreachable_blocks(function);
     }
     return changed;
+}
+
+std::optional<BinaryOperation> negated_integer_comparison(
+    BinaryOperation operation);
+
+// Computes `condition ? when_true : when_false` for integer constants of
+// which one is zero and the other one, a power of two, or all ones, as the
+// extended condition or its negation, shifted or negated. Emitted values are
+// appended to the function and to `emitted`.
+std::optional<ValueId> conditional_constant(
+    ManagedFunction& function, const hir::Module& hir_module,
+    std::vector<ValueId>& emitted, ValueId condition, hir::TypeId type,
+    const ManagedValue& when_true, const ManagedValue& when_false,
+    SourceLocation location) {
+    const auto boolean = hir_module.builtin(BuiltinType::Bool);
+    const auto bits = type_bits(hir_module, type);
+    if (!boolean || function.values[condition.value].type != *boolean ||
+        !integer_type(hir_module, type) || bits == 0 ||
+        when_true.kind != ValueKind::ConstantInteger ||
+        when_false.kind != ValueKind::ConstantInteger ||
+        when_true.type != type || when_false.type != type) {
+        return std::nullopt;
+    }
+    const auto truth = mask_to(UInt128{when_true.integer, when_true.integer_high}, bits);
+    const auto falsity = mask_to(UInt128{when_false.integer, when_false.integer_high}, bits);
+    const bool invert = truth == UInt128{};
+    const auto magnitude = invert ? falsity : truth;
+    const auto all_ones = mask_to(bit_not(UInt128{}), bits);
+    if ((invert ? truth : falsity) != UInt128{} || magnitude == UInt128{} ||
+        (!power_of_two(magnitude) && magnitude != all_ones) ||
+        (type == *boolean && magnitude != UInt128{1})) {
+        return std::nullopt;
+    }
+    const auto emit = [&](ManagedValue value) {
+        value.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+        value.location = location;
+        emitted.push_back(value.id);
+        function.values.push_back(std::move(value));
+        return emitted.back();
+    };
+    auto result = condition;
+    if (invert) {
+        const auto source = function.values[condition.value];
+        const auto inverse =
+            source.kind == ValueKind::Binary && source.operands.size() == 2 &&
+                    (integer_type(hir_module,
+                                  function.values[source.operands[0].value].type) ||
+                     pointer_type(hir_module,
+                                  function.values[source.operands[0].value].type))
+                ? negated_integer_comparison(source.binary)
+                : std::nullopt;
+        ManagedValue negation;
+        negation.type = *boolean;
+        if (inverse) {
+            negation.kind = ValueKind::Binary;
+            negation.binary = *inverse;
+            negation.operands = source.operands;
+        } else {
+            negation.kind = ValueKind::Unary;
+            negation.unary = UnaryOperation::IsZero;
+            negation.operands = {condition};
+        }
+        result = emit(std::move(negation));
+    }
+    if (type != *boolean) {
+        ManagedValue extension;
+        extension.type = type;
+        extension.kind = ValueKind::Cast;
+        extension.cast = CastOperation::ZeroExtend;
+        extension.operands = {result};
+        result = emit(std::move(extension));
+    }
+    if (magnitude == UInt128{1}) return result;
+    if (magnitude == all_ones) {
+        ManagedValue negation;
+        negation.type = type;
+        negation.kind = ValueKind::Unary;
+        negation.unary = UnaryOperation::Negate;
+        negation.operands = {result};
+        return emit(std::move(negation));
+    }
+    ManagedValue amount;
+    amount.type = type;
+    amount.kind = ValueKind::ConstantInteger;
+    amount.integer = magnitude.high != 0
+        ? 64U + static_cast<unsigned>(std::countr_zero(magnitude.high))
+        : static_cast<unsigned>(std::countr_zero(magnitude.low));
+    ManagedValue shift;
+    shift.type = type;
+    shift.kind = ValueKind::Binary;
+    shift.binary = BinaryOperation::ShiftLeft;
+    shift.operands = {result, emit(std::move(amount))};
+    return emit(std::move(shift));
+}
+
+// Replaces a select, or the phis of a branch whose arms hold only
+// constants, that chooses a zero or a power of two (or all ones) by a
+// condition with the extended condition. This removes the branch but
+// speculates nothing, so it is independent of if-conversion budgets.
+bool replace_conditional_constants(ManagedFunction& function,
+                                   const hir::Module& hir_module) {
+    bool changed = false;
+    ValueReplacements replacements;
+    std::unordered_set<std::uint32_t> removed;
+    for (auto& block : function.blocks) {
+        std::vector<ValueId> rewritten;
+        rewritten.reserve(block.values.size());
+        for (const auto id : block.values) {
+            const auto select = function.values[id.value];
+            if (select.kind == ValueKind::Select && select.operands.size() == 3) {
+                if (const auto result = conditional_constant(
+                        function, hir_module, rewritten, select.operands[0],
+                        select.type, function.values[select.operands[1].value],
+                        function.values[select.operands[2].value],
+                        select.location)) {
+                    replacements.add(id, *result);
+                    removed.insert(id.value);
+                    changed = true;
+                    continue;
+                }
+            }
+            rewritten.push_back(id);
+        }
+        block.values = std::move(rewritten);
+    }
+
+    std::unordered_map<std::uint32_t, EffectId> forwarded;
+    const auto labeled = [&](BlockId id) {
+        return std::any_of(function.labels.begin(), function.labels.end(),
+                           [&](const ManagedLabel& label) {
+                               return label.block == id;
+                           });
+    };
+    // A converted owner that absorbed its merge can end in another branch of
+    // the same shape, so it is examined again.
+    const auto convert = [&](std::size_t index) {
+        const auto owner_id = function.blocks[index].id;
+        const auto& owner = function.blocks[index];
+        if (owner.terminator.kind != TerminatorKind::ConditionalBranch ||
+            !owner.terminator.value ||
+            owner.terminator.successors.size() != 2) {
+            return false;
+        }
+        const auto condition = *owner.terminator.value;
+        // An arm holds only constants and has the owner as its only
+        // predecessor. Each side reaches its destination through an arm or
+        // directly.
+        const auto arm = [&](BlockId id) {
+            const auto& block = function.blocks[id.value];
+            return id != owner_id &&
+                   block.predecessors == std::vector<BlockId>{owner_id} &&
+                   !labeled(id) &&
+                   std::all_of(block.values.begin(), block.values.end(),
+                               [&](ValueId value) {
+                                   return function.values[value.value].kind ==
+                                          ValueKind::ConstantInteger;
+                               });
+        };
+        std::array<BlockId, 2> via{};
+        std::array<std::optional<BlockId>, 2> destination;
+        bool returns = true;
+        for (std::size_t side = 0; side < 2; ++side) {
+            const auto target = owner.terminator.successors[side];
+            const auto& block = function.blocks[target.value];
+            const bool is_arm = arm(target);
+            returns = returns && is_arm &&
+                      block.terminator.kind == TerminatorKind::Return;
+            if (is_arm && block.terminator.kind == TerminatorKind::Branch &&
+                block.terminator.successors.size() == 1) {
+                via[side] = target;
+                destination[side] = block.terminator.successors.front();
+            } else {
+                via[side] = owner_id;
+                destination[side] = target;
+            }
+        }
+        std::vector<ValueId> emitted;
+        if (returns) {
+            const auto& truth = function.blocks[owner.terminator.successors[0].value];
+            const auto& falsity = function.blocks[owner.terminator.successors[1].value];
+            if (truth.terminator.value.has_value() !=
+                falsity.terminator.value.has_value()) {
+                return false;
+            }
+            std::optional<ValueId> result;
+            if (truth.terminator.value) {
+                const auto t = *truth.terminator.value;
+                const auto f = *falsity.terminator.value;
+                result = t == f ? std::optional<ValueId>(t)
+                    : conditional_constant(
+                          function, hir_module, emitted, condition,
+                          function.values[t.value].type, function.values[t.value],
+                          function.values[f.value], owner.terminator.location);
+                if (!result) return false;
+            }
+            auto& mutable_owner = function.blocks[index];
+            for (const auto side : {0U, 1U}) {
+                auto& arm_block =
+                    function.blocks[mutable_owner.terminator.successors[side].value];
+                mutable_owner.values.insert(mutable_owner.values.end(),
+                                            arm_block.values.begin(),
+                                            arm_block.values.end());
+                arm_block.values.clear();
+            }
+            mutable_owner.values.insert(mutable_owner.values.end(),
+                                        emitted.begin(), emitted.end());
+            const auto arms = mutable_owner.terminator.successors;
+            mutable_owner.terminator.kind = TerminatorKind::Return;
+            mutable_owner.terminator.value = result;
+            mutable_owner.terminator.successors.clear();
+            for (const auto arm_id : arms) {
+                disconnect_block(function, function.blocks[arm_id.value]);
+            }
+            return true;
+        }
+        if (destination[0] != destination[1] || via[0] == via[1] ||
+            *destination[0] == owner_id) {
+            return false;
+        }
+        const auto merge_id = *destination[0];
+        const auto& merge = function.blocks[merge_id.value];
+        if (merge.predecessors.size() != 2 ||
+            std::find(merge.predecessors.begin(), merge.predecessors.end(),
+                      via[0]) == merge.predecessors.end() ||
+            std::find(merge.predecessors.begin(), merge.predecessors.end(),
+                      via[1]) == merge.predecessors.end()) {
+            return false;
+        }
+        bool convertible = true;
+        std::vector<std::pair<ValueId, ValueId>> results;
+        for (const auto phi_id : merge.values) {
+            const auto& phi = function.values[phi_id.value];
+            if (phi.kind != ValueKind::Phi) continue;
+            std::array<std::optional<ValueId>, 2> incoming;
+            for (const auto& edge : phi.incoming) {
+                for (std::size_t side = 0; side < 2; ++side) {
+                    if (edge.predecessor == via[side]) incoming[side] = edge.value;
+                }
+            }
+            if (!incoming[0] || !incoming[1]) {
+                convertible = false;
+                break;
+            }
+            const auto result = *incoming[0] == *incoming[1]
+                ? std::optional<ValueId>(*incoming[0])
+                : conditional_constant(function, hir_module, emitted, condition,
+                                       phi.type,
+                                       function.values[incoming[0]->value],
+                                       function.values[incoming[1]->value],
+                                       phi.location);
+            if (!result) {
+                convertible = false;
+                break;
+            }
+            results.push_back({phi_id, *result});
+        }
+        if (!convertible) {
+            // Drop the unused values emitted for earlier phis.
+            function.values.resize(function.values.size() - emitted.size());
+            return false;
+        }
+        auto& mutable_owner = function.blocks[index];
+        for (const auto side : {0U, 1U}) {
+            if (via[side] == owner_id) continue;
+            auto& arm_block = function.blocks[via[side].value];
+            mutable_owner.values.insert(mutable_owner.values.end(),
+                                        arm_block.values.begin(),
+                                        arm_block.values.end());
+            arm_block.values.clear();
+        }
+        mutable_owner.values.insert(mutable_owner.values.end(), emitted.begin(),
+                                    emitted.end());
+        auto& mutable_merge = function.blocks[merge_id.value];
+        for (const auto& [phi, result] : results) {
+            replacements.add(phi, result);
+            removed.insert(phi.value);
+        }
+        std::erase_if(mutable_merge.values, [&](ValueId id) {
+            return removed.contains(id.value);
+        });
+        for (const auto side : {0U, 1U}) {
+            if (via[side] != owner_id) {
+                disconnect_block(function, function.blocks[via[side].value]);
+            }
+        }
+        mutable_owner.terminator.kind = TerminatorKind::Branch;
+        mutable_owner.terminator.value.reset();
+        mutable_owner.terminator.successors = {merge_id};
+        mutable_merge.predecessors = {owner_id};
+        function.effects[mutable_merge.effect.value].incoming = {
+            {owner_id, mutable_owner.terminator.effect}};
+        absorb_linear_successor(function, owner_id, merge_id, forwarded);
+        return true;
+    };
+    for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+        while (convert(index)) changed = true;
+    }
+    if (!changed) return false;
+    forward_effects(function, forwarded);
+    replacements.apply(function);
+    remove_replaced_values(function, removed);
+    eliminate_unreachable_blocks(function);
+    return true;
 }
 
 bool safely_loop_invariant(const ManagedValue& value,
@@ -12821,12 +13284,16 @@ bool reduce_affine_address_inductions(
                     }
                     std::optional<ValueId> base;
                     std::optional<ValueId> index;
+                    // A store shares the recurrence with the loads of its
+                    // element; its address is replaced like theirs.
+                    const bool store = load.kind == ValueKind::PointerStore &&
+                                       load.operands.size() == 2;
                     if (load.kind == ValueKind::IndexedLoad &&
                         load.operands.size() == 2) {
                         base = load.operands[0];
                         index = load.operands[1];
-                    } else if (load.kind == ValueKind::PointerLoad &&
-                               load.operands.size() == 1 &&
+                    } else if ((store || (load.kind == ValueKind::PointerLoad &&
+                                          load.operands.size() == 1)) &&
                                load.operands.front().value <
                                    function.values.size()) {
                         const auto& address =
@@ -12852,8 +13319,11 @@ bool reduce_affine_address_inductions(
                         !pointer.pointee) {
                         continue;
                     }
-                    const auto element_size =
-                        storage_size(hir_module, load.type, target);
+                    const auto element_size = storage_size(
+                        hir_module,
+                        store ? function.values[load.operands[1].value].type
+                              : load.type,
+                        target);
                     const auto pointee_size =
                         storage_size(hir_module, *pointer.pointee, target);
                     if (element_size == 0 || element_size != pointee_size ||
@@ -12964,8 +13434,12 @@ bool reduce_affine_address_inductions(
                         block.values.insert(load_position, address);
                     }
                     auto& load = function.values[access.load.value];
-                    load.kind = ValueKind::PointerLoad;
-                    load.operands = {address};
+                    if (load.kind == ValueKind::PointerStore) {
+                        load.operands[0] = address;
+                    } else {
+                        load.kind = ValueKind::PointerLoad;
+                        load.operands = {address};
+                    }
                 }
                 changed = true;
             }
@@ -16859,10 +17333,199 @@ bool vectorize_early_exit_loops(ManagedFunction& function,
     return changed;
 }
 
+// Folds a floating operation on constants with the evaluator that
+// translation-time evaluation uses, so that the constant is the run-time
+// value. The operation stays when the environment traps an exception it
+// raises, when it produces a NaN, whose payload the target chooses, and,
+// under flushing, when its result is tiny: targets detect tininess before
+// or after rounding.
+bool fold_floating_operation(ManagedValue& value,
+                             const ManagedFunction& function,
+                             const hir::Module& hir_module,
+                             const floating::Environment& environment,
+                             floating::NanEncoding encoding) {
+    using floating::Exception;
+    floating::ExceptionSet raised{};
+    const auto exact = [&] {
+        return !(environment.flush_denormal_results &&
+                 (raised & floating::exception_set(Exception::Underflow))) &&
+               !floating::trap(environment, raised);
+    };
+    const auto fold_floating = [&](floating::Value result) {
+        if (floating::is_nan(result) || !exact()) return false;
+        make_floating_constant(value, result);
+        return true;
+    };
+    const auto fold_integer = [&](UInt128 result) {
+        if (!exact()) return false;
+        value.kind = ValueKind::ConstantInteger;
+        value.integer = result.low;
+        value.integer_high = result.high;
+        value.operands.clear();
+        return true;
+    };
+    const auto operand = [&](std::size_t index) {
+        return index < value.operands.size()
+            ? floating_constant_value(function, hir_module,
+                                      value.operands[index])
+            : std::nullopt;
+    };
+    const auto format = floating_format(hir_module, value.type);
+    const auto bits = type_bits(hir_module, value.type);
+    switch (value.kind) {
+    case ValueKind::Unary: {
+        const auto x = operand(0);
+        if (value.unary != UnaryOperation::IsZero || !x) return false;
+        // The truth value is a quiet comparison with zero.
+        (void)floating::compare(floating::Comparison::NotEqual, *x,
+                                floating::Value{UInt128{}, x->format},
+                                encoding, &raised);
+        return fold_integer(UInt128{floating::nonzero(*x) ? 0U : 1U});
+    }
+    case ValueKind::Binary: {
+        const auto x = operand(0);
+        const auto y = operand(1);
+        if (!x || !y || x->format != y->format) return false;
+        std::optional<floating::Comparison> comparison;
+        std::optional<floating::Operation> arithmetic;
+        switch (value.binary) {
+        case BinaryOperation::Add: arithmetic = floating::Operation::Add; break;
+        case BinaryOperation::Subtract:
+            arithmetic = floating::Operation::Subtract;
+            break;
+        case BinaryOperation::Multiply:
+            arithmetic = floating::Operation::Multiply;
+            break;
+        case BinaryOperation::SignedDivide:
+            arithmetic = floating::Operation::Divide;
+            break;
+        case BinaryOperation::Equal:
+            comparison = floating::Comparison::Equal;
+            break;
+        case BinaryOperation::NotEqual:
+            comparison = floating::Comparison::NotEqual;
+            break;
+        case BinaryOperation::SignedLess:
+            comparison = floating::Comparison::Less;
+            break;
+        case BinaryOperation::SignedLessEqual:
+            comparison = floating::Comparison::LessEqual;
+            break;
+        case BinaryOperation::SignedGreater:
+            comparison = floating::Comparison::Greater;
+            break;
+        case BinaryOperation::SignedGreaterEqual:
+            comparison = floating::Comparison::GreaterEqual;
+            break;
+        default: return false;
+        }
+        if (comparison) {
+            return fold_integer(UInt128{
+                floating::compare(*comparison, *x, *y, encoding, &raised)
+                    ? 1U : 0U});
+        }
+        if (format != x->format) return false;
+        return fold_floating(floating::binary(*arithmetic, *x, *y, *format,
+                                              encoding, &raised));
+    }
+    case ValueKind::Cast: {
+        if (value.operands.size() != 1) return false;
+        const auto& source = function.values[value.operands[0].value];
+        const auto source_bits = type_bits(hir_module, source.type);
+        const auto x = operand(0);
+        switch (value.cast) {
+        case CastOperation::FloatExtend:
+        case CastOperation::FloatTruncate:
+            if (!x || !format) return false;
+            return fold_floating(
+                floating::convert(*x, *format, encoding, &raised));
+        case CastOperation::SignedIntegerToFloat:
+        case CastOperation::UnsignedIntegerToFloat:
+            if (source.kind != ValueKind::ConstantInteger || !format ||
+                !integer_type(hir_module, source.type)) {
+                return false;
+            }
+            return fold_floating(floating::from_integer(
+                UInt128{source.integer, source.integer_high}, source_bits,
+                value.cast == CastOperation::SignedIntegerToFloat, *format,
+                &raised));
+        case CastOperation::FloatToSignedInteger:
+        case CastOperation::FloatToUnsignedInteger: {
+            const auto& target = hir_module.type(value.type);
+            if (!x || !integer_type(hir_module, value.type) ||
+                target.builtin == BuiltinType::Bool) {
+                return false;
+            }
+            const auto integer = floating::to_integer(
+                *x, bits,
+                value.cast == CastOperation::FloatToSignedInteger, &raised);
+            return integer && fold_integer(mask_to(*integer, bits));
+        }
+        case CastOperation::Reinterpret:
+            // Bit-preserving views between floating and integer types.
+            if (bits != source_bits) return false;
+            if (x && integer_type(hir_module, value.type)) {
+                return fold_integer(mask_to(x->bits, bits));
+            }
+            if (format && (x || source.kind == ValueKind::ConstantInteger)) {
+                make_floating_constant(
+                    value, floating::Value{
+                               mask_to(UInt128{source.integer,
+                                               source.integer_high},
+                                       bits),
+                               *format});
+                return true;
+            }
+            return false;
+        default: return false;
+        }
+    }
+    case ValueKind::Intrinsic: {
+        const auto x = operand(0);
+        if (!x || !format || x->format != *format) return false;
+        switch (value.intrinsic) {
+        case IntrinsicOperation::Sqrt:
+            return fold_floating(floating::square_root(*x, encoding, &raised));
+        // Sign operations and minNum/maxNum copy operand bits, NaNs
+        // included, at run time too.
+        case IntrinsicOperation::Fabs:
+            make_floating_constant(value, floating::absolute(*x));
+            return true;
+        case IntrinsicOperation::Copysign:
+        case IntrinsicOperation::Fmin:
+        case IntrinsicOperation::Fmax: {
+            const auto y = operand(1);
+            if (!y || y->format != x->format) return false;
+            if (value.intrinsic == IntrinsicOperation::Copysign) {
+                make_floating_constant(value, floating::copy_sign(*x, *y));
+                return true;
+            }
+            const auto result =
+                value.intrinsic == IntrinsicOperation::Fmin
+                    ? floating::min_num(*x, *y, encoding, &raised)
+                    : floating::max_num(*x, *y, encoding, &raised);
+            if (!exact()) return false;
+            make_floating_constant(value, result);
+            return true;
+        }
+        default: return false;
+        }
+    }
+    default: return false;
+    }
+}
+
 bool fold_constants(ManagedFunction& function,
-                    const hir::Module& hir_module) {
+                    const hir::Module& hir_module,
+                    const floating::Environment& environment,
+                    floating::NanEncoding encoding) {
     bool changed = false;
     for (auto& value : function.values) {
+        if (fold_floating_operation(value, function, hir_module, environment,
+                                    encoding)) {
+            changed = true;
+            continue;
+        }
         if (value.kind == ValueKind::Unary && value.operands.size() == 1) {
             const auto& operand = function.values[value.operands[0].value];
             if (operand.kind == ValueKind::ConstantFloating &&
@@ -17369,7 +18032,7 @@ bool promote_native_induction_views(ManagedModule& module,
 
 void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
-              Diagnostics& diagnostics) {
+              Diagnostics& diagnostics, const data::Module* data_module) {
     inline_managed_calls(module, hir_module, options, diagnostics);
 
     // Scalar cells are a source-language ownership device, not a mandate for
@@ -17394,7 +18057,9 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             propagate_trivial_copies(function);
         }
         if (!options.tree_ccp) {
-            (void)fold_constants(function, hir_module);
+            (void)fold_constants(function, hir_module,
+                                 options.floating_environment,
+                                 subtarget.nan_encoding());
             simplify_integer_operations(function, hir_module);
         }
         if (!options.tree_dce) {
@@ -17431,15 +18096,33 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
+    std::optional<ConstantObjects> constant_objects;
+    if (options.tree_ccp && data_module) {
+        constant_objects.emplace(hir_module, *data_module, options);
+    }
     if (options.tree_ccp) {
         const auto rounds = std::max(1U, options.ccp_rounds);
         for (unsigned round = 0; round < rounds; ++round) {
             pipeline.add(
                 PassId::ConstantFolding,
                 [&](ManagedFunction& function, FunctionAnalysisManager&) {
-                    return fold_constants(function, hir_module)
-                        ? PassResult::changed_values()
-                        : PassResult::unchanged();
+                    const auto fold = [&] {
+                        return fold_constants(function, hir_module,
+                                              options.floating_environment,
+                                              subtarget.nan_encoding());
+                    };
+                    bool changed = fold();
+                    // Reads at addresses that folding made constant; the
+                    // loaded constants fold in turn.
+                    if (constant_objects &&
+                        fold_constant_object_reads(function, hir_module,
+                                                   *constant_objects,
+                                                   subtarget.target())) {
+                        (void)fold();
+                        changed = true;
+                    }
+                    return changed ? PassResult::changed_values()
+                                   : PassResult::unchanged();
                 });
         }
         pipeline.add(
@@ -17469,6 +18152,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 }
                 return changed ? PassResult::changed_cfg()
                                : PassResult::unchanged();
+            });
+    }
+    if (options.tree_ccp) {
+        pipeline.add(
+            PassId::ConditionalReplacement,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return replace_conditional_constants(function, hir_module)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
             });
     }
     if (options.if_conversion) {
@@ -17505,9 +18197,19 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     if (options.tree_fre) {
         pipeline.add(
             PassId::RedundantExpressionElimination,
-            [](ManagedFunction& function, FunctionAnalysisManager&) {
-                eliminate_fully_redundant_expressions(function);
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_fully_redundant_expressions(
+                    function, hir_module, subtarget,
+                    options.floating_environment);
                 return PassResult::changed_values();
+            });
+        pipeline.add(
+            PassId::MemoryValueForwarding,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return forward_memory_values(function, hir_module,
+                                             subtarget.target())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
             });
     }
     if (options.ivopts) {
@@ -17611,8 +18313,11 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
         pipeline.add(
             PassId::DivisionByConstant,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                const bool floating =
+                    reduce_floating_divisions(function, hir_module);
                 return reduce_constant_divisions(function, hir_module,
-                                                 subtarget, options)
+                                                 subtarget, options) ||
+                               floating
                     ? PassResult::changed_values()
                     : PassResult::unchanged();
             });
@@ -17636,8 +18341,10 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     if (options.tree_fre) {
         pipeline.add(
             PassId::RedundantExpressionElimination,
-            [](ManagedFunction& function, FunctionAnalysisManager&) {
-                eliminate_fully_redundant_expressions(function);
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_fully_redundant_expressions(
+                    function, hir_module, subtarget,
+                    options.floating_environment);
                 return PassResult::changed_values();
             });
     }

@@ -98,6 +98,9 @@ global u32 signaling_nan = 0x7fc00000u32;
 global u32 quiet_nan = 0x7fbfffffu32;
 global u64 signaling_nan64 = 0x7ff8000000012345u64;
 
+// A constant quiet NaN, whose reads fold to a constant operand.
+global const f32 constant_quiet_nan = from_bits(0x7fbfffffu32);
+
 global u32 test_entry() {
     u32 flush_and_invalid = 0x01000800u32;
     $::_ctc1(flush_and_invalid, 31);
@@ -107,6 +110,10 @@ global u32 test_entry() {
 #elif defined(SIGNALING)
     // Traps: comparing a signaling NaN is invalid.
     return $::runtime(is_zero(from_bits(signaling_nan)));
+#elif defined(CONSTANT_COMPARISON)
+    // Traps: the relational comparison of constant operands raises invalid,
+    // so it is not folded.
+    return constant_quiet_nan < 1.0f32 ? 1u32 : 0u32;
 #elif defined(FMIN_SIGNALING)
     // Traps: a signaling right operand is invalid even when the left one is
     // a quiet NaN.

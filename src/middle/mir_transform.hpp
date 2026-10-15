@@ -59,6 +59,47 @@ private:
 // parameter lists, phi inputs, and terminators.
 void compact_managed_values(ManagedFunction& function);
 
+// Removes effectful values whose uses were already replaced and reconnects
+// the effect chain around them.
+void remove_effectful_values(ManagedFunction& function,
+                             const std::unordered_set<std::uint32_t>& removed);
+
+// Replaces a non-volatile load of a location whose contents are known on
+// every path, from a dominating store or load and no intervening effect
+// that may change it, with that value.
+[[nodiscard]] bool forward_memory_values(ManagedFunction& function,
+                                         const hir::Module& hir_module,
+                                         const TargetInfo& target);
+
+// The initial bytes of the const objects defined in the compilation group
+// whose contents no store, loader, or patcher may change.
+class ConstantObjects {
+public:
+    ConstantObjects(const hir::Module& hir_module,
+                    const data::Module& data_module,
+                    const CompilerOptions& options);
+    // The `bytes` bytes at `offset` as an integer in the target byte order,
+    // unless they are unknown or hold a relocation.
+    [[nodiscard]] std::optional<UInt128> read(hir::ObjectId object,
+                                              std::int64_t offset,
+                                              unsigned bytes) const;
+
+private:
+    struct Image {
+        std::vector<unsigned char> bytes;
+        std::vector<data::Relocation> relocations;
+    };
+    ByteOrder byte_order_;
+    std::unordered_map<std::uint32_t, Image> images_;
+};
+
+// Replaces non-volatile scalar loads from constant offsets of such objects
+// with constants.
+[[nodiscard]] bool fold_constant_object_reads(ManagedFunction& function,
+                                              const hir::Module& hir_module,
+                                              const ConstantObjects& objects,
+                                              const TargetInfo& target);
+
 // Shared identity-preserving cleanup used by CFG transforms after they make
 // one or more non-addressable blocks unreachable.
 void prune_unreachable_blocks(ManagedFunction& function);

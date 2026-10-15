@@ -4,11 +4,23 @@
 // default profile, defining the masked:: operations and the test. For the
 // trapping operations MXCSR also sets FTZ, as the profile's flushing declares.
 
+union constant_bits { f32 value; u32 bits; };
+static f32 constant_f32(in u32 bits) {
+    union constant_bits cell;
+    cell.bits = bits;
+    return cell.value;
+}
+
 #if defined(TRAPPING)
 namespace trapping {
 #else
 namespace masked {
 #endif
+// Constant operands fold only where the environment traps nothing that the
+// operation raises: here a quiet NaN compared and a denormal operand.
+global const f32 quiet = constant_f32(0x7fc00000u32);
+[[noinline]] global bool constant_less() { return quiet < 1.0f32; }
+[[noinline]] global f32 constant_product() { return 1.0e-40f32 * 2.0f32; }
 [[noinline]] global bool less(in f32 a, in f32 b) { return a < b; }
 [[noinline]] global bool equal(in f32 a, in f32 b) { return a == b; }
 [[noinline]] global bool zero(in f32 a) { return !a; }
@@ -34,6 +46,8 @@ global f32 negated(in f32 a);
 global f32 magnitude(in f32 a);
 global f32 root(in f32 a);
 global void discard(in f32 a, in f32 b);
+global bool constant_less();
+global f32 constant_product();
 }
 
 [[naked, clobber("memory")]]
@@ -145,6 +159,13 @@ global u32 test_entry() {
     clear(flushing);
     value = $::runtime(trapping::root(qnan));
     if (raised() != 0u32) return 15u32;
+    clear(flushing);
+    result = $::runtime(trapping::constant_less());
+    if (raised() != invalid || result) return 16u32;
+    clear(flushing);
+    value = $::runtime(trapping::constant_product());
+    if (raised() != (denormal_operand | underflow_inexact) || bits_of(value) != 0u32)
+        return 17u32;
 
     // The default profile: the same comparisons, and gradual underflow.
     clear(gradual);
@@ -169,6 +190,9 @@ global u32 test_entry() {
     if (bits_of($::runtime(masked::minimum(qnan, x))) != one ||
         bits_of64($::runtime(masked::maximum(f64_of(quiet_nan64), 2.0))) !=
             0x4000000000000000u64) return 27u32;
+    // Masked flags are unobservable, so only the values are checked.
+    if ($::runtime(masked::constant_less()) ||
+        bits_of($::runtime(masked::constant_product())) != 0x00022d84u32) return 28u32;
     clear(gradual);
     return 0u32;
 }

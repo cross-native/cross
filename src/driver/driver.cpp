@@ -1148,7 +1148,8 @@ int cc_main(int argc, char** argv) {
         hir_module, *subtarget, options, diagnostics);
     if (diagnostics.errors() != 0) return 1;
     mir::optimize(
-        managed_mir, hir_module, *subtarget, options, diagnostics);
+        managed_mir, hir_module, *subtarget, options, diagnostics,
+        &data_module);
     if (!mir::verify(managed_mir, hir_module, diagnostics)) return 1;
     if (options.verbose) {
         std::cerr << "cc: validating target ABI plans and managed legality\n";

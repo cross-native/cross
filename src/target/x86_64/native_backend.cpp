@@ -324,6 +324,15 @@ machine::IntegerMode mode_for(const hir::Module& module, hir::TypeId id) {
     return {static_cast<std::uint16_t>(type_bits(module, id))};
 }
 
+// The displacement of a scalar pointer access, after its register operands.
+std::int64_t pointer_displacement(const machine::Instruction& value,
+                                  std::size_t registers) {
+    if (value.operands.size() <= registers) return 0;
+    const auto* immediate =
+        std::get_if<machine::ImmediateOperand>(&value.operands[registers]);
+    return immediate ? static_cast<std::int64_t>(immediate->value) : 0;
+}
+
 unsigned mode_bytes(machine::IntegerMode mode) {
     if (mode.bits == 80) return 16;
     return static_cast<unsigned>((mode.bits + 7U) / 8U);
@@ -4843,8 +4852,79 @@ private:
         }
     }
 
+    // A scalar pointer access through `base + constant * scale` addresses
+    // `displacement(base)` instead, wherever the address is defined and
+    // however many uses it has; the index is never materialized.
+    void fold_constant_index_addresses() {
+        std::unordered_map<std::uint32_t, std::int64_t> constants;
+        std::unordered_map<std::uint32_t, const machine::Instruction*> addresses;
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.defs.size() != 1 ||
+                    instruction.defs.front().kind != machine::RegisterKind::Virtual) {
+                    continue;
+                }
+                const auto id = instruction.defs.front().id;
+                if (instruction.opcode == Opcode::Constant &&
+                    instruction.defs.front().mode.bits == 64 &&
+                    !instruction.operands.empty()) {
+                    if (const auto* immediate = std::get_if<machine::ImmediateOperand>(
+                            &instruction.operands.front())) {
+                        constants[id] = static_cast<std::int64_t>(immediate->value);
+                    }
+                } else if (instruction.opcode == Opcode::IndexedAddress &&
+                           instruction.uses.size() == 2 &&
+                           instruction.operands.size() == 3 &&
+                           !instruction.patch && !instruction.has_side_effects) {
+                    addresses[id] = &instruction;
+                }
+            }
+        }
+        for (auto& block : current_.blocks) {
+            for (auto& consumer : block.instructions) {
+                const bool load = consumer.opcode == Opcode::PointerLoad ||
+                                  consumer.opcode == Opcode::FpointerLoad;
+                const bool store = consumer.opcode == Opcode::PointerStore ||
+                                   consumer.opcode == Opcode::FpointerStore;
+                if ((!load && !store) || consumer.patch ||
+                    consumer.operands.size() != (load ? 1U : 2U) ||
+                    consumer.uses.empty() ||
+                    consumer.uses.front().kind != machine::RegisterKind::Virtual) {
+                    continue;
+                }
+                const auto address = addresses.find(consumer.uses.front().id);
+                if (address == addresses.end()) continue;
+                const auto& definition = *address->second;
+                const auto index = definition.uses[1];
+                const auto constant = index.kind == machine::RegisterKind::Virtual
+                    ? constants.find(index.id) : constants.end();
+                const auto* scale = std::get_if<machine::ImmediateOperand>(
+                    &definition.operands[2]);
+                if (constant == constants.end() || !scale ||
+                    scale->value > static_cast<std::uint64_t>(
+                                       std::numeric_limits<std::int32_t>::max())) {
+                    continue;
+                }
+                const auto displacement =
+                    static_cast<__int128>(constant->second) *
+                    static_cast<__int128>(scale->value);
+                if (displacement < std::numeric_limits<std::int32_t>::min() ||
+                    displacement > std::numeric_limits<std::int32_t>::max()) {
+                    continue;
+                }
+                const auto base = definition.uses[0];
+                consumer.uses.front() = base;
+                consumer.operands.front() = definition.operands.front();
+                consumer.operands.push_back(machine::ImmediateOperand{
+                    static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement)),
+                    0, machine::i64, true});
+            }
+        }
+    }
+
     void fold_indexed_memory_addresses() {
         if (!options_.combine_addresses) return;
+        fold_constant_index_addresses();
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -4877,23 +4957,37 @@ private:
             }
             return machine::TargetOpcodeId{};
         };
-        for (auto& block : current_.blocks) {
-            std::unordered_map<std::uint32_t, std::size_t> addresses;
-            std::unordered_map<std::uint32_t, std::size_t> definitions;
+        // An address folds into every memory access that uses it, in any
+        // block: its base and index are available wherever it is. One used
+        // only by the access is removed here, others by dead-value cleanup.
+        struct IndexedAddress {
+            machine::BlockId block;
+            std::size_t index{};
+            machine::Instruction instruction;
+        };
+        std::unordered_map<std::uint32_t, IndexedAddress> addresses;
+        for (const auto& block : current_.blocks) {
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
                 const auto& instruction = block.instructions[index];
-                for (const auto& definition : instruction.defs) {
-                    if (definition.kind ==
-                        machine::RegisterKind::Virtual) {
-                        definitions[definition.id] = index;
-                    }
-                }
                 if (instruction.opcode == Opcode::IndexedAddress &&
                     instruction.defs.size() == 1 &&
                     instruction.defs.front().kind ==
                         machine::RegisterKind::Virtual) {
-                    addresses[instruction.defs.front().id] = index;
+                    addresses.emplace(instruction.defs.front().id,
+                                      IndexedAddress{block.id, index, instruction});
+                }
+            }
+        }
+        for (auto& block : current_.blocks) {
+            std::unordered_map<std::uint32_t, std::size_t> definitions;
+            for (std::size_t index = 0;
+                 index < block.instructions.size(); ++index) {
+                for (const auto& definition : block.instructions[index].defs) {
+                    if (definition.kind ==
+                        machine::RegisterKind::Virtual) {
+                        definitions[definition.id] = index;
+                    }
                 }
             }
             std::unordered_set<std::size_t> removed;
@@ -4906,6 +5000,7 @@ private:
                     consumer.opcode == Opcode::FpointerStore ||
                     consumer.opcode == Opcode::VpointerStore;
                 if (opcode.empty() || consumer.uses.empty() ||
+                    consumer.operands.size() != (store ? 2U : 1U) ||
                     (!store && consumer.defs.size() != 1) ||
                     (store && (!consumer.defs.empty() ||
                                consumer.uses.size() != 2)) ||
@@ -4915,11 +5010,8 @@ private:
                 }
                 const auto address_id = consumer.uses.front().id;
                 const auto found = addresses.find(address_id);
-                if (found == addresses.end() || found->second >= index ||
-                    uses[address_id] != 1) {
-                    continue;
-                }
-                const auto& address = block.instructions[found->second];
+                if (found == addresses.end()) continue;
+                const auto& address = found->second.instruction;
                 if (address.uses.size() != 2 ||
                     address.operands.size() != 3 || address.patch ||
                     address.has_side_effects) {
@@ -4963,7 +5055,9 @@ private:
                     consumer.operands.assign(address.operands.begin(),
                                              address.operands.begin() + 2);
                 }
-                removed.insert(found->second);
+                if (uses[address_id] == 1 && found->second.block == block.id) {
+                    removed.insert(found->second.index);
+                }
             }
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
@@ -12078,6 +12172,12 @@ private:
                    machine::Register value, unsigned lane,
                    const VectorShape& shape, std::string_view target,
                    bool signed_value) {
+        // A rematerialized zero vector has no memory home.
+        if (is_rematerialized_zero_vector(function, value)) {
+            const auto name = register_name(target, 32);
+            instruction("xorl", name + ", " + name);
+            return;
+        }
         const auto source = lane_memory(function, value, lane,
                                         shape.element_bits);
         if (shape.element_bits == 8) {
@@ -12094,6 +12194,19 @@ private:
             instruction("movq", source + ", " +
                                     register_name(target, 64));
         }
+    }
+
+    // Loads a 32- or 64-bit floating lane into XMM0.
+    void load_float_lane(const machine::Function& function,
+                         machine::Register value, unsigned lane,
+                         const VectorShape& shape) {
+        if (is_rematerialized_zero_vector(function, value)) {
+            instruction("xorps", "%xmm0, %xmm0");
+            return;
+        }
+        instruction(shape.element_bits == 32 ? "movss" : "movsd",
+                    lane_memory(function, value, lane, shape.element_bits) +
+                        ", %xmm0");
     }
 
     void store_lane(const machine::Function& function,
@@ -14525,10 +14638,7 @@ private:
             (target_shape.element_bits == 32 ||
              target_shape.element_bits == 64)) {
             for (unsigned lane = 0; lane < source_shape.lanes; ++lane) {
-                instruction(source_shape.element_bits == 32 ? "movss" : "movsd",
-                            lane_memory(function, source, lane,
-                                        source_shape.element_bits) +
-                                ", %xmm0");
+                load_float_lane(function, source, lane, source_shape);
                 instruction(source_shape.element_bits == 32 ? "cvtss2sd"
                                                              : "cvtsd2ss",
                             "%xmm0, %xmm0");
@@ -14561,10 +14671,7 @@ private:
             (source_shape.element_bits == 32 ||
              source_shape.element_bits == 64)) {
             for (unsigned lane = 0; lane < source_shape.lanes; ++lane) {
-                instruction(source_shape.element_bits == 32 ? "movss" : "movsd",
-                            lane_memory(function, source, lane,
-                                        source_shape.element_bits) +
-                                ", %xmm0");
+                load_float_lane(function, source, lane, source_shape);
                 float_register_to_integer(
                     function, target_shape.signed_integer,
                     target_shape.element_bits, source_shape.element_bits);
@@ -20151,21 +20258,36 @@ private:
     void emit_pointer_access(const machine::Function& function,
                              const machine::Instruction& value) {
         const auto address = std::get<machine::RegisterOperand>(value.operands[0]).value;
-        if (value.opcode == Opcode::PointerLoad) {
-            load(function, address, "rax");
+        const bool load_access = value.opcode == Opcode::PointerLoad;
+        const auto displacement =
+            pointer_displacement(value, load_access ? 1U : 2U);
+        const auto at = [&](std::int64_t offset, std::string_view base) {
+            return std::to_string(displacement + offset) + "(%" +
+                   std::string(base) + ")";
+        };
+        // An address in a register is used in place, unless a wide value
+        // or the source staged in RCX needs that register.
+        const auto* assigned_address =
+            assigned_integer_register(function, address);
+        if (load_access) {
             const auto target = value.defs.front();
             if (target.mode.bits == 128) {
-                instruction("movq", "0(%rax), %rdx");
-                instruction("movq", "8(%rax), %rcx");
+                load(function, address, "rax");
+                instruction("movq", at(0, "rax") + ", %rdx");
+                instruction("movq", at(8, "rax") + ", %rcx");
                 store(function, target, "rdx", "rcx");
             } else {
+                const auto base = assigned_address
+                    ? std::string(assigned_address->storage_name)
+                    : std::string("rax");
+                if (!assigned_address) load(function, address, "rax");
                 const auto* assigned_target =
                     assigned_integer_register(function, target);
                 const auto destination = assigned_target
                     ? std::string(assigned_target->storage_name)
                     : std::string("rax");
                 instruction("mov" + std::string(1, suffix(target.mode.bits)),
-                            "0(%rax), " +
+                            at(0, base) + ", " +
                                 register_name(destination, target.mode.bits));
                 store(function, target, destination);
             }
@@ -20176,15 +20298,19 @@ private:
             assigned_integer_register(function, source);
         // Calls define scalar integer results in RAX. Preserve such a value
         // while materializing the independent pointer operand for the store.
-        const std::string address_register =
-            assigned_source && assigned_source->storage_name == "rax"
+        const bool in_place = assigned_address && source.mode.bits != 128 &&
+                              (assigned_source ||
+                               assigned_address->storage_name != "rcx");
+        const std::string address_register = in_place
+            ? std::string(assigned_address->storage_name)
+            : assigned_source && assigned_source->storage_name == "rax"
                 ? "r10"
                 : "rax";
-        load(function, address, address_register);
+        if (!in_place) load(function, address, address_register);
         if (source.mode.bits == 128) {
             load(function, source, "rdx", "rcx");
-            instruction("movq", "%rdx, 0(%" + address_register + ")");
-            instruction("movq", "%rcx, 8(%" + address_register + ")");
+            instruction("movq", "%rdx, " + at(0, address_register));
+            instruction("movq", "%rcx, " + at(8, address_register));
         } else {
             const auto source_register = assigned_source
                 ? std::string(assigned_source->storage_name)
@@ -20194,38 +20320,46 @@ private:
             }
             instruction("mov" + std::string(1, suffix(source.mode.bits)),
                         register_name(source_register, source.mode.bits) +
-                            ", 0(%" + address_register + ")");
+                            ", " + at(0, address_register));
         }
     }
 
     void emit_float_pointer_access(const machine::Function& function,
                                    const machine::Instruction& value) {
         const auto address = std::get<machine::RegisterOperand>(value.operands[0]).value;
-        load(function, address, "rax");
-        if (value.opcode == Opcode::FpointerLoad) {
+        const auto* assigned_address =
+            assigned_integer_register(function, address);
+        const auto base = assigned_address
+            ? std::string(assigned_address->storage_name)
+            : std::string("rax");
+        if (!assigned_address) load(function, address, "rax");
+        const bool load_access = value.opcode == Opcode::FpointerLoad;
+        const auto memory = std::to_string(
+            pointer_displacement(value, load_access ? 1U : 2U)) + "(%" + base + ")";
+        if (load_access) {
             const auto target = value.defs.front();
             if (target.mode.bits == 80) {
-                instruction("fldt", "0(%rax)");
+                instruction("fldt", memory);
                 store_x87(function, target);
                 return;
             }
             instruction(target.mode.bits == 128
                             ? "movdqu"
                             : target.mode.bits == 32 ? "movss" : "movsd",
-                        "0(%rax), %xmm0");
+                        memory + ", %xmm0");
             store_float(function, target, "xmm0");
         } else {
             const auto source = value.uses[1];
             if (source.mode.bits == 80) {
                 load_x87(function, source);
-                instruction("fstpt", "0(%rax)");
+                instruction("fstpt", memory);
                 return;
             }
             load_float(function, source, "xmm0");
             instruction(source.mode.bits == 128
                             ? "movdqu"
                             : source.mode.bits == 32 ? "movss" : "movsd",
-                        "%xmm0, 0(%rax)");
+                        "%xmm0, " + memory);
         }
     }
 

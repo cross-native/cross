@@ -23,10 +23,12 @@ std::string_view pass_name(PassId pass) {
     case PassId::ForwardingBlockElimination:
         return "forwarding-block-elimination";
     case PassId::TailMerging: return "tail-merging";
+    case PassId::ConditionalReplacement: return "conditional-replacement";
     case PassId::IfConversion: return "if-conversion";
     case PassId::SelectFactoring: return "select-factoring";
     case PassId::RedundantExpressionElimination:
         return "redundant-expression-elimination";
+    case PassId::MemoryValueForwarding: return "memory-value-forwarding";
     case PassId::InductionCoalescing: return "induction-coalescing";
     case PassId::UnitInductionExitSelection:
         return "unit-induction-exit-selection";
