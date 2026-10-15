@@ -2053,6 +2053,113 @@ private:
         return '(' + types_.name(object.type) + ") " + target;
     }
 
+    // An aggregate is rebuilt from its bytes by type; records are opaque
+    // byte structures here, so an address inside one has no C form.
+    std::string aggregate_value(const data::Object& object, hir::TypeId id,
+                                std::uint64_t offset) {
+        if (types_.padding(id) != 0) {
+            return "{ " + aggregate_value_unpadded(object, id, offset) +
+                   ", {0} }";
+        }
+        return aggregate_value_unpadded(object, id, offset);
+    }
+
+    std::string aggregate_value_unpadded(const data::Object& object,
+                                         hir::TypeId id,
+                                         std::uint64_t offset) {
+        const auto& type = hir_.type(id);
+        const auto size = types_.stride(id);
+        for (const auto& relocation : object.relocations) {
+            if (relocation.offset < offset ||
+                relocation.offset >= offset + size) {
+                continue;
+            }
+            if (relocation.offset == offset &&
+                type.kind == hir::Type::Kind::Pointer) {
+                data::Object scalar = object;
+                scalar.type = id;
+                scalar.address = relocation.address;
+                return address_initializer(scalar);
+            }
+            if (type.kind != hir::Type::Kind::Array) {
+                diagnostics_.error(object.location,
+                                   "GCC GIMPLE serialization cannot place an "
+                                   "address inside a record initializer");
+                return "{0}";
+            }
+        }
+        switch (type.kind) {
+        case hir::Type::Kind::Array:
+        case hir::Type::Kind::Vector: {
+            if (!type.element) break;
+            const auto stride = types_.stride(*type.element);
+            std::string result = "{";
+            for (std::uint64_t index = 0; index < type.lanes; ++index) {
+                if (index != 0) result += ", ";
+                result += aggregate_value(object, *type.element,
+                                          offset + index * stride);
+            }
+            return result + '}';
+        }
+        case hir::Type::Kind::Record: {
+            std::string result = "{{";
+            for (std::uint64_t index = 0; index < std::max<std::uint64_t>(1, size);
+                 ++index) {
+                if (index != 0) result += ", ";
+                result += std::to_string(static_cast<unsigned>(
+                    offset + index < object.bytes.size()
+                        ? object.bytes[offset + index]
+                        : 0U));
+            }
+            return result + "}}";
+        }
+        case hir::Type::Kind::Pointer:
+        case hir::Type::Kind::Builtin: {
+            const auto bytes = types_.bytes(id);
+            if (bytes > 8) {
+                diagnostics_.error(object.location,
+                                   "GCC GIMPLE serialization does not yet "
+                                   "encode 128-bit or f80 members of an "
+                                   "aggregate static initializer");
+                return "0";
+            }
+            std::uint64_t bits = 0;
+            for (unsigned index = 0; index < bytes; ++index) {
+                const auto position =
+                    data_.byte_order == ByteOrder::Little
+                        ? offset + index
+                        : offset + bytes - 1 - index;
+                const auto byte = position < object.bytes.size()
+                                      ? object.bytes[position]
+                                      : 0U;
+                bits |= static_cast<std::uint64_t>(byte) << (8 * index);
+            }
+            if (types_.is_floating(id)) {
+                std::ostringstream out;
+                out << std::hexfloat;
+                if (bytes == 4) {
+                    const auto value =
+                        std::bit_cast<float>(static_cast<std::uint32_t>(bits));
+                    if (!std::isfinite(value)) break;
+                    out << value << 'f';
+                } else {
+                    const auto value = std::bit_cast<double>(bits);
+                    if (!std::isfinite(value)) break;
+                    out << value;
+                }
+                return out.str();
+            }
+            return '(' + types_.name(id) + ") " + std::to_string(bits) +
+                   (bits > 0x7fffffffffffffffULL ? "ULL" : "");
+        }
+        case hir::Type::Kind::Function: break;
+        }
+        diagnostics_.error(object.location,
+                           "GCC GIMPLE serialization cannot encode this "
+                           "aggregate static initializer member");
+        return "0";
+    }
+
     std::string initializer(const data::Object& object) {
         switch (object.initializer) {
         case data::InitializerKind::Declaration:
@@ -2082,10 +2189,7 @@ private:
             return result + '}';
         }
         case data::InitializerKind::Aggregate:
-            diagnostics_.error(
-                object.location,
-                "GCC GIMPLE serialization does not yet encode aggregate static initializers");
-            return "{0}";
+            return aggregate_value(object, object.type, 0);
         }
         return "{0}";
     }

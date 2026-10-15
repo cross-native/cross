@@ -2171,6 +2171,17 @@ if(BUILD_TESTING)
                         -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
             set_tests_properties(cross_gcc_gimple_vla PROPERTIES
                 LABELS "check.runtime;arch.x86_64;backend.gcc;feature.array;feature.frame;opt.O0;opt.O2")
+            add_test(NAME cross_gcc_gimple_aggregate
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DGCC=${CROSS_TEST_GCC}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_aggregate.x
+                        -DHARNESS=${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_aggregate_harness.c
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-aggregate
+                        -DEXPECTED=0
+                        -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+            set_tests_properties(cross_gcc_gimple_aggregate PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.gcc;feature.initializer;feature.records;opt.O0;opt.O2")
         endif()
     endif()
     add_test(NAME cross_namespace
