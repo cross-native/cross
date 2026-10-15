@@ -399,17 +399,15 @@ bool is_nan(Value value) {
 // and a signaling one in the legacy encoding.
 bool signaling(Value value, NanEncoding encoding) {
     return is_nan(value) &&
-           bit(value.bits, spec(value.format).precision - 2) ==
-               (encoding == NanEncoding::Legacy);
+           bit(value.bits, spec(value.format).precision - 2) == encoding.legacy;
 }
 
 Value nan(Format format, NanEncoding encoding) {
     const auto info = spec(format);
     const auto quiet = shift_left(UInt128{1}, info.precision - 2);
-    auto fraction = encoding == NanEncoding::Ieee2008
-        ? quiet : subtract(quiet, UInt128{1});
+    auto fraction = encoding.legacy ? subtract(quiet, UInt128{1}) : quiet;
     if (info.explicit_bit) fraction = bit_or(fraction, shift_left(UInt128{1}, 63));
-    return encoded(format, false, info.max_field(), fraction);
+    return encoded(format, encoding.negative_default, info.max_field(), fraction);
 }
 
 Value square_root(Value value, NanEncoding encoding, ExceptionSet* raised) {

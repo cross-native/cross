@@ -125,10 +125,11 @@ FTZ needs a profile that declares it ([models.md](models.md#profiles)). The
 relational operators compile to `comiss`, `comisd`, and `fcomip`, which raise
 the invalid-operation exception for every NaN; `==`, `!=`, and the truth value
 of a floating operand use `ucomiss`, `ucomisd`, and `fucomip`, which raise it
-only for a signaling NaN. An invalid operation evaluated at compile time
-produces a positive quiet NaN, such as 0x7fc00000 for `f32`, where SSE and the
-x87 unit produce a negative one. FTZ does not apply to `f80` and `f128`
-results, and `f128` operations raise no exceptions.
+only for a signaling NaN. An invalid operation produces a negative quiet NaN,
+as SSE and the x87 unit do: 0xffc00000 for `f32`, 0xfff8000000000000 for
+`f64`, and likewise for `f80` and `f128`; compile-time evaluation produces
+the same NaN. FTZ does not apply to `f80` and `f128` results, and `f128`
+operations raise no exceptions.
 
 The floating intrinsics use SSE for `f32` and `f64` and the x87 unit for
 `f80`; `$::fmin` and `$::fmax` are `minss`/`maxss` (`minsd`/`maxsd`) with an

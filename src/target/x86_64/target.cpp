@@ -959,7 +959,9 @@ const TargetInfo target = with_instruction_costs({
     {ByteOrder::Little, 16, 16, 16,
      BitFieldOrder::LeastSignificantFirst,
      BitFieldUnitSharing::SameStorageSize,
-     BitFieldPlacement::NextAvailableBit, CodeAddressRepresentation::Flat},
+     BitFieldPlacement::NextAvailableBit, CodeAddressRepresentation::Flat,
+     // SSE and the x87 unit produce a negative default NaN.
+     floating::NanEncoding{.negative_default = true}},
     target_registers(),
     {
         {"i8", 8, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},

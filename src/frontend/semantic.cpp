@@ -429,6 +429,7 @@ ContinuationTask<std::unique_ptr<Expr>> clone_expr_async(const Expr& source,
         copy->evaluated_address = node->evaluated_address;
         copy->object_relocations = node->object_relocations;
         copy->generic_visible_at_call = node->generic_visible_at_call;
+        copy->runtime_staged = node->runtime_staged;
         copy->instance_label = node->instance_label;
         if (node->type) copy->type = co_await clone_type_async(node->type, types, *active_values);
         if (node->deferred_generic_signature)
@@ -8675,6 +8676,11 @@ public:
     EvaluationTask<std::optional<EvalValue>> expression_async(const Expr& expression) {
         if (resource_exhausted_ || context_unavailable_) co_return std::nullopt;
         if (!step(expression.location)) co_return std::nullopt;
+        if (expression.runtime_staged) {
+            fail(expression.location,
+                 "the operand of $::runtime is invalid where a translation-time value is required");
+            co_return std::nullopt;
+        }
         switch (expression.kind) {
         case Expr::Kind::VoidValue:
             co_return EvalValue{0, builtin_type(BuiltinType::Void)};
@@ -16104,6 +16110,7 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
     if (!expression) co_return;
     const auto epoch = program.evaluation_resource_errors;
     const auto stopped = [&] { return program.evaluation_resource_errors != epoch; };
+    runtime_context = runtime_context || expression->runtime_staged;
 
     if (expression->kind == Expr::Kind::Sizeof || expression->kind == Expr::Kind::Alignof ||
         expression->kind == Expr::Kind::Offsetof ||
@@ -16183,8 +16190,9 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
     };
 
     // A runtime wrapper is a staging barrier for its complete operand. Remove
-    // the marker before HIR construction, but deliberately do not visit the
-    // enclosed expression in this pass.
+    // the marker before HIR construction, but deliberately do not fold the
+    // enclosed expression in this pass. The operand keeps the barrier, so an
+    // enclosing call, or a later evaluation of this body, cannot enter it.
     if (direct_builtin_call("$::runtime")) {
         if (expression->arguments.size() != 1) {
             diagnostics.error(expression->location,
@@ -16195,6 +16203,7 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
         // the selected path reaches it.
         if (required_context) co_return;
         expression = std::move(expression->arguments.front());
+        expression->runtime_staged = true;
         co_await rewrite_eval_expr_async(expression, caller, program, diagnostics, false,
                           false, true, call_rewrite);
         co_return;

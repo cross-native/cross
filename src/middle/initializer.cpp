@@ -44,11 +44,6 @@ bool aggregate(const hir::Module& module, hir::TypeId type) {
            kind == hir::Type::Kind::Record;
 }
 
-bool prefix(const Path& left, const Path& right) {
-    return left.size() <= right.size() &&
-           std::equal(left.begin(), left.end(), right.begin());
-}
-
 unsigned offset_alignment(unsigned natural, std::uint64_t offset) {
     if (offset == 0) return natural;
     unsigned actual = 1;
@@ -70,6 +65,7 @@ public:
           types_only_(types_only), pending_extents_(pending_extents) {}
 
     Plan run(const Expr& source, hir::TypeId type) {
+        root_ = type;
         if (source.kind != Expr::Kind::AggregateInitializer) {
             error(source.location,
                                "aggregate initializer requires a brace list");
@@ -261,16 +257,45 @@ private:
                          selected.bit_width, selected.bit_offset};
     }
 
-    bool occupied(const Path& path, SourceLocation location) {
-        if (std::any_of(paths_.begin(), paths_.end(), [&](const Path& prior) {
-                return prefix(path, prior) || prefix(prior, path);
-            })) {
-            error(location,
-                               "duplicate destination in aggregate initializer");
-            result_.valid = false;
+    // Whether each step of a destination path selects a union member.
+    std::vector<bool> union_steps(const Path& path) const {
+        std::vector<bool> result;
+        result.reserve(path.size());
+        auto type = root_;
+        for (const auto& position : path) {
+            const auto& current = module_.type(type);
+            if (current.kind == hir::Type::Kind::Array) {
+                result.push_back(false);
+                type = *current.element;
+            } else {
+                const auto& record = module_.record(*current.record);
+                result.push_back(record.is_union);
+                type = record.members[*concrete(position)].type;
+            }
+        }
+        return result;
+    }
+
+    // An entry may not initialize an object, or part of one, that an
+    // earlier entry initialized: a destination covers its subobjects, and
+    // one member of a union covers the others. Only the entries of the
+    // current list can lie inside its destination.
+    bool overlaps(const Path& path, SourceLocation location) {
+        const auto unions = union_steps(path);
+        for (auto prior = destinations_.begin() +
+                          static_cast<std::ptrdiff_t>(list_begin_);
+             prior != destinations_.end(); ++prior) {
+            const auto [mine, theirs] = std::mismatch(
+                path.begin(), path.end(), prior->begin(), prior->end());
+            if (mine != path.end() && theirs != prior->end() &&
+                !unions[static_cast<std::size_t>(mine - path.begin())]) {
+                continue;
+            }
+            error(location, path == *prior
+                ? "duplicate destination in aggregate initializer"
+                : "aggregate initializer entry overlaps the destination of an earlier entry");
             return true;
         }
-        paths_.push_back(path);
         return false;
     }
 
@@ -326,12 +351,19 @@ private:
                                       entry.designators[index]);
             }
             if (!selection) continue;
+            if (overlaps(selection->path, entry.location)) continue;
             if (entry.value->kind == Expr::Kind::AggregateInitializer) {
+                // The nested list initializes its whole destination, so its
+                // own entries need only be distinct from each other.
+                const auto enclosing = std::exchange(list_begin_, destinations_.size());
                 list(*entry.value, selection->type, selection->offset,
-                     std::move(selection->path));
+                     selection->path);
+                destinations_.resize(list_begin_);
+                list_begin_ = enclosing;
+                destinations_.push_back(std::move(selection->path));
                 continue;
             }
-            if (occupied(selection->path, entry.location)) continue;
+            destinations_.push_back(selection->path);
             if (types_only_ || !deferred_indices_.empty())
                 result_.type_items.emplace_back(entry.value.get(), selection->type);
             if (!selection->offset) continue;
@@ -361,7 +393,11 @@ private:
     const TargetInfo& target_;
     Diagnostics& diagnostics_;
     Plan result_;
-    std::vector<Path> paths_;
+    hir::TypeId root_;
+    // The destinations of the entries applied so far, and where those of
+    // the list being planned begin.
+    std::vector<Path> destinations_;
+    std::size_t list_begin_{};
     bool dynamic_outer_{};
     std::span<const Expr* const> deferred_indices_;
     bool types_only_{};

@@ -8619,11 +8619,16 @@ bool verify(const ManagedModule& module, const hir::Module& hir_module,
         valid = verify_function(function, hir_module, diagnostics) && valid;
         for (const auto& value : function.values) {
             if (value.kind != ValueKind::PatchValue) continue;
-            const auto [owner, first_use] = patch_owners.emplace(value.patch_id, function.source);
-            if (!first_use && owner->second != function.source) {
-                diagnostics.error(value.location,
-                    "invalid managed MIR: patch identity has multiple function owners");
-                valid = false;
+            // A function's own expression owns its identity; the copies
+            // that required inlining makes wait for check_patch_owners.
+            if (!value.inline_site) {
+                const auto [owner, first_use] =
+                    patch_owners.emplace(value.patch_id, function.source);
+                if (!first_use && owner->second != function.source) {
+                    diagnostics.error(value.location,
+                        "invalid managed MIR: patch identity has multiple function owners");
+                    valid = false;
+                }
             }
             if (!value.patch_sink) continue;
             const auto sink = std::pair{
@@ -8720,11 +8725,13 @@ bool allocates_dynamic_stack(const ManagedFunction& function) {
 // Why no call to the function can be inlined, if anything prevents it. Direct
 // labels are inlined as ordinary blocks; a taken or exported label address
 // needs the canonical body, and a patch identity keeps its single cell by
-// suppressing inlining.
+// suppressing optional inlining. Required inlining copies a patch, which the
+// frontend keeps sinkless there; check_patch_owners diagnoses an identity
+// that more than one emitted function keeps.
 std::optional<std::string> inline_blocker(const ManagedFunction& function,
                                           const hir::Function& entity,
                                           const hir::Module& hir_module,
-                                          bool naked_caller) {
+                                          bool naked_caller, bool mandatory) {
     if (entity.variadic) return "the callee is variadic";
     if (entity.naked) return "the callee is naked";
     for (const auto& parameter : entity.parameters) {
@@ -8751,7 +8758,7 @@ std::optional<std::string> inline_blocker(const ManagedFunction& function,
     for (const auto& value : function.values) {
         if (value.kind == ValueKind::LabelAddress)
             return "the callee takes a label address";
-        if (value.kind == ValueKind::PatchValue)
+        if (value.kind == ValueKind::PatchValue && !mandatory)
             return "the callee contains a $::patch expression";
         if (value.must_tail) return "the callee contains a musttail call";
     }
@@ -9295,7 +9302,7 @@ void inline_managed_calls(ManagedModule& module,
                                          "the call is a musttail call")
                     : recursive(frame_of[call_id.value], *call.callee)
                         ? std::optional<std::string>("the call is recursive")
-                        : inline_blocker(*callee, entity, hir_module, naked);
+                        : inline_blocker(*callee, entity, hir_module, naked, mandatory);
                 if (blocker) {
                     if (mandatory) failures.emplace(call_id.value, std::move(*blocker));
                     ++position;
@@ -11179,7 +11186,7 @@ bool reduce_floating_divisions(ManagedFunction& function,
                     UInt128{1}, 2, false, divisor->format);
                 const auto reciprocal = floating::binary(
                     floating::Operation::Divide, one, *divisor,
-                    divisor->format, floating::NanEncoding::Ieee2008,
+                    divisor->format, floating::NanEncoding{},
                     &raised);
                 if (raised == 0 && floating::nonzero(reciprocal)) {
                     ManagedValue constant;
@@ -18862,6 +18869,40 @@ void discard_unreferenced_functions(ManagedModule& module,
             hir::BodyOwnership::Discarded;
         return true;
     });
+}
+
+bool check_patch_owners(const ManagedModule& module,
+                        const hir::Module& hir_module,
+                        Diagnostics& diagnostics) {
+    // The first copy of each identity in each function, in module order.
+    std::map<std::uint32_t, std::vector<std::pair<const ManagedFunction*, const ManagedValue*>>> copies;
+    for (const auto& function : module.functions) {
+        std::unordered_set<std::uint32_t> seen;
+        for (const auto& value : function.values) {
+            if (value.kind == ValueKind::PatchValue && seen.insert(value.patch_id).second)
+                copies[value.patch_id].emplace_back(&function, &value);
+        }
+    }
+    bool valid = true;
+    for (const auto& [identity, owners] : copies) {
+        if (owners.size() < 2) continue;
+        diagnostics.error(owners.front().second->location,
+            "required inlining emits this $::patch in more than one function; "
+            "a sinkless patch must have exactly one emitted identity");
+        for (const auto& [function, value] : owners) {
+            if (!value->inline_site) {
+                diagnostics.note(function->location, "emitted out of line in '" +
+                    hir_module.function(function->source).source_name + "'");
+                continue;
+            }
+            // The call in the emitted function's own body.
+            auto site = function->inline_sites[value->inline_site->value];
+            while (site.parent) site = function->inline_sites[site.parent->value];
+            diagnostics.note(site.location, "inlined here");
+        }
+        valid = false;
+    }
+    return valid;
 }
 
 } // namespace cross::mir

@@ -558,7 +558,7 @@ TargetInfo make_target(ByteOrder order,
              : BitFieldOrder::LeastSignificantFirst,
          BitFieldUnitSharing::SameUnqualifiedBase,
          BitFieldPlacement::AlignedUnits, CodeAddressRepresentation::Flat,
-         floating::NanEncoding::Legacy, "nan2008"},
+         floating::NanEncoding{.legacy = true}, "nan2008"},
         target_registers(),
         {
             {"i8", 8, "mips1", PatchAddressRepresentation::FlatUptr, false, true},

@@ -51,14 +51,14 @@ endforeach()
 
 string(REGEX MATCHALL "call i64 @\"__cross_static_[0-9]+_add\"" default_add_calls "${default_ir}")
 list(LENGTH default_add_calls default_add_count)
-if(NOT default_add_count EQUAL 2)
+if(NOT default_add_count EQUAL 4)
     message(FATAL_ERROR
-        "default evaluation retained ${default_add_count} add calls, expected 2")
+        "default evaluation retained ${default_add_count} add calls, expected 4")
 endif()
 
 string(REGEX MATCHALL "call i64 @\"__cross_static_[0-9]+_add\"" disabled_add_calls "${disabled_ir}")
 list(LENGTH disabled_add_calls disabled_add_count)
-if(NOT disabled_add_count EQUAL 3)
+if(NOT disabled_add_count EQUAL 5)
     message(FATAL_ERROR
-        "-fno-eval-calls retained ${disabled_add_count} add calls, expected 3")
+        "-fno-eval-calls retained ${disabled_add_count} add calls, expected 5")
 endif()

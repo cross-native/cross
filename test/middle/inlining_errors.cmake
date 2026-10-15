@@ -37,8 +37,6 @@ expect_failure(MUTUAL "${x86}"
     "always_inline call to 'pong' could not be inlined: the call is recursive")
 expect_failure(VARIADIC "${x86}"
     "always_inline call to 'first' could not be inlined: the callee is variadic")
-expect_failure(PATCH "${x86}"
-    "always_inline call to 'patched' could not be inlined: the callee contains a $::patch expression")
 expect_failure(MUSTTAIL "${x86}"
     "always_inline call to 'forward' could not be inlined: the callee contains a musttail call")
 expect_failure(LOCATED "${x86}"

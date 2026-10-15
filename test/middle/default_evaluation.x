@@ -41,12 +41,14 @@ global u64 staged_calls_entry() {
     u64 forbidden = runtime_add(5u64, 6u64);
     u64 only = evaluated_add(7u64, 8u64);
     u64 unknown = add(runtime_seed(), 1u64);
-    return automatic + required + deferred + forbidden + only + unknown;
+    // A runtime operand keeps the call around it at runtime too.
+    u64 enclosing = add($::runtime(add(9u64, 10u64)), 1u64);
+    return automatic + required + deferred + forbidden + only + unknown + enclosing;
 }
 
 global i32 evaluation_entry() {
     return required_global == 42u64 &&
            required_short_circuit == 1 &&
            required_compound_once == 3 &&
-           staged_calls_entry() == 89u64;
+           staged_calls_entry() == 109u64;
 }

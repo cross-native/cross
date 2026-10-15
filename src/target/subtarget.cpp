@@ -97,7 +97,7 @@ std::optional<InstructionFeatureConflict> Subtarget::form_conflict(
 floating::NanEncoding Subtarget::nan_encoding() const {
     const auto& layout = target_->data_layout;
     return !layout.nan2008_feature.empty() && has_feature(layout.nan2008_feature)
-        ? floating::NanEncoding::Ieee2008 : layout.nan_encoding;
+        ? layout.nan2008_encoding : layout.nan_encoding;
 }
 
 std::optional<TargetFeatureId> Subtarget::feature_id(

@@ -2480,6 +2480,24 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/middle/data/null_pointer_errors.cmake")
     set_tests_properties(cross_null_pointer_errors PROPERTIES
         LABELS "frontend;feature.initializer;feature.pointer;arch.x86_64;diagnostics")
+    add_test(NAME cross_initializer_overlap_errors COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/initializer_overlap.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/initializer-overlap-errors
+        -P "${CMAKE_SOURCE_DIR}/test/frontend/initializer_overlap.cmake")
+    set_tests_properties(cross_initializer_overlap_errors PROPERTIES
+        LABELS "frontend;feature.initializer;feature.evaluation;arch.x86_64;arch.mips;check.compile;diagnostics")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_initializer_overlap_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/initializer_overlap.x
+            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-initializer-overlap-${level}
+            -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_initializer_overlap_${level} PROPERTIES
+            LABELS "check.runtime;frontend;backend.native;feature.initializer;feature.evaluation;arch.x86_64;opt.${level}")
+    endforeach()
     if(WIN32)
         set(null_host_abi ms_abi)
     else()
@@ -2596,6 +2614,36 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/inlining_errors.cmake")
     set_tests_properties(cross_inlining_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;middle;feature.optimization;feature.calls")
+    add_test(NAME cross_patch_inlining_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_inlining.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/patch-inlining-errors
+                -P "${CMAKE_SOURCE_DIR}/test/middle/patch_inlining.cmake")
+    set_tests_properties(cross_patch_inlining_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;middle;feature.patch;feature.optimization;opt.O0;opt.O2")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_patch_inlining_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_inlining.x
+            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-patch-inlining-${level}
+            -DENTRY=test_entry -DEXPECTED=0 -DCC_FLAGS=-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_patch_inlining_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.patch;feature.optimization;opt.${level}")
+    endforeach()
+    add_test(NAME cross_runtime_patch_inlining_mips
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/patch_inlining.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-patch-inlining-mips
+            -DEXPECTED=P
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_patch_inlining_mips PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;middle;feature.patch;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
     add_test(NAME cross_unreferenced_functions
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -3173,6 +3221,28 @@ if(BUILD_TESTING)
             -P "${floating_environment}/nan_encoding.cmake")
     set_tests_properties(cross_floating_nan_encoding PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.floating;feature.evaluation;feature.model;isa.vr4300;isa.mips32r2;opt.O2")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_floating_nan_x86_64_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DSOURCE=${floating_environment}/nan_runtime.x
+            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-nan-x86-64-${level}
+            -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${level};-DWIDE"
+            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_floating_nan_x86_64_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;frontend;feature.floating;feature.evaluation;opt.${level}")
+    endforeach()
+    add_test(NAME cross_runtime_floating_nan_mips
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${floating_environment}/nan_runtime.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-nan-mips
+            -DEXPECTED=P -DMIPS_CPUS=vr4300
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_floating_nan_mips PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;frontend;feature.floating;feature.evaluation;isa.vr4300;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
     add_test(NAME cross_floating_environment_lowering
         COMMAND "${CMAKE_COMMAND}"
             -DCC=$<TARGET_FILE:cross_cc>
@@ -3363,6 +3433,16 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_mips.cmake")
     set_tests_properties(cross_debug_info_mips PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.debug;feature.object;feature.frame;feature.enum;endian.big;endian.little")
+    add_test(NAME cross_debug_info_noreturn
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_noreturn.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/debug-info-noreturn
+                -DHOST_TARGET=${cross_default_target}
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_noreturn.cmake")
+    set_tests_properties(cross_debug_info_noreturn PROPERTIES
+        LABELS "check.compile;check.runtime;arch.x86_64;arch.mips;backend.native;feature.debug;feature.frame;opt.O0;opt.O2")
     foreach(gdb_config
             "n64_big;mips64-unknown-elf;n64;qemu-system-mips64;MIPS64R2-generic;mips64;elf64btsmip;bare-n64.ld;start64;big"
             "n64_little;mips64el-unknown-elf;n64;qemu-system-mips64el;MIPS64R2-generic;mips64;elf64ltsmip;bare-n64.ld;start64;little"

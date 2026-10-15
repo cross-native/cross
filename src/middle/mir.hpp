@@ -377,4 +377,11 @@ void discard_unreferenced_functions(ManagedModule& module,
                                     hir::Module& hir_module,
                                     const data::Module& data_module);
 
+// Diagnoses a patch identity that more than one function of the final module
+// contains. Required inlining copies the sinkless patch of an always_inline
+// or raw_inline callee, which must leave exactly one emitted identity.
+[[nodiscard]] bool check_patch_owners(const ManagedModule& module,
+                                      const hir::Module& hir_module,
+                                      Diagnostics& diagnostics);
+
 } // namespace cross::mir

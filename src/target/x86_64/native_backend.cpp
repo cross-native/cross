@@ -27,6 +27,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -183,6 +184,30 @@ const RegisterView* canonical_storage_view(
                     view.bits == 128 && view.name.starts_with("xmm"));
         });
     return found == views.end() ? nullptr : &*found;
+}
+
+bool names_clobber_storage(const std::vector<std::string>& names,
+                           const RegisterView& candidate) {
+    return std::any_of(
+        names.begin(), names.end(), [&](const std::string& name) {
+            const auto* clobber = find_register_view(name);
+            return clobber && shares_register_storage(candidate, *clobber);
+        });
+}
+
+// Whether the boundary of `function` lets it change `candidate`: the
+// clobbers of its dynamic plan or ABI, and its own clobber list.
+bool boundary_may_clobber(const hir::Module& module,
+                          const DynamicAbiPlans& dynamic_plans,
+                          hir::FunctionId function,
+                          const RegisterView& candidate) {
+    const auto& entity = module.function(function);
+    const auto* dynamic = dynamic_plans.find(function);
+    const auto* abi = abi_model(entity.abi);
+    const bool base_clobber = dynamic
+        ? names_clobber_storage(dynamic->clobbers, candidate)
+        : abi && names_clobber_storage(abi->call_clobbers, candidate);
+    return base_clobber || names_clobber_storage(entity.clobbers, candidate);
 }
 
 const RegisterView* machine_register_view(
@@ -949,28 +974,10 @@ private:
         }
     }
 
-    static bool names_clobber_storage(
-        const std::vector<std::string>& names,
-        const RegisterView& candidate) {
-        return std::any_of(
-            names.begin(), names.end(), [&](const std::string& name) {
-                const auto* clobber = find_register_view(name);
-                return clobber &&
-                       shares_register_storage(candidate, *clobber);
-            });
-    }
-
     bool current_function_may_clobber(
         const RegisterView& candidate) const {
-        const auto& entity = hir_.function(current_.source);
-        const auto* dynamic = dynamic_plans_.find(current_.source);
-        const auto* abi = abi_model(entity.abi);
-        const bool base_clobber = dynamic
-            ? names_clobber_storage(dynamic->clobbers, candidate)
-            : abi && names_clobber_storage(
-                         abi->call_clobbers, candidate);
-        return base_clobber ||
-               names_clobber_storage(entity.clobbers, candidate);
+        return boundary_may_clobber(hir_, dynamic_plans_, current_.source,
+                                    candidate);
     }
 
     bool elide_noreturn_saves(const hir::Function& entity) const {
@@ -10414,6 +10421,34 @@ private:
                 }};
     }
 
+    // A function that never returns and skips its incoming saves loses the
+    // incoming values of the preserved registers it overwrites.
+    void describe_unsaved_registers(const machine::Function& function) {
+        if (!function.frame.elide_incoming_saves) return;
+        std::set<unsigned> lost;
+        const auto add = [&](std::uint32_t storage) {
+            const auto* view = canonical_storage_view({storage});
+            if (!view || view->storage_name == "rsp" ||
+                boundary_may_clobber(hir_, dynamic_plans_, function.source, *view))
+                return;
+            if (const auto number = dwarf_register(
+                    view->register_class == RegisterClass::simd ? view->name
+                                                                : view->storage_name))
+                lost.insert(*number);
+        };
+        for (const auto& assignment : function.virtual_register_assignments)
+            if (assignment) add(assignment->value);
+        machine::for_each_instruction(function, [&](const machine::Instruction& value) {
+            for (const auto& reg : value.defs)
+                if (reg.kind == machine::RegisterKind::Physical) add(reg.id);
+            for (const auto& reg : value.clobbers)
+                if (reg.kind == machine::RegisterKind::Physical) add(reg.id);
+        });
+        if (function.frame.has_frame_pointer && frame_pointer_save_size_ == 0)
+            add(find_register_view("rbp")->storage_id);
+        for (const auto number : lost) frame_cfi().undefined(output_, number);
+    }
+
     // A frame-program function describes each block with the entry state
     // or, once its prologue has run, the body state.
     void cfi_enter_block(const machine::Function& function, machine::BlockId id) {
@@ -11562,6 +11597,16 @@ private:
     std::string f128_scratch(const machine::Function& function,
                              std::int32_t displacement = 0) {
         return memory(f128_scratch_offset(function, displacement));
+    }
+
+    // An invalid binary128 operation produces the target's default NaN in
+    // rdx:rax, the value translation-time evaluation produces.
+    void load_f128_default_nan() {
+        const auto bits = floating::nan(floating::Format::Binary128,
+                                        subtarget_.nan_encoding()).bits;
+        if (bits.low == 0) instruction("xorq", "%rax, %rax");
+        else instruction("movabsq", "$" + std::to_string(bits.low) + ", %rax");
+        instruction("movabsq", "$" + std::to_string(bits.high) + ", %rdx");
     }
 
     std::vector<const RegisterView*> hard_register_views(
@@ -15429,8 +15474,7 @@ private:
         store(function, target, "rax", "rdx");
         instruction("jmp", done);
         output_ << invalid << ":\n";
-        instruction("xorq", "%rax, %rax");
-        instruction("movabsq", "$9223231299366420480, %rdx");
+        load_f128_default_nan();
         store(function, target, "rax", "rdx");
         output_ << done << ":\n";
     }
@@ -15586,8 +15630,7 @@ private:
         store(function, target, "rax", "rdx");
         instruction("jmp", done);
         output_ << invalid << ":\n";
-        instruction("xorq", "%rax, %rax");
-        instruction("movabsq", "$9223231299366420480, %rdx");
+        load_f128_default_nan();
         store(function, target, "rax", "rdx");
         output_ << done << ":\n";
     }
@@ -15753,8 +15796,7 @@ private:
         store(function, target, "rax", "rdx");
         instruction("jmp", done);
         output_ << invalid << ":\n";
-        instruction("xorq", "%rax, %rax");
-        instruction("movabsq", "$9223231299366420480, %rdx");
+        load_f128_default_nan();
         store(function, target, "rax", "rdx");
         output_ << done << ":\n";
     }
@@ -24471,7 +24513,10 @@ private:
         if (debug_) debug_->begin_function(function.source);
         pending_location_ = function.location;
         pending_site_.reset();
-        if (dwarf_cfi_enabled()) output_ << ".cfi_startproc\n";
+        if (dwarf_cfi_enabled()) {
+            output_ << ".cfi_startproc\n";
+            describe_unsaved_registers(function);
+        }
         const bool seh = format_ == ObjectFormat::Coff && unwind_enabled();
         if (seh) output_ << ".seh_proc " << symbol << "\n";
 
@@ -24521,13 +24566,15 @@ private:
                 }
                 frame_size_ = storage;
             } else if (function.frame.has_frame_pointer) {
-                if (frame_pointer_save_size_ != 0)
+                // A function that never returns may skip saving RBP.
+                if (frame_pointer_save_size_ != 0) {
                     instruction("pushq", "%rbp");
-                if (seh)
-                    output_ << ".seh_pushreg %rbp\n";
-                if (dwarf_cfi_enabled()) {
-                    output_ << ".cfi_def_cfa_offset 16\n"
-                               ".cfi_offset %rbp, -16\n";
+                    if (seh)
+                        output_ << ".seh_pushreg %rbp\n";
+                    if (dwarf_cfi_enabled()) {
+                        output_ << ".cfi_def_cfa_offset 16\n"
+                                   ".cfi_offset %rbp, -16\n";
+                    }
                 }
                 instruction("movq", "%rsp, %rbp");
                 if (seh && !realigned_stack_ && fixed_cfa_storage == 0) {

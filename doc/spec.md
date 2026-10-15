@@ -366,8 +366,12 @@ initialized, except that a brace initializer of a structure declared
 `exhaustive` must initialize each member other than an unnamed bit-field, by
 position or by designator; an embedded member is initialized by an entry for it
 or for a member promoted from it.
-Excess entries, duplicate designators, invalid member names, and out-of-range
-indices are errors.
+Excess entries, invalid member names, and out-of-range indices are errors, as
+is an entry that initializes an object, or part of one, that an earlier entry
+of the same initializer initialized: a repeated designator, a member of an
+object that an earlier entry initialized as a whole (a nested brace list
+initializes its whole destination) or the reverse, and a second member of one
+union.
 
 For an automatic variable-length array, the bound is evaluated once before
 initialization. The runtime bound must include every explicitly initialized
@@ -724,9 +728,10 @@ arithmetic operation, comparison, or conversion with a denormal operand traps.
 A literal denotes its rounded value; flushing applies to the results of
 arithmetic, square roots, and conversions, not to operations that copy an
 operand such as unary `-` and `$::fmin`, and whether tininess is detected
-before or after rounding is target-defined. Which NaNs are signaling and the
-NaN that an invalid operation produces are target-defined; translation-time
-evaluation uses the target's. Machine operations that change x87 precision,
+before or after rounding is target-defined. Which NaNs are signaling, the NaN
+that an invalid operation produces, and the NaN that an operation or
+conversion with a NaN operand produces are target-defined; translation-time
+evaluation uses the target's rules. Machine operations that change x87 precision,
 rounding, or control state must restore the target default before ordinary
 floating code or a managed call. Cross never inserts a hidden
 floating-environment helper.
@@ -1563,7 +1568,9 @@ branches and unevaluated operands. `$::runtime` is invalid where a
 translation-time-only context evaluates it, cannot have an opaque meta result
 even when unevaluated, and its operand cannot evaluate `$::eval` or an eval-only
 call; a well-typed occurrence in an unselected branch or unevaluated operand is
-permitted. `$::eval` may call ordinary or eval-only visible definitions but
+permitted. A `$::runtime` operand is a runtime value: a call that takes it as
+an input is not computed during translation, and an evaluation that reaches
+it fails. `$::eval` may call ordinary or eval-only visible definitions but
 fails when it reaches a runtime-only call. Staging is not an optimization
 barrier: after `$::runtime` lowers its operand, ordinary runtime constant
 folding and inlining may still transform it. The two attributes are mutually
@@ -3633,9 +3640,9 @@ and cells. Function/block inlining, cloning, tail duplication, and unrolling
 shall preserve one cell for an identity or be suppressed.
 
 A `raw_inline` or `always_inline` function shall not contain a
-sink-bearing patch expression. A sinkless patch is permitted only when the
-required inlining produces exactly one emitted identity; otherwise compilation
-is diagnosed. No facility generates per-expansion sinks. `used` or `retain`
+sink-bearing patch expression. A sinkless patch is permitted only when, after
+the required inlining, exactly one emitted function contains its identity;
+copies in that function share one cell. Otherwise compilation is diagnosed. No facility generates per-expansion sinks. `used` or `retain`
 may make a containing definition and record observable.
 
 Each `site` lvalue is written by at most one live patch expression and shall

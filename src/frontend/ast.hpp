@@ -353,6 +353,9 @@ struct Expr {
     // Semantic expansion must not turn a later/group-only definition into an
     // implicit declaration.
     bool generic_visible_at_call{};
+    // The operand of a removed `$::runtime`: translation-time evaluation
+    // rejects it, and no call inside it is entered or folded.
+    bool runtime_staged{};
     // The label named by `name<arguments>::label` in that generic instance.
     std::string instance_label;
 private:
@@ -644,7 +647,7 @@ struct EvaluationLayout {
     // The profile's floating environment and the target's NaN encoding, as
     // at runtime.
     floating::Environment floating_environment{};
-    floating::NanEncoding nan_encoding{floating::NanEncoding::Ieee2008};
+    floating::NanEncoding nan_encoding{};
 };
 
 struct EvaluationMemberLayout {

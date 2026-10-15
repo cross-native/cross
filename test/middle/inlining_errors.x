@@ -23,9 +23,6 @@ global u32 entry(in u32 value) { return ping(value); }
 #elif defined(VARIADIC)
 [[always_inline]] static u32 first(in u32 count, ...) { return count; }
 global u32 entry(in u32 value) { return first(value, 1u32, 2u32); }
-#elif defined(PATCH)
-[[always_inline]] static u32 patched() { return $::patch(7u32); }
-global u32 entry(in u32 value) { return patched() + value; }
 #elif defined(MUSTTAIL)
 [[noinline]] static u32 target(in u32 value) { return value + 1u32; }
 [[always_inline]] static u32 forward(in u32 value) {

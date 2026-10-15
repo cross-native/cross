@@ -48,8 +48,10 @@ int main() {
     const auto f64 = Format::Binary64;
     const auto f80 = Format::Extended80;
     const auto f128 = Format::Binary128;
-    const auto ieee = NanEncoding::Ieee2008;
-    const auto legacy = NanEncoding::Legacy;
+    const auto ieee = NanEncoding{};
+    const auto legacy = NanEncoding{.legacy = true};
+    // The x86 default NaN is negative.
+    const auto x86 = NanEncoding{.negative_default = true};
     const auto one = *parse("1.0", f32);
     const auto half_ulp = *parse("0x1p-24", f32);
     const auto above_half = *parse("0x1.8p-24", f32);
@@ -144,7 +146,15 @@ int main() {
         nan(f64, ieee).bits != UInt128{0x7ff8000000000000ULL} ||
         nan(f64, legacy).bits != UInt128{0x7ff7ffffffffffffULL} ||
         nan(f80, ieee).bits != UInt128{0xc000000000000000ULL, 0x7fff} ||
-        nan(f128, legacy).bits != UInt128{~0ULL, 0x7fff7fffffffffffULL}) return 60;
+        nan(f128, legacy).bits != UInt128{~0ULL, 0x7fff7fffffffffffULL} ||
+        nan(f32, x86).bits != UInt128{0xffc00000} ||
+        nan(f64, x86).bits != UInt128{0xfff8000000000000ULL} ||
+        nan(f80, x86).bits != UInt128{0xc000000000000000ULL, 0xffff} ||
+        nan(f128, x86).bits != UInt128{0, 0xffff800000000000ULL}) return 60;
+    raised = 0;
+    if (binary(Operation::Divide, zero, zero, f32, x86, &raised).bits !=
+            UInt128{0xffc00000} || raised != invalid_flag ||
+        !signaling(signaling_nan, x86) || signaling(quiet_nan, x86)) return 60;
     if (!signaling(quiet_nan, legacy) || signaling(signaling_nan, legacy) ||
         signaling(quiet_nan, ieee) || !signaling(signaling_nan, ieee) ||
         signaling(infinity, legacy) || signaling(one, legacy)) return 61;

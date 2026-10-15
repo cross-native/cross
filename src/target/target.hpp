@@ -524,9 +524,10 @@ struct TargetDataLayout {
     BitFieldPlacement bit_field_placement{BitFieldPlacement::AlignedUnits};
     CodeAddressRepresentation code_addresses{CodeAddressRepresentation::Opaque};
     // The NaN encoding, unless the resolved subtarget has `nan2008_feature`,
-    // which selects the IEEE 754-2008 encoding.
-    floating::NanEncoding nan_encoding{floating::NanEncoding::Ieee2008};
+    // which selects `nan2008_encoding`.
+    floating::NanEncoding nan_encoding{};
     std::string_view nan2008_feature{};
+    floating::NanEncoding nan2008_encoding{};
 };
 
 // Target-independent optimizations describe the value they need priced;

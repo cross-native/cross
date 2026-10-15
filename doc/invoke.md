@@ -128,6 +128,11 @@ types. `dwarf-lines` emits only the line tables, the inlined calls, and the
 call-frame information, and [models.md](models.md#debug-entries) describes
 entries of your own.
 
+From `-O1`, a function that never returns does not save the preserved
+registers it changes (`-fno-elide-noreturn-saves` keeps the saves); its
+call-frame information marks them undefined, so a debugger reports their
+values in the calling frames as not saved.
+
 Debuggers read the compile unit as C++, so qualified names work as in
 `break app::run`; generic instances and the specialized copies of a function
 carry the function's own name beside their link names. `-g` never changes the

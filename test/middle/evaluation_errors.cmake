@@ -51,3 +51,24 @@ file(READ "${OUTPUT}.unselected.s" assembly)
 if(NOT assembly MATCHES "unselected:\n[ \t]*\\.long 3\n")
     message(FATAL_ERROR "unselected initializer did not evaluate to 3\n${assembly}")
 endif()
+
+# A required evaluation that enters a body with a $::runtime operand fails
+# there, also after that body's opportunistic rewrite removed the marker.
+file(WRITE "${OUTPUT}.entered.x" [=[
+static u64 twice(in u64 value) { return value * 2u64; }
+static u64 add(in u64 left, in u64 right) { return left + right; }
+static u64 wrapper() { return add($::runtime(twice(3u64)), 1u64); }
+global u64 entry() { return wrapper(); }
+global u64 required = wrapper();
+]=])
+execute_process(
+    COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu "${OUTPUT}.entered.x"
+            -o "${OUTPUT}.entered.s"
+    RESULT_VARIABLE status
+    ERROR_VARIABLE stderr
+)
+if(status EQUAL 0 OR
+   NOT stderr MATCHES "entered\\.x:3:[0-9]+: error: [^\n]*\\$::runtime is invalid where a translation-time value is required" OR
+   NOT stderr MATCHES "entered\\.x:5:[0-9]+: note: while evaluating call to 'wrapper'")
+    message(FATAL_ERROR "required evaluation entered a $::runtime operand\n${stderr}")
+endif()

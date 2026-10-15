@@ -45,6 +45,9 @@ public:
     // Prints the directives that change `current` into `target`.
     void transition(std::ostream& output, CfiState& current,
                     const CfiState& target) const;
+    // Prints the directive that marks the incoming value of `reg` lost, as
+    // in a function that never returns and skips its incoming saves.
+    void undefined(std::ostream& output, unsigned reg) const;
 
 private:
     unsigned stack_pointer_;

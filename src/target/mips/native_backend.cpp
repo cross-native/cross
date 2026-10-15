@@ -7727,10 +7727,13 @@ private:
         machine::for_each_instruction(function, [&](const machine::Instruction& value) {
             for (const auto reg : value.defs)
                 if (reg.kind == machine::RegisterKind::Physical) add(reg.id);
+            // A callee under another ABI may change more than this one does.
+            for (const auto reg : value.clobbers)
+                if (reg.kind == machine::RegisterKind::Physical) add(reg.id);
         });
         if (function.frame.has_frame_pointer) add(30);
         std::sort(overwritten.begin(), overwritten.end());
-        for (const auto reg : overwritten) output_ << ".cfi_undefined " << reg << '\n';
+        for (const auto reg : overwritten) frame_cfi().undefined(output_, reg);
     }
 
     void emit_frame_program_instruction(const machine::Instruction& value) {
@@ -9507,7 +9510,7 @@ private:
         }
         // A frame that does not save $ra loses the incoming value here.
         if (cfi_ && function.frame.elide_incoming_saves && !return_address_lost_) {
-            output_ << ".cfi_undefined 31\n";
+            frame_cfi().undefined(output_, 31);
             return_address_lost_ = true;
         }
         if (delayed_argument) {

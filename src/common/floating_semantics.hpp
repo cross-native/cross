@@ -52,8 +52,12 @@ struct Environment {
 // significant fraction bit marks a quiet NaN, and the default NaN that an
 // invalid operation produces sets only that bit. In the legacy MIPS encoding
 // that bit marks a signaling NaN, and the default NaN sets every other
-// fraction bit.
-enum class NanEncoding { Ieee2008, Legacy };
+// fraction bit. The target also chooses the default NaN's sign: x86 FPUs
+// set it.
+struct NanEncoding {
+    bool legacy{};
+    bool negative_default{};
+};
 
 // Whether a rewrite may create floating intermediate results that the source
 // does not compute, as reassociation does: such a result can overflow,

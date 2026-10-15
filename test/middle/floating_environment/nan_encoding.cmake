@@ -3,8 +3,9 @@
 
 # Legacy MIPS FPUs such as the VR4300 produce the default NaN 0x7fbfffff and
 # treat a set most significant fraction bit as signaling; -mnan2008 and
-# x86-64 use the IEEE 754-2008 encoding. Evaluated initializers and the
-# exceptions a trapping profile reports follow the selected encoding.
+# x86-64 use the IEEE 754-2008 encoding, whose default NaN x86-64 makes
+# negative. Evaluated initializers and the exceptions a trapping profile
+# reports follow the selected encoding.
 
 foreach(required CC SOURCE MODEL OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -31,7 +32,7 @@ set(x86 -target x86_64-unknown-linux-gnu)
 # encoding, f32 default NaN, f64 default NaN
 foreach(case "vr4300|2143289343|9221120237041090559"
              "nan2008|2143289344|9221120237041090560"
-             "x86|2143289344|9221120237041090560")
+             "x86|4290772992|18444492273895866368")
     string(REPLACE "|" ";" fields "${case}")
     list(GET fields 0 encoding)
     list(GET fields 1 single)

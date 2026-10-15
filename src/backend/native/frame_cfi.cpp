@@ -89,4 +89,8 @@ void FrameCfi::transition(std::ostream& output, CfiState& current,
     current = target;
 }
 
+void FrameCfi::undefined(std::ostream& output, unsigned reg) const {
+    output << ".cfi_undefined " << spelling_(reg) << '\n';
+}
+
 } // namespace cross::native
