@@ -3758,6 +3758,9 @@ private:
                     diagnose_undefined(resource, instruction.location);
                 }
                 state.stack_depth -= instruction.form->stack_delta;
+                current_.stack_depth = std::max(
+                    current_.stack_depth,
+                    static_cast<std::uint64_t>(std::max(state.stack_depth, 0)));
                 if (state.stack_depth < 0) {
                     diagnostics_.error(instruction.location,
                                        "raw stack instruction reads above the entry stack baseline");
@@ -3943,7 +3946,9 @@ public:
         bundle_.object_definitions = module_.object_definitions;
         for (const auto& function : module_.functions) {
             emit_function(function);
-            bundle_.functions.push_back({function.source, output_.str()});
+            // The call's return address precedes the body's own stack.
+            bundle_.functions.push_back(
+                {function.source, output_.str(), {8U + function.stack_depth, false}});
             bundle_.module_assembly += bundle_.functions.back().text;
             output_.str({});
         }
@@ -4123,7 +4128,7 @@ private:
                     << "; .type 32; .endef\n";
         }
         output_ << symbol << ":\n";
-        if (debug_) debug_->begin_function();
+        if (debug_) debug_->begin_function(function.source);
         for (std::size_t layout_index = 0;
              layout_index < function.layout.size(); ++layout_index) {
             const auto id = function.layout[layout_index];

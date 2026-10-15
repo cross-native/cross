@@ -160,6 +160,7 @@ struct CompilerOptions {
     // -ffile-prefix-map settings in order; a later match takes precedence.
     std::vector<std::pair<std::string, std::string>> file_prefix_maps;
     bool zero_init_in_data{};
+    bool stack_usage{};
     bool omit_frame_pointer{};
     bool tree_ccp{};
     bool tree_bit_ccp{};

@@ -3,6 +3,8 @@
 
 #include "target/mips/native_backend.hpp"
 
+#include "backend/native/debug_info.hpp"
+#include "backend/native/frame_cfi.hpp"
 #include "backend/native/machine_pass.hpp"
 #include "backend/native/machine_transform.hpp"
 #include "common/control_flow.hpp"
@@ -2000,9 +2002,11 @@ private:
                                            options_.floating_environment)) {
                     instruction.has_side_effects = true;
                 }
+                instruction.inline_site = managed_value.inline_site;
                 target.instructions.push_back(std::move(instruction));
             }
             target.instructions.push_back(lower_terminator(block.terminator));
+            target.instructions.back().inline_site = block.terminator.inline_site;
             current_.blocks.push_back(std::move(target));
             current_.layout.push_back({block.id.value});
         }
@@ -3555,6 +3559,7 @@ private:
                     shift.kind = machine::InstructionKind::Target;
                     shift.opcode = Opcode::Shl;
                     shift.location = block.instructions[position].location;
+                    shift.inline_site = block.instructions[position].inline_site;
                     shift.operands = {
                         machine::RegisterOperand{group.index},
                         machine::ImmediateOperand{
@@ -3826,6 +3831,7 @@ private:
                     function, address_mode, value.location, "global.high");
                 auto lui = target_instruction(Opcode::GlobalHigh,
                                               value.location);
+                lui.inline_site = value.inline_site;
                 lui.operands = {low};
                 lui.defs = {high};
                 rewritten.push_back(std::move(lui));
@@ -4459,6 +4465,7 @@ private:
 
                     auto read = target_instruction(Opcode::MoveFromLo,
                                                    expanded.back().location);
+                    read.inline_site = expanded.back().inline_site;
                     read.uses.push_back(active);
                     read.defs = {result, completed};
                     expanded.push_back(std::move(read));
@@ -5689,9 +5696,11 @@ public:
                     const hir::Module& hir_module,
                     const Subtarget& subtarget,
                     const CompilerOptions& options,
-                    Diagnostics& diagnostics)
+                    Diagnostics& diagnostics,
+                    native::DebugInfo* debug = nullptr)
         : module_(module), hir_(hir_module), subtarget_(subtarget), options_(options),
           diagnostics_(diagnostics), format_(subtarget.object_format()),
+          debug_(debug && debug->active() ? debug : nullptr),
           // Assemblers read the n32/n64 and EABI register names for a 64-bit
           // address model and for an EABI object tag: $t0-$t3 denote
           // registers 12-15 and 8-11 are $a4-$a7. Numeric GPR operands read
@@ -5748,9 +5757,10 @@ public:
             const auto& entity = hir_.function(function.source);
             shared_literals_ = entity.section || !own_section(entity)
                 ? &unit_literals_[entity.unit_index] : nullptr;
+            stack_usage_ = {};
             emit_function(function);
             emit_literal_pools(function);
-            result.functions.push_back({function.source, output_.str()});
+            result.functions.push_back({function.source, output_.str(), stack_usage_});
             output_.str({});
         }
         return result;
@@ -5970,6 +5980,7 @@ private:
                          std::string_view operands = {}) {
         count_hazard_separation(opcode);
         audit_naked_write(opcode, operands);
+        if (debug_) debug_->row(output_, pending_location_, pending_site_);
         output_ << '\t' << opcode;
         if (!operands.empty()) {
             output_ << '\t';
@@ -6618,6 +6629,7 @@ private:
             fpu_transfer_delay_register_.reset();
         }
         count_hazard_separation({});
+        if (debug_) debug_->row(output_, pending_location_, pending_site_);
         output_ << "\t.word\t0x" << std::hex << std::setw(8)
                 << std::setfill('0') << word << std::dec << std::setfill(' ');
         if (!comment.empty()) output_ << "\t# " << respell_registers(comment);
@@ -7412,7 +7424,9 @@ private:
                             ? slot->size > 4 ? "sdc1" : "swc1"
                             : slot->size > 4 ? "sd" : "sw",
                         reg_name(name) + "," + save_memory(*slot->frame_offset));
-            if (cfi) {
+            // The CFA is the caller's $sp; a dynamic frame's own save of
+            // $sp is not the caller's value.
+            if (cfi && physical.value != 29) {
                 output_ << ".cfi_offset " << physical.value << ','
                         << static_cast<std::int64_t>(*slot->frame_offset) -
                                frame_size_
@@ -7435,7 +7449,7 @@ private:
                             ? slot->size > 4 ? "ldc1" : "lwc1"
                             : slot->size > 4 ? "ld" : "lw",
                         reg_name(name) + "," + save_memory(*slot->frame_offset));
-            if (cfi) output_ << ".cfi_restore " << item->value << '\n';
+            if (cfi && item->value != 29) output_ << ".cfi_restore " << item->value << '\n';
         }
     }
 
@@ -7560,7 +7574,76 @@ private:
         return register_interface(active_signature_->layout);
     }
 
-    void emit_frame_instruction(const machine::Instruction& value) {
+    // Frame programs are described in DWARF register numbers, which are the
+    // physical register numbers.
+    static native::FrameCfi frame_cfi() {
+        return {29, 0, [](machine::Register reg) { return reg.id; },
+                [](unsigned reg) { return std::to_string(reg); }};
+    }
+
+    // Prints a frame-program instruction and, unless it fills the delay slot
+    // of a transfer that leaves the function, the call-frame state after it.
+    void emit_frame_instruction(const machine::Instruction& value,
+                                bool describe = true) {
+        emit_frame_program_instruction(value);
+        if (cfi_ && describe) {
+            frame_cfi().transition(output_, cfi_state_,
+                                   frame_cfi().after(cfi_state_, *value.frame_effect));
+        }
+    }
+
+    // A frame-program function describes each block with the entry state
+    // or, once its prologue has run, the body state.
+    void cfi_enter_block(const machine::Function& function, machine::BlockId id) {
+        if (!cfi_ || !function.frame.program) return;
+        frame_cfi().transition(output_, cfi_state_,
+                               framed_[id.value] && function.frame.prologue_block != id
+                                   ? cfi_body_ : frame_cfi().entry());
+    }
+
+    // Reloads a late frame's registers before its final stack release. The
+    // CFA moves from $fp to $sp before $fp is reloaded.
+    void emit_late_frame_restores(const machine::Function& function) {
+        emit_callee_restores(function, cfi_);
+        if (function.frame.has_frame_pointer && !realignment_) {
+            instruction("move", "$sp,$fp");
+            if (cfi_) output_ << ".cfi_def_cfa_register 29\n";
+        }
+        if (saves_fp_) {
+            instruction(address_load(), "$fp," + memory(saved_fp_offset_, "sp"));
+            if (cfi_) output_ << ".cfi_restore 30\n";
+        }
+        if (saves_ra_) {
+            instruction(address_load(), "$ra," + memory(saved_ra_offset_, "sp"));
+            if (cfi_) output_ << ".cfi_restore 31\n";
+        }
+    }
+
+    // A frame that skips the saves of a function that never returns loses
+    // the incoming values of the preserved registers it overwrites.
+    void describe_unsaved_registers(const machine::Function& function) {
+        if (!function.frame.elide_incoming_saves || !active_signature_) return;
+        const auto& clobbers = active_signature_->abi->call_clobbers;
+        std::vector<std::uint32_t> overwritten;
+        const auto add = [&](std::uint32_t id) {
+            const auto name = id < fpr_physical_base ? gpr_name({id}) : fpr_name({id});
+            if (!name.empty() && id != 0 && id != 29 && id != 31 &&
+                std::find(clobbers.begin(), clobbers.end(), name) == clobbers.end() &&
+                std::find(overwritten.begin(), overwritten.end(), id) == overwritten.end())
+                overwritten.push_back(id);
+        };
+        for (const auto& assignment : function.virtual_register_assignments)
+            if (assignment) add(assignment->value);
+        machine::for_each_instruction(function, [&](const machine::Instruction& value) {
+            for (const auto reg : value.defs)
+                if (reg.kind == machine::RegisterKind::Physical) add(reg.id);
+        });
+        if (function.frame.has_frame_pointer) add(30);
+        std::sort(overwritten.begin(), overwritten.end());
+        for (const auto reg : overwritten) output_ << ".cfi_undefined " << reg << '\n';
+    }
+
+    void emit_frame_program_instruction(const machine::Instruction& value) {
         const auto& effect = *value.frame_effect;
         const auto base = reg_name(gpr_name({effect.base.id}));
         switch (decode_opcode(value.opcode)) {
@@ -7592,6 +7675,8 @@ private:
         }
     }
 
+    // Prints a frame program's epilogue up to a final stack release, which it
+    // returns to fill the delay slot of the leaving transfer.
     const machine::Instruction* emit_prepared_epilogue(const machine::Function& function) {
         const auto& code = function.frame.program->epilogue;
         const bool delayed = !code.empty() && code.back().opcode == Opcode::FrameAdjust;
@@ -7898,14 +7983,19 @@ private:
         }
     }
 
-    // A planned delay-slot instruction: one move or one target operation.
+    // A planned delay-slot instruction: one move or one target operation,
+    // with its own source position.
     void emit_delay_slot(const machine::Function& function,
                          const machine::Instruction& value) {
+        const auto location = std::exchange(pending_location_, value.location);
+        const auto site = std::exchange(pending_site_, value.inline_site);
         if (value.kind == machine::InstructionKind::Copy) {
             emit_copy(function, value);
         } else {
             emit_target(function, value);
         }
+        pending_location_ = location;
+        pending_site_ = site;
     }
 
     void emit_copy(const machine::Function& function,
@@ -9132,8 +9222,7 @@ private:
     }
 
     void emit_call(const machine::Function& function,
-                   const machine::Instruction& call, bool tail = false,
-                   bool cfi = false) {
+                   const machine::Instruction& call, bool tail = false) {
         auto signature = classify_call(call);
         if (!signature) return;
         if (signature->layout.call.arguments.size() + 1 !=
@@ -9285,23 +9374,13 @@ private:
                                    "indirect MIPS tail calls are not selected");
                 return;
             }
-            if (cfi) output_ << ".cfi_remember_state\n";
+            if (cfi_) output_ << ".cfi_remember_state\n";
+            const auto remembered = cfi_state_;
             const machine::Instruction* frame_delay = nullptr;
             if (function.frame.program) {
                 frame_delay = emit_prepared_epilogue(function);
             } else {
-                emit_callee_restores(function, cfi);
-                if (function.frame.has_frame_pointer && !realignment_) {
-                    instruction("move", "$sp,$fp");
-                }
-                if (saves_fp_) {
-                    instruction(address_load(),
-                                "$fp," + memory(saved_fp_offset_, "sp"));
-                }
-                if (saves_ra_) {
-                    instruction(address_load(),
-                                "$ra," + memory(saved_ra_offset_, "sp"));
-                }
+                emit_late_frame_restores(function);
             }
             // With far calls the callee may lie outside the 256 MB
             // region a direct jump can name.  $at is the emitter's own
@@ -9313,13 +9392,16 @@ private:
             } else {
                 instruction("j", assembly_symbol(callee_symbol->name));
             }
-            if (frame_delay) emit_frame_instruction(*frame_delay);
+            if (frame_delay) emit_frame_instruction(*frame_delay, false);
             else if (frame_size_ == 0) instruction("nop");
             else {
                 instruction(address_add_immediate(),
                             "$sp,$sp," + std::to_string(frame_size_));
             }
-            if (cfi) output_ << ".cfi_restore_state\n";
+            if (cfi_) {
+                output_ << ".cfi_restore_state\n";
+                cfi_state_ = remembered;
+            }
             return;
         }
         if (callee_register) {
@@ -9332,6 +9414,11 @@ private:
             instruction("jalr", "$at");
         } else {
             instruction("jal", assembly_symbol(callee_symbol->name));
+        }
+        // A frame that does not save $ra loses the incoming value here.
+        if (cfi_ && function.frame.elide_incoming_saves && !return_address_lost_) {
+            output_ << ".cfi_undefined 31\n";
+            return_address_lost_ = true;
         }
         if (delayed_argument) {
             emit_argument_step(function, steps.back(), call.location);
@@ -10803,6 +10890,7 @@ private:
                           const machine::Instruction* delay = nullptr,
                           std::string_view resume_after_compare = {});
     void emit_function(machine::Function& function);
+    void describe_homes(const machine::Function& function);
 
     machine::Module& module_;
     const hir::Module& hir_;
@@ -10810,12 +10898,27 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    // Null without -g.
+    native::DebugInfo* debug_{};
+    // The source position of the instructions being printed, and the
+    // innermost inlined call they come from.
+    SourceLocation pending_location_;
+    std::optional<mir::InlineSiteId> pending_site_;
+    // Whether .cfi directives describe the active function, the state they
+    // describe, and that of a frame program's body.
+    bool cfi_{};
+    native::CfiState cfi_state_;
+    native::CfiState cfi_body_;
+    // Whether .cfi_undefined has described the loss of the incoming $ra.
+    bool return_address_lost_{};
     bool numeric_gprs_{};
     bool wide_addresses_{};
     std::ostringstream output_;
     std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::optional<ActiveSignature> active_signature_;
     std::uint32_t frame_size_{};
+    // The stack the function being emitted uses.
+    mir::StackUsage stack_usage_;
     // Alignment of $fp in a realigned frame, or zero.
     std::uint32_t realignment_{};
     std::uint32_t saved_fp_offset_{};
@@ -10861,6 +10964,10 @@ private:
     std::unordered_map<std::uint32_t, UnitLiterals> unit_literals_;
     UnitLiterals* shared_literals_{};
     std::string epilogue_label_;
+    // The source position of the shared epilogue: that of the last return
+    // through it.
+    SourceLocation epilogue_location_;
+    std::optional<mir::InlineSiteId> epilogue_site_;
     std::unordered_map<std::uint32_t, SuccessorDelayEntry>
         edge_delay_entries_;
     std::unordered_map<std::uint32_t, SuccessorDelayEntry>
@@ -13033,6 +13140,8 @@ void AssemblyEmitter::emit_successor_delay_branch(
             instruction("b", planned->second.resume_label);
             const auto& candidate =
                 block->instructions[planned->second.instruction];
+            const auto location = std::exchange(pending_location_, candidate.location);
+            const auto site = std::exchange(pending_site_, candidate.inline_site);
             if (planned->second.fused_compare) {
                 if (!emit_fused_order_compare(function, candidate)) {
                     instruction("nop");
@@ -13040,6 +13149,8 @@ void AssemblyEmitter::emit_successor_delay_branch(
             } else {
                 emit_target(function, candidate);
             }
+            pending_location_ = location;
+            pending_site_ = site;
             return;
         }
     }
@@ -13590,6 +13701,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         if (!finalize_frame(function)) return;
     }
     framed_ = machine::framed_blocks(function);
+    stack_usage_ = {frame_size_, has_dynamic_stack(function)};
     function_location_ = function.location;
     const bool shared_epilogue =
         frame_size_ != 0 && needs_shared_epilogue(function);
@@ -13674,10 +13786,26 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             << ',' << frame_size_ << ','
             << respell_registers("$ra") << '\n';
     // A naked function has no unwind description.
-    const bool cfi = (options_.unwind_tables ||
-                      options_.asynchronous_unwind_tables) &&
-                     assembly_uses_dwarf_cfi(format_) && !entity.naked;
-    if (cfi) output_ << ".cfi_startproc\n";
+    cfi_ = (options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            (debug_ && debug_->frames())) &&
+           assembly_uses_dwarf_cfi(format_) && !entity.naked;
+    const bool cfi = cfi_;
+    cfi_state_ = frame_cfi().entry();
+    cfi_body_ = cfi_state_;
+    if (function.frame.program) {
+        for (const auto& instruction : function.frame.program->prologue)
+            cfi_body_ = frame_cfi().after(cfi_body_, *instruction.frame_effect);
+    }
+    return_address_lost_ = false;
+    if (debug_) debug_->begin_function(function.source);
+    pending_location_ = function.location;
+    pending_site_.reset();
+    epilogue_location_ = function.location;
+    epilogue_site_.reset();
+    if (cfi) {
+        output_ << ".cfi_startproc\n";
+        describe_unsaved_registers(function);
+    }
     if (function.frame.program) {
         if (!function.frame.prologue_block) {
             for (const auto& instruction : function.frame.program->prologue) {
@@ -13720,6 +13848,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             if (cfi) output_ << ".cfi_def_cfa_register 30\n";
         }
         emit_callee_saves(function, cfi);
+    } else if (function.frame.has_frame_pointer) {
+        // A function that never returns and keeps nothing in a frame still
+        // anchors the CFA in $fp before it allocates on the stack.
+        instruction("move", "$fp,$sp");
+        if (cfi) output_ << ".cfi_def_cfa_register 30\n";
     }
     // Entry homes run before a shrink-wrapped prologue.
     frame_active_ = !function.frame.prologue_block;
@@ -13727,6 +13860,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         emit_parameter_homes(function);
         emit_variadic_prologue(function);
     }
+    if (debug_) debug_->end_prologue();
     epilogue_label_ = label_prefix(function) + ".return";
     plan_cross_block_delays(function);
     plan_successor_delay_slots(function);
@@ -13755,7 +13889,12 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             }
         }
         frame_active_ = framed_[found->id.value];
+        cfi_enter_block(function, found->id);
         if (function.frame.prologue_block == found->id) {
+            if (!found->instructions.empty()) {
+                pending_location_ = found->instructions.front().location;
+                pending_site_ = found->instructions.front().inline_site;
+            }
             for (const auto& instruction : function.frame.program->prologue) {
                 emit_frame_instruction(instruction);
             }
@@ -13771,6 +13910,13 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 continue;
             }
             const auto& value = found->instructions[index];
+            pending_location_ = value.location;
+            pending_site_ = value.inline_site;
+            if (value.kind == machine::InstructionKind::Return &&
+                !direct_return()) {
+                epilogue_location_ = value.location;
+                epilogue_site_ = value.inline_site;
+            }
             if (value.kind == machine::InstructionKind::Target) {
                 const auto successor_delay =
                     successor_delay_entries_.find(found->id.value);
@@ -13821,7 +13967,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 if (index + 1 < found->instructions.size() &&
                     can_emit_tail_call(function, value,
                                        found->instructions[index + 1])) {
-                    emit_call(function, value, true, cfi);
+                    emit_call(function, value, true);
                     ++index;
                 } else if (value.must_tail) {
                     diagnostics_.error(
@@ -13870,33 +14016,68 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     frame_active_ = true;
     if (shared_epilogue) {
         output_ << epilogue_label_ << ":\n";
+        pending_location_ = epilogue_location_;
+        pending_site_ = epilogue_site_;
         if (function.frame.program) {
+            if (cfi) frame_cfi().transition(output_, cfi_state_, cfi_body_);
             const auto* delay = emit_prepared_epilogue(function);
             instruction("jr", "$ra");
-            if (delay) emit_frame_instruction(*delay);
+            if (delay) emit_frame_instruction(*delay, false);
             else instruction("nop");
         } else {
-            emit_callee_restores(function, cfi);
-            if (function.frame.has_frame_pointer && !realignment_) {
-                instruction("move", "$sp,$fp");
-            }
-            if (saves_fp_) {
-                instruction(address_load(),
-                            "$fp," + memory(saved_fp_offset_, "sp"));
-            }
-            if (saves_ra_) {
-                instruction(address_load(),
-                            "$ra," + memory(saved_ra_offset_, "sp"));
-            }
+            emit_late_frame_restores(function);
             instruction("jr", "$ra");
             instruction(address_add_immediate(),
                         "$sp,$sp," + std::to_string(frame_size_));
         }
     }
     if (cfi) output_ << ".cfi_endproc\n";
+    if (debug_) {
+        describe_homes(function);
+        output_ << debug_->end_function(function.source, symbol, cfi) << ":\n";
+    }
     output_ << ".end " << symbol << "\n.size " << symbol << ",.-"
             << symbol << "\n.set reorder\n.set pop\n";
     active_signature_.reset();
+}
+
+// Reports the frame homes that hold variables in all of the body: the
+// slots of MIR objects and the spill homes of unassigned parameter values.
+// With exact call-frame information they are given from the CFA, so they
+// also hold around a shrink-wrapped frame.
+void AssemblyEmitter::describe_homes(const machine::Function& function) {
+    if (!debug_->variables() || hir_.function(function.source).naked) return;
+    const unsigned base = frame_pointer_active_ ? 30 : 29;
+    // A realigned $fp has no fixed distance from the CFA.
+    if (cfi_ && !realignment_) debug_->frame_base(base, frame_size_);
+    else if (function.frame.prologue_block) return;
+    for (std::uint32_t index = 0; index < function.stack_slots.size(); ++index) {
+        const auto& slot = function.stack_slots[index];
+        if (slot.kind == machine::StackSlotKind::Local && !slot.elided &&
+            slot.frame_offset)
+            debug_->slot_home(index, slot.name, base, *slot.frame_offset);
+    }
+    const auto entry = std::find_if(
+        function.blocks.begin(), function.blocks.end(),
+        [&](const machine::Block& block) { return block.id == function.entry; });
+    if (entry == function.blocks.end()) return;
+    for (const auto& instruction : entry->instructions) {
+        if (instruction.kind != machine::InstructionKind::Target ||
+            (instruction.opcode != Opcode::Parameter &&
+             instruction.opcode != Opcode::Fparameter) ||
+            instruction.defs.empty() || instruction.operands.empty())
+            continue;
+        const auto value = instruction.defs.front();
+        if (value.kind != machine::RegisterKind::Virtual ||
+            (value.id < function.virtual_register_assignments.size() &&
+             function.virtual_register_assignments[value.id]))
+            continue;
+        const auto* home = spill_slot(function, value);
+        if (!home || home->elided || !home->frame_offset) continue;
+        debug_->parameter_home(
+            std::get<machine::ImmediateOperand>(instruction.operands.front()).value,
+            base, *home->frame_offset);
+    }
 }
 
 } // namespace
@@ -13915,10 +14096,11 @@ machine::Module lower_managed_machine(
 mir::ManagedAssembly emit_managed_machine_assembly(
     machine::Module& module, const mir::ManagedModule& managed,
     const hir::Module& hir_module, const Subtarget& subtarget,
-    const CompilerOptions& options, Diagnostics& diagnostics) {
+    const CompilerOptions& options, Diagnostics& diagnostics,
+    native::DebugInfo* debug) {
     (void)managed;
     return AssemblyEmitter(module, hir_module, subtarget, options,
-                           diagnostics).run();
+                           diagnostics, debug).run();
 }
 
 ElfAbiTag elf_abi_tag(const AbiEntry& abi) {

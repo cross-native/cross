@@ -625,6 +625,16 @@ public:
         return emit_managed_machine_assembly(machine_module, managed_module, hir_module,
                                              subtarget, options, diagnostics);
     }
+
+    mir::ManagedAssembly emit_machine_assembly_with_debug(
+        machine::Module& machine_module,
+        const mir::ManagedModule& managed_module,
+        const hir::Module& hir_module, const Subtarget& subtarget,
+        const CompilerOptions& options, native::DebugInfo& debug,
+        Diagnostics& diagnostics) const override {
+        return emit_managed_machine_assembly(machine_module, managed_module, hir_module,
+                                             subtarget, options, diagnostics, &debug);
+    }
 };
 
 } // namespace

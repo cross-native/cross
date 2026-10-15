@@ -8844,6 +8844,17 @@ std::vector<BlockId> inline_call(ManagedFunction& caller, BlockId site,
     const auto call = caller.values[call_id.value];
     const auto& entry = callee.blocks[callee.entry.value];
 
+    // The call becomes an inline site of the caller, and the callee's own
+    // sites nest inside it.
+    const InlineSiteId inlined{static_cast<std::uint32_t>(caller.inline_sites.size())};
+    const auto inlined_site = [&](std::optional<InlineSiteId> origin) {
+        return origin ? InlineSiteId{inlined.value + 1 + origin->value} : inlined;
+    };
+    caller.inline_sites.push_back({callee.source, call.location, call.inline_site});
+    for (const auto& nested : callee.inline_sites)
+        caller.inline_sites.push_back(
+            {nested.callee, nested.location, inlined_site(nested.parent)});
+
     std::vector<std::optional<ValueId>> value_map(callee.values.size());
     std::vector<std::optional<SlotId>> cell_of(callee.values.size());
     for (const auto parameter : callee.parameters) {
@@ -8889,6 +8900,7 @@ std::vector<BlockId> inline_call(ManagedFunction& caller, BlockId site,
     const auto append = [&](ManagedValue value) {
         value.id = {static_cast<std::uint32_t>(caller.values.size())};
         value.location = call.location;
+        value.inline_site = call.inline_site;
         caller.values.push_back(std::move(value));
         return caller.values.back().id;
     };
@@ -8965,6 +8977,7 @@ std::vector<BlockId> inline_call(ManagedFunction& caller, BlockId site,
         const auto& source = callee.values[id.value];
         auto clone = source;
         clone.id = *value_map[id.value];
+        clone.inline_site = inlined_site(source.inline_site);
         if (const auto cell = cell_access(source)) {
             clone.kind = source.kind == ValueKind::PointerLoad
                              ? ValueKind::Load
@@ -9013,6 +9026,7 @@ std::vector<BlockId> inline_call(ManagedFunction& caller, BlockId site,
     }
 
     const auto remap = [&](ManagedTerminator terminator) {
+        terminator.inline_site = inlined_site(terminator.inline_site);
         if (terminator.value) terminator.value = value_map[terminator.value->value];
         for (auto& successor : terminator.successors)
             successor = block_map[successor.value];
@@ -10156,6 +10170,7 @@ void factor_common_select_addends(ManagedFunction& function) {
             ManagedValue terms;
             terms.id = {static_cast<std::uint32_t>(function.values.size())};
             terms.location = selected.location;
+            terms.inline_site = selected.inline_site;
             terms.type = selected.type;
             terms.kind = ValueKind::Select;
             terms.operands = {
@@ -10580,6 +10595,7 @@ bool reduce_constant_multiplications(ManagedFunction& function,
             if (digits.size() == 1) {
                 ManagedValue amount;
                 amount.location = source.location;
+                amount.inline_site = source.inline_site;
                 amount.type = source.type;
                 amount.kind = ValueKind::ConstantInteger;
                 amount.integer = digits.front().shift;
@@ -10598,6 +10614,7 @@ bool reduce_constant_multiplications(ManagedFunction& function,
                 if (amount == 0) return variable;
                 ManagedValue amount_value;
                 amount_value.location = source.location;
+                amount_value.inline_site = source.inline_site;
                 amount_value.type = source.type;
                 amount_value.kind = ValueKind::ConstantInteger;
                 amount_value.integer = amount;
@@ -10605,6 +10622,7 @@ bool reduce_constant_multiplications(ManagedFunction& function,
 
                 ManagedValue shifted;
                 shifted.location = source.location;
+                shifted.inline_site = source.inline_site;
                 shifted.type = source.type;
                 shifted.kind = ValueKind::Binary;
                 shifted.binary = BinaryOperation::ShiftLeft;
@@ -10632,6 +10650,7 @@ bool reduce_constant_multiplications(ManagedFunction& function,
                 } else {
                     ManagedValue next;
                     next.location = source.location;
+                    next.inline_site = source.inline_site;
                     next.type = source.type;
                     next.kind = ValueKind::Binary;
                     next.binary = operation;
@@ -11135,6 +11154,7 @@ bool reduce_floating_divisions(ManagedFunction& function,
                     constant.id = ValueId{
                         static_cast<std::uint32_t>(function.values.size())};
                     constant.location = candidate.location;
+                    constant.inline_site = candidate.inline_site;
                     constant.type =
                         function.values[candidate.operands[1].value].type;
                     make_floating_constant(constant, reciprocal);
@@ -15877,6 +15897,7 @@ bool vectorize_reduction_loop(
             const auto index = vector_address_index(operands[1]);
             ManagedValue load;
             load.location = source.location;
+            load.inline_site = source.inline_site;
             load.type = vector_type_for(source.type);
             load.kind = ValueKind::IndexedLoad;
             load.is_volatile_access = false;
@@ -15956,6 +15977,7 @@ bool vectorize_reduction_loop(
             if (boundary_operation) {
                 ManagedValue compare;
                 compare.location = source.location;
+                compare.inline_site = source.inline_site;
                 compare.type = hir_module.vector_of(*mask_element, lanes);
                 compare.kind = ValueKind::Binary;
                 compare.binary = *boundary_operation;
@@ -15973,6 +15995,7 @@ bool vectorize_reduction_loop(
                 const auto append_biased = [&](ValueId operand) {
                     ManagedValue biased;
                     biased.location = source.location;
+                    biased.inline_site = source.inline_site;
                     biased.type = vector_type_for(element_type);
                     biased.kind = ValueKind::Binary;
                     biased.binary = BinaryOperation::BitXor;
@@ -15984,6 +16007,7 @@ bool vectorize_reduction_loop(
                 const auto right = append_biased(source.operands[1]);
                 ManagedValue compare;
                 compare.location = source.location;
+                compare.inline_site = source.inline_site;
                 compare.type = hir_module.vector_of(*mask_element, lanes);
                 compare.kind = ValueKind::Binary;
                 compare.binary = *signed_operation;
@@ -15996,6 +16020,7 @@ bool vectorize_reduction_loop(
         }
         ManagedValue transformed;
         transformed.location = source.location;
+        transformed.inline_site = source.inline_site;
         transformed.type = vector_type_for(source.type);
         if (source.kind == ValueKind::Binary &&
             comparison(source.binary) && !source.operands.empty()) {
@@ -16577,6 +16602,7 @@ bool vectorize_slp_group(
                 function.values[node.lanes.front().value];
             ManagedValue operation;
             operation.location = source.location;
+            operation.inline_site = source.inline_site;
             operation.type = vector_type;
             operation.kind = source.kind;
             operation.unary = source.unary;

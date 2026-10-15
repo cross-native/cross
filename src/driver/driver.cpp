@@ -11,6 +11,7 @@
 #include "backend/native/assembler.hpp"
 #include "backend/native/data_emitter.hpp"
 #include "backend/native/debug_info.hpp"
+#include "backend/native/stack_usage.hpp"
 #include "common/options.hpp"
 #include "common/relocation_addend.hpp"
 #include "common/source.hpp"
@@ -1224,6 +1225,14 @@ int cc_main(int argc, char** argv) {
         auto functions = std::move(managed.functions);
         functions.insert(functions.end(), raw_assembly.functions.begin(),
                          raw_assembly.functions.end());
+        if (options.stack_usage && diagnostics.errors() == 0) {
+            std::string error;
+            if (!write_file(std::filesystem::path(output).replace_extension(".su"),
+                            native::stack_usage_report(hir_module, options, functions),
+                            error)) {
+                diagnostics.command_error(error);
+            }
+        }
         auto assembly = std::move(managed.header) +
             native::emit_module_assembly(codegen_module, std::move(functions),
                                          *subtarget, options, diagnostics);

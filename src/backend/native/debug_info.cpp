@@ -23,6 +23,7 @@ constexpr unsigned tag_structure_type = 0x13;
 constexpr unsigned tag_subroutine_type = 0x15;
 constexpr unsigned tag_union_type = 0x17;
 constexpr unsigned tag_unspecified_parameters = 0x18;
+constexpr unsigned tag_inlined_subroutine = 0x1d;
 constexpr unsigned tag_subrange_type = 0x21;
 constexpr unsigned tag_base_type = 0x24;
 constexpr unsigned tag_const_type = 0x26;
@@ -44,7 +45,9 @@ constexpr unsigned at_high_pc = 0x12;
 constexpr unsigned at_language = 0x13;
 constexpr unsigned at_comp_dir = 0x1b;
 constexpr unsigned at_const_value = 0x1c;
+constexpr unsigned at_inline = 0x20;
 constexpr unsigned at_producer = 0x25;
+constexpr unsigned at_abstract_origin = 0x31;
 constexpr unsigned at_count = 0x37;
 constexpr unsigned at_data_member_location = 0x38;
 constexpr unsigned at_decl_file = 0x3a;
@@ -55,6 +58,9 @@ constexpr unsigned at_external = 0x3f;
 constexpr unsigned at_frame_base = 0x40;
 constexpr unsigned at_type = 0x49;
 constexpr unsigned at_ranges = 0x55;
+constexpr unsigned at_call_column = 0x57;
+constexpr unsigned at_call_file = 0x58;
+constexpr unsigned at_call_line = 0x59;
 constexpr unsigned at_data_bit_offset = 0x6b;
 constexpr unsigned at_linkage_name = 0x6e;
 constexpr unsigned at_gnu_vector = 0x2107;
@@ -62,6 +68,7 @@ constexpr unsigned at_gnu_vector = 0x2107;
 constexpr unsigned form_addr = 0x01;
 constexpr unsigned form_data2 = 0x05;
 constexpr unsigned form_data4 = 0x06;
+constexpr unsigned form_block1 = 0x0a;
 constexpr unsigned form_data1 = 0x0b;
 constexpr unsigned form_sdata = 0x0d;
 constexpr unsigned form_strp = 0x0e;
@@ -80,12 +87,15 @@ constexpr unsigned ate_unsigned = 0x07;
 constexpr unsigned ate_unsigned_char = 0x08;
 
 constexpr unsigned ut_compile = 0x01;
+constexpr unsigned inl_inlined = 0x01;
 constexpr unsigned lang_c_plus_plus_14 = 0x21;
 constexpr unsigned op_addr = 0x03;
 constexpr unsigned op_reg0 = 0x50;
 constexpr unsigned op_breg0 = 0x70;
+constexpr unsigned op_fbreg = 0x91;
 constexpr unsigned op_call_frame_cfa = 0x9c;
 constexpr unsigned rle_end_of_list = 0x00;
+constexpr unsigned rle_start_end = 0x06;
 constexpr unsigned rle_start_length = 0x07;
 } // namespace dw
 
@@ -104,9 +114,9 @@ struct Die {
     std::string label{};
 };
 
-// A generated token is described at the outermost invocation that produced
-// it, and preprocessed text at the file and line its line marker names.
-SourceLocation written(SourceLocation location) {
+} // namespace
+
+SourceLocation written_location(SourceLocation location) {
     for (unsigned depth = 0; location.valid() && depth < 64; ++depth) {
         const auto* file = location.file;
         if (const auto* expansion = file->expansion_at(location.offset);
@@ -130,6 +140,8 @@ SourceLocation written(SourceLocation location) {
     }
     return location;
 }
+
+namespace {
 
 std::string assembly_string(std::string_view text) {
     static constexpr char digits[] = "01234567";
@@ -239,18 +251,23 @@ public:
         case ObjectFormat::Coff:
             return "\t.secrel32 " + std::string(target) + '\n';
         case ObjectFormat::MachO:
-            return "\t.long " + std::string(target) + '-' + std::string(start) + '\n';
+            return "\t.4byte " + std::string(target) + '-' + std::string(start) + '\n';
         default:
-            return "\t.long " + std::string(target) + '\n';
+            return "\t.4byte " + std::string(target) + '\n';
         }
     }
 
     [[nodiscard]] std::string address(std::string_view value) const {
-        return std::string(address_bytes_ == 8 ? "\t.quad " : "\t.long ") +
+        return std::string(address_bytes_ == 8 ? "\t.8byte " : "\t.4byte ") +
                std::string(value) + '\n';
     }
 
     [[nodiscard]] unsigned address_bytes() const { return address_bytes_; }
+
+    // Whether the distance between two labels of a function is a constant:
+    // Mach-O block labels split a function into atoms, so its code bounds
+    // are addresses.
+    [[nodiscard]] bool label_distances() const { return format_ != ObjectFormat::MachO; }
 
     // The .debug_str offset of `text`.
     [[nodiscard]] std::string string(const std::string& text) {
@@ -271,7 +288,7 @@ public:
 
     // A reference to the entry labeled `target` in the unit.
     [[nodiscard]] std::string reference(std::string_view target) const {
-        return "\t.long " + std::string(target) + '-' + label("info") + '\n';
+        return "\t.4byte " + std::string(target) + '-' + label("info") + '\n';
     }
 
 private:
@@ -498,22 +515,43 @@ private:
             type.builtin == BuiltinType::I16 || type.builtin == BuiltinType::I32 ||
             type.builtin == BuiltinType::I64 || type.builtin == BuiltinType::I128 ||
             type.builtin == BuiltinType::Iptr;
+        const auto bits = static_cast<unsigned>(size(id) * 8U);
         for (const auto& enumerator : found->enumerators) {
             if (!enumerator.value) continue;
             Die item{dw::tag_enumerator, {}, {}};
             item.attributes.push_back({dw::at_name, dw::form_strp,
                                        writer_.string(enumerator.name)});
-            const auto low = enumerator.value->value.low;
-            if (is_signed) {
-                item.attributes.push_back({dw::at_const_value, dw::form_sdata,
-                                           "\t.sleb128 " +
-                                               std::to_string(static_cast<std::int64_t>(low)) + '\n'});
-            } else {
-                item.attributes.push_back({dw::at_const_value, dw::form_udata, udata(low)});
-            }
+            item.attributes.push_back(constant(enumerator.value->value, bits, is_signed));
             die.children.push_back(std::move(item));
         }
         return path;
+    }
+
+    // The DW_AT_const_value of a `bits`-wide integer: a signed or unsigned
+    // number when it fits in 64 bits, otherwise its bytes in target order.
+    Attribute constant(UInt128 value, unsigned bits, bool is_signed) const {
+        if (bits < 64) {
+            const auto mask = (std::uint64_t{1} << bits) - 1U;
+            value.low &= mask;
+            if (is_signed && ((value.low >> (bits - 1U)) & 1U) != 0) value.low |= ~mask;
+        }
+        const auto low = static_cast<std::int64_t>(value.low);
+        if (bits <= 64) value.high = is_signed && low < 0 ? ~std::uint64_t{} : 0;
+        if (is_signed && value.high == (low < 0 ? ~std::uint64_t{} : std::uint64_t{})) {
+            return {dw::at_const_value, dw::form_sdata,
+                    "\t.sleb128 " + std::to_string(low) + '\n'};
+        }
+        if (!is_signed && value.high == 0)
+            return {dw::at_const_value, dw::form_udata, udata(value.low)};
+        const bool big = target_.data_layout.byte_order == ByteOrder::Big;
+        std::string bytes = "\t.byte 16\n\t.byte ";
+        for (unsigned index = 0; index < 16; ++index) {
+            const auto byte = big ? 15U - index : index;
+            const auto limb = byte < 8 ? value.low : value.high;
+            if (index != 0) bytes += ", ";
+            bytes += std::to_string((limb >> (8U * (byte % 8U))) & 0xffU);
+        }
+        return {dw::at_const_value, dw::form_block1, bytes + '\n'};
     }
 
     std::vector<std::string> record(Die& die, hir::RecordId id) {
@@ -632,15 +670,25 @@ DebugInfo::DebugInfo(const CompilerOptions& options, const hir::Module& module,
                 ? std::string()
                 : mapped_source_path(options, options.inputs.front())) {}
 
-void DebugInfo::begin_function() {
+void DebugInfo::begin_function(hir::FunctionId function) {
     last_row_.reset();
     prologue_end_ = false;
     homes_.clear();
     parameter_homes_.clear();
+    base_.reset();
+    stem_ = hir::label_stem(module_.function(function));
+    next_label_ = 0;
+    body_ = managed_.find(function);
+    open_sites_.clear();
+    site_ranges_.assign(body_ ? body_->inline_sites.size() : 0, {});
+    parameters_.clear();
+    for (const auto& parameter : module_.function(function).parameters) {
+        if (const auto place = position(parameter.location)) parameters_.push_back(*place);
+    }
 }
 
 std::optional<DebugInfo::Position> DebugInfo::position(SourceLocation location) {
-    const auto place = written(location);
+    const auto place = written_location(location);
     if (!place.valid() || place.line == 0) return std::nullopt;
     return Position{file_number(mapped_source_path(options_, place.file->path)),
                     place.line, place.column};
@@ -654,14 +702,45 @@ unsigned DebugInfo::file_number(const std::string& path) {
     return found->second;
 }
 
-void DebugInfo::row(std::ostream& output, SourceLocation location) {
+std::string DebugInfo::place_label(std::ostream& output) {
+    auto label = (format_ == ObjectFormat::MachO ? "L" : ".L") +
+                 std::string("cross.debug.") + stem_ + '.' +
+                 std::to_string(next_label_++);
+    output << label << ":\n";
+    return label;
+}
+
+void DebugInfo::row(std::ostream& output, SourceLocation location,
+                    std::optional<mir::InlineSiteId> site) {
     if (!lines()) return;
+    // A label ends the code of the inlined calls the instruction is outside
+    // of and starts that of those it is inside of.
+    std::vector<std::uint32_t> sites;
+    for (; site && site->value < site_ranges_.size();
+         site = body_->inline_sites[site->value].parent)
+        sites.insert(sites.begin(), site->value);
+    if (sites != open_sites_) {
+        std::size_t common = 0;
+        while (common < sites.size() && common < open_sites_.size() &&
+               sites[common] == open_sites_[common])
+            ++common;
+        const auto label = place_label(output);
+        for (auto index = common; index < open_sites_.size(); ++index)
+            site_ranges_[open_sites_[index]].back().end = label;
+        for (auto index = common; index < sites.size(); ++index)
+            site_ranges_[sites[index]].push_back({label, {}});
+        open_sites_ = std::move(sites);
+    }
     const auto current = position(location);
     if (!current || current == last_row_) return;
+    // Copies of parameters into their homes stay in the prologue.
+    const bool parameter = std::find(parameters_.begin(), parameters_.end(),
+                                     *current) != parameters_.end();
     output << ".loc " << current->file << ' ' << current->line << ' '
-           << current->column << (prologue_end_ ? " prologue_end\n" : "\n");
+           << current->column
+           << (prologue_end_ && !parameter ? " prologue_end\n" : "\n");
     last_row_ = current;
-    prologue_end_ = false;
+    prologue_end_ = prologue_end_ && parameter;
     rows_ = true;
 }
 
@@ -679,10 +758,14 @@ std::string DebugInfo::end_function(hir::FunctionId function, std::string symbol
                                     bool frame) {
     auto end = (format_ == ObjectFormat::MachO ? "L" : ".L") +
                std::string("cross.debug.end.") + hir::label_stem(module_.function(function));
+    for (const auto site : open_sites_) site_ranges_[site].back().end = end;
+    open_sites_.clear();
     functions_.push_back({function, std::move(symbol), end, frame,
-                          std::move(homes_), std::move(parameter_homes_)});
+                          std::move(homes_), std::move(parameter_homes_),
+                          frame ? base_ : std::nullopt, std::move(site_ranges_)});
     homes_.clear();
     parameter_homes_.clear();
+    site_ranges_.clear();
     return end;
 }
 
@@ -698,7 +781,7 @@ std::string DebugInfo::finish(std::string assembly) {
     unit.attributes.push_back({dw::at_producer, dw::form_strp,
                                writer.string(std::string(toolchain_version()))});
     unit.attributes.push_back({dw::at_language, dw::form_data2,
-                               "\t.short " + std::to_string(dw::lang_c_plus_plus_14) + '\n'});
+                               "\t.2byte " + std::to_string(dw::lang_c_plus_plus_14) + '\n'});
     unit.attributes.push_back({dw::at_name, dw::form_strp, writer.string(unit_)});
     unit.attributes.push_back({dw::at_comp_dir, dw::form_strp, writer.string(".")});
     if (line_table) {
@@ -723,11 +806,17 @@ std::string DebugInfo::finish(std::string assembly) {
             die.attributes.push_back({dw::at_decl_line, dw::form_udata, udata(place->line)});
         }
     };
-    const auto add_location = [&](Die& die, const Home& home) {
+    // A home based on the register the CFA is a fixed distance from is
+    // described from the frame base, the CFA.
+    const auto add_location = [&](Die& die, const Function& function,
+                                  const Home& home) {
         if (home.reg >= 32) return;
         std::vector<std::uint8_t> bytes;
         if (home.in_register) {
             bytes.push_back(static_cast<std::uint8_t>(dw::op_reg0 + home.reg));
+        } else if (function.base && function.base->first == home.reg) {
+            bytes.push_back(static_cast<std::uint8_t>(dw::op_fbreg));
+            append_sleb(bytes, home.offset - function.base->second);
         } else {
             bytes.push_back(static_cast<std::uint8_t>(dw::op_breg0 + home.reg));
             append_sleb(bytes, home.offset);
@@ -738,24 +827,10 @@ std::string DebugInfo::finish(std::string assembly) {
                               const mir::ManagedSlot& slot) {
         const auto found = function.homes.find(slot.id.value);
         if (found != function.homes.end() && found->second.name == slot.name)
-            add_location(die, found->second);
+            add_location(die, function, found->second);
     };
-
-    for (const auto& function : functions_) {
-        const auto& entity = module_.function(function.source);
-        auto path = name_components(source_name(entity));
-        const auto name = path.back();
-        path.pop_back();
-        Die die{dw::tag_subprogram, {}, {}};
-        die.attributes.push_back({dw::at_low_pc, dw::form_addr,
-                                  writer.address(function.symbol)});
-        die.attributes.push_back({dw::at_high_pc, dw::form_data4,
-                                  "\t.long " + function.end_label + '-' +
-                                      function.symbol + '\n'});
-        if (function.frame) {
-            die.attributes.push_back({dw::at_frame_base, dw::form_exprloc,
-                                      expression({static_cast<std::uint8_t>(dw::op_call_frame_cfa)})});
-        }
+    const auto add_identity = [&](Die& die, const hir::Function& entity,
+                                  const std::string& name) {
         if (entity.link_symbol != name) {
             die.attributes.push_back({dw::at_linkage_name, dw::form_strp,
                                       writer.string(entity.link_symbol)});
@@ -766,11 +841,105 @@ std::string DebugInfo::finish(std::string assembly) {
         if (entity.linkage == Linkage::Global) {
             die.attributes.push_back({dw::at_external, dw::form_flag_present, {}});
         }
+    };
+    // Code bounds: one range as an address and a length, several as a list
+    // in .debug_rnglists.
+    std::vector<std::pair<std::string, std::vector<Range>>> range_lists;
+    const auto add_ranges = [&](Die& die, const std::vector<Range>& ranges) {
+        if (ranges.size() == 1) {
+            const auto& range = ranges.front();
+            die.attributes.push_back({dw::at_low_pc, dw::form_addr, writer.address(range.begin)});
+            if (writer.label_distances()) {
+                die.attributes.push_back({dw::at_high_pc, dw::form_data4,
+                                          "\t.4byte " + range.end + '-' + range.begin + '\n'});
+            } else {
+                die.attributes.push_back({dw::at_high_pc, dw::form_addr, writer.address(range.end)});
+            }
+            return;
+        }
+        auto label = writer.label("ranges." + std::to_string(range_lists.size()));
+        die.attributes.push_back({dw::at_ranges, dw::form_sec_offset,
+                                  writer.offset(label, writer.label("rnglists"))});
+        range_lists.emplace_back(std::move(label), ranges);
+    };
+    // The abstract instance of each inlined function, which its inlined
+    // copies name as their origin.
+    std::unordered_map<std::uint32_t, std::string> abstracts;
+    const auto abstract = [&](hir::FunctionId callee) {
+        if (const auto found = abstracts.find(callee.value); found != abstracts.end())
+            return found->second;
+        const auto& entity = module_.function(callee);
+        auto path = name_components(source_name(entity));
+        const auto name = path.back();
+        path.pop_back();
+        Die die{dw::tag_subprogram, {}, {},
+                writer.label("abstract." + std::to_string(callee.value))};
+        add_identity(die, entity, name);
+        die.attributes.push_back({dw::at_inline, dw::form_data1,
+                                  "\t.byte " + std::to_string(dw::inl_inlined) + '\n'});
+        for (const auto& parameter : entity.parameters) {
+            if (!entry.variables) break;
+            Die item{dw::tag_formal_parameter, {}, {}};
+            item.attributes.push_back({dw::at_name, dw::form_strp,
+                                       writer.string(parameter.name)});
+            add_declaration(item, parameter.location);
+            add_type(item, parameter.type);
+            die.children.push_back(std::move(item));
+        }
+        abstracts.emplace(callee.value, die.label);
+        auto label = die.label;
+        scopes.add(path, std::move(die));
+        return label;
+    };
+    // The inlined calls of a function whose code remains, nested as they
+    // were made.
+    const auto add_inlined = [&](Die& die, const Function& function,
+                                 const mir::ManagedFunction& body) {
+        const auto& sites = body.inline_sites;
+        std::vector<std::optional<Die>> entries(function.sites.size());
+        std::vector<std::vector<std::uint32_t>> nested(function.sites.size());
+        std::vector<std::uint32_t> outermost;
+        for (std::uint32_t index = 0; index < function.sites.size(); ++index) {
+            if (function.sites[index].empty()) continue;
+            const auto& site = sites[index];
+            Die item{dw::tag_inlined_subroutine, {}, {}};
+            item.attributes.push_back({dw::at_abstract_origin, dw::form_ref4,
+                                       writer.reference(abstract(site.callee))});
+            add_ranges(item, function.sites[index]);
+            if (const auto place = position(site.location)) {
+                item.attributes.push_back({dw::at_call_file, dw::form_udata, udata(place->file)});
+                item.attributes.push_back({dw::at_call_line, dw::form_udata, udata(place->line)});
+                item.attributes.push_back({dw::at_call_column, dw::form_udata,
+                                           udata(place->column)});
+            }
+            entries[index] = std::move(item);
+            (site.parent ? nested[site.parent->value] : outermost).push_back(index);
+        }
+        // A site's parent precedes it, so its children are complete first.
+        for (auto index = entries.size(); index-- > 0;) {
+            for (const auto child : nested[index])
+                entries[index]->children.push_back(std::move(*entries[child]));
+        }
+        for (const auto index : outermost) die.children.push_back(std::move(*entries[index]));
+    };
+
+    for (const auto& function : functions_) {
+        const auto& entity = module_.function(function.source);
+        auto path = name_components(source_name(entity));
+        const auto name = path.back();
+        path.pop_back();
+        Die die{dw::tag_subprogram, {}, {}};
+        add_ranges(die, {{function.symbol, function.end_label}});
+        if (function.frame) {
+            die.attributes.push_back({dw::at_frame_base, dw::form_exprloc,
+                                      expression({static_cast<std::uint8_t>(dw::op_call_frame_cfa)})});
+        }
+        add_identity(die, entity, name);
+        const auto* body = managed_.find(function.source);
         if (entry.variables) {
             // Parameters, then the locals with source names. A variable whose
             // slot MIR no longer accesses, or that has no home, has no
             // location.
-            const auto* body = managed_.find(function.source);
             const auto used = body ? used_slots(*body) : std::vector<bool>{};
             for (std::size_t index = 0; index < entity.parameters.size(); ++index) {
                 const auto& parameter = entity.parameters[index];
@@ -791,7 +960,7 @@ std::string DebugInfo::finish(std::string assembly) {
                 } else if (const auto found = function.parameter_homes.find(index);
                            parameter.mode == ParameterMode::In &&
                            found != function.parameter_homes.end()) {
-                    add_location(item, found->second);
+                    add_location(item, function, found->second);
                 }
                 die.children.push_back(std::move(item));
             }
@@ -809,6 +978,7 @@ std::string DebugInfo::finish(std::string assembly) {
                 die.children.push_back(std::move(item));
             }
         }
+        if (body) add_inlined(die, function, *body);
         scopes.add(path, std::move(die));
     }
 
@@ -850,8 +1020,8 @@ std::string DebugInfo::finish(std::string assembly) {
     const auto info_begin = writer.label("info.begin");
     const auto info_end = writer.label("info.end");
     sections << writer.section("debug_info") << info_start << ":\n"
-             << "\t.long " << info_end << '-' << info_begin << '\n'
-             << info_begin << ":\n\t.short 5\n\t.byte " << dw::ut_compile
+             << "\t.4byte " << info_end << '-' << info_begin << '\n'
+             << info_begin << ":\n\t.2byte 5\n\t.byte " << dw::ut_compile
              << "\n\t.byte " << writer.address_bytes() << '\n'
              << writer.offset(abbrev, abbrev) << info.str() << info_end << ":\n";
     if (!functions_.empty()) {
@@ -859,15 +1029,31 @@ std::string DebugInfo::finish(std::string assembly) {
         const auto begin = writer.label("rnglists.begin");
         const auto end = writer.label("rnglists.end");
         sections << writer.section("debug_rnglists") << start << ":\n"
-                 << "\t.long " << end << '-' << begin << '\n' << begin
-                 << ":\n\t.short 5\n\t.byte " << writer.address_bytes()
-                 << "\n\t.byte 0\n\t.long 0\n" << writer.label("ranges") << ":\n";
-        for (const auto& function : functions_) {
-            sections << "\t.byte " << dw::rle_start_length << '\n'
-                     << writer.address(function.symbol) << "\t.uleb128 "
-                     << function.end_label << '-' << function.symbol << '\n';
+                 << "\t.4byte " << end << '-' << begin << '\n' << begin
+                 << ":\n\t.2byte 5\n\t.byte " << writer.address_bytes()
+                 << "\n\t.byte 0\n\t.4byte 0\n" << writer.label("ranges") << ":\n";
+        const auto list = [&](const std::vector<Range>& ranges) {
+            for (const auto& range : ranges) {
+                if (writer.label_distances()) {
+                    sections << "\t.byte " << dw::rle_start_length << '\n'
+                             << writer.address(range.begin) << "\t.uleb128 "
+                             << range.end << '-' << range.begin << '\n';
+                } else {
+                    sections << "\t.byte " << dw::rle_start_end << '\n'
+                             << writer.address(range.begin) << writer.address(range.end);
+                }
+            }
+            sections << "\t.byte " << dw::rle_end_of_list << '\n';
+        };
+        std::vector<Range> code;
+        for (const auto& function : functions_)
+            code.push_back({function.symbol, function.end_label});
+        list(code);
+        for (const auto& [label, ranges] : range_lists) {
+            sections << label << ":\n";
+            list(ranges);
         }
-        sections << "\t.byte " << dw::rle_end_of_list << '\n' << end << ":\n";
+        sections << end << ":\n";
     }
     sections << writer.strings();
     if (line_table) {

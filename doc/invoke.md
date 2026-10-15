@@ -19,9 +19,19 @@ it joined or separate (`-oout.s`, `-o out.s`).
 | `-E` | Preprocessed Cross, also accepted by `cc` as `.i` input | `input.i` |
 | `-emit-llvm` | LLVM IR text of the compiled program, for debugging and comparison | `input.ll` |
 | `-emit-gimple`, `-emit-gimple=rtl` | GCC GIMPLE text, for comparison with GCC's back end | `input.gimple.c` |
+| `-fstack-usage` | With `-S` or `-c`, also the stack each function uses, in GCC's format | the output's name with `.su` |
 
 `-o FILE` names the output. `-c` runs `llvm-mc` from `PATH` as the assembler;
 `cc` never calls a C compiler, LLVM's code generator, or a linker.
+
+`-fstack-usage` writes one line per emitted function, in output order:
+`FILE:LINE:COLUMN:NAME`, a tab, the bytes, a tab, and `static` or `dynamic`.
+`NAME` is the link name. The bytes are the most stack the function itself
+uses below its caller's stack pointer: saved registers, locals, and outgoing
+arguments, on x86-64 also the return address (as GCC counts), but not the
+stack of its callees; a naked function counts what its own instructions
+push. `dynamic` marks a function that also allocates variable-length arrays,
+whose sizes the bytes do not include.
 
 `cc` does not link: running it without `-S`, `-c`, or `-E` is an error, and
 linker options such as `-e`, `-L`, and `-l` are rejected. Link the objects with
@@ -113,9 +123,10 @@ Options that have no meaning without a hosted runtime, such as `-fno-builtin`,
 The last of these options counts. The shipped `dwarf` entry emits DWARF 5:
 line tables, call-frame information in `.debug_frame` (not loaded; with
 `-funwind-tables` the frames are also in `.eh_frame`), and the compile unit
-with its namespaces, functions, variables, and types. `dwarf-lines` emits
-only the line tables and the call-frame information, and
-[models.md](models.md#debug-entries) describes entries of your own.
+with its namespaces, functions, the calls inlined into them, variables, and
+types. `dwarf-lines` emits only the line tables, the inlined calls, and the
+call-frame information, and [models.md](models.md#debug-entries) describes
+entries of your own.
 
 Debuggers read the compile unit as C++, so qualified names work as in
 `break app::run`; generic instances and the specialized copies of a function

@@ -612,6 +612,10 @@ std::span<const OptionDefinition> common_option_definitions() {
          OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented,
          "place zero-valued static objects with the initialized data"},
+        {"f.stack-usage", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::CodeGeneration, false,
+         OptionImplementation::Implemented,
+         "write each function's stack usage to a .su file beside the output"},
 
         // Signed wrapping and bounds instrumentation.
         {"f.wrapv", {}, OptionValueKind::Boolean, false, {}, 0, 0,
@@ -883,6 +887,7 @@ bool resolve_registered_options(
     options.generic_depth_limit = static_cast<unsigned>(
         resolved_unsigned(options, "f.generic-depth-limit", 128));
     options.zero_init_in_data = resolved_bool(options, "f.zero-init-in-data");
+    options.stack_usage = resolved_bool(options, "f.stack-usage");
     // -ffile-prefix-map is repeatable: every profile and command-line setting
     // adds a mapping. The registry value lists them for inspection.
     options.file_prefix_maps.clear();

@@ -81,6 +81,8 @@ struct RawFunction {
     BlockId entry;
     std::vector<RawBlock> blocks;
     std::vector<BlockId> layout;
+    // The most bytes the body's own stack instructions hold.
+    std::uint64_t stack_depth{};
 };
 
 struct RawModule {
@@ -93,10 +95,18 @@ struct RawModule {
     std::unordered_set<std::uint32_t> object_definitions;
 };
 
+// The stack a function uses itself: the most bytes below its caller's
+// stack pointer, and whether it also allocates at run time.
+struct StackUsage {
+    std::uint64_t bytes{};
+    bool dynamic{};
+};
+
 // The assembly of one function followed by its jump tables and literals.
 struct FunctionAssembly {
     hir::FunctionId function;
     std::string text;
+    StackUsage stack{};
 };
 
 // Managed functions, after directives that precede every definition.

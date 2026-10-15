@@ -502,6 +502,7 @@ bool fold_constant_object_reads(ManagedFunction& function,
                 constant.id = ValueId{
                     static_cast<std::uint32_t>(function.values.size())};
                 constant.location = load.location;
+                constant.inline_site = load.inline_site;
                 constant.type = load.type;
                 constant.kind = floating ? ValueKind::ConstantFloating
                                          : ValueKind::ConstantInteger;

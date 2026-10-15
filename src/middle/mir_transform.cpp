@@ -139,6 +139,7 @@ bool commute_masked_truncations(ManagedFunction& function,
             narrow.id = {
                 static_cast<std::uint32_t>(function.values.size())};
             narrow.location = truncate.location;
+            narrow.inline_site = truncate.inline_site;
             narrow.type = truncate.type;
             narrow.kind = ValueKind::Cast;
             narrow.cast = CastOperation::Truncate;
@@ -225,6 +226,7 @@ bool narrow_single_use_integer_loads(ManagedFunction& function,
                 address.id = {
                     static_cast<std::uint32_t>(function.values.size())};
                 address.location = load.location;
+                address.inline_site = load.inline_site;
                 address.type =
                     function.values[load.operands.front().value].type;
                 address.kind = ValueKind::IndexedAddress;
@@ -242,6 +244,7 @@ bool narrow_single_use_integer_loads(ManagedFunction& function,
             reinterpret.id = {
                 static_cast<std::uint32_t>(function.values.size())};
             reinterpret.location = load.location;
+            reinterpret.inline_site = load.inline_site;
             reinterpret.type = narrow_pointer;
             reinterpret.kind = ValueKind::Cast;
             reinterpret.cast = CastOperation::Reinterpret;
@@ -255,6 +258,7 @@ bool narrow_single_use_integer_loads(ManagedFunction& function,
                 offset.id = {
                     static_cast<std::uint32_t>(function.values.size())};
                 offset.location = load.location;
+                offset.inline_site = load.inline_site;
                 offset.type = *hir_module.builtin(BuiltinType::Uptr);
                 offset.kind = ValueKind::ConstantInteger;
                 offset.integer = byte_offset / target_bytes;
@@ -266,6 +270,7 @@ bool narrow_single_use_integer_loads(ManagedFunction& function,
                 address.id = {
                     static_cast<std::uint32_t>(function.values.size())};
                 address.location = load.location;
+                address.inline_site = load.inline_site;
                 address.type = narrow_pointer;
                 address.kind = ValueKind::IndexedAddress;
                 address.operands = {narrow_address, offset_id};
@@ -1303,7 +1308,8 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         header_snapshot.terminator.location,
         rotated_condition,
         header_snapshot.terminator.successors,
-        latch_final_effect};
+        latch_final_effect,
+        header_snapshot.terminator.inline_site};
 
     auto& mutable_body = function.blocks[body_id->value];
     mutable_body.predecessors.push_back(latch_id);

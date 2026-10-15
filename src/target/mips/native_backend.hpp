@@ -13,6 +13,10 @@
 #include <cstdint>
 #include <string>
 
+namespace cross::native {
+class DebugInfo;
+}
+
 namespace cross::mips {
 
 // The ELF ABI tag an ABI model requests through `elf_abi_tag`, which model
@@ -29,6 +33,7 @@ enum class ElfAbiTag : std::uint8_t { Default, Eabi32 };
 [[nodiscard]] mir::ManagedAssembly emit_managed_machine_assembly(
     machine::Module& module, const mir::ManagedModule& managed,
     const hir::Module& hir_module, const Subtarget& subtarget,
-    const CompilerOptions& options, Diagnostics& diagnostics);
+    const CompilerOptions& options, Diagnostics& diagnostics,
+    native::DebugInfo* debug = nullptr);
 
 } // namespace cross::mips

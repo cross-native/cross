@@ -441,6 +441,7 @@ bool split_entry_parameters(Function& function,
         move.kind = InstructionKind::Copy;
         move.location = position != top.end() ? position->location
                                               : function.location;
+        if (position != top.end()) move.inline_site = position->inline_site;
         move.defs.push_back(copy);
         move.uses.push_back(parameter);
         top.insert(position, std::move(move));

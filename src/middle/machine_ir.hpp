@@ -285,6 +285,8 @@ struct Instruction {
     InstructionKind kind{InstructionKind::Target};
     TargetOpcodeId opcode;
     SourceLocation location;
+    // The innermost inlined call of the MIR function it comes from.
+    std::optional<mir::InlineSiteId> inline_site;
     std::vector<Operand> operands;
     std::vector<Register> defs;
     std::vector<Register> uses;

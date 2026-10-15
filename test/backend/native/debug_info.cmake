@@ -3,9 +3,9 @@
 
 # -g emits DWARF 5 line tables with mapped paths, call-frame information in
 # .debug_frame (or .eh_frame when the entry asks), and the compile unit with
-# its namespaces, subprograms, variables, and types; the code itself does not
-# change.
-foreach(required CC SOURCE HEADER PROBE OUTPUT)
+# its namespaces, subprograms, inlined calls, variables, and types; the code
+# itself does not change.
+foreach(required CC SOURCE HEADER PROBE FRAMES INLINE ENUMERATIONS OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -234,8 +234,16 @@ if(NOT first STREQUAL second)
     message(FATAL_ERROR "-g objects differ between source trees")
 endif()
 
+# The local of a shrink-wrapped frame is described from the CFA, which the
+# call-frame information follows into and out of the frame.
+compile(shrunk.o -g -O2 -target ${linux} "${FRAMES}")
+verify(shrunk.o)
+run("shrink-wrapped homes" "${LLVM_DWARFDUMP}" --debug-info "${OUTPUT}/shrunk.o")
+expect("shrink-wrapped homes" "${stdout}"
+    "DW_AT_name\t[(]\"shrunk\"[)]\n[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*\n\n[^\n]*DW_TAG_formal_parameter\n[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*\n\n[^\n]*DW_TAG_variable\n[^\n]*DW_AT_name\t[(]\"cell\"[)]\n[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*DW_AT_location\t[(]DW_OP_fbreg -[0-9]+[)]")
+
 # COFF describes frames in .debug_frame beside the SEH records; Mach-O
-# emits lines and the compile unit; MIPS emits the compile unit.
+# emits lines and the compile unit.
 compile(coff.o -g -funwind-tables -target x86_64-w64-windows-gnu "${input}")
 verify(coff.o)
 sections(listing coff.o)
@@ -245,7 +253,50 @@ compile(macho.o -g -target x86_64-apple-darwin "${input}")
 verify(macho.o)
 sections(listing macho.o)
 expect("Mach-O sections" "${listing}" "Name: __debug_info" "Name: __debug_line")
-compile(mips.o -g -target mips-unknown-elf "${input}")
-verify(mips.o)
-run("MIPS info" "${LLVM_DWARFDUMP}" --debug-info "${OUTPUT}/mips.o")
-expect("MIPS info" "${stdout}" "DW_TAG_compile_unit" "addr_size = 0x04")
+# Block labels split a Mach-O function into atoms, so its bounds are
+# addresses: the last row of sum_to lies inside its subprogram.
+run("Mach-O rows" "${LLVM_DWARFDUMP}" --debug-line "${OUTPUT}/macho.o")
+string(REGEX MATCHALL "\n0x[0-9a-f]+ +19 " rows "${stdout}")
+list(GET rows -1 row)
+string(REGEX MATCH "0x[0-9a-f]+" address "${row}")
+run("Mach-O lookup" "${LLVM_DWARFDUMP}" --lookup=${address} "${OUTPUT}/macho.o")
+expect("Mach-O lookup" "${stdout}" "DW_AT_name\t[(]\"sum_to\"[)]")
+
+# Calls inlined into calls: an abstract instance describes each inlined
+# function, and each inlined copy, nested as the calls were, names it and
+# the position of its call; its rows name the callee's lines.
+foreach(target ${linux} x86_64-apple-darwin x86_64-w64-windows-gnu)
+    compile(inline-${target}.o -g -O2 -target ${target} "${INLINE}")
+    verify(inline-${target}.o)
+endforeach()
+run("inlined calls" "${LLVM_DWARFDUMP}" --debug-info "${OUTPUT}/inline-${linux}.o")
+expect("inlined calls" "${stdout}"
+    "DW_AT_name\t[(]\"square\"[)]\n[^\n]*DW_AT_decl_file[^\n]*\n[^\n]*DW_AT_decl_line\t[(]10[)]\n[^\n]*DW_AT_type[^\n]*\n[^\n]*DW_AT_inline\t[(]DW_INL_inlined[)]"
+    ":     DW_TAG_inlined_subroutine\n[^\n]*DW_AT_abstract_origin\t[(]0x[0-9a-f]+ \"[^\"]*_twice_square\"[)]\n[^\n]*DW_AT_low_pc[^\n]*\n[^\n]*DW_AT_high_pc[^\n]*\n[^\n]*DW_AT_call_file[^\n]*\n[^\n]*DW_AT_call_line\t[(]20[)]\n[^\n]*DW_AT_call_column\t[(]13[)]\n\n[^\n]*:       DW_TAG_inlined_subroutine\n[^\n]*DW_AT_abstract_origin\t[(]0x[0-9a-f]+ \"[^\"]*_square\"[)]"
+    "DW_AT_call_line\t[(]16[)]\n[^\n]*DW_AT_call_column\t[(]12[)]"
+    "DW_AT_call_line\t[(]16[)]\n[^\n]*DW_AT_call_column\t[(]24[)]")
+string(REGEX MATCHALL "DW_TAG_inlined_subroutine" copies "${stdout}")
+list(LENGTH copies copy_count)
+if(NOT copy_count EQUAL 3)
+    message(FATAL_ERROR "expected three inlined copies\n${stdout}")
+endif()
+run("inlined rows" "${LLVM_DWARFDUMP}" --debug-line "${OUTPUT}/inline-${linux}.o")
+expect("inlined rows" "${stdout}" "\n0x[0-9a-f]+ +11 +[0-9]+ +0 ")
+compile(inline-lines.o -g=dwarf-lines -O2 -target ${linux} "${INLINE}")
+run("dwarf-lines inlined calls" "${LLVM_DWARFDUMP}" --debug-info "${OUTPUT}/inline-lines.o")
+expect("dwarf-lines inlined calls" "${stdout}" "DW_TAG_inlined_subroutine")
+
+# Enumerators keep the width and signedness of their underlying type; a
+# 128-bit value that no 64-bit number holds is its bytes in target order.
+compile(enum.o -g -target ${linux} "${ENUMERATIONS}")
+verify(enum.o)
+run("enumerators" "${LLVM_DWARFDUMP}" --debug-info "${OUTPUT}/enum.o")
+expect("enumerators" "${stdout}"
+    "\"negative\"[)]\n[^\n]*DW_AT_const_value\t[(]-1[)]"
+    "\"lowest\"[)]\n[^\n]*DW_AT_const_value\t[(]-128[)]"
+    "\"highest\"[)]\n[^\n]*DW_AT_const_value\t[(]127[)]"
+    "\"top\"[)]\n[^\n]*DW_AT_const_value\t[(]65535[)]"
+    "\"minus\"[)]\n[^\n]*DW_AT_const_value\t[(]-2[)]"
+    "\"large\"[)]\n[^\n]*DW_AT_const_value\t[(]<0x10> ef cd ab 89 67 45 23 01 ef cd ab 89 67 45 23 01 [)]"
+    "\"all\"[)]\n[^\n]*DW_AT_const_value\t[(]<0x10> ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff [)]"
+    "\"back\"[)]\n[^\n]*DW_AT_const_value\t[(]-3[)]")

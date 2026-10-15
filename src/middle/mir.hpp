@@ -40,6 +40,20 @@ struct EffectId {
     friend bool operator==(EffectId, EffectId) = default;
 };
 
+struct InlineSiteId {
+    std::uint32_t value{};
+    friend bool operator==(InlineSiteId, InlineSiteId) = default;
+};
+
+// A call to `callee` at `location` that the inliner replaced with the
+// callee's body, inside the body inlined at `parent` or in the function
+// itself.
+struct InlineSite {
+    hir::FunctionId callee;
+    SourceLocation location;
+    std::optional<InlineSiteId> parent;
+};
+
 enum class ValueKind {
     Parameter,
     ConstantInteger,
@@ -165,6 +179,8 @@ struct ManagedValue {
 
     ValueId id;
     SourceLocation location;
+    // The innermost inlined call the value comes from.
+    std::optional<InlineSiteId> inline_site;
     hir::TypeId type;
     ValueKind kind{ValueKind::ConstantInteger};
     UnaryOperation unary{UnaryOperation::Negate};
@@ -279,6 +295,7 @@ struct ManagedTerminator {
     std::optional<ValueId> value;
     std::vector<BlockId> successors;
     EffectId effect;
+    std::optional<InlineSiteId> inline_site{};
 };
 
 struct ManagedBlock {
@@ -306,6 +323,7 @@ struct ManagedFunction {
     std::vector<ManagedEffect> effects;
     std::vector<ManagedBlock> blocks;
     std::vector<ManagedLabel> labels;
+    std::vector<InlineSite> inline_sites;
 };
 
 struct ManagedModule {

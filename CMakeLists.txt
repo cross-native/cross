@@ -163,6 +163,7 @@ cross_component(cross_middle)
 
 add_library(cross_debug_info
     src/backend/native/debug_info.cpp
+    src/backend/native/stack_usage.cpp
 )
 target_link_libraries(cross_debug_info PUBLIC cross_middle cross_targets)
 cross_component(cross_debug_info)
@@ -177,6 +178,7 @@ cross_component(cross_raw_backend)
 add_library(cross_native_backend
     src/backend/native/assembler.cpp
     src/backend/native/data_emitter.cpp
+    src/backend/native/frame_cfi.cpp
     src/backend/native/machine_pass.cpp
     src/backend/native/machine_pipeline.cpp
     src/backend/native/machine_transform.cpp
@@ -3281,10 +3283,65 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info.x
                 -DHEADER=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_header.x
                 -DPROBE=${CMAKE_SOURCE_DIR}/test/backend/machine/static_stack_probe.x
+                -DFRAMES=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_frames.x
+                -DINLINE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_inline.x
+                -DENUMERATIONS=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_enum.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/debug-info
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/debug_info.cmake")
     set_tests_properties(cross_debug_info PROPERTIES
-        LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.debug;feature.object;feature.frame")
+        LABELS "check.compile;arch.x86_64;backend.native;feature.debug;feature.object;feature.frame;feature.enum")
+    add_test(NAME cross_debug_info_mips
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info.x
+                -DHEADER=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_header.x
+                -DFRAMES=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_frames.x
+                -DINLINE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_inline.x
+                -DENUMERATIONS=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_enum.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/debug-info-mips
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_mips.cmake")
+    set_tests_properties(cross_debug_info_mips PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.debug;feature.object;feature.frame;feature.enum;endian.big;endian.little")
+    foreach(gdb_config
+            "n64_big;mips64-unknown-elf;n64;qemu-system-mips64;MIPS64R2-generic;mips64;elf64btsmip;bare-n64.ld;start64;big"
+            "n64_little;mips64el-unknown-elf;n64;qemu-system-mips64el;MIPS64R2-generic;mips64;elf64ltsmip;bare-n64.ld;start64;little"
+            "o32_big;mips-unknown-elf;o32;qemu-system-mips;24Kf;mips1;elf32btsmip;bare.ld;start32;big"
+            "o32_little;mipsel-unknown-elf;o32;qemu-system-mipsel;24Kf;mips1;elf32ltsmip;bare.ld;start32;little")
+        list(GET gdb_config 0 gdb_name)
+        list(GET gdb_config 1 gdb_triple)
+        list(GET gdb_config 2 gdb_abi)
+        list(GET gdb_config 3 gdb_qemu)
+        list(GET gdb_config 4 gdb_cpu)
+        list(GET gdb_config 5 gdb_mc_cpu)
+        list(GET gdb_config 6 gdb_emulation)
+        list(GET gdb_config 7 gdb_linker)
+        list(GET gdb_config 8 gdb_start)
+        list(GET gdb_config 9 gdb_endian)
+        add_test(NAME cross_debug_info_gdb_${gdb_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_gdb.x
+                    -DSTART=${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_gdb_${gdb_start}.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/${gdb_linker}
+                    -DTRIPLE=${gdb_triple}
+                    -DABI=${gdb_abi}
+                    -DQEMU_NAME=${gdb_qemu}
+                    -DQEMU_CPU=${gdb_cpu}
+                    -DMC_CPU=${gdb_mc_cpu}
+                    -DEMULATION=${gdb_emulation}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/debug-info-gdb-${gdb_name}
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/native/debug_info_gdb.cmake")
+        set_tests_properties(cross_debug_info_gdb_${gdb_name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.debug;feature.frame;endian.${gdb_endian}")
+    endforeach()
+    add_test(NAME cross_stack_usage
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/stack_usage.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/stack-usage
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/stack_usage.cmake")
+    set_tests_properties(cross_stack_usage PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.stack_usage;feature.frame;feature.driver;endian.big;endian.little")
     add_test(NAME cross_symbol_indirection
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
