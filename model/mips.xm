@@ -1164,6 +1164,23 @@ profile "vr4300-o32" {
     f.if-conversion-memory-limit = 12;
 }
 
+# Threads of the N64 operating system run with FCSR.FS and the
+# invalid-operation enable set; the VR4300 traps on denormal operands.
+profile "n64" {
+    target = "mips-unknown-elf";
+    abi = "o32";
+    mangling = "cross";
+    m.arch = "vr4300";
+    m.tune = "vr4300";
+    m.fix4300 = true;
+    m.risc-cisc-balance = 0;
+    f.if-conversion-limit = 0;
+    f.if-conversion-memory-limit = 12;
+    fp_traps = ["invalid"];
+    fp_denormal_operand = "trap";
+    fp_denormal_result = "flush";
+}
+
 profile "psp-allegrex" {
     default_for = ["mipsallegrexel-sony-psp-elf"];
     target = "mipsallegrexel-sony-psp-elf";

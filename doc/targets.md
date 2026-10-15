@@ -169,6 +169,7 @@ would need a call, a spill, or a stack object is an error.
 | `r6000-eabi` | `mips-unknown-elf` | MIPS II (R6000) | `eabi32` |
 | `vr4300-o32` | `mips-unknown-elf` | MIPS III (VR4300) | `o32` |
 | `vr4300-cross64` | `mips-unknown-elf` | MIPS III (VR4300) | `cross64` |
+| `n64` | `mips-unknown-elf` | MIPS III (VR4300), `-mfix4300` | `o32` |
 | `psp-allegrex` | `mipsallegrexel-sony-psp-elf` | Allegrex | `eabi32` |
 | `allegrex-o32` | `mipsallegrexel-sony-psp-elf` | Allegrex | `o32` |
 | `mips64-n64`, `mips64el-n64` | `mips64-unknown-elf`, `mips64el-unknown-elf` | MIPS64 | `cross-n64` |
@@ -180,26 +181,22 @@ cc -c -O2 -mprofile=vr4300-o32 input.x -o input.o
 cc -c -O2 -target mips-unknown-elf -march=vr4300 -mabi=o32 input.x -o input.o
 ```
 
-The MIPS profiles declare the IEEE default floating environment: no
-exception traps, and denormal results are kept. The VR4300 FPU raises an
-unimplemented-operation exception for a denormal operand, and for a denormal
-result unless FCSR.FS flushes it, so on a VR4300 that environment needs a
-system that emulates those operations. Code that runs with traps enabled or
-with FS set declares its environment in its own profile; threads of the N64
-operating system, for example, start with FS and the invalid-operation enable
-set:
+The MIPS profiles other than `n64` declare the IEEE default floating
+environment: no exception traps, and denormal results are kept. The VR4300
+FPU raises an unimplemented-operation exception for a denormal operand, and
+for a denormal result unless FCSR.FS flushes it, so on a VR4300 that
+environment needs a system that emulates those operations. The `n64`
+profile declares the environment in which threads of the N64 operating
+system start, with FS and the invalid-operation enable set:
 
 ```text
-profile "n64-thread" {
-    target = "mips-unknown-elf";
-    abi = "o32";
-    mangling = "cross";
-    m.arch = "vr4300";
-    fp_traps = ["invalid"];
-    fp_denormal_operand = "trap";
-    fp_denormal_result = "flush";
-}
+fp_traps = ["invalid"];
+fp_denormal_operand = "trap";
+fp_denormal_result = "flush";
 ```
+
+Code that runs in another environment declares it in its own profile
+([models.md](models.md#profiles)).
 
 `$::_ctc1` changes the FCSR without changing the environment that the profile
 declares.
