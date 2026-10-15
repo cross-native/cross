@@ -1146,6 +1146,93 @@ abi "ms_abi" {
     }
 }
 
+# CPUs. Their instructions keep the target's default costs, which
+# cc --print-costs shows.
+cpu "generic" {
+    architecture = "x86-64";
+    features = ["base"];
+}
+
+cpu "x86-64" {
+    architecture = "x86-64";
+    features = ["base"];
+}
+
+cpu "x86-64-v2" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "cx16"];
+}
+
+cpu "x86-64-v3" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx",
+                "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt", "movbe",
+                "cx16", "xsave"];
+}
+
+cpu "x86-64-v4" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx",
+                "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt", "movbe",
+                "avx512f", "avx512dq", "avx512cd", "avx512bw", "avx512vl",
+                "cx16", "xsave"];
+}
+
+cpu "haswell" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
+                "lzcnt", "movbe", "rdrnd", "cx16", "xsave", "xsaveopt",
+                "fsgsbase", "rdtscp", "invpcid"];
+}
+
+cpu "skylake" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
+                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "cx16", "xsave",
+                "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp", "pku",
+                "clflushopt", "invpcid"];
+}
+
+cpu "skylake-avx512" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
+                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "avx512f",
+                "avx512dq", "avx512cd", "avx512bw", "avx512vl", "cx16",
+                "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
+                "pku", "clflushopt", "invpcid"];
+}
+
+cpu "znver1" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
+                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16",
+                "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
+                "prefetchw", "monitor"];
+}
+
+cpu "znver2" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
+                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16",
+                "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
+                "rdpid", "prefetchw", "monitor", "clwb"];
+}
+
+cpu "znver3" {
+    architecture = "x86-64";
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
+                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "sha", "gfni",
+                "vaes", "vpclmulqdq", "cx16", "xsave", "xsaveopt", "xsavec",
+                "xsaves", "fsgsbase", "rdtscp", "rdpid", "prefetchw",
+                "monitor", "clwb"];
+}
+
 profile "x86_64-windows" {
     default_for = [
         "x86_64-*-windows-*", "x86_64-*-mingw*",

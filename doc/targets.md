@@ -104,7 +104,7 @@ Target options:
 
 | Option | Values |
 | --- | --- |
-| `-march=`, `-mtune=` | `generic`, `x86-64`, `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `skylake-avx512`, `znver1`, `znver2`, `znver3` |
+| `-march=`, `-mtune=` | A `cpu` model entry ([models.md](models.md#cpu-entries)). `model/x86_64.xm` ships `generic`, `x86-64`, `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `skylake-avx512`, `znver1`, `znver2`, and `znver3`, which set features only, so their instructions have the target's default costs (`cc --print-costs`). |
 | `-mFEATURE`, `-mno-FEATURE` | Instruction set extensions such as `sse4.2`, `popcnt`, `avx`, `avx2`, `fma`, `bmi2`, `avx512f`, `avx512vl` (see `--print-options=target`) |
 | `-mcmodel=` | `small` (default), `kernel`, `medium`, `large` |
 | `-mred-zone`, `-mno-red-zone` | Let leaf functions use the area below the stack pointer (not with COFF). |
@@ -234,10 +234,17 @@ preserves all 64 bits. Select `o32`, `n64`, or `eabi32` at C boundaries, per
 declaration with `[[abi("n64")]]` or for the whole compilation with
 `-mabi=n64`.
 
-`-march=` accepts `generic`, `mips1`, `r2000`, `r3000`, `mips2`, `r6000`,
-`allegrex`, `mips3`, `r4000`, `r4400`, `r4600`, `vr4300`, `mips4`, `mips5`,
-`mips32`, `mips32r2`, and `mips64`; `-mtune=` is independent. A CPU enables
-the features it implies, and `-m`/`-mno-` options adjust them:
+`-march=` and `-mtune=` name `cpu` model entries
+([models.md](models.md#cpu-entries)). `model/mips.xm` ships `generic`,
+`mips1`, `r2000`, `r3000`, `mips2`, `r6000`, `allegrex`, `mips3`, `r4000`,
+`r4400`, `r4600`, `vr4300`, `mips4`, `mips5`, `mips32`, `mips32r2`, and
+`mips64`; `cc --print-cpus` lists the loaded entries. The `r2000`, `r3000`,
+`r6000`, `r4000`, `r4400`, `r4600`, and `vr4300` entries give those CPUs'
+multiply and divide cycle counts, all but `r4000` and `r4400` also their
+floating-point ones, and `r2000`, `r3000`, and `r4600` their load latency;
+the other entries carry no published timing. `cc --print-costs` shows the
+costs in effect. A CPU enables the features it implies, and `-m`/`-mno-`
+options adjust them:
 
 | Option | Effect |
 | --- | --- |

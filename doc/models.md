@@ -1023,22 +1023,29 @@ cpu "vr4300" {
 | `issue_width` | integer | `1` | no |
 
 `architecture` names a compiled-in architecture as `cc --print-targets`
-prints it. `inherits` names a `cpu` entry of the same architecture whose
-properties and blocks this entry starts from; the entry replaces individual
-properties and `instruction` blocks, and an inheritance cycle is an error.
-`features` lists the instruction-set features the processor implements by
-the names of the `-m` feature options (`cc --print-options=target`); each is
-enabled as its option would enable it. `issue_width` is the number of
-instructions the processor starts per cycle.
+prints it; CPU names are unique per architecture. `inherits` names a `cpu`
+entry of the same architecture whose properties and blocks this entry starts
+from; the entry replaces individual properties and `instruction` blocks, and
+an inheritance cycle is an error. `features` lists the instruction-set
+features the processor implements by the names of the `-m` feature options
+(`cc --print-options=target`); each is enabled as its option would enable it,
+and two features that conflict, directly or through what they enable, are an
+error. `issue_width`, from 1 to 65535, is the number of instructions the
+processor starts per cycle.
 
 An `instruction "NAME"` block describes one instruction, named as
 `cc --print-costs` lists the target's instructions:
 
 | Property | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `latency` | integer | `1` | Cycles from the start of the instruction until a dependent instruction can use its result. |
-| `issue` | integer | `1` | Cycles before the processor can start another instruction of the same kind. |
+| `latency` | integer | the target's | Cycles, from 0 to 65535, from the start of the instruction until a dependent instruction can use its result. |
+| `issue` | integer | the target's | Cycles, from 1 to 65535, before the processor can start another instruction of the same kind. |
 | `available` | bool | `true` | `false` removes an instruction that the features would allow. |
+
+The target gives each instruction a default latency and issue cost, 1 unless
+it states otherwise; an instruction that no entry of the chain describes, or
+a property that its block omits, has the default. `cc --print-costs` shows
+the costs in effect.
 
 `-march=NAME` (`m.arch`) selects the entry whose `features` and `available`
 properties decide which instructions are legal; explicit `-mFEATURE` and
@@ -1048,7 +1055,10 @@ the `-march` entry's costs apply. Costs never change which instructions are
 legal or what a program computes. An operation with an inline alternative,
 such as `$::clz`, uses the instruction only where the `-march` entry has it
 and the `-mtune` costs favor it; a machine instruction built-in (`$::_name`)
-that needs an unavailable instruction is an error.
+that needs an unavailable instruction is an error, and so is an operation
+that the target implements only with one. The `m.arch` and `m.tune`
+properties of profiles and presets name `cpu` entries of their
+architectures.
 
 The shipped CPUs are `cpu` entries in `model/mips.xm` and
 `model/x86_64.xm`.

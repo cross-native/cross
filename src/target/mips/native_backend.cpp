@@ -14,6 +14,7 @@
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
 #include "target/mips/features.hpp"
+#include "target/mips/instructions.hpp"
 #include "target/mips/machine_description.hpp"
 
 #include <algorithm>
@@ -1687,10 +1688,7 @@ private:
             for (const auto* form : find_instruction_forms(
                      target, entry->instruction)) {
                 if (form->operands.front().value_bits != bits) continue;
-                conflict = instruction_feature_conflict(
-                    *form, [&](std::string_view feature) {
-                        return subtarget_.supports_registry_feature(feature);
-                    });
+                conflict = subtarget_.form_conflict(*form);
                 if (conflict) continue;
                 auto form_value = value;
                 form_value.kind = ValueKind::MachineInstruction;
@@ -1698,15 +1696,13 @@ private:
                     instruction_form_id(subtarget_.target(), *form);
                 return lower_machine_instruction(form_value);
             }
-            diagnostics_.error(
-                value.location,
-                "$::sqrt " +
-                    (conflict ? (conflict->forbidden
-                                     ? "is unavailable with feature '"
-                                     : "requires feature '") +
-                                    std::string(conflict->feature) + "'"
-                              : std::string("has no MIPS form for this type")) +
-                    " on the selected MIPS CPU");
+            auto reason = conflict
+                ? instruction_conflict_reason(*conflict, subtarget_.cpu())
+                : std::string("has no MIPS form for this type");
+            if (!conflict || !conflict->unavailable) {
+                reason += " on the selected MIPS CPU";
+            }
+            diagnostics_.error(value.location, "$::sqrt " + reason);
             auto result = target_instruction(Opcode::Invalid, value.location);
             result.defs.push_back(reg(value.id));
             return result;
@@ -4350,45 +4346,90 @@ private:
         }
     }
 
+    // The -mtune latency of an operation: that of the instructions on its
+    // result path. A conversion counts its CVT or TRUNC alone; operations
+    // without one principal instruction count one cycle.
     unsigned estimated_latency(const machine::Instruction& instruction) const {
-        if (instruction.may_load) {
-            return subtarget_.has_feature(Feature::Mips3) ? 3U : 4U;
-        }
-        switch (decode_opcode(instruction.opcode)) {
+        using I = Instruction;
+        const auto bits = instruction.defs.empty()
+            ? 32U : instruction.defs.front().mode.bits;
+        const bool wide = bits == 64 && subtarget_.has_feature(Feature::Mips3);
+        const bool single = bits <= 32;
+        const bool wide_address = hir_.address_bits > 32;
+        const auto sum = [&](std::initializer_list<I> path) {
+            unsigned result{};
+            for (const auto item : path) result += subtarget_.latency(item);
+            return result;
+        };
+        const auto opcode = decode_opcode(instruction.opcode);
+        switch (opcode) {
+        case Opcode::LoadSigned:
+        case Opcode::PointerLoadSigned:
+        case Opcode::IndexedLoadSigned:
+        case Opcode::GlobalLoadSigned:
+            return sum({bits <= 8 ? I::Lb : bits <= 16 ? I::Lh
+                        : wide ? I::Ld : I::Lw});
+        case Opcode::LoadUnsigned:
+        case Opcode::PointerLoadUnsigned:
+        case Opcode::IndexedLoadUnsigned:
+        case Opcode::GlobalLoadUnsigned:
+            return sum({bits <= 8 ? I::Lbu : bits <= 16 ? I::Lhu
+                        : wide ? I::Ld : I::Lw});
+        case Opcode::Fload:
+        case Opcode::FpointerLoad:
+        case Opcode::FindexedLoad:
+        case Opcode::FglobalLoad:
+            return sum({single || !subtarget_.has_feature(Feature::Mips2)
+                            ? I::Lwc1 : I::Ldc1});
+        case Opcode::UnalignedLoadSigned:
+        case Opcode::UnalignedLoadUnsigned:
+            return sum({wide ? I::Ldl : I::Lwl});
         case Opcode::Sdiv:
-        case Opcode::Udiv:
         case Opcode::Srem:
-        case Opcode::Urem:
         case Opcode::Sdivrem:
-        case Opcode::Udivrem: return 36U;
-        case Opcode::Fdiv:
-            return instruction.defs.empty() ||
-                           instruction.defs.front().mode.bits <= 32
-                       ? 20U
-                       : 36U;
+            return sum({wide ? I::Ddiv : I::Div, I::Mflo});
+        case Opcode::Udiv:
+        case Opcode::Urem:
+        case Opcode::Udivrem:
+            return sum({wide ? I::Ddivu : I::Divu, I::Mflo});
+        // A split multiply's MFLO waits as long as the whole multiply.
         case Opcode::Mul:
         case Opcode::MulStart:
-        case Opcode::Mulhs:
-        case Opcode::Mulhu: return 8U;
-        case Opcode::Fmul:
-            return instruction.defs.empty() ||
-                           instruction.defs.front().mode.bits <= 32
-                       ? 4U
-                       : 7U;
-        case Opcode::Fadd:
-        case Opcode::Fsub: return 4U;
-        case Opcode::Fextend:
-        case Opcode::Ftruncate:
+            return sum({wide ? I::Dmult : I::Mult, I::Mflo});
+        case Opcode::Mulhs: return sum({wide ? I::Dmult : I::Mult, I::Mfhi});
+        case Opcode::Mulhu:
+            return sum({wide ? I::Dmultu : I::Multu, I::Mfhi});
+        case Opcode::Fadd: return sum({single ? I::AddS : I::AddD});
+        case Opcode::Fsub: return sum({single ? I::SubS : I::SubD});
+        case Opcode::Fmul: return sum({single ? I::MulS : I::MulD});
+        case Opcode::Fdiv: return sum({single ? I::DivS : I::DivD});
+        case Opcode::Fextend: return sum({I::CvtDS});
+        case Opcode::Ftruncate: return sum({I::CvtSD});
         case Opcode::Sitofp:
         case Opcode::Uitofp:
+            return sum({single ? I::CvtSW : I::CvtDW});
         case Opcode::Fptosi:
-        case Opcode::Fptoui: return 5U;
+        case Opcode::Fptoui:
+            return sum({instruction.uses.empty() ||
+                                instruction.uses.front().mode.bits <= 32
+                            ? I::TruncWS : I::TruncWD});
         case Opcode::StackAddress:
+        case Opcode::PointerOffset:
+            return sum({wide_address ? I::Daddiu : I::Addiu});
         case Opcode::GlobalAddress:
         case Opcode::LabelAddress:
+            return sum({I::Lui, wide_address ? I::Daddiu : I::Addiu});
         case Opcode::IndexedAddress:
-        case Opcode::PointerOffset: return 2U;
-        default: return 1U;
+            return sum({wide_address ? I::Dsll : I::Sll,
+                        wide_address ? I::Daddu : I::Addu});
+        case Opcode::Machine:
+            return subtarget_.latency(
+                subtarget_.target().form_instructions.at(
+                    std::get<machine::ImmediateOperand>(
+                        instruction.operands.front())
+                        .value));
+        default:
+            return instruction.may_load ? sum({I::Lw}) : 1U;
         }
     }
 
@@ -5708,7 +5749,16 @@ public:
           numeric_gprs_(hir_module.address_bits > 32 ||
                         elf_abi_tag(subtarget.abi_info()) !=
                             ElfAbiTag::Default),
-          wide_addresses_(hir_module.address_bits > 32) {}
+          wide_addresses_(hir_module.address_bits > 32) {
+        if (!subtarget.lacks_instructions()) return;
+        const auto& instructions = subtarget.target().instruction_costs;
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            if (!subtarget.has_instruction(
+                    InstructionCostId{static_cast<std::uint16_t>(index)})) {
+                unavailable_.insert(instructions[index].name);
+            }
+        }
+    }
 
     void prepare_frames() {
         if (options_.unwind_tables || options_.asynchronous_unwind_tables ||
@@ -6067,8 +6117,14 @@ private:
     // NOP.
     bool split_doubleword_coprocessor_access(std::string_view opcode,
                                              std::string_view operands) {
-        if (subtarget_.has_feature(Feature::Mips2) ||
-            (opcode != "ldc1" && opcode != "sdc1")) {
+        // MIPS I has no doubleword coprocessor access; under FR=0 a pair of
+        // word accesses also replaces one that the -march CPU lacks.
+        const bool load = opcode == "ldc1";
+        if ((!load && opcode != "sdc1") ||
+            (subtarget_.has_feature(Feature::Mips2) &&
+             (subtarget_.has_instruction(load ? Instruction::Ldc1
+                                              : Instruction::Sdc1) ||
+              !subtarget_.has_feature(Feature::Fp32)))) {
             return false;
         }
         const auto comma = operands.find(',');
@@ -6523,6 +6579,7 @@ private:
                      std::string_view operands = {},
                      bool defer_load_delay = false) {
         if (split_doubleword_coprocessor_access(opcode, operands)) return;
+        if (unavailable_.contains(opcode)) diagnose_unavailable(opcode);
         const auto* form = std::exchange(hazard_form_, nullptr);
         resolve_hazards(opcode, form);
         const bool floating_multiply =
@@ -6616,6 +6673,39 @@ private:
         if (subtarget_.has_feature(Feature::Fix4300) && floating_multiply) {
             fpu_multiply_pending_ = true;
         }
+    }
+
+    // An instruction without an alternative that the -march CPU lacks.
+    void diagnose_unavailable(std::string_view opcode) {
+        if (!reported_unavailable_.insert(std::string(opcode)).second) return;
+        diagnostics_.error(function_location_,
+                           "function needs instruction '" +
+                               std::string(opcode) + "', which CPU '" +
+                               std::string(subtarget_.cpu()) +
+                               "' does not have");
+    }
+
+    // Conditional moves, rotates, and branch-likely forms are selected only
+    // where the -march CPU has the instructions; each has an alternative.
+    bool selects_cond_move() const {
+        return subtarget_.has_feature(Feature::CondMove) &&
+               subtarget_.has_instruction(Instruction::Movn);
+    }
+
+    bool selects_rotate() const {
+        return subtarget_.has_feature(Feature::Rotate) &&
+               subtarget_.has_instruction(Instruction::Rotrv);
+    }
+
+    bool selects_branch_likely() const {
+        using I = Instruction;
+        if (!subtarget_.has_feature(Feature::BranchLikely)) return false;
+        for (const auto likely : {I::Beql, I::Bnel, I::Beqzl, I::Bnezl,
+                                  I::Bltzl, I::Bgezl, I::Blezl, I::Bgtzl,
+                                  I::Bc1tl, I::Bc1fl}) {
+            if (!subtarget_.has_instruction(likely)) return false;
+        }
+        return true;
     }
 
     void encoded(std::uint32_t word, std::string_view comment) {
@@ -10796,7 +10886,7 @@ private:
                 // is the layout successor. Its otherwise-empty delay slot
                 // can execute the false successor's first operation.
                 plan_edge(source, no->target, true, true);
-            } else if (subtarget_.has_feature(Feature::BranchLikely)) {
+            } else if (selects_branch_likely()) {
                 // A branch-likely annuls its delay slot on the fallthrough
                 // edge. This makes the first target operation edge-specific
                 // without speculative side effects or physical-register
@@ -10913,6 +11003,9 @@ private:
     bool return_address_lost_{};
     bool numeric_gprs_{};
     bool wide_addresses_{};
+    // The instructions the -march CPU lacks, and those already reported.
+    std::unordered_set<std::string_view> unavailable_;
+    std::unordered_set<std::string> reported_unavailable_;
     std::ostringstream output_;
     std::unordered_set<std::uint32_t> emitted_patch_cells_;
     std::optional<ActiveSignature> active_signature_;
@@ -11352,7 +11445,7 @@ void AssemblyEmitter::emit_integer_binary(
     // that one form on its fixed scratch tuple until the encoder accepts
     // arbitrary register fields; all ordinary MIPS-III operations consume
     // and define their allocated registers directly.
-    const bool fixed_rotate = !wide && subtarget_.has_feature(Feature::Rotate) &&
+    const bool fixed_rotate = !wide && selects_rotate() &&
         (opcode == Opcode::Rotl || opcode == Opcode::Rotr);
     const auto left_gpr = fixed_rotate
         ? (load_vreg(function, left, "t0", value.location),
@@ -11504,7 +11597,7 @@ void AssemblyEmitter::emit_integer_binary(
         else instruction(wide ? "dsrlv" : "srlv", binary_operands());
         break;
     case Opcode::Rotl:
-        if (!wide && subtarget_.has_feature(Feature::Rotate)) {
+        if (!wide && selects_rotate()) {
             instruction("subu", "$t3,$zero,$t1");
             encoded(0x01685046U, "rorv $t2,$t0,$t3");
         } else {
@@ -11524,7 +11617,7 @@ void AssemblyEmitter::emit_integer_binary(
         }
         break;
     case Opcode::Rotr:
-        if (!wide && subtarget_.has_feature(Feature::Rotate)) {
+        if (!wide && selects_rotate()) {
             encoded(0x01285046U, "rorv $t2,$t0,$t1");
         } else {
             instruction(wide ? "dsubu" : "subu",
@@ -13005,7 +13098,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
     if (opcode == Opcode::Select) {
         if (value.uses.size() < 3 || value.defs.empty()) return;
         if (value.defs.front().mode.bits <= 32 &&
-            subtarget_.has_feature(Feature::CondMove)) {
+            selects_cond_move()) {
             load_vreg(function, value.uses[0], "t0", value.location);
             load_vreg(function, value.uses[1], "t1", value.location);
             load_vreg(function, value.uses[2], "t2", value.location);
@@ -13436,7 +13529,7 @@ void AssemblyEmitter::emit_terminator(
                 return;
             }
             if (options_.schedule_insns2 &&
-                subtarget_.has_feature(Feature::BranchLikely)) {
+                selects_branch_likely()) {
                 if (next == yes && !yes_copies) {
                     if (const auto copy = single_assigned_gpr_phi_copy(
                             function, predecessor, no)) {
@@ -13544,7 +13637,7 @@ void AssemblyEmitter::emit_terminator(
         // the annulled slot.  This removes both edge stubs without executing
         // the copy on the fallthrough path.
         if (options_.schedule_insns2 &&
-            subtarget_.has_feature(Feature::BranchLikely)) {
+            selects_branch_likely()) {
             const auto condition_gpr = input_gpr(
                 function, condition, "t0", value.location);
             if (next == yes && !yes_copies) {
@@ -13931,7 +14024,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                     decode_opcode(value.opcode) == Opcode::Select &&
                     value.uses.size() >= 3 && !value.defs.empty() &&
                     !(value.defs.front().mode.bits <= 32 &&
-                      subtarget_.has_feature(Feature::CondMove))) {
+                      selects_cond_move())) {
                     std::size_t end = index + 1;
                     while (end < found->instructions.size()) {
                         const auto& candidate = found->instructions[end];
@@ -13942,7 +14035,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                             candidate.defs.empty() ||
                             candidate.uses.front() != value.uses.front() ||
                             (candidate.defs.front().mode.bits <= 32 &&
-                             subtarget_.has_feature(Feature::CondMove))) {
+                             selects_cond_move())) {
                             break;
                         }
                         ++end;

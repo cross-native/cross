@@ -441,12 +441,15 @@ if(NOT reduced_multiply MATCHES
         "reduced:\n${reduced_multiply}\nhardware:\n${hardware_multiply}")
 endif()
 
+# A signed product reduces in the unsigned type of its width, where shifts
+# and additions wrap as the multiplication does.
 function_body("${OUTPUT}.enabled.s"
               mips_signed_constant_multiply signed_multiply)
-if(NOT signed_multiply MATCHES "[\t ]dmult[\t ]" OR
-   NOT signed_multiply MATCHES "[\t ]mflo[\t ]")
+if(NOT signed_multiply MATCHES "[\t ]dsll[\t ][^\n]*,4" OR
+   NOT signed_multiply MATCHES "[\t ]daddu[\t ]" OR
+   signed_multiply MATCHES "[\t ]dmult[\t ]")
     message(FATAL_ERROR
-        "MIR strength reduction changed signed-overflow semantics\n"
+        "MIR strength reduction did not reduce a signed multiplication\n"
         "${signed_multiply}")
 endif()
 

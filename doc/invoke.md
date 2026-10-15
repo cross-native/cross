@@ -60,7 +60,7 @@ give such files different spellings, for example with `-ffile-prefix-map`.
 | Option | Selects |
 | --- | --- |
 | `-target TRIPLE` | Target architecture, object format, and default ABI. |
-| `-march=CPU`, `-mtune=CPU` | Instruction set and, independently, scheduling and cost tuning. |
+| `-march=CPU`, `-mtune=CPU` | A `cpu` model entry ([models.md](models.md#cpu-entries)): `-march` the instruction set, `-mtune` the instruction costs that guide instruction choice and scheduling (default: the `-march` CPU). |
 | `-mFEATURE`, `-mno-FEATURE` | Target features, such as `-mavx2` or `-mno-red-zone`. |
 | `-mOPTION=VALUE` | Other target options, such as `-mcmodel=large`. |
 | `-mabi=NAME` | ABI for global, unresolved, and indirect calls (normally the Cross ABI). |
@@ -160,6 +160,8 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | --- | --- |
 | `--print-targets` | Compiled-in architectures and their triples. |
 | `--print-profiles`, `--print-abis` (`-mabi=help`), `--print-manglings`, `--print-optimizations`, `--print-models` | Model entries. |
+| `--print-cpus` | The target's CPU entries with their parents, features, and issue widths. |
+| `--print-costs` | The latency, issue cost, and availability of each of the target's instructions for `-march` and `-mtune`: a `cpu: NAME  tune: NAME  issue_width: N` line, then one `INSTRUCTION  latency: N  issue: N  available: yes` (or `no`) line per instruction. |
 | `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |
 | `--print-keywords`, `--print-builtins`, `--print-attributes` | The language surface. |
 | `--print-features`, `--print-instructions`, `--print-registers` | Target feature queries, machine instructions, and register names. |

@@ -43,8 +43,9 @@ struct TargetFeatureId {
 };
 
 // These tables belong to a target implementation, not the driver.  Adding an
-// architecture therefore only requires registering its TargetInfo and a
-// matching SubtargetTable (until the table is embedded in TargetInfo itself).
+// architecture therefore only requires registering its TargetInfo, a
+// matching SubtargetTable (until the table is embedded in TargetInfo itself),
+// and `cpu` model entries for its CPUs.
 struct SubtargetFeature {
     std::string_view name;
     bool enabled_by_default{};
@@ -56,15 +57,9 @@ struct SubtargetFeature {
     std::vector<std::string_view> conflicts;
 };
 
-struct SubtargetCpu {
-    std::string_view name;
-    std::vector<std::string_view> enabled_features;
-};
-
 struct SubtargetTable {
     std::string_view architecture;
     std::vector<SubtargetFeature> features;
-    std::vector<SubtargetCpu> cpus;
 };
 
 class Subtarget {
@@ -95,14 +90,34 @@ public:
         TargetFeatureId feature) const;
     [[nodiscard]] unsigned integer_constant_materialization_cost(
         const IntegerConstantCostQuery& query) const;
-    [[nodiscard]] std::optional<unsigned> integer_division_cost(
-        const IntegerOperationCostQuery& query) const;
-    [[nodiscard]] std::optional<unsigned> integer_multiply_high_cost(
+    // The sum of the -mtune latencies of the operation's instructions, or
+    // no value when the instruction set or the -march CPU has none.
+    [[nodiscard]] std::optional<unsigned> integer_operation_cost(
+        CostedIntegerOperation operation,
         const IntegerOperationCostQuery& query) const;
     [[nodiscard]] floating::NanEncoding nan_encoding() const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;
     }
+
+    [[nodiscard]] const InstructionCost& instruction_cost(
+        InstructionCostId instruction) const {
+        return instruction_costs_[instruction.value];
+    }
+    [[nodiscard]] unsigned latency(InstructionCostId instruction) const {
+        return instruction_costs_[instruction.value].latency;
+    }
+    [[nodiscard]] bool has_instruction(InstructionCostId instruction) const {
+        return instruction_costs_[instruction.value].available;
+    }
+    // Whether the -march CPU lacks any instruction its features allow.
+    [[nodiscard]] bool lacks_instructions() const {
+        return lacks_instructions_;
+    }
+    [[nodiscard]] unsigned issue_width() const { return issue_width_; }
+    // The first feature, or the instruction, that makes `form` unusable.
+    [[nodiscard]] std::optional<InstructionFeatureConflict> form_conflict(
+        const InstructionEntry& form) const;
 
 private:
     Subtarget() = default;
@@ -116,6 +131,9 @@ private:
     std::string tune_;
     std::vector<std::string> enabled_features_;
     std::vector<std::uint64_t> enabled_feature_words_;
+    std::vector<InstructionCost> instruction_costs_;
+    bool lacks_instructions_{};
+    unsigned issue_width_{1};
 };
 
 // Built-in table selected for a compiled-in target.  It is intentionally

@@ -3,6 +3,7 @@
 #include "target/x86_64/target.hpp"
 
 #include "target/subtarget.hpp"
+#include "target/x86_64/instructions.hpp"
 #include "target/x86_64/manual_endpoint.hpp"
 
 namespace cross {
@@ -70,18 +71,29 @@ unsigned integer_constant_materialization_cost(
                : 1U;
 }
 
-// DIV/IDIV and the one-operand MUL/IMUL; wider values are expanded inline.
-std::optional<unsigned> integer_division_cost(
-    const Subtarget&, const IntegerOperationCostQuery& query) {
-    if (query.bits == 32) return 26U;
-    if (query.bits == 64) return 40U;
-    return std::nullopt;
-}
-
-std::optional<unsigned> integer_multiply_high_cost(
-    const Subtarget&, const IntegerOperationCostQuery& query) {
-    if (query.bits == 32 || query.bits == 64) return 3U;
-    return std::nullopt;
+// IMUL, the one-operand MUL/IMUL, and DIV/IDIV; wider values are expanded
+// inline.
+std::vector<InstructionCostId> integer_operation_instructions(
+    const Subtarget&, CostedIntegerOperation operation,
+    const IntegerOperationCostQuery& query) {
+    using x86_64::Instruction;
+    const bool wide = query.bits == 64;
+    switch (operation) {
+    case CostedIntegerOperation::Multiply:
+        if (query.bits > 64) return {};
+        return {wide ? Instruction::Imulq
+                : query.bits == 16 ? Instruction::Imulw
+                                   : Instruction::Imull};
+    case CostedIntegerOperation::MultiplyHigh:
+        if (query.bits != 32 && !wide) return {};
+        return {query.is_signed ? (wide ? Instruction::Imulq : Instruction::Imull)
+                                : (wide ? Instruction::Mulq : Instruction::Mull)};
+    case CostedIntegerOperation::Divide:
+        if (query.bits != 32 && !wide) return {};
+        return {query.is_signed ? (wide ? Instruction::Idivq : Instruction::Idivl)
+                                : (wide ? Instruction::Divq : Instruction::Divl)};
+    }
+    return {};
 }
 
 InstructionOperandEntry integer_register_operand(
@@ -926,61 +938,22 @@ const SubtargetTable subtargets{
         {"avx512bitalg", false, true, {"avx512bw"}, {}},
         {"avx512vpopcntdq", false, true, {"avx512f"}, {}},
     },
-    {
-        {"generic", {"base"}},
-        {"x86-64", {"base"}},
-        {"x86-64-v2", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                        "popcnt", "cx16"}},
-        {"x86-64-v3", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                        "popcnt", "avx", "f16c", "fma", "avx2", "bmi",
-                        "bmi2", "lzcnt", "movbe", "cx16", "xsave"}},
-        {"x86-64-v4", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                        "popcnt", "avx", "f16c", "fma", "avx2", "bmi",
-                        "bmi2", "lzcnt", "movbe", "avx512f", "avx512dq",
-                        "avx512cd", "avx512bw", "avx512vl", "cx16",
-                        "xsave"}},
-        {"haswell", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                     "popcnt", "aes", "pclmul", "avx", "f16c", "fma",
-                     "avx2", "bmi", "bmi2", "lzcnt", "movbe", "rdrnd",
-                     "cx16", "xsave", "xsaveopt", "fsgsbase", "rdtscp",
-                     "invpcid"}},
-        {"skylake", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                     "popcnt", "aes", "pclmul", "avx", "f16c", "fma",
-                     "avx2", "bmi", "bmi2", "lzcnt", "movbe", "adx",
-                     "rdrnd", "rdseed", "cx16", "xsave", "xsaveopt",
-                     "xsavec", "xsaves", "fsgsbase", "rdtscp", "pku",
-                     "clflushopt", "invpcid"}},
-        {"skylake-avx512",
-         {"base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt",
-          "aes", "pclmul", "avx", "f16c", "fma", "avx2", "bmi",
-          "bmi2", "lzcnt", "movbe", "adx", "rdrnd", "rdseed",
-          "avx512f", "avx512dq",
-          "avx512cd", "avx512bw", "avx512vl", "cx16", "xsave",
-          "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp", "pku",
-          "clflushopt", "invpcid"}},
-        {"znver1", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                    "popcnt", "aes", "pclmul", "avx", "f16c", "fma",
-                    "avx2", "bmi", "bmi2", "lzcnt", "movbe", "adx",
-                    "rdrnd", "rdseed", "sha", "cx16", "xsave",
-                    "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
-                    "prefetchw", "monitor"}},
-        {"znver2", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                    "popcnt", "aes", "pclmul", "avx", "f16c", "fma",
-                    "avx2", "bmi", "bmi2", "lzcnt", "movbe", "adx",
-                    "rdrnd", "rdseed", "sha", "cx16", "xsave",
-                    "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
-                    "rdpid", "prefetchw", "monitor", "clwb"}},
-        {"znver3", {"base", "sse3", "ssse3", "sse4.1", "sse4.2",
-                    "popcnt", "aes", "pclmul", "avx", "f16c", "fma",
-                    "avx2", "bmi", "bmi2", "lzcnt", "movbe", "adx",
-                    "rdrnd", "rdseed", "sha", "gfni", "vaes",
-                    "vpclmulqdq", "cx16", "xsave", "xsaveopt", "xsavec",
-                    "xsaves", "fsgsbase", "rdtscp", "rdpid", "prefetchw",
-                    "monitor", "clwb"}},
-    },
 };
 
-const TargetInfo target{
+std::vector<InstructionCostEntry> declared_instructions() {
+    return {
+#define X(name, spelling, latency) {spelling, latency},
+#include "target/x86_64/instructions.def"
+#undef X
+    };
+}
+
+TargetInfo with_instruction_costs(TargetInfo info) {
+    set_instruction_costs(info, declared_instructions());
+    return info;
+}
+
+const TargetInfo target = with_instruction_costs({
     "x86-64",
     {"x86_64", "amd64"},
     {ByteOrder::Little, 16, 16, 16,
@@ -2811,13 +2784,12 @@ const TargetInfo target{
          "preferred maximum width for internal vector operations"},
     },
     &subtargets,
-    {integer_constant_materialization_cost, integer_division_cost,
-     integer_multiply_high_cost},
+    {integer_constant_materialization_cost, integer_operation_instructions},
     {{0, 0, 0, 0, true, true, true, true, false, true, true}},
     {{64, 64, "integer", {0}, {1, 2, 4, 8}, {"rsp"}, 32, "base"}},
     {{"integer128", {}}, {"binary128_storage", {}}, {"binary128_arithmetic", {}},
      {"fixed_vectors", {}}, {"atomics", {}}, {"variadics", {}}, {"thread_local", {}}},
-};
+});
 
 } // namespace
 

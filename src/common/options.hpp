@@ -222,6 +222,8 @@ struct CompilerOptions {
     bool print_profiles{};
     bool print_manglings{};
     bool print_optimizations{};
+    bool print_cpus{};
+    bool print_costs{};
     bool print_options{};
     std::string print_options_category{"all"};
     bool print_attributes{};

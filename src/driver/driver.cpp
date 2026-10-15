@@ -108,8 +108,7 @@ void install_evaluation_layout_queries(Program& current, const TargetInfo* targe
             ? current.address_bits : type_bits(type);
         for (const auto* form : find_instruction_forms(*target, instruction)) {
             if (form->operands.size() != count || index >= count ||
-                instruction_feature_conflict(*form,
-                    [&](std::string_view feature) { return subtarget.supports_registry_feature(feature); })) continue;
+                subtarget.form_conflict(*form)) continue;
             const auto& operand = form->operands[index];
             if (patch_operand_accepts_type(operand, name, bits)) candidates.push_back({
                 patch_address_type(operand.patch_address, current.address_bits), operand.patch_supports_symbol_relocation,
@@ -333,6 +332,44 @@ void print_optimizations() {
                       << option_value_text(option.value) << '\n';
         }
     }
+}
+
+void print_cpus(const CompilerOptions& options) {
+    const auto* target = target_for_triple(options.target);
+    if (!target) return;
+    for (const auto& cpu : model_registry().cpus()) {
+        if (cpu.architecture != target->architecture) continue;
+        const auto resolved = model_registry().resolve_cpu(*target, cpu);
+        std::cout << cpu.canonical_name;
+        if (cpu.inherits) std::cout << "  inherits: " << *cpu.inherits;
+        std::cout << "  features: ";
+        for (std::size_t index = 0; index < resolved.features.size();
+             ++index) {
+            std::cout << (index == 0 ? "" : ",") << resolved.features[index];
+        }
+        std::cout << "  issue_width: " << resolved.issue_width
+                  << "  source: " << cpu.source << '\n';
+    }
+}
+
+bool print_costs(const CompilerOptions& options, Diagnostics& diagnostics) {
+    const auto* target = target_for_triple(options.target);
+    if (!target) return true;
+    const auto subtarget = resolve_subtarget(*target, options, diagnostics);
+    if (!subtarget) return false;
+    std::cout << "cpu: " << subtarget->cpu() << "  tune: " << subtarget->tune()
+              << "  issue_width: " << subtarget->issue_width() << '\n';
+    for (std::size_t index = 0; index < target->instruction_costs.size();
+         ++index) {
+        const auto& cost = subtarget->instruction_cost(
+            InstructionCostId{static_cast<std::uint16_t>(index)});
+        std::cout << target->instruction_costs[index].name
+                  << "  latency: " << cost.latency
+                  << "  issue: " << cost.issue
+                  << "  available: " << (cost.available ? "yes" : "no")
+                  << '\n';
+    }
+    return true;
 }
 
 void print_options(const CompilerOptions& options) {
@@ -922,6 +959,8 @@ int cc_main(int argc, char** argv) {
     if (options.print_profiles) { print_profiles(); return 0; }
     if (options.print_manglings) { print_manglings(); return 0; }
     if (options.print_optimizations) { print_optimizations(); return 0; }
+    if (options.print_cpus) { print_cpus(options); return 0; }
+    if (options.print_costs) return print_costs(options, diagnostics) ? 0 : 1;
     if (options.print_options) { print_options(options); return 0; }
     if (options.print_attributes) { print_attributes(); return 0; }
     if (options.print_registers) { print_registers(options); return 0; }

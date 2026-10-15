@@ -12,6 +12,7 @@
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
 #include "target/x86_64/features.hpp"
+#include "target/x86_64/instructions.hpp"
 #include "target/x86_64/machine_description.hpp"
 #include "target/x86_64/target.hpp"
 
@@ -35,6 +36,18 @@
 
 namespace cross::x86_64 {
 namespace {
+
+// BMI2 shifts take their count in any register where the -march CPU has
+// them; the legacy forms take it in CL.
+bool selects_bmi2_shifts(const Subtarget& subtarget) {
+    if (!subtarget.has_feature(Feature::Bmi2)) return false;
+    for (const auto shift : {Instruction::Shlxl, Instruction::Shlxq,
+                             Instruction::Sarxl, Instruction::Sarxq,
+                             Instruction::Shrxl, Instruction::Shrxq}) {
+        if (!subtarget.has_instruction(shift)) return false;
+    }
+    return true;
+}
 
 AssemblySymbolVisibility assembly_visibility(
     hir::SymbolVisibility visibility) {
@@ -5669,18 +5682,27 @@ private:
                 ++indegree[update->second];
             }
         }
-        const auto estimated_latency = [](const machine::Instruction& value) {
+        const auto estimated_latency = [&](const machine::Instruction& value) {
             // Model a cache hit as a multi-cycle operation so the list
             // scheduler starts independent loads before consuming either
             // result.  The exact hardware latency varies, but four cycles is
             // a useful dependency-ordering estimate on every supported
-            // x86-64 tuning profile.
+            // x86-64 tuning profile; a memory operand has no instruction of
+            // its own to cost.
             if (value.may_load) return 4U;
-            if (value.opcode == Opcode::Mul) return 3U;
+            if (value.opcode == Opcode::Mul) {
+                const auto bits = value.defs.empty()
+                    ? 64U : value.defs.front().mode.bits;
+                return subtarget_.latency(
+                    bits == 64 ? Instruction::Imulq
+                    : bits == 16 ? Instruction::Imulw : Instruction::Imull);
+            }
             if (value.opcode == Opcode::LabelAddress ||
                 value.opcode == Opcode::StackAddress ||
                 value.opcode == Opcode::GlobalAddress ||
-                value.opcode == Opcode::IndexedAddress) return 2U;
+                value.opcode == Opcode::IndexedAddress) {
+                return subtarget_.latency(Instruction::Leaq);
+            }
             return 1U;
         };
         std::vector<unsigned> critical_height(count);
@@ -7234,7 +7256,7 @@ private:
                 // live range.
                 const bool destructive_right_must_differ =
                     base == Opcode::Sub ||
-                    ((!subtarget_.has_feature(Feature::Bmi2)) &&
+                    ((!selects_bmi2_shifts(subtarget_)) &&
                      (base == Opcode::Shl || base == Opcode::ShrS ||
                       base == Opcode::ShrU)) ||
                     ((!subtarget_.has_feature(Feature::Avx)) &&
@@ -7524,7 +7546,7 @@ private:
                      item->opcode == Opcode::ShrU) &&
                     !item->uses.empty() &&
                     !(item->uses.front().mode.bits >= 32 &&
-                      subtarget_.has_feature(Feature::Bmi2));
+                      selects_bmi2_shifts(subtarget_));
                 const bool count_in_cl =
                     item->opcode == Opcode::Rotl ||
                     item->opcode == Opcode::Rotr || legacy_shift;
@@ -8270,7 +8292,7 @@ private:
             (direct_result_view->storage_name == "rax" ||
              direct_result_view->storage_name == "rcx");
         const bool extra_integer_colors_safe =
-            (subtarget_.has_feature(Feature::Bmi2) ||
+            (selects_bmi2_shifts(subtarget_) ||
              dynamic_integer_endpoint_safe) &&
             integer_opcode_set_safe;
         if (extra_integer_colors_safe) {
@@ -10103,7 +10125,16 @@ public:
           options_(options),
           diagnostics_(diagnostics),
           format_(subtarget.object_format()),
-          debug_(debug && debug->active() ? debug : nullptr) {}
+          debug_(debug && debug->active() ? debug : nullptr) {
+        if (!subtarget.lacks_instructions()) return;
+        const auto& instructions = subtarget.target().instruction_costs;
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            if (!subtarget.has_instruction(
+                    InstructionCostId{static_cast<std::uint16_t>(index)})) {
+                unavailable_.insert(instructions[index].name);
+            }
+        }
+    }
 
     void prepare_frames() {
         if (unwind_enabled() || options_.unwind_model != UnwindModel::None) return;
@@ -11718,6 +11749,14 @@ private:
 
     void instruction(std::string_view opcode,
                      std::string_view operands = {}) {
+        if (unavailable_.contains(opcode) &&
+            reported_unavailable_.insert(std::string(opcode)).second) {
+            diagnostics_.error(pending_location_,
+                               "this operation needs instruction '" +
+                                   std::string(opcode) + "', which CPU '" +
+                                   std::string(subtarget_.cpu()) +
+                                   "' does not have");
+        }
         if (debug_) debug_->row(output_, pending_location_, pending_site_);
         output_ << '\t' << opcode;
         if (!operands.empty()) output_ << '\t' << operands;
@@ -19860,7 +19899,7 @@ private:
             const auto opcode =
                 value.opcode == Opcode::Shl ? "shl" :
                 value.opcode == Opcode::ShrS ? "sar" : "shr";
-            if (bits >= 32 && subtarget_.has_feature(Feature::Bmi2)) {
+            if (bits >= 32 && selects_bmi2_shifts(subtarget_)) {
                 const auto left_register = source_register(left, "rax");
                 const auto right_register = source_register(right, "rcx");
                 const auto* assigned_target =
@@ -24794,6 +24833,9 @@ private:
     // innermost inlined call they come from.
     SourceLocation pending_location_;
     std::optional<mir::InlineSiteId> pending_site_;
+    // The instructions the -march CPU lacks, and those already reported.
+    std::unordered_set<std::string_view> unavailable_;
+    std::unordered_set<std::string> reported_unavailable_;
     bool cfi_{};
     // Inside a legacy frame's exit, between remember and restore.
     bool cfi_exit_{};

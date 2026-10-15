@@ -398,8 +398,21 @@ std::string Preprocessor::evaluate_query(
         }
         return enabled;
     };
+    // The -march CPU entry decides which instructions its features allow.
+    const auto* cpu = target
+        ? model_registry().find_cpu(target->architecture, options_.cpu)
+        : nullptr;
+    std::optional<ResolvedCpu> cpu_model;
     const auto instruction_enabled = [&](const InstructionEntry& instruction) {
-        return !instruction_feature_conflict(instruction, feature_enabled);
+        if (instruction_feature_conflict(instruction, feature_enabled)) {
+            return false;
+        }
+        if (!cpu) return true;
+        if (!cpu_model) cpu_model = model_registry().resolve_cpu(*target, *cpu);
+        return cpu_model
+            ->instructions[target->form_instructions[instruction_form_id(
+                               *target, instruction).value].value]
+            .available;
     };
     const auto scalar_bits = [address_bits](std::string_view type) {
         if (type == "bool" || type == "i8" || type == "u8") return 8u;

@@ -141,10 +141,10 @@ private:
         return subtarget_.supports_registry_feature(feature);
     }
 
-    std::optional<std::string_view> missing_feature(
+    std::optional<InstructionFeatureConflict> missing_feature(
         const InstructionEntry& instruction) const {
         if (!feature_enabled(instruction.feature)) {
-            return instruction.feature;
+            return InstructionFeatureConflict{instruction.feature};
         }
         const auto missing = std::find_if(
             instruction.required_features.begin(),
@@ -152,9 +152,11 @@ private:
             [&](std::string_view feature) {
                 return !feature_enabled(feature);
             });
-        return missing == instruction.required_features.end()
-                   ? std::nullopt
-                   : std::optional<std::string_view>(*missing);
+        if (missing != instruction.required_features.end()) {
+            return InstructionFeatureConflict{*missing};
+        }
+        const auto conflict = subtarget_.form_conflict(instruction);
+        return conflict && conflict->unavailable ? conflict : std::nullopt;
     }
 
     struct RawMemoryAddress {
@@ -315,7 +317,7 @@ private:
 
         std::vector<const InstructionEntry*> arity_matches;
         std::vector<const InstructionEntry*> available_matches;
-        std::optional<std::string_view> first_missing_feature;
+        std::optional<InstructionFeatureConflict> first_missing_feature;
         for (const auto* form : forms) {
             if (form->operands.size() != arguments.size()) continue;
             arity_matches.push_back(form);
@@ -343,8 +345,10 @@ private:
         if (first_missing_feature) {
             diagnostics_.error(location,
                                "target instruction '" + std::string(name) +
-                                   "' requires feature '" +
-                                   std::string(*first_missing_feature) + "'");
+                                   "' " +
+                                   instruction_conflict_reason(
+                                       *first_missing_feature,
+                                       subtarget_.cpu()));
             return nullptr;
         }
         if (arity_matches.empty()) {

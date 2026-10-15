@@ -198,7 +198,11 @@ struct ModelDocument {
     std::vector<OptimizationEntry> optimizations;
     std::vector<ProfileEntry> profiles;
     std::vector<DebugEntry> debugs;
+    std::vector<CpuEntry> cpus;
 };
+
+// Instruction costs are cycle counts that cost sums must not overflow.
+constexpr unsigned max_cpu_cost = 65535;
 
 class ModelParser {
 public:
@@ -211,7 +215,7 @@ public:
             if (current_.kind != ModelTokenKind::Identifier) {
                 fail(current_.line,
                      "expected model domain: abi, mangling, optimization, "
-                     "profile, or debug");
+                     "profile, debug, or cpu");
                 break;
             }
             const auto domain = current_.text;
@@ -219,7 +223,7 @@ public:
             advance();
             if (domain != "abi" && domain != "mangling" &&
                 domain != "optimization" && domain != "profile" &&
-                domain != "debug") {
+                domain != "debug" && domain != "cpu") {
                 fail(line, "unknown model domain '" + domain + "'");
                 break;
             }
@@ -243,6 +247,13 @@ public:
                 if (auto entry = parse_abi(std::move(name), line)) {
                     entry->source = position(line);
                     result.abis.push_back(std::move(*entry));
+                }
+                continue;
+            }
+            if (domain == "cpu") {
+                if (auto entry = parse_cpu(std::move(name), line)) {
+                    entry->source = position(line);
+                    result.cpus.push_back(std::move(*entry));
                 }
                 continue;
             }
@@ -2483,6 +2494,166 @@ private:
         return result;
     }
 
+    std::optional<CpuEntry> parse_cpu(std::string name, unsigned entry_line) {
+        ModelProperties properties;
+        std::vector<AbiNestedBlock> blocks;
+        while (current_.kind != ModelTokenKind::RightBrace &&
+               current_.kind != ModelTokenKind::End) {
+            if (current_.kind != ModelTokenKind::Identifier) {
+                fail(current_.line, "expected cpu property or instruction");
+                return std::nullopt;
+            }
+            if (current_.text != "instruction") {
+                if (!parse_property(properties)) return std::nullopt;
+                continue;
+            }
+            const auto line = current_.line;
+            advance();
+            if (current_.kind != ModelTokenKind::String) {
+                fail(current_.line, "expected quoted instruction name");
+                return std::nullopt;
+            }
+            auto block_name = current_.text;
+            advance();
+            if (!expect(ModelTokenKind::LeftBrace,
+                        "'{' after instruction name")) {
+                return std::nullopt;
+            }
+            auto block_properties = parse_properties();
+            if (!block_properties) return std::nullopt;
+            blocks.push_back(
+                {std::move(block_name), std::move(*block_properties), line});
+        }
+        if (!expect(ModelTokenKind::RightBrace, "'}' after cpu entry")) {
+            return std::nullopt;
+        }
+        return make_cpu(std::move(name), properties, blocks, entry_line);
+    }
+
+    // An integer cost from `minimum` through max_cpu_cost.
+    std::optional<unsigned> cost_property(const ModelProperties& properties,
+                                          std::string_view name,
+                                          unsigned minimum) {
+        const auto value = unsigned_property(properties, name);
+        if (value && (*value < minimum || *value > max_cpu_cost)) {
+            fail(properties.at(std::string(name)).line,
+                 "model property '" + std::string(name) + "' must be from " +
+                     std::to_string(minimum) + " to " +
+                     std::to_string(max_cpu_cost));
+            return std::nullopt;
+        }
+        return value;
+    }
+
+    // Each feature is a target feature; enabled with its prerequisites, no
+    // two conflict.
+    bool cpu_features(const TargetInfo& target,
+                      const std::vector<std::string>& features,
+                      unsigned line) {
+        const auto& table = target.subtargets->features;
+        // The index of a feature, or the table size.
+        const auto find = [&](std::string_view name) {
+            return static_cast<std::size_t>(
+                std::find_if(table.begin(), table.end(),
+                             [&](const SubtargetFeature& feature) {
+                                 return feature.name == name;
+                             }) -
+                table.begin());
+        };
+        std::vector<bool> enabled(table.size());
+        std::vector<std::string_view> pending;
+        for (const auto& name : features) {
+            if (find(name) == table.size()) {
+                fail(line, "unknown " + std::string(target.architecture) +
+                               " feature '" + name + "'");
+                return false;
+            }
+            if (std::count(features.begin(), features.end(), name) > 1) {
+                fail(line, "cpu features list '" + name + "' twice");
+                return false;
+            }
+            pending.push_back(name);
+        }
+        while (!pending.empty()) {
+            const auto index = find(pending.back());
+            pending.pop_back();
+            if (index == table.size() || enabled[index]) continue;
+            enabled[index] = true;
+            pending.insert(pending.end(), table[index].prerequisites.begin(),
+                           table[index].prerequisites.end());
+        }
+        for (std::size_t index = 0; index < table.size(); ++index) {
+            if (!enabled[index]) continue;
+            for (const auto conflict : table[index].conflicts) {
+                const auto other = find(conflict);
+                if (other != table.size() && enabled[other]) {
+                    fail(line, "cpu features '" +
+                                   std::string(table[index].name) + "' and '" +
+                                   std::string(conflict) + "' conflict");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    std::optional<CpuEntry> make_cpu(
+        std::string name, const ModelProperties& properties,
+        const std::vector<AbiNestedBlock>& blocks, unsigned line) {
+        if (!known_properties(properties, {"architecture", "inherits",
+                                           "features", "issue_width"})) {
+            return std::nullopt;
+        }
+        CpuEntry result;
+        result.canonical_name = std::move(name);
+        const auto architecture =
+            text_property(properties, "architecture", line);
+        if (!architecture) return std::nullopt;
+        const auto* target = architecture_target(*architecture);
+        if (!target) {
+            fail(properties.at("architecture").line,
+                 "unknown architecture '" + *architecture + "'");
+            return std::nullopt;
+        }
+        result.architecture = *architecture;
+        result.inherits = text_property(properties, "inherits");
+        if (auto features = list_property(properties, "features")) {
+            if (!cpu_features(*target, *features,
+                              properties.at("features").line)) {
+                return std::nullopt;
+            }
+            result.features = std::move(*features);
+        }
+        result.issue_width = cost_property(properties, "issue_width", 1);
+        for (const auto& block : blocks) {
+            const auto instruction = find_instruction_cost(*target, block.name);
+            if (!instruction) {
+                fail(block.line, "unknown " + *architecture +
+                                     " instruction '" + block.name + "'");
+                return std::nullopt;
+            }
+            if (std::any_of(result.instructions.begin(),
+                            result.instructions.end(),
+                            [&](const CpuInstructionEntry& entry) {
+                                return entry.instruction == *instruction;
+                            })) {
+                fail(block.line,
+                     "duplicate instruction '" + block.name + "'");
+                return std::nullopt;
+            }
+            if (!known_properties(block.properties,
+                                  {"latency", "issue", "available"})) {
+                return std::nullopt;
+            }
+            result.instructions.push_back(
+                {*instruction, cost_property(block.properties, "latency", 0),
+                 cost_property(block.properties, "issue", 1),
+                 bool_property(block.properties, "available")});
+        }
+        if (!error_.empty()) return std::nullopt;
+        return result;
+    }
+
     bool floating_environment(const ModelProperties& properties,
                               floating::Environment& result) {
         using floating::Exception;
@@ -2665,6 +2836,22 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
         !unique_names(debugs_, document->debugs, "debug")) {
         return false;
     }
+    // CPU names are unique per architecture.
+    std::unordered_set<std::string> cpu_names;
+    for (const auto& entry : cpus_) {
+        cpu_names.insert(entry.architecture + '\n' + entry.canonical_name);
+    }
+    for (const auto& entry : document->cpus) {
+        if (cpu_names.insert(entry.architecture + '\n' + entry.canonical_name)
+                .second) {
+            continue;
+        }
+        diagnostics.file_error(entry.source,
+                               "duplicate " + entry.architecture +
+                                   " cpu model '" + entry.canonical_name +
+                                   "'");
+        return false;
+    }
 
     const auto abi_capacity = static_cast<std::size_t>(AbiId::invalid_value);
     if (abis_.size() > abi_capacity ||
@@ -2704,6 +2891,9 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     }
     for (auto& entry : document->debugs) {
         debugs_.push_back(std::move(entry));
+    }
+    for (auto& entry : document->cpus) {
+        cpus_.push_back(std::move(entry));
     }
     origins_.push_back(std::move(origin));
     return true;
@@ -2832,6 +3022,46 @@ const DebugEntry* ModelRegistry::find_debug(std::string_view name) const {
     return nullptr;
 }
 
+const CpuEntry* ModelRegistry::find_cpu(std::string_view architecture,
+                                        std::string_view name) const {
+    for (const auto& entry : cpus_) {
+        if (entry.architecture == architecture && entry.canonical_name == name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+ResolvedCpu ModelRegistry::resolve_cpu(const TargetInfo& target,
+                                       const CpuEntry& entry) const {
+    // Loading checked that every chain of parents ends; values apply from
+    // the root down.
+    std::vector<const CpuEntry*> chain;
+    for (const auto* item = &entry; item && chain.size() <= cpus_.size();
+         item = item->inherits ? find_cpu(item->architecture, *item->inherits)
+                               : nullptr) {
+        chain.push_back(item);
+    }
+    ResolvedCpu result;
+    for (const auto& instruction : target.instruction_costs) {
+        result.instructions.push_back(
+            {instruction.latency, instruction.issue, true});
+    }
+    for (auto item = chain.rbegin(); item != chain.rend(); ++item) {
+        if ((*item)->features) result.features = *(*item)->features;
+        if ((*item)->issue_width) result.issue_width = *(*item)->issue_width;
+        for (const auto& block : (*item)->instructions) {
+            const auto& defaults =
+                target.instruction_costs[block.instruction.value];
+            result.instructions[block.instruction.value] = {
+                block.latency.value_or(defaults.latency),
+                block.issue.value_or(defaults.issue),
+                block.available.value_or(true)};
+        }
+    }
+    return result;
+}
+
 ModelRegistry& model_registry() {
     static ModelRegistry registry;
     return registry;
@@ -2901,6 +3131,36 @@ bool check_options(std::span<const OptionAssignment> options,
     return true;
 }
 
+// An m.arch or m.tune property names a cpu entry of each of `targets`, or,
+// when `targets` is empty, of some compiled-in target.
+bool check_cpu_options(const ModelRegistry& registry,
+                       std::span<const OptionAssignment> options,
+                       std::span<const TargetInfo* const> targets,
+                       Diagnostics& diagnostics) {
+    for (const auto& option : options) {
+        const auto* name = std::get_if<std::string>(&option.value);
+        if ((option.name != "m.arch" && option.name != "m.tune") || !name) {
+            continue;
+        }
+        const auto known = [&](const TargetInfo* target) {
+            return registry.find_cpu(target->architecture, *name) != nullptr;
+        };
+        const auto candidates =
+            targets.empty() ? std::span<const TargetInfo* const>(all_targets())
+                            : targets;
+        if (targets.empty() ? std::none_of(candidates.begin(),
+                                           candidates.end(), known)
+                            : !std::all_of(candidates.begin(),
+                                           candidates.end(), known)) {
+            diagnostics.file_error(option.source,
+                                   "unknown cpu '" + *name + "' for option '" +
+                                       option.name + "'");
+            return false;
+        }
+    }
+    return true;
+}
+
 // Checks the names that presets and profiles use, once every file is loaded:
 // parents, architectures, targets, ABIs, manglings, presets, and options.
 bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
@@ -2940,7 +3200,9 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             }
             targets.push_back(target);
         }
-        if (!check_options(preset.options, targets, true, diagnostics)) {
+        if (!check_options(preset.options, targets, true, diagnostics) ||
+            !check_cpu_options(registry, preset.options, targets,
+                               diagnostics)) {
             return false;
         }
     }
@@ -2994,8 +3256,42 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
         const std::span<const TargetInfo* const> targets =
             target ? std::span<const TargetInfo* const>(&target, 1)
                    : std::span<const TargetInfo* const>{};
-        if (!check_options(profile.options, targets, false, diagnostics)) {
+        if (!check_options(profile.options, targets, false, diagnostics) ||
+            !check_cpu_options(registry, profile.options, targets,
+                               diagnostics)) {
             return false;
+        }
+    }
+    for (const auto& cpu : registry.cpus()) {
+        if (!cpu.inherits) continue;
+        const auto fail = [&](std::string message) {
+            diagnostics.file_error(cpu.source, "cpu '" + cpu.canonical_name +
+                                                   "' " + std::move(message));
+            return false;
+        };
+        if (!registry.find_cpu(cpu.architecture, *cpu.inherits)) {
+            for (const auto& other : registry.cpus()) {
+                if (other.canonical_name == *cpu.inherits) {
+                    return fail("inherits '" + *cpu.inherits +
+                                "' of architecture " + other.architecture +
+                                ", not " + cpu.architecture);
+                }
+            }
+            return fail("inherits unknown cpu '" + *cpu.inherits + "'");
+        }
+        std::string cycle = cpu.canonical_name;
+        const auto* parent = &cpu;
+        for (std::size_t step = 0;
+             step < registry.cpus().size() && parent && parent->inherits;
+             ++step) {
+            parent = registry.find_cpu(cpu.architecture, *parent->inherits);
+            if (!parent) break;
+            cycle += " -> " + parent->canonical_name;
+            if (parent == &cpu) {
+                diagnostics.file_error(cpu.source,
+                                       "cpu inheritance cycle: " + cycle);
+                return false;
+            }
         }
     }
     return true;

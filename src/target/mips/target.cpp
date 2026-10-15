@@ -4,6 +4,7 @@
 
 #include "common/options.hpp"
 #include "target/mips/features.hpp"
+#include "target/mips/instructions.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
@@ -374,23 +375,34 @@ unsigned mips64_constant_materialization_cost(std::uint64_t value) {
     return cost;
 }
 
-// DIV/DIVU and MULT/MULTU at the word width, their D forms from MIPS III.
-// Before MIPS III a doubleword quotient is a pair-legalized software loop.
-std::optional<unsigned> integer_division_cost(
-    const Subtarget& subtarget, const IntegerOperationCostQuery& query) {
-    if (query.bits == 32) return 35U;
-    if (query.bits == 64 && subtarget.has_feature(mips::Feature::Mips3)) {
-        return 69U;
+// The multiply and divide unit: MULT/MULTU and DIV/DIVU, their D forms from
+// MIPS III, and the MFLO or MFHI that reads the result. Before MIPS III a
+// doubleword operation is a pair-legalized sequence.
+std::vector<InstructionCostId> integer_operation_instructions(
+    const Subtarget& subtarget, CostedIntegerOperation operation,
+    const IntegerOperationCostQuery& query) {
+    using mips::Instruction;
+    const bool wide = query.bits == 64;
+    if (wide && !subtarget.has_feature(mips::Feature::Mips3)) return {};
+    switch (operation) {
+    case CostedIntegerOperation::Multiply:
+        if (query.bits > 64) return {};
+        return {wide ? Instruction::Dmult : Instruction::Mult,
+                Instruction::Mflo};
+    case CostedIntegerOperation::MultiplyHigh:
+        if (query.bits != 32 && !wide) return {};
+        return {query.is_signed
+                    ? (wide ? Instruction::Dmult : Instruction::Mult)
+                    : (wide ? Instruction::Dmultu : Instruction::Multu),
+                Instruction::Mfhi};
+    case CostedIntegerOperation::Divide:
+        if (query.bits != 32 && !wide) return {};
+        return {query.is_signed
+                    ? (wide ? Instruction::Ddiv : Instruction::Div)
+                    : (wide ? Instruction::Ddivu : Instruction::Divu),
+                Instruction::Mflo};
     }
-    return std::nullopt;
-}
-
-std::optional<unsigned> integer_multiply_high_cost(
-    const Subtarget& subtarget, const IntegerOperationCostQuery& query) {
-    const bool mips3 = subtarget.has_feature(mips::Feature::Mips3);
-    if (query.bits == 32) return mips3 ? 6U : 12U;
-    if (query.bits == 64 && mips3) return 9U;
-    return std::nullopt;
+    return {};
 }
 
 unsigned integer_constant_materialization_cost(
@@ -457,50 +469,6 @@ const SubtargetTable subtargets{
         // FCSR.NAN2008: Release 2 FPUs may implement the IEEE 754-2008 NaN
         // encoding; earlier ones have only the legacy encoding.
         {"nan2008", false, true, {"mips32r2"}, {}},
-    },
-    {
-        {"generic", {"mips1", "hard-float", "fp32", "odd-spreg"}},
-        {"mips1", {"mips1", "hard-float", "fp32", "odd-spreg"}},
-        {"r2000", {"mips1", "hard-float", "fp32", "odd-spreg"}},
-        {"r3000", {"mips1", "hard-float", "fp32", "odd-spreg"}},
-        {"mips2", {"mips2", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely", "load-interlocks"}},
-        {"r6000", {"mips2", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely", "load-interlocks"}},
-        {"allegrex", {"mips2", "hard-float", "fp32", "single-float",
-                       "odd-spreg", "llsc", "branch-likely", "allegrex",
-                       "cond-move", "rotate", "load-interlocks",
-                       "fpu-transfer-interlocks", "hilo-interlocks"}},
-        {"mips3", {"mips3", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely", "load-interlocks"}},
-        {"r4000", {"mips3", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely", "load-interlocks"}},
-        {"r4400", {"mips3", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely", "load-interlocks"}},
-        {"r4600", {"mips3", "hard-float", "fp32", "odd-spreg",
-                    "llsc", "branch-likely", "load-interlocks"}},
-        {"vr4300", {"mips3", "hard-float", "fp32", "odd-spreg",
-                     "llsc", "branch-likely", "load-interlocks"}},
-        {"mips4", {"mips4", "hard-float", "fp64", "odd-spreg",
-                    "llsc", "branch-likely", "cond-move",
-                    "load-interlocks", "fpu-transfer-interlocks",
-                    "fpu-compare-interlocks"}},
-        {"mips5", {"mips5", "hard-float", "fp64", "odd-spreg",
-                    "llsc", "branch-likely", "cond-move",
-                    "load-interlocks", "fpu-transfer-interlocks",
-                    "fpu-compare-interlocks"}},
-        {"mips32", {"mips32", "hard-float", "fp32", "odd-spreg",
-                     "llsc", "branch-likely", "cond-move",
-                     "load-interlocks", "fpu-transfer-interlocks",
-                     "fpu-compare-interlocks", "hilo-interlocks"}},
-        {"mips32r2", {"mips32r2", "hard-float", "fp32", "odd-spreg",
-                       "llsc", "branch-likely", "cond-move", "rotate",
-                       "load-interlocks", "fpu-transfer-interlocks",
-                       "fpu-compare-interlocks", "hilo-interlocks"}},
-        {"mips64", {"mips64", "hard-float", "fp64", "odd-spreg",
-                     "llsc", "branch-likely", "cond-move",
-                     "load-interlocks", "fpu-transfer-interlocks",
-                     "fpu-compare-interlocks", "hilo-interlocks"}},
     },
 };
 
@@ -572,9 +540,17 @@ std::vector<OptionDefinition> target_options() {
     return result;
 }
 
+std::vector<InstructionCostEntry> declared_instructions() {
+    return {
+#define X(name, spelling, latency) {spelling, latency},
+#include "target/mips/instructions.def"
+#undef X
+    };
+}
+
 TargetInfo make_target(ByteOrder order,
                        std::vector<std::string_view> prefixes) {
-    return {
+    TargetInfo result{
         "mips", std::move(prefixes),
         {order, 8, 16, 8,
          order == ByteOrder::Big
@@ -603,8 +579,8 @@ TargetInfo make_target(ByteOrder order,
         {},
         target_options(),
         &subtargets,
-        {integer_constant_materialization_cost, integer_division_cost,
-         integer_multiply_high_cost},
+        {integer_constant_materialization_cost,
+         integer_operation_instructions},
         {{0, 0, 0, 0, true, true, true, true, false, true, true}},
         // Instruction memory operands are a GPR base plus a signed 16-bit
         // displacement; MIPS has no scaled index.
@@ -616,6 +592,8 @@ TargetInfo make_target(ByteOrder order,
         NakedLowering::Constrained,
         {{"$::sqrt", "$::_sqrt"}},
     };
+    set_instruction_costs(result, declared_instructions());
+    return result;
 }
 
 const TargetInfo big_endian = make_target(

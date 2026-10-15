@@ -146,6 +146,33 @@ struct DebugEntry {
     bool types{true};
 };
 
+// One `instruction` block of a cpu entry.
+struct CpuInstructionEntry {
+    InstructionCostId instruction;
+    std::optional<unsigned> latency;
+    std::optional<unsigned> issue;
+    std::optional<bool> available;
+};
+
+struct CpuEntry {
+    std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
+    std::string architecture;
+    std::optional<std::string> inherits;
+    std::optional<std::vector<std::string>> features;
+    std::optional<unsigned> issue_width;
+    std::vector<CpuInstructionEntry> instructions;
+};
+
+// A cpu entry with its parents applied.
+struct ResolvedCpu {
+    std::vector<std::string> features;
+    unsigned issue_width{1};
+    // By InstructionCostId; instructions no entry describes keep the
+    // target's defaults.
+    std::vector<InstructionCost> instructions;
+};
+
 struct ShippedModelSource {
     std::string_view name;
     std::string_view text;
@@ -172,6 +199,10 @@ public:
     [[nodiscard]] const OptimizationEntry* find_optimization(
         std::string_view name) const;
     [[nodiscard]] const DebugEntry* find_debug(std::string_view name) const;
+    [[nodiscard]] const CpuEntry* find_cpu(std::string_view architecture,
+                                           std::string_view name) const;
+    [[nodiscard]] ResolvedCpu resolve_cpu(const TargetInfo& target,
+                                          const CpuEntry& entry) const;
     // The profiles whose default_for patterns match `triple` most
     // specifically; more than one is an ambiguous default.
     [[nodiscard]] std::vector<const ProfileEntry*> default_profiles(
@@ -192,6 +223,7 @@ public:
     [[nodiscard]] const std::vector<DebugEntry>& debugs() const {
         return debugs_;
     }
+    [[nodiscard]] const std::vector<CpuEntry>& cpus() const { return cpus_; }
     [[nodiscard]] const std::vector<std::string>& origins() const {
         return origins_;
     }
@@ -205,6 +237,7 @@ private:
     std::vector<ProfileEntry> profiles_;
     std::vector<OptimizationEntry> optimizations_;
     std::vector<DebugEntry> debugs_;
+    std::vector<CpuEntry> cpus_;
     std::vector<std::string> origins_;
     std::unordered_set<std::string> loaded_files_;
 };

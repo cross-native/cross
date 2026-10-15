@@ -2136,6 +2136,15 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/debug_entries.cmake")
     set_tests_properties(cross_model_debug_entries PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;feature.model;feature.driver;feature.debug")
+    add_test(NAME cross_model_cpu_entries
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DROTATE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-cpu-entries
+                -P "${CMAKE_SOURCE_DIR}/test/model/cpu_entries.cmake")
+    set_tests_properties(cross_model_cpu_entries PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.optimization")
     add_test(NAME cross_mangling_dsl
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2731,6 +2740,58 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     set_tests_properties(cross_runtime_division_by_constant_llvm PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.llvm;middle;feature.optimization;opt.O2")
+    # Multiplication by a constant: shifts and additions where the multiply
+    # costs more, at the RISC end of the cost balance and with a one-cycle
+    # multiply that keeps the instruction.
+    set(multiplication_model ${CMAKE_SOURCE_DIR}/test/middle/fast_multiply.xm)
+    foreach(multiplication_mode O0 O2 O2-risc Os-risc O2-fastmul)
+        if(multiplication_mode STREQUAL "O2-risc")
+            set(multiplication_flags "-O2;-mrisc-cisc-balance=0")
+            set(multiplication_level O2)
+        elseif(multiplication_mode STREQUAL "Os-risc")
+            set(multiplication_flags "-Os;-mrisc-cisc-balance=0")
+            set(multiplication_level Os)
+        elseif(multiplication_mode STREQUAL "O2-fastmul")
+            set(multiplication_flags
+                "-O2;-mrisc-cisc-balance=0;--model=${multiplication_model};-mtune=fastmul")
+            set(multiplication_level O2)
+        else()
+            set(multiplication_flags "-${multiplication_mode}")
+            set(multiplication_level ${multiplication_mode})
+        endif()
+        add_test(NAME cross_runtime_multiplication_by_constant_${multiplication_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/multiplication_by_constant.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-multiplication-${multiplication_mode}
+                -DENTRY=multiplication_entry -DEXPECTED=0
+                "-DCC_FLAGS=${multiplication_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_multiplication_by_constant_${multiplication_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.model;opt.${multiplication_level}")
+    endforeach()
+    foreach(multiplication_mode O2 Os O2-fastmul)
+        if(multiplication_mode STREQUAL "O2-fastmul")
+            set(multiplication_flags
+                "-O2;--model=${multiplication_model};-mtune=fastmul")
+            set(multiplication_level O2)
+        else()
+            set(multiplication_flags "-${multiplication_mode}")
+            set(multiplication_level ${multiplication_mode})
+        endif()
+        add_test(NAME cross_runtime_multiplication_by_constant_mips_${multiplication_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/multiplication_by_constant.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/multiplication_by_constant_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-multiplication-mips-${multiplication_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${multiplication_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_multiplication_by_constant_mips_${multiplication_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;feature.model;isa.vr4300;endian.big;endian.little;opt.${multiplication_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     # Floating constant folding, constant-object reads, memory value
     # forwarding, conditional replacement, and shared store addresses.
     add_test(NAME cross_mir_folding_codegen

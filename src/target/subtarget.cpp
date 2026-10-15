@@ -4,6 +4,7 @@
 
 #include "common/diagnostic.hpp"
 #include "common/options.hpp"
+#include "model/model.hpp"
 #include "target/target.hpp"
 
 #include <algorithm>
@@ -27,9 +28,8 @@ const SubtargetFeature* find_feature(const SubtargetTable& table, std::string_vi
     return nullptr;
 }
 
-const SubtargetCpu* find_cpu(const SubtargetTable& table, std::string_view name) {
-    for (const auto& cpu : table.cpus) if (cpu.name == name) return &cpu;
-    return nullptr;
+const CpuEntry* find_cpu(const TargetInfo& target, std::string_view name) {
+    return model_registry().find_cpu(target.architecture, name);
 }
 
 } // namespace
@@ -63,18 +63,35 @@ unsigned Subtarget::integer_constant_materialization_cost(
                : 1U;
 }
 
-std::optional<unsigned> Subtarget::integer_division_cost(
+std::optional<unsigned> Subtarget::integer_operation_cost(
+    CostedIntegerOperation operation,
     const IntegerOperationCostQuery& query) const {
-    if (!target_ || !target_->cost_model.integer_division) return std::nullopt;
-    return target_->cost_model.integer_division(*this, query);
+    if (!target_ || !target_->cost_model.integer_operation) return std::nullopt;
+    const auto instructions =
+        target_->cost_model.integer_operation(*this, operation, query);
+    if (instructions.empty()) return std::nullopt;
+    unsigned cost{};
+    for (const auto instruction : instructions) {
+        if (!has_instruction(instruction)) return std::nullopt;
+        cost += latency(instruction);
+    }
+    return cost;
 }
 
-std::optional<unsigned> Subtarget::integer_multiply_high_cost(
-    const IntegerOperationCostQuery& query) const {
-    if (!target_ || !target_->cost_model.integer_multiply_high) {
-        return std::nullopt;
+std::optional<InstructionFeatureConflict> Subtarget::form_conflict(
+    const InstructionEntry& form) const {
+    if (auto conflict = instruction_feature_conflict(
+            form, [&](std::string_view feature) {
+                return supports_registry_feature(feature);
+            })) {
+        return conflict;
     }
-    return target_->cost_model.integer_multiply_high(*this, query);
+    if (lacks_instructions_ &&
+        !has_instruction(target_->form_instructions[instruction_form_id(
+            *target_, form).value])) {
+        return InstructionFeatureConflict{form.assembly_mnemonic, false, true};
+    }
+    return std::nullopt;
 }
 
 floating::NanEncoding Subtarget::nan_encoding() const {
@@ -128,7 +145,7 @@ bool normalize_subtarget_options(const TargetInfo& target,
     const auto* arch_option = find_resolved_option(options, "m.arch");
     const auto arch = std::string(
         resolved_text(options, "m.arch", options.cpu));
-    const auto* cpu = find_cpu(*table, arch);
+    const auto* cpu = find_cpu(target, arch);
     if (!cpu) {
         diagnostics.command_error(
             "unknown " + std::string(target.architecture) +
@@ -150,7 +167,7 @@ bool normalize_subtarget_options(const TargetInfo& target,
     }
     const auto tune = std::string(
         resolved_text(options, "m.tune", options.tune));
-    if (!find_cpu(*table, tune)) {
+    if (!find_cpu(target, tune)) {
         diagnostics.command_error(
             "unknown " + std::string(target.architecture) +
             " tuning CPU '" + tune + "'");
@@ -162,8 +179,9 @@ bool normalize_subtarget_options(const TargetInfo& target,
         states.emplace(std::string(feature.name),
                        feature.enabled_by_default);
     }
-    for (const auto feature : cpu->enabled_features) {
-        states[std::string(feature)] = true;
+    for (const auto& feature :
+         model_registry().resolve_cpu(target, *cpu).features) {
+        states[feature] = true;
     }
 
     const auto arch_origin = arch_option ? arch_option->origin
@@ -386,23 +404,25 @@ std::optional<Subtarget> resolve_subtarget(const TargetInfo& target,
                                   "' cannot be selected for a compilation");
         return std::nullopt;
     }
-    const auto* cpu = find_cpu(table, options.cpu);
+    const auto* cpu = find_cpu(target, options.cpu);
     if (!cpu) {
         diagnostics.command_error("unknown " + std::string(target.architecture) + " CPU '" +
                                   options.cpu + "'");
         return std::nullopt;
     }
-    const auto* tune = find_cpu(table, options.tune);
+    const auto* tune = find_cpu(target, options.tune);
     if (!tune) {
         diagnostics.command_error("unknown " +
                                   std::string(target.architecture) +
                                   " tuning CPU '" + options.tune + "'");
         return std::nullopt;
     }
+    const auto arch_model = model_registry().resolve_cpu(target, *cpu);
+    const auto tune_model = model_registry().resolve_cpu(target, *tune);
 
     std::unordered_map<std::string, bool> states;
     for (const auto& feature : table.features) states.emplace(std::string(feature.name), feature.enabled_by_default);
-    for (const auto feature : cpu->enabled_features) states[std::string(feature)] = true;
+    for (const auto& feature : arch_model.features) states[feature] = true;
     std::unordered_map<std::string, char> selections;
     std::unordered_map<std::string, std::string> unavailable_by;
 
@@ -510,8 +530,17 @@ std::optional<Subtarget> resolve_subtarget(const TargetInfo& target,
     result.abi_ = abi;
     result.table_ = &table;
     result.object_format_ = format;
-    result.cpu_ = std::string(cpu->name);
-    result.tune_ = std::string(tune->name);
+    result.cpu_ = cpu->canonical_name;
+    result.tune_ = tune->canonical_name;
+    result.issue_width_ = tune_model.issue_width;
+    result.instruction_costs_ = tune_model.instructions;
+    for (std::size_t index = 0; index < result.instruction_costs_.size();
+         ++index) {
+        result.instruction_costs_[index].available =
+            arch_model.instructions[index].available;
+        result.lacks_instructions_ = result.lacks_instructions_ ||
+                                     !arch_model.instructions[index].available;
+    }
     result.enabled_feature_words_.assign((table.features.size() + 63U) / 64U,
                                          0);
     for (std::size_t index = 0; index < table.features.size(); ++index) {

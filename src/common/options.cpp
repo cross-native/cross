@@ -1070,6 +1070,8 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         if (argument == "--print-profiles") { options.print_profiles = true; continue; }
         if (argument == "--print-manglings") { options.print_manglings = true; continue; }
         if (argument == "--print-optimizations") { options.print_optimizations = true; continue; }
+        if (argument == "--print-cpus") { options.print_cpus = true; continue; }
+        if (argument == "--print-costs") { options.print_costs = true; continue; }
         if (argument == "--print-options" ||
             argument.starts_with("--print-options=")) {
             options.print_options = true;
@@ -1211,6 +1213,8 @@ void print_cc_help() {
   --print-profiles      list model profiles
   --print-manglings     list name-mangling models
   --print-optimizations list loaded optimization presets
+  --print-cpus          list the target's CPU entries
+  --print-costs         list instruction costs for -march and -mtune
   --print-options[=CATEGORY]
                         list typed effective options and origins
   --print-attributes    list contextual [[attribute]] names

@@ -251,8 +251,7 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         for (std::size_t i = 0; i < arguments.size(); ++i)
             if (!operand_matches(arguments[i], form->operands[i], id)) { match = false; break; }
         if (!match) continue;
-        const auto conflict = instruction_feature_conflict(*form,
-            [&](std::string_view feature) { return subtarget.supports_registry_feature(feature); });
+        const auto conflict = subtarget.form_conflict(*form);
         if (conflict) { if (!feature_conflict) feature_conflict = conflict; }
         else ++matches;
     }
@@ -262,8 +261,7 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         return prefix + "has ambiguous typed forms for these operands";
     }
     if (feature_conflict)
-        return prefix + (feature_conflict->forbidden ? "is unavailable with feature '" : "requires feature '") +
-            std::string(feature_conflict->feature) + "'";
+        return prefix + instruction_conflict_reason(*feature_conflict, subtarget.cpu());
     if (!arity) return prefix + "has no form accepting " + std::to_string(arguments.size()) + " operands";
     if (memory_error) return memory_error;
     if (label_scope_error) return prefix + "requires a same-function label operand";
@@ -289,6 +287,43 @@ const AddressSpaceEntry* find_address_space(const TargetInfo& target,
         if (entry.number == number) return &entry;
     }
     return nullptr;
+}
+
+void set_instruction_costs(TargetInfo& target,
+                           std::vector<InstructionCostEntry> declared) {
+    target.instruction_costs = std::move(declared);
+    target.form_instructions.clear();
+    for (const auto& form : target.instructions) {
+        auto instruction = find_instruction_cost(target, form.assembly_mnemonic);
+        if (!instruction) {
+            instruction = InstructionCostId{
+                static_cast<std::uint16_t>(target.instruction_costs.size())};
+            target.instruction_costs.push_back({form.assembly_mnemonic});
+        }
+        target.form_instructions.push_back(*instruction);
+    }
+}
+
+std::optional<InstructionCostId> find_instruction_cost(
+    const TargetInfo& target, std::string_view name) {
+    for (std::size_t index = 0; index < target.instruction_costs.size();
+         ++index) {
+        if (target.instruction_costs[index].name == name) {
+            return InstructionCostId{static_cast<std::uint16_t>(index)};
+        }
+    }
+    return std::nullopt;
+}
+
+std::string instruction_conflict_reason(
+    const InstructionFeatureConflict& conflict, std::string_view cpu) {
+    if (conflict.unavailable) {
+        return "uses '" + std::string(conflict.feature) + "', which CPU '" +
+               std::string(cpu) + "' does not have";
+    }
+    return (conflict.forbidden ? "is unavailable with feature '"
+                               : "requires feature '") +
+           std::string(conflict.feature) + "'";
 }
 
 std::optional<std::string> address_space_type_error(const TargetInfo& target,

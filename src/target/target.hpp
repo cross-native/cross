@@ -11,6 +11,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -404,6 +405,8 @@ struct InstructionFeatureConflict {
     std::string_view feature;
     // The feature is enabled but forbidden, rather than required but absent.
     bool forbidden{};
+    // `feature` names the form's instruction, which the selected CPU lacks.
+    bool unavailable{};
 };
 
 // The first feature that makes `form` unavailable under `enabled`, if any.
@@ -419,6 +422,44 @@ std::optional<InstructionFeatureConflict> instruction_feature_conflict(
     }
     return std::nullopt;
 }
+
+// Why a form is unusable, completing "target instruction 'NAME' ...".
+std::string instruction_conflict_reason(
+    const InstructionFeatureConflict& conflict, std::string_view cpu);
+
+// An instruction the backend emits, by its assembler spelling, with the
+// default costs that `cpu` model entries replace.
+struct InstructionCostEntry {
+    std::string_view name;
+    unsigned latency{1};
+    unsigned issue{1};
+};
+
+// Dense identity of an instruction: its index in
+// `TargetInfo::instruction_costs`. Targets name their own instructions with
+// an enumeration in table order.
+struct InstructionCostId {
+    std::uint16_t value{};
+
+    constexpr InstructionCostId() = default;
+    constexpr explicit InstructionCostId(std::uint16_t raw) : value(raw) {}
+
+    template <typename TargetInstruction>
+        requires std::is_enum_v<TargetInstruction>
+    constexpr InstructionCostId(TargetInstruction instruction)
+        : value(static_cast<std::uint16_t>(instruction)) {}
+
+    friend constexpr bool operator==(InstructionCostId,
+                                     InstructionCostId) = default;
+};
+
+// An instruction on the resolved CPUs: the -mtune entry's latency and issue
+// cost, and whether the -march entry has it.
+struct InstructionCost {
+    unsigned latency{1};
+    unsigned issue{1};
+    bool available{true};
+};
 
 struct PatchValueMaterializerEntry {
     std::string_view type_name;
@@ -500,6 +541,15 @@ struct IntegerConstantCostQuery {
     bool is_signed{};
 };
 
+enum class CostedIntegerOperation {
+    // The low half of the product.
+    Multiply,
+    // The high half of the double-width product.
+    MultiplyHigh,
+    // A quotient or remainder.
+    Divide,
+};
+
 struct IntegerOperationCostQuery {
     unsigned bits{};
     bool is_signed{};
@@ -508,18 +558,15 @@ struct IntegerOperationCostQuery {
 struct TargetCostModel {
     using IntegerConstantMaterializationCost =
         unsigned (*)(const Subtarget&, const IntegerConstantCostQuery&);
-    // Latency in units of a simple integer ALU operation, or no value when
-    // the subtarget has no single instruction for the operation at that
-    // width.
-    using IntegerOperationCost = std::optional<unsigned> (*)(
-        const Subtarget&, const IntegerOperationCostQuery&);
+    // The instructions on the operation's result path, or none when the
+    // instruction set has no instruction for it at that width. A
+    // multiply-high with instructions is also legal in MIR at that width.
+    using IntegerOperationInstructions = std::vector<InstructionCostId> (*)(
+        const Subtarget&, CostedIntegerOperation,
+        const IntegerOperationCostQuery&);
 
     IntegerConstantMaterializationCost integer_constant_materialization{};
-    // A quotient or remainder.
-    IntegerOperationCost integer_division{};
-    // The high half of the double-width product. Its presence also makes
-    // the MIR multiply-high operations legal at that width.
-    IntegerOperationCost integer_multiply_high{};
+    IntegerOperationInstructions integer_operation{};
 };
 
 // Direct typed instruction-memory addressing. These are encoding constraints,
@@ -585,6 +632,11 @@ struct TargetInfo {
     // to the function's declared registers.
     NakedLowering naked_lowering{NakedLowering::Raw};
     std::vector<IntrinsicFormEntry> intrinsic_forms{};
+    // The instructions `cpu` entries describe and `--print-costs` lists:
+    // the backend's own, then each registry form's mnemonic.
+    std::vector<InstructionCostEntry> instruction_costs{};
+    // The instruction of each registry form, by InstructionFormId.
+    std::vector<InstructionCostId> form_instructions{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;
@@ -620,6 +672,13 @@ bool target_has_instruction(const TargetInfo& target, std::string_view name);
 }
 const AddressSpaceEntry* find_address_space(const TargetInfo& target,
                                             std::uint32_t number);
+// Sets a target's instruction table to `declared`, then the registry
+// mnemonics it does not already name at latency and issue 1, and maps each
+// registry form to its instruction.
+void set_instruction_costs(TargetInfo& target,
+                           std::vector<InstructionCostEntry> declared);
+std::optional<InstructionCostId> find_instruction_cost(
+    const TargetInfo& target, std::string_view name);
 // Source pointer types require an explicitly registered native representation.
 // Shared by ordinary HIR validation and pre-erasure expansion validation.
 std::optional<std::string> address_space_type_error(const TargetInfo& target,

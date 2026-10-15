@@ -1090,6 +1090,242 @@ abi "eabi32" {
     }
 }
 
+# CPUs. An instruction that no entry of a chain describes has the target's
+# default costs, which cc --print-costs shows. Without published timing,
+# loads of MIPS I, MIPS II, and MIPS32 CPUs are scheduled as four-cycle
+# operations.
+cpu "mips1" {
+    architecture = "mips";
+    features = ["mips1", "hard-float", "fp32", "odd-spreg"];
+    instruction "lb" { latency = 4; }
+    instruction "lbu" { latency = 4; }
+    instruction "lh" { latency = 4; }
+    instruction "lhu" { latency = 4; }
+    instruction "lw" { latency = 4; }
+    instruction "lwl" { latency = 4; }
+    instruction "lwr" { latency = 4; }
+    instruction "lwc1" { latency = 4; }
+    instruction "ldc1" { latency = 4; }
+    instruction "ll" { latency = 4; }
+}
+
+cpu "generic" {
+    architecture = "mips";
+    inherits = "mips1";
+}
+
+# The R3000 with the R3010 FPU.
+cpu "r3000" {
+    architecture = "mips";
+    inherits = "mips1";
+    instruction "lb" { latency = 2; }
+    instruction "lbu" { latency = 2; }
+    instruction "lh" { latency = 2; }
+    instruction "lhu" { latency = 2; }
+    instruction "lw" { latency = 2; }
+    instruction "lwl" { latency = 2; }
+    instruction "lwr" { latency = 2; }
+    instruction "lwc1" { latency = 2; }
+    instruction "mult" { latency = 12; issue = 12; }
+    instruction "multu" { latency = 12; issue = 12; }
+    instruction "div" { latency = 35; issue = 35; }
+    instruction "divu" { latency = 35; issue = 35; }
+    instruction "add.s" { latency = 2; }
+    instruction "add.d" { latency = 2; }
+    instruction "sub.s" { latency = 2; }
+    instruction "sub.d" { latency = 2; }
+    instruction "mul.s" { latency = 4; }
+    instruction "mul.d" { latency = 5; }
+    instruction "div.s" { latency = 12; }
+    instruction "div.d" { latency = 19; }
+    instruction "c.eq.s" { latency = 2; }
+    instruction "c.eq.d" { latency = 2; }
+    instruction "c.lt.s" { latency = 2; }
+    instruction "c.lt.d" { latency = 2; }
+    instruction "c.le.s" { latency = 2; }
+    instruction "c.le.d" { latency = 2; }
+    instruction "c.olt.s" { latency = 2; }
+    instruction "c.olt.d" { latency = 2; }
+    instruction "c.un.s" { latency = 2; }
+    instruction "c.un.d" { latency = 2; }
+}
+
+cpu "r2000" {
+    architecture = "mips";
+    inherits = "r3000";
+}
+
+cpu "mips2" {
+    architecture = "mips";
+    inherits = "mips1";
+    features = ["mips2", "hard-float", "fp32", "odd-spreg", "llsc",
+                "branch-likely", "load-interlocks"];
+}
+
+cpu "r6000" {
+    architecture = "mips";
+    inherits = "mips2";
+    instruction "mult" { latency = 17; issue = 17; }
+    instruction "multu" { latency = 17; issue = 17; }
+    instruction "div" { latency = 38; issue = 38; }
+    instruction "divu" { latency = 38; issue = 38; }
+    instruction "add.s" { latency = 3; }
+    instruction "add.d" { latency = 3; }
+    instruction "sub.s" { latency = 3; }
+    instruction "sub.d" { latency = 3; }
+    instruction "mul.s" { latency = 5; }
+    instruction "mul.d" { latency = 6; }
+    instruction "div.s" { latency = 15; }
+    instruction "div.d" { latency = 16; }
+    instruction "c.eq.s" { latency = 2; }
+    instruction "c.eq.d" { latency = 2; }
+    instruction "c.lt.s" { latency = 2; }
+    instruction "c.lt.d" { latency = 2; }
+    instruction "c.le.s" { latency = 2; }
+    instruction "c.le.d" { latency = 2; }
+    instruction "c.olt.s" { latency = 2; }
+    instruction "c.olt.d" { latency = 2; }
+    instruction "c.un.s" { latency = 2; }
+    instruction "c.un.d" { latency = 2; }
+}
+
+# The PSP's CPU: MIPS II with a single-precision FPU, conditional moves,
+# rotates, and interlocked FPU transfers and HI/LO.
+cpu "allegrex" {
+    architecture = "mips";
+    inherits = "mips2";
+    features = ["mips2", "hard-float", "fp32", "single-float", "odd-spreg",
+                "llsc", "branch-likely", "allegrex", "cond-move", "rotate",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "hilo-interlocks"];
+}
+
+cpu "mips32" {
+    architecture = "mips";
+    inherits = "mips2";
+    features = ["mips32", "hard-float", "fp32", "odd-spreg", "llsc",
+                "branch-likely", "cond-move", "load-interlocks",
+                "fpu-transfer-interlocks", "fpu-compare-interlocks",
+                "hilo-interlocks"];
+}
+
+cpu "mips32r2" {
+    architecture = "mips";
+    inherits = "mips32";
+    features = ["mips32r2", "hard-float", "fp32", "odd-spreg", "llsc",
+                "branch-likely", "cond-move", "rotate", "load-interlocks",
+                "fpu-transfer-interlocks", "fpu-compare-interlocks",
+                "hilo-interlocks"];
+}
+
+cpu "mips3" {
+    architecture = "mips";
+    features = ["mips3", "hard-float", "fp32", "odd-spreg", "llsc",
+                "branch-likely", "load-interlocks"];
+}
+
+cpu "r4000" {
+    architecture = "mips";
+    inherits = "mips3";
+    instruction "mult" { latency = 10; issue = 10; }
+    instruction "multu" { latency = 10; issue = 10; }
+    instruction "div" { latency = 69; issue = 69; }
+    instruction "divu" { latency = 69; issue = 69; }
+}
+
+cpu "r4400" {
+    architecture = "mips";
+    inherits = "r4000";
+}
+
+cpu "r4600" {
+    architecture = "mips";
+    inherits = "mips3";
+    instruction "lb" { latency = 2; }
+    instruction "lbu" { latency = 2; }
+    instruction "lh" { latency = 2; }
+    instruction "lhu" { latency = 2; }
+    instruction "lw" { latency = 2; }
+    instruction "lwl" { latency = 2; }
+    instruction "lwr" { latency = 2; }
+    instruction "lwc1" { latency = 2; }
+    instruction "mult" { latency = 10; issue = 10; }
+    instruction "multu" { latency = 10; issue = 10; }
+    instruction "dmult" { latency = 12; issue = 12; }
+    instruction "dmultu" { latency = 12; issue = 12; }
+    instruction "div" { latency = 42; issue = 42; }
+    instruction "divu" { latency = 42; issue = 42; }
+    instruction "ddiv" { latency = 74; issue = 74; }
+    instruction "ddivu" { latency = 74; issue = 74; }
+    instruction "mul.s" { latency = 8; }
+    instruction "div.s" { latency = 32; }
+    instruction "div.d" { latency = 61; }
+    instruction "sqrt.s" { latency = 31; }
+    instruction "sqrt.d" { latency = 60; }
+}
+
+# The NEC VR4300 of the Nintendo 64. A multicycle operation stalls the
+# whole pipeline, so its issue cost equals its latency.
+cpu "vr4300" {
+    architecture = "mips";
+    inherits = "mips3";
+    instruction "mult" { latency = 5; issue = 5; }
+    instruction "multu" { latency = 5; issue = 5; }
+    instruction "dmult" { latency = 8; issue = 8; }
+    instruction "dmultu" { latency = 8; issue = 8; }
+    instruction "div" { latency = 37; issue = 37; }
+    instruction "divu" { latency = 37; issue = 37; }
+    instruction "ddiv" { latency = 69; issue = 69; }
+    instruction "ddivu" { latency = 69; issue = 69; }
+    instruction "add.s" { latency = 3; issue = 3; }
+    instruction "add.d" { latency = 3; issue = 3; }
+    instruction "sub.s" { latency = 3; issue = 3; }
+    instruction "sub.d" { latency = 3; issue = 3; }
+    instruction "abs.s" { latency = 3; issue = 3; }
+    instruction "abs.d" { latency = 3; issue = 3; }
+    instruction "mul.s" { latency = 5; issue = 5; }
+    instruction "mul.d" { latency = 8; issue = 8; }
+    instruction "div.s" { latency = 29; issue = 29; }
+    instruction "sqrt.s" { latency = 29; issue = 29; }
+    instruction "div.d" { latency = 58; issue = 58; }
+    instruction "sqrt.d" { latency = 58; issue = 58; }
+    instruction "cvt.s.d" { latency = 2; issue = 2; }
+    instruction "cvt.d.s" { latency = 1; }
+    instruction "cvt.s.w" { latency = 5; issue = 5; }
+    instruction "cvt.d.w" { latency = 5; issue = 5; }
+    instruction "cvt.s.l" { latency = 5; issue = 5; }
+    instruction "cvt.d.l" { latency = 5; issue = 5; }
+    instruction "trunc.w.s" { latency = 5; issue = 5; }
+    instruction "trunc.w.d" { latency = 5; issue = 5; }
+    instruction "trunc.l.s" { latency = 5; issue = 5; }
+    instruction "trunc.l.d" { latency = 5; issue = 5; }
+}
+
+cpu "mips4" {
+    architecture = "mips";
+    inherits = "mips3";
+    features = ["mips4", "hard-float", "fp64", "odd-spreg", "llsc",
+                "branch-likely", "cond-move", "load-interlocks",
+                "fpu-transfer-interlocks", "fpu-compare-interlocks"];
+}
+
+cpu "mips5" {
+    architecture = "mips";
+    inherits = "mips4";
+    features = ["mips5", "hard-float", "fp64", "odd-spreg", "llsc",
+                "branch-likely", "cond-move", "load-interlocks",
+                "fpu-transfer-interlocks", "fpu-compare-interlocks"];
+}
+
+cpu "mips64" {
+    architecture = "mips";
+    inherits = "mips3";
+    features = ["mips64", "hard-float", "fp64", "odd-spreg", "llsc",
+                "branch-likely", "cond-move", "load-interlocks",
+                "fpu-transfer-interlocks", "fpu-compare-interlocks",
+                "hilo-interlocks"];
+}
+
 # MIPS profiles without a native conditional move preserve ordinary control
 # diamonds by default.  They retain the larger budget for recognized
 # high-entropy memory predicates, where speculation can still beat a branch.
