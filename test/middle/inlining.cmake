@@ -21,45 +21,37 @@ function(compile_ir suffix)
     endif()
 endfunction()
 
+# The calls inline_entry keeps; every other helper is inlined.
+function(check_calls suffix)
+    file(READ "${OUTPUT}.${suffix}.ll" ir)
+    string(REGEX MATCH "define i64 @\"inline_entry\"\\([^}]*}" body "${ir}")
+    if(body STREQUAL "")
+        message(FATAL_ERROR "${suffix} output lacks inline_entry")
+    endif()
+    foreach(callee inline_add retained_add mandatory_double inline_magnitude
+                   retained_magnitude mandatory_clamp)
+        list(FIND ARGN ${callee} kept)
+        if(body MATCHES "call [^\n]*${callee}")
+            if(kept EQUAL -1)
+                message(FATAL_ERROR "${suffix} did not inline ${callee}\n${body}")
+            endif()
+        elseif(NOT kept EQUAL -1)
+            message(FATAL_ERROR "${suffix} inlined ${callee}\n${body}")
+        endif()
+    endforeach()
+endfunction()
+
 compile_ir(O2 -O2)
 compile_ir(no-inline -O0 -fno-inline)
+compile_ir(O2-no-inline -O2 -fno-inline-functions)
 compile_ir(explicit -O0 -finline-functions)
 
-file(READ "${OUTPUT}.O2.ll" optimized)
-file(READ "${OUTPUT}.no-inline.ll" disabled)
-file(READ "${OUTPUT}.explicit.ll" explicit)
-
-string(REGEX MATCH "define i64 @\"inline_entry\"\\([^}]*}"
-       optimized_body "${optimized}")
-string(REGEX MATCH "define i64 @\"inline_entry\"\\([^}]*}"
-       disabled_body "${disabled}")
-string(REGEX MATCH "define i64 @\"inline_entry\"\\([^}]*}"
-       explicit_body "${explicit}")
-if(optimized_body STREQUAL "" OR disabled_body STREQUAL "" OR
-   explicit_body STREQUAL "")
-    message(FATAL_ERROR "one inlining output lacks inline_entry")
-endif()
-
-if(optimized_body MATCHES "inline_add" OR
-   optimized_body MATCHES "mandatory_double" OR
-   NOT optimized_body MATCHES "retained_add")
-    message(FATAL_ERROR
-        "O2 did not apply inline > noinline policy\n${optimized_body}")
-endif()
-
-if(NOT disabled_body MATCHES "inline_add" OR
-   disabled_body MATCHES "mandatory_double" OR
-   NOT disabled_body MATCHES "retained_add")
-    message(FATAL_ERROR
-        "-fno-inline did not retain ordinary calls or lost mandatory inline\n${disabled_body}")
-endif()
-
-if(explicit_body MATCHES "inline_add" OR
-   explicit_body MATCHES "mandatory_double" OR
-   NOT explicit_body MATCHES "retained_add")
-    message(FATAL_ERROR
-        "explicit O0 inlining did not enable the pass\n${explicit_body}")
-endif()
+check_calls(O2 retained_add retained_magnitude)
+check_calls(no-inline inline_add retained_add inline_magnitude
+            retained_magnitude)
+check_calls(O2-no-inline inline_add retained_add inline_magnitude
+            retained_magnitude)
+check_calls(explicit retained_add retained_magnitude)
 
 execute_process(
     COMMAND "${CC}" -c -O2 "${SOURCE}" -o "${OUTPUT}.o"

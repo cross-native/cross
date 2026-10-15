@@ -5,7 +5,8 @@ global u64 early_unsigned_values[9];
 global i64 early_signed_values[9];
 global u32 early_u32_values[10];
 
-[[noinline, link_name("early_exit_less")]]
+// -O3 specializes the calls; `used` keeps the bodies the test inspects.
+[[noinline, used, link_name("early_exit_less")]]
 static uptr early_exit_less(in const u64 *values, in uptr count,
                             in u64 limit) {
     uptr index = 0;
@@ -15,7 +16,7 @@ static uptr early_exit_less(in const u64 *values, in uptr count,
     return index;
 }
 
-[[noinline, link_name("early_exit_not_equal")]]
+[[noinline, used, link_name("early_exit_not_equal")]]
 static uptr early_exit_not_equal(in const u64 *values, in uptr count,
                                  in u64 sought) {
     uptr index = 0;
@@ -25,7 +26,7 @@ static uptr early_exit_not_equal(in const u64 *values, in uptr count,
     return index;
 }
 
-[[noinline, link_name("early_exit_reversed")]]
+[[noinline, used, link_name("early_exit_reversed")]]
 static uptr early_exit_reversed(in const u64 *values, in uptr count,
                                 in u64 limit) {
     uptr index = 0;
@@ -65,7 +66,7 @@ static uptr early_exit_u32(in const u32 *values, in uptr count,
     return index;
 }
 
-[[noinline, link_name("early_exit_signed")]]
+[[noinline, used, link_name("early_exit_signed")]]
 static uptr early_exit_signed(in const i64 *values, in uptr count,
                               in i64 floor) {
     uptr index = 0;
@@ -75,7 +76,7 @@ static uptr early_exit_signed(in const i64 *values, in uptr count,
     return index;
 }
 
-[[noinline, link_name("early_exit_volatile")]]
+[[noinline, used, link_name("early_exit_volatile")]]
 static uptr early_exit_volatile(in volatile u64 *values, in uptr count,
                                 in u64 sought) {
     uptr index = 0;

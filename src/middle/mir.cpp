@@ -8642,52 +8642,80 @@ bool has_function_attribute(const hir::Function& function,
     return function.definition && function.definition->attribute(name);
 }
 
+// The callee's size in emitted operations. A conditional branch or a trap
+// counts like any operation; parameters, phis, lifetime markers, and void
+// values emit nothing.
 std::size_t inline_cost(const ManagedFunction& function) {
-    return static_cast<std::size_t>(std::count_if(
-        function.values.begin(), function.values.end(),
-        [](const ManagedValue& value) {
-            return value.kind != ValueKind::Parameter &&
-                   value.kind != ValueKind::VoidValue &&
-                   value.kind != ValueKind::LifetimeStart &&
-                   value.kind != ValueKind::LifetimeEnd;
-        }));
+    std::size_t cost = 0;
+    for (const auto& value : function.values) {
+        if (value.kind != ValueKind::Parameter && value.kind != ValueKind::Phi &&
+            value.kind != ValueKind::VoidValue &&
+            value.kind != ValueKind::LifetimeStart &&
+            value.kind != ValueKind::LifetimeEnd) {
+            ++cost;
+        }
+    }
+    for (const auto& block : function.blocks) {
+        if (block.terminator.kind == TerminatorKind::ConditionalBranch ||
+            block.terminator.kind == TerminatorKind::Trap) {
+            ++cost;
+        }
+    }
+    return cost;
 }
 
-bool structurally_inlineable(const ManagedFunction& function,
-                             const hir::Function& entity) {
-    if (entity.variadic || function.blocks.size() != 1 ||
-        function.entry.value != 0 ||
-        !function.labels.empty() ||
-        function.blocks.front().terminator.kind != TerminatorKind::Return) {
-        return false;
-    }
+bool allocates_dynamic_stack(const ManagedFunction& function) {
+    return std::any_of(function.values.begin(), function.values.end(),
+                       [](const ManagedValue& value) {
+                           return value.kind == ValueKind::DynamicAlloca;
+                       });
+}
+
+// Why no call to the function can be inlined, if anything prevents it. Direct
+// labels are inlined as ordinary blocks; a taken or exported label address
+// needs the canonical body, and a patch identity keeps its single cell by
+// suppressing inlining.
+std::optional<std::string> inline_blocker(const ManagedFunction& function,
+                                          const hir::Function& entity,
+                                          const hir::Module& hir_module,
+                                          bool naked_caller) {
+    if (entity.variadic) return "the callee is variadic";
+    if (entity.naked) return "the callee is naked";
     for (const auto& parameter : entity.parameters) {
-        if (parameter.mode != ParameterMode::In ||
-            (parameter.physical_location &&
-             *parameter.physical_location != "auto")) {
-            return false;
+        if (parameter.physical_location &&
+            *parameter.physical_location != "auto") {
+            return "a parameter has an explicit location";
         }
     }
-    if (std::any_of(function.values.begin(), function.values.end(),
-                    [](const ManagedValue& value) {
-                        return value.kind == ValueKind::DynamicStackSave ||
-                               value.kind == ValueKind::DynamicAlloca ||
-                               value.kind == ValueKind::DynamicStackRestore;
+    // A manual interface copies output cells out after the body.
+    if (hir::manual_interface(entity) &&
+        std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                    [](const hir::Parameter& parameter) {
+                        return parameter.mode != ParameterMode::In;
                     })) {
-        return false;
+        return "its output parameters belong to a manual interface";
     }
     for (const auto& slot : function.slots) {
-        if (slot.physical_location) return false;
+        if (slot.physical_location) return "a local has an explicit location";
+    }
+    for (const auto label : entity.labels) {
+        if (hir_module.labels[label.value].is_global)
+            return "the callee defines a global label";
     }
     for (const auto& value : function.values) {
-        if (value.kind == ValueKind::Phi ||
-            value.kind == ValueKind::LabelAddress ||
-            value.kind == ValueKind::VariadicState ||
-            value.kind == ValueKind::PatchValue) {
-            return false;
-        }
+        if (value.kind == ValueKind::LabelAddress)
+            return "the callee takes a label address";
+        if (value.kind == ValueKind::PatchValue)
+            return "the callee contains a $::patch expression";
+        if (value.must_tail) return "the callee contains a musttail call";
     }
-    return true;
+    for (const auto& block : function.blocks) {
+        if (block.terminator.kind == TerminatorKind::IndirectBranch)
+            return "the callee contains a computed goto";
+    }
+    if (naked_caller && allocates_dynamic_stack(function))
+        return "a naked function cannot allocate a variable-length array";
+    return std::nullopt;
 }
 
 void replace_effect_inputs(ManagedFunction& function, EffectId from,
@@ -8748,130 +8776,326 @@ void replace_value_uses(ManagedFunction& function, ValueId from, ValueId to) {
     }
 }
 
-bool inline_call(ManagedFunction& caller, std::size_t block_index,
-                 std::size_t position, const ManagedFunction& callee) {
-    const auto call_id = caller.blocks[block_index].values[position];
+// Replaces the call at `position` of block `site` with a copy of the callee.
+// The callee's entry continues the site block, and its returns reach a
+// continuation that receives the rest of the site block: the single return
+// block, or a new block joining the returned values and effects. Parameters
+// become the call's argument values, and an output parameter's transport
+// pointer the caller's argument cell. A callee that allocates a
+// variable-length array runs between a stack save and restore, as its own
+// frame would. Returns the added blocks in layout order, the continuation
+// last.
+std::vector<BlockId> inline_call(ManagedFunction& caller, BlockId site,
+                                 std::size_t position,
+                                 const ManagedFunction& callee,
+                                 const hir::Module& hir_module) {
+    const auto call_id = caller.blocks[site.value].values[position];
     const auto call = caller.values[call_id.value];
-    if (!call.effect_input || !call.effect_output ||
-        call.call_arguments.size() != callee.parameters.size()) {
-        return false;
-    }
-    for (const auto& argument : call.call_arguments) {
-        if (!argument.value || argument.cell) return false;
-    }
+    const auto& entry = callee.blocks[callee.entry.value];
 
     std::vector<std::optional<ValueId>> value_map(callee.values.size());
-    for (const auto parameter_id : callee.parameters) {
-        if (parameter_id.value >= callee.values.size()) return false;
-        const auto parameter_index =
-            callee.values[parameter_id.value].parameter_index;
-        if (parameter_index >= call.call_arguments.size() ||
-            !call.call_arguments[parameter_index].value) {
-            return false;
+    std::vector<std::optional<SlotId>> cell_of(callee.values.size());
+    for (const auto parameter : callee.parameters) {
+        const auto& argument = call.call_arguments[
+            callee.values[parameter.value].parameter_index];
+        value_map[parameter.value] = argument.value;
+        cell_of[parameter.value] = argument.cell;
+    }
+    // Dereferencing a transport pointer becomes a direct access of the cell,
+    // which keeps the cell promotable; any other use takes its address.
+    const auto cell_access =
+        [&](const ManagedValue& value) -> std::optional<SlotId> {
+        const bool store = value.kind == ValueKind::PointerStore;
+        if ((!store && value.kind != ValueKind::PointerLoad) ||
+            value.bit_field_region || !cell_of[value.operands.front().value]) {
+            return std::nullopt;
         }
-        value_map[parameter_id.value] =
-            *call.call_arguments[parameter_index].value;
+        const auto cell = *cell_of[value.operands.front().value];
+        const auto& slot = caller.slots[cell.value];
+        const bool typed =
+            store ? representation_compatible(
+                        hir_module,
+                        callee.values[value.operands[1].value].type, slot.type)
+                  : value.type == slot.type;
+        if (!typed || value.is_volatile_access != slot.is_volatile)
+            return std::nullopt;
+        return cell;
+    };
+    std::vector<bool> addressed(callee.values.size());
+    const auto note = [&](ValueId value) {
+        if (cell_of[value.value]) addressed[value.value] = true;
+    };
+    for (const auto& value : callee.values) {
+        for (std::size_t index = cell_access(value) ? 1 : 0;
+             index < value.operands.size(); ++index) {
+            note(value.operands[index]);
+        }
+        for (const auto& incoming : value.incoming) note(incoming.value);
+    }
+    for (const auto& block : callee.blocks)
+        if (block.terminator.value) note(*block.terminator.value);
+
+    const auto append = [&](ManagedValue value) {
+        value.id = {static_cast<std::uint32_t>(caller.values.size())};
+        value.location = call.location;
+        caller.values.push_back(std::move(value));
+        return caller.values.back().id;
+    };
+    const auto chain = [&](ValueId operation, EffectId input) {
+        ManagedEffect effect;
+        effect.id = {static_cast<std::uint32_t>(caller.effects.size())};
+        effect.location = call.location;
+        effect.kind = EffectKind::Operation;
+        effect.input = input;
+        effect.operation = operation;
+        caller.effects.push_back(effect);
+        caller.values[operation.value].effect_input = input;
+        caller.values[operation.value].effect_output = effect.id;
+        return effect.id;
+    };
+    std::vector<ValueId> prefix;
+    for (const auto parameter : callee.parameters) {
+        if (!addressed[parameter.value]) continue;
+        const auto cell = *cell_of[parameter.value];
+        caller.slots[cell.value].address_taken = true;
+        ManagedValue address;
+        address.kind = ValueKind::SlotAddress;
+        address.type = callee.values[parameter.value].type;
+        address.slot = cell;
+        value_map[parameter.value] = append(std::move(address));
+        prefix.push_back(*value_map[parameter.value]);
+    }
+    const bool dynamic = allocates_dynamic_stack(callee);
+    auto head = *call.effect_input;
+    std::optional<ValueId> mark;
+    if (dynamic) {
+        ManagedValue save;
+        save.kind = ValueKind::DynamicStackSave;
+        save.type = *hir_module.builtin(BuiltinType::Uptr);
+        mark = append(std::move(save));
+        head = chain(*mark, head);
+        prefix.push_back(*mark);
     }
 
-    std::vector<SlotId> slot_map;
-    slot_map.reserve(callee.slots.size());
-    for (std::size_t index = 0; index < callee.slots.size(); ++index) {
-        slot_map.push_back(
-            {static_cast<std::uint32_t>(caller.slots.size() + index)});
+    std::vector<std::uint32_t> returns;
+    for (const auto& block : callee.blocks) {
+        if (block.terminator.kind == TerminatorKind::Return)
+            returns.push_back(block.id.value);
     }
-
-    std::vector<ManagedValue> clones;
-    std::vector<bool> clone_effectful;
-    std::vector<ValueId> inserted;
-    clones.reserve(callee.values.size());
-    clone_effectful.reserve(callee.values.size());
-    inserted.reserve(callee.values.size());
-    const auto value_base = caller.values.size();
-    for (const auto source_id : callee.blocks.front().values) {
-        const auto& source = callee.values[source_id.value];
-        if (source.kind == ValueKind::Parameter) continue;
-
-        ManagedValue clone = source;
-        clone.id = {
-            static_cast<std::uint32_t>(value_base + clones.size())};
-        clone.effect_input.reset();
-        clone.effect_output.reset();
-        const auto remap_value = [&](ValueId& value) {
-            if (value.value >= value_map.size() || !value_map[value.value]) {
-                return false;
-            }
-            value = *value_map[value.value];
-            return true;
-        };
-        for (auto& operand : clone.operands) {
-            if (!remap_value(operand)) return false;
+    // Clones are numbered in the callee's block order. The entry has no
+    // predecessors: its effect is the function entry.
+    std::vector<ValueId> order;
+    for (const auto& block : callee.blocks) {
+        for (const auto id : block.values) {
+            if (callee.values[id.value].kind != ValueKind::Parameter)
+                order.push_back(id);
         }
+    }
+    auto next_value = static_cast<std::uint32_t>(caller.values.size());
+    for (const auto id : order) value_map[id.value] = ValueId{next_value++};
+    std::vector<BlockId> block_map(callee.blocks.size());
+    auto next_block = static_cast<std::uint32_t>(caller.blocks.size());
+    for (std::size_t index = 0; index < callee.blocks.size(); ++index) {
+        block_map[index] =
+            index == callee.entry.value ? site : BlockId{next_block++};
+    }
+    const auto join = returns.size() == 1 ? block_map[returns.front()]
+                                          : BlockId{next_block++};
+    std::vector<std::optional<EffectId>> effect_map(callee.effects.size());
+    auto next_effect = static_cast<std::uint32_t>(caller.effects.size());
+    for (std::size_t index = 0; index < callee.effects.size(); ++index) {
+        effect_map[index] = index == entry.effect.value
+                                ? head
+                                : EffectId{next_effect++};
+    }
+    const auto slot_base = static_cast<std::uint32_t>(caller.slots.size());
+
+    for (const auto id : order) {
+        const auto& source = callee.values[id.value];
+        auto clone = source;
+        clone.id = *value_map[id.value];
+        if (const auto cell = cell_access(source)) {
+            clone.kind = source.kind == ValueKind::PointerLoad
+                             ? ValueKind::Load
+                             : ValueKind::Store;
+            clone.slot = cell;
+            clone.memory_alignment = 0;
+            clone.operands.erase(clone.operands.begin());
+        } else if (clone.slot) {
+            clone.slot = SlotId{slot_base + clone.slot->value};
+        }
+        for (auto& operand : clone.operands) operand = *value_map[operand.value];
         for (auto& argument : clone.call_arguments) {
-            if (argument.value && !remap_value(*argument.value)) return false;
-            if (argument.cell) {
-                if (argument.cell->value >= slot_map.size()) return false;
-                argument.cell = slot_map[argument.cell->value];
-            }
+            if (argument.value) argument.value = value_map[argument.value->value];
+            if (argument.cell)
+                argument.cell = SlotId{slot_base + argument.cell->value};
         }
         for (auto& incoming : clone.incoming) {
-            if (!remap_value(incoming.value)) return false;
+            incoming.predecessor = block_map[incoming.predecessor.value];
+            incoming.value = *value_map[incoming.value.value];
         }
-        if (clone.slot) {
-            if (clone.slot->value >= slot_map.size()) return false;
-            clone.slot = slot_map[clone.slot->value];
+        if (clone.effect_input)
+            clone.effect_input = effect_map[clone.effect_input->value];
+        if (clone.effect_output)
+            clone.effect_output = effect_map[clone.effect_output->value];
+        caller.values.push_back(std::move(clone));
+    }
+    for (std::size_t index = 0; index < callee.effects.size(); ++index) {
+        if (index == entry.effect.value) continue;
+        auto effect = callee.effects[index];
+        effect.id = *effect_map[index];
+        if (effect.input) effect.input = effect_map[effect.input->value];
+        if (effect.operation) effect.operation = value_map[effect.operation->value];
+        for (auto& incoming : effect.incoming) {
+            incoming.predecessor = block_map[incoming.predecessor.value];
+            incoming.effect = *effect_map[incoming.effect.value];
         }
-        value_map[source_id.value] = clone.id;
-        inserted.push_back(clone.id);
-        clone_effectful.push_back(is_effectful_value(source));
-        clones.push_back(std::move(clone));
+        caller.effects.push_back(std::move(effect));
+    }
+    for (const auto& source : callee.slots) {
+        auto slot = source;
+        slot.id = SlotId{slot_base + source.id.value};
+        slot.name = "$inline." + std::to_string(callee.source.value) + "." +
+                    std::to_string(call_id.value) + "." + source.name;
+        slot.source_parameter.reset();
+        caller.slots.push_back(std::move(slot));
+    }
+
+    const auto remap = [&](ManagedTerminator terminator) {
+        if (terminator.value) terminator.value = value_map[terminator.value->value];
+        for (auto& successor : terminator.successors)
+            successor = block_map[successor.value];
+        terminator.effect = *effect_map[terminator.effect.value];
+        return terminator;
+    };
+    std::vector<ValueId> rest;
+    ManagedTerminator continuation;
+    {
+        auto& block = caller.blocks[site.value];
+        rest.assign(block.values.begin() + static_cast<std::ptrdiff_t>(position) + 1,
+                    block.values.end());
+        continuation = std::move(block.terminator);
+        block.values.resize(position);
+        block.values.insert(block.values.end(), prefix.begin(), prefix.end());
+        for (const auto id : entry.values) {
+            if (callee.values[id.value].kind != ValueKind::Parameter)
+                block.values.push_back(*value_map[id.value]);
+        }
+        block.terminator = remap(entry.terminator);
+    }
+    for (const auto& source : callee.blocks) {
+        if (source.id == callee.entry) continue;
+        ManagedBlock block;
+        block.id = block_map[source.id.value];
+        block.location = source.location;
+        for (const auto id : source.values) block.values.push_back(*value_map[id.value]);
+        for (const auto predecessor : source.predecessors)
+            block.predecessors.push_back(block_map[predecessor.value]);
+        block.terminator = remap(source.terminator);
+        block.effect = *effect_map[source.effect.value];
+        caller.blocks.push_back(std::move(block));
     }
 
     std::optional<ValueId> returned;
-    if (callee.blocks.front().terminator.value) {
-        const auto source = *callee.blocks.front().terminator.value;
-        if (source.value >= value_map.size() || !value_map[source.value]) {
-            return false;
-        }
-        returned = *value_map[source.value];
-    }
-
-    for (std::size_t index = 0; index < callee.slots.size(); ++index) {
-        auto slot = callee.slots[index];
-        slot.id = slot_map[index];
-        slot.name = "$inline." + std::to_string(callee.source.value) + "." +
-                    std::to_string(call_id.value) + "." + slot.name;
-        caller.slots.push_back(std::move(slot));
-    }
-    for (auto& clone : clones) caller.values.push_back(std::move(clone));
-
-    auto current_effect = *call.effect_input;
-    for (std::size_t index = 0; index < inserted.size(); ++index) {
-        if (!clone_effectful[index]) continue;
-        const EffectId output{
-            static_cast<std::uint32_t>(caller.effects.size())};
+    EffectId resume;
+    if (returns.size() == 1) {
+        const auto& exit = caller.blocks[join.value].terminator;
+        returned = exit.value;
+        resume = exit.effect;
+    } else {
+        ManagedBlock block;
+        block.id = join;
+        block.location = call.location;
         ManagedEffect effect;
-        effect.id = output;
-        effect.location = caller.values[inserted[index].value].location;
-        effect.kind = EffectKind::Operation;
-        effect.input = current_effect;
-        effect.operation = inserted[index];
+        effect.id = {static_cast<std::uint32_t>(caller.effects.size())};
+        effect.location = call.location;
+        effect.kind = EffectKind::Phi;
+        ManagedValue phi;
+        phi.kind = ValueKind::Phi;
+        phi.type = call.type;
+        for (const auto index : returns) {
+            auto& exit = caller.blocks[block_map[index].value];
+            block.predecessors.push_back(exit.id);
+            effect.incoming.push_back({exit.id, exit.terminator.effect});
+            if (exit.terminator.value)
+                phi.incoming.push_back({exit.id, *exit.terminator.value});
+            exit.terminator.kind = TerminatorKind::Branch;
+            exit.terminator.value.reset();
+            exit.terminator.successors = {join};
+        }
+        block.effect = effect.id;
+        resume = effect.id;
         caller.effects.push_back(std::move(effect));
-        auto& operation = caller.values[inserted[index].value];
-        operation.effect_input = current_effect;
-        operation.effect_output = output;
-        current_effect = output;
+        // Without a return the continuation is unreachable; its zero-input
+        // phi only stands for the result until unreachable blocks go.
+        if (!void_type(hir_module, call.type)) {
+            returned = append(std::move(phi));
+            block.values.push_back(*returned);
+        }
+        caller.blocks.push_back(std::move(block));
     }
-    replace_effect_inputs(
-        caller, *call.effect_output, current_effect);
-
-    auto& block_values = caller.blocks[block_index].values;
-    block_values.erase(block_values.begin() +
-                       static_cast<std::ptrdiff_t>(position));
-    block_values.insert(
-        block_values.begin() + static_cast<std::ptrdiff_t>(position),
-        inserted.begin(), inserted.end());
+    if (dynamic) {
+        ManagedValue restore;
+        restore.kind = ValueKind::DynamicStackRestore;
+        restore.type = *hir_module.builtin(BuiltinType::Void);
+        restore.operands = {*mark};
+        const auto id = append(std::move(restore));
+        resume = chain(id, resume);
+        caller.blocks[join.value].values.push_back(id);
+    }
+    {
+        auto& block = caller.blocks[join.value];
+        block.values.insert(block.values.end(), rest.begin(), rest.end());
+        block.terminator = continuation;
+    }
+    if (join != site) {
+        for (const auto successor : continuation.successors) {
+            auto& block = caller.blocks[successor.value];
+            std::replace(block.predecessors.begin(), block.predecessors.end(),
+                         site, join);
+            for (auto& incoming : caller.effects[block.effect.value].incoming)
+                if (incoming.predecessor == site) incoming.predecessor = join;
+            for (const auto id : block.values) {
+                for (auto& incoming : caller.values[id.value].incoming)
+                    if (incoming.predecessor == site) incoming.predecessor = join;
+            }
+        }
+    }
+    replace_effect_inputs(caller, *call.effect_output, resume);
     if (returned) replace_value_uses(caller, call_id, *returned);
-    return true;
+
+    std::vector<BlockId> added;
+    for (const auto& block : callee.blocks) {
+        const auto id = block_map[block.id.value];
+        if (id != site && id != join) added.push_back(id);
+    }
+    if (join != site) added.push_back(join);
+    return added;
+}
+
+// Renumbers the blocks in `order`, which lists every block once.
+void reorder_blocks(ManagedFunction& function, const std::vector<BlockId>& order) {
+    std::vector<BlockId> remap(order.size());
+    for (std::size_t index = 0; index < order.size(); ++index)
+        remap[order[index].value] = {static_cast<std::uint32_t>(index)};
+    std::vector<ManagedBlock> blocks;
+    blocks.reserve(order.size());
+    for (const auto id : order) blocks.push_back(std::move(function.blocks[id.value]));
+    for (auto& block : blocks) {
+        block.id = remap[block.id.value];
+        for (auto& predecessor : block.predecessors) predecessor = remap[predecessor.value];
+        for (auto& successor : block.terminator.successors)
+            successor = remap[successor.value];
+        for (auto& incoming : function.effects[block.effect.value].incoming)
+            incoming.predecessor = remap[incoming.predecessor.value];
+        for (const auto id : block.values) {
+            for (auto& incoming : function.values[id.value].incoming)
+                incoming.predecessor = remap[incoming.predecessor.value];
+        }
+    }
+    function.entry = remap[function.entry.value];
+    for (auto& label : function.labels) label.block = remap[label.block.value];
+    function.blocks = std::move(blocks);
 }
 
 void compact_effects(ManagedFunction& function) {
@@ -8945,32 +9169,53 @@ void inline_managed_calls(ManagedModule& module,
                           const hir::Module& hir_module,
                           const CompilerOptions& options,
                           Diagnostics& diagnostics) {
-    for (auto& caller : module.functions) {
-        bool changed = false;
-        std::size_t expanded_units = 0;
-        const auto ordinary_limit =
-            static_cast<std::size_t>(options.inline_unit_limit);
-        const std::size_t expansion_multiplier =
-            options.optimize_for == OptimizationGoal::Speed
-                ? 8U
-                : options.optimize_for == OptimizationGoal::Size
-                      ? 4U
-                      : 2U;
-        const auto expansion_limit =
-            std::max<std::size_t>(32,
-                                  ordinary_limit * expansion_multiplier);
+    const auto ordinary_limit =
+        static_cast<std::size_t>(options.inline_unit_limit);
+    const std::size_t expansion_multiplier =
+        options.optimize_for == OptimizationGoal::Speed
+            ? 8U
+            : options.optimize_for == OptimizationGoal::Size ? 4U : 2U;
+    const auto expansion_limit =
+        std::max<std::size_t>(32, ordinary_limit * expansion_multiplier);
+    // Inlined copies of a failing call share its source position.
+    std::set<std::pair<std::pair<const SourceFile*, std::size_t>, std::string>>
+        reported;
+    const auto report = [&](SourceLocation location, std::string message) {
+        if (reported.insert({{location.file, location.offset}, message}).second)
+            diagnostics.error(location, message);
+    };
 
-        for (std::size_t block_index = 0;
+    for (auto& caller : module.functions) {
+        const bool naked = hir_module.function(caller.source).naked;
+        // Each inlined body is a frame naming its callee and the frame that
+        // called it; frame 0 is the caller's own body. A call never inlines a
+        // function of its own frame chain, which also ends call cycles.
+        struct Frame {
+            hir::FunctionId function;
+            std::uint32_t parent{};
+        };
+        std::vector<Frame> frames{{caller.source}};
+        std::vector<std::uint32_t> frame_of(caller.values.size());
+        const auto recursive = [&](std::uint32_t frame, hir::FunctionId callee) {
+            for (;; frame = frames[frame].parent) {
+                if (frames[frame].function == callee) return true;
+                if (frame == 0) return false;
+            }
+        };
+        // Inlined blocks follow their call site.
+        std::vector<BlockId> layout;
+        for (const auto& block : caller.blocks) layout.push_back(block.id);
+        std::unordered_map<std::uint32_t, std::string> failures;
+        std::size_t expanded_units = 0;
+        bool changed = false;
+
+        for (std::uint32_t block_index = 0;
              block_index < caller.blocks.size(); ++block_index) {
-            auto& values = caller.blocks[block_index].values;
-            for (std::size_t position = 0; position < values.size();) {
-                const auto call_id = values[position];
+            for (std::size_t position = 0;
+                 position < caller.blocks[block_index].values.size();) {
+                const auto call_id = caller.blocks[block_index].values[position];
                 const auto& call = caller.values[call_id.value];
                 if (call.kind != ValueKind::Call || !call.callee) {
-                    ++position;
-                    continue;
-                }
-                if (call.must_tail) {
                     ++position;
                     continue;
                 }
@@ -8979,14 +9224,20 @@ void inline_managed_calls(ManagedModule& module,
                 // A naked function admits only raw-compatible inlining.
                 const bool mandatory =
                     has_function_attribute(entity, "always_inline") ||
-                    (hir_module.function(caller.source).naked &&
-                     has_function_attribute(entity, "raw_inline"));
-                const bool forbidden =
-                    has_function_attribute(entity, "noinline");
-                const bool requested =
-                    options.inline_functions || mandatory;
-                if (!callee || callee == &caller || forbidden || !requested ||
-                    !structurally_inlineable(*callee, entity)) {
+                    (naked && has_function_attribute(entity, "raw_inline"));
+                if (!callee || has_function_attribute(entity, "noinline") ||
+                    (!mandatory && (!options.inline_functions || naked))) {
+                    ++position;
+                    continue;
+                }
+                auto blocker =
+                    call.must_tail ? std::optional<std::string>(
+                                         "the call is a musttail call")
+                    : recursive(frame_of[call_id.value], *call.callee)
+                        ? std::optional<std::string>("the call is recursive")
+                        : inline_blocker(*callee, entity, hir_module, naked);
+                if (blocker) {
+                    if (mandatory) failures.emplace(call_id.value, std::move(*blocker));
                     ++position;
                     continue;
                 }
@@ -8995,59 +9246,63 @@ void inline_managed_calls(ManagedModule& module,
                     entity.definition && entity.definition->inline_hint
                         ? ordinary_limit * 2
                         : ordinary_limit;
+                // Like a frame of its own, an inlined variable-length array
+                // is released at the call's end; only a mandatory call pays
+                // for the dynamic frame this gives the caller.
                 if (!mandatory &&
                     (cost > hinted_limit ||
-                     expanded_units + cost > expansion_limit)) {
+                     expanded_units + cost > expansion_limit ||
+                     allocates_dynamic_stack(*callee))) {
                     ++position;
                     continue;
                 }
-                if (!inline_call(caller, block_index, position, *callee)) {
-                    ++position;
-                    continue;
-                }
+                const auto frame = static_cast<std::uint32_t>(frames.size());
+                frames.push_back({*call.callee, frame_of[call_id.value]});
+                const auto added = inline_call(caller, {block_index}, position,
+                                               *callee, hir_module);
+                frame_of.resize(caller.values.size(), frame);
+                layout.insert(std::find(layout.begin(), layout.end(),
+                                        BlockId{block_index}) + 1,
+                              added.begin(), added.end());
                 changed = true;
                 expanded_units += cost;
                 // The inserted body can itself contain profitable calls.
             }
         }
-        if (changed) {
-            compact_effects(caller);
-            compact_managed_values(caller);
-        }
-    }
 
-    for (const auto& caller : module.functions) {
-        const bool naked = hir_module.function(caller.source).naked;
         for (const auto& block : caller.blocks) {
             for (const auto value_id : block.values) {
                 const auto& value = caller.values[value_id.value];
-                if (naked && value.kind == ValueKind::Call) {
-                    const auto* callee = value.callee
-                        ? &hir_module.function(*value.callee)
-                        : nullptr;
-                    diagnostics.error(
-                        value.location,
-                        callee && has_function_attribute(*callee, "raw_inline")
-                            ? "raw_inline call to '" + callee->source_name +
-                                  "' could not be inlined into the naked "
-                                  "function"
-                            : std::string("ordinary calls are not permitted "
-                                          "in a naked function"));
-                    continue;
-                }
-                if (value.kind != ValueKind::Call || !value.callee ||
-                    !module.owns(*value.callee)) {
-                    continue;
-                }
-                const auto& callee = hir_module.function(*value.callee);
-                if (has_function_attribute(callee, "always_inline") &&
-                    !has_function_attribute(callee, "noinline")) {
-                    diagnostics.error(
-                        value.location,
-                        "always_inline call to '" + callee.source_name +
-                            "' could not be inlined");
+                if (value.kind != ValueKind::Call) continue;
+                const auto* callee = value.callee
+                    ? &hir_module.function(*value.callee)
+                    : nullptr;
+                const auto failure = failures.find(value_id.value);
+                const auto reason = failure == failures.end()
+                    ? std::string()
+                    : ": " + failure->second;
+                if (naked && callee && has_function_attribute(*callee, "raw_inline")) {
+                    report(value.location,
+                           "raw_inline call to '" + callee->source_name +
+                               "' could not be inlined into the naked function" +
+                               reason);
+                } else if (callee && module.owns(*value.callee) &&
+                           has_function_attribute(*callee, "always_inline") &&
+                           !has_function_attribute(*callee, "noinline")) {
+                    report(value.location, "always_inline call to '" +
+                                               callee->source_name +
+                                               "' could not be inlined" + reason);
+                } else if (naked) {
+                    report(value.location,
+                           "ordinary calls are not permitted in a naked function");
                 }
             }
+        }
+        if (changed) {
+            reorder_blocks(caller, layout);
+            prune_unreachable_blocks(caller);
+            compact_effects(caller);
+            compact_managed_values(caller);
         }
     }
 }
@@ -17725,6 +17980,67 @@ bool specialize_surviving_calls(ManagedModule& module,
         changed = true;
     }
     return changed;
+}
+
+void discard_unreferenced_functions(ManagedModule& module,
+                                    hir::Module& hir_module,
+                                    const data::Module& data_module) {
+    std::vector<bool> live(hir_module.functions.size());
+    std::vector<hir::FunctionId> pending;
+    const auto mark = [&](hir::FunctionId id) {
+        if (live[id.value]) return;
+        live[id.value] = true;
+        pending.push_back(id);
+    };
+    const auto mark_address = [&](const data::AddressConstant& address) {
+        if (address.function) mark(*address.function);
+        if (address.label) mark(hir_module.labels[address.label->value].owner);
+    };
+    std::unordered_set<std::string_view> targets;
+    for (const auto& function : hir_module.functions) {
+        if (function.alias_target) targets.insert(*function.alias_target);
+        if (function.weakref_target) targets.insert(*function.weakref_target);
+    }
+    for (const auto& object : hir_module.objects) {
+        if (object.alias_target) targets.insert(*object.alias_target);
+        if (object.weakref_target) targets.insert(*object.weakref_target);
+    }
+    std::unordered_map<std::uint32_t, const ManagedFunction*> bodies;
+    for (const auto& function : module.functions) {
+        bodies.emplace(function.source.value, &function);
+        const auto& entity = hir_module.function(function.source);
+        if (entity.linkage == Linkage::Global || entity.used || entity.retain ||
+            targets.contains(entity.link_symbol) ||
+            std::any_of(function.values.begin(), function.values.end(),
+                        [](const ManagedValue& value) {
+                            return value.patch_sink.has_value();
+                        })) {
+            mark(function.source);
+        }
+    }
+    for (const auto& object : data_module.objects) {
+        if (object.address) mark_address(*object.address);
+        for (const auto& relocation : object.relocations)
+            mark_address(relocation.address);
+    }
+    while (!pending.empty()) {
+        const auto body = bodies.find(pending.back().value);
+        pending.pop_back();
+        if (body == bodies.end()) continue;
+        for (const auto& value : body->second->values) {
+            if (value.callee) mark(*value.callee);
+            if (value.label) mark(hir_module.labels[value.label->value].owner);
+            if (value.patch_initial_address)
+                mark_address(*value.patch_initial_address);
+        }
+    }
+    std::erase_if(module.functions, [&](const ManagedFunction& function) {
+        if (live[function.source.value]) return false;
+        module.definitions.erase(function.source.value);
+        hir_module.functions[function.source.value].ownership =
+            hir::BodyOwnership::Discarded;
+        return true;
+    });
 }
 
 } // namespace cross::mir

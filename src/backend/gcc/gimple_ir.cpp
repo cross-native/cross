@@ -1647,7 +1647,8 @@ public:
                 << ");\n\n";
         }
         for (const auto& function : hir_.functions) {
-            if (!function.definition || raw_assembly_.owns(function.id)) {
+            if (!function.definition || raw_assembly_.owns(function.id) ||
+                function.ownership == hir::BodyOwnership::Discarded) {
                 continue;
             }
             const auto* body = managed_.find(function.id);
@@ -1886,6 +1887,8 @@ private:
                 attributes.emplace_back(marker);
             }
         }
+        // GCC's retain does not keep an unreferenced definition by itself.
+        if (function.retain && !function.used) attributes.emplace_back("used");
         for (const auto& name : function.no_sanitize) {
             attributes.push_back("no_sanitize(" + c_string(name) + ')');
         }
@@ -1918,6 +1921,7 @@ private:
 
     void emit_function_declarations(std::ostringstream& out) const {
         for (const auto& function : hir_.functions) {
+            if (function.ownership == hir::BodyOwnership::Discarded) continue;
             const bool internal_definition =
                 function.linkage != Linkage::Global && function.definition &&
                 !raw_assembly_.owns(function.id);
@@ -1958,7 +1962,7 @@ private:
         }
         attributes.push_back("aligned(" + std::to_string(object.alignment) +
                              ')');
-        if (object.used) attributes.emplace_back("used");
+        if (object.used || object.retain) attributes.emplace_back("used");
         if (object.retain) attributes.emplace_back("retain");
         if (entity.weak) attributes.emplace_back("weak");
         if (entity.alias_target) {

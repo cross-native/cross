@@ -230,6 +230,11 @@ Other rules:
   unprototyped functions, no implicit declarations, and no overloading.
 - `inline` permits inlining; it never changes linkage. `[[always_inline]]`,
   `[[noinline]]`, `[[hot]]`, `[[cold]]`, and `[[noreturn]]` work as in GCC.
+  A call to an `[[always_inline]]` function that cannot be inlined is an error
+  that names the reason: a recursive or `[[musttail]]` call, or a callee that
+  is variadic or `[[naked]]`, takes a label's address, contains `$::patch` or a
+  `[[musttail]]` return, places a parameter or local at an explicit location,
+  or has `out` or `inout` parameters and an explicit result location.
 - `[[musttail]] return f(x);` requires a tail call or fails to compile. During
   compile-time evaluation it also replaces the caller's frame, so tail-call
   chains do not count toward the recursion limit.

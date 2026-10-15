@@ -31,7 +31,10 @@ your own linker, startup code, and libraries. Nothing is added implicitly, and
 All inputs of one command form a single compilation group with one output, named
 after the first input when `-o` is absent. Definitions without `static` or
 `global` are shared within the group but not exported to the linker. Compile
-separately and link only `global` entities to combine objects.
+separately and link only `global` entities to combine objects. A function that
+is not `global` is emitted only when an emitted function or static data refers
+to it, when it has `[[used]]` or `[[retain]]`, or when an alias names it, so a
+function inlined into every caller leaves no copy.
 
 The output depends only on the inputs, options, and models, not on the working
 directory or the environment. Internal symbols of `static` entities derive from
@@ -84,6 +87,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-ffast-math` | Relax floating-point rules: finite math only, no signed zeros, `-ffp-contract=fast`. Under a profile that traps floating exceptions ([models.md](models.md#profiles)), it reassociates floating operations only when no exception but divide-by-zero traps, and `-ffp-contract=fast` fuses a multiply and an add only when overflow and underflow do not trap. |
 | `-funwind-tables` | Emit unwind tables (CFI or SEH). No unwinder is linked. |
 | `-fno-inline-functions` | Disable discretionary inlining; `[[always_inline]]` still applies. |
+| `-finline-limit=N` | Inline a call that `[[always_inline]]` does not require only when the callee has at most N operations, counting conditional branches (2N for an `inline` function), until the calls inlined into one function add up to 8N operations from `-O1` to `-O3`, 4N at `-Os`, and 2N otherwise, but at least 32. The presets set 32 at `-O1`, 96 at `-O2`, 256 at `-O3`, 24 at `-Os`, and 8 at `-Oz`. A function that allocates a variable-length array is inlined only when required, and a `[[naked]]` function inlines only `[[raw_inline]]` and `[[always_inline]]` functions. |
 | `-fno-ipa-cp-clone` | Do not specialize functions for constant arguments. From `-O3` on x86-64, calls with constant arguments to a function that is not `global` may use a copy of it specialized for those constants: at most four copies per function, each named `NAME.const.I_V` after the function's link name `NAME`, with the index `I` and hexadecimal value `V` of each constant argument, and placed right after the function. |
 | `-fno-shrink-wrap` | Set up the stack frame and save preserved registers at function entry, not only on the paths that need them (the default from `-O1`). |
 | `-fno-div-by-constant` | Keep the divide instruction for division and remainder by a constant. From `-Og`, such a divide becomes a multiplication by a fixed-point reciprocal with shifts and adds when the target prices that sequence lower; `-Os` and `-Oz` replace only a divide that a single shift or mask performs. |

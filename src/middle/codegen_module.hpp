@@ -15,7 +15,7 @@ namespace codegen {
 // Typed, non-owning boundary between target-independent lowering and output
 // components. Backends consume entity IDs and IR nodes through this view;
 // source text and serialized LLVM syntax are never compiler-internal transport.
-enum class FunctionBodyKind { Declaration, ManagedMir, RawMir, Unlowered };
+enum class FunctionBodyKind { Declaration, ManagedMir, RawMir, Discarded, Unlowered };
 
 class ModuleView {
 public:

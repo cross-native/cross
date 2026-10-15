@@ -57,7 +57,8 @@ static u64 affine_xor_reduction(in const u64 *values, in uptr count) {
     return result;
 }
 
-[[noinline, link_name("byte_swap_reduction")]]
+// -O3 specializes the calls; `used` keeps the bodies the test inspects.
+[[noinline, used, link_name("byte_swap_reduction")]]
 static u64 byte_swap_reduction(in const u64 *values, in uptr count) {
     u64 result = 0;
     uptr index = 0;
@@ -71,7 +72,7 @@ static u64 byte_swap_reduction(in const u64 *values, in uptr count) {
     return result;
 }
 
-[[noinline, link_name("constant_product_reduction")]]
+[[noinline, used, link_name("constant_product_reduction")]]
 static u64 constant_product_reduction(in const u64 *values, in uptr count) {
     u64 result = 0;
     uptr index = 0;

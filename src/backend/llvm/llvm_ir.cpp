@@ -192,7 +192,8 @@ private:
 
     void emit_definitions(std::ostringstream& module) {
         for (const auto& function : hir_.functions) {
-            if (!function.definition || raw_assembly_.owns(function.id)) {
+            if (!function.definition || raw_assembly_.owns(function.id) ||
+                function.ownership == hir::BodyOwnership::Discarded) {
                 continue;
             }
             const auto* managed = managed_.find(function.id);

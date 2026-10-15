@@ -1703,7 +1703,7 @@ if(BUILD_TESTING)
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions.x
             -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions_start.s
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-machine-instructions-${level}
-            -DMIPS_CPUS=vr4300 -DEXPECTED=11111111111 "-DCC_FLAGS=-${level}"
+            -DMIPS_CPUS=vr4300 -DEXPECTED=1111111111111 "-DCC_FLAGS=-${level}"
             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
         set_tests_properties(${name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.raw;isa.vr4300;endian.big;endian.little;opt.${level}"
@@ -2510,6 +2510,80 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/inlining.cmake")
     set_tests_properties(cross_managed_inlining PROPERTIES
         LABELS "check.compile;arch.x86_64;middle;feature.optimization")
+    add_test(NAME cross_inlining_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/inlining_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/inlining-errors
+                -P "${CMAKE_SOURCE_DIR}/test/middle/inlining_errors.cmake")
+    set_tests_properties(cross_inlining_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;middle;feature.optimization;feature.calls")
+    add_test(NAME cross_unreferenced_functions
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/unreferenced_functions.x
+                -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/unreferenced-functions
+                -P "${CMAKE_SOURCE_DIR}/test/middle/unreferenced_functions.cmake")
+    set_tests_properties(cross_unreferenced_functions PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;backend.llvm;feature.optimization;opt.O0;opt.O2")
+    if(CROSS_ENABLE_GCC_GIMPLE_TEXT AND CROSS_TEST_GCC)
+        add_test(NAME cross_gcc_gimple_unreferenced_functions
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DGCC=${CROSS_TEST_GCC}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/unreferenced_functions.x
+                -DHARNESS=${CMAKE_SOURCE_DIR}/test/middle/unreferenced_functions_harness.c
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/gimple-unreferenced-functions
+                "-DLEVELS=O0;O2" "-DCC_FLAGS=-DGIMPLE;-mabi=sysv_abi" -DEXPECTED=0
+                -P "${CMAKE_SOURCE_DIR}/test/backend/gcc/gimple_runtime.cmake")
+        set_tests_properties(cross_gcc_gimple_unreferenced_functions PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.gcc;middle;feature.optimization;opt.O0;opt.O2")
+    endif()
+    # Inlined control flow, output cells, and variable-length arrays under
+    # mandatory, discretionary, and disabled inlining.
+    foreach(variant mandatory-O0 mandatory-O2 discretionary-O2 discretionary-Os disabled-O2)
+        string(REPLACE "-" ";" parts "${variant}")
+        list(GET parts 0 mode)
+        list(GET parts 1 level)
+        if(mode STREQUAL "discretionary")
+            set(define -DDISCRETIONARY)
+        elseif(mode STREQUAL "disabled")
+            set(define -DDISABLED)
+        else()
+            set(define -DMANDATORY)
+        endif()
+        add_test(NAME cross_inlining_runtime_${mode}_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/inlining_runtime.x
+                -DDRIVER=${CMAKE_SOURCE_DIR}/test/middle/inlining_runtime_driver.cpp
+                -DMODE=${mode} -DLEVEL=${level}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/inlining-runtime-${mode}-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/middle/inlining_runtime.cmake")
+        set_tests_properties(cross_inlining_runtime_${mode}_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.calls;opt.${level}")
+        foreach(endian b l)
+            if(endian STREQUAL b)
+                set(endian_label big)
+            else()
+                set(endian_label little)
+            endif()
+            set(name cross_inlining_runtime_o32_vr4300_${endian}_${mode}_${level})
+            add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/inlining_runtime.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/inlining_runtime_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/inlining-runtime-o32-${endian}-${mode}-${level}
+                -DMIPS_CPUS=vr4300 -DMIPS_ENDIANS=${endian} -DMIPS_SINGLE_CASE=ON
+                -DEXPECTED=P "-DCC_FLAGS=-${level};-fno-eval-calls;${define}"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(${name} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;feature.calls;profile.o32;isa.vr4300;endian.${endian_label};opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     add_test(NAME cross_call_cloning
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

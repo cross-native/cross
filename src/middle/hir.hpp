@@ -156,7 +156,9 @@ struct VariadicBinding {
     ValueBinding binding{};
 };
 
-enum class BodyOwnership { None, ManagedAst, ManagedMir, RawMir };
+// A Discarded definition is one that nothing reachable references: it has no
+// body and emits nothing.
+enum class BodyOwnership { None, ManagedAst, ManagedMir, RawMir, Discarded };
 enum class AbiContract { Dynamic, Registered };
 enum class FunctionTemperature { Normal, Hot, Cold };
 enum class SymbolVisibility { Default, Hidden, Protected, Internal };

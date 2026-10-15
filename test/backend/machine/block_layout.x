@@ -12,7 +12,8 @@ static i32 layout_choice(in i32 condition) {
     return result + 3;
 }
 
-[[runtime_only, noinline]]
+// Its calls are specialized at -O3; `used` keeps the body the test inspects.
+[[runtime_only, noinline, used]]
 static u64 scheduled_choice(in bool choose, in u64 left, in u64 right) {
     if (choose) {
         return left + right;

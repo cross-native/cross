@@ -120,6 +120,21 @@ global u32 naked_scaled(in u32 value "a0") -> "v0" {
     $::_jr(link);
 }
 
+[[raw_inline]]
+static u32 smaller(in u32 value, in u32 limit) {
+    if (value > limit) return limit;
+    return value;
+}
+
+// An inlined body with a branch and two returns.
+[[naked, clobber("t0", "t1", "t2")]]
+global u32 naked_clamp(in u32 value "a0", in u32 limit "a1") -> "v0" {
+    register u32 result "v0";
+    register void *link "ra";
+    result = smaller(value, limit);
+    $::_jr(link);
+}
+
 // Leaves through ERET to `target` with Status.EXL set and ERL clear.
 [[naked, clobber("k0", "k1")]]
 global void return_through_eret(in void *target "a0") {

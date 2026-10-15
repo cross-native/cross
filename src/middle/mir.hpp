@@ -348,4 +348,12 @@ bool specialize_surviving_calls(ManagedModule& module,
                                 hir::Module& hir_module,
                                 const CompilerOptions& options);
 
+// Discards the managed bodies that no root reaches once no later pass adds a
+// reference, and marks their HIR functions Discarded. The roots are `global`,
+// `used`, and `retain` functions, alias and weak-reference targets, bodies
+// with a patch sink, and the functions and label owners static data names.
+void discard_unreferenced_functions(ManagedModule& module,
+                                    hir::Module& hir_module,
+                                    const data::Module& data_module);
+
 } // namespace cross::mir

@@ -4997,14 +4997,15 @@ public:
                 "native MIPS assembly currently requires an ELF target");
             return result;
         }
-        // EF_MIPS_NAN2008 tells linkers and loaders the NaN encoding.
-        if (subtarget_.has_feature(Feature::Nan2008)) output_ << ".nan 2008\n";
+        // EF_MIPS_NAN2008 tells linkers and loaders the NaN encoding, also of
+        // an object without functions.
+        if (subtarget_.has_feature(Feature::Nan2008)) result.header = ".nan 2008\n";
         if (elf_abi_tag(subtarget_.abi_info()) == ElfAbiTag::Eabi32) {
             // GNU MIPS linkers use this conventional empty marker in addition
             // to EF_MIPS_ABI_EABI32.  LLVM MC accepts the section even though
             // it cannot infer EABI32 from the PSP triple by itself.
-            result.header = ".section .mdebug.eabi32\n.previous\n"
-                            ".section .gcc_compiled_long32\n.previous\n";
+            result.header += ".section .mdebug.eabi32\n.previous\n"
+                             ".section .gcc_compiled_long32\n.previous\n";
         }
         for (auto& function : module_.functions) {
             next_label_ = 0;

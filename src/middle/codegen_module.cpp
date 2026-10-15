@@ -24,6 +24,8 @@ const mir::RawFunction* ModuleView::raw_body(hir::FunctionId id) const {
 FunctionBodyKind ModuleView::body_kind(hir::FunctionId id) const {
     const auto& function = hir_.function(id);
     if (!function.definition) return FunctionBodyKind::Declaration;
+    if (function.ownership == hir::BodyOwnership::Discarded)
+        return FunctionBodyKind::Discarded;
     if (managed_body(id)) return FunctionBodyKind::ManagedMir;
     if (raw_body(id)) return FunctionBodyKind::RawMir;
     return FunctionBodyKind::Unlowered;
@@ -273,7 +275,8 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
             valid = false;
         }
         if ((entity.ownership == hir::BodyOwnership::None ||
-             entity.ownership == hir::BodyOwnership::ManagedAst) &&
+             entity.ownership == hir::BodyOwnership::ManagedAst ||
+             entity.ownership == hir::BodyOwnership::Discarded) &&
             (has_managed || has_raw)) {
             diagnostics.error(entity.location,
                               "lowered function body has no matching HIR owner");

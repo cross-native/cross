@@ -1157,6 +1157,7 @@ int cc_main(int argc, char** argv) {
             managed_mir, hir_module, *subtarget, options, diagnostics)) {
         return 1;
     }
+    mir::discard_unreferenced_functions(managed_mir, hir_module, data_module);
     if (options.verbose) std::cerr << "cc: emitting raw machine assembly\n";
     native::DebugInfo debug(options, hir_module, managed_mir,
                             program.enumerations, *subtarget);

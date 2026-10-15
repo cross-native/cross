@@ -61,6 +61,17 @@ _start:
         nop
         jal print_digit
         addiu $a0,$v0,-8
+        # min(9, 5) and min(3, 5) through a branching raw_inline callee.
+        addiu $a0,$zero,9
+        jal naked_clamp
+        addiu $a1,$zero,5
+        jal print_digit
+        addiu $a0,$v0,-4
+        addiu $a0,$zero,3
+        jal naked_clamp
+        addiu $a1,$zero,5
+        jal print_digit
+        addiu $a0,$v0,-2
         # ERET resumes at after_eret instead of returning here.
         lui $a0,%hi(after_eret)
         addiu $a0,$a0,%lo(after_eret)
