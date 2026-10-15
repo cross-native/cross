@@ -11,7 +11,8 @@ are built into them.
 - `llvm-mc` on `PATH` to produce object files with `cc -c`. Assembly output
   (`cc -S`) needs no other tool.
 
-The most tested host is x86-64 Windows with the MSYS2 MINGW64 environment:
+The tested hosts are x86-64 Windows with the MSYS2 MINGW64 environment and
+x86-64 Ubuntu Linux. On Windows:
 
 ```sh
 pacman -S mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gcc \
@@ -21,8 +22,17 @@ pacman -S mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gcc \
 Add `mingw-w64-x86_64-clang` to build with Clang, and `mingw-w64-x86_64-qemu`
 and `mingw-w64-x86_64-python-pytest` for the complete test suite. Use the
 MINGW64 tools: MSYS2's own `/usr/bin/g++` produces programs that depend on
-the MSYS runtime. On Linux, install the distribution's CMake, Ninja, GCC or
-Clang, LLVM, and LLD packages.
+the MSYS runtime. On Ubuntu:
+
+```sh
+sudo apt install cmake ninja-build g++ clang llvm lld qemu-system-mips \
+                 python3-pytest
+```
+
+Some distributions install the LLVM tools only under a versioned directory
+such as `/usr/lib/llvm-21/bin`; add it to `PATH`. The default static link of
+`cc` and `cpp` needs the static C and C++ runtime libraries, which the GCC
+development packages provide.
 
 ## Configure and build
 

@@ -186,5 +186,5 @@ global i32 aggregate_entry() {
            (sizeof(initialized_local_array) == 16uptr) +
            initialized_layout[0] + initialized_layout[1] +
            reset_array[0] + reset_array[1] + reset_array[2] +
-           reset_array[3];
+           reset_array[3] - 512; // an exit status keeps eight bits
 }

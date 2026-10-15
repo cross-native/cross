@@ -4165,7 +4165,7 @@ if(BUILD_TESTING)
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate/runtime.x
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregates.ll
                 -DENTRY=aggregate_entry
-                -DEXPECTED=576
+                -DEXPECTED=64
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
     set_tests_properties(cross_runtime_aggregates_llvm_debug PROPERTIES
@@ -4178,7 +4178,7 @@ if(BUILD_TESTING)
                 -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-aggregates
                 -DENTRY=aggregate_entry
-                -DEXPECTED=576
+                -DEXPECTED=64
                 -DCC_FLAGS=-O2
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_aggregates PROPERTIES

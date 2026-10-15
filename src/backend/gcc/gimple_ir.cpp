@@ -1658,7 +1658,8 @@ public:
                     "managed MIR ownership");
                 continue;
             }
-            out << FunctionEmitter(hir_, *body, options_, diagnostics_, types_,
+            out << definition_attributes(function)
+                << FunctionEmitter(hir_, *body, options_, diagnostics_, types_,
                                    start_)
                        .run();
         }
@@ -1838,6 +1839,16 @@ private:
                                "GIMPLE serializer has no selected ABI model");
         }
         return result;
+    }
+
+    // The calling convention is part of a GCC function type, so a definition
+    // repeats its declaration's attribute.
+    std::string definition_attributes(const hir::Function& function) const {
+        const auto* target = target_for_triple(options_.target);
+        const auto* entry = target ? find_abi(*target, function.abi) : nullptr;
+        return entry && !entry->gcc_calling_attribute.empty()
+                   ? "__attribute__((" + entry->gcc_calling_attribute + ")) "
+                   : std::string{};
     }
 
     std::string function_attributes(const hir::Function& function) const {

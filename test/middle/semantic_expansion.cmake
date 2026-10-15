@@ -20,7 +20,7 @@ function(run_cc output)
 endfunction()
 
 set(ir_output "${OUTPUT}.ll")
-run_cc("${ir_output}" -emit-llvm -O2)
+run_cc("${ir_output}" -emit-llvm -O2 -target x86_64-w64-windows-gnu)
 run_cc("${OUTPUT}.windows.o" -c -O2 -target x86_64-w64-windows-gnu)
 run_cc("${OUTPUT}.linux.o" -c -O2 -target x86_64-unknown-linux-gnu)
 

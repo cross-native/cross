@@ -29,7 +29,7 @@ bool preserves_scratch() {
         "movq %%rbx, %%rsp\n\t"
         "popq %%rbx\n\t"
         : "=c"(preserved)
-        : "i"(Factory)
+        : "s"(Factory)
         : "rax", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
     return (preserved & 255u) == 1u;
 }
