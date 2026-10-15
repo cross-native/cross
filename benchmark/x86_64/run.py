@@ -12,6 +12,7 @@ import json
 import math
 import platform
 import re
+import os
 import shutil
 import statistics
 import subprocess
@@ -298,13 +299,15 @@ def resolve_tool(value: str, description: str) -> Path:
 
     supplied = Path(value)
     if supplied.parent != Path(".") or supplied.is_absolute():
-        candidate = supplied.expanduser().resolve()
+        candidate = Path(os.path.abspath(supplied.expanduser()))
         if candidate.is_file():
             return candidate
     found = shutil.which(value)
     if found is None:
         raise BenchmarkError(f"cannot find {description}: {value}")
-    return Path(found).resolve()
+    # Keep the invoked name: multi-call tools such as lld and clang
+    # dispatch on it, so a resolved symlink would change their mode.
+    return Path(os.path.abspath(found))
 
 
 def render_template(template: str, replacements: Mapping[str, str]) -> str:
