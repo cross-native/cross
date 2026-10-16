@@ -78,6 +78,25 @@ std::optional<unsigned> Subtarget::integer_operation_cost(
     return cost;
 }
 
+std::optional<unsigned> Subtarget::bit_operation_cost(
+    CostedBitOperation operation, unsigned bits) const {
+    if (!target_ || !target_->cost_model.bit_operation) return std::nullopt;
+    const auto instructions =
+        target_->cost_model.bit_operation(*this, operation, bits);
+    if (instructions.empty()) return std::nullopt;
+    unsigned cost{};
+    for (const auto instruction : instructions) {
+        if (!has_instruction(instruction)) return std::nullopt;
+        cost += latency(instruction);
+    }
+    return cost;
+}
+
+unsigned Subtarget::integer_register_bits() const {
+    return target_ && target_->cost_model.integer_register_bits
+        ? target_->cost_model.integer_register_bits(*this) : 64U;
+}
+
 std::optional<InstructionFeatureConflict> Subtarget::form_conflict(
     const InstructionEntry& form) const {
     if (auto conflict = instruction_feature_conflict(

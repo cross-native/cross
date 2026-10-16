@@ -133,4 +133,51 @@ inline IntegerResult checked_integer_operation(IntegerOperation operation,
     return {mask_to(result, type.bits), IntegerError::None};
 }
 
+// The bit intrinsics on the low `bits` of `value`; zero counts `bits`.
+inline unsigned count_leading_zeros(UInt128 value, unsigned bits) {
+    unsigned count = 0;
+    while (count < bits && !cross::bit(value, bits - 1 - count)) ++count;
+    return count;
+}
+
+inline unsigned count_trailing_zeros(UInt128 value, unsigned bits) {
+    unsigned count = 0;
+    while (count < bits && !cross::bit(value, count)) ++count;
+    return count;
+}
+
+inline unsigned population_count(UInt128 value, unsigned bits) {
+    unsigned count = 0;
+    for (unsigned index = 0; index < bits; ++index)
+        if (cross::bit(value, index)) ++count;
+    return count;
+}
+
+inline UInt128 byte_swap(UInt128 value, unsigned bits) {
+    UInt128 result;
+    for (unsigned byte = 0; byte < bits / 8; ++byte) {
+        const auto piece = mask_to(shift_right(value, byte * 8), 8);
+        result = bit_or(result, shift_left(piece, bits - 8 - byte * 8));
+    }
+    return result;
+}
+
+// `amount` is below `bits`.
+inline UInt128 rotate_left(UInt128 value, unsigned amount, unsigned bits) {
+    value = mask_to(value, bits);
+    if (amount == 0) return value;
+    return mask_to(bit_or(shift_left(value, amount),
+                          shift_right(value, bits - amount)), bits);
+}
+
+// A rotation count `amount` of type `type` reduced modulo `bits`, so that a
+// negative count rotates the other way.
+inline unsigned rotate_amount(UInt128 amount, IntegerType type, unsigned bits) {
+    const bool negative = integer_negative(amount, type);
+    auto magnitude = negative ? mask_to(negate(amount), type.bits)
+                              : mask_to(amount, type.bits);
+    const auto remainder = divide_small(magnitude, bits);
+    return negative && remainder != 0 ? bits - remainder : remainder;
+}
+
 } // namespace cross

@@ -366,6 +366,49 @@ the stack arguments that follow them; `n64` has `gp_arg_area` for its one
 sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 `arg_area` reaches only the unnamed arguments passed on the stack.
 
+## Bit intrinsics
+
+`$::clz`, `$::ctz`, `$::popcount`, `$::rotl`, `$::rotr`, and `$::bswap`
+compile to instructions where the `-march` CPU has them and their `-mtune`
+latencies (`cc --print-costs`) add up to no more than the inline sequence,
+which counts one cycle for each operation, the latency of a multiplication,
+and the cost of materializing each constant. Otherwise they compile to the
+inline sequence. A `cpu` entry that marks an instruction `available = false`
+or raises its `latency` therefore selects the sequence
+([models.md](models.md#cpu-entries)). No form calls a function.
+
+| Operation | x86-64 | MIPS |
+| --- | --- | --- |
+| `$::clz` | `lzcnt` with LZCNT; otherwise `bsr`, `cmovne`, and `xor` | `clz` on MIPS32, MIPS64, and Allegrex, or `clo` for a complement `~x`; `dclz` or `dclo` for 64 bits on MIPS64 |
+| `$::ctz` | `tzcnt` with BMI; otherwise `bsf` and `cmovne` | the width less the leading ones of `x \| -x` (`clo`) where `clz` exists |
+| `$::popcount` | `popcnt` with POPCNT | none |
+| `$::bswap` | `bswap`, or `rolw $8` for 16 bits | `wsbh` and `rotr` on MIPS32 Release 2, `wsbw` on Allegrex; `wsbh` and `andi` for 16 bits |
+| `$::rotl`, `$::rotr` | `rol`, `ror` | `rotr` or `rotrv` with `-mrotate`; otherwise two shifts and `or` |
+
+The inline sequences use neither branches nor data tables:
+
+- leading zeros: a binary search that, for `k` from half the width down to
+  1, shifts the value left by `k` and counts `k` when it is below
+  2^(width - k), and counts one more for zero;
+- trailing zeros: the population count of `~(x | -x)`, whose ones are the
+  trailing zeros of `x`;
+- population count: sums of bit pairs, nibbles, and bytes under masks, the
+  byte sums added by shifts or collected by one multiplication by 0x0101…01,
+  whichever the costs favor;
+- byte swap: exchanges of neighboring bytes, then of larger pieces, under
+  masks;
+- rotation: two shifts by the count and its negation modulo the width.
+
+8- and 16-bit operands use the 32-bit form on their zero-extended value or
+the sequence at their own width, whichever is cheaper. An operand wider than
+a general register (64 bits on MIPS I, MIPS II, MIPS32, and Allegrex, 128
+bits on x86-64) combines its halves: a count of the half on the counted side,
+plus that of the other half when the first is zero, the sum of the halves'
+population counts, and the swapped halves exchanged; a 128-bit rotation uses
+128-bit shifts. Allegrex's `clz`, `clo`, `wsbh`, `wsbw`, `rotr`, and `rotrv`
+appear as `.word` directives with the instruction in a comment; its `clz`
+and `clo` are SPECIAL functions 0x16 and 0x17, not the MIPS32 encodings.
+
 ## Limits on all targets
 
 - `-fbounds-trap` checks only subscripts of arrays with a known bound; it
@@ -387,7 +430,8 @@ sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 - `-emit-gimple` rejects what GCC's `__GIMPLE` input cannot express or the
   serializer does not encode, among them aggregate static initializers,
   variadic functions and calls through a variadic function pointer, label
-  addresses, `$::patch` values, floating intrinsics, and `[[musttail]]` calls.
+  addresses, `$::patch` values, floating intrinsics, bit intrinsics that
+  compile to instructions, and `[[musttail]]` calls.
 - `-emit-llvm` and `-emit-gimple` output ignores the profile's floating
   environment: it is valid only where no exception traps and denormal results
   are kept.

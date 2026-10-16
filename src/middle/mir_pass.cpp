@@ -47,6 +47,7 @@ std::string_view pass_name(PassId pass) {
     case PassId::StraightLineStrengthReduction:
         return "straight-line-strength-reduction";
     case PassId::DivisionByConstant: return "division-by-constant";
+    case PassId::BitOperationLowering: return "bit-operation-lowering";
     case PassId::LoopRotation: return "loop-rotation";
     case PassId::SlpVectorization: return "slp-vectorization";
     case PassId::FloatingSimplification: return "floating-simplification";

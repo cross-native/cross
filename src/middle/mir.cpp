@@ -517,7 +517,8 @@ bool eligible_expression(const Expr& expression) {
             expression.left->text == "$::trap") {
             return true;
         }
-        if (floating_intrinsic(expression) != FloatingIntrinsic::None) {
+        if (floating_intrinsic(expression) != FloatingIntrinsic::None ||
+            bit_intrinsic(expression) != BitIntrinsic::None) {
             return std::all_of(expression.arguments.begin(),
                                expression.arguments.end(),
                                [](const auto& argument) {
@@ -3260,6 +3261,13 @@ private:
                 const auto type = infer_type(*expression.arguments.front());
                 return type ? std::optional(hir_.unqualified(*type)) : std::nullopt;
             }
+            if (const auto operation = bit_intrinsic(expression);
+                operation != BitIntrinsic::None) {
+                if (bit_count_intrinsic(operation)) return hir_.builtin(BuiltinType::U32);
+                if (expression.arguments.empty()) return std::nullopt;
+                const auto type = infer_type(*expression.arguments.front());
+                return type ? std::optional(hir_.unqualified(*type)) : std::nullopt;
+            }
             if (expression.left->text == "$::assume" ||
                 expression.left->text == "$::unreachable" ||
                 expression.left->text == "$::trap") {
@@ -5476,6 +5484,68 @@ private:
         co_return result;
     }
 
+    // A bit intrinsic computes on the unsigned type of its operand's width.
+    // A rotation count converts to that type, which keeps it modulo the
+    // width, and rotations and byte swaps convert back to the operand type.
+    ContinuationTask<std::optional<ValueId>> lower_bit_intrinsic_async(
+        const Expr& expression, BitIntrinsic operation) {
+        const auto& name = expression.left->text;
+        std::vector<hir::TypeId> types;
+        for (const auto& argument : expression.arguments) {
+            const auto type = infer_type(*argument);
+            if (!type || !integer_type(hir_, *type) ||
+                hir_.type(*type).builtin == BuiltinType::Bool) {
+                diagnostics_.error(argument->location,
+                                   name + " requires integer operands");
+                co_return std::nullopt;
+            }
+            types.push_back(hir_.unqualified(*type));
+        }
+        if (types.size() != bit_intrinsic_arity(operation)) {
+            diagnostics_.error(expression.location,
+                               name + (bit_intrinsic_arity(operation) == 1
+                                           ? " requires one argument"
+                                           : " requires two arguments"));
+            co_return std::nullopt;
+        }
+        const auto type = types.front();
+        const auto bits = type_bits(hir_, type);
+        const auto domain = *hir_.builtin(
+            hir_.type(type).builtin == BuiltinType::Iptr ||
+                    hir_.type(type).builtin == BuiltinType::Uptr
+                ? BuiltinType::Uptr
+            : bits == 8 ? BuiltinType::U8
+            : bits == 16 ? BuiltinType::U16
+            : bits == 32 ? BuiltinType::U32
+            : bits == 64 ? BuiltinType::U64 : BuiltinType::U128);
+        std::vector<ValueId> operands;
+        for (const auto& argument : expression.arguments) {
+            auto source = co_await lower_expression_async(*argument);
+            if (!source) co_return std::nullopt;
+            operands.push_back(cast(*source, domain, argument->location));
+        }
+        ValueId result;
+        if (operation == BitIntrinsic::Rotl || operation == BitIntrinsic::Rotr) {
+            result = add_value(ValueKind::Binary, domain, expression.location);
+            current_.values[result.value].binary =
+                operation == BitIntrinsic::Rotl ? BinaryOperation::RotateLeft
+                                                : BinaryOperation::RotateRight;
+        } else {
+            result = add_value(ValueKind::Intrinsic,
+                               bit_count_intrinsic(operation)
+                                   ? *hir_.builtin(BuiltinType::U32) : domain,
+                               expression.location);
+            current_.values[result.value].intrinsic =
+                operation == BitIntrinsic::Clz ? IntrinsicOperation::Clz
+                : operation == BitIntrinsic::Ctz ? IntrinsicOperation::Ctz
+                : operation == BitIntrinsic::Popcount ? IntrinsicOperation::Popcount
+                                                      : IntrinsicOperation::Bswap;
+        }
+        current_.values[result.value].operands = std::move(operands);
+        if (bit_count_intrinsic(operation)) co_return result;
+        co_return cast(result, type, expression.location);
+    }
+
     ContinuationTask<std::optional<ValueId>> lower_call_async(const Expr& expression) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
             co_return co_await lower_indirect_call_async(expression);
@@ -5594,6 +5664,10 @@ private:
                                                         : IntrinsicOperation::Fmax;
             intrinsic.operands = std::move(operands);
             co_return result;
+        }
+        if (const auto operation = bit_intrinsic(expression);
+            operation != BitIntrinsic::None) {
+            co_return co_await lower_bit_intrinsic_async(expression, operation);
         }
         if (expression.left->text == "$::assume") {
             if (expression.arguments.size() != 1) {
@@ -7535,7 +7609,8 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                    (value.kind == ValueKind::Intrinsic &&
                                     value.intrinsic !=
                                         IntrinsicOperation::Expect &&
-                                    !floating_intrinsic_operation(value.intrinsic)) ||
+                                    !floating_intrinsic_operation(value.intrinsic) &&
+                                    !bit_intrinsic_operation(value.intrinsic)) ||
                                    // Only an impure form joins the chain.
                                    (value.kind == ValueKind::MachineInstruction &&
                                     value.effect_input.has_value());
@@ -7850,6 +7925,19 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                                                value.type;
                                 })) {
                     fail(value.location, "invalid floating-intrinsic MIR operation");
+                }
+            } else if (value.kind == ValueKind::Intrinsic &&
+                       bit_intrinsic_operation(value.intrinsic)) {
+                const auto operand = value.operands.size() == 1 &&
+                        value.operands.front().value < function.values.size()
+                    ? std::optional(function.values[value.operands.front().value].type)
+                    : std::nullopt;
+                if (!operand || !unsigned_integer_type(hir_module, *operand) ||
+                    hir_module.type(*operand).builtin == BuiltinType::Bool ||
+                    value.type != (value.intrinsic == IntrinsicOperation::Bswap
+                                       ? *operand
+                                       : *hir_module.builtin(BuiltinType::U32))) {
+                    fail(value.location, "invalid bit-intrinsic MIR operation");
                 }
             } else if (value.kind == ValueKind::Intrinsic) {
                 const bool expect =
@@ -10232,7 +10320,8 @@ std::optional<std::string> redundant_expression_key(
     case ValueKind::InsertElement:
         break;
     case ValueKind::Intrinsic:
-        if (!floating_intrinsic_operation(value.intrinsic)) return std::nullopt;
+        if (!floating_intrinsic_operation(value.intrinsic) &&
+            !bit_intrinsic_operation(value.intrinsic)) return std::nullopt;
         result += ':' + std::to_string(static_cast<unsigned>(value.intrinsic));
         break;
     case ValueKind::MachineInstruction:
@@ -12690,7 +12779,8 @@ bool safely_loop_invariant(const ManagedValue& value,
     case ValueKind::InsertElement:
         return true;
     case ValueKind::Intrinsic:
-        return value.intrinsic == IntrinsicOperation::Expect;
+        return value.intrinsic == IntrinsicOperation::Expect ||
+               bit_intrinsic_operation(value.intrinsic);
     default:
         return false;
     }
@@ -17798,6 +17888,27 @@ bool fold_constants(ManagedFunction& function,
             value.kind = ValueKind::ConstantInteger;
             value.operands.clear();
             changed = true;
+        } else if (value.kind == ValueKind::Intrinsic &&
+                   bit_intrinsic_operation(value.intrinsic) &&
+                   value.operands.size() == 1) {
+            const auto& operand = function.values[value.operands[0].value];
+            if (operand.kind != ValueKind::ConstantInteger) continue;
+            const auto bits = type_bits(hir_module, operand.type);
+            const auto input = mask_to(
+                UInt128{operand.integer, operand.integer_high}, bits);
+            const auto folded =
+                value.intrinsic == IntrinsicOperation::Bswap
+                    ? byte_swap(input, bits)
+                : value.intrinsic == IntrinsicOperation::Clz
+                    ? UInt128{count_leading_zeros(input, bits)}
+                : value.intrinsic == IntrinsicOperation::Ctz
+                    ? UInt128{count_trailing_zeros(input, bits)}
+                    : UInt128{population_count(input, bits)};
+            value.integer = folded.low;
+            value.integer_high = folded.high;
+            value.kind = ValueKind::ConstantInteger;
+            value.operands.clear();
+            changed = true;
         }
     }
     return changed;
@@ -18426,6 +18537,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
+    // Every level: the target lowers only the bit operations this leaves.
+    // After value numbering and LICM have shared and hoisted the operations,
+    // before the second rounds, which share and hoist their sequences.
+    pipeline.add(
+        PassId::BitOperationLowering,
+        [&](ManagedFunction& function, FunctionAnalysisManager&) {
+            return lower_bit_operations(function, hir_module, subtarget)
+                ? PassResult::changed_values()
+                : PassResult::unchanged();
+        });
     // After vectorization, so loop shapes keep their divisions; before LICM,
     // which hoists a reciprocal's materialization, value numbering, which
     // shares the quotient of a division and a remainder, and SLSR, which
@@ -18509,6 +18630,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             [&](ManagedFunction& function,
                 FunctionAnalysisManager&) {
                 return canonicalize_bitwise_operations(function, hir_module)
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
+        // Lowers the rotations that canonicalization formed on a target
+        // without them.
+        pipeline.add(
+            PassId::BitOperationLowering,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return lower_bit_operations(function, hir_module, subtarget)
                     ? PassResult::changed_values()
                     : PassResult::unchanged();
             });

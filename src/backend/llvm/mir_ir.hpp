@@ -27,6 +27,16 @@ inline std::string llvm_floating_intrinsic(mir::IntrinsicOperation operation,
     return "llvm." + std::string(name) + "." + std::string(suffix);
 }
 
+// The LLVM intrinsic of a Cross bit intrinsic on the LLVM integer type
+// `type`, such as `llvm.ctlz.i32`.
+inline std::string llvm_bit_intrinsic(mir::IntrinsicOperation operation,
+                                      std::string_view type) {
+    const std::string_view name = operation == mir::IntrinsicOperation::Clz ? "ctlz"
+        : operation == mir::IntrinsicOperation::Ctz ? "cttz"
+        : operation == mir::IntrinsicOperation::Popcount ? "ctpop" : "bswap";
+    return "llvm." + std::string(name) + "." + std::string(type);
+}
+
 struct TargetInfo;
 
 // The LLVM type of an object, array element, or pointee of `type`, including

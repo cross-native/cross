@@ -3,6 +3,7 @@
 #include "target/mips/target.hpp"
 
 #include "common/options.hpp"
+#include "target/mips/bit_operations.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/instructions.hpp"
 #include "target/subtarget.hpp"
@@ -405,6 +406,10 @@ std::vector<InstructionCostId> integer_operation_instructions(
     return {};
 }
 
+unsigned integer_register_bits(const Subtarget& subtarget) {
+    return subtarget.has_feature(mips::Feature::Mips3) ? 64U : 32U;
+}
+
 unsigned integer_constant_materialization_cost(
     const Subtarget& subtarget, const IntegerConstantCostQuery& query) {
     if (query.bits == 0) return 1;
@@ -580,7 +585,8 @@ TargetInfo make_target(ByteOrder order,
         target_options(),
         &subtargets,
         {integer_constant_materialization_cost,
-         integer_operation_instructions},
+         integer_operation_instructions, mips::bit_operation_instructions,
+         integer_register_bits},
         {{0, 0, 0, 0, true, true, true, true, false, true, true}},
         // Instruction memory operands are a GPR base plus a signed 16-bit
         // displacement; MIPS has no scaled index.

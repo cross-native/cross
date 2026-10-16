@@ -93,7 +93,7 @@ expect(print-costs-x86 "${stdout}"
     "^cpu: generic  tune: generic  issue_width: 1\n"
     "\nimulq  latency: 3  issue: 1  available: yes\n"
     "\ndivq  latency: 40  issue: 1  available: yes\n"
-    "\nlzcntq  latency: 1  issue: 1  available: yes\n")
+    "\nlzcntq  latency: 3  issue: 1  available: yes\n")
 
 # User CPUs: names are per architecture, entries inherit, and -march,
 # -mtune, and profiles select them.
@@ -238,13 +238,13 @@ function(compile_assembly label)
     set(assembly "${assembly}" PARENT_SCOPE)
 endfunction()
 compile_assembly(allegrex -mprofile=psp-allegrex "${ROTATE_SOURCE}")
-expect(allegrex "${assembly}" "[.]word[\t ]+0x0128500b" "[.]word[\t ]+0x01285046")
+expect(allegrex "${assembly}" "[.]word[\t ]+0x0128500b" "[.]word[^\n]*# rotrv")
 compile_assembly(nomovn -mprofile=psp-allegrex -march=nomovn "${ROTATE_SOURCE}")
-expect(nomovn "${assembly}" "[.]word[\t ]+0x01285046" "[\t ]beq[\t ]")
+expect(nomovn "${assembly}" "[.]word[^\n]*# rotrv" "[\t ]beq[\t ]")
 reject(nomovn "${assembly}" "0x0128500b")
 compile_assembly(norotate -mprofile=psp-allegrex -march=norotate "${ROTATE_SOURCE}")
 expect(norotate "${assembly}" "[.]word[\t ]+0x0128500b" "[\t ]srlv[\t ]")
-reject(norotate "${assembly}" "0x01285046")
+reject(norotate "${assembly}" "# rotrv")
 
 set(branches "${OUTPUT}/branches.x")
 file(WRITE "${branches}" "global u32 pick(u32 c, u32 a, u32 b) {

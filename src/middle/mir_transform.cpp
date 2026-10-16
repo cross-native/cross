@@ -978,7 +978,8 @@ bool cloneable_rotated_guard_value(const ManagedValue& value) {
     case ValueKind::InsertElement:
         return true;
     case ValueKind::Intrinsic:
-        return value.intrinsic == IntrinsicOperation::Expect;
+        return value.intrinsic == IntrinsicOperation::Expect ||
+               bit_intrinsic_operation(value.intrinsic);
     default: return false;
     }
 }

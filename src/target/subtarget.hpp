@@ -95,6 +95,10 @@ public:
     [[nodiscard]] std::optional<unsigned> integer_operation_cost(
         CostedIntegerOperation operation,
         const IntegerOperationCostQuery& query) const;
+    // The same for the target's own lowering of a bit operation.
+    [[nodiscard]] std::optional<unsigned> bit_operation_cost(
+        CostedBitOperation operation, unsigned bits) const;
+    [[nodiscard]] unsigned integer_register_bits() const;
     [[nodiscard]] floating::NanEncoding nan_encoding() const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;

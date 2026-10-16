@@ -180,7 +180,8 @@ bool has_precise_straight_line_scalar_clobbers(
             break;
         case mir::ValueKind::Intrinsic:
             if (value.intrinsic != mir::IntrinsicOperation::Expect &&
-                value.intrinsic != mir::IntrinsicOperation::MachineNop) {
+                value.intrinsic != mir::IntrinsicOperation::MachineNop &&
+                !mir::bit_intrinsic_operation(value.intrinsic)) {
                 return false;
             }
             break;

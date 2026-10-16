@@ -38,6 +38,11 @@ endif()
 if(NOT DEFINED MIPS_ENDIANS)
     set(MIPS_ENDIANS b l)
 endif()
+# The emulated CPU runs the MIPS III transport wrapper; a MIPS32 or MIPS64
+# object needs a Release 2 CPU.
+if(NOT DEFINED QEMU_CPU)
+    set(QEMU_CPU R4000)
+endif()
 if(MIPS_SINGLE_CASE)
     list(LENGTH MIPS_CPUS cpu_count)
     list(LENGTH MIPS_ENDIANS endian_count)
@@ -131,7 +136,7 @@ foreach(endian IN LISTS MIPS_ENDIANS)
             message(STATUS "skipping MIPS ${cpu}/${endian}: QEMU unavailable")
             continue()
         endif()
-        execute_process(COMMAND "${qemu}" -M malta -cpu R4000 -m 64M -bios none
+        execute_process(COMMAND "${qemu}" -M malta -cpu ${QEMU_CPU} -m 64M -bios none
             -kernel "${out}.elf64" -display none -serial none -serial none -serial stdio
             -monitor none -no-reboot -semihosting RESULT_VARIABLE s OUTPUT_VARIABLE o
             ERROR_VARIABLE e TIMEOUT 15)

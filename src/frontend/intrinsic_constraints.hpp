@@ -136,6 +136,35 @@ inline std::size_t floating_intrinsic_arity(FloatingIntrinsic operation) {
     return operation == FloatingIntrinsic::Sqrt || operation == FloatingIntrinsic::Fabs ? 1 : 2;
 }
 
+// Operations on the bits of one integer: counts return u32, rotations and
+// byte swaps the operand's type.
+enum class BitIntrinsic { None, Clz, Ctz, Popcount, Rotl, Rotr, Bswap };
+
+inline BitIntrinsic bit_intrinsic(std::string_view name) {
+    if (name == "$::clz") return BitIntrinsic::Clz;
+    if (name == "$::ctz") return BitIntrinsic::Ctz;
+    if (name == "$::popcount") return BitIntrinsic::Popcount;
+    if (name == "$::rotl") return BitIntrinsic::Rotl;
+    if (name == "$::rotr") return BitIntrinsic::Rotr;
+    if (name == "$::bswap") return BitIntrinsic::Bswap;
+    return BitIntrinsic::None;
+}
+
+inline BitIntrinsic bit_intrinsic(const Expr& expression) {
+    return expression.kind == Expr::Kind::Call && expression.left &&
+        expression.left->kind == Expr::Kind::Name
+        ? bit_intrinsic(expression.left->text) : BitIntrinsic::None;
+}
+
+inline std::size_t bit_intrinsic_arity(BitIntrinsic operation) {
+    return operation == BitIntrinsic::Rotl || operation == BitIntrinsic::Rotr ? 2 : 1;
+}
+
+inline bool bit_count_intrinsic(BitIntrinsic operation) {
+    return operation == BitIntrinsic::Clz || operation == BitIntrinsic::Ctz ||
+           operation == BitIntrinsic::Popcount;
+}
+
 struct AssumptionViolation {
     enum class Kind { Effects, QualifiedRead } kind;
     const Expr* expression;
@@ -195,7 +224,8 @@ std::optional<AssumptionViolation> assumption_violation(
                 // Only the operand's source type is observed.
             } else if (control_intrinsic(*node) == ControlIntrinsic::Expect) {
                 if (!node->arguments.empty()) push(node->arguments.front().get());
-            } else if (floating_intrinsic(*node) != FloatingIntrinsic::None) {
+            } else if (floating_intrinsic(*node) != FloatingIntrinsic::None ||
+                       bit_intrinsic(*node) != BitIntrinsic::None) {
                 for (const auto& argument : node->arguments) push(argument.get());
             } else if (node->left && node->left->kind == Expr::Kind::Name &&
                        node->left->text == "$::eval") {

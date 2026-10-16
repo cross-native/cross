@@ -82,7 +82,7 @@ foreach(pattern
         "\\.section \\.mdebug\\.eabi32"
         "\\.section \\.gcc_compiled_long32"
         "\\.set mips2"
-        "\\.word[	 ]+0x01285046"
+        "\\.word[^\n]*# rotrv"
         "\\.word[	 ]+0x0128500b"
         "swc1[	 ]+[$]f12"
         "swc1[	 ]+[$]f13")
@@ -131,7 +131,7 @@ if(pair MATCHES "addiu[\t ]+[$]10,[$]10,-1" OR
 endif()
 
 file(READ "${baseline_assembly}" baseline)
-if(baseline MATCHES "\\.word[	 ]+0x(01285046|0128500b)" OR
+if(baseline MATCHES "# rotrv|\\.word[	 ]+0x0128500b" OR
    NOT baseline MATCHES "[	 ]srlv[	 ]" OR
    NOT baseline MATCHES "[	 ]beq[	 ]")
     message(FATAL_ERROR

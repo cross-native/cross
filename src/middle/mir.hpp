@@ -110,6 +110,13 @@ enum class IntrinsicOperation {
     Copysign,
     Fmin,
     Fmax,
+    // Pure operations on one unsigned integer: leading zeros, trailing
+    // zeros, and one bits as a u32, where zero gives the width, and the
+    // operand with its bytes reversed.
+    Clz,
+    Ctz,
+    Popcount,
+    Bswap,
 };
 [[nodiscard]] inline bool floating_intrinsic_operation(IntrinsicOperation operation) {
     return operation == IntrinsicOperation::Sqrt ||
@@ -117,6 +124,12 @@ enum class IntrinsicOperation {
            operation == IntrinsicOperation::Copysign ||
            operation == IntrinsicOperation::Fmin ||
            operation == IntrinsicOperation::Fmax;
+}
+[[nodiscard]] inline bool bit_intrinsic_operation(IntrinsicOperation operation) {
+    return operation == IntrinsicOperation::Clz ||
+           operation == IntrinsicOperation::Ctz ||
+           operation == IntrinsicOperation::Popcount ||
+           operation == IntrinsicOperation::Bswap;
 }
 enum class AtomicOperation {
     Load, Store, Exchange, CompareExchange,

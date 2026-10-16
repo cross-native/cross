@@ -38,6 +38,13 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 // self-latches, and addressable blocks rather than weakening those invariants.
 [[nodiscard]] bool rotate_guarded_loops(ManagedFunction& function);
 
+// Lowers each bit intrinsic and rotation to the target's instructions or to
+// an inline sequence, whichever the subtarget's costs favor; afterwards the
+// target lowers every remaining one itself.
+[[nodiscard]] bool lower_bit_operations(ManagedFunction& function,
+                                        const hir::Module& hir_module,
+                                        const Subtarget& subtarget);
+
 // Value replacements collected by one sweep and applied to every use at once,
 // instead of rescanning the function per replaced value. Chains resolve to
 // their final value. A sweep that inspects operands rewrites each value with

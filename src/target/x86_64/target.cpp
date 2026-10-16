@@ -3,6 +3,7 @@
 #include "target/x86_64/target.hpp"
 
 #include "target/subtarget.hpp"
+#include "target/x86_64/bit_operations.hpp"
 #include "target/x86_64/instructions.hpp"
 #include "target/x86_64/manual_endpoint.hpp"
 
@@ -95,6 +96,8 @@ std::vector<InstructionCostId> integer_operation_instructions(
     }
     return {};
 }
+
+unsigned integer_register_bits(const Subtarget&) { return 64; }
 
 InstructionOperandEntry integer_register_operand(
     InstructionOperandRole role, unsigned bits) {
@@ -2786,7 +2789,8 @@ const TargetInfo target = with_instruction_costs({
          "preferred maximum width for internal vector operations"},
     },
     &subtargets,
-    {integer_constant_materialization_cost, integer_operation_instructions},
+    {integer_constant_materialization_cost, integer_operation_instructions,
+     x86_64::bit_operation_instructions, integer_register_bits},
     {{0, 0, 0, 0, true, true, true, true, false, true, true}},
     {{64, 64, "integer", {0}, {1, 2, 4, 8}, {"rsp"}, 32, "base"}},
     {{"integer128", {}}, {"binary128_storage", {}}, {"binary128_arithmetic", {}},

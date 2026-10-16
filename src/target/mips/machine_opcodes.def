@@ -129,6 +129,12 @@ X(Fcopysign, "mips.fcopysign")
 X(FnegSign, "mips.fneg.sign")
 X(Fmin, "mips.fmin")
 X(Fmax, "mips.fmax")
+// The bit intrinsics the CPU has instructions for: CLZ and DCLZ, CLO and
+// DCLO for the leading zeros of a complement, and WSBH, WSBW, or WSBH and
+// ROTR for a byte swap.
+X(Clz, "mips.clz")
+X(Clo, "mips.clo")
+X(Bswap, "mips.bswap")
 // A registry instruction form. Operand 0 is the form ID; the form's
 // operands follow, with a memory operand as base register and displacement.
 X(Machine, "mips.machine")

@@ -1320,6 +1320,11 @@ TypePtr translation_intrinsic_type(const Expr& expression, bool procedural, Type
     }
     if (floating_intrinsic(expression) != FloatingIntrinsic::None)
         return expression.arguments.empty() ? TypePtr{} : type_of(*expression.arguments.front());
+    if (const auto operation = bit_intrinsic(expression); operation != BitIntrinsic::None) {
+        if (bit_count_intrinsic(operation)) return builtin_type(BuiltinType::U32);
+        return expression.arguments.empty() ? TypePtr{}
+                                            : atomic_value_type(type_of(*expression.arguments.front()));
+    }
     switch (atomic_builtin(expression)) {
     case AtomicBuiltin::Store: case AtomicBuiltin::ThreadFence: case AtomicBuiltin::SignalFence:
         return builtin_type(BuiltinType::Void);
@@ -5813,6 +5818,27 @@ std::optional<SourceExpressionIssue> source_floating_intrinsic_error(
     return std::nullopt;
 }
 
+// A bit intrinsic takes integer operands of any width; every target has an
+// inline form.
+template<class TypeOf>
+std::optional<SourceExpressionIssue> source_bit_intrinsic_error(
+    const Expr& call, const TypeOf& type_of) {
+    const auto operation = bit_intrinsic(call);
+    if (operation == BitIntrinsic::None) return std::nullopt;
+    const auto& name = call.left->text;
+    const auto arity = bit_intrinsic_arity(operation);
+    if (call.arguments.size() != arity)
+        return SourceExpressionIssue{call.location,
+            name + (arity == 1 ? " requires one argument" : " requires two arguments")};
+    for (const auto& argument : call.arguments) {
+        const auto type = type_of(*argument, true);
+        if (!type || type->kind == Type::Kind::Generic) continue;
+        if (!is_integer(type) || type->builtin == BuiltinType::Bool)
+            return SourceExpressionIssue{argument->location, name + " requires integer operands"};
+    }
+    return std::nullopt;
+}
+
 // Portable source constraints do not execute an atomic access or ask a target
 // to select its lock-free sequence. Pointer representation/address-space
 // lowering stays with the ordinary resolved-model conversion path.
@@ -6400,6 +6426,12 @@ private:
         }
         if (floating_intrinsic(node) != FloatingIntrinsic::None) {
             if (const auto issue = source_floating_intrinsic_error(node,
+                    [&](const Expr& operand, bool decay) { return type(operand, decay); }))
+                error(issue->location, issue->message);
+            co_return;
+        }
+        if (bit_intrinsic(node) != BitIntrinsic::None) {
+            if (const auto issue = source_bit_intrinsic_error(node,
                     [&](const Expr& operand, bool decay) { return type(operand, decay); }))
                 error(issue->location, issue->message);
             co_return;
@@ -9782,6 +9814,11 @@ private:
             fail(issue->location, issue->message);
             co_return false;
         }
+        if (const auto issue = source_bit_intrinsic_error(node,
+                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
+            fail(issue->location, issue->message);
+            co_return false;
+        }
         if (!(co_await validate_atomic_intrinsic_async(node))) co_return false;
         if (!(co_await validate_patch_constraints_async(node, patch_operand))) co_return false;
         if (source_instruction_call(node)) {
@@ -9925,7 +9962,7 @@ private:
             }
         }
         if (control_intrinsic(node) != ControlIntrinsic::None || atomic_builtin(node) != AtomicBuiltin::None ||
-            floating_intrinsic(node) != FloatingIntrinsic::None ||
+            floating_intrinsic(node) != FloatingIntrinsic::None || bit_intrinsic(node) != BitIntrinsic::None ||
             patch_intrinsic(node) || source_instruction_call(node))
             co_return co_await validate_unevaluated_constraints_async(node, true, {}, false, use);
         if (node.kind == Expr::Kind::Call) {
@@ -13654,6 +13691,39 @@ private:
             // others copy an operand.
             if (!floating_environment_permits(raised, nullptr, expression.location)) co_return std::nullopt;
             co_return EvalValue{result, builtin_type(operands.front().type->builtin)};
+        }
+        if (const auto operation = bit_intrinsic(name); operation != BitIntrinsic::None) {
+            if (const auto issue = source_bit_intrinsic_error(expression,
+                    [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
+                fail(issue->location, issue->message);
+                co_return std::nullopt;
+            }
+            std::vector<EvalValue> operands;
+            for (const auto& argument : expression.arguments) {
+                auto value = co_await this->expression_async(*argument);
+                if (!value || value->pointer() || value->floating) co_return std::nullopt;
+                if (!is_integer(value->type) || value->type->builtin == BuiltinType::Bool) {
+                    fail(argument->location, name + " requires integer operands");
+                    co_return std::nullopt;
+                }
+                operands.push_back(std::move(*value));
+            }
+            const auto bits = integer_type(operands.front().type).bits;
+            const auto x = mask_to(operands.front().integer, bits);
+            const auto count = [&](unsigned value) {
+                return EvalValue{UInt128{value}, builtin_type(BuiltinType::U32)};
+            };
+            switch (operation) {
+            case BitIntrinsic::Clz: co_return count(count_leading_zeros(x, bits));
+            case BitIntrinsic::Ctz: co_return count(count_trailing_zeros(x, bits));
+            case BitIntrinsic::Popcount: co_return count(population_count(x, bits));
+            default: break;
+            }
+            const auto type = atomic_value_type(operands.front().type);
+            if (operation == BitIntrinsic::Bswap) co_return EvalValue{byte_swap(x, bits), type};
+            auto amount = rotate_amount(operands[1].integer, integer_type(operands[1].type), bits);
+            if (operation == BitIntrinsic::Rotr) amount = (bits - amount) % bits;
+            co_return EvalValue{rotate_left(x, amount, bits), type};
         }
         if (atomic_builtin(name) == AtomicBuiltin::IsLockFree) {
             if (!(co_await validate_unevaluated_constraints_async(expression))) co_return std::nullopt;

@@ -538,6 +538,7 @@ private:
     void emit_intrinsic_declarations(std::ostringstream& module) const {
         std::vector<std::string> expect_types;
         std::vector<std::pair<std::string, std::string>> floating_intrinsics;
+        std::vector<std::pair<std::string, std::string>> bit_intrinsics;
         std::vector<std::string> rotate_left_types;
         std::vector<std::string> rotate_right_types;
         bool trap = false;
@@ -575,6 +576,17 @@ private:
                     if (std::find(floating_intrinsics.begin(), floating_intrinsics.end(),
                                   declaration) == floating_intrinsics.end()) {
                         floating_intrinsics.push_back(declaration);
+                    }
+                }
+                if (value.kind == mir::ValueKind::Intrinsic &&
+                    mir::bit_intrinsic_operation(value.intrinsic)) {
+                    const auto type =
+                        ir_type(function.values[value.operands.front().value].type);
+                    const std::pair<std::string, std::string> declaration{
+                        llvm_bit_intrinsic(value.intrinsic, type), type};
+                    if (std::find(bit_intrinsics.begin(), bit_intrinsics.end(),
+                                  declaration) == bit_intrinsics.end()) {
+                        bit_intrinsics.push_back(declaration);
                     }
                 }
                 if (value.kind != mir::ValueKind::Intrinsic ||
@@ -615,6 +627,13 @@ private:
                    << (name.starts_with("llvm.copysign.") ? ", " + type : std::string{})
                    << ")\n";
         }
+        std::sort(bit_intrinsics.begin(), bit_intrinsics.end());
+        for (const auto& [name, type] : bit_intrinsics) {
+            const bool zero_flag = name.starts_with("llvm.ctlz.") ||
+                                   name.starts_with("llvm.cttz.");
+            module << "declare " << type << " @" << name << '(' << type
+                   << (zero_flag ? ", i1" : "") << ")\n";
+        }
         if (trap) module << "declare void @llvm.trap()\n";
         if (va_start) module << "declare void @llvm.va_start(ptr)\n";
         if (dynamic_stack) {
@@ -622,6 +641,7 @@ private:
                       "declare void @llvm.stackrestore.p0(ptr)\n";
         }
         if (!expect_types.empty() || !floating_intrinsics.empty() ||
+            !bit_intrinsics.empty() ||
             !rotate_left_types.empty() ||
             !rotate_right_types.empty() || trap || va_start ||
             dynamic_stack) {

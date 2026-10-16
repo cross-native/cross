@@ -153,6 +153,7 @@ add_library(cross_middle
     src/middle/frame_ir.cpp
     src/middle/mir.cpp
     src/middle/mir_analysis.cpp
+    src/middle/mir_bits.cpp
     src/middle/mir_memory.cpp
     src/middle/mir_pass.cpp
     src/middle/mir_transform.cpp
@@ -1655,7 +1656,7 @@ if(BUILD_TESTING)
     add_test(NAME cross_mips_gnu_as
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
-                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x;${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x"
+                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x;${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x;${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x"
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-gnu-as/output
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.cmake")
     set_tests_properties(cross_mips_gnu_as PROPERTIES
@@ -3147,6 +3148,97 @@ if(BUILD_TESTING)
             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/floating_intrinsics_errors.cmake")
     set_tests_properties(cross_floating_intrinsic_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.floating;feature.intrinsics")
+    # Bit intrinsics at run time and in evaluation: x86-64 with and without
+    # LZCNT, TZCNT, and POPCNT, with no bit instructions at all, and through
+    # LLVM IR; MIPS I, III, MIPS32, MIPS32 without CLZ, and n64.
+    set(bit_intrinsics_source ${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x)
+    set(bit_intrinsics_cpus ${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics_cpus.xm)
+    foreach(level O0 O2)
+        foreach(variant baseline features disabled none)
+            if(variant STREQUAL features)
+                set(bit_flags "-${level};-mlzcnt;-mbmi;-mpopcnt")
+            elseif(variant STREQUAL disabled)
+                set(bit_flags "-${level};-march=haswell;-mno-lzcnt;-mno-bmi;-mno-popcnt")
+            elseif(variant STREQUAL none)
+                set(bit_flags "-${level};--model=${bit_intrinsics_cpus};-march=x86-no-bit-instructions")
+            else()
+                set(bit_flags "-${level}")
+            endif()
+            add_test(NAME cross_runtime_bit_intrinsics_${variant}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${bit_intrinsics_source}
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bit-intrinsics-${variant}-${level}
+                    -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${bit_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_bit_intrinsics_${variant}_${level} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.intrinsics;feature.evaluation;opt.${level}")
+        endforeach()
+        if(CROSS_ENABLE_LLVM_TEXT)
+            add_test(NAME cross_runtime_bit_intrinsics_llvm_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> "-DCC_FLAGS=-${level};-mlzcnt;-mbmi;-mpopcnt"
+                    -DSOURCE=${bit_intrinsics_source}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bit-intrinsics-${level}.ll
+                    -DENTRY=test_entry -DEXPECTED=0
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+            set_tests_properties(cross_runtime_bit_intrinsics_llvm_${level} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.llvm;feature.intrinsics;opt.${level}")
+        endif()
+        add_test(NAME cross_runtime_bit_intrinsics_mips_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${bit_intrinsics_source}
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bit-intrinsics-mips-${level}
+                -DEXPECTED=P -DCC_FLAGS=-${level} "-DMIPS_CPUS=vr4300;r3000"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_bit_intrinsics_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.intrinsics;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        add_test(NAME cross_runtime_bit_intrinsics_mips32_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${bit_intrinsics_source}
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bit-intrinsics-mips32-${level}
+                -DEXPECTED=P "-DCC_FLAGS=-${level};--model=${bit_intrinsics_cpus}"
+                "-DMIPS_CPUS=mips32;mips32r2;mips32-noclz" -DQEMU_CPU=MIPS64R2-generic
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_bit_intrinsics_mips32_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.intrinsics;feature.model;isa.mips32;isa.mips32r2;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(endian big little)
+            add_test(NAME cross_runtime_bit_intrinsics_n64_${endian}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${bit_intrinsics_source}
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_n64_entry_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bit-intrinsics-n64-${endian}-${level}
+                    -DN64_ENDIAN=${endian} -DEXTRA_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_runtime_bit_intrinsics_n64_${endian}_${level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.intrinsics;endian.${endian};opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_bit_intrinsics_codegen
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DMODEL=${bit_intrinsics_cpus}
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/bit-intrinsics-codegen
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics_codegen.cmake")
+    set_tests_properties(cross_bit_intrinsics_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.intrinsics;feature.model")
+    add_test(NAME cross_bit_intrinsic_errors
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics_errors.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/bit-intrinsic-errors
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics_errors.cmake")
+    set_tests_properties(cross_bit_intrinsic_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.intrinsics")
     if(CROSS_ENABLE_GCC_GIMPLE_TEXT AND CROSS_TEST_GCC)
         add_test(NAME cross_gcc_gimple_wrapv
             COMMAND "${CMAKE_COMMAND}"

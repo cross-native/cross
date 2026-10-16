@@ -1345,6 +1345,15 @@ private:
                     "the GCC GIMPLE serializer does not represent floating "
                     "intrinsics");
                 break;
+            case mir::IntrinsicOperation::Clz:
+            case mir::IntrinsicOperation::Ctz:
+            case mir::IntrinsicOperation::Popcount:
+            case mir::IntrinsicOperation::Bswap:
+                diagnostics_.error(
+                    value.location,
+                    "the GCC GIMPLE serializer does not represent bit "
+                    "intrinsics");
+                break;
             }
             return;
         }

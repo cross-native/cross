@@ -13,6 +13,7 @@
 #include "middle/shrink_wrap.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
+#include "target/mips/bit_operations.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/instructions.hpp"
 #include "target/mips/machine_description.hpp"
@@ -109,6 +110,17 @@ std::optional<machine::PhysicalRegisterId> gpr_id(std::string_view name) {
     if (found == gpr_names.end()) return std::nullopt;
     return machine::PhysicalRegisterId{
         static_cast<std::uint32_t>(found - gpr_names.begin())};
+}
+
+// The word of an R-type instruction whose register fields name `rs`, `rt`,
+// and `rd`; Allegrex encodings unknown to generic assemblers are words.
+std::uint32_t register_word(std::uint32_t base, std::string_view rs,
+                            std::string_view rt, std::string_view rd) {
+    const auto field = [](std::string_view name) {
+        const auto id = gpr_id(name);
+        return id ? id->value : 0U;
+    };
+    return base | field(rs) << 21U | field(rt) << 16U | field(rd) << 11U;
 }
 
 std::string_view gpr_name(machine::PhysicalRegisterId id) {
@@ -1721,6 +1733,35 @@ private:
                 result.operands.push_back(register_operand(source));
                 result.uses.push_back(source);
             }
+            result.defs.push_back(reg(value.id));
+            return result;
+        }
+        if (value.kind == ValueKind::Intrinsic &&
+            (value.intrinsic == mir::IntrinsicOperation::Clz ||
+             value.intrinsic == mir::IntrinsicOperation::Bswap)) {
+            auto operand = value.operands.front();
+            auto opcode = value.intrinsic == mir::IntrinsicOperation::Clz
+                ? Opcode::Clz : Opcode::Bswap;
+            // The leading zeros of a complement are the leading ones. A
+            // reinterpretation, such as of a const operand, keeps the bits.
+            auto complement_id = operand;
+            while (source_->values[complement_id.value].kind == ValueKind::Cast &&
+                   source_->values[complement_id.value].cast ==
+                       mir::CastOperation::Reinterpret) {
+                complement_id = source_->values[complement_id.value].operands.front();
+            }
+            const auto& complement = source_->values[complement_id.value];
+            if (opcode == Opcode::Clz &&
+                complement.kind == ValueKind::Unary &&
+                complement.unary == mir::UnaryOperation::BitNot &&
+                counts_leading_ones(subtarget_, type_bits(hir_, complement.type))) {
+                operand = complement.operands.front();
+                opcode = Opcode::Clo;
+            }
+            auto result = target_instruction(opcode, value.location);
+            const auto source = reg(operand);
+            result.operands.push_back(register_operand(source));
+            result.uses.push_back(source);
             result.defs.push_back(reg(value.id));
             return result;
         }
@@ -4218,9 +4259,13 @@ private:
                     variable = instruction.uses[1];
                     opcode = swapped_comparison(opcode);
                 }
+                const bool shift = opcode == Opcode::Shl ||
+                    opcode == Opcode::ShrS || opcode == Opcode::ShrU;
+                // A word pair shifts by a constant without the variable
+                // expansion's branches.
                 if (!immediate || immediate->high != 0 ||
                     variable.mode.bits < 32 || variable.mode.bits > 64 ||
-                    (variable.mode.bits > 32 &&
+                    (variable.mode.bits > 32 && !shift &&
                      !subtarget_.has_feature(Feature::Mips3))) {
                     continue;
                 }
@@ -4276,8 +4321,8 @@ private:
                     // their register form so upper bits remain exact.
                     encodable = selected.value <= 0xffffU;
                     selected.is_signed = false;
-                } else if (opcode == Opcode::Shl || opcode == Opcode::ShrS ||
-                           opcode == Opcode::ShrU) {
+                } else if (shift || opcode == Opcode::Rotl ||
+                           opcode == Opcode::Rotr) {
                     selected.value %= variable.mode.bits;
                     selected.is_signed = false;
                     encodable = true;
@@ -4428,6 +4473,20 @@ private:
                     std::get<machine::ImmediateOperand>(
                         instruction.operands.front())
                         .value));
+        case Opcode::Clo:
+            return sum({instruction.uses.front().mode.bits > 32 ? I::Dclo : I::Clo});
+        case Opcode::Clz:
+        case Opcode::Bswap: {
+            unsigned result{};
+            for (const auto item : bit_operation_instructions(
+                     subtarget_,
+                     opcode == Opcode::Clz ? CostedBitOperation::CountLeadingZeros
+                                           : CostedBitOperation::ByteSwap,
+                     instruction.uses.front().mode.bits)) {
+                result += subtarget_.latency(item);
+            }
+            return std::max(result, 1U);
+        }
         default:
             return instruction.may_load ? sum({I::Lw}) : 1U;
         }
@@ -10958,6 +11017,8 @@ private:
                               const machine::Instruction& value);
     void emit_cast(const machine::Function& function,
                    const machine::Instruction& value);
+    void emit_bit_operation(const machine::Function& function,
+                            const machine::Instruction& value);
     void emit_atomic(const machine::Function& function,
                      const machine::Instruction& value);
     void emit_phi_edge_copies(const machine::Function& function,
@@ -11082,6 +11143,46 @@ private:
 void AssemblyEmitter::emit_integer_pair_binary(
     const machine::Function& function,
     const machine::Instruction& value) {
+    const auto* immediate = value.operands.size() >= 2
+        ? std::get_if<machine::ImmediateOperand>(&value.operands[1])
+        : nullptr;
+    if (immediate && !value.uses.empty() && !value.defs.empty()) {
+        // A shift by a constant moves words and shifts them by fixed amounts.
+        const auto opcode = decode_opcode(value.opcode);
+        const auto amount = static_cast<unsigned>(immediate->value % 64U);
+        const auto by = [](unsigned bits) { return "," + std::to_string(bits); };
+        load_vreg_pair(function, value.uses.front(), "t0", "t1", value.location);
+        if (amount == 0) {
+            instruction("move", "$t4,$t0");
+            instruction("move", "$t5,$t1");
+        } else if (opcode == Opcode::Shl && amount >= 32) {
+            instruction("sll", "$t5,$t0" + by(amount - 32));
+            instruction("move", "$t4,$zero");
+        } else if (opcode == Opcode::Shl) {
+            instruction("sll", "$t5,$t1" + by(amount));
+            instruction("srl", "$t6,$t0" + by(32 - amount));
+            instruction("or", "$t5,$t5,$t6");
+            instruction("sll", "$t4,$t0" + by(amount));
+        } else {
+            const std::string shift = opcode == Opcode::ShrS ? "sra" : "srl";
+            if (amount >= 32) {
+                instruction(shift, "$t4,$t1" + by(amount - 32));
+            } else {
+                instruction("srl", "$t4,$t0" + by(amount));
+                instruction("sll", "$t6,$t1" + by(32 - amount));
+                instruction("or", "$t4,$t4,$t6");
+            }
+            if (amount < 32) {
+                instruction(shift, "$t5,$t1" + by(amount));
+            } else if (opcode == Opcode::ShrS) {
+                instruction("sra", "$t5,$t1,31");
+            } else {
+                instruction("move", "$t5,$zero");
+            }
+        }
+        store_vreg_pair(function, value.defs.front(), "t4", "t5", value.location);
+        return;
+    }
     if (value.uses.size() < 2 || value.defs.empty()) return;
     const auto left = value.uses[0];
     const auto right = value.uses[1];
@@ -11444,23 +11545,10 @@ void AssemblyEmitter::emit_integer_binary(
         return;
     }
     const auto opcode = decode_opcode(value.opcode);
-    // Allegrex RORV is currently emitted as a fixed instruction word. Keep
-    // that one form on its fixed scratch tuple until the encoder accepts
-    // arbitrary register fields; all ordinary MIPS-III operations consume
-    // and define their allocated registers directly.
-    const bool fixed_rotate = !wide && selects_rotate() &&
-        (opcode == Opcode::Rotl || opcode == Opcode::Rotr);
-    const auto left_gpr = fixed_rotate
-        ? (load_vreg(function, left, "t0", value.location),
-           std::string_view{"t0"})
-        : input_gpr(function, left, "t0", value.location);
-    const auto right_gpr = immediate ? std::string_view{} : fixed_rotate
-        ? (load_vreg(function, right, "t1", value.location),
-           std::string_view{"t1"})
+    const auto left_gpr = input_gpr(function, left, "t0", value.location);
+    const auto right_gpr = immediate ? std::string_view{}
         : input_gpr(function, right, "t1", value.location);
-    const auto target_gpr = fixed_rotate
-        ? std::string_view{"t2"}
-        : output_gpr(function, target, "t2");
+    const auto target_gpr = output_gpr(function, target, "t2");
     const auto binary_operands = [&] {
         return reg_name(target_gpr) + "," + reg_name(left_gpr) + "," +
             reg_name(right_gpr);
@@ -11525,6 +11613,40 @@ void AssemblyEmitter::emit_integer_binary(
                                   reg_name(left_gpr) + "," +
                                   std::to_string(amount));
     };
+    if (immediate && (opcode == Opcode::Rotl || opcode == Opcode::Rotr)) {
+        // A rotation right by a constant: ROTR, or two fixed shifts and OR.
+        const auto bits = wide ? 64U : 32U;
+        const auto amount = static_cast<unsigned>(immediate->value % bits);
+        const auto rightward = opcode == Opcode::Rotr ? amount : (bits - amount) % bits;
+        if (rightward == 0) {
+            if (target_gpr != left_gpr) {
+                instruction("move", reg_name(target_gpr) + "," + reg_name(left_gpr));
+            }
+        } else if (!wide && selects_rotate()) {
+            encoded(register_word(0x00200002U | rightward << 6U, "zero", left_gpr,
+                                  target_gpr),
+                    "rotr " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
+                        "," + std::to_string(rightward));
+        } else {
+            const auto fixed = [&](bool left_shift, std::string_view destination,
+                                   unsigned count) {
+                const auto mnemonic = !wide ? (left_shift ? "sll" : "srl")
+                    : count >= 32 ? (left_shift ? "dsll32" : "dsrl32")
+                                  : (left_shift ? "dsll" : "dsrl");
+                instruction(mnemonic, reg_name(destination) + "," +
+                                          reg_name(left_gpr) + "," +
+                                          std::to_string(count % 32U));
+            };
+            const auto rotate_target = target_gpr == left_gpr
+                ? std::string_view{"t2"} : target_gpr;
+            fixed(false, "t3", rightward);
+            fixed(true, rotate_target, bits - rightward);
+            instruction("or", reg_name(target_gpr) + "," +
+                                  reg_name(rotate_target) + ",$t3");
+        }
+        commit_gpr(function, target, target_gpr, value.location);
+        return;
+    }
     switch (opcode) {
     case Opcode::Add:
         instruction(immediate ? (wide ? "daddiu" : "addiu")
@@ -11601,8 +11723,12 @@ void AssemblyEmitter::emit_integer_binary(
         break;
     case Opcode::Rotl:
         if (!wide && selects_rotate()) {
-            instruction("subu", "$t3,$zero,$t1");
-            encoded(0x01685046U, "rorv $t2,$t0,$t3");
+            // ROTRV by the negated count; Allegrex shares the MIPS32
+            // Release 2 word, which generic assemblers do not know.
+            instruction("subu", "$t3,$zero," + reg_name(right_gpr));
+            encoded(register_word(0x00000046U, "t3", left_gpr, target_gpr),
+                    "rotrv " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
+                        ",$t3");
         } else {
             instruction(wide ? "dsubu" : "subu",
                         "$t3,$zero," + reg_name(right_gpr));
@@ -11621,7 +11747,9 @@ void AssemblyEmitter::emit_integer_binary(
         break;
     case Opcode::Rotr:
         if (!wide && selects_rotate()) {
-            encoded(0x01285046U, "rorv $t2,$t0,$t1");
+            encoded(register_word(0x00000046U, right_gpr, left_gpr, target_gpr),
+                    "rotrv " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
+                        "," + reg_name(right_gpr));
         } else {
             instruction(wide ? "dsubu" : "subu",
                         "$t3,$zero," + reg_name(right_gpr));
@@ -11758,6 +11886,49 @@ void AssemblyEmitter::emit_floating_binary(
     instruction("li", reg_name(result_gpr) + ",1");
     output_ << done << ":\n";
     commit_gpr(function, target, result_gpr, value.location);
+}
+
+// CLZ and DCLZ, CLO and DCLO; WSBH and ANDI for 16 bits, Allegrex's WSBW or
+// WSBH and ROTR by 16 for 32 bits. Allegrex's CLZ and CLO are SPECIAL
+// functions 0x16 and 0x17, not MIPS32's SPECIAL2 forms.
+void AssemblyEmitter::emit_bit_operation(const machine::Function& function,
+                                         const machine::Instruction& value) {
+    const auto source = value.uses.front();
+    const auto target = value.defs.front();
+    const auto bits = source.mode.bits;
+    const auto input = input_gpr(function, source, "t0", value.location);
+    const auto output = output_gpr(function, target, "t1");
+    const bool allegrex = subtarget_.has_feature(Feature::Allegrex);
+    const auto operands = reg_name(output) + "," + reg_name(input);
+    const auto opcode = decode_opcode(value.opcode);
+    if (opcode == Opcode::Clz || opcode == Opcode::Clo) {
+        const bool ones = opcode == Opcode::Clo;
+        if (bits > 32) {
+            instruction(ones ? "dclo" : "dclz", operands);
+        } else if (allegrex) {
+            encoded(register_word(ones ? 0x00000017U : 0x00000016U, input,
+                                  "zero", output),
+                    (ones ? "clo " : "clz ") + operands);
+        } else {
+            instruction(ones ? "clo" : "clz", operands);
+        }
+    } else if (bits == 16 || !allegrex) {
+        if (allegrex) {
+            encoded(register_word(0x7c0000a0U, "zero", input, output),
+                    "wsbh " + operands);
+        } else {
+            instruction("wsbh", operands);
+        }
+        if (bits == 16) {
+            instruction("andi", reg_name(output) + "," + reg_name(output) + ",65535");
+        } else {
+            instruction("rotr", reg_name(output) + "," + reg_name(output) + ",16");
+        }
+    } else {
+        encoded(register_word(0x7c0000e0U, "zero", input, output),
+                "wsbw " + operands);
+    }
+    commit_gpr(function, target, output, value.location);
 }
 
 void AssemblyEmitter::emit_cast(const machine::Function& function,
@@ -13056,6 +13227,11 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             output_ << done << ":\n";
             commit_gpr(function, target, destination, value.location);
         }
+        return;
+    }
+    if (opcode == Opcode::Clz || opcode == Opcode::Clo ||
+        opcode == Opcode::Bswap) {
+        emit_bit_operation(function, value);
         return;
     }
     if (opcode == Opcode::MulStart) {

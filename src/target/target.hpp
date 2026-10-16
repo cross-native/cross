@@ -556,6 +556,17 @@ struct IntegerOperationCostQuery {
     bool is_signed{};
 };
 
+// Bit operations on an unsigned operand, which MIR lowers to the target's
+// own instructions or to inline sequences of ordinary operations.
+enum class CostedBitOperation {
+    CountLeadingZeros,
+    CountTrailingZeros,
+    PopulationCount,
+    ByteSwap,
+    RotateLeft,
+    RotateRight,
+};
+
 struct TargetCostModel {
     using IntegerConstantMaterializationCost =
         unsigned (*)(const Subtarget&, const IntegerConstantCostQuery&);
@@ -566,8 +577,18 @@ struct TargetCostModel {
         const Subtarget&, CostedIntegerOperation,
         const IntegerOperationCostQuery&);
 
+    // The instructions on the result path of the target's own lowering of a
+    // bit operation at that width, the cheapest one the -march CPU has by
+    // the -mtune costs, or none.
+    using BitOperationInstructions = std::vector<InstructionCostId> (*)(
+        const Subtarget&, CostedBitOperation, unsigned bits);
+    // The width of a general register; a wider integer is a register pair.
+    using IntegerRegisterBits = unsigned (*)(const Subtarget&);
+
     IntegerConstantMaterializationCost integer_constant_materialization{};
     IntegerOperationInstructions integer_operation{};
+    BitOperationInstructions bit_operation{};
+    IntegerRegisterBits integer_register_bits{};
 };
 
 // Direct typed instruction-memory addressing. These are encoding constraints,

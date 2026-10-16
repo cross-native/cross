@@ -1201,6 +1201,31 @@ private:
                 out_ << ")\n";
                 break;
             }
+            case mir::IntrinsicOperation::Clz:
+            case mir::IntrinsicOperation::Ctz:
+            case mir::IntrinsicOperation::Popcount:
+            case mir::IntrinsicOperation::Bswap: {
+                // The counts are i32 at every width and defined for zero.
+                const auto source = value.operands.front();
+                const auto type =
+                    ir_type(hir_, function_.values[source.value].type);
+                const bool count = value.intrinsic != mir::IntrinsicOperation::Bswap;
+                const bool converted = count && type != "i32";
+                const auto raw = converted ? result + ".raw" : result;
+                out_ << "  " << raw << " = call " << type << " @"
+                     << llvm_bit_intrinsic(value.intrinsic, type) << '(' << type
+                     << ' ' << reference(source)
+                     << (count && value.intrinsic != mir::IntrinsicOperation::Popcount
+                             ? ", i1 false" : "")
+                     << ")\n";
+                if (converted) {
+                    const auto bits = std::stoul(type.substr(1));
+                    out_ << "  " << result << " = "
+                         << (bits < 32 ? "zext " : "trunc ") << type << ' ' << raw
+                         << " to i32\n";
+                }
+                break;
+            }
             case mir::IntrinsicOperation::Fmin:
             case mir::IntrinsicOperation::Fmax: {
                 // A NaN left operand yields the right one; equal operands

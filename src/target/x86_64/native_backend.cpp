@@ -11,6 +11,7 @@
 #include "common/control_flow.hpp"
 #include "target/abi_lowering.hpp"
 #include "target/assembly_format.hpp"
+#include "target/x86_64/bit_operations.hpp"
 #include "target/x86_64/features.hpp"
 #include "target/x86_64/instructions.hpp"
 #include "target/x86_64/machine_description.hpp"
@@ -1958,6 +1959,21 @@ private:
                 for (const auto name : {"rax", "rcx", "rdx"})
                     append_fixed_clobber(instruction, name, machine::i64);
             }
+            return instruction;
+        }
+        if (value.kind == ValueKind::Intrinsic &&
+            mir::bit_intrinsic_operation(value.intrinsic)) {
+            using mir::IntrinsicOperation;
+            auto instruction = target_instruction(
+                value.intrinsic == IntrinsicOperation::Clz ? Opcode::Clz
+                : value.intrinsic == IntrinsicOperation::Ctz ? Opcode::Ctz
+                : value.intrinsic == IntrinsicOperation::Popcount
+                    ? Opcode::Popcount : Opcode::Bswap,
+                value.location);
+            const auto source = reg(value.operands.front());
+            instruction.operands.push_back(register_operand(source));
+            instruction.uses.push_back(source);
+            instruction.defs.push_back(reg(value.id));
             return instruction;
         }
         if (value.kind == ValueKind::Intrinsic) {
@@ -5709,6 +5725,21 @@ private:
                 value.opcode == Opcode::GlobalAddress ||
                 value.opcode == Opcode::IndexedAddress) {
                 return subtarget_.latency(Instruction::Leaq);
+            }
+            if ((value.opcode == Opcode::Clz || value.opcode == Opcode::Ctz ||
+                 value.opcode == Opcode::Popcount) && !value.uses.empty()) {
+                unsigned total{};
+                for (const auto id : x86_64::bit_operation_instructions(
+                         subtarget_,
+                         value.opcode == Opcode::Clz
+                             ? CostedBitOperation::CountLeadingZeros
+                         : value.opcode == Opcode::Ctz
+                             ? CostedBitOperation::CountTrailingZeros
+                             : CostedBitOperation::PopulationCount,
+                         value.uses.front().mode.bits)) {
+                    total += subtarget_.latency(id);
+                }
+                return std::max(total, 1U);
             }
             return 1U;
         };
@@ -18804,6 +18835,73 @@ private:
         store(function, target, "rax", "rdx");
     }
 
+    // A bit intrinsic in the form bit_operation_instructions chose: LZCNT,
+    // TZCNT, or POPCNT; BSR or BSF into a scratch, kept by CMOVNE over the
+    // result for zero, a BSR index flipped into a count by XOR; BSWAP, or
+    // ROLW by 8 for 16 bits.
+    void emit_bit_operation(const machine::Function& function,
+                            const machine::Instruction& value) {
+        const auto source = value.uses.front();
+        const auto target = value.defs.front();
+        const auto bits = source.mode.bits;
+        const auto* assigned_target = assigned_integer_register(function, target);
+        const auto destination = assigned_target
+            ? std::string(assigned_target->storage_name) : std::string("rax");
+        const auto* assigned_source = assigned_integer_register(function, source);
+        const auto input = assigned_source
+            ? std::string(assigned_source->storage_name) : destination;
+        if (!assigned_source) load(function, source, destination);
+        const auto size = std::string(1, suffix(bits));
+        if (value.opcode == Opcode::Bswap) {
+            if (input != destination) {
+                instruction("mov" + size, register_name(input, bits) + ", " +
+                                              register_name(destination, bits));
+            }
+            if (bits == 16) {
+                instruction("rolw", "$8, " + register_name(destination, 16));
+            } else {
+                instruction("bswap" + size, register_name(destination, bits));
+            }
+            store(function, target, destination);
+            return;
+        }
+        const auto operation = value.opcode == Opcode::Clz
+            ? CostedBitOperation::CountLeadingZeros
+            : value.opcode == Opcode::Ctz ? CostedBitOperation::CountTrailingZeros
+                                          : CostedBitOperation::PopulationCount;
+        const auto path = x86_64::bit_operation_instructions(subtarget_, operation, bits);
+        if (path.empty()) {
+            diagnostics_.error(value.location,
+                               "unselected x86 bit operation '" +
+                                   std::string(opcode_name(value.opcode)) + "'");
+            return;
+        }
+        using I = x86_64::Instruction;
+        const auto first = path.front();
+        if (first == I::Bsrl || first == I::Bsrq || first == I::Bsfl ||
+            first == I::Bsfq) {
+            const bool leading = value.opcode == Opcode::Clz;
+            const auto scratch = destination == "rcx" ? "rax" : "rcx";
+            instruction((leading ? "bsr" : "bsf") + size,
+                        register_name(input, bits) + ", " +
+                            register_name(scratch, bits));
+            instruction("movl", "$" + std::to_string(leading ? 2 * bits - 1 : bits) +
+                                    ", " + register_name(destination, 32));
+            instruction("cmovne" + size, register_name(scratch, bits) + ", " +
+                                             register_name(destination, bits));
+            if (leading) {
+                instruction("xorl", "$" + std::to_string(bits - 1) + ", " +
+                                        register_name(destination, 32));
+            }
+        } else {
+            instruction((value.opcode == Opcode::Clz ? "lzcnt"
+                         : value.opcode == Opcode::Ctz ? "tzcnt" : "popcnt") + size,
+                        register_name(input, bits) + ", " +
+                            register_name(destination, bits));
+        }
+        store(function, target, destination);
+    }
+
     void emit_unary(const machine::Function& function,
                     const machine::Instruction& value) {
         if (value.uses.front().mode.bits == 128) {
@@ -24082,6 +24180,11 @@ private:
                    value.opcode == Opcode::Fmin ||
                    value.opcode == Opcode::Fmax) {
             emit_float_intrinsic(function, value);
+        } else if (value.opcode == Opcode::Clz ||
+                   value.opcode == Opcode::Ctz ||
+                   value.opcode == Opcode::Popcount ||
+                   value.opcode == Opcode::Bswap) {
+            emit_bit_operation(function, value);
         } else if (value.opcode == Opcode::Fneg ||
                    value.opcode == Opcode::Fiszero) {
             emit_float_unary(function, value);

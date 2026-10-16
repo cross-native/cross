@@ -334,6 +334,31 @@ $::static_assert($::sqrt(2.25) == 1.5, "evaluated at translation time");
 $::static_assert($::copysign(3.0, -0.0) == -3.0, "the sign of -0.0");
 ```
 
+- `$::clz`, `$::ctz`, and `$::popcount` count the leading zero bits, the
+  trailing zero bits, and the one bits of an integer at the width of its type
+  and return a `u32`; zero gives the width. `$::rotl(x, n)` and
+  `$::rotr(x, n)` rotate `x` by `n` modulo its width, so a negative `n`
+  rotates the other way, and `$::bswap(x)` reverses the bytes of `x`; these
+  three return the type of `x`. They evaluate at translation time like
+  operators and compile to an instruction where the CPU has one, otherwise to
+  a short inline sequence, never to a call
+  ([targets.md](targets.md#bit-intrinsics)).
+
+```x
+// The lowest free slot of a 64-slot pool, or 64 when the pool is full.
+u32 first_free(in u64 used) {
+    return $::ctz(~used);
+}
+
+u32 hash_step(in u32 hash, in u32 word) {
+    return $::rotl(hash ^ word, 5) * 0x9e3779b9u32;
+}
+
+$::static_assert($::clz(1u16) == 15u32 && $::popcount(0xf0u8) == 4u32, "counts");
+$::static_assert($::rotl(0x81u8, -1) == 0xc0u8, "a negative count rotates right");
+$::static_assert($::bswap(0x1234u16) == 0x3412u16, "bytes in reverse order");
+```
+
 ## Namespaces
 
 ```x
