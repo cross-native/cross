@@ -10,6 +10,9 @@
 _start:
         lui     $sp,0x8080
         addiu   $sp,$sp,-64
+        # Small data, when selected, is reached through $gp.
+        lui     $gp,%hi(_gp)
+        addiu   $gp,$gp,%lo(_gp)
 
         # The Malta firmware-less entry leaves CP1 disabled.
         mfc0    $t0,$12

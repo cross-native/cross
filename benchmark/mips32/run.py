@@ -70,6 +70,7 @@ class Configuration:
     levels: tuple[str, ...]
     kernels: tuple[Kernel, ...]
     cross_extra_flags: tuple[str, ...]
+    gcc_extra_flags: tuple[str, ...]
     samples: int
     timeout_seconds: int
     revision: str
@@ -981,6 +982,7 @@ async def build_unit(
                 "-c",
                 "-fgimple",
                 *gcc_flags(level),
+                *config.gcc_extra_flags,
                 f"-fdump-tree-optimized={tree_dump}",
                 f"-fdump-rtl-final={rtl_dump}",
                 gimple,
@@ -997,6 +999,7 @@ async def build_unit(
                 "-std=c11",
                 "-c",
                 *gcc_flags(level),
+                *config.gcc_extra_flags,
                 f"-fdump-tree-optimized={tree_dump}",
                 f"-fdump-rtl-final={rtl_dump}",
                 source,
@@ -1819,6 +1822,12 @@ def generate_report(
             + " ".join(config.cross_extra_flags)
             + "`  "
         )
+    if config.gcc_extra_flags:
+        lines.append(
+            "Additional GCC flags: `"
+            + " ".join(config.gcc_extra_flags)
+            + "`  "
+        )
     lines.extend(
         (
             "Target: VR4300 / MIPS III / big-endian o32  ",
@@ -2175,6 +2184,12 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
         default=[],
         help="append one flag to every Cross frontend invocation; repeatable",
     )
+    parser.add_argument(
+        "--gcc-flag",
+        action="append",
+        default=[],
+        help="append one flag to every GCC compilation of a kernel; repeatable",
+    )
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--output", type=Path)
@@ -2265,6 +2280,7 @@ async def configuration_from_arguments(
         levels=levels,
         kernels=kernels,
         cross_extra_flags=tuple(arguments.cross_flag),
+        gcc_extra_flags=tuple(arguments.gcc_flag),
         samples=arguments.samples,
         timeout_seconds=arguments.timeout_seconds,
         revision=revision,
@@ -2362,6 +2378,7 @@ async def async_main(argv: Sequence[str]) -> int:
                 "revision": config.revision,
                 "levels": config.levels,
                 "cross_extra_flags": config.cross_extra_flags,
+                "gcc_extra_flags": config.gcc_extra_flags,
                 "samples": config.samples,
                 "pipeline_timing": {
                     "enabled": config.pipeline_timing,

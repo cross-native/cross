@@ -81,6 +81,15 @@ python benchmark/mips32/run.py --levels O3 --samples 3 \
   --cross-flag=-fno-tree-loop-rotate --run-name no-rotation
 ```
 
+`--gcc-flag` likewise appends one flag to every GCC compilation of a kernel.
+The startup sets `$gp` to the linker's `_gp`, so small data can be compared
+with the settings console projects use:
+
+```text
+python benchmark/mips32/run.py --levels O3 --samples 3 \
+  --cross-flag=-mdata-bases=mips-gp --gcc-flag=-G8 --run-name small-data
+```
+
 To add the path-weighted LLVM-MCA estimate (the driver auto-discovers QEMU's
 contributed hotblocks plugin beside the emulator when installed):
 
